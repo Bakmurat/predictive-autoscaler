@@ -1,0 +1,210 @@
+# ========================================================================
+# PREDICTIVE AUTOSCALER - ML-DRIVEN PROACTIVE SCALING
+# ========================================================================
+# This CR uses machine learning predictions to scale BEFORE load arrives.
+# Works with KEDA as a hybrid solution: ML predicts, KEDA reacts if needed.
+#
+# Architecture:
+# 1. This PredictiveAutoscaler CR defines scaling targets
+# 2. Operator watches this CR and calls ML API for predictions
+# 3. Operator scales deployment based on predictions (15 min lead time)
+# 4. KEDA ScaledObject (see keda-hybrid-scaledobject.yaml) acts as fallback
+# 5. If ML fails or underestimates, KEDA reactive triggers catch it
+# ========================================================================
+
+apiVersion: autoscaler.example.com/v1alpha1
+kind: PredictiveAutoscaler
+metadata:
+  name: web-frontend-autoscaler
+  namespace: demo
+  annotations:
+    description: "Predictive autoscaling for web-frontend using LSTM model"
+    keda-fallback: "enabled"  # KEDA ScaledObject exists as fallback
+spec:
+  # Target deployment to scale
+  targetDeployment:
+    name: web-frontend
+    namespace: demo
+    container: frontend  # Container name for resource calculations
+  
+  # Scaling boundaries (KEDA must use same or wider range)
+  minReplicas: 2
+  maxReplicas: 20
+  
+  # Metrics configuration - used by ML model for predictions
+  metrics:
+    cpu:
+      enabled: true
+      targetPercent: 70  # Keep CPU below 70% under predicted load
+    
+    memory:
+      enabled: true
+      targetPercent: 60  # Keep Memory below 60%
+    
+    requests:
+      enabled: true
+      targetRPM: 120000  # Expected requests per minute at peak
+  
+  # Prediction settings
+  prediction:
+    horizonMinutes: 60         # Predict 60 minutes ahead
+    leadTimeMinutes: 15        # Scale 15 min before predicted spike
+    updateIntervalSeconds: 300  # Check predictions every 5 minutes
+  
+  # Resource configuration for replica calculation
+  resources:
+    cpuRequestMillicores: 100   # Each pod requests 100m CPU
+    memoryRequestMB: 128        # Each pod requests 128Mi memory
+    baselineRPM: 120000         # Baseline requests per minute
+
+---
+# ========================================================================
+# E-COMMERCE EXAMPLE - High Traffic Variability
+# ========================================================================
+# E-commerce sites have:
+# - Daily patterns (morning/afternoon/evening peaks)
+# - Weekly patterns (weekend vs weekday)
+# - Seasonal patterns (holidays, sales events)
+# - Sudden spikes (flash sales, viral products)
+#
+# ML handles patterns, KEDA handles unexpected spikes
+# ========================================================================
+
+apiVersion: autoscaler.example.com/v1alpha1
+kind: PredictiveAutoscaler
+metadata:
+  name: ecommerce-shop-autoscaler
+  namespace: demo
+  annotations:
+    description: "E-commerce with high traffic variability"
+    keda-fallback: "enabled"
+    business-hours: "24/7"
+spec:
+  targetDeployment:
+    name: ecommerce-shop
+    namespace: demo
+    container: shop-api
+  
+  minReplicas: 5      # Higher minimum for business-critical service
+  maxReplicas: 50     # Large max for flash sales
+  
+  metrics:
+    cpu:
+      enabled: true
+      targetPercent: 65  # Lower target for better user experience
+    
+    memory:
+      enabled: true
+      targetPercent: 70
+    
+    requests:
+      enabled: true
+      targetRPM: 300000  # 5000 RPS at peak
+  
+  prediction:
+    horizonMinutes: 120        # 2 hours ahead for better planning
+    leadTimeMinutes: 20        # More lead time for larger scales
+    updateIntervalSeconds: 180  # More frequent checks (3 min)
+  
+  resources:
+    cpuRequestMillicores: 200
+    memoryRequestMB: 256
+    baselineRPM: 300000
+
+---
+# ========================================================================
+# BATCH PROCESSOR EXAMPLE - Predictable Patterns
+# ========================================================================
+# Batch jobs typically have:
+# - Very predictable schedules (cron jobs, nightly runs)
+# - High confidence predictions (historical patterns repeat)
+# - Less need for aggressive reactive scaling
+# ========================================================================
+
+apiVersion: autoscaler.example.com/v1alpha1
+kind: PredictiveAutoscaler
+metadata:
+  name: batch-processor-autoscaler
+  namespace: batch-jobs
+  annotations:
+    description: "Batch processor with predictable patterns"
+    keda-fallback: "enabled"
+    workload-type: "batch"
+spec:
+  targetDeployment:
+    name: batch-processor
+    namespace: batch-jobs
+    container: processor
+  
+  minReplicas: 1      # Can scale to zero with KEDA if needed
+  maxReplicas: 15
+  
+  metrics:
+    cpu:
+      enabled: true
+      targetPercent: 85  # Higher utilization OK for batch jobs
+    
+    memory:
+      enabled: true
+      targetPercent: 80
+    
+    requests:
+      enabled: false     # Batch jobs don't use HTTP requests
+  
+  prediction:
+    horizonMinutes: 240        # 4 hours ahead (batch jobs are scheduled)
+    leadTimeMinutes: 30        # More time to scale up for batch
+    updateIntervalSeconds: 600  # Less frequent checks (10 min)
+  
+  resources:
+    cpuRequestMillicores: 500  # CPU-intensive batch processing
+    memoryRequestMB: 1024      # Memory-intensive
+    baselineRPM: 0             # Not request-driven
+
+---
+# ========================================================================
+# NGINX TEST EXAMPLE - Testing and Development
+# ========================================================================
+# Used for testing the predictive autoscaler with known load patterns
+# ========================================================================
+
+apiVersion: autoscaler.example.com/v1alpha1
+kind: PredictiveAutoscaler
+metadata:
+  name: nginx-test-autoscaler
+  namespace: default
+  annotations:
+    description: "Test deployment for validating ML predictions"
+    keda-fallback: "enabled"
+    environment: "test"
+spec:
+  targetDeployment:
+    name: nginx-test
+    namespace: default
+    container: nginx
+  
+  minReplicas: 2
+  maxReplicas: 40
+  
+  metrics:
+    cpu:
+      enabled: true
+      targetPercent: 70
+    
+    memory:
+      enabled: true
+      targetPercent: 60
+    
+    requests:
+      enabled: true
+      targetRPM: 60000
+  
+  prediction:
+    horizonMinutes: 60
+    leadTimeMinutes: 15
+    updateIntervalSeconds: 300
+  
+  resources:
+    cpuRequestMillicores: 50
+    memoryRequestMB: 64
+    baselineRPM: 60000

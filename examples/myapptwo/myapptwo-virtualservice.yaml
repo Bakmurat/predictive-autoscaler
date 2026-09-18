@@ -1,0 +1,23 @@
+---
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: myapptwo-vs
+  namespace: myapptwo
+spec:
+  hosts:
+  - myapptwo.example.com
+  gateways:
+  - istio-system/myapptwo-gateway
+  http:
+  # Default route - nginx service
+  - route:
+    - destination:
+        host: myapptwo.myapptwo.svc.cluster.local
+        port:
+          number: 80
+    timeout: 30s
+    retries:
+      attempts: 3
+      perTryTimeout: 10s
+      retryOn: gateway-error,connect-failure,refused-stream

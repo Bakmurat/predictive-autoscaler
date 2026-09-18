@@ -1,0 +1,86 @@
+# VMServiceScrape for ML API metrics (VictoriaMetrics operator)
+# Scrapes /metrics from ml-api-service in ml-engine namespace
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMServiceScrape
+metadata:
+  name: predictive-autoscaler-ml-api
+  namespace: monitoring
+  labels:
+    app: predictive-autoscaler
+    component: ml-api
+spec:
+  namespaceSelector:
+    matchNames:
+    - ml-engine
+  selector:
+    matchLabels:
+      app: ml-api
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 30s
+    scrapeTimeout: 10s
+    honorLabels: true
+    relabelConfigs:
+    - sourceLabels:
+      - __meta_kubernetes_service_name
+      targetLabel: service
+    - sourceLabels:
+      - __meta_kubernetes_namespace
+      targetLabel: kubernetes_namespace
+    - sourceLabels:
+      - __meta_kubernetes_pod_name
+      targetLabel: kubernetes_pod_name
+---
+# VMServiceScrape for Go Operator controller-runtime metrics
+# Scrapes /metrics from predictive-operator-metrics service in ml-engine namespace
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMServiceScrape
+metadata:
+  name: predictive-autoscaler-controller
+  namespace: monitoring
+  labels:
+    app: predictive-autoscaler
+    component: controller
+spec:
+  namespaceSelector:
+    matchNames:
+    - ml-engine
+  selector:
+    matchLabels:
+      app: predictive-operator
+  endpoints:
+  - port: metrics
+    path: /metrics
+    interval: 30s
+    scrapeTimeout: 10s
+    honorLabels: true
+    relabelConfigs:
+    - sourceLabels:
+      - __meta_kubernetes_service_name
+      targetLabel: service
+    - sourceLabels:
+      - __meta_kubernetes_namespace
+      targetLabel: kubernetes_namespace
+    - sourceLabels:
+      - __meta_kubernetes_pod_name
+      targetLabel: kubernetes_pod_name
+---
+# Service to expose operator metrics port (8080) for scraping
+apiVersion: v1
+kind: Service
+metadata:
+  name: predictive-operator-metrics
+  namespace: ml-engine
+  labels:
+    app: predictive-operator
+    component: controller
+spec:
+  selector:
+    app: predictive-operator
+  ports:
+  - name: metrics
+    port: 8080
+    targetPort: 8080
+    protocol: TCP
+  type: ClusterIP

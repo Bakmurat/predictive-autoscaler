@@ -1,0 +1,77 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ml-training
+  namespace: ml-engine
+  labels:
+    app: ml-training
+    component: trainer
+spec:
+  schedule: "0 */6 * * *"  # Every 6 hours
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      activeDeadlineSeconds: 600
+      template:
+        metadata:
+          labels:
+            app: ml-training
+        spec:
+          restartPolicy: OnFailure
+          
+          # Schedule on same node as ml-api to share RWO PVC
+          affinity:
+            podAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    app: ml-api
+                topologyKey: kubernetes.io/hostname
+          
+          containers:
+          - name: trainer
+            # Use the same image as ML API - it contains training code
+            image: registry.example.com/predictive-autoscaler/predictive-autoscaler-ml-api:v3.9.4
+            imagePullPolicy: Always
+            
+            # Run as root to write to PVC (training job is short-lived)
+            securityContext:
+              runAsUser: 0
+              runAsGroup: 0
+            
+            # Override command to run training instead of API
+            command: ["python3"]
+            args: ["training/train_nginx_test.py"]
+            
+            env:
+            - name: VICTORIA_METRICS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: victoriametrics-config
+                  key: victoria_metrics_url
+            
+            - name: MODEL_DIR
+              value: "/models"
+            
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            
+            volumeMounts:
+            - name: models
+              mountPath: /models
+            
+            resources:
+              requests:
+                cpu: 1000m
+                memory: 2Gi
+              limits:
+                cpu: 4000m
+                memory: 8Gi
+          
+          volumes:
+          - name: models
+            persistentVolumeClaim:
+              claimName: ml-models-pvc

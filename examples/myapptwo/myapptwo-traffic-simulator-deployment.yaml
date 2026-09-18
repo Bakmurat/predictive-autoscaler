@@ -1,0 +1,47 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapptwo-traffic-simulator
+  namespace: myapptwo
+  labels:
+    app: myapptwo-traffic-simulator
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: myapptwo-traffic-simulator
+  template:
+    metadata:
+      labels:
+        app: myapptwo-traffic-simulator
+    spec:
+      containers:
+      - name: k6
+        image: grafana/k6:0.48.0
+        command: ["k6"]
+        args: ["run", "--quiet", "/scripts/traffic-simulator.js"]
+        resources:
+          requests:
+            cpu: 1000m
+            memory: 1Gi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+        volumeMounts:
+        - name: script
+          mountPath: /scripts
+          readOnly: true
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          runAsUser: 1000
+          capabilities:
+            drop:
+            - ALL
+      volumes:
+      - name: script
+        configMap:
+          name: myapptwo-traffic-simulator
+          defaultMode: 0755
+      restartPolicy: Always

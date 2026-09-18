@@ -1,0 +1,92 @@
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nginx-test-traffic-sync
+  namespace: default
+  labels:
+    app: nginx-test-traffic-simulator
+spec:
+  # Run every hour at minute 0 (e.g., 4:00, 5:00, 6:00)
+  schedule: "0 * * * *"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: nginx-test-traffic-sync-job
+          annotations:
+            sidecar.istio.io/inject: "false"
+        spec:
+          serviceAccountName: nginx-test-traffic-sync
+          restartPolicy: OnFailure
+          containers:
+          - name: kubectl
+            image: bitnami/kubectl:latest
+            command:
+            - /bin/bash
+            - -c
+            - |
+              echo "=========================================="
+              echo "Traffic Simulator Hourly Sync Job"
+              echo "Time: $(date)"
+              echo "PST Hour: $(TZ=America/Los_Angeles date +%H):00"
+              echo "=========================================="
+              echo ""
+              echo "Rolling out restart of traffic simulator pods..."
+              kubectl rollout restart deployment/nginx-test-traffic-simulator -n default
+              echo ""
+              echo "Waiting for rollout to complete..."
+              kubectl rollout status deployment/nginx-test-traffic-simulator -n default --timeout=120s
+              echo ""
+              echo "Verifying new pods are running..."
+              kubectl get pods -n default -l app=nginx-test-traffic-simulator
+              echo ""
+              echo "Checking logs for synchronized schedule..."
+              sleep 5
+              kubectl logs -n default -l app=nginx-test-traffic-simulator --tail=10 | grep -E "(Current PST Hour|Hour [0-9].*PST)" | head -5
+              echo ""
+              echo "=========================================="
+              echo "Hourly sync completed successfully!"
+              echo "All traffic simulator pods now synchronized"
+              echo "=========================================="
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nginx-test-traffic-sync
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: nginx-test-traffic-sync
+  namespace: default
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "watch", "patch"]
+  resourceNames: ["nginx-test-traffic-simulator"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: nginx-test-traffic-sync
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: nginx-test-traffic-sync
+subjects:
+- kind: ServiceAccount
+  name: nginx-test-traffic-sync
+  namespace: default

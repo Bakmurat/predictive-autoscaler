@@ -1,0 +1,354 @@
+{
+  "dashboard": {
+    "uid": "pred-components-v5",
+    "title": "Predictive Autoscaler - Component Analysis",
+    "description": "Prediction pipeline internals: RPM overlay, component breakdown, accuracy, replicas, and overestimate detection",
+    "tags": ["autoscaler", "prediction", "v5"],
+    "timezone": "browser",
+    "editable": true,
+    "graphTooltip": 1,
+    "refresh": "30s",
+    "time": {
+      "from": "now-6h",
+      "to": "now"
+    },
+    "templating": {
+      "list": [
+        {
+          "name": "application",
+          "type": "query",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "query": "label_values(predictive_autoscaler_predicted_replicas, application)",
+          "current": {
+            "text": "nginx-test",
+            "value": "nginx-test"
+          },
+          "refresh": 1,
+          "sort": 1
+        },
+        {
+          "name": "namespace",
+          "type": "query",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "query": "label_values(predictive_autoscaler_predicted_replicas{application=\"$application\"}, namespace)",
+          "current": {
+            "text": "default",
+            "value": "default"
+          },
+          "refresh": 1,
+          "sort": 1
+        }
+      ]
+    },
+    "panels": [
+      {
+        "id": 1,
+        "title": "Predicted vs Actual RPM",
+        "type": "timeseries",
+        "gridPos": {
+          "h": 8,
+          "w": 24,
+          "x": 0,
+          "y": 0
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "reqpm",
+            "custom": {
+              "fillOpacity": 10,
+              "lineWidth": 2,
+              "spanNulls": true
+            }
+          },
+          "overrides": [
+            {
+              "matcher": { "id": "byName", "options": "Predicted RPM" },
+              "properties": [
+                { "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } }
+              ]
+            },
+            {
+              "matcher": { "id": "byName", "options": "Actual RPM" },
+              "properties": [
+                { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }
+              ]
+            }
+          ]
+        },
+        "targets": [
+          {
+            "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+            "expr": "predictive_autoscaler_predicted_rpm{application=\"$application\", namespace=\"$namespace\"}",
+            "legendFormat": "Predicted RPM",
+            "refId": "A"
+          },
+          {
+            "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+            "expr": "predictive_autoscaler_current_rpm{application=\"$application\", namespace=\"$namespace\"}",
+            "legendFormat": "Actual RPM",
+            "refId": "B"
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "title": "Prediction Components (per-step)",
+        "type": "timeseries",
+        "gridPos": {
+          "h": 10,
+          "w": 24,
+          "x": 0,
+          "y": 8
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "reqpm",
+            "custom": {
+              "fillOpacity": 5,
+              "lineWidth": 1,
+              "spanNulls": true
+            }
+          },
+          "overrides": [
+            {
+              "matcher": { "id": "byRegexp", "options": "LSTM.*" },
+              "properties": [
+                { "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } }
+              ]
+            },
+            {
+              "matcher": { "id": "byRegexp", "options": "Pattern.*" },
+              "properties": [
+                { "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } }
+              ]
+            },
+            {
+              "matcher": { "id": "byRegexp", "options": "Blended.*" },
+              "properties": [
+                { "id": "color", "value": { "mode": "fixed", "fixedColor": "purple" } }
+              ]
+            },
+            {
+              "matcher": { "id": "byRegexp", "options": "Final.*" },
+              "properties": [
+                { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }
+              ]
+            }
+          ]
+        },
+        "targets": [
+          {
+            "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+            "expr": "ml_api_prediction_rpm{application=\"$application\", component=\"lstm\"}",
+            "legendFormat": "LSTM step {{step}}",
+            "refId": "A"
+          },
+          {
+            "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+            "expr": "ml_api_prediction_rpm{application=\"$application\", component=\"pattern\"}",
+            "legendFormat": "Pattern step {{step}}",
+            "refId": "B"
+          },
+          {
+            "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+            "expr": "ml_api_prediction_rpm{application=\"$application\", component=\"blended\"}",
+            "legendFormat": "Blended step {{step}}",
+            "refId": "C"
+          },
+          {
+            "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+            "expr": "ml_api_prediction_rpm{application=\"$application\", component=\"final\"}",
+            "legendFormat": "Final step {{step}}",
+            "refId": "D"
+          }
+        ]
+      },
+      {
+        "id": 3,
+        "title": "Floor % and MAPE by Component",
+        "type": "timeseries",
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 0,
+          "y": 18
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "custom": {
+              "fillOpacity": 5,
+              "lineWidth": 1,
+              "spanNulls": true
+            }
+          },
+          "overrides": [
+            {
+              "matcher": { "id": "byName", "options": "Floor %" },
+              "properties": [
+                { "id": "custom.axisPlacement", "value": "right" },
+                { "id": "unit", "value": "percentunit" },
+                { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }
+              ]
+            }
+          ]
+        },
+        "targets": [
+          {
+            "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+            "expr": "ml_api_floor_pct{application=\"$application\"}",
+            "legendFormat": "Floor %",
+            "refId": "A"
+          },
+          {
+            "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+            "expr": "ml_api_component_mape{application=\"$application\", component=\"lstm\"}",
+            "legendFormat": "LSTM MAPE",
+            "refId": "B"
+          },
+          {
+            "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+            "expr": "ml_api_component_mape{application=\"$application\", component=\"pattern\"}",
+            "legendFormat": "Pattern MAPE",
+            "refId": "C"
+          },
+          {
+            "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+            "expr": "ml_api_component_mape{application=\"$application\", component=\"blended\"}",
+            "legendFormat": "Blended MAPE",
+            "refId": "D"
+          },
+          {
+            "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+            "expr": "predictive_autoscaler_mape{application=\"$application\"}",
+            "legendFormat": "Overall MAPE",
+            "refId": "E"
+          }
+        ]
+      },
+      {
+        "id": 4,
+        "title": "Replica Comparison",
+        "type": "timeseries",
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 12,
+          "y": 18
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "decimals": 0,
+            "custom": {
+              "fillOpacity": 10,
+              "lineWidth": 2,
+              "spanNulls": true
+            }
+          },
+          "overrides": [
+            {
+              "matcher": { "id": "byName", "options": "Current Replicas" },
+              "properties": [
+                { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } },
+                { "id": "color", "value": { "mode": "fixed", "fixedColor": "yellow" } }
+              ]
+            }
+          ]
+        },
+        "targets": [
+          {
+            "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+            "expr": "predictive_autoscaler_predicted_replicas{application=\"$application\", namespace=\"$namespace\"}",
+            "legendFormat": "ML Predicted",
+            "refId": "A"
+          },
+          {
+            "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+            "expr": "predictive_autoscaler_actual_needed_replicas{application=\"$application\", namespace=\"$namespace\"}",
+            "legendFormat": "Actual Needed",
+            "refId": "B"
+          },
+          {
+            "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+            "expr": "kube_deployment_spec_replicas{deployment=\"$application\"}",
+            "legendFormat": "Current Replicas",
+            "refId": "C"
+          }
+        ]
+      },
+      {
+        "id": 5,
+        "title": "Overestimate Detection",
+        "type": "timeseries",
+        "gridPos": {
+          "h": 8,
+          "w": 24,
+          "x": 0,
+          "y": 26
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "custom": {
+              "fillOpacity": 5,
+              "lineWidth": 1,
+              "spanNulls": true
+            }
+          },
+          "overrides": []
+        },
+        "targets": [
+          {
+            "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+            "expr": "predictive_autoscaler_overestimate_streak{application=\"$application\", namespace=\"$namespace\"}",
+            "legendFormat": "Streak Count",
+            "refId": "A"
+          },
+          {
+            "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+            "expr": "predictive_autoscaler_prediction_error_percent{application=\"$application\", namespace=\"$namespace\"}",
+            "legendFormat": "Error %",
+            "refId": "B"
+          },
+          {
+            "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+            "expr": "increase(predictive_autoscaler_overestimate_overrides_total{application=\"$application\", namespace=\"$namespace\"}[5m])",
+            "legendFormat": "Overrides (5m)",
+            "refId": "C"
+          }
+        ]
+      }
+    ],
+    "schemaVersion": 39,
+    "version": 1
+  },
+  "overwrite": true,
+  "folderId": 0
+}

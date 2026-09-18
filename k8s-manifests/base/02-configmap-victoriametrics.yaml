@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: victoriametrics-config
+  namespace: ml-engine
+data:
+  victoria_metrics_url: "http://vmselect-vmst.monitoring.svc.cluster.local:8481/select/0/prometheus"

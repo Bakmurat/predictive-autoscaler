@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ml-engine
+  labels:
+    name: ml-engine
+    app.kubernetes.io/name: predictive-autoscaler
+    app.kubernetes.io/component: ml-engine

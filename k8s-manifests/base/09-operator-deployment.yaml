@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: predictive-operator
+  namespace: ml-engine
+  labels:
+    app: predictive-operator
+    component: controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: predictive-operator
+  template:
+    metadata:
+      labels:
+        app: predictive-operator
+        component: controller
+    spec:
+      serviceAccountName: predictive-operator-sa
+      
+      containers:
+      - name: operator
+        image: registry.example.com/predictive-autoscaler/predictive-autoscaler-operator:v4.3.0
+
+        env:
+        - name: ML_API_URL
+          value: "http://ml-api-service.ml-engine.svc.cluster.local:8000"
+
+        - name: VICTORIAMETRICS_URL
+          value: "http://vmselect-vmst.monitoring.svc.cluster.local:8481/select/0/prometheus"
+
+        - name: RECONCILE_INTERVAL
+          value: "60"  # 60s for fast reactive response
+
+        - name: LOG_LEVEL
+          value: "INFO"
+        
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi

@@ -1,0 +1,22 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: ml-engine
+
+resources:
+  - 00-namespace.yaml
+  - 01-crd.yaml
+  - 02-configmap-victoriametrics.yaml
+  - 03-pvc.yaml
+  - 04-serviceaccount.yaml
+  - 05-clusterrole.yaml
+  - 06-clusterrolebinding.yaml
+  - 07-ml-api-deployment.yaml
+  - 08-ml-api-service.yaml
+  - 09-operator-deployment.yaml
+  - 10-training-cronjob.yaml
+  - 11-vmservicescrapes.yaml
+
+images:
+  - name: registry.example.com/predictive-autoscaler/predictive-autoscaler-ml-api
+    newTag: v3.10.0

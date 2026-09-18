@@ -1,0 +1,28 @@
+# Ignore Go binaries from local builds
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Ignore test files
+*_test.go
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Ignore IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Ignore config samples (not needed in runtime)
+config/
+
+# Ignore hack scripts
+hack/

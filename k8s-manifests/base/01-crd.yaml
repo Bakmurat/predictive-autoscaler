@@ -1,0 +1,193 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: predictiveautoscalers.autoscaler.example.com
+spec:
+  group: autoscaler.example.com
+  names:
+    kind: PredictiveAutoscaler
+    listKind: PredictiveAutoscalerList
+    plural: predictiveautoscalers
+    singular: predictiveautoscaler
+    shortNames:
+    - pa
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    served: true
+    storage: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          apiVersion:
+            type: string
+          kind:
+            type: string
+          metadata:
+            type: object
+          spec:
+            type: object
+            required:
+            - targetDeployment
+            - minReplicas
+            - maxReplicas
+            properties:
+              targetDeployment:
+                type: object
+                required:
+                - name
+                - namespace
+                properties:
+                  name:
+                    type: string
+                    description: "Name of the deployment to scale"
+                  namespace:
+                    type: string
+                    description: "Namespace of the deployment"
+                  container:
+                    type: string
+                    description: "Container name (default: first container)"
+              
+              minReplicas:
+                type: integer
+                minimum: 1
+                description: "Minimum number of replicas"
+              
+              maxReplicas:
+                type: integer
+                minimum: 1
+                description: "Maximum number of replicas"
+              
+              metrics:
+                type: object
+                properties:
+                  cpu:
+                    type: object
+                    properties:
+                      enabled:
+                        type: boolean
+                        default: true
+                      targetPercent:
+                        type: integer
+                        minimum: 1
+                        maximum: 100
+                        default: 70
+                  
+                  memory:
+                    type: object
+                    properties:
+                      enabled:
+                        type: boolean
+                        default: true
+                      targetPercent:
+                        type: integer
+                        minimum: 1
+                        maximum: 100
+                        default: 60
+                  
+                  requests:
+                    type: object
+                    properties:
+                      enabled:
+                        type: boolean
+                        default: false
+                      targetRPS:
+                        type: integer
+                        minimum: 1
+              
+              prediction:
+                type: object
+                properties:
+                  horizonMinutes:
+                    type: integer
+                    minimum: 5
+                    default: 60
+                    description: "How far ahead to predict"
+                  
+                  leadTimeMinutes:
+                    type: integer
+                    minimum: 1
+                    default: 15
+                    description: "How early to scale up before predicted load"
+                  
+                  updateIntervalSeconds:
+                    type: integer
+                    minimum: 60
+                    default: 300
+                    description: "How often to update predictions"
+              
+              resources:
+                type: object
+                properties:
+                  cpuRequestMillicores:
+                    type: integer
+                    minimum: 1
+                    default: 100
+                  
+                  memoryRequestMB:
+                    type: integer
+                    minimum: 1
+                    default: 128
+                  
+                  baselineRPM:
+                    type: integer
+                    minimum: 1
+                    default: 10000
+          
+          status:
+            type: object
+            properties:
+              currentReplicas:
+                type: integer
+              
+              predictedReplicas:
+                type: integer
+              
+              lastPrediction:
+                type: string
+                format: date-time
+              
+              lastScaleTime:
+                type: string
+                format: date-time
+              
+              conditions:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    type:
+                      type: string
+                    status:
+                      type: string
+                    lastTransitionTime:
+                      type: string
+                      format: date-time
+                    reason:
+                      type: string
+                    message:
+                      type: string
+    
+    subresources:
+      status: {}
+    
+    additionalPrinterColumns:
+    - name: Target
+      type: string
+      jsonPath: .spec.targetDeployment.name
+    - name: Min
+      type: integer
+      jsonPath: .spec.minReplicas
+    - name: Max
+      type: integer
+      jsonPath: .spec.maxReplicas
+    - name: Current
+      type: integer
+      jsonPath: .status.currentReplicas
+    - name: Predicted
+      type: integer
+      jsonPath: .status.predictedReplicas
+    - name: Age
+      type: date
+      jsonPath: .metadata.creationTimestamp

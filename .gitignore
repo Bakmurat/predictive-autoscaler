@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+# trained model artifacts (produced at runtime, never committed)
+ml-engine/training/models/
+*.pkl
+*.h5
+*.keras
+# Go
+k8s-operator/bin/
+k8s-operator/manager
+# local tooling and editors
+.DS_Store
+.idea/
+.vscode/
+*.log
+logs/

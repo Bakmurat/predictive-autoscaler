@@ -1,0 +1,43 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: predictive-operator-role
+rules:
+# Read/Write Deployments (for scaling)
+- apiGroups: ["apps"]
+  resources: ["deployments", "deployments/scale"]
+  verbs: ["get", "list", "watch", "patch", "update"]
+
+# Read Pods (for current metrics)
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+
+# Read/Write HPA (to coordinate with KEDA)
+- apiGroups: ["autoscaling"]
+  resources: ["horizontalpodautoscalers"]
+  verbs: ["get", "list", "watch", "patch", "update"]
+
+# Read KEDA ScaledObjects (optional)
+- apiGroups: ["keda.sh"]
+  resources: ["scaledobjects"]
+  verbs: ["get", "list", "watch"]
+
+# Read ConfigMaps (for application config)
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "watch"]
+
+# Access PredictiveAutoscaler CRD
+- apiGroups: ["autoscaler.example.com"]
+  resources: ["predictiveautoscalers"]
+  verbs: ["get", "list", "watch", "patch", "update"]
+
+- apiGroups: ["autoscaler.example.com"]
+  resources: ["predictiveautoscalers/status"]
+  verbs: ["get", "patch", "update"]
+
+# Create jobs (for ML API cold-start trigger)
+- apiGroups: ["batch"]
+  resources: ["jobs"]
+  verbs: ["create"]

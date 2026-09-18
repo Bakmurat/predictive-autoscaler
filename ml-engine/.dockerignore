@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+tests/
+models/*.pkl
+models/*.h5
+models/*.keras
+generated-data/
+*.log
+.env
+.venv/
