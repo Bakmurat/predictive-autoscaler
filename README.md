@@ -63,7 +63,7 @@ spec:
     updateIntervalSeconds: 60
 ```
 
-`spec.metrics.cpu` and `spec.metrics.memory` exist in the schema, but after March 2026 only the request-rate model is trained; CPU and memory forecasting were removed from the training path and remain as unfinished options.
+`spec.metrics.cpu` and `spec.metrics.memory` exist in the schema, but after March 2026 only the request-rate model is trained; CPU and memory forecasting were removed from the training path and remain in the schema as optional inputs that are not currently trained.
 
 The API group `autoscaler.example.com` is a placeholder. Rename it (CRD, RBAC, Go types, and samples) to a domain you control before installing.
 
