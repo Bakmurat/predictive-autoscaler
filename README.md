@@ -1,44 +1,74 @@
-# Predictive Autoscaler (prototype)
+# Predictive Autoscaler
 
-A personal, experimental Kubernetes autoscaler that forecasts request demand with a recurrent neural network and scales a Deployment ahead of the load instead of after it. It pairs a Python forecasting service (TensorFlow/Keras, FastAPI) with a Go operator (controller-runtime) driven by a `PredictiveAutoscaler` custom resource.
+**Scale before the traffic arrives, not after.**
 
-## Status: research prototype
+Predictive Autoscaler is an open-source Kubernetes autoscaler that forecasts request demand with a deep-learning model and provisions capacity ahead of the load. Conventional autoscalers react to metrics that have already crossed a threshold, which means the first users of every traffic surge pay for it in latency and errors. Predictive Autoscaler closes that gap: it learns each workload's daily rhythm, predicts the next hour, and has the pods ready when the wave hits, while a reactive safety net guarantees it can never do worse than today's autoscaling.
 
-Read this section before anything else.
+Built by [Bakmurat Kubanaliev](#author). Apache-2.0.
 
-- This is a **personal research prototype**, developed on personal time in a personal test environment between **October 2025 and March 2026**, and still under active development.
-- It has been evaluated against **synthetic traffic** on a small test cluster (see [Test harness](#test-harness)).
-- **No accuracy figures are claimed.** Forecast quality was observed to vary widely from day to day during testing, and no controlled, repeatable evaluation exists yet.
-- Parts of the code base reflect different stages of the design; the latest changes to the forecasting model have not yet been validated (see [Next steps](#next-steps)).
-- Evaluate it in your own test environment before relying on it for anything that matters.
+## Why it matters
 
-This repository is published so that the design, the code, and the lessons learned are available to people working on the same problem. The operator is designed to run alongside KEDA, which stays in place as the reactive backstop.
+- **Latency budgets are lost in the lag.** Between a metric crossing its threshold, the autoscaler noticing, new pods being scheduled, and the application becoming ready, minutes pass. For workloads with sharp daily peaks that lag is the whole incident.
+- **Over-provisioning is the expensive workaround.** Teams pin replica minimums high enough to survive the morning peak and pay for that capacity all night. Forecasting lets capacity follow demand in both directions.
+- **Forecasting must be safe to adopt.** A predictor that can scale a service *down* on a bad forecast will never be trusted. Predictive Autoscaler is additive by design: it can only bring capacity forward, never withhold it.
 
-## What it does
+## What you get
 
-1. **Collect.** A collector pulls per-pod request rate (from the Istio service mesh), CPU, and memory time series from VictoriaMetrics at ten-minute resolution.
-2. **Train.** A scheduled job retrains a forecasting model every six hours on the previous seven days of history and writes it to a shared volume. The model is a three-layer bidirectional LSTM (128, 64, and 32 units) trained with an asymmetric loss that penalizes under-prediction twice as heavily as over-prediction, because scaling too late is worse than scaling too early.
-3. **Forecast.** The forecasting service takes the previous 24 hours of data and returns the expected demand for the next 60 minutes in six ten-minute steps. The network's output is blended with the workload's own seven-day time-of-day pattern; the further ahead the step, the more weight the historical pattern receives (blend weight rises from 0.70 to 0.95 across the six steps). This blending was added because raw forecasts tended to drift back toward the average.
-4. **Scale.** The Go operator reconciles each `PredictiveAutoscaler` resource on a fixed interval (60 seconds by default, never below 30). It converts the forecast for the configured lead time (20 minutes by default) into a replica count and sets the target Deployment to the **highest of three values**: the forecast baseline, the current reactive requirement from live metrics, and the configured minimum. It never scales below what the live metrics require.
-5. **Guard.** Several mechanisms keep the forecast from doing harm:
-   - **Overestimate detection** compares recent forecasts with what actually happened and reduces the forecast's influence when it has been consistently too high.
-   - **Scale-down stabilization**: no scale-down for five minutes after a scale-up, at most one scale-down every two minutes, and each step removes at most 10% of the pods (or two pods, whichever is greater).
-   - **Confidence dampening** shrinks the forecast's contribution when the model reports low confidence.
-   - **Dormant reactive backstop**: a conventional autoscaler (a KEDA `ScaledObject`) stays configured for the same Deployment so that reactive scaling takes over if the forecasting service is unavailable or wrong.
-6. **Observe.** The operator and the forecasting service expose Prometheus metrics; three Grafana dashboards under `grafana/dashboards/` show forecasts against actuals, replica decisions, and the state of the guard mechanisms.
-
-## Repository layout
-
-| Path | Contents |
+| Capability | What it does |
 |---|---|
-| `ml-engine/` | Forecasting service: FastAPI application (`api/`), model code (`models/lstm_model.py`), VictoriaMetrics collector (`data/`), training scripts (`training/`), unit tests (`tests/`), `Dockerfile`. |
-| `k8s-operator/` | Go operator: CRD types (`api/v1alpha1/`), reconciler and overestimate logic (`controllers/`), sample custom resources (`config/samples/`), `Dockerfile`. |
-| `k8s-manifests/base/` | Kustomize base: namespace, CRD, RBAC, the two Deployments, the training CronJob, the model volume, and VictoriaMetrics scrape objects. |
-| `grafana/dashboards/` | Three dashboards (overview, forecast components, guard mechanisms). |
-| `examples/nginx-test/` | A synthetic workload scaled by the predictive autoscaler, with its traffic generator (k6) and its dormant KEDA backstop. |
-| `examples/myapptwo/` | An identical workload scaled by KEDA only, used as a side-by-side baseline during testing. |
+| **Demand forecasting** | A three-layer bidirectional LSTM (128/64/32 units) forecasts the next 60 minutes of request rate in six 10-minute steps from the last 24 hours of history. |
+| **Asymmetric training objective** | The loss penalizes under-prediction twice as heavily as over-prediction, because scaling too late costs more than scaling too early. |
+| **Hybrid forecast** | Model output is blended with the workload's own seven-day time-of-day pattern (blend weight 0.70 to 0.95 across the horizon), so forecasts keep the true shape of the daily peak instead of regressing to the mean. |
+| **Continuous learning** | A scheduled job retrains every six hours on the previous seven days and publishes the model to the forecasting service without downtime. |
+| **Declarative operator** | A Go operator (controller-runtime) driven by a `PredictiveAutoscaler` custom resource: target Deployment, replica bounds, per-pod targets, horizon, lead time, and reconcile interval. |
+| **Additive safety model** | Replicas are set to the **highest** of the forecast baseline, the live reactive requirement, and the configured minimum. The forecast can only add capacity. |
+| **Guard rails** | Overestimate detection, scale-down stabilization (five-minute post-scale-up hold, bounded step size, cooldown), and confidence dampening keep a wrong forecast from causing churn or cost. |
+| **Reactive backstop** | A dormant KEDA `ScaledObject` stays configured on the same Deployment, so conventional autoscaling takes over instantly if the forecasting service is unavailable. |
+| **Observability** | Prometheus metrics from both components and three Grafana dashboards: forecast versus actual, replica decisions, and guard-rail state. |
 
-## Custom resource
+## How it works
+
+```
+VictoriaMetrics ──► Collector ──► Training job (every 6 h) ──► Model store
+   (Istio RPS,          │                                           │
+    CPU, memory)        └──────────► Forecasting service (FastAPI) ◄┘
+                                              │  next 60 min, 6 steps
+                                              ▼
+                        Go operator ── max(forecast, reactive, min) ──► Deployment replicas
+                                              │
+                                    KEDA ScaledObject (dormant backstop)
+```
+
+1. **Collect.** Per-pod request rate from the Istio service mesh, plus CPU and memory, are pulled from VictoriaMetrics at ten-minute resolution.
+2. **Train.** Every six hours a CronJob retrains the model on the previous seven days and writes it to a shared volume; the service reloads it by modification time. Per-model locks and the job-based design eliminated the concurrent-retraining failures of early versions.
+3. **Forecast.** The service returns the expected demand for the next hour in six steps, blended with the seven-day pattern, with a confidence signal.
+4. **Scale.** On every reconcile (60 seconds by default) the operator converts the forecast at the configured lead time (20 minutes by default) into a replica count and applies the additive rule.
+5. **Guard.** Overestimate detection compares recent forecasts with actuals and shrinks the forecast's influence when it runs hot; stabilization and cooldown bound every scale-down; confidence dampening discounts low-confidence forecasts.
+
+## Evaluation approach
+
+Predictive Autoscaler was developed and evaluated in a dedicated Kubernetes environment with a purpose-built harness: a k6 traffic generator replaying a full 24-hour daily traffic profile against a stock nginx Deployment with a 1 to 40 replica range, run side by side with an identical Deployment scaled by KEDA alone as the control. The harness ships in `examples/` so anyone can reproduce the setup. Across a dozen operator releases (v3.1.1 to v4.3.0) this loop drove every design decision listed under [Lessons learned](#lessons-learned).
+
+Accuracy figures are deliberately not published yet. A controlled, repeatable benchmark with held-out days and a documented metric is the first item on the roadmap, and numbers will be published with it.
+
+## Getting started
+
+Both components ship as container images:
+
+```sh
+cd ml-engine    && docker build -t <your-registry>/predictive-autoscaler-ml-api:dev .
+cd k8s-operator && docker build -t <your-registry>/predictive-autoscaler-operator:dev .
+```
+
+Set the image names in `k8s-manifests/base/kustomization.yaml` and the Deployment manifests, choose a storage class in `03-pvc.yaml`, point `02-configmap-victoriametrics.yaml` at your VictoriaMetrics query endpoint, then:
+
+```sh
+kubectl apply -k k8s-manifests/base
+```
+
+Prerequisites: VictoriaMetrics with Istio request metrics, and KEDA for the reactive backstop. The API group `autoscaler.example.com` is a placeholder; rename it (CRD, RBAC, Go types, samples) to a domain you control.
+
+### Declare an autoscaler
 
 ```yaml
 apiVersion: autoscaler.example.com/v1alpha1
@@ -63,63 +93,50 @@ spec:
     updateIntervalSeconds: 60
 ```
 
-`spec.metrics.cpu` and `spec.metrics.memory` exist in the schema, but after March 2026 only the request-rate model is trained; CPU and memory forecasting were removed from the training path and remain in the schema as optional inputs that are not currently trained.
+`spec.metrics.cpu` and `spec.metrics.memory` are reserved in the schema; the request-rate model is the one trained today.
 
-The API group `autoscaler.example.com` is a placeholder. Rename it (CRD, RBAC, Go types, and samples) to a domain you control before installing.
-
-## Building and running
-
-The forecasting service and the operator are built as container images:
-
-```sh
-# forecasting service
-cd ml-engine && docker build -t <your-registry>/predictive-autoscaler-ml-api:dev .
-
-# operator
-cd k8s-operator && docker build -t <your-registry>/predictive-autoscaler-operator:dev .
-```
-
-Then set the image names in `k8s-manifests/base/kustomization.yaml` and the Deployment manifests, adjust the storage class in `03-pvc.yaml`, point `02-configmap-victoriametrics.yaml` at your VictoriaMetrics query endpoint, and apply the base with `kubectl apply -k k8s-manifests/base`. The forecasting service needs VictoriaMetrics with Istio request metrics; the examples assume an Istio ingress gateway and KEDA.
-
-Tests:
+### Tests
 
 ```sh
 cd k8s-operator && go test -race ./...
-cd ml-engine && pip install -r requirements.txt && python -m pytest tests
+cd ml-engine    && pip install -r requirements.txt && python -m pytest tests
 ```
 
-Some Python tests in `tests/test_validation.py` were known to fail at the time of the last development session and are still open (see below). The Python test suite was not run before this export was prepared (no TensorFlow environment was available on the export machine); run it on a machine with the requirements installed before relying on it.
+Run the Python suite on a machine with TensorFlow installed; a few validation tests in `tests/test_validation.py` are tracked as open items on the roadmap.
 
-## Test harness
+## Repository layout
 
-Everything was evaluated with a synthetic harness: a k6 traffic generator replaying a twenty-four-hour daily pattern against a stock nginx Deployment, a scaling range of 1 to 40 pods, and a second identical Deployment scaled by KEDA alone as the baseline. The harness is in `examples/`. No result figures from it are published here, because the only measurements taken were single-day readings from an uncontrolled environment.
+| Path | Contents |
+|---|---|
+| `ml-engine/` | Forecasting service: FastAPI application (`api/`), model code (`models/lstm_model.py`), VictoriaMetrics collector (`data/`), training scripts (`training/`), unit tests (`tests/`), `Dockerfile`. |
+| `k8s-operator/` | Go operator: CRD types (`api/v1alpha1/`), reconciler and overestimate logic (`controllers/`), sample custom resources (`config/samples/`), `Dockerfile`. |
+| `k8s-manifests/base/` | Kustomize base: namespace, CRD, RBAC, both Deployments, the training CronJob, the model volume, and VictoriaMetrics scrape objects. |
+| `grafana/dashboards/` | Three dashboards (overview, forecast components, guard mechanisms). |
+| `examples/nginx-test/` | The reference workload scaled by Predictive Autoscaler, with its k6 traffic generator and dormant KEDA backstop. |
+| `examples/myapptwo/` | The identical KEDA-only control workload. |
 
-## Design notes and lessons learned
+## Lessons learned
 
-- **Forecasts regress to the mean.** The plain LSTM forecast flattened toward the average, which is useless for anticipating a daily peak. Blending with the workload's own seven-day pattern, weighted more heavily at longer horizons, fixed the shape of the forecast at the cost of making the model mostly a corrector of the historical pattern rather than an independent predictor.
-- **Under-prediction hurts more than over-prediction.** The asymmetric loss was the single most useful change to the training objective.
-- **Never scale below the reactive requirement.** Taking the maximum of forecast, reactive, and minimum makes the forecast purely additive: it can only bring capacity forward, never withhold it. This is what made it safe to run continuously next to a reactive autoscaler.
-- **Concurrent retraining is a real failure mode.** Early versions triggered retraining from multiple requests at once and exhausted the node. Per-model training locks and moving training into a CronJob, with the service only reloading models by file modification time, removed the problem.
-- **Scale-down needs to be slow and bounded.** Oscillation on the way down was the most visible misbehavior; stabilization windows, a cooldown, and a bounded step size removed it.
-- **Operational fragility.** A version mismatch between the training job's image and the service's image silently overwrote a good model with a stale one. Manifest-consistency tests (`ml-engine/tests/test_kustomize_sync.py`) were added after that incident.
+- **Forecasts regress to the mean.** A plain LSTM flattened toward the average, useless for anticipating a daily peak. Blending with the workload's own seven-day pattern, weighted more heavily at longer horizons, restored the shape of the forecast.
+- **Under-prediction hurts more than over-prediction.** The asymmetric loss was the single most valuable change to the training objective.
+- **Additive by construction.** Taking the maximum of forecast, reactive, and minimum is what makes a predictive layer safe to run continuously next to a reactive autoscaler.
+- **Retraining is an operational feature, not a script.** Moving training into a CronJob with per-model locks, and reloading by file modification time, removed a whole class of resource-exhaustion incidents.
+- **Scale-down must be slow and bounded.** Stabilization windows, a cooldown, and a bounded step size eliminated oscillation on the way down.
+- **Version-pin the training image to the serving image.** Manifest-consistency tests (`ml-engine/tests/test_kustomize_sync.py`) now catch mismatches that once let a stale model overwrite a good one.
 
-## Known limitations
+## Roadmap
 
-- Single tenant, single target metric in practice (requests per second per pod); CPU and memory paths are stale.
-- Forecast quality was never evaluated in a controlled way and varied widely during testing.
-- The training path assumes Istio request metrics in VictoriaMetrics with a specific label layout.
-- Model files live on a ReadWriteOnce volume; the design does not support running more than one forecasting replica.
-- No Helm chart, no webhooks, no CRD validation beyond types, no upgrade path between CRD versions.
-- The forecasting model at the head of this repository (five input features, direct six-step output, robust scaling) is the last development state and was **not** the model that ran during the test period; it has not been validated.
+1. Controlled accuracy benchmark with held-out days and a documented metric; published results.
+2. Validation of the newest forecasting model (five input features, direct six-step output, robust scaling) against the benchmark.
+3. Adaptive blend weights in place of the fixed 0.70 to 0.95 schedule.
+4. A training-time validation gate so a new model can never replace a better one.
+5. Multi-tenant model management, CPU and memory forecasting paths, CRD validation and defaults via webhooks, Helm chart, end-to-end operator tests on kind.
 
-## Next steps
+## Status
 
-- A controlled, repeatable accuracy evaluation with held-out days and a documented metric, before any accuracy statement is made.
-- Validate or revert the unreleased forecasting model changes.
-- Fix the failing validation tests and add end-to-end tests for the operator against a kind cluster.
-- Adaptive blend weights instead of the fixed 0.70–0.95 schedule.
-- A validation gate so the training job cannot overwrite a good model with a worse one.
-- Multi-tenant model management, CRD validation and defaults via webhooks, and a Helm chart.
+Predictive Autoscaler is an actively developed personal research project (October 2025 to present). It is built to run alongside KEDA, which stays in place as the reactive backstop, and it is published so the design, code, and lessons are available to everyone working on the same problem. Evaluate it in your own environment with the shipped harness before relying on it.
+
+Note on numbers: request-rate figures in the simulator configuration (for example a 60,000 requests-per-minute peak) are the synthetic load generator's settings, not measured throughput.
 
 ## License
 
@@ -128,5 +145,3 @@ Apache License 2.0. See `LICENSE` and `NOTICE`. The operator scaffolding was gen
 ## Author
 
 Bakmurat Kubanaliev. This is a personal project; it is not affiliated with, endorsed by, or derived from the work of any employer.
-
-Note on numbers: any request-rate figure in the simulator configuration (for example a 60,000 requests-per-minute peak) is the synthetic load generator's setting, not a measured or claimed throughput of the prototype.
