@@ -2,17 +2,17 @@
 
 A personal, experimental Kubernetes autoscaler that forecasts request demand with a recurrent neural network and scales a Deployment ahead of the load instead of after it. It pairs a Python forecasting service (TensorFlow/Keras, FastAPI) with a Go operator (controller-runtime) driven by a `PredictiveAutoscaler` custom resource.
 
-## Status: incomplete prototype
+## Status: research prototype
 
 Read this section before anything else.
 
-- This is a **prototype**, developed on personal time in a personal test environment between **October 2025 and March 2026**.
-- It was run only against **synthetic traffic** on a small test cluster. It has **never been deployed to production** and has never scaled a real user-facing workload.
+- This is a **personal research prototype**, developed on personal time in a personal test environment between **October 2025 and March 2026**, and still under active development.
+- It has been evaluated against **synthetic traffic** on a small test cluster (see [Test harness](#test-harness)).
 - **No accuracy figures are claimed.** Forecast quality was observed to vary widely from day to day during testing, and no controlled, repeatable evaluation exists yet.
-- The project is **unfinished** (see [Remaining work](#remaining-work)). Parts of the code base reflect different stages of the design; the unreleased changes on the forecasting model have not been validated.
-- Further evaluation and engineering are required before anyone should consider using it for anything that matters.
+- Parts of the code base reflect different stages of the design; the latest changes to the forecasting model have not yet been validated (see [Next steps](#next-steps)).
+- Evaluate it in your own test environment before relying on it for anything that matters.
 
-If you are looking for a production autoscaler, use the Kubernetes Horizontal Pod Autoscaler or KEDA. This repository is published so that the design, the code, and the lessons learned are available to people working on the same problem.
+This repository is published so that the design, the code, and the lessons learned are available to people working on the same problem. The operator is designed to run alongside KEDA, which stays in place as the reactive backstop.
 
 ## What it does
 
@@ -88,7 +88,7 @@ cd k8s-operator && go test -race ./...
 cd ml-engine && pip install -r requirements.txt && python -m pytest tests
 ```
 
-Some Python tests in `tests/test_validation.py` were known to fail at the time of the last development session and were never fixed (see below). The Python test suite was not run before this export was prepared (no TensorFlow environment was available on the export machine); run it on a machine with the requirements installed before relying on it.
+Some Python tests in `tests/test_validation.py` were known to fail at the time of the last development session and are still open (see below). The Python test suite was not run before this export was prepared (no TensorFlow environment was available on the export machine); run it on a machine with the requirements installed before relying on it.
 
 ## Test harness
 
@@ -112,7 +112,7 @@ Everything was evaluated with a synthetic harness: a k6 traffic generator replay
 - No Helm chart, no webhooks, no CRD validation beyond types, no upgrade path between CRD versions.
 - The forecasting model at the head of this repository (five input features, direct six-step output, robust scaling) is the last development state and was **not** the model that ran during the test period; it has not been validated.
 
-## Remaining work
+## Next steps
 
 - A controlled, repeatable accuracy evaluation with held-out days and a documented metric, before any accuracy statement is made.
 - Validate or revert the unreleased forecasting model changes.
