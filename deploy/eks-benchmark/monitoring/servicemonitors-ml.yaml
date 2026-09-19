@@ -1,0 +1,19 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ml-api
+  namespace: monitoring
+spec:
+  namespaceSelector: { matchNames: [ml-engine] }
+  selector: { matchLabels: { app: ml-api } }
+  endpoints: [{ port: http, path: /metrics, interval: 30s }]
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: predictive-operator
+  namespace: monitoring
+spec:
+  namespaceSelector: { matchNames: [ml-engine] }
+  selector: { matchLabels: { app: predictive-operator } }
+  endpoints: [{ port: metrics, path: /metrics, interval: 30s }]

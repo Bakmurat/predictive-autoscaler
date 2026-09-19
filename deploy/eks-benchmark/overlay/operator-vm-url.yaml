@@ -1,0 +1,13 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: predictive-operator
+  namespace: ml-engine
+spec:
+  template:
+    spec:
+      containers:
+        - name: operator
+          env:
+            - name: VICTORIAMETRICS_URL
+              value: VM_QUERY_URL

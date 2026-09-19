@@ -1,0 +1,84 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: myapptwo-keda-fallback
+  namespace: demo
+  labels:
+    app: myapptwo
+    scaler-type: reactive-fallback
+  annotations:
+    description: "KEDA reactive fallback for myapptwo"
+    predictive-autoscaler-name: "myapptwo-autoscaler"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: myapptwo
+
+  # Must match PredictiveAutoscaler boundaries
+  minReplicaCount: 2
+  maxReplicaCount: 40
+
+  # Reactive polling - checks frequently for safety
+  pollingInterval: 10        # Check every 10 seconds
+  cooldownPeriod: 180        # 3 min cooldown before scale-down
+
+  # Scaling behavior - fast up, slow down
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 600  # 10 min stabilization — must be longer than
+                                           # operator reconciliation interval (5min) to
+                                           # prevent operator-KEDA micro-oscillation
+          policies:
+          - type: Pods
+            value: 1
+            periodSeconds: 300   # Remove 1 pod every 5 min (was 3 min)
+          - type: Percent
+            value: 10
+            periodSeconds: 300   # Or 10% every 5 min
+          selectPolicy: Min      # Conservative scale-down
+
+        scaleUp:
+          stabilizationWindowSeconds: 0   # Immediate scale-up
+          policies:
+          - type: Percent
+            value: 100           # Double capacity
+            periodSeconds: 15
+          - type: Pods
+            value: 4             # Or add 4 pods
+            periodSeconds: 15
+          selectPolicy: Max      # Aggressive scale-up
+
+  triggers:
+  # -----------------------------------------------
+  # CPU-based scaling (PRIMARY FALLBACK)
+  # Fires if predictive missed and CPU > 70%
+  # -----------------------------------------------
+  - type: cpu
+    metricType: Utilization
+    metadata:
+      value: "70"
+
+  # -----------------------------------------------
+  # Memory-based scaling (SECONDARY FALLBACK)
+  # Protects against OOM kills
+  # -----------------------------------------------
+  - type: memory
+    metricType: Utilization
+    metadata:
+      value: "70"
+
+  # -----------------------------------------------
+  # Request rate from VictoriaMetrics (LEADING FALLBACK)
+  # Uses RPS (requests per second) directly — no * 60 conversion
+  # This is the same metric the predictive autoscaler uses
+  # -----------------------------------------------
+  - type: prometheus
+    metadata:
+      serverAddress: VM_QUERY_URL
+      query: |
+        sum(rate(istio_requests_total{destination_workload="myapptwo"}[1m]))
+      threshold: "30"             # Scale if per-pod avg RPS > 300
+      activationThreshold: "15"   # Start evaluating at 150 RPS per-pod avg

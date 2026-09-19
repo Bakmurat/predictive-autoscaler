@@ -1,0 +1,25 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../../k8s-manifests/base
+images:
+  - name: registry.example.com/predictive-autoscaler/predictive-autoscaler-ml-api
+    newName: ECR_REGISTRY/predictive-autoscaler/ml-api
+    newTag: IMAGE_TAG
+  - name: registry.example.com/predictive-autoscaler/predictive-autoscaler-operator
+    newName: ECR_REGISTRY/predictive-autoscaler/operator
+    newTag: IMAGE_TAG
+patches:
+  - path: delete-predictive-autoscaler-ml-api.yaml
+  - path: delete-predictive-autoscaler-controller.yaml
+  - path: operator-vm-url.yaml
+  - target: { kind: PersistentVolumeClaim, name: ".*" }
+    patch: |-
+      - op: add
+        path: /spec/storageClassName
+        value: gp3
+  - target: { kind: ConfigMap, name: ".*victoria.*" }
+    patch: |-
+      - op: replace
+        path: /data/victoria_metrics_url
+        value: VM_QUERY_URL

@@ -1,0 +1,12 @@
+# Istio control plane, small footprint for a 2-node benchmark cluster
+pilot:
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+global:
+  proxy:
+    resources:
+      requests: { cpu: 10m, memory: 48Mi }
+      limits: { cpu: 500m, memory: 256Mi }
+meshConfig:
+  enablePrometheusMerge: true
+  accessLogFile: ""

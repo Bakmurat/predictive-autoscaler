@@ -1,0 +1,6 @@
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMServiceScrape
+metadata:
+  name: predictive-autoscaler-controller
+  namespace: ml-engine
+$patch: delete

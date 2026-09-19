@@ -1,0 +1,8 @@
+# Copy to terraform.tfvars (gitignored) and fill in.
+region                 = "ap-southeast-1"
+cluster_name           = "predictive-bench"
+grafana_admin_password = "change-me"
+tags = {
+  Project = "predictive-benchmark"
+  Owner   = "your-name"
+}

@@ -1,0 +1,60 @@
+---
+# PredictiveAutoscaler CR for nginx-test
+# UNIFIED SCALER - Single source of truth for deployment replicas
+#
+# Combines predictive (ML) and reactive (current metrics) into one decision:
+#   desired = max(predicted_baseline, reactive_needed, minReplicas)
+#
+# - Predicted baseline: LSTM predicts RPM within leadTimeMinutes window
+# - Reactive floor: current RPM from VictoriaMetrics (catches under-prediction)
+# - Scale-up: immediate
+# - Scale-down: stabilized (5 min wait, then gradual reduction)
+# - KEDA is paused — this operator is the sole replica controller
+#
+apiVersion: autoscaler.example.com/v1alpha1
+kind: PredictiveAutoscaler
+metadata:
+  name: nginx-test-autoscaler
+  namespace: demo
+  labels:
+    app: nginx-test
+    scaler-type: predictive
+  annotations:
+    description: "LSTM-based predictive scaling for nginx-test"
+    keda-fallback: "nginx-test-keda-fallback"
+spec:
+  targetDeployment:
+    name: nginx-test
+    namespace: demo
+    container: nginx
+
+  minReplicas: 1
+  maxReplicas: 40
+
+  metrics:
+    # Request rate is PRIMARY metric (leading indicator)
+    # Matches Grafana: sum(rate(istio_requests_total{...}[1m]))
+    # Matches KEDA Prometheus threshold: 300 RPS/pod
+    requests:
+      enabled: true
+      targetRPS: 30      # 300 RPS/pod — aligns with KEDA threshold and Grafana dashboard
+
+    # CPU as supplementary signal
+    cpu:
+      enabled: true
+      targetPercent: 70
+
+    # Memory as supplementary signal
+    memory:
+      enabled: true
+      targetPercent: 70
+
+  prediction:
+    horizonMinutes: 60          # ML API predicts 1 hour ahead (full context)
+    leadTimeMinutes: 20         # Use predictions within 20-min window for scaling
+    updateIntervalSeconds: 60   # Reconcile every 60s (reactive needs fast cycles)
+
+  resources:
+    cpuRequestMillicores: 20    # From nginx-deployment.yaml: cpu: 20m
+    memoryRequestMB: 32         # From nginx-deployment.yaml: memory: 32Mi
+    baselineRPM: 6000          # Baseline RPM at 2 replicas (night minimum ~3k, peak ~120k)
