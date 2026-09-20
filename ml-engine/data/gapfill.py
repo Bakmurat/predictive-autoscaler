@@ -98,7 +98,7 @@ def mask_intervals(mask: Optional[Dict]) -> List[Tuple[int, int]]:
 def fill_interior_gaps(points: Sequence[Tuple[int, float]], cutoff: Optional[int] = None,
                        boundaries: Sequence[int] = (), grid_s: int = GRID_S,
                        max_missing: int = MAX_MISSING_SLOTS, max_fill_fraction: float = MAX_FILL_FRACTION,
-                       forbidden: Sequence[Tuple[int, int]] = ()):
+                       forbidden: Sequence[Tuple[int, int]] = (), end_at: Optional[int] = None):
     """Fill bounded interior gaps of a grid series by linear interpolation.
 
     points: (epoch, value) on the grid, sorted or not. cutoff: latest epoch an endpoint may have (the
@@ -106,7 +106,9 @@ def fill_interior_gaps(points: Sequence[Tuple[int, float]], cutoff: Optional[int
     partition boundaries (a slot t belongs to the partition of the largest boundary <= t); a gap whose
     two endpoints fall in different partitions is never filled. forbidden: (start, end) epoch intervals
     (the validity mask) — a gap that overlaps one is changed behaviour, not missing telemetry, and is
-    never filled (it stays a hard break in the series).
+    never filled (it stays a hard break in the series). end_at: when given, the selected window is the
+    contiguous run ENDING at that epoch (inference: the run that contains the latest observation) instead
+    of the longest run (training).
 
     Returns (series, imputed_flags, record) where series is the longest contiguous run after filling,
     imputed_flags marks filled slots, and record documents every decision for provenance.
@@ -142,8 +144,10 @@ def fill_interior_gaps(points: Sequence[Tuple[int, float]], cutoff: Optional[int
             rec.update({"filled": True, "filled_values": vals, "algorithm": ALGORITHM})
         gaps_considered.append(rec)
     # assemble, select the longest contiguous run, enforce the cap
+    def _select(series):
+        return _run_ending_at(series, end_at, grid_s) if end_at is not None else _longest_run(series, grid_s)
     merged = sorted(list(by_t.items()) + list(filled.items()))
-    run = _longest_run(merged, grid_s)
+    run = _select(merged)
     n_filled_in_run = sum(1 for t, _ in run if t in filled)
     cap_removed = []
     while run and n_filled_in_run > max_fill_fraction * len(run):
@@ -156,7 +160,7 @@ def fill_interior_gaps(points: Sequence[Tuple[int, float]], cutoff: Optional[int
         gap["reason"] = f"removed: filled slots would exceed {max_fill_fraction:.0%} of the selected window"
         cap_removed.append(gap["start"])
         merged = sorted(list(by_t.items()) + list(filled.items()))
-        run = _longest_run(merged, grid_s)
+        run = _select(merged)
         n_filled_in_run = sum(1 for t, _ in run if t in filled)
     flags = [t in filled for t, _ in run]
     record = {"algorithm": ALGORITHM, "grid_seconds": grid_s, "max_missing_slots": max_missing,
@@ -173,6 +177,18 @@ def fill_interior_gaps(points: Sequence[Tuple[int, float]], cutoff: Optional[int
 
 def _partition(t: int, boundaries: Sequence[int]) -> int:
     return sum(1 for b in boundaries if t >= b)
+
+
+def _run_ending_at(series: List[Tuple[int, float]], end_at: int, grid_s: int) -> List[Tuple[int, float]]:
+    """The contiguous run of a sorted grid series that ends exactly at end_at ([] if absent)."""
+    idx = {t: i for i, (t, _) in enumerate(series)}
+    if end_at not in idx:
+        return []
+    j = idx[end_at]
+    i = j
+    while i > 0 and series[i][0] - series[i - 1][0] == grid_s:
+        i -= 1
+    return series[i:j + 1]
 
 
 def _longest_run(series: List[Tuple[int, float]], grid_s: int) -> List[Tuple[int, float]]:
@@ -202,9 +218,9 @@ def check_inference_window(points: Sequence[Tuple[int, float]], now: int, sequen
     last_t = pts[-1][0]
     if now - last_t > max_age_s:
         raise ValueError(f"latest observation {_iso(last_t)} is stale ({now - last_t}s old, max {max_age_s}s)")
-    run, flags, rec = fill_interior_gaps(pts, cutoff=last_t, grid_s=grid_s, forbidden=forbidden)
+    run, flags, rec = fill_interior_gaps(pts, cutoff=last_t, grid_s=grid_s, forbidden=forbidden, end_at=last_t)
     if not run or run[-1][0] != last_t:
-        raise ValueError("latest observation is not part of the contiguous input window")
+        raise ValueError("latest observation is not on the ten-minute grid")
     if len(run) < sequence_length:
         raise ValueError(f"input window has {len(run)} contiguous slots, need {sequence_length} (gaps not fillable under the rule)")
     window = run[-sequence_length:]

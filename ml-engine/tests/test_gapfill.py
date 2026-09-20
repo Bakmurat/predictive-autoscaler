@@ -111,6 +111,17 @@ class Inference(unittest.TestCase):
         window, rec = gapfill.check_inference_window(grid(40, drop=(35,)), now=now, sequence_length=10)
         self.assertEqual(rec["imputed_in_window"], 1); self.assertEqual(rec["gaps_filled"], 1)
 
+    def test_window_is_the_run_ending_at_the_latest_observation(self):
+        # a longer pre-cutover run must not be chosen over the short run that ends at the latest sample
+        now = T0 + 39 * G + 30
+        mask = {"intervals": [{"start": gapfill._iso(T0 + 30 * G), "end": gapfill._iso(T0 + 31 * G), "reason": "cutover"}]}
+        pts, _ = gapfill.apply_mask(grid(40), mask, role="inference")          # runs: 0..29 (30) and 32..39 (8)
+        with self.assertRaises(ValueError) as cm:
+            gapfill.check_inference_window(pts, now=now, sequence_length=10, forbidden=gapfill.mask_intervals(mask))
+        self.assertIn("has 8 contiguous slots, need 10", str(cm.exception))
+        window, rec = gapfill.check_inference_window(pts, now=now, sequence_length=8, forbidden=gapfill.mask_intervals(mask))
+        self.assertEqual(window[-1][0], T0 + 39 * G); self.assertEqual(len(window), 8)
+
     def test_unfillable_gap_in_window_is_refused(self):
         now = T0 + 39 * G + 30
         with self.assertRaises(ValueError):
