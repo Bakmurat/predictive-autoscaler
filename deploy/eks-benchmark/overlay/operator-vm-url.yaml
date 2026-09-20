@@ -11,3 +11,5 @@ spec:
           env:
             - name: VICTORIAMETRICS_URL
               value: VM_QUERY_URL
+            - name: WATCH_NAMESPACES
+              value: demo   # benchmark operator watches only the benchmark namespace
