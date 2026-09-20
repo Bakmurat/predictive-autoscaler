@@ -7,7 +7,7 @@ metadata:
   labels:
     app: myapptwo
 spec:
-  replicas: 2
+  # no `replicas`: the autoscalers own the count; a re-apply must not reset it (kubectl apply would)
   selector:
     matchLabels:
       app: myapptwo

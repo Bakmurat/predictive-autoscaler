@@ -10,6 +10,7 @@ import json
 import time
 from pathlib import Path
 import logging
+from datetime import datetime
 
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
@@ -200,8 +201,13 @@ def main():
             logger.info(f"  RMSE: {ev['rmse']:.4f}")
             logger.info(f"  MAE: {ev['mae']:.4f}")
 
-        # JSON summary line
+        # JSON summary line (peak RSS from the kernel's accounting: exact, no sampler needed)
         training_time = round(time.time() - start_time, 1)
+        try:
+            import resource
+            peak_rss_mb = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0, 1)  # Linux: KiB
+        except Exception:
+            peak_rss_mb = None
         summary = {
             "status": "success",
             "model_path": str(result.get("model_path", "")),
@@ -212,7 +218,9 @@ def main():
             "training_cutoff": result.get("training_cutoff"),
             "artifact_sha256": meta["artifact_sha256"] if tmp_path else None,
             "sequence_length": sequence_length,
-            "training_time_seconds": training_time
+            "training_time_seconds": training_time,
+            "peak_rss_mb": peak_rss_mb,
+            "finished_at": datetime.utcnow().isoformat() + "Z"
         }
         print(json.dumps(summary))
 

@@ -54,6 +54,18 @@ module "eks" {
   # The control plane must reach admission webhooks running on the nodes: Istio's sidecar injector
   # listens on 15017 (the module's defaults cover 443/4443/6443/8443/9443/10250 only).
   node_security_group_additional_rules = {
+    # Pod-to-pod traffic across nodes travels on pod IPs through the node ENIs (VPC CNI, no overlay), so
+    # the node group must accept all traffic from itself. The module's recommended rules open only the
+    # ephemeral range (1025-65535) and DNS; application ports such as 80 were blocked between nodes, which
+    # silently turned every cross-node request into a dial timeout (found 2026-09-20 via k6 failures).
+    ingress_self_all = {
+      description = "Node to node, all protocols and ports (pod-to-pod across nodes)"
+      protocol    = "-1"
+      from_port   = 0
+      to_port     = 0
+      type        = "ingress"
+      self        = true
+    }
     ingress_cluster_istiod_webhook = {
       description                   = "Cluster API to istiod webhook"
       protocol                      = "tcp"
