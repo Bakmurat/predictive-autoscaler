@@ -4,6 +4,7 @@ alertmanager:
 prometheus:
   prometheusSpec:
     replicas: 1
+    enableRemoteWriteReceiver: true   # k6 generators push their own metrics (experimental-prometheus-rw)
     retention: 15d
     scrapeInterval: 30s
     resources:
