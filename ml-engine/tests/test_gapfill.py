@@ -7,11 +7,20 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-for name in ("models", "models.lstm_model", "data.victoriametrics_collector"):
-    if name not in sys.modules:
+# Stub the TensorFlow-dependent modules ONLY when they cannot be imported (no TensorFlow on the
+# machine). Installing stubs unconditionally poisoned sys.modules for every later test in the
+# session (the whole suite failed in-cluster on 2026-09-20), so the real modules win when present.
+import importlib
+for name, attr, stub in (("models.lstm_model", "LSTMForecastModel", object),
+                         ("data.victoriametrics_collector", "VictoriaMetricsCollector", object)):
+    try:
+        importlib.import_module(name)
+    except Exception:  # ImportError from a missing tensorflow, or its transitive failures
+        pkg = name.split(".")[0]
+        if pkg not in sys.modules:
+            sys.modules[pkg] = types.ModuleType(pkg)
         mod = types.ModuleType(name)
-        if name == "models.lstm_model": mod.LSTMForecastModel = object
-        if name == "data.victoriametrics_collector": mod.VictoriaMetricsCollector = object
+        setattr(mod, attr, stub)
         sys.modules[name] = mod
 from data import gapfill  # noqa: E402
 from training import train_lstm_from_vm as t  # noqa: E402

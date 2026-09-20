@@ -193,6 +193,16 @@ class TestDynamicFloor:
 # TestMAPEInjection (ACC-03 wiring verification)
 # ---------------------------------------------------------------------------
 @requires_tf
+def _fresh_grid(n):
+    """n ten-minute points ending now: the inference path requires a gridded, fresh window
+    (data/gapfill.check_inference_window), so a fixed historical timestamp is rejected as stale."""
+    from datetime import datetime, timezone, timedelta
+    end = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    end = end - timedelta(minutes=end.minute % 10)
+    return [{'timestamp': (end - timedelta(minutes=10 * (n - 1 - i))).strftime('%Y-%m-%dT%H:%M:%SZ'),
+             'value': float(i)} for i in range(n)]
+
+
 class TestMAPEInjection:
     """Test that MAPE flows from accuracy_tracker through predict() to model.mape_for_floor.
 
@@ -220,7 +230,7 @@ class TestMAPEInjection:
         from unittest.mock import patch
 
         fake_model = self._make_fake_model()
-        metric_data = [{'timestamp': '2026-01-01T00:00:00Z', 'value': float(i)} for i in range(200)]
+        metric_data = _fresh_grid(200)
 
         with patch('api.main.accuracy_tracker') as mock_tracker, \
              patch.dict('api.main.predictor.trained_models', {'myapp_requests': fake_model}), \
@@ -237,7 +247,7 @@ class TestMAPEInjection:
         from unittest.mock import patch
 
         fake_model = self._make_fake_model()
-        metric_data = [{'timestamp': '2026-01-01T00:00:00Z', 'value': float(i)} for i in range(200)]
+        metric_data = _fresh_grid(200)
 
         with patch('api.main.accuracy_tracker') as mock_tracker, \
              patch.dict('api.main.predictor.trained_models', {'myapp_requests': fake_model}), \
@@ -256,7 +266,7 @@ class TestMAPEInjection:
         from unittest.mock import patch
 
         fake_model = self._make_fake_model()
-        metric_data = [{'timestamp': '2026-01-01T00:00:00Z', 'value': float(i)} for i in range(200)]
+        metric_data = _fresh_grid(200)
 
         with patch('api.main.accuracy_tracker') as mock_tracker, \
              patch.dict('api.main.predictor.trained_models', {'myapp_requests': fake_model}), \

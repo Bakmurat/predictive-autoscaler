@@ -33,7 +33,10 @@ COPY --from=builder /usr/local /usr/local
 # Copy application source
 COPY . .
 
-# Install kubectl for cold-start job triggering
+# Install kubectl for cold-start job triggering. TARGETARCH must be re-declared in this stage:
+# without it the URL had an empty architecture and the download was an XML error page, so kubectl
+# was not executable on arm64 nodes (found by the in-cluster test run, 2026-09-20).
+ARG TARGETARCH
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
     && curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/${TARGETARCH}/kubectl" \
     && chmod +x kubectl \

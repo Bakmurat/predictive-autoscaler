@@ -341,9 +341,11 @@ class TestEvaluateMultistep:
         """evaluate() on Dense(6) model returns valid metrics."""
         from models.lstm_model import LSTMForecastModel
 
-        df = _make_synthetic_data(n_points=400, base_value=3000.0)
-        train_df = df.iloc[:300]
-        test_df = df.iloc[300:]
+        # The test partition must hold at least sequence_length + STEPS_AHEAD points, otherwise
+        # evaluate() reports "unavailable" (None metrics) instead of infinities - see the next test.
+        df = _make_synthetic_data(n_points=600, base_value=3000.0)
+        train_df = df.iloc[:400]
+        test_df = df.iloc[400:]
 
         model = LSTMForecastModel(sequence_length=144)
         model.train(train_df, target_column='value', epochs=1)
@@ -352,5 +354,18 @@ class TestEvaluateMultistep:
         assert 'rmse' in eval_result
         assert 'mae' in eval_result
         assert 'mape' in eval_result
-        assert eval_result['rmse'] >= 0
-        assert eval_result['mae'] >= 0
+        assert eval_result['rmse'] is not None and eval_result['rmse'] >= 0
+        assert eval_result['mae'] is not None and eval_result['mae'] >= 0
+
+    def test_evaluate_short_partition_is_unavailable_not_infinite(self):
+        """A test partition shorter than sequence_length + STEPS_AHEAD yields None metrics and an
+        explicit 'unavailable' reason (never inf), per the training-preflight contract."""
+        from models.lstm_model import LSTMForecastModel
+
+        df = _make_synthetic_data(n_points=400, base_value=3000.0)
+        model = LSTMForecastModel(sequence_length=144)
+        model.train(df.iloc[:300], target_column='value', epochs=1)
+
+        eval_result = model.evaluate(df.iloc[300:], target_column='value')
+        assert eval_result['rmse'] is None and eval_result['mae'] is None and eval_result['mape'] is None
+        assert str(eval_result.get('evaluation', '')).startswith('unavailable')

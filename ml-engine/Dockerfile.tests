@@ -1,0 +1,13 @@
+# Test-runner image: the runtime ml-api image plus pytest and the repository
+# checkout, so the Python suite can run inside the cluster where TensorFlow is.
+# Build from the repository root:  docker build -f ml-engine/Dockerfile.tests --build-arg BASE=<ml-api image> -t <repo>:tests-<sha> .
+ARG BASE
+FROM ${BASE}
+USER root
+COPY ml-engine/requirements-dev.txt /tmp/requirements-dev.txt
+RUN pip install --no-cache-dir -r /tmp/requirements-dev.txt
+WORKDIR /repo
+COPY --chown=app:app . /repo
+USER app
+ENV PYTHONPATH=/repo/ml-engine
+CMD ["python", "-m", "pytest", "-q", "ml-engine/tests"]

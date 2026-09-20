@@ -56,11 +56,14 @@ class TestKustomizeRenderSync:
     @pytest.fixture(scope="class")
     def rendered_yaml(self):
         """Run 'kubectl kustomize' and return the rendered output."""
-        result = subprocess.run(
-            ["kubectl", "kustomize", str(PROJECT_ROOT / "k8s-manifests" / "base")],
-            capture_output=True,
-            text=True,
-        )
+        try:
+            result = subprocess.run(
+                ["kubectl", "kustomize", str(PROJECT_ROOT / "k8s-manifests" / "base")],
+                capture_output=True,
+                text=True,
+            )
+        except OSError as exc:  # kubectl missing or not executable on this platform
+            pytest.skip(f"kubectl not usable here: {exc}")
         if result.returncode != 0:
             pytest.skip(f"kubectl kustomize failed (kubectl may not be installed): {result.stderr}")
         return result.stdout
