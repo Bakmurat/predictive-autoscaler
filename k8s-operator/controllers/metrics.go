@@ -61,9 +61,68 @@ var (
 		},
 		[]string{"application", "namespace"},
 	)
+
+	// Forecast record (set at issuance, before the outcome exists). One series per horizon step.
+	forecastRpmGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "predictive_autoscaler_forecast_rpm",
+			Help: "Forecast request rate (requests per minute) for horizon step N, set when the forecast is issued",
+		},
+		[]string{"application", "namespace", "step"},
+	)
+	forecastTargetTsGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "predictive_autoscaler_forecast_target_timestamp_seconds",
+			Help: "Unix time the forecast for horizon step N refers to",
+		},
+		[]string{"application", "namespace", "step"},
+	)
+	forecastIssuedTsGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "predictive_autoscaler_forecast_issued_timestamp_seconds",
+			Help: "Unix time the current forecast was issued (fetched from the forecasting service)",
+		},
+		[]string{"application", "namespace"},
+	)
+	forecastStepMinutesGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "predictive_autoscaler_forecast_step_minutes",
+			Help: "Minutes between consecutive horizon steps of the current forecast",
+		},
+		[]string{"application", "namespace"},
+	)
+	modelTrainedTsGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "predictive_autoscaler_model_trained_timestamp_seconds",
+			Help: "Unix time the model behind the current forecast was trained (training data cutoff); -1 if unknown",
+		},
+		[]string{"application", "namespace"},
+	)
+	modelInfoGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "predictive_autoscaler_model_info",
+			Help: "Model name and version behind the current forecast (value is always 1)",
+		},
+		[]string{"application", "namespace", "model_name", "model_version"},
+	)
+	scaleEventsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "predictive_autoscaler_scale_events_total",
+			Help: "Replica changes applied by the operator, by direction (up or down)",
+		},
+		[]string{"application", "namespace", "direction"},
+	)
+	desiredReplicasGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "predictive_autoscaler_desired_replicas",
+			Help: "Replica count the operator decided on in the last reconcile (before scale-down stabilization)",
+		},
+		[]string{"application", "namespace"},
+	)
 )
 
 func init() {
+	metrics.Registry.MustRegister(forecastRpmGauge, forecastTargetTsGauge, forecastIssuedTsGauge, forecastStepMinutesGauge, modelTrainedTsGauge, modelInfoGauge, scaleEventsTotal, desiredReplicasGauge)
 	metrics.Registry.MustRegister(
 		predictedReplicasGauge,
 		actualNeededReplicasGauge,

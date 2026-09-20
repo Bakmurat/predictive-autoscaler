@@ -454,9 +454,13 @@ class LSTMPredictor:
                            f"min={min(predicted_values):.2f}, max={max(predicted_values):.2f}, "
                            f"confidence={prediction_result['confidence']:.3f}")
 
+                trained_mtime = self.model_file_mtimes.get(model_key, 0)
+                trained_at = (datetime.utcfromtimestamp(trained_mtime).isoformat() + "Z") if trained_mtime else ""
                 return {
                     "application": application,
                     "metric_type": metric_type,
+                    "model_version": f"{model_key}@{int(trained_mtime)}" if trained_mtime else f"{model_key}@untrained",
+                    "model_trained_at": trained_at,
                     "predictions": predicted_values,
                     "confidence": round(prediction_result['confidence'], 3),
                     "model_name": f"lstm_{application}_{metric_type}",

@@ -7,7 +7,8 @@ prometheus:
     retention: 15d
     scrapeInterval: 30s
     resources:
-      requests: { cpu: 150m, memory: 768Mi }
+      requests: { cpu: 200m, memory: 700Mi }   # measured working set ~600Mi at 15d retention
+      limits: { memory: 1200Mi }
     storageSpec:
       volumeClaimTemplate:
         spec:
@@ -25,6 +26,7 @@ grafana:
     size: 2Gi
   resources:
     requests: { cpu: 50m, memory: 128Mi }
+    limits: { memory: 320Mi }               # measured ~200Mi
   sidecar:
     dashboards:
       enabled: true
@@ -33,6 +35,10 @@ grafana:
   defaultDashboardsEnabled: false
 kubeStateMetrics:
   enabled: true
+kube-state-metrics:
+  resources:
+    requests: { cpu: 10m, memory: 32Mi }
+    limits: { memory: 128Mi }
 nodeExporter:
   enabled: false
 kubeControllerManager: { enabled: false }

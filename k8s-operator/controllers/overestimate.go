@@ -10,13 +10,13 @@ import (
 // Overestimate detection constants.
 // When predicted/actual ratio exceeds the threshold for N consecutive reconciles, cap predicted.
 const (
-	overestimateRatioThreshold  = 1.2  // predicted/reactive must exceed this to count
-	overestimateHeadroom        = 1.1  // cap = reactive * headroom
-	overestimateStreakRequired   = 3    // consecutive reconciles before cap fires
-	overestimateMaxStreak        = 10   // max streak before trusting the model regardless
-	rampUpThreshold             = 0.02 // 2% RPM increase between reconciles indicates ramp-up
-	predictionRampRatio         = 1.2  // if lead-time prediction step2 > step1 * this, model sees upcoming ramp
-	overestimateReEvalInterval  = 30   // reconciles between re-evaluation resets after max streak
+	overestimateRatioThreshold = 1.2  // predicted/reactive must exceed this to count
+	overestimateHeadroom       = 1.1  // cap = reactive * headroom
+	overestimateStreakRequired = 3    // consecutive reconciles before cap fires
+	overestimateMaxStreak      = 10   // max streak before trusting the model regardless
+	rampUpThreshold            = 0.02 // 2% RPM increase between reconciles indicates ramp-up
+	predictionRampRatio        = 1.2  // if lead-time prediction step2 > step1 * this, model sees upcoming ramp
+	overestimateReEvalInterval = 30   // reconciles between re-evaluation resets after max streak
 )
 
 // adjustForOverestimation detects when ML-predicted replicas consistently exceed
@@ -24,10 +24,10 @@ const (
 // reconciles, it caps predicted to reactive * 1.1 to allow scale-down.
 //
 // Three safeguards prevent false overestimate detection during proactive scaling:
-// 1. Ramp-up detection: if currentRPM is increasing, predictions SHOULD be ahead
-// 2. Prediction-trend awareness: if ML predictions show rising traffic (step2 > step1 * 1.2),
-//    the model sees an upcoming ramp — trust it
-// 3. Streak cap: after 10 consecutive reconciles, trust the model regardless
+//  1. Ramp-up detection: if currentRPM is increasing, predictions SHOULD be ahead
+//  2. Prediction-trend awareness: if ML predictions show rising traffic (step2 > step1 * 1.2),
+//     the model sees an upcoming ramp — trust it
+//  3. Streak cap: after 10 consecutive reconciles, trust the model regardless
 func adjustForOverestimation(
 	log logr.Logger,
 	predictedReplicas, reactiveReplicas int32,

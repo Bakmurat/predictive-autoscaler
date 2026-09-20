@@ -1,7 +1,7 @@
 resources:
   operator:
-    requests: { cpu: 50m, memory: 128Mi }
+    requests: { cpu: 20m, memory: 64Mi }
   metricServer:
-    requests: { cpu: 50m, memory: 128Mi }
+    requests: { cpu: 20m, memory: 64Mi }
   webhooks:
     requests: { cpu: 20m, memory: 64Mi }

@@ -11,8 +11,21 @@ variable "cluster_name" {
 }
 
 variable "kubernetes_version" {
-  type    = string
-  default = "1.32"
+  description = "EKS Kubernetes minor. 1.34 is the current standard-support line; 1.31-1.33 are in extended support (control plane billed at a higher rate)."
+  type        = string
+  default     = "1.34"
+}
+
+# Default addon versions for Kubernetes 1.34 (aws eks describe-addon-versions --kubernetes-version 1.34, 2026-09-20).
+variable "addon_versions" {
+  type = map(string)
+  default = {
+    "vpc-cni"            = "v1.22.4-eksbuild.3"
+    "coredns"            = "v1.12.4-eksbuild.38"
+    "kube-proxy"         = "v1.34.6-eksbuild.29"
+    "metrics-server"     = "v0.9.0-eksbuild.11"
+    "aws-ebs-csi-driver" = "v1.66.0-eksbuild.1"
+  }
 }
 
 variable "vpc_cidr" {
@@ -23,7 +36,7 @@ variable "vpc_cidr" {
 variable "instance_type" {
   description = "Node instance type (arm64 by default; images are built for the node architecture)"
   type        = string
-  default     = "t4g.large"
+  default     = "t4g.medium"
 }
 
 variable "node_min" {
@@ -33,12 +46,12 @@ variable "node_min" {
 
 variable "node_desired" {
   type    = number
-  default = 3
+  default = 2
 }
 
 variable "node_max" {
   type    = number
-  default = 3
+  default = 2
 }
 
 variable "tags" {

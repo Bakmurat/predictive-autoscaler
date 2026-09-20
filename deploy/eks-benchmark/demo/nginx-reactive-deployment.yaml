@@ -2,19 +2,19 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: nginx-test
+  name: nginx-reactive
   namespace: demo
   labels:
-    app: nginx-test
+    app: nginx-reactive
 spec:
   replicas: 2
   selector:
     matchLabels:
-      app: nginx-test
+      app: nginx-reactive
   template:
     metadata:
       labels:
-        app: nginx-test
+        app: nginx-reactive
       annotations:
         sidecar.istio.io/proxyCPU: "40m"       # measured proxy usage up to ~63m CPU, 29-41Mi at 100 req/s per pod
         sidecar.istio.io/proxyCPULimit: "200m"

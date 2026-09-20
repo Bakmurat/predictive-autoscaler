@@ -2,11 +2,12 @@
 pilot:
   resources:
     requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 512Mi }
 global:
   proxy:
     resources:
-      requests: { cpu: 10m, memory: 48Mi }
-      limits: { cpu: 500m, memory: 256Mi }
+      requests: { cpu: 5m, memory: 24Mi }   # measured sidecar working set 32-41Mi; requests are for bin-packing
+      limits: { cpu: 300m, memory: 128Mi }
 meshConfig:
   enablePrometheusMerge: true
   accessLogFile: ""

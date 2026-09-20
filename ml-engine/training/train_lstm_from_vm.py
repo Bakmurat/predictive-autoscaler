@@ -27,6 +27,36 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+
+# Minimum complete 10-minute observations for a non-empty train/validation split:
+# sequence_length (144) + STEPS_AHEAD (6) input/target window, plus enough rows that the 80/20
+# split inside the model and the 80/20 split here both leave at least one sequence.
+MIN_HISTORY_POINTS = 189
+EXPECTED_CADENCE_S = 600
+CADENCE_TOLERANCE_S = 90
+MAX_GAP_S = 1800
+
+
+def preflight_history(df) -> tuple:
+    """Check that the fetched history can train the model. Returns (ok, reason)."""
+    if df is None or df.empty:
+        return False, "insufficient history: have 0 of %d points" % MIN_HISTORY_POINTS
+    ts = df['timestamp'].sort_values().values
+    n = len(ts)
+    if n < MIN_HISTORY_POINTS:
+        return False, "insufficient history: have %d of %d ten-minute points" % (n, MIN_HISTORY_POINTS)
+    import numpy as np
+    deltas = np.diff(ts.astype('datetime64[s]').astype('int64'))
+    if len(deltas) and abs(float(np.median(deltas)) - EXPECTED_CADENCE_S) > CADENCE_TOLERANCE_S:
+        return False, "unexpected cadence: median %.0fs, expected %ds" % (float(np.median(deltas)), EXPECTED_CADENCE_S)
+    big = deltas[deltas > MAX_GAP_S]
+    if len(big):
+        return False, "history has %d gap(s) longer than %ds (largest %.0fs)" % (len(big), MAX_GAP_S, float(big.max()))
+    train_rows = int(0.8 * n)
+    if train_rows < MIN_HISTORY_POINTS * 0.8 or (n - train_rows) < 1:
+        return False, "insufficient history for train/validation split: %d rows" % n
+    return True, "ok: %d points" % n
+
 def train_lstm_for_metric(
     df: pd.DataFrame,
     app_name: str,
@@ -86,7 +116,10 @@ def train_lstm_for_metric(
 
         # Evaluate on test data
         eval_result = model.evaluate(test_data, target_column='value')
-        logger.info(f"Evaluation - RMSE: {eval_result['rmse']:.4f}, MAE: {eval_result['mae']:.4f}")
+        if eval_result.get('rmse') is None:
+            logger.info(f"Evaluation - {eval_result.get('evaluation', 'unavailable')}")
+        else:
+            logger.info(f"Evaluation - RMSE: {eval_result['rmse']:.4f}, MAE: {eval_result['mae']:.4f}")
 
         # Make sample prediction -- Phase 16: Dense(6) outputs exactly 6 steps
         prediction = model.predict(steps_ahead=6, confidence_level=0.95)  # 1 hour ahead (6 * 10min)
@@ -275,6 +308,10 @@ def train_from_victoriametrics(
     if not metrics:
         logger.error("No metrics retrieved from VictoriaMetrics")
         return {"success": False, "error": "No metrics available"}
+    ok, reason = preflight_history(df)
+    if not ok:
+        logger.warning("Training skipped - %s", reason)
+        return {"success": False, "skipped": True, "error": reason}
 
     # Prepare model directory
     if model_dir is None:
@@ -388,7 +425,8 @@ def main():
         if result.get("success"):
             logger.info(f"  {app_name}: Successfully trained")
             if result.get("evaluation_metrics"):
-                logger.info(f"    RMSE={result['evaluation_metrics']['rmse']:.4f}")
+                if result['evaluation_metrics'].get('rmse') is not None:
+                    logger.info(f"    RMSE={result['evaluation_metrics']['rmse']:.4f}")
         else:
             logger.error(f"  {app_name}: Failed - {result.get('error')}")
 

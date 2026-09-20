@@ -426,13 +426,14 @@ class LSTMForecastModel:
         X_test, y_test = self._create_sequences(scaled_data.flatten(), time_features)
 
         if len(X_test) == 0:
-            logger.warning("Insufficient test data for evaluation")
+            logger.warning("Evaluation unavailable: test partition shorter than sequence_length + STEPS_AHEAD")
             return {
-                'rmse': float('inf'),
-                'mae': float('inf'),
-                'mape': float('inf'),
-                'r2': -float('inf'),
-                'confidence': 0.0
+                'rmse': None,
+                'mae': None,
+                'mape': None,
+                'r2': None,
+                'confidence': 0.0,
+                'evaluation': 'unavailable: test partition too short'
             }
 
         # X_test already has shape (N, seq_len, 5) from _create_sequences

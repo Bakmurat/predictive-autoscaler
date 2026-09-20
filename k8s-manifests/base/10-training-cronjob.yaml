@@ -55,6 +55,10 @@ spec:
             
             - name: MODEL_DIR
               value: "/models"
+            - name: TRAINING_WORKLOAD
+              value: "nginx-test"
+            - name: TRAINING_NAMESPACE
+              value: "default"
             
             - name: PYTHONUNBUFFERED
               value: "1"

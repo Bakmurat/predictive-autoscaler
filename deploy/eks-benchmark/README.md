@@ -4,16 +4,16 @@ A small, reproducible Kubernetes environment for evaluating the predictive autos
 
 ## What it creates
 - VPC `10.50.0.0/16` with two **public** subnets in two availability zones, **no NAT gateway** (nodes get public IPs; egress via the internet gateway).
-- EKS 1.32, public endpoint, IRSA enabled; addons vpc-cni, coredns, kube-proxy, metrics-server, aws-ebs-csi-driver (IRSA role). One managed node group: `t4g.large` (arm64, AL2023, on-demand), min 2 / desired 3 / max 3, 40 GiB gp3 root volumes. No KMS key, no control-plane logs.
+- EKS **1.34** (standard support until 2026-12-01 per the EKS release calendar; 1.31–1.33 were in extended support, which bills the control plane at about six times the standard rate — check `aws eks describe-cluster-versions` before choosing), public endpoint, IRSA enabled; addons vpc-cni (prefix delegation on, so small instances are not capped at 17 pods), coredns, kube-proxy, metrics-server, aws-ebs-csi-driver (IRSA role), versions pinned per minor in `variables.tf`. One managed node group: **two `t4g.medium`** (arm64, AL2023, on-demand; 2 vCPU / 4 GiB each), fixed at 2 (no autoscaling headroom), 30 GiB gp3 root volumes. No KMS key, no control-plane logs.
 - `gp3` default StorageClass.
 - Istio (base + istiod), KEDA, kube-prometheus-stack (Prometheus with 15-day retention on 20 GiB gp3, Grafana on 2 GiB gp3, no alerting); namespaces `istio-system`, `keda`, `monitoring`, and `demo` (sidecar injection enabled).
 - Two ECR repositories: `predictive-autoscaler/ml-api` and `predictive-autoscaler/operator`.
-- `deploy.sh app` then adds: the Istio PodMonitor and the ServiceMonitors, the three Grafana dashboards, the ml-engine stack from `../../k8s-manifests/base` through the kustomize overlay (images from ECR, Prometheus as the metrics backend, gp3), and the demo namespace with `nginx-test` (predictive-scaled; its KEDA ScaledObject is present but paused), `myapptwo` (KEDA-only twin), and one k6 traffic generator per app.
+- `deploy.sh app` then adds: the Istio PodMonitor and the ServiceMonitors, the three Grafana dashboards, the ml-engine stack from `../../k8s-manifests/base` through the kustomize overlay (images from ECR, Prometheus as the metrics backend, gp3, trimmed resource requests, training targets), and the demo namespace with three identical nginx Deployments scaled three ways — `nginx-test` by the operator with forecasting on, `nginx-reactive` by the same operator with forecasting off (`spec.prediction.enabled: false`, the matched control), and `myapptwo` by KEDA with a single Prometheus trigger on the same request-count definition (the system comparison) — each with `min 1 / max 12` replicas and the same per-replica target (10 req/s), plus one k6 CronJob per app that runs every UTC hour at that hour's rate.
 
 No load balancers are created; Grafana, Prometheus, and the ml-api are reached with `kubectl port-forward`.
 
-## Cost (ap-southeast-1, on-demand, approximate)
-EKS control plane 0.10/h + 3 × t4g.large ≈ 0.25/h + ≈ 140 GiB gp3 ≈ 0.015/h ≈ **0.37 USD/hour ≈ 9 USD/day**. Spot capacity is deliberately not used: a multi-day held-out evaluation must not be interrupted.
+## Cost (ap-southeast-1, on-demand, list prices)
+Per day: EKS control plane (standard support) 2.40 + two t4g.medium 2.04 + two public IPv4 addresses 0.24 + gp3 (33 GiB of PVCs and two 30 GiB root volumes) ≈ 0.27 ≈ **about 5 USD/day** before variable charges (CPU surplus credits under the t4g Unlimited mode at 0.04 USD per vCPU-hour, cross-AZ traffic, ECR storage, data transfer), which are read from Cost Explorer after a run. Spot capacity is deliberately not used: a multi-day forward-looking evaluation must not be interrupted.
 
 ## Usage
 ```sh
@@ -30,10 +30,19 @@ terraform import aws_ecr_repository.operator predictive-autoscaler/operator
 Images are built for the node architecture (`IMAGE_ARCH=arm64` by default; set `amd64` with an x86 instance type) and tagged `bench-<git short sha>` (override with `IMAGE_TAG`).
 
 ## Differences from the manifests in `examples/`
-The demo manifests under `demo/` are the repository examples adapted to a three-node cluster: traffic pattern and per-pod thresholds divided by ten (peak 6,000 requests/min; `targetRPS` 30; KEDA Prometheus trigger 30/15), nginx CPU request 20m, both apps capped at 40 replicas, one k6 pod per app, traffic sent to the in-cluster Services instead of an ingress gateway, and the `nginx-test` ScaledObject paused so the operator is the only controller of that Deployment. The VictoriaMetrics endpoints in the base manifests are pointed at Prometheus (the collector and the operator use only the Prometheus-compatible `/api/v1/query` and `/api/v1/query_range` endpoints).
+The demo manifests under `demo/` are the repository examples adapted to two small nodes and to a controlled comparison:
+- Traffic: the 24-hour pattern is divided by ten (night 150–300 req/min, peak 6,000 req/min at 15:00 UTC) and keyed by **UTC hour**; each app has a k6 **CronJob** that starts at every full hour, runs a constant arrival rate for the rest of that hour, and prints a one-line JSON summary (requests, dropped iterations, failures, latency) to its log. Generator pods carry no sidecar; requests are counted by the destination sidecar.
+- One request-count definition everywhere: `sum(rate(istio_requests_total{reporter="destination",destination_workload="<app>",destination_workload_namespace="demo"}[1m])) * 60` — in the forecasting service's collector, the operator's reactive rule, the KEDA trigger, and the scorer.
+- Bounds and targets identical for all three apps: min 1, max 12, 10 requests/s per replica (so the daily pattern needs 1 to 10 replicas). The KEDA comparison uses only the Prometheus trigger; its CPU and memory triggers were removed on purpose.
+- The `nginx-test` ScaledObject is present but paused so the operator is the only controller of that Deployment.
+- nginx pods request 10m CPU / 16Mi; the forecasting service, operator, and training job carry measured requests set in the overlay; the training CronJob is co-located with the forecasting service (shared ReadWriteOnce model volume) by pod affinity.
+- The VictoriaMetrics endpoints in the base manifests are pointed at Prometheus (the collector and the operator use only the Prometheus-compatible `/api/v1/query` and `/api/v1/query_range` endpoints).
 
 ## Evaluation
-The protocol, the scoring script, and the recorded runs live outside this repository until a run is complete; `score.py`-style scoring reads Prometheus through a port-forward and reports MAPE and MAE per 10-minute step on held-out days, plus replica time series and pod-minutes for both apps.
+The operator records every forecast at issuance — Prometheus series `predictive_autoscaler_forecast_rpm{step}`, `..._forecast_target_timestamp_seconds{step}`, `..._forecast_issued_timestamp_seconds`, `..._model_trained_timestamp_seconds`, `..._model_info{model_name,model_version}` and a JSONL line on its own small volume (`FORECAST_LOG`) — so each horizon step can be scored against the observation at its own target time. The protocol, the scorer (`score.py` with known-answer tests), and the recorded runs live outside this repository until a run is complete.
+
+## Versions
+Pinned and used for the recorded runs (2026-09-20): Terraform aws provider 5.100, kubernetes 2.38, helm 2.17; modules terraform-aws-vpc 5.21, terraform-aws-eks 20.37, iam-role-for-service-accounts-eks 5.60; charts istio 1.30.4, keda 2.20.2, kube-prometheus-stack 91.4.1. Latest available on that date, not adopted because they change module inputs or are not yet published as stable charts: terraform-aws-eks 21.25, terraform-aws-vpc 6.7, aws provider 6.65, Istio 1.31.0 (charts only at rc/beta in the Istio Helm index).
 
 ## Teardown
 ```sh

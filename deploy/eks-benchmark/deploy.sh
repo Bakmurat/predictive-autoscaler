@@ -53,7 +53,7 @@ app() {
     | sed -e "s#ECR_REGISTRY#$reg#g" -e "s#IMAGE_TAG#$TAG#g" -e "s#VM_QUERY_URL#$prom#g" > "$HERE/rendered/ml-engine.yaml"
   kubectl apply -f "$HERE/rendered/ml-engine.yaml"
   kubectl wait --for condition=established crd/predictiveautoscalers.autoscaler.example.com --timeout=90s
-  { cat "$HERE/demo/00-namespace.yaml"; for f in "$HERE"/demo/nginx-test-*.yaml "$HERE"/demo/myapptwo-*.yaml; do echo "---"; sed -e "s#VM_QUERY_URL#$prom#g" "$f"; done; } > "$HERE/rendered/demo.yaml"
+  { cat "$HERE/demo/00-namespace.yaml"; for f in "$HERE"/demo/*.yaml; do [ "$(basename "$f")" = "00-namespace.yaml" ] && continue; echo "---"; sed -e "s#VM_QUERY_URL#$prom#g" "$f"; done; } > "$HERE/rendered/demo.yaml"
   kubectl apply -f "$HERE/rendered/demo.yaml"
   echo "T0 (traffic start, UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }

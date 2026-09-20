@@ -1,0 +1,13 @@
+---
+# Append-only forecast record written by the operator (one JSON line per issued forecast).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: forecast-log-pvc
+  namespace: ml-engine
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+  # storageClassName: <your-storage-class>   (omit to use the cluster default)

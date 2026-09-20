@@ -15,14 +15,39 @@ module "eks" {
   vpc_id     = module.vpc.vpc_id
   subnet_ids = module.vpc.public_subnets
 
+  # Addon versions are pinned per Kubernetes minor (see var.addon_versions); EKS upgrades one minor at a time.
   cluster_addons = {
-    vpc-cni        = { most_recent = true }
-    coredns        = { most_recent = true }
-    kube-proxy     = { most_recent = true }
-    metrics-server = { most_recent = true }
+    vpc-cni = {
+      addon_version = var.addon_versions["vpc-cni"]
+      # Prefix delegation: /28 prefixes per ENI instead of single IPs, so small instances are not
+      # capped at ~17 pods (t4g.medium: 3 ENIs x 6 IPs). Set before node groups are created/rolled.
+      configuration_values = jsonencode({
+        env = {
+          ENABLE_PREFIX_DELEGATION = "true"
+          WARM_PREFIX_TARGET       = "1"
+        }
+      })
+    }
+    coredns    = { addon_version = var.addon_versions["coredns"] }
+    kube-proxy = { addon_version = var.addon_versions["kube-proxy"] }
+    metrics-server = {
+      addon_version = var.addon_versions["metrics-server"]
+      # One replica and small requests: two 200Mi replicas do not fit a two-node t4g.medium cluster.
+      configuration_values = jsonencode({
+        replicas  = 1
+        resources = { requests = { cpu = "30m", memory = "64Mi" }, limits = { memory = "160Mi" } }
+      })
+    }
     aws-ebs-csi-driver = {
-      most_recent              = true
+      addon_version            = var.addon_versions["aws-ebs-csi-driver"]
       service_account_role_arn = module.ebs_csi_irsa.iam_role_arn
+      # One controller replica (the default two do not fit two small nodes; a restart is tolerable here).
+      configuration_values = jsonencode({
+        controller = {
+          replicaCount = 1
+          resources    = { requests = { cpu = "10m", memory = "40Mi" }, limits = { memory = "256Mi" } }
+        }
+      })
     }
   }
 
@@ -37,6 +62,16 @@ module "eks" {
       type                          = "ingress"
       source_cluster_security_group = true
     }
+    # The metrics-server addon serves the metrics.k8s.io APIService on 10251; without this rule the
+    # API server cannot reach it and `kubectl top` / resource-metric HPAs fail.
+    ingress_cluster_metrics_server = {
+      description                   = "Cluster API to metrics-server"
+      protocol                      = "tcp"
+      from_port                     = 10251
+      to_port                       = 10251
+      type                          = "ingress"
+      source_cluster_security_group = true
+    }
   }
 
   eks_managed_node_groups = {
@@ -48,7 +83,7 @@ module "eks" {
       desired_size   = var.node_desired
       max_size       = var.node_max
       subnet_ids     = module.vpc.public_subnets
-      disk_size      = 40
+      disk_size      = 30
       labels         = { role = "worker" }
     }
   }

@@ -1,0 +1,48 @@
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: k6-nginx-test
+  namespace: demo
+  labels:
+    app: k6
+    target: nginx-test
+spec:
+  schedule: "0 * * * *"
+  timeZone: "Etc/UTC"
+  concurrencyPolicy: Replace
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: 72
+  failedJobsHistoryLimit: 24
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 3570
+      template:
+        metadata:
+          labels:
+            app: k6
+            target: nginx-test
+          annotations:
+            sidecar.istio.io/inject: "false"   # requests are counted by the destination sidecar (reporter="destination")
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: k6
+              image: grafana/k6:0.48.0
+              args: ["run", "--quiet", "/scripts/load.js"]
+              env:
+                - name: TARGET_URL
+                  value: "http://nginx-test.demo.svc.cluster.local/"
+                - name: TARGET_NAME
+                  value: "nginx-test"
+              resources:
+                requests: { cpu: 50m, memory: 64Mi }
+                limits: { cpu: 500m, memory: 192Mi }
+              volumeMounts:
+                - name: script
+                  mountPath: /scripts
+          volumes:
+            - name: script
+              configMap:
+                name: k6-load-script

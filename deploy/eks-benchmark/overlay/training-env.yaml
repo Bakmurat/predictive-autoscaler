@@ -1,0 +1,17 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ml-training
+  namespace: ml-engine
+spec:
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: trainer
+              env:
+                - name: TRAINING_WORKLOAD
+                  value: "nginx-test"
+                - name: TRAINING_NAMESPACE
+                  value: "demo"

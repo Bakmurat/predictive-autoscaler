@@ -36,11 +36,13 @@ def main():
     vm_url = VICTORIA_METRICS_CONFIG["url"]
     logger.info(f"VictoriaMetrics URL: {vm_url}")
 
+    # Workload identity comes from the environment so the same image trains any target
+    # (defaults keep the original example). TRAINING_HOURS and TRAINING_EPOCHS are optional overrides.
     app_config = {
-        "name": "nginx-test",
-        "namespace": "default",
-        "workload_name": "nginx-test",
-        "baseline_rpm": 60000,
+        "name": os.environ.get("TRAINING_WORKLOAD", "nginx-test"),
+        "namespace": os.environ.get("TRAINING_NAMESPACE", "default"),
+        "workload_name": os.environ.get("TRAINING_WORKLOAD", "nginx-test"),
+        "baseline_rpm": int(os.environ.get("TRAINING_BASELINE_RPM", "60000")),
     }
 
     logger.info("Application Configuration:")
@@ -49,8 +51,8 @@ def main():
     logger.info("")
 
     # Training parameters
-    hours = 168  # 7 days of data
-    epochs = 50
+    hours = int(os.environ.get("TRAINING_HOURS", "168"))  # 7 days of data by default
+    epochs = int(os.environ.get("TRAINING_EPOCHS", "50"))
 
     logger.info(f"Training Parameters:")
     logger.info(f"  Historical data: {hours} hours ({hours // 24} days)")
@@ -87,6 +89,9 @@ def main():
             epochs=epochs
         )
 
+        if result.get("skipped"):
+            logger.info(f"Training skipped (not an error): {result.get('error')}")
+            sys.exit(0)
         if not result.get("success"):
             logger.error(f"Training failed: {result.get('error')}")
             sys.exit(1)

@@ -10,6 +10,10 @@ images:
     newName: ECR_REGISTRY/predictive-autoscaler/operator
     newTag: IMAGE_TAG
 patches:
+  - path: training-env.yaml
+  - path: resources-training.yaml
+  - path: resources-operator.yaml
+  - path: resources-ml-api.yaml
   - path: delete-predictive-autoscaler-ml-api.yaml
   - path: delete-predictive-autoscaler-controller.yaml
   - path: operator-vm-url.yaml

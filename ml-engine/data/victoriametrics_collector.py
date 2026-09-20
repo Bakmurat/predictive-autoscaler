@@ -265,7 +265,7 @@ class VictoriaMetricsCollector:
         This is a LEADING INDICATOR - traffic increases BEFORE CPU increases.
         Better for predictive autoscaling than CPU metrics.
         
-        Query: sum(rate(istio_requests_total{destination_workload="nginx-test"}[1m]))
+        Query: sum(rate(istio_requests_total{reporter="destination",destination_workload="nginx-test",destination_workload_namespace="<ns>"}[1m])) * 60
         Returns requests per second, multiplied by 60 to get requests per minute
         
         Args:
@@ -280,9 +280,12 @@ class VictoriaMetricsCollector:
         start_time = end_time - timedelta(hours=hours)
 
         # Build query
-        filters = [f'destination_workload="{destination_workload}"']
+        # Canonical request-count definition shared by training, scaling (operator), the KEDA twin,
+        # and the scorer: destination-reported requests only (each request is reported by both the
+        # client and the server sidecar; counting both doubles the rate).
+        filters = ['reporter="destination"', f'destination_workload="{destination_workload}"']
         if namespace:
-            filters.append(f'destination_service_namespace="{namespace}"')
+            filters.append(f'destination_workload_namespace="{namespace}"')
         
         filter_str = ",".join(filters)
         

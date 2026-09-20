@@ -1,5 +1,5 @@
 ---
-# PredictiveAutoscaler CR for nginx-test
+# PredictiveAutoscaler CR for nginx-reactive
 # UNIFIED SCALER - Single source of truth for deployment replicas
 #
 # Combines predictive (ML) and reactive (current metrics) into one decision:
@@ -14,17 +14,16 @@
 apiVersion: autoscaler.example.com/v1alpha1
 kind: PredictiveAutoscaler
 metadata:
-  name: nginx-test-autoscaler
+  name: nginx-reactive-autoscaler
   namespace: demo
   labels:
-    app: nginx-test
-    scaler-type: predictive
+    app: nginx-reactive
+    scaler-type: reactive-control
   annotations:
-    description: "LSTM-based predictive scaling for nginx-test"
-    keda-fallback: "nginx-test-keda-fallback"
+    description: "Matched control: same operator, same reactive rule, forecasting disabled"
 spec:
   targetDeployment:
-    name: nginx-test
+    name: nginx-reactive
     namespace: demo
     container: nginx
 
@@ -50,6 +49,7 @@ spec:
       targetPercent: 70
 
   prediction:
+    enabled: false            # reactive-only control (forecast switch off)
     horizonMinutes: 60          # ML API predicts 1 hour ahead (full context)
     leadTimeMinutes: 20         # Use predictions within 20-min window for scaling
     updateIntervalSeconds: 60   # Reconcile every 60s (reactive needs fast cycles)

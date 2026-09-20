@@ -99,6 +99,10 @@ spec:
               prediction:
                 type: object
                 properties:
+                  enabled:
+                    type: boolean
+                    default: true
+                    description: "Use the forecast; false = reactive request-rate rule only (matched control)"
                   horizonMinutes:
                     type: integer
                     minimum: 5

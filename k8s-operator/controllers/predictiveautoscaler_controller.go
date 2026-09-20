@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/prometheus/client_golang/prometheus"
 	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -27,16 +28,16 @@ import (
 
 // Scaling configuration constants
 const (
-	predictionCacheTTL      = 5 * time.Minute  // How often to refresh ML API predictions
-	scaleDownStabilization  = 5 * time.Minute  // Wait after scale-up before any scale-down
-	scaleDownCooldown       = 2 * time.Minute  // Minimum time between scale-down operations
-	scaleDownMaxPercent     = 10               // Max % of pods to remove per scale-down
-	scaleDownMinPods        = 2                // Min pods to remove per scale-down (whichever is greater)
-	defaultLeadTimeMinutes  = 20               // Default prediction lead time
-	defaultHorizonMinutes   = 60               // Default prediction horizon
-	defaultReconcileSeconds = 60               // Default reconcile interval (fast for reactive)
-	minReconcileSeconds     = 30               // Minimum reconcile interval
-	vmQueryTimeout          = 10 * time.Second // VictoriaMetrics query timeout (short — it's lightweight)
+	predictionCacheTTL      = 5 * time.Minute   // How often to refresh ML API predictions
+	scaleDownStabilization  = 5 * time.Minute   // Wait after scale-up before any scale-down
+	scaleDownCooldown       = 2 * time.Minute   // Minimum time between scale-down operations
+	scaleDownMaxPercent     = 10                // Max % of pods to remove per scale-down
+	scaleDownMinPods        = 2                 // Min pods to remove per scale-down (whichever is greater)
+	defaultLeadTimeMinutes  = 20                // Default prediction lead time
+	defaultHorizonMinutes   = 60                // Default prediction horizon
+	defaultReconcileSeconds = 60                // Default reconcile interval (fast for reactive)
+	minReconcileSeconds     = 30                // Minimum reconcile interval
+	vmQueryTimeout          = 10 * time.Second  // VictoriaMetrics query timeout (short — it's lightweight)
 	mlAPITimeout            = 120 * time.Second // ML API timeout (long — allows for model training)
 )
 
@@ -82,11 +83,20 @@ type MLPredictionRequest struct {
 
 // MLPredictionResponse represents the response from ML API
 type MLPredictionResponse struct {
-	Predictions []float64 `json:"predictions"`
-	Confidence  float64   `json:"confidence"`
-	ModelName   string    `json:"model_name"`
-	Timestamp   string    `json:"timestamp"`
-	MAPE        float64   `json:"mape"`
+	Predictions    []float64 `json:"predictions"`
+	Confidence     float64   `json:"confidence"`
+	ModelName      string    `json:"model_name"`
+	ModelVersion   string    `json:"model_version"`
+	ModelTrainedAt string    `json:"model_trained_at"`
+	HorizonMinutes int32     `json:"horizon_minutes"`
+	Timestamp      string    `json:"timestamp"`
+	MAPE           float64   `json:"mape"`
+}
+
+// predictionEnabled reports whether the forecasting component is on for this autoscaler
+// (spec.prediction.enabled; nil means true).
+func predictionEnabled(a *autoscalerv1alpha1.PredictiveAutoscaler) bool {
+	return a.Spec.Prediction.Enabled == nil || *a.Spec.Prediction.Enabled
 }
 
 // VMInstantQueryResponse represents the VictoriaMetrics instant query response
@@ -169,9 +179,16 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 
 	// --- PREDICTIVE COMPONENT ---
 	// Get ML prediction (cached, refresh every 5 min)
-	prediction, predErr := r.getCachedPrediction(ctx, &autoscaler, key)
+	var prediction *MLPredictionResponse
+	var predErr error
+	forecasting := predictionEnabled(&autoscaler)
+	if forecasting {
+		prediction, predErr = r.getCachedPrediction(ctx, &autoscaler, key)
+	}
 	predictedReplicas := int32(0)
-	if predErr != nil {
+	if !forecasting {
+		log.V(1).Info("Forecasting disabled for this autoscaler; reactive rule only")
+	} else if predErr != nil {
 		log.Info("Prediction unavailable, using reactive only", "error", predErr.Error())
 	} else if prediction != nil {
 		predictedReplicas = r.calculatePredictedReplicas(&autoscaler, prediction)
@@ -179,7 +196,7 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 
 	// --- REACTIVE COMPONENT ---
 	// Query VictoriaMetrics for current RPM
-	currentRPM, vmErr := r.queryCurrentRPM(autoscaler.Spec.TargetDeployment.Name)
+	currentRPM, vmErr := r.queryCurrentRPM(autoscaler.Spec.TargetDeployment.Name, autoscaler.Spec.TargetDeployment.Namespace)
 	reactiveReplicas := int32(0)
 	if vmErr != nil {
 		log.Info("VM query failed, using prediction only", "error", vmErr.Error())
@@ -238,8 +255,8 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		desiredReplicas = autoscaler.Spec.MaxReplicas
 	}
 
-	// Both sources failed — keep current replicas as safety fallback
-	if predErr != nil && vmErr != nil {
+	// No usable input (forecast off or failed, and the metrics query failed) — keep current replicas
+	if (predErr != nil || !forecasting) && vmErr != nil {
 		log.Info("Both prediction and VM query failed, keeping current replicas",
 			"current", currentReplicas)
 		desiredReplicas = currentReplicas
@@ -257,6 +274,7 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	}
 
 	predictedReplicasGauge.WithLabelValues(appName, appNS).Set(float64(predictedReplicas))
+	desiredReplicasGauge.WithLabelValues(appName, appNS).Set(float64(desiredReplicas))
 	actualNeededReplicasGauge.WithLabelValues(appName, appNS).Set(float64(actualNeeded))
 	predictionErrorPercentGauge.WithLabelValues(appName, appNS).Set(errorPct)
 
@@ -420,13 +438,15 @@ func (r *PredictiveAutoscalerReconciler) calculatePredictedReplicas(
 
 // queryCurrentRPM queries VictoriaMetrics for the current requests per minute
 // of the target deployment. This is the REACTIVE signal.
-func (r *PredictiveAutoscalerReconciler) queryCurrentRPM(deploymentName string) (float64, error) {
+func (r *PredictiveAutoscalerReconciler) queryCurrentRPM(deploymentName, namespace string) (float64, error) {
 	vmURL := os.Getenv("VICTORIAMETRICS_URL")
 	if vmURL == "" {
 		vmURL = "http://vmselect-vmst.monitoring.svc.cluster.local:8481/select/0/prometheus"
 	}
 
-	query := fmt.Sprintf(`sum(rate(istio_requests_total{destination_workload="%s"}[1m])) * 60`, deploymentName)
+	// Canonical request-count definition (shared with the forecasting service, the KEDA comparison,
+	// and the scorer): destination-reported requests only, one workload, one namespace.
+	query := fmt.Sprintf(`sum(rate(istio_requests_total{reporter="destination",destination_workload="%s",destination_workload_namespace="%s"}[1m])) * 60`, deploymentName, namespace)
 
 	endpoint := fmt.Sprintf("%s/api/v1/query", vmURL)
 	params := url.Values{}
@@ -493,12 +513,89 @@ func (r *PredictiveAutoscalerReconciler) getCachedPrediction(
 		return nil, err
 	}
 
-	// Update cache
+	// Update cache and record the forecast at issuance (before any outcome exists)
+	now := time.Now()
 	r.predictionCache[key] = &cachedPrediction{
 		response:  prediction,
-		fetchedAt: time.Now(),
+		fetchedAt: now,
 	}
+	r.recordForecast(autoscaler, prediction, now)
 	return prediction, nil
+}
+
+// forecastRecord is one JSON line in the append-only forecast log (FORECAST_LOG).
+type forecastRecord struct {
+	IssuedAt       string  `json:"issued_at"`
+	Application    string  `json:"application"`
+	Namespace      string  `json:"namespace"`
+	HorizonMinutes int32   `json:"horizon_minutes"`
+	StepMinutes    float64 `json:"step_minutes"`
+	ModelName      string  `json:"model_name"`
+	ModelVersion   string  `json:"model_version"`
+	ModelTrainedAt string  `json:"model_trained_at"`
+	Confidence     float64 `json:"confidence"`
+	Forecasts      []struct {
+		Step     int     `json:"step"`
+		TargetAt string  `json:"target_at"`
+		RPM      float64 `json:"rpm"`
+	} `json:"forecasts"`
+}
+
+// recordForecast exposes every horizon step of a freshly issued forecast as Prometheus series
+// (value, target time, issuance time, model identity) and appends one line to the JSONL log.
+// Both are written before the forecast horizon elapses, so a scorer can join each step with the
+// observation at its target time.
+func (r *PredictiveAutoscalerReconciler) recordForecast(
+	autoscaler *autoscalerv1alpha1.PredictiveAutoscaler,
+	prediction *MLPredictionResponse,
+	issuedAt time.Time,
+) {
+	if prediction == nil || len(prediction.Predictions) == 0 {
+		return
+	}
+	app := autoscaler.Spec.TargetDeployment.Name
+	ns := autoscaler.Spec.TargetDeployment.Namespace
+	horizon := autoscaler.Spec.Prediction.HorizonMinutes
+	if horizon == 0 {
+		horizon = defaultHorizonMinutes
+	}
+	stepMin := float64(horizon) / float64(len(prediction.Predictions))
+	rec := forecastRecord{
+		IssuedAt: issuedAt.UTC().Format(time.RFC3339), Application: app, Namespace: ns,
+		HorizonMinutes: horizon, StepMinutes: stepMin, ModelName: prediction.ModelName,
+		ModelVersion: prediction.ModelVersion, ModelTrainedAt: prediction.ModelTrainedAt, Confidence: prediction.Confidence,
+	}
+	forecastIssuedTsGauge.WithLabelValues(app, ns).Set(float64(issuedAt.Unix()))
+	forecastStepMinutesGauge.WithLabelValues(app, ns).Set(stepMin)
+	trainedTs := float64(-1)
+	if t, err := time.Parse(time.RFC3339, prediction.ModelTrainedAt); err == nil {
+		trainedTs = float64(t.Unix())
+	}
+	modelTrainedTsGauge.WithLabelValues(app, ns).Set(trainedTs)
+	modelInfoGauge.DeletePartialMatch(prometheus.Labels{"application": app, "namespace": ns})
+	modelInfoGauge.WithLabelValues(app, ns, prediction.ModelName, prediction.ModelVersion).Set(1)
+	for i, v := range prediction.Predictions {
+		step := i + 1
+		target := issuedAt.Add(time.Duration(float64(step) * stepMin * float64(time.Minute)))
+		forecastRpmGauge.WithLabelValues(app, ns, strconv.Itoa(step)).Set(v)
+		forecastTargetTsGauge.WithLabelValues(app, ns, strconv.Itoa(step)).Set(float64(target.Unix()))
+		rec.Forecasts = append(rec.Forecasts, struct {
+			Step     int     `json:"step"`
+			TargetAt string  `json:"target_at"`
+			RPM      float64 `json:"rpm"`
+		}{Step: step, TargetAt: target.UTC().Format(time.RFC3339), RPM: v})
+	}
+	if path := os.Getenv("FORECAST_LOG"); path != "" {
+		if f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err != nil {
+			r.Log.Error(err, "forecast log not writable", "path", path)
+		} else {
+			line, _ := json.Marshal(rec)
+			if _, err := f.Write(append(line, '\n')); err != nil {
+				r.Log.Error(err, "forecast log write failed", "path", path)
+			}
+			_ = f.Close()
+		}
+	}
 }
 
 // calculateScaleDownTarget applies stabilization and gradual reduction to scale-down.
@@ -645,8 +742,16 @@ func (r *PredictiveAutoscalerReconciler) scaleDeployment(
 	if deployment.Spec.Replicas != nil && *deployment.Spec.Replicas == replicas {
 		return nil // Already at target
 	}
+	direction := "up"
+	if deployment.Spec.Replicas != nil && replicas < *deployment.Spec.Replicas {
+		direction = "down"
+	}
 	deployment.Spec.Replicas = &replicas
-	return r.Update(ctx, deployment)
+	if err := r.Update(ctx, deployment); err != nil {
+		return err
+	}
+	scaleEventsTotal.WithLabelValues(deployment.Name, deployment.Namespace, direction).Inc()
+	return nil
 }
 
 // updateStatus updates the PredictiveAutoscaler status

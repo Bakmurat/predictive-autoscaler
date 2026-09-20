@@ -1,0 +1,74 @@
+---
+# Shared k6 load script. One Job per app per UTC hour (see k6-*-cronjob.yaml): each Job runs a
+# constant arrival rate taken from PATTERN_UTC for the current UTC hour and stops ~30 s before the
+# next hour, so every generator is aligned to wall-clock UTC hours and independent of restarts.
+# The summary is printed as one JSON line at the end (kept in the Job's logs).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k6-load-script
+  namespace: demo
+data:
+  load.js: |
+    import http from 'k6/http';
+
+    // Requests per minute by UTC hour (synthetic daily pattern: night trough, morning ramp,
+    // afternoon peak at 15:00 UTC, evening decline). Peak 6,000 req/min = 100 req/s.
+    const PATTERN_UTC = {
+      0: 250, 1: 200, 2: 150, 3: 150, 4: 200, 5: 300,
+      6: 750, 7: 1250, 8: 2000,
+      9: 3000, 10: 3750, 11: 4250,
+      12: 4500, 13: 5000, 14: 5500, 15: 6000, 16: 5000,
+      17: 4250, 18: 3000, 19: 2400, 20: 1000,
+      21: 600, 22: 400, 23: 300,
+    };
+
+    const now = new Date();
+    const HOUR = now.getUTCHours();
+    const RATE = PATTERN_UTC[HOUR];
+    const secondsIntoHour = now.getUTCMinutes() * 60 + now.getUTCSeconds();
+    const DURATION = Math.max(60, 3600 - secondsIntoHour - 30);  // end 30 s before the next hour
+
+    export const options = {
+      discardResponseBodies: true,
+      scenarios: {
+        hour: {
+          executor: 'constant-arrival-rate',
+          rate: RATE,
+          timeUnit: '1m',
+          duration: `${DURATION}s`,
+          preAllocatedVUs: 10,
+          maxVUs: 100,
+        },
+      },
+    };
+
+    export default function () {
+      http.get(__ENV.TARGET_URL);
+    }
+
+    export function handleSummary(data) {
+      // handleSummary runs in a fresh init context at the END of the test, so recompute the
+      // planned values from the actual start time (end - run duration), not from `now`.
+      const m = data.metrics;
+      const pick = (k) => (m[k] ? m[k].values : null);
+      const runMs = data.state.testRunDurationMs;
+      const startedAt = new Date(Date.now() - runMs);
+      const startHour = startedAt.getUTCHours();
+      const summary = {
+        kind: 'k6-hour-summary',
+        target: __ENV.TARGET_NAME,
+        utc_hour: startHour,
+        planned_rpm: PATTERN_UTC[startHour],
+        planned_duration_s: Math.round(runMs / 1000),
+        planned_requests: Math.round(PATTERN_UTC[startHour] * runMs / 60000),
+        started_at: startedAt.toISOString(),
+        http_reqs: pick('http_reqs'),
+        iterations: pick('iterations'),
+        dropped_iterations: pick('dropped_iterations'),
+        http_req_failed: pick('http_req_failed'),
+        http_req_duration: pick('http_req_duration'),
+        vus_max: pick('vus_max'),
+      };
+      return { stdout: JSON.stringify(summary) + '\n' };
+    }

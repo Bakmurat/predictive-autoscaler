@@ -23,7 +23,7 @@ type PredictiveAutoscalerSpec struct {
 
 	// Resources configuration for replica calculation
 	Resources ResourcesConfig `json:"resources,omitempty"`
-} 
+}
 
 // TargetDeployment specifies the target deployment
 type TargetDeployment struct {
@@ -80,6 +80,12 @@ type RequestsMetric struct {
 // PredictionConfig defines prediction settings
 type PredictionConfig struct {
 	// HorizonMinutes is how far ahead to predict (in minutes)
+	// Enabled turns the forecasting component on or off. When false the operator scales the target from
+	// the reactive request-rate rule only, which makes it a matched reactive-only control for benchmarks.
+	// Defaults to true.
+	// +kubebuilder:default=true
+	Enabled *bool `json:"enabled,omitempty"`
+
 	HorizonMinutes int32 `json:"horizonMinutes,omitempty"`
 
 	// LeadTimeMinutes is how early to scale before predicted load

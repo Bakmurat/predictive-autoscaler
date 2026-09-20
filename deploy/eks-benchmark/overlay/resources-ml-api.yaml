@@ -1,0 +1,13 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ml-api
+  namespace: ml-engine
+spec:
+  template:
+    spec:
+      containers:
+        - name: api
+          resources:
+            requests: { cpu: 250m, memory: 512Mi }   # measured idle working set 300-384Mi; TensorFlow inference headroom in the limit
+            limits: { cpu: "2", memory: 1536Mi }

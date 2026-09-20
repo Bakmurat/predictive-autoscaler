@@ -16,8 +16,8 @@ spec:
     name: myapptwo
 
   # Must match PredictiveAutoscaler boundaries
-  minReplicaCount: 2
-  maxReplicaCount: 40
+  minReplicaCount: 1
+  maxReplicaCount: 12
 
   # Reactive polling - checks frequently for safety
   pollingInterval: 10        # Check every 10 seconds
@@ -51,34 +51,14 @@ spec:
             periodSeconds: 15
           selectPolicy: Max      # Aggressive scale-up
 
+  # Single trigger, same request-count definition and per-replica target as the operator's
+  # reactive rule (KEDA desired = ceil(value / threshold)). CPU and memory triggers were removed on
+  # purpose so that this is a like-for-like system comparison of the reactive policy.
   triggers:
-  # -----------------------------------------------
-  # CPU-based scaling (PRIMARY FALLBACK)
-  # Fires if predictive missed and CPU > 70%
-  # -----------------------------------------------
-  - type: cpu
-    metricType: Utilization
-    metadata:
-      value: "70"
-
-  # -----------------------------------------------
-  # Memory-based scaling (SECONDARY FALLBACK)
-  # Protects against OOM kills
-  # -----------------------------------------------
-  - type: memory
-    metricType: Utilization
-    metadata:
-      value: "70"
-
-  # -----------------------------------------------
-  # Request rate from VictoriaMetrics (LEADING FALLBACK)
-  # Uses RPS (requests per second) directly — no * 60 conversion
-  # This is the same metric the predictive autoscaler uses
-  # -----------------------------------------------
   - type: prometheus
     metadata:
       serverAddress: VM_QUERY_URL
       query: |
-        sum(rate(istio_requests_total{destination_workload="myapptwo"}[1m]))
-      threshold: "30"             # Scale if per-pod avg RPS > 300
-      activationThreshold: "15"   # Start evaluating at 150 RPS per-pod avg
+        sum(rate(istio_requests_total{reporter="destination",destination_workload="myapptwo",destination_workload_namespace="demo"}[1m])) * 60
+      threshold: "600"             # 10 req/s per replica = 600 req/min per replica
+      activationThreshold: "60"
