@@ -53,6 +53,12 @@ def main():
     # Training parameters
     hours = int(os.environ.get("TRAINING_HOURS", "168"))  # 7 days of data by default
     epochs = int(os.environ.get("TRAINING_EPOCHS", "50"))
+    # SMOKE-TEST ONLY: a shorter input window lets the whole train -> save -> load -> forecast pipeline
+    # be exercised on a few hours of data. The benchmark model always uses the default (144 = 24 h);
+    # the API serves whatever window the artifact carries, so never point the real API at a smoke model.
+    sequence_length = int(os.environ.get("TRAINING_SEQUENCE_LENGTH", "144"))
+    if sequence_length != 144:
+        logger.warning("TRAINING_SEQUENCE_LENGTH=%d: smoke-test setting, not the benchmark model", sequence_length)
 
     logger.info(f"Training Parameters:")
     logger.info(f"  Historical data: {hours} hours ({hours // 24} days)")
@@ -86,7 +92,8 @@ def main():
             baseline_rpm=app_config["baseline_rpm"],
             hours=hours,
             model_dir=model_dir,
-            epochs=epochs
+            epochs=epochs,
+            sequence_length=sequence_length
         )
 
         if result.get("skipped"):
@@ -135,6 +142,46 @@ def main():
             logger.info(f"Atomic rename: {tmp_path} -> {final_path}")
         else:
             logger.warning("No tmp_model_path in result, model was saved directly")
+            final_path = Path(model_path)
+
+        # Provenance sidecar (read by the API and reported to the operator): what the artifact was
+        # trained on, where the splits fall, and the artifact's own hash. Written after the rename so the
+        # hash is of the published file; the API treats a model without a sidecar as "provenance unknown".
+        import hashlib
+        h = hashlib.sha256()
+        with open(final_path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        meta = {
+            "artifact": final_path.name,
+            "artifact_sha256": h.hexdigest(),
+            "artifact_bytes": final_path.stat().st_size,
+            "trained_at": result.get("trained_at"),
+            "training_cutoff": result.get("training_cutoff"),
+            "data_start": result.get("data_start"),
+            "train_end": result.get("train_end"),
+            "test_start": result.get("test_start"),
+            "sequence_length": result.get("sequence_length"),
+            "steps_ahead": result.get("steps_ahead"),
+            "epochs_requested": result.get("epochs_requested"),
+            "data_points": result.get("data_points"),
+            "train_points": result.get("train_points"),
+            "test_points": result.get("test_points"),
+            "model_metadata": result.get("model_metadata"),
+            "evaluation_metrics": result.get("evaluation_metrics"),
+            "preflight": result.get("preflight"),
+            "workload": app_config["workload_name"],
+            "namespace": app_config["namespace"],
+            "training_hours_requested": hours,
+            "image": os.environ.get("IMAGE_REF", ""),
+            "git_commit": os.environ.get("GIT_COMMIT", ""),
+            "smoke_test": sequence_length != 144,
+        }
+        meta_tmp = final_path.with_suffix(".meta.json.tmp")
+        with open(meta_tmp, "w") as fh:
+            json.dump(meta, fh, indent=2, default=str)
+        os.rename(str(meta_tmp), str(final_path.with_suffix(".meta.json")))
+        logger.info(f"Provenance written: {final_path.with_suffix('.meta.json')} sha256={meta['artifact_sha256']}")
 
         # Print results
         logger.info("")
@@ -146,9 +193,12 @@ def main():
         logger.info(f"Requests Model Trained Successfully")
         logger.info(f"  Model saved: {result.get('model_path')}")
         logger.info(f"  Training data points: {result.get('data_points')}")
-        if result.get('evaluation_metrics'):
-            logger.info(f"  RMSE: {result['evaluation_metrics']['rmse']:.4f}")
-            logger.info(f"  MAE: {result['evaluation_metrics']['mae']:.4f}")
+        ev = result.get('evaluation_metrics') or {}
+        if ev.get('rmse') is None:
+            logger.info(f"  Evaluation: {ev.get('evaluation', 'unavailable')}")
+        else:
+            logger.info(f"  RMSE: {ev['rmse']:.4f}")
+            logger.info(f"  MAE: {ev['mae']:.4f}")
 
         # JSON summary line
         training_time = round(time.time() - start_time, 1)
@@ -156,8 +206,12 @@ def main():
             "status": "success",
             "model_path": str(result.get("model_path", "")),
             "data_points": result.get("data_points", 0),
-            "rmse": result.get("evaluation_metrics", {}).get("rmse", 0),
-            "mae": result.get("evaluation_metrics", {}).get("mae", 0),
+            "rmse": ev.get("rmse"),
+            "mae": ev.get("mae"),
+            "evaluation": ev.get("evaluation", "ok" if ev.get("rmse") is not None else "unavailable"),
+            "training_cutoff": result.get("training_cutoff"),
+            "artifact_sha256": meta["artifact_sha256"] if tmp_path else None,
+            "sequence_length": sequence_length,
             "training_time_seconds": training_time
         }
         print(json.dumps(summary))

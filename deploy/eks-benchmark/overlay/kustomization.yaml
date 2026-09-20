@@ -17,6 +17,7 @@ patches:
   - path: delete-predictive-autoscaler-ml-api.yaml
   - path: delete-predictive-autoscaler-controller.yaml
   - path: operator-vm-url.yaml
+  - path: placement.yaml
   - target: { kind: PersistentVolumeClaim, name: ".*" }
     patch: |-
       - op: add

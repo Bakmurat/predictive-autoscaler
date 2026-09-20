@@ -28,34 +28,114 @@ logger = logging.getLogger(__name__)
 
 
 
-# Minimum complete 10-minute observations for a non-empty train/validation split:
-# sequence_length (144) + STEPS_AHEAD (6) input/target window, plus enough rows that the 80/20
-# split inside the model and the 80/20 split here both leave at least one sequence.
-MIN_HISTORY_POINTS = 189
+# The model needs sequence_length input steps plus STEPS_AHEAD target steps per training sequence,
+# and both the outer 80/20 (train/test) split here and the inner 80/20 (train/validation) split in
+# LSTMForecastModel.train must leave at least one sequence. Validity is decided by counting the
+# sequences that would actually be built, not by a fractional threshold (see sequence_budget()).
 EXPECTED_CADENCE_S = 600
-CADENCE_TOLERANCE_S = 90
-MAX_GAP_S = 1800
+CADENCE_TOLERANCE_S = 30      # a grid sample may deviate this much from its 10-minute slot
+DEFAULT_SEQUENCE_LENGTH = 144  # 24 h of ten-minute steps (LSTMForecastModel default)
+STEPS_AHEAD = 6                # one hour of ten-minute steps (LSTMForecastModel.STEPS_AHEAD)
 
 
-def preflight_history(df) -> tuple:
-    """Check that the fetched history can train the model. Returns (ok, reason)."""
-    if df is None or df.empty:
-        return False, "insufficient history: have 0 of %d points" % MIN_HISTORY_POINTS
-    ts = df['timestamp'].sort_values().values
-    n = len(ts)
-    if n < MIN_HISTORY_POINTS:
-        return False, "insufficient history: have %d of %d ten-minute points" % (n, MIN_HISTORY_POINTS)
+def sequence_budget(n_points: int, sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
+                    steps_ahead: int = STEPS_AHEAD) -> dict:
+    """How many sequences a contiguous run of n_points ten-minute observations yields.
+
+    Mirrors the two splits exactly: train_rows = int(0.8 * n) (train_lstm_for_metric), then the model
+    builds train_rows - L - S + 1 sequences and splits them int(0.8 * m) / rest (LSTMForecastModel.train).
+    Evaluation needs the remaining test rows to hold at least one sequence as well; it is optional.
+    """
+    b = _budget(n_points, sequence_length, steps_ahead)
+    b["min_points_for_training"] = min_points_for_training(sequence_length, steps_ahead)
+    return b
+
+
+def _budget(n_points, sequence_length, steps_ahead):
+    window = sequence_length + steps_ahead
+    train_rows = int(0.8 * n_points)
+    test_rows = n_points - train_rows
+    seqs = max(0, train_rows - window + 1)
+    inner_train = int(0.8 * seqs)
+    inner_val = seqs - inner_train
+    return {"points": n_points, "train_rows": train_rows, "test_rows": test_rows, "window": window,
+            "sequences": seqs, "train_sequences": inner_train, "validation_sequences": inner_val,
+            "evaluation_available": test_rows >= window}
+
+
+def min_points_for_training(sequence_length: int = DEFAULT_SEQUENCE_LENGTH, steps_ahead: int = STEPS_AHEAD) -> int:
+    """Smallest n such that the budget has >= 1 training and >= 1 validation sequence."""
+    n = sequence_length + steps_ahead
+    while True:
+        b = _budget(n, sequence_length, steps_ahead)
+        if b["train_sequences"] >= 1 and b["validation_sequences"] >= 1:
+            return n
+        n += 1
+
+
+def preflight_history(df, sequence_length: int = DEFAULT_SEQUENCE_LENGTH, steps_ahead: int = STEPS_AHEAD):
+    """Validate fetched history against an explicit ten-minute grid.
+
+    Returns (ok, reason, prepared_df, info). prepared_df is the longest contiguous run of grid slots
+    (sorted, one row per slot, duplicates and non-finite values removed) — the data the model trains on.
+    """
     import numpy as np
-    deltas = np.diff(ts.astype('datetime64[s]').astype('int64'))
-    if len(deltas) and abs(float(np.median(deltas)) - EXPECTED_CADENCE_S) > CADENCE_TOLERANCE_S:
-        return False, "unexpected cadence: median %.0fs, expected %ds" % (float(np.median(deltas)), EXPECTED_CADENCE_S)
-    big = deltas[deltas > MAX_GAP_S]
-    if len(big):
-        return False, "history has %d gap(s) longer than %ds (largest %.0fs)" % (len(big), MAX_GAP_S, float(big.max()))
-    train_rows = int(0.8 * n)
-    if train_rows < MIN_HISTORY_POINTS * 0.8 or (n - train_rows) < 1:
-        return False, "insufficient history for train/validation split: %d rows" % n
-    return True, "ok: %d points" % n
+    import pandas as pd
+    info = {"raw_points": 0 if df is None else int(len(df)), "pandas": pd.__version__}
+    if df is None or df.empty:
+        return False, "insufficient history: have 0 of %d ten-minute points" % min_points_for_training(sequence_length, steps_ahead), None, info
+    d = df[["timestamp", "value"]].copy()
+    d["value"] = pd.to_numeric(d["value"], errors="coerce")
+    n_nonfinite = int((~np.isfinite(d["value"])).sum())
+    d = d[np.isfinite(d["value"])]
+    d["timestamp"] = pd.to_datetime(d["timestamp"], utc=True)
+    d = d.sort_values("timestamp")
+    n_dup = int(d["timestamp"].duplicated().sum())
+    d = d.drop_duplicates("timestamp", keep="last")
+    info.update({"nonfinite_dropped": n_nonfinite, "duplicates_dropped": n_dup})
+    if d.empty:
+        return False, "insufficient history: no finite observations", None, info
+    # Snap every sample to its ten-minute slot; a sample farther than the tolerance from any slot is
+    # a cadence violation, and two samples in one slot after snapping are duplicates (keep the last).
+    # Seconds since the epoch, computed with Timestamp arithmetic (portable across pandas versions;
+    # .astype("int64") on tz-aware columns is not).
+    epoch = ((d["timestamp"] - pd.Timestamp("1970-01-01", tz="UTC")) // pd.Timedelta(seconds=1)).astype("int64")
+    slot = ((epoch + EXPECTED_CADENCE_S // 2) // EXPECTED_CADENCE_S) * EXPECTED_CADENCE_S
+    off = (epoch - slot).abs()
+    n_offgrid = int((off > CADENCE_TOLERANCE_S).sum())
+    d = d[off <= CADENCE_TOLERANCE_S].copy()
+    d["slot"] = slot[off <= CADENCE_TOLERANCE_S]
+    d = d.drop_duplicates("slot", keep="last")
+    info["offgrid_dropped"] = n_offgrid
+    if d.empty:
+        return False, "unexpected cadence: no samples on the ten-minute grid", None, info
+    slots = d["slot"].to_numpy()
+    expected = int((slots[-1] - slots[0]) // EXPECTED_CADENCE_S) + 1
+    missing = expected - len(slots)
+    # Longest contiguous run of consecutive slots (missing slots break the run).
+    breaks = np.flatnonzero(np.diff(slots) != EXPECTED_CADENCE_S)
+    starts = np.concatenate(([0], breaks + 1)); ends = np.concatenate((breaks + 1, [len(slots)]))
+    lengths = ends - starts
+    k = int(np.argmax(lengths)); run = d.iloc[starts[k]:ends[k]]
+    info.update({"grid_first": pd.Timestamp(slots[0], unit="s", tz="UTC").isoformat(),
+                 "grid_last": pd.Timestamp(slots[-1], unit="s", tz="UTC").isoformat(),
+                 "expected_slots": expected, "present_slots": int(len(slots)), "missing_slots": int(missing),
+                 "contiguous_runs": int(len(lengths)), "longest_run_points": int(lengths[k]),
+                 "run_first": run["timestamp"].iloc[0].isoformat(), "run_last": run["timestamp"].iloc[-1].isoformat()})
+    budget = sequence_budget(int(lengths[k]), sequence_length, steps_ahead)
+    info["sequence_budget"] = budget
+    need = budget["min_points_for_training"]
+    if budget["train_sequences"] < 1 or budget["validation_sequences"] < 1:
+        why = "insufficient history: have %d of %d ten-minute points" % (int(lengths[k]), need)
+        if missing:
+            why += " in the longest contiguous run (%d slot(s) missing across %d run(s))" % (missing, len(lengths))
+        return False, why, None, info
+    prepared = run[["timestamp", "value"]].reset_index(drop=True)
+    prepared["timestamp"] = prepared["timestamp"].dt.tz_localize(None)  # model uses naive UTC index
+    return True, "ok: %d contiguous points (%d train / %d validation sequences; evaluation %s)" % (
+        int(lengths[k]), budget["train_sequences"], budget["validation_sequences"],
+        "available" if budget["evaluation_available"] else "unavailable"), prepared, info
+
 
 def train_lstm_for_metric(
     df: pd.DataFrame,
@@ -64,7 +144,8 @@ def train_lstm_for_metric(
     model_dir: Path,
     epochs: int = 50,
     min_data_points: int = None,
-    atomic: bool = False
+    atomic: bool = False,
+    sequence_length: int = DEFAULT_SEQUENCE_LENGTH
 ) -> dict:
     """
     Train LSTM model for a specific metric.
@@ -107,8 +188,13 @@ def train_lstm_for_metric(
 
     logger.info(f"Train size: {len(train_data)}, Test size: {len(test_data)}")
 
-    # Initialize and train model
-    model = LSTMForecastModel()
+    # Provenance boundaries (UTC): training data start/end (= training cutoff), outer split boundary
+    data_start = df.index[0]; train_end = train_data.index[-1]
+    test_start = test_data.index[0] if len(test_data) else None
+    data_end = df.index[-1]
+
+    # Initialize and train model (sequence_length is the model default unless a smoke test overrides it)
+    model = LSTMForecastModel(sequence_length=sequence_length)
 
     try:
         training_result = model.train(train_data, target_column='value', epochs=epochs)
@@ -146,7 +232,15 @@ def train_lstm_for_metric(
             "evaluation_metrics": eval_result,
             "sample_prediction_confidence": prediction['confidence'],
             "model_path": str(model_path),
-            "trained_at": datetime.utcnow().isoformat()
+            "trained_at": datetime.utcnow().isoformat() + "Z",
+            "sequence_length": sequence_length,
+            "steps_ahead": STEPS_AHEAD,
+            "epochs_requested": epochs,
+            "data_start": data_start.isoformat() + "Z",
+            "training_cutoff": data_end.isoformat() + "Z",
+            "train_end": train_end.isoformat() + "Z",
+            "test_start": (test_start.isoformat() + "Z") if test_start is not None else None,
+            "model_metadata": training_result.get('metadata', {})
         }
 
         if atomic:
@@ -172,7 +266,8 @@ def train_requests_only(
     baseline_rpm: float = 60000,
     hours: int = 168,
     model_dir: Path = None,
-    epochs: int = 50
+    epochs: int = 50,
+    sequence_length: int = DEFAULT_SEQUENCE_LENGTH
 ) -> dict:
     """
     Train LSTM model for requests metric only.
@@ -214,6 +309,15 @@ def train_requests_only(
 
     logger.info(f"Fetched {len(df)} data points for requests metric")
 
+    # Explicit ten-minute-grid preflight: decides by the sequences that will actually be built.
+    ok, reason, prepared, info = preflight_history(df, sequence_length=sequence_length)
+    logger.info("Preflight: %s", json.dumps(info, default=str))
+    if not ok:
+        logger.warning("Training skipped - %s", reason)
+        return {"success": False, "skipped": True, "error": reason, "preflight": info}
+    logger.info("Preflight %s", reason)
+    df = prepared
+
     # Prepare model directory
     if model_dir is None:
         model_dir = Path(__file__).parent / "models"
@@ -226,8 +330,11 @@ def train_requests_only(
         metric_type="requests",
         model_dir=model_dir,
         epochs=epochs,
-        atomic=True
+        atomic=True,
+        sequence_length=sequence_length
     )
+    if isinstance(result, dict):
+        result["preflight"] = info
 
     return result
 
@@ -308,10 +415,15 @@ def train_from_victoriametrics(
     if not metrics:
         logger.error("No metrics retrieved from VictoriaMetrics")
         return {"success": False, "error": "No metrics available"}
-    ok, reason = preflight_history(df)
-    if not ok:
-        logger.warning("Training skipped - %s", reason)
-        return {"success": False, "skipped": True, "error": reason}
+    for key in list(metrics):
+        ok, reason, prepared, _info = preflight_history(metrics[key])
+        if not ok:
+            logger.warning("Skipping %s model - %s", key, reason)
+            metrics.pop(key)
+        else:
+            metrics[key] = prepared
+    if not metrics:
+        return {"success": False, "skipped": True, "error": "no metric passed the history preflight"}
 
     # Prepare model directory
     if model_dir is None:

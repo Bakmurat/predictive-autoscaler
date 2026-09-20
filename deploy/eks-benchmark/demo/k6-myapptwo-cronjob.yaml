@@ -27,6 +27,15 @@ spec:
             sidecar.istio.io/inject: "false"   # requests are counted by the destination sidecar (reporter="destination")
         spec:
           restartPolicy: Never
+          # Generators never share a node with ml-api (whose node also hosts the training job), so
+          # the training node's budget is deterministic (Codex C-12).
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels: { app: ml-api }
+                  namespaces: [ml-engine]
+                  topologyKey: kubernetes.io/hostname
           containers:
             - name: k6
               image: grafana/k6:0.48.0
@@ -38,7 +47,7 @@ spec:
                   value: "myapptwo"
               resources:
                 requests: { cpu: 50m, memory: 64Mi }
-                limits: { cpu: 500m, memory: 192Mi }
+                limits: { cpu: 500m, memory: 256Mi }
               volumeMounts:
                 - name: script
                   mountPath: /scripts

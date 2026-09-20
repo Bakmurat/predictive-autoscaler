@@ -94,7 +94,14 @@ var (
 	modelTrainedTsGauge = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "predictive_autoscaler_model_trained_timestamp_seconds",
-			Help: "Unix time the model behind the current forecast was trained (training data cutoff); -1 if unknown",
+			Help: "Unix time the model behind the current forecast finished training; -1 if unknown",
+		},
+		[]string{"application", "namespace"},
+	)
+	modelTrainingCutoffTsGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "predictive_autoscaler_model_training_cutoff_timestamp_seconds",
+			Help: "Unix time of the last observation the model behind the current forecast was trained on; -1 if unknown",
 		},
 		[]string{"application", "namespace"},
 	)
@@ -122,7 +129,7 @@ var (
 )
 
 func init() {
-	metrics.Registry.MustRegister(forecastRpmGauge, forecastTargetTsGauge, forecastIssuedTsGauge, forecastStepMinutesGauge, modelTrainedTsGauge, modelInfoGauge, scaleEventsTotal, desiredReplicasGauge)
+	metrics.Registry.MustRegister(forecastRpmGauge, forecastTargetTsGauge, forecastIssuedTsGauge, forecastStepMinutesGauge, modelTrainedTsGauge, modelTrainingCutoffTsGauge, modelInfoGauge, scaleEventsTotal, desiredReplicasGauge)
 	metrics.Registry.MustRegister(
 		predictedReplicasGauge,
 		actualNeededReplicasGauge,

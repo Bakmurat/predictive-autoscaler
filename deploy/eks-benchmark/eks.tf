@@ -83,7 +83,9 @@ module "eks" {
       desired_size   = var.node_desired
       max_size       = var.node_max
       subnet_ids     = module.vpc.public_subnets
-      disk_size      = 30
+      # 20 GiB is what the AL2023 launch template actually provisions for this group (verified with
+      # describe-volumes on 2026-09-20); declared explicitly so the cost ledger and the code agree.
+      disk_size      = 20
       labels         = { role = "worker" }
     }
   }

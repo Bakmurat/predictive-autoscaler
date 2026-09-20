@@ -1,0 +1,37 @@
+# Deterministic placement (Codex C-12). The model PVC (RWO, zonal EBS) already pins ml-api and the
+# training job to one availability zone; these rules make the rest of the layout explicit:
+#   ml-api   never on the Prometheus node (Prometheus is pinned to its own zonal volume),
+#   operator never on the ml-api node (its forecast-log PVC is in the other zone as well),
+#   training co-located with ml-api (podAffinity in the base manifest, RWO volume).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ml-api
+  namespace: ml-engine
+spec:
+  strategy:
+    type: Recreate   # single writer of the RWO model volume; no surge pod on the training node
+  template:
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels: { app.kubernetes.io/name: prometheus }
+              namespaces: [monitoring]
+              topologyKey: kubernetes.io/hostname
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: predictive-operator
+  namespace: ml-engine
+spec:
+  template:
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels: { app: ml-api }
+              topologyKey: kubernetes.io/hostname

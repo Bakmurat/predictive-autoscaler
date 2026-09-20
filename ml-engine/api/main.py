@@ -2,10 +2,11 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 import logging
 import os
+import json
 import sys
 import gc
 import asyncio
@@ -89,6 +90,7 @@ class LSTMPredictor:
         self.trained_models = {}
         self.model_train_times = {}  # Track when each model was trained
         self.model_file_mtimes = {}  # Track file mtime for disk reload detection
+        self.model_meta = {}  # model_key -> provenance sidecar (lstm_<key>.meta.json) written by the trainer
         self.validation_metadata = {}  # model_key -> {status, mape, old_mape, timestamp}
         self._training_locks = {}  # Per-model locks to prevent concurrent training
         # Check for MODEL_DIR env var, then try container path, then local paths
@@ -128,6 +130,22 @@ class LSTMPredictor:
             except Exception as e:
                 logger.warning(f"Cold-start job trigger error (non-fatal): {e}")
     
+    def _read_meta(self, model_key: str) -> dict:
+        """Read the trainer's provenance sidecar for a model (artifact hash, training cutoff, split
+        boundaries). Missing or unreadable sidecar -> {} and the model is reported as provenance-unknown."""
+        meta_path = self.model_dir / f"lstm_{model_key}.meta.json"
+        try:
+            with open(meta_path) as fh:
+                meta = json.load(fh)
+            if not isinstance(meta, dict):
+                return {}
+            return meta
+        except FileNotFoundError:
+            return {}
+        except Exception as e:
+            logger.warning(f"Unreadable provenance sidecar {meta_path}: {e}")
+            return {}
+
     def _load_pretrained_models(self):
         """Load pre-trained LSTM models if available.
 
@@ -153,13 +171,16 @@ class LSTMPredictor:
                         continue
 
                     self.trained_models[app_name] = model
-                    # Track model file modification time as training time
                     file_mtime = model_file.stat().st_mtime
-                    mtime = datetime.fromtimestamp(file_mtime)
-                    self.model_train_times[app_name] = mtime
                     self.model_file_mtimes[app_name] = file_mtime
-                    age_hours = (datetime.utcnow() - mtime).total_seconds() / 3600
-                    logger.info(f"Loaded model for {app_name} (age: {age_hours:.1f}h)")
+                    meta = self._read_meta(app_name)
+                    self.model_meta[app_name] = meta
+                    # Training time from the trainer's sidecar; the file mtime is only the fallback
+                    trained_at = _parse_iso(meta.get("trained_at")) or datetime.utcfromtimestamp(file_mtime)
+                    self.model_train_times[app_name] = trained_at
+                    age_hours = (datetime.utcnow() - trained_at).total_seconds() / 3600
+                    logger.info(f"Loaded model for {app_name} (age: {age_hours:.1f}h, sha256={meta.get('artifact_sha256', 'unknown')[:12]}, "
+                                f"training_cutoff={meta.get('training_cutoff', 'unknown')})")
                 except Exception as e:
                     logger.warning(f"Failed to load {model_file}: {e}")
         except Exception as e:
@@ -228,6 +249,7 @@ class LSTMPredictor:
                     self._cleanup_old_model(model_key)
 
                 model = joblib.load(model_path)
+                meta = self._read_meta(model_key)
 
                 # Phase 16 (D-10, D-12): Check for old Dense(1) format
                 if LSTMForecastModel._is_old_model_format(model):
@@ -236,7 +258,8 @@ class LSTMPredictor:
                     return  # Don't load old format
 
                 self.trained_models[model_key] = model
-                self.model_train_times[model_key] = datetime.fromtimestamp(current_mtime)
+                self.model_meta[model_key] = meta
+                self.model_train_times[model_key] = _parse_iso(meta.get("trained_at")) or datetime.utcfromtimestamp(current_mtime)
                 self.model_file_mtimes[model_key] = current_mtime
                 RSS_BYTES_GAUGE.set(self._get_rss_bytes())
                 logger.info(f"Reloaded model {model_key} from disk (file updated)")
@@ -454,13 +477,31 @@ class LSTMPredictor:
                            f"min={min(predicted_values):.2f}, max={max(predicted_values):.2f}, "
                            f"confidence={prediction_result['confidence']:.3f}")
 
-                trained_mtime = self.model_file_mtimes.get(model_key, 0)
-                trained_at = (datetime.utcfromtimestamp(trained_mtime).isoformat() + "Z") if trained_mtime else ""
+                meta = self.model_meta.get(model_key, {})
+                sha = meta.get("artifact_sha256") or ""
+                trained_dt = self.model_train_times.get(model_key)
+                trained_at = (trained_dt.isoformat() + "Z") if trained_dt and trained_dt != datetime.min else ""
+                if model_key not in self.trained_models:
+                    version = f"{model_key}@untrained"
+                elif sha:
+                    version = f"{model_key}@{sha[:12]}"
+                else:
+                    version = f"{model_key}@mtime{int(self.model_file_mtimes.get(model_key, 0))}"
+                inference_input_end = ""
+                try:
+                    inference_input_end = str(metric_data[-1].get("timestamp", "")) if metric_data else ""
+                except Exception:
+                    pass
                 return {
                     "application": application,
                     "metric_type": metric_type,
-                    "model_version": f"{model_key}@{int(trained_mtime)}" if trained_mtime else f"{model_key}@untrained",
+                    "model_version": version,
                     "model_trained_at": trained_at,
+                    "training_cutoff": meta.get("training_cutoff") or "",
+                    "artifact_sha256": sha,
+                    "sequence_length": int(getattr(model, "sequence_length", 0) or 0),
+                    "inference_input_end": inference_input_end,
+                    "provenance": "sidecar" if meta else "unknown",
                     "predictions": predicted_values,
                     "confidence": round(prediction_result['confidence'], 3),
                     "model_name": f"lstm_{application}_{metric_type}",
@@ -475,6 +516,20 @@ class LSTMPredictor:
             except Exception as e:
                 PREDICTION_ERRORS.labels(error_type=type(e).__name__).inc()
                 raise e
+
+def _parse_iso(value):
+    """ISO-8601 (with or without Z) -> naive UTC datetime, or None."""
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        v = value.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(v)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+    except Exception:
+        return None
+
 
 # Initialize predictor
 predictor = LSTMPredictor()
@@ -755,6 +810,7 @@ async def get_models():
             "scaler_range": scaler_range,
             "age_hours": round(age_hours, 1) if age_hours is not None else None,
             "is_stale": is_stale,
+            "provenance": predictor.model_meta.get(model_key) or {"provenance": "unknown"},
         }
 
     return {

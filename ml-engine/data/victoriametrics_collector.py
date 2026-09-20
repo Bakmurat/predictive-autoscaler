@@ -15,6 +15,14 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def _floor_to_grid(dt, seconds):
+    """Floor a naive UTC datetime to a multiple of `seconds` since the epoch."""
+    from datetime import timedelta as _td
+    epoch = int((dt.replace(tzinfo=None) - datetime(1970, 1, 1)).total_seconds())
+    return datetime(1970, 1, 1) + _td(seconds=(epoch // seconds) * seconds)
+
+
+
 class VictoriaMetricsCollector:
     """Collects CPU and memory metrics from VictoriaMetrics for LSTM training/prediction."""
 
@@ -276,7 +284,9 @@ class VictoriaMetricsCollector:
         Returns:
             DataFrame with columns: timestamp, value (requests per minute)
         """
-        end_time = datetime.utcnow()
+        # Align the window to the ten-minute wall-clock grid so every sample of every run sits on the same
+        # slots (training preflight, scoring, and cross-run comparisons all assume this grid).
+        end_time = _floor_to_grid(datetime.utcnow(), 600)
         start_time = end_time - timedelta(hours=hours)
 
         # Build query

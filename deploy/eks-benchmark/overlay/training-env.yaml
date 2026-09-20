@@ -15,3 +15,8 @@ spec:
                   value: "nginx-test"
                 - name: TRAINING_NAMESPACE
                   value: "demo"
+                # Provenance recorded in the model's sidecar (substituted by deploy.sh)
+                - name: IMAGE_REF
+                  value: "ECR_REGISTRY/predictive-autoscaler/ml-api:IMAGE_TAG"
+                - name: GIT_COMMIT
+                  value: "GIT_COMMIT_VALUE"

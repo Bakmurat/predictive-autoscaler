@@ -11,6 +11,9 @@ spec:
   selector:
     matchLabels:
       app: nginx-test
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }   # rollout overlap bounded to one extra pod per app (budget, Codex C-12)
   template:
     metadata:
       labels:
@@ -21,6 +24,15 @@ spec:
         sidecar.istio.io/proxyMemory: "48Mi"
         sidecar.istio.io/proxyMemoryLimit: "128Mi"
     spec:
+      # Replicas spread evenly across the two nodes (max skew 1), so each node's share of the
+      # 12-replica ceiling is at most 6 per app (Codex C-12: enforced placement, not assumed).
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: nginx-test
       containers:
       - name: nginx
         image: nginx:1.25-alpine

@@ -88,9 +88,14 @@ type MLPredictionResponse struct {
 	ModelName      string    `json:"model_name"`
 	ModelVersion   string    `json:"model_version"`
 	ModelTrainedAt string    `json:"model_trained_at"`
-	HorizonMinutes int32     `json:"horizon_minutes"`
-	Timestamp      string    `json:"timestamp"`
-	MAPE           float64   `json:"mape"`
+	// Provenance from the trainer's sidecar, passed through by the API (empty when unknown).
+	TrainingCutoff    string  `json:"training_cutoff"`
+	ArtifactSHA256    string  `json:"artifact_sha256"`
+	InferenceInputEnd string  `json:"inference_input_end"`
+	SequenceLength    int32   `json:"sequence_length"`
+	HorizonMinutes    int32   `json:"horizon_minutes"`
+	Timestamp         string  `json:"timestamp"`
+	MAPE              float64 `json:"mape"`
 }
 
 // predictionEnabled reports whether the forecasting component is on for this autoscaler
@@ -533,8 +538,15 @@ type forecastRecord struct {
 	ModelName      string  `json:"model_name"`
 	ModelVersion   string  `json:"model_version"`
 	ModelTrainedAt string  `json:"model_trained_at"`
-	Confidence     float64 `json:"confidence"`
-	Forecasts      []struct {
+	// TrainingCutoff is the last observation timestamp the model was trained on; every target_at
+	// below is later than it, which is what makes the record forward-looking.
+	TrainingCutoff    string  `json:"training_cutoff"`
+	ArtifactSHA256    string  `json:"artifact_sha256"`
+	InferenceInputEnd string  `json:"inference_input_end"`
+	SequenceLength    int32   `json:"sequence_length"`
+	TargetAnchor      string  `json:"target_anchor"` // "inference_input_end" or "issued_at"
+	Confidence        float64 `json:"confidence"`
+	Forecasts         []struct {
 		Step     int     `json:"step"`
 		TargetAt string  `json:"target_at"`
 		RPM      float64 `json:"rpm"`
@@ -563,7 +575,10 @@ func (r *PredictiveAutoscalerReconciler) recordForecast(
 	rec := forecastRecord{
 		IssuedAt: issuedAt.UTC().Format(time.RFC3339), Application: app, Namespace: ns,
 		HorizonMinutes: horizon, StepMinutes: stepMin, ModelName: prediction.ModelName,
-		ModelVersion: prediction.ModelVersion, ModelTrainedAt: prediction.ModelTrainedAt, Confidence: prediction.Confidence,
+		ModelVersion: prediction.ModelVersion, ModelTrainedAt: prediction.ModelTrainedAt,
+		TrainingCutoff: prediction.TrainingCutoff, ArtifactSHA256: prediction.ArtifactSHA256,
+		InferenceInputEnd: prediction.InferenceInputEnd, SequenceLength: prediction.SequenceLength,
+		Confidence: prediction.Confidence,
 	}
 	forecastIssuedTsGauge.WithLabelValues(app, ns).Set(float64(issuedAt.Unix()))
 	forecastStepMinutesGauge.WithLabelValues(app, ns).Set(stepMin)
@@ -572,11 +587,25 @@ func (r *PredictiveAutoscalerReconciler) recordForecast(
 		trainedTs = float64(t.Unix())
 	}
 	modelTrainedTsGauge.WithLabelValues(app, ns).Set(trainedTs)
+	cutoffTs := float64(-1)
+	if t, err := time.Parse(time.RFC3339, prediction.TrainingCutoff); err == nil {
+		cutoffTs = float64(t.Unix())
+	}
+	modelTrainingCutoffTsGauge.WithLabelValues(app, ns).Set(cutoffTs)
 	modelInfoGauge.DeletePartialMatch(prometheus.Labels{"application": app, "namespace": ns})
 	modelInfoGauge.WithLabelValues(app, ns, prediction.ModelName, prediction.ModelVersion).Set(1)
+	// Horizon steps are anchored on the last observation the forecast was computed from
+	// (inference_input_end, on the ten-minute grid) when the API reports it; otherwise on the
+	// issuance time. The anchor is recorded so the scorer can see which one applied.
+	anchor := issuedAt
+	rec.TargetAnchor = "issued_at"
+	if t, err := time.Parse(time.RFC3339, normalizeRFC3339(prediction.InferenceInputEnd)); err == nil && !t.IsZero() {
+		anchor = t
+		rec.TargetAnchor = "inference_input_end"
+	}
 	for i, v := range prediction.Predictions {
 		step := i + 1
-		target := issuedAt.Add(time.Duration(float64(step) * stepMin * float64(time.Minute)))
+		target := anchor.Add(time.Duration(float64(step) * stepMin * float64(time.Minute)))
 		forecastRpmGauge.WithLabelValues(app, ns, strconv.Itoa(step)).Set(v)
 		forecastTargetTsGauge.WithLabelValues(app, ns, strconv.Itoa(step)).Set(float64(target.Unix()))
 		rec.Forecasts = append(rec.Forecasts, struct {
@@ -830,4 +859,18 @@ func (r *PredictiveAutoscalerReconciler) SetupWithManager(mgr ctrl.Manager) erro
 		For(&autoscalerv1alpha1.PredictiveAutoscaler{}).
 		Owns(&appsv1.Deployment{}).
 		Complete(r)
+}
+
+// normalizeRFC3339 accepts the API's ISO-8601 variants (with or without a trailing Z / offset,
+// with fractional seconds) and returns an RFC3339 string; unknown input is returned unchanged.
+func normalizeRFC3339(v string) string {
+	if v == "" {
+		return v
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02T15:04:05.999999", "2006-01-02T15:04:05", "2006-01-02T15:04:05.999999Z07:00"} {
+		if t, err := time.Parse(layout, v); err == nil {
+			return t.UTC().Format(time.RFC3339)
+		}
+	}
+	return v
 }

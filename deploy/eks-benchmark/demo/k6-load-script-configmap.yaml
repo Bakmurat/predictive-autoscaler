@@ -37,38 +37,49 @@ data:
           rate: RATE,
           timeUnit: '1m',
           duration: `${DURATION}s`,
-          preAllocatedVUs: 10,
-          maxVUs: 100,
+          preAllocatedVUs: 30,   // enough VUs from the first second so the arrival rate is met without drops
+          maxVUs: 60,            // 100 req/s at in-cluster latency needs a handful; 60 bounds memory
         },
       },
     };
+
+    // setup() runs once at the start; its return value reaches handleSummary as data.setup_data, so the
+    // summary reports the planned values of the hour that actually ran (handleSummary re-runs the init
+    // context at the end, where `now` would be stale).
+    export function setup() {
+      return { started_at: now.toISOString(), utc_hour: HOUR, planned_rpm: RATE, planned_duration_s: DURATION };
+    }
 
     export default function () {
       http.get(__ENV.TARGET_URL);
     }
 
     export function handleSummary(data) {
-      // handleSummary runs in a fresh init context at the END of the test, so recompute the
-      // planned values from the actual start time (end - run duration), not from `now`.
       const m = data.metrics;
       const pick = (k) => (m[k] ? m[k].values : null);
-      const runMs = data.state.testRunDurationMs;
-      const startedAt = new Date(Date.now() - runMs);
-      const startHour = startedAt.getUTCHours();
+      const plan = data.setup_data || {};
+      const plannedRequests = Math.round((plan.planned_rpm || 0) * (plan.planned_duration_s || 0) / 60);
+      const reqs = pick('http_reqs') ? pick('http_reqs').count : 0;
+      const dropped = pick('dropped_iterations') ? pick('dropped_iterations').count : 0;
+      const failed = pick('http_req_failed') ? pick('http_req_failed').passes : 0;
       const summary = {
         kind: 'k6-hour-summary',
+        format: 2,
         target: __ENV.TARGET_NAME,
-        utc_hour: startHour,
-        planned_rpm: PATTERN_UTC[startHour],
-        planned_duration_s: Math.round(runMs / 1000),
-        planned_requests: Math.round(PATTERN_UTC[startHour] * runMs / 60000),
-        started_at: startedAt.toISOString(),
-        http_reqs: pick('http_reqs'),
-        iterations: pick('iterations'),
-        dropped_iterations: pick('dropped_iterations'),
-        http_req_failed: pick('http_req_failed'),
-        http_req_duration: pick('http_req_duration'),
-        vus_max: pick('vus_max'),
+        utc_hour: plan.utc_hour,
+        planned_rpm: plan.planned_rpm,
+        planned_duration_s: plan.planned_duration_s,
+        planned_requests: plannedRequests,
+        started_at: plan.started_at,
+        run_duration_s: Math.round(data.state.testRunDurationMs / 1000),
+        http_reqs: reqs,
+        delivered_pct: plannedRequests ? Math.round(10000 * reqs / plannedRequests) / 100 : null,
+        dropped_iterations: dropped,
+        dropped_pct: plannedRequests ? Math.round(100000 * dropped / plannedRequests) / 1000 : null,
+        http_req_failed: failed,
+        failed_pct: reqs ? Math.round(100000 * failed / reqs) / 1000 : null,
+        http_req_duration_ms: pick('http_req_duration'),
+        vus_max: pick('vus_max') ? pick('vus_max').value : null,
       };
       return { stdout: JSON.stringify(summary) + '\n' };
     }
