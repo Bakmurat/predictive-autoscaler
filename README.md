@@ -2,7 +2,7 @@
 
 **Scale before the traffic arrives, not after.**
 
-Predictive Autoscaler is an open-source Kubernetes autoscaler that forecasts request demand with a deep-learning model and provisions capacity ahead of the load. Conventional autoscalers react to metrics that have already crossed a threshold, which means the first users of every traffic surge pay for it in latency and errors. Predictive Autoscaler closes that gap: it learns each workload's daily rhythm, predicts the next hour, and has the pods ready when the wave hits, while a reactive safety net guarantees it can never do worse than today's autoscaling.
+Predictive Autoscaler is an open-source Kubernetes autoscaler that forecasts request demand with a deep-learning model and provisions capacity ahead of the load. Conventional autoscalers react to metrics that have already crossed a threshold, which means the first users of every traffic surge pay for it in latency and errors. Predictive Autoscaler is built to close that gap: it learns each workload's daily rhythm, predicts the next hour, and aims to have pods ready before the wave hits. A reactive floor means the forecast can only add capacity on top of what live metrics require.
 
 Built by [Bakmurat Kubanaliev](#author). Apache-2.0.
 
@@ -23,7 +23,7 @@ Built by [Bakmurat Kubanaliev](#author). Apache-2.0.
 | **Declarative operator** | A Go operator (controller-runtime) driven by a `PredictiveAutoscaler` custom resource: target Deployment, replica bounds, per-pod targets, horizon, lead time, and reconcile interval. |
 | **Additive safety model** | Replicas are set to the **highest** of the forecast baseline, the live reactive requirement, and the configured minimum. The forecast can only add capacity. |
 | **Guard rails** | Overestimate detection, scale-down stabilization (five-minute post-scale-up hold, bounded step size, cooldown), and confidence dampening keep a wrong forecast from causing churn or cost. |
-| **Reactive backstop** | A dormant KEDA `ScaledObject` stays configured on the same Deployment, so conventional autoscaling takes over instantly if the forecasting service is unavailable. |
+| **Reactive fallback** | When the forecasting service is unavailable or its output fails sanity checks, the operator falls back to its own reactive calculation from live metrics. A KEDA `ScaledObject` can be kept on the same Deployment as an independent backstop; pause it while the operator is active (KEDA's `autoscaling.keda.sh/paused` annotation) so the two controllers do not compete. |
 | **Observability** | Prometheus metrics from both components and three Grafana dashboards: forecast versus actual, replica decisions, and guard-rail state. |
 
 ## How it works
@@ -137,6 +137,14 @@ Both suites pass. Last full run 2026-09-20: Go `go vet` + `go test -race` green;
 Predictive Autoscaler is an actively developed personal research project (October 2025 to present). It is built to run alongside KEDA, which stays in place as the reactive backstop, and it is published so the design, code, and lessons are available to everyone working on the same problem. Evaluate it in your own environment with the shipped harness before relying on it.
 
 Note on numbers: request-rate figures in the simulator configuration (for example a 60,000 requests-per-minute peak) are the synthetic load generator's settings, not measured throughput.
+
+## Limitations
+
+- Not deployed to production anywhere; evaluated so far only against synthetic traffic in the author's own environments. No accuracy figures are published yet; a controlled benchmark is in progress (`deploy/eks-benchmark/`), and its results will be published with their method, whatever they show.
+- One target metric in practice (request rate per pod); CPU and memory paths exist in the schema but are not trained.
+- Model files live on a ReadWriteOnce volume, so a single forecasting replica is supported.
+- The API group `autoscaler.example.com` is a placeholder to rename before use.
+- Integration with a node-level autoscaler has not been tested; the operator manages replicas only.
 
 ## License
 
