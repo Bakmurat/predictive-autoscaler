@@ -18,6 +18,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from models.lstm_model import LSTMForecastModel
 from data.victoriametrics_collector import VictoriaMetricsCollector
+from data import gapfill
 
 # Configure logging
 logging.basicConfig(
@@ -73,17 +74,20 @@ def min_points_for_training(sequence_length: int = DEFAULT_SEQUENCE_LENGTH, step
         n += 1
 
 
-def preflight_history(df, sequence_length: int = DEFAULT_SEQUENCE_LENGTH, steps_ahead: int = STEPS_AHEAD):
-    """Validate fetched history against an explicit ten-minute grid.
+def preflight_history(df, sequence_length: int = DEFAULT_SEQUENCE_LENGTH, steps_ahead: int = STEPS_AHEAD,
+                      mask: dict = None, role: str = "benchmark", fill: bool = True):
+    """Validate fetched history against an explicit ten-minute grid, apply the validity mask, fill
+    bounded interior gaps under the predeclared rule, and decide by the sequences actually built.
 
-    Returns (ok, reason, prepared_df, info). prepared_df is the longest contiguous run of grid slots
-    (sorted, one row per slot, duplicates and non-finite values removed) — the data the model trains on.
+    Returns (ok, reason, prepared_df, info). prepared_df carries columns timestamp, value, imputed;
+    info records the mask application and every gap decision (copied into provenance).
     """
     import numpy as np
     import pandas as pd
     info = {"raw_points": 0 if df is None else int(len(df)), "pandas": pd.__version__}
+    need = min_points_for_training(sequence_length, steps_ahead)
     if df is None or df.empty:
-        return False, "insufficient history: have 0 of %d ten-minute points" % min_points_for_training(sequence_length, steps_ahead), None, info
+        return False, "insufficient history: have 0 of %d ten-minute points" % need, None, info
     d = df[["timestamp", "value"]].copy()
     d["value"] = pd.to_numeric(d["value"], errors="coerce")
     n_nonfinite = int((~np.isfinite(d["value"])).sum())
@@ -95,45 +99,65 @@ def preflight_history(df, sequence_length: int = DEFAULT_SEQUENCE_LENGTH, steps_
     info.update({"nonfinite_dropped": n_nonfinite, "duplicates_dropped": n_dup})
     if d.empty:
         return False, "insufficient history: no finite observations", None, info
-    # Snap every sample to its ten-minute slot; a sample farther than the tolerance from any slot is
-    # a cadence violation, and two samples in one slot after snapping are duplicates (keep the last).
-    # Seconds since the epoch, computed with Timestamp arithmetic (portable across pandas versions;
-    # .astype("int64") on tz-aware columns is not).
     epoch = ((d["timestamp"] - pd.Timestamp("1970-01-01", tz="UTC")) // pd.Timedelta(seconds=1)).astype("int64")
     slot = ((epoch + EXPECTED_CADENCE_S // 2) // EXPECTED_CADENCE_S) * EXPECTED_CADENCE_S
     off = (epoch - slot).abs()
     n_offgrid = int((off > CADENCE_TOLERANCE_S).sum())
-    d = d[off <= CADENCE_TOLERANCE_S].copy()
-    d["slot"] = slot[off <= CADENCE_TOLERANCE_S]
+    keep = off <= CADENCE_TOLERANCE_S
+    d = d[keep].copy(); d["slot"] = slot[keep]
     d = d.drop_duplicates("slot", keep="last")
     info["offgrid_dropped"] = n_offgrid
     if d.empty:
         return False, "unexpected cadence: no samples on the ten-minute grid", None, info
-    slots = d["slot"].to_numpy()
+    # --- validity mask (raw data untouched; decisions recorded) ---
+    points = list(zip(d["slot"].astype(int).tolist(), d["value"].astype(float).tolist()))
+    points, mask_info = gapfill.apply_mask(points, mask or {"intervals": []}, role=role)
+    info["mask"] = mask_info
+    if not points:
+        return False, "insufficient history: nothing left after the validity mask", None, info
+    slots = np.array([t for t, _ in points])
     expected = int((slots[-1] - slots[0]) // EXPECTED_CADENCE_S) + 1
-    missing = expected - len(slots)
-    # Longest contiguous run of consecutive slots (missing slots break the run).
-    breaks = np.flatnonzero(np.diff(slots) != EXPECTED_CADENCE_S)
-    starts = np.concatenate(([0], breaks + 1)); ends = np.concatenate((breaks + 1, [len(slots)]))
-    lengths = ends - starts
-    k = int(np.argmax(lengths)); run = d.iloc[starts[k]:ends[k]]
-    info.update({"grid_first": pd.Timestamp(slots[0], unit="s", tz="UTC").isoformat(),
-                 "grid_last": pd.Timestamp(slots[-1], unit="s", tz="UTC").isoformat(),
-                 "expected_slots": expected, "present_slots": int(len(slots)), "missing_slots": int(missing),
-                 "contiguous_runs": int(len(lengths)), "longest_run_points": int(lengths[k]),
-                 "run_first": run["timestamp"].iloc[0].isoformat(), "run_last": run["timestamp"].iloc[-1].isoformat()})
-    budget = sequence_budget(int(lengths[k]), sequence_length, steps_ahead)
+    breaks = int((np.diff(slots) != EXPECTED_CADENCE_S).sum())
+    info.update({"grid_first": gapfill._iso(int(slots[0])), "grid_last": gapfill._iso(int(slots[-1])),
+                 "expected_slots": expected, "present_slots": int(len(slots)), "missing_slots": int(expected - len(slots)),
+                 "contiguous_runs": breaks + 1})
+    # --- bounded interior-gap fill (predeclared rule), then select the longest contiguous run ---
+    cutoff = int(slots[-1])
+    if fill:
+        # partition boundary: the outer 80/20 split of the run that WOULD be selected without filling
+        raw_run = gapfill._longest_run(points, EXPECTED_CADENCE_S)
+        boundaries = [raw_run[int(0.8 * len(raw_run))][0]] if len(raw_run) >= 5 else []
+        run, flags, fill_rec = gapfill.fill_interior_gaps(points, cutoff=cutoff, boundaries=boundaries,
+                                                          forbidden=gapfill.mask_intervals(mask))
+    else:
+        run = gapfill._longest_run(points, EXPECTED_CADENCE_S); flags = [False] * len(run)
+        fill_rec = {"algorithm": None, "gaps_filled": 0, "slots_filled_in_window": 0, "window_points": len(run)}
+    info["gap_fill"] = fill_rec
+    info.update({"contiguous_run_points": len(run),
+                 "run_first": gapfill._iso(run[0][0]) if run else None, "run_last": gapfill._iso(run[-1][0]) if run else None})
+    budget = sequence_budget(len(run), sequence_length, steps_ahead)
+    # eligible sequences after filling: a validation/evaluation sequence whose target window contains an
+    # imputed slot is not counted (imputed labels never enter validation or reported accuracy)
+    n = len(run); window = sequence_length + steps_ahead
+    train_rows = int(0.8 * n)
+    def _valid_targets(lo, hi):  # sequences fully inside rows [lo, hi) with genuine target labels
+        cnt = 0
+        for i in range(lo, hi - window + 1):
+            if not any(flags[i + sequence_length:i + window]):
+                cnt += 1
+        return cnt
+    budget["train_sequences_genuine_targets"] = _valid_targets(0, train_rows)
+    budget["test_sequences_genuine_targets"] = _valid_targets(train_rows, n)
     info["sequence_budget"] = budget
-    need = budget["min_points_for_training"]
     if budget["train_sequences"] < 1 or budget["validation_sequences"] < 1:
-        why = "insufficient history: have %d of %d ten-minute points" % (int(lengths[k]), need)
-        if missing:
-            why += " in the longest contiguous run (%d slot(s) missing across %d run(s))" % (missing, len(lengths))
+        why = "insufficient history: have %d of %d ten-minute points" % (n, need)
+        if info["missing_slots"]:
+            why += " in the longest contiguous run (%d slot(s) missing after mask and bounded fill)" % info["missing_slots"]
         return False, why, None, info
-    prepared = run[["timestamp", "value"]].reset_index(drop=True)
-    prepared["timestamp"] = prepared["timestamp"].dt.tz_localize(None)  # model uses naive UTC index
-    return True, "ok: %d contiguous points (%d train / %d validation sequences; evaluation %s)" % (
-        int(lengths[k]), budget["train_sequences"], budget["validation_sequences"],
+    prepared = pd.DataFrame({"timestamp": [pd.Timestamp(t, unit="s") for t, _ in run],
+                             "value": [v for _, v in run], "imputed": flags})
+    return True, "ok: %d contiguous points (%d train / %d validation sequences; %d imputed slots; evaluation %s)" % (
+        n, budget["train_sequences"], budget["validation_sequences"], int(sum(flags)),
         "available" if budget["evaluation_available"] else "unavailable"), prepared, info
 
 
@@ -176,10 +200,13 @@ def train_lstm_for_metric(
     if len(df) < min_data_points:
         raise ValueError(f"Insufficient data: {len(df)} points (minimum {min_data_points} required)")
 
-    # Prepare data
+    # Prepare data (an optional 'imputed' column flags gap-filled slots; see data/gapfill.py)
     df = df.copy()
     df.set_index('timestamp', inplace=True)
     df = df.sort_index()
+    imputed = df['imputed'].to_numpy() if 'imputed' in df.columns else None
+    if imputed is not None:
+        df = df.drop(columns=['imputed'])
 
     # Split data: 80% train, 20% test
     train_size = int(0.8 * len(df))
@@ -197,11 +224,13 @@ def train_lstm_for_metric(
     model = LSTMForecastModel(sequence_length=sequence_length)
 
     try:
-        training_result = model.train(train_data, target_column='value', epochs=epochs)
+        train_imputed = imputed[:train_size] if imputed is not None else None
+        test_imputed = imputed[train_size:] if imputed is not None else None
+        training_result = model.train(train_data, target_column='value', epochs=epochs, imputed=train_imputed)
         logger.info(f"Training completed successfully")
 
-        # Evaluate on test data
-        eval_result = model.evaluate(test_data, target_column='value')
+        # Evaluate on test data (sequences with an imputed target label are excluded from the metrics)
+        eval_result = model.evaluate(test_data, target_column='value', imputed=test_imputed)
         if eval_result.get('rmse') is None:
             logger.info(f"Evaluation - {eval_result.get('evaluation', 'unavailable')}")
         else:
@@ -240,7 +269,10 @@ def train_lstm_for_metric(
             "training_cutoff": data_end.isoformat() + "Z",
             "train_end": train_end.isoformat() + "Z",
             "test_start": (test_start.isoformat() + "Z") if test_start is not None else None,
-            "model_metadata": training_result.get('metadata', {})
+            "model_metadata": training_result.get('metadata', {}),
+            "imputed_slots_total": int(imputed.sum()) if imputed is not None else 0,
+            "imputed_slots_train": int(imputed[:train_size].sum()) if imputed is not None else 0,
+            "imputed_slots_test": int(imputed[train_size:].sum()) if imputed is not None else 0
         }
 
         if atomic:
@@ -267,7 +299,10 @@ def train_requests_only(
     hours: int = 168,
     model_dir: Path = None,
     epochs: int = 50,
-    sequence_length: int = DEFAULT_SEQUENCE_LENGTH
+    sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
+    mask: dict = None,
+    role: str = "benchmark",
+    fill: bool = True
 ) -> dict:
     """
     Train LSTM model for requests metric only.
@@ -310,7 +345,7 @@ def train_requests_only(
     logger.info(f"Fetched {len(df)} data points for requests metric")
 
     # Explicit ten-minute-grid preflight: decides by the sequences that will actually be built.
-    ok, reason, prepared, info = preflight_history(df, sequence_length=sequence_length)
+    ok, reason, prepared, info = preflight_history(df, sequence_length=sequence_length, mask=mask, role=role, fill=fill)
     logger.info("Preflight: %s", json.dumps(info, default=str))
     if not ok:
         logger.warning("Training skipped - %s", reason)

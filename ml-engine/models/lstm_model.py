@@ -126,7 +126,8 @@ class LSTMForecastModel:
         self.trained_at = None  # Track when model was trained
         self.training_timestamps = None  # Store for pattern alignment
 
-    def train(self, data: pd.DataFrame, target_column: str = 'value', epochs: int = 50) -> Dict:
+    def train(self, data: pd.DataFrame, target_column: str = 'value', epochs: int = 50,
+              imputed: Optional[np.ndarray] = None) -> Dict:
         """
         Train LSTM model on the provided data.
 
@@ -184,7 +185,23 @@ class LSTMForecastModel:
         X_train, X_val = X[:train_size], X[train_size:]
         y_train, y_val = y[:train_size], y[train_size:]
 
-        logger.info(f"Training set: {len(X_train)}, Validation set: {len(X_val)}")
+        # Gap-filled (imputed) slots may serve as inputs, never as validation labels or as labels in the
+        # reported training metrics (data/gapfill.py rule). A sequence i has targets at rows
+        # i+seq_len .. i+seq_len+STEPS_AHEAD-1.
+        genuine_target = np.ones(len(X), dtype=bool)
+        n_val_dropped = 0
+        if imputed is not None and len(imputed) == len(values) and imputed.any():
+            imp = np.asarray(imputed, dtype=bool)
+            for i in range(len(X)):
+                if imp[i + self.sequence_length:i + self.sequence_length + STEPS_AHEAD].any():
+                    genuine_target[i] = False
+            val_keep = genuine_target[train_size:]
+            n_val_dropped = int((~val_keep).sum())
+            X_val, y_val = X_val[val_keep], y_val[val_keep]
+        if len(X_val) == 0:
+            raise ValueError("no validation sequences with genuine target labels")
+
+        logger.info(f"Training set: {len(X_train)}, Validation set: {len(X_val)} (imputed-target sequences excluded: {n_val_dropped})")
 
         # Build BiLSTM model -- Phase 16 (D-01): Dense(STEPS_AHEAD) output
         model = Sequential([
@@ -229,11 +246,13 @@ class LSTMForecastModel:
         self.trained_at = datetime.utcnow()
         self.training_timestamps = data.index  # Phase 16: store for pattern alignment
 
-        # Calculate training metrics -- Phase 16: handle (N, 6) predictions
-        train_pred = model.predict(X_train, verbose=0)  # shape (N, 6)
+        # Calculate training metrics -- Phase 16: handle (N, 6) predictions; imputed-target sequences excluded
+        keep_train = genuine_target[:train_size]
+        X_metric, y_metric = (X_train[keep_train], y_train[keep_train]) if keep_train.any() else (X_train, y_train)
+        train_pred = model.predict(X_metric, verbose=0)  # shape (N, 6)
         # Inverse transform each column separately (scaler was fit on (n,1))
         train_pred_rescaled = self.scaler.inverse_transform(train_pred.reshape(-1, 1)).reshape(train_pred.shape)
-        y_train_rescaled = self.scaler.inverse_transform(y_train.reshape(-1, 1)).reshape(y_train.shape)
+        y_train_rescaled = self.scaler.inverse_transform(y_metric.reshape(-1, 1)).reshape(y_metric.shape)
 
         # Average RMSE/MAE across all steps
         train_rmse = np.sqrt(np.mean((y_train_rescaled - train_pred_rescaled) ** 2))
@@ -245,6 +264,8 @@ class LSTMForecastModel:
             'target_column': target_column,
             'training_samples': len(X_train),
             'validation_samples': len(X_val),
+            'validation_sequences_dropped_imputed_target': n_val_dropped,
+            'training_metric_sequences': int(len(X_metric)),
             'epochs_trained': len(history.history['loss']),
             'final_train_loss': float(history.history['loss'][-1]),
             'final_val_loss': float(history.history['val_loss'][-1]) if history.history.get('val_loss') else None
@@ -399,7 +420,8 @@ class LSTMForecastModel:
             'floor_pct': float(floor_pct_value)
         }
 
-    def evaluate(self, test_data: pd.DataFrame, target_column: str = 'value') -> Dict:
+    def evaluate(self, test_data: pd.DataFrame, target_column: str = 'value',
+                 imputed: Optional[np.ndarray] = None) -> Dict:
         """
         Evaluate model performance on test data.
 
@@ -422,8 +444,14 @@ class LSTMForecastModel:
         # Phase 16: Generate time features for evaluation data
         time_features = generate_time_features(test_data.index)
 
-        # Create sequences with time features
+        # Create sequences with time features; drop sequences whose target labels include an imputed slot
         X_test, y_test = self._create_sequences(scaled_data.flatten(), time_features)
+        n_eval_dropped = 0
+        if imputed is not None and len(imputed) == len(values) and len(X_test) and np.asarray(imputed, dtype=bool).any():
+            imp = np.asarray(imputed, dtype=bool)
+            keep = np.array([not imp[i + self.sequence_length:i + self.sequence_length + STEPS_AHEAD].any() for i in range(len(X_test))])
+            n_eval_dropped = int((~keep).sum())
+            X_test, y_test = X_test[keep], y_test[keep]
 
         if len(X_test) == 0:
             logger.warning("Evaluation unavailable: test partition shorter than sequence_length + STEPS_AHEAD")

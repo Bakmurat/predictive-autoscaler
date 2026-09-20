@@ -60,6 +60,16 @@ def main():
     sequence_length = int(os.environ.get("TRAINING_SEQUENCE_LENGTH", "144"))
     if sequence_length != 144:
         logger.warning("TRAINING_SEQUENCE_LENGTH=%d: smoke-test setting, not the benchmark model", sequence_length)
+    # Role: "benchmark" (default) enforces the validity mask's history start and publishes to MODEL_DIR;
+    # "diagnostic" may use pre-history data and publishes under MODEL_DIR/diagnostic/, which the API never loads.
+    role = os.environ.get("TRAINING_ROLE", "benchmark")
+    if role not in ("benchmark", "diagnostic"):
+        logger.error("TRAINING_ROLE must be benchmark or diagnostic"); sys.exit(2)
+    from data import gapfill
+    mask = gapfill.load_mask(os.environ.get("VALIDITY_MASK"))
+    fill = os.environ.get("GAP_FILL", "1") != "0"
+    logger.info("Role: %s; validity mask: %s (version %s, %d interval(s), history start %s); bounded gap fill: %s",
+                role, mask.get("source"), mask.get("version"), len(mask.get("intervals", [])), mask.get("benchmark_history_start"), fill)
 
     logger.info(f"Training Parameters:")
     logger.info(f"  Historical data: {hours} hours ({hours // 24} days)")
@@ -74,6 +84,9 @@ def main():
     else:
         model_dir = Path(__file__).parent.parent / "models" / "trained"
         logger.info(f"  Using local model directory: {model_dir}")
+    if role == "diagnostic":
+        model_dir = model_dir / "diagnostic"
+        logger.warning("Diagnostic role: artifact goes to %s and is never loaded by the API", model_dir)
     model_dir.mkdir(parents=True, exist_ok=True)
     logger.info("")
 
@@ -94,7 +107,10 @@ def main():
             hours=hours,
             model_dir=model_dir,
             epochs=epochs,
-            sequence_length=sequence_length
+            sequence_length=sequence_length,
+            mask=mask,
+            role=role,
+            fill=fill
         )
 
         if result.get("skipped"):
@@ -177,6 +193,10 @@ def main():
             "image": os.environ.get("IMAGE_REF", ""),
             "git_commit": os.environ.get("GIT_COMMIT", ""),
             "smoke_test": sequence_length != 144,
+            "role": role,
+            "validity_mask": (result.get("preflight") or {}).get("mask"),
+            "gap_fill": (result.get("preflight") or {}).get("gap_fill"),
+            "imputed_slots": {"total": result.get("imputed_slots_total"), "train": result.get("imputed_slots_train"), "test": result.get("imputed_slots_test")},
         }
         meta_tmp = final_path.with_suffix(".meta.json.tmp")
         with open(meta_tmp, "w") as fh:

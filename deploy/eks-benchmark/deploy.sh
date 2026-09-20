@@ -51,6 +51,7 @@ app() {
   mkdir -p "$HERE/rendered"
   (cd "$HERE/overlay" && kubectl kustomize .) \
     | sed -e "s#ECR_REGISTRY#$reg#g" -e "s#IMAGE_TAG#$TAG#g" -e "s#VM_QUERY_URL#$prom#g" -e "s#GIT_COMMIT_VALUE#$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)#g" > "$HERE/rendered/ml-engine.yaml"
+  kubectl create configmap validity-mask -n ml-engine --from-file=validity-mask.json="$HERE/validity-mask.json" --dry-run=client -o yaml | kubectl apply -f -
   kubectl apply -f "$HERE/rendered/ml-engine.yaml"
   kubectl wait --for condition=established crd/predictiveautoscalers.autoscaler.example.com --timeout=90s
   { cat "$HERE/demo/00-namespace.yaml"; for f in "$HERE"/demo/*.yaml; do [ "$(basename "$f")" = "00-namespace.yaml" ] && continue; echo "---"; sed -e "s#VM_QUERY_URL#$prom#g" "$f"; done; } > "$HERE/rendered/demo.yaml"

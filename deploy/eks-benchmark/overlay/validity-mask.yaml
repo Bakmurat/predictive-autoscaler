@@ -1,0 +1,49 @@
+# Mounts the predeclared validity mask (deploy/eks-benchmark/validity-mask.json, rendered into the
+# ConfigMap by deploy.sh) into the training job and the forecasting service. Both read VALIDITY_MASK.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ml-training
+  namespace: ml-engine
+spec:
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: trainer
+              env:
+                - name: VALIDITY_MASK
+                  value: /etc/predictive/validity-mask.json
+                - name: TRAINING_ROLE
+                  value: benchmark
+              volumeMounts:
+                - name: validity-mask
+                  mountPath: /etc/predictive
+                  readOnly: true
+          volumes:
+            - name: validity-mask
+              configMap:
+                name: validity-mask
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ml-api
+  namespace: ml-engine
+spec:
+  template:
+    spec:
+      containers:
+        - name: api
+          env:
+            - name: VALIDITY_MASK
+              value: /etc/predictive/validity-mask.json
+          volumeMounts:
+            - name: validity-mask
+              mountPath: /etc/predictive
+              readOnly: true
+      volumes:
+        - name: validity-mask
+          configMap:
+            name: validity-mask

@@ -9,7 +9,7 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-for name in ("models", "models.lstm_model", "data", "data.victoriametrics_collector"):
+for name in ("models", "models.lstm_model", "data.victoriametrics_collector"):
     if name not in sys.modules:
         mod = types.ModuleType(name)
         if name == "models.lstm_model":
@@ -56,16 +56,18 @@ class GridChecks(unittest.TestCase):
         ok, why, prepared, info = t.preflight_history(df)
         self.assertEqual(info["duplicates_dropped"], 2)
         self.assertEqual(info["nonfinite_dropped"], 2)
-        # two slots lost -> longest contiguous run is the 177 points after slot 11 -> rejected
-        self.assertFalse(ok); self.assertIn("slot(s) missing", why)
+        # two adjacent slots lost -> a 2-slot interior telemetry gap: filled under the bounded rule (2/189 < 5 %)
+        self.assertTrue(ok); self.assertEqual(int(prepared["imputed"].sum()), 2)
+        self.assertEqual(info["gap_fill"]["gaps_filled"], 1); self.assertEqual(len(prepared), 189)
 
     def test_missing_slot_breaks_the_run(self):
         df = grid(400).drop(index=[200])                   # one missing slot in the middle
         ok, _, prepared, info = t.preflight_history(df)
         self.assertTrue(ok)
         self.assertEqual(info["missing_slots"], 1); self.assertEqual(info["contiguous_runs"], 2)
-        self.assertEqual(len(prepared), 200)              # the longer half only
-        self.assertEqual(info["longest_run_points"], 200)
+        # a single interior missing slot is a telemetry gap: filled (1/400 < 5 %), so the whole series is one run
+        self.assertEqual(len(prepared), 400); self.assertEqual(int(prepared["imputed"].sum()), 1)
+        self.assertEqual(info["contiguous_run_points"], 400)
 
     def test_offgrid_samples_are_rejected_not_snapped(self):
         df = grid(189, start=T0 + pd.Timedelta(minutes=3))  # 3 minutes off the grid
@@ -76,7 +78,7 @@ class GridChecks(unittest.TestCase):
         df = grid(189, start=T0 + pd.Timedelta(seconds=20))
         ok, _, prepared, info = t.preflight_history(df)
         self.assertTrue(ok); self.assertEqual(info["offgrid_dropped"], 0)
-        self.assertEqual(prepared["timestamp"].iloc[0], (T0 + pd.Timedelta(seconds=20)).tz_localize(None))
+        self.assertEqual(prepared["timestamp"].iloc[0], T0.tz_localize(None))   # snapped to its grid slot
 
     def test_one_minute_cadence_is_rejected(self):
         df = grid(600, step_min=1)

@@ -91,6 +91,12 @@ class LSTMPredictor:
         self.model_train_times = {}  # Track when each model was trained
         self.model_file_mtimes = {}  # Track file mtime for disk reload detection
         self.model_meta = {}  # model_key -> provenance sidecar (lstm_<key>.meta.json) written by the trainer
+        try:
+            from data import gapfill as _gf
+            self.validity_mask = _gf.load_mask(os.getenv("VALIDITY_MASK"))
+        except Exception as e:
+            logger.warning(f"validity mask not loaded: {e}")
+            self.validity_mask = {"version": 0, "intervals": []}
         self.validation_metadata = {}  # model_key -> {status, mape, old_mape, timestamp}
         self._training_locks = {}  # Per-model locks to prevent concurrent training
         # Check for MODEL_DIR env var, then try container path, then local paths
@@ -434,10 +440,26 @@ class LSTMPredictor:
                 # Update Prometheus gauge
                 MODEL_AGE_GAUGE.labels(application=application, metric_type=metric_type).set(age_hours if age_hours >= 0 else -1)
 
-                # Update the model with the FULL fresh metric data so that:
+                # Inference input window (data/gapfill.py rule): the latest input must be a genuinely
+                # observed, fresh sample; masked intervals are excluded; only bounded interior gaps are
+                # filled and every fill is reported. An incomplete window is refused (the operator then
+                # falls back to its reactive rule) instead of forecasting from a broken series.
+                from data import gapfill
+                pts = []
+                for dpt in metric_data:
+                    try:
+                        pts.append((gapfill._ts(dpt["timestamp"]), float(dpt["value"])))
+                    except Exception:
+                        continue
+                pts, mask_info = gapfill.apply_mask(pts, self.validity_mask, role="inference")
+                window, inference_fill = gapfill.check_inference_window(
+                    pts, now=int(datetime.now(timezone.utc).timestamp()), sequence_length=model.sequence_length,
+                    forbidden=gapfill.mask_intervals(self.validity_mask))
+                inference_fill["mask"] = {k: mask_info[k] for k in ("mask_version", "dropped_in_intervals")}
+                # Update the model with the fresh window so that:
                 # 1. last_sequence reflects current state (not training-time state)
                 # 2. raw_training_values is time-aligned for historical pattern lookup
-                all_values = np.array([d['value'] for d in metric_data])
+                all_values = np.array([v for _, v in window])
                 if hasattr(model, 'scaler') and model.scaler is not None and len(all_values) >= model.sequence_length:
                     recent_scaled = model.scaler.transform(
                         all_values[-model.sequence_length:].reshape(-1, 1)
@@ -487,11 +509,7 @@ class LSTMPredictor:
                     version = f"{model_key}@{sha[:12]}"
                 else:
                     version = f"{model_key}@mtime{int(self.model_file_mtimes.get(model_key, 0))}"
-                inference_input_end = ""
-                try:
-                    inference_input_end = str(metric_data[-1].get("timestamp", "")) if metric_data else ""
-                except Exception:
-                    pass
+                inference_input_end = gapfill._iso(window[-1][0])
                 return {
                     "application": application,
                     "metric_type": metric_type,
@@ -501,6 +519,7 @@ class LSTMPredictor:
                     "artifact_sha256": sha,
                     "sequence_length": int(getattr(model, "sequence_length", 0) or 0),
                     "inference_input_end": inference_input_end,
+                    "inference_window": {k: inference_fill[k] for k in ("window_slots", "imputed_in_window", "latest_observed", "latest_is_imputed", "gaps_filled", "mask")},
                     "provenance": "sidecar" if meta else "unknown",
                     "predictions": predicted_values,
                     "confidence": round(prediction_result['confidence'], 3),
@@ -629,10 +648,14 @@ async def predict(request: Dict):
 
         # Run blocking ML work in a thread so health probes stay responsive
         loop = asyncio.get_event_loop()
-        prediction = await loop.run_in_executor(
-            None,
-            functools.partial(predictor.predict, application, metric_data, horizon_minutes, metric_type, namespace)
-        )
+        try:
+            prediction = await loop.run_in_executor(
+                None,
+                functools.partial(predictor.predict, application, metric_data, horizon_minutes, metric_type, namespace)
+            )
+        except ValueError as e:
+            # includes "Model must be trained" and inference-window refusals; the operator falls back to reactive
+            raise HTTPException(status_code=422, detail=f"forecast refused: {e}")
 
         # --- ACCURACY TRACKING ---
         # Compare previous prediction against current actual
