@@ -16,7 +16,7 @@ spec:
       labels:
         app: myapptwo
       annotations:
-        sidecar.istio.io/proxyCPU: "40m"       # measured proxy usage up to ~63m CPU, 29-41Mi at 100 req/s per pod
+        sidecar.istio.io/proxyCPU: "25m"       # measured: ~63m at 100 req/s per pod (2 replicas), ~10m at the 10 req/s per-replica target; CPU is the binding constraint on two t4g.medium
         sidecar.istio.io/proxyCPULimit: "200m"
         sidecar.istio.io/proxyMemory: "48Mi"
         sidecar.istio.io/proxyMemoryLimit: "128Mi"
