@@ -6,6 +6,11 @@ metadata:
 spec:
   jobTemplate:
     spec:
+      # A full seven-day window (1,008 points, ~850 sequences x 50 epochs of a BiLSTM on one t4g.medium
+      # core) needs more than the base manifest's 10 minutes; 25 minutes is well inside the 6-hour cadence.
+      # One retry only: a second attempt against the same data would fail the same way (Forbid stays).
+      activeDeadlineSeconds: 1500
+      backoffLimit: 1
       template:
         spec:
           containers:
