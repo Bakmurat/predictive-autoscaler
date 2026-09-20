@@ -3,11 +3,13 @@ package main
 import (
 	"flag"
 	"os"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
@@ -48,14 +50,29 @@ func main() {
 
 	setupLog.Info("Starting predictive-operator", "version", Version)
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	// WATCH_NAMESPACES (comma-separated) restricts the manager's cache, and therefore the
+	// reconciler, to those namespaces. Empty means cluster-wide (the historical behaviour).
+	// Used by the benchmark so that a second operator instance can be exercised in an
+	// isolated namespace without both instances reconciling the same objects.
+	mgrOpts := ctrl.Options{
 		Scheme:                 scheme,
 		MetricsBindAddress:     metricsAddr,
 		Port:                   9443,
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "predictive-autoscaler-leader",
-	})
+	}
+	if raw := strings.TrimSpace(os.Getenv("WATCH_NAMESPACES")); raw != "" {
+		var namespaces []string
+		for _, ns := range strings.Split(raw, ",") {
+			if ns = strings.TrimSpace(ns); ns != "" {
+				namespaces = append(namespaces, ns)
+			}
+		}
+		mgrOpts.Cache = cache.Options{Namespaces: namespaces}
+		setupLog.Info("Restricting watches to namespaces", "namespaces", namespaces)
+	}
+	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), mgrOpts)
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
