@@ -16,7 +16,7 @@ import joblib
 # Add the project root to the path
 sys.path.append(str(Path(__file__).parent.parent))
 
-from models.lstm_model import LSTMForecastModel
+from models.lstm_model import LSTMForecastModel, purged_split_indices
 from data.victoriametrics_collector import VictoriaMetricsCollector
 from data import gapfill
 
@@ -43,9 +43,13 @@ def sequence_budget(n_points: int, sequence_length: int = DEFAULT_SEQUENCE_LENGT
                     steps_ahead: int = STEPS_AHEAD) -> dict:
     """How many sequences a contiguous run of n_points ten-minute observations yields.
 
-    Mirrors the two splits exactly: train_rows = int(0.8 * n) (train_lstm_for_metric), then the model
-    builds train_rows - L - S + 1 sequences and splits them int(0.8 * m) / rest (LSTMForecastModel.train).
-    Evaluation needs the remaining test rows to hold at least one sequence as well; it is optional.
+    The outer split is train_rows = int(0.8 * n) (train_lstm_for_metric). The inner split is
+    NOT recomputed here: it calls models.lstm_model.purged_split_indices, the same function
+    LSTMForecastModel.train uses, so eligibility is decided and enforced by one rule
+    (Codex C-57). The previous version counted an 80/20 split of the sequence LIST, which the
+    purged split replaced; it reported 189 points as trainable when the deployed split yields
+    zero training sequences there and raises. Evaluation needs the remaining test rows to hold
+    at least one sequence as well; it is optional.
     """
     b = _budget(n_points, sequence_length, steps_ahead)
     b["min_points_for_training"] = min_points_for_training(sequence_length, steps_ahead)
@@ -57,10 +61,12 @@ def _budget(n_points, sequence_length, steps_ahead):
     train_rows = int(0.8 * n_points)
     test_rows = n_points - train_rows
     seqs = max(0, train_rows - window + 1)
-    inner_train = int(0.8 * seqs)
-    inner_val = seqs - inner_train
+    # The inner split comes from the model itself, not from a second implementation here.
+    train_idx, val_idx = purged_split_indices(train_rows, sequence_length, steps_ahead,
+                                              n_sequences=seqs)
     return {"points": n_points, "train_rows": train_rows, "test_rows": test_rows, "window": window,
-            "sequences": seqs, "train_sequences": inner_train, "validation_sequences": inner_val,
+            "sequences": seqs, "train_sequences": int(len(train_idx)),
+            "validation_sequences": int(len(val_idx)),
             "evaluation_available": test_rows >= window}
 
 

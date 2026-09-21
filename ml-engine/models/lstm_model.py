@@ -104,6 +104,35 @@ def asymmetric_mse(y_true, y_pred):
     return tf.reduce_mean(under_weight * step_weights * squared_error)
 
 
+def purged_split_indices(n_rows, sequence_length, steps_ahead, n_sequences=None):
+    """The ONE definition of the purged train/validation split (Codex C-57).
+
+    Both `LSTMForecastModel.train` and the trainer's preflight call this, so eligibility
+    can never again be decided by one rule and enforced by another. Sequence i reads rows
+    [i, i+sequence_length) and is labelled by rows
+    [i+sequence_length, i+sequence_length+steps_ahead).
+
+    A sequence is a TRAINING sequence when its whole label period lies before the split
+    row, and a VALIDATION sequence when its label period starts at or after it. Sequences
+    straddling the boundary belong to neither: that gap is the purge, and it is what stops
+    a training label and a validation label sharing a timestamp. Input windows may overlap
+    freely -- reading a row the other partition also reads is not leakage; being scored on
+    a timestamp the model was trained to predict is.
+
+    There is no fallback. If the series cannot supply disjoint label periods the caller
+    raises; the contiguous fallback was removed because it restored the very overlap the
+    split exists to prevent.
+    """
+    if n_sequences is None:
+        n_sequences = max(0, n_rows - sequence_length - steps_ahead + 1)
+    split_row = int(0.8 * n_rows)
+    first_target = np.arange(n_sequences) + sequence_length
+    last_target = first_target + steps_ahead - 1
+    train_idx = np.flatnonzero(last_target < split_row)
+    val_idx = np.flatnonzero(first_target >= split_row)
+    return train_idx, val_idx
+
+
 class LSTMForecastModel:
     """LSTM-based forecasting model for time series prediction."""
 
@@ -217,11 +246,8 @@ class LSTMForecastModel:
         # was added to remove. That fallback was active in every evaluation run to date, so
         # the fix was inert. There is no fallback now: if the series cannot support disjoint
         # label periods, training fails loudly.
-        first_target = np.arange(len(X)) + self.sequence_length
-        last_target = first_target + STEPS_AHEAD - 1
-
-        train_idx = np.flatnonzero(last_target < split_row)
-        val_idx = np.flatnonzero(first_target >= split_row)
+        train_idx, val_idx = purged_split_indices(
+            len(values), self.sequence_length, STEPS_AHEAD, n_sequences=len(X))
 
         if len(train_idx) == 0 or len(val_idx) == 0:
             raise ValueError(
@@ -232,13 +258,14 @@ class LSTMForecastModel:
             )
 
         # Belt and braces: assert the label periods really are disjoint.
-        train_targets = set()
-        for i in train_idx:
-            train_targets.update(range(first_target[i], last_target[i] + 1))
-        val_targets = set()
-        for i in val_idx:
-            val_targets.update(range(first_target[i], last_target[i] + 1))
-        shared = train_targets & val_targets
+        def _label_rows(idx):
+            rows = set()
+            for i in idx:
+                rows.update(range(i + self.sequence_length,
+                                  i + self.sequence_length + STEPS_AHEAD))
+            return rows
+
+        shared = _label_rows(train_idx) & _label_rows(val_idx)
         if shared:
             raise AssertionError(
                 f"train/validation share {len(shared)} target rows after the split; "

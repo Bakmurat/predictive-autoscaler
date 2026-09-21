@@ -142,13 +142,15 @@ class PreflightIntegration(unittest.TestCase):
         return pd.DataFrame({"timestamp": [pd.Timestamp(tt, unit="s", tz="UTC") for tt, _ in pts], "value": [v for _, v in pts]})
 
     def test_preflight_masked_interval_breaks_run(self):
-        pts = grid(400)
-        mask = {"version": 1, "intervals": [{"start": gapfill._iso(T0 + 200 * G), "end": gapfill._iso(T0 + 201 * G), "reason": "reset"}]}
+        # 600 slots so that the longer surviving run still clears the 235-point minimum
+        # (Codex C-57); the point of this test is the hard break, not eligibility.
+        pts = grid(600)
+        mask = {"version": 1, "intervals": [{"start": gapfill._iso(T0 + 300 * G), "end": gapfill._iso(T0 + 301 * G), "reason": "reset"}]}
         ok, why, prepared, info = t.preflight_history(self.df(pts), mask=mask)
         # masked slots are dropped BEFORE the fill step and must not be re-filled: the run breaks there
         self.assertTrue(ok); self.assertEqual(info["mask"]["dropped_in_intervals"], 2)
         self.assertEqual(info["gap_fill"]["gaps_filled"], 0)
-        self.assertEqual(len(prepared), 200)          # runs: slots 0..199 (200) and 202..399 (198); the masked hole is a hard break
+        self.assertEqual(len(prepared), 300)          # runs: slots 0..299 (300) and 302..599 (298); the masked hole is a hard break
         self.assertEqual(info["gap_fill"]["gaps_considered"][0]["reason"].split(" (")[0], "gap overlaps a validity-mask interval")
 
     def test_preflight_fills_and_flags_and_recounts(self):
@@ -162,7 +164,7 @@ class PreflightIntegration(unittest.TestCase):
         pts = grid(400)
         mask = {"benchmark_history_start": gapfill._iso(T0 + 300 * G), "intervals": []}
         ok, why, prepared, info = t.preflight_history(self.df(pts), mask=mask, role="benchmark")
-        self.assertFalse(ok); self.assertIn("have 100 of 189", why)
+        self.assertFalse(ok); self.assertIn("have 100 of 235", why)
         ok2, _, prepared2, _ = t.preflight_history(self.df(pts), mask=mask, role="diagnostic")
         self.assertTrue(ok2); self.assertEqual(len(prepared2), 400)
 
