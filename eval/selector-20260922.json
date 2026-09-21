@@ -1,0 +1,1817 @@
+{
+  "generated_utc": "2026-09-21T22:17:44.754030Z",
+  "experiment": "offline online-selector experiment (D-116); nothing deployed",
+  "cost_proxy": {
+    "definition": "weighted asymmetric ABSOLUTE error, under:over = 2:1, units rpm",
+    "is_not": "operating cost -- no start-up delay, no integer replica step, no stabilisation, no dropped request, no dollars"
+  },
+  "design": {
+    "scenarios": [
+      "repeating",
+      "trend",
+      "levelshift",
+      "spike",
+      "weekly"
+    ],
+    "days": 14,
+    "origins_per_run": 720,
+    "validation_seeds": [
+      1,
+      2
+    ],
+    "validation_start": "2026-03-01T00:00:00",
+    "test_seeds": [
+      11,
+      12,
+      13
+    ],
+    "test_start": "2026-06-07T00:00:00",
+    "candidates": [
+      "seasonal_pattern",
+      "trend_adaptive",
+      "lagged_linear"
+    ],
+    "control_arm": "constant_blend",
+    "maturation_lag_origins": 6,
+    "lagged_linear_lags": [
+      1,
+      2,
+      3,
+      6,
+      144
+    ],
+    "lag_1008_omitted_because": "1008 steps = 7 days = the whole training window",
+    "bootstrap": {
+      "blocks": "whole calendar days within a run",
+      "draws": 2000,
+      "seed": 20260922
+    }
+  },
+  "preselected_parameters": {
+    "ewma_half_life_matured_origins": 6,
+    "horizon_weights": "lead2",
+    "min_matured_observations": 6,
+    "switching_penalty_rpm": 5.402,
+    "startup_default_arm": "trend_adaptive",
+    "control_blend_seasonal_weight": 0.25
+  },
+  "validation_sweep_top12": {
+    "median_per_origin_cost_rpm": 270.09,
+    "constant_blend_weight_scores": {
+      "0.25": 438.49,
+      "0.5": 503.9,
+      "0.75": 574.28
+    },
+    "fixed_arm_validation_cost": {
+      "seasonal_pattern": 651.41,
+      "trend_adaptive": 332.47,
+      "lagged_linear": 354.35
+    },
+    "top12": [
+      {
+        "params": {
+          "ewma_half_life_matured_origins": 6,
+          "horizon_weights": "lead2",
+          "min_matured_observations": 6,
+          "switching_penalty_rpm": 5.402,
+          "startup_default_arm": "trend_adaptive",
+          "control_blend_seasonal_weight": 0.25
+        },
+        "mean_cost": 295.04,
+        "switch_fraction": 0.044
+      },
+      {
+        "params": {
+          "ewma_half_life_matured_origins": 6,
+          "horizon_weights": "lead2",
+          "min_matured_observations": 6,
+          "switching_penalty_rpm": 13.504,
+          "startup_default_arm": "trend_adaptive",
+          "control_blend_seasonal_weight": 0.25
+        },
+        "mean_cost": 295.14,
+        "switch_fraction": 0.0308
+      },
+      {
+        "params": {
+          "ewma_half_life_matured_origins": 6,
+          "horizon_weights": "lead2",
+          "min_matured_observations": 6,
+          "switching_penalty_rpm": 0.0,
+          "startup_default_arm": "trend_adaptive",
+          "control_blend_seasonal_weight": 0.25
+        },
+        "mean_cost": 295.18,
+        "switch_fraction": 0.0636
+      },
+      {
+        "params": {
+          "ewma_half_life_matured_origins": 6,
+          "horizon_weights": "lead2",
+          "min_matured_observations": 6,
+          "switching_penalty_rpm": 5.402,
+          "startup_default_arm": "lagged_linear",
+          "control_blend_seasonal_weight": 0.25
+        },
+        "mean_cost": 295.24,
+        "switch_fraction": 0.0437
+      },
+      {
+        "params": {
+          "ewma_half_life_matured_origins": 6,
+          "horizon_weights": "lead2",
+          "min_matured_observations": 18,
+          "switching_penalty_rpm": 5.402,
+          "startup_default_arm": "trend_adaptive",
+          "control_blend_seasonal_weight": 0.25
+        },
+        "mean_cost": 295.33,
+        "switch_fraction": 0.0435
+      },
+      {
+        "params": {
+          "ewma_half_life_matured_origins": 6,
+          "horizon_weights": "lead2",
+          "min_matured_observations": 6,
+          "switching_penalty_rpm": 13.504,
+          "startup_default_arm": "lagged_linear",
+          "control_blend_seasonal_weight": 0.25
+        },
+        "mean_cost": 295.34,
+        "switch_fraction": 0.0306
+      },
+      {
+        "params": {
+          "ewma_half_life_matured_origins": 6,
+          "horizon_weights": "lead2",
+          "min_matured_observations": 6,
+          "switching_penalty_rpm": 0.0,
+          "startup_default_arm": "lagged_linear",
+          "control_blend_seasonal_weight": 0.25
+        },
+        "mean_cost": 295.38,
+        "switch_fraction": 0.0633
+      },
+      {
+        "params": {
+          "ewma_half_life_matured_origins": 6,
+          "horizon_weights": "lead2",
+          "min_matured_observations": 18,
+          "switching_penalty_rpm": 13.504,
+          "startup_default_arm": "trend_adaptive",
+          "control_blend_seasonal_weight": 0.25
+        },
+        "mean_cost": 295.45,
+        "switch_fraction": 0.0306
+      },
+      {
+        "params": {
+          "ewma_half_life_matured_origins": 6,
+          "horizon_weights": "lead2",
+          "min_matured_observations": 18,
+          "switching_penalty_rpm": 0.0,
+          "startup_default_arm": "trend_adaptive",
+          "control_blend_seasonal_weight": 0.25
+        },
+        "mean_cost": 295.51,
+        "switch_fraction": 0.0628
+      },
+      {
+        "params": {
+          "ewma_half_life_matured_origins": 6,
+          "horizon_weights": "lead2",
+          "min_matured_observations": 6,
+          "switching_penalty_rpm": 5.402,
+          "startup_default_arm": "seasonal_pattern",
+          "control_blend_seasonal_weight": 0.25
+        },
+        "mean_cost": 295.6,
+        "switch_fraction": 0.0433
+      },
+      {
+        "params": {
+          "ewma_half_life_matured_origins": 6,
+          "horizon_weights": "lead2",
+          "min_matured_observations": 6,
+          "switching_penalty_rpm": 13.504,
+          "startup_default_arm": "seasonal_pattern",
+          "control_blend_seasonal_weight": 0.25
+        },
+        "mean_cost": 295.66,
+        "switch_fraction": 0.0299
+      },
+      {
+        "params": {
+          "ewma_half_life_matured_origins": 6,
+          "horizon_weights": "lead2",
+          "min_matured_observations": 18,
+          "switching_penalty_rpm": 5.402,
+          "startup_default_arm": "lagged_linear",
+          "control_blend_seasonal_weight": 0.25
+        },
+        "mean_cost": 295.71,
+        "switch_fraction": 0.0431
+      }
+    ],
+    "worst": {
+      "params": {
+        "ewma_half_life_matured_origins": 72,
+        "horizon_weights": "uniform",
+        "min_matured_observations": 18,
+        "switching_penalty_rpm": 13.504,
+        "startup_default_arm": "lagged_linear",
+        "control_blend_seasonal_weight": 0.25
+      },
+      "mean_cost": 349.48
+    },
+    "grid_size": 216
+  },
+  "test": {
+    "per_run": {
+      "repeating/seed11": {
+        "scenario": "repeating",
+        "seed": 11,
+        "start": "2026-06-07T00:00:00",
+        "origins": 720,
+        "target_rpm_per_replica": 1684.8,
+        "switches": 13,
+        "switch_fraction": 0.0181,
+        "served_share": {
+          "seasonal_pattern": 0.924,
+          "trend_adaptive": 0.054,
+          "lagged_linear": 0.022
+        },
+        "arms": {
+          "seasonal_pattern": {
+            "cost_proxy_mean": 187.12,
+            "mae": 143.7,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 20922.0,
+            "scaling_events": 33,
+            "shortage_minutes": 4.0,
+            "shortage_replicas_mean": 1.0,
+            "shortage_replicas_max": 1,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "trend_adaptive": {
+            "cost_proxy_mean": 250.26,
+            "mae": 162.8,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 20912.0,
+            "scaling_events": 33,
+            "shortage_minutes": 4.0,
+            "shortage_replicas_mean": 1.0,
+            "shortage_replicas_max": 1,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "lagged_linear": {
+            "cost_proxy_mean": 256.02,
+            "mae": 218.0,
+            "degraded_origins": 60,
+            "forecast_failures": 0,
+            "replica_minutes": 20782.0,
+            "scaling_events": 33,
+            "shortage_minutes": 6.0,
+            "shortage_replicas_mean": 1.0,
+            "shortage_replicas_max": 1,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "constant_blend": {
+            "cost_proxy_mean": 227.19,
+            "mae": 153.8,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 20912.0,
+            "scaling_events": 33,
+            "shortage_minutes": 4.0,
+            "shortage_replicas_mean": 1.0,
+            "shortage_replicas_max": 1,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "selector": {
+            "cost_proxy_mean": 190.86,
+            "mae": 146.3,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 20922.0,
+            "scaling_events": 33,
+            "shortage_minutes": 4.0,
+            "shortage_replicas_mean": 1.0,
+            "shortage_replicas_max": 1,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          }
+        }
+      },
+      "repeating/seed12": {
+        "scenario": "repeating",
+        "seed": 12,
+        "start": "2026-06-07T00:00:00",
+        "origins": 720,
+        "target_rpm_per_replica": 1680.8,
+        "switches": 23,
+        "switch_fraction": 0.0319,
+        "served_share": {
+          "seasonal_pattern": 0.929,
+          "trend_adaptive": 0.039,
+          "lagged_linear": 0.032
+        },
+        "arms": {
+          "seasonal_pattern": {
+            "cost_proxy_mean": 185.82,
+            "mae": 141.9,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 20922.0,
+            "scaling_events": 31,
+            "shortage_minutes": 2.0,
+            "shortage_replicas_mean": 1.0,
+            "shortage_replicas_max": 1,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "trend_adaptive": {
+            "cost_proxy_mean": 250.06,
+            "mae": 163.7,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 20892.0,
+            "scaling_events": 33,
+            "shortage_minutes": 6.0,
+            "shortage_replicas_mean": 1.0,
+            "shortage_replicas_max": 1,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "lagged_linear": {
+            "cost_proxy_mean": 254.22,
+            "mae": 209.7,
+            "degraded_origins": 60,
+            "forecast_failures": 0,
+            "replica_minutes": 20732.0,
+            "scaling_events": 31,
+            "shortage_minutes": 12.0,
+            "shortage_replicas_mean": 1.0,
+            "shortage_replicas_max": 1,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "constant_blend": {
+            "cost_proxy_mean": 226.65,
+            "mae": 154.0,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 20922.0,
+            "scaling_events": 33,
+            "shortage_minutes": 4.0,
+            "shortage_replicas_mean": 1.0,
+            "shortage_replicas_max": 1,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "selector": {
+            "cost_proxy_mean": 188.7,
+            "mae": 144.1,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 20912.0,
+            "scaling_events": 31,
+            "shortage_minutes": 2.0,
+            "shortage_replicas_mean": 1.0,
+            "shortage_replicas_max": 1,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          }
+        }
+      },
+      "repeating/seed13": {
+        "scenario": "repeating",
+        "seed": 13,
+        "start": "2026-06-07T00:00:00",
+        "origins": 720,
+        "target_rpm_per_replica": 1660.1,
+        "switches": 25,
+        "switch_fraction": 0.0347,
+        "served_share": {
+          "seasonal_pattern": 0.878,
+          "trend_adaptive": 0.032,
+          "lagged_linear": 0.09
+        },
+        "arms": {
+          "seasonal_pattern": {
+            "cost_proxy_mean": 187.07,
+            "mae": 142.4,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 20962.0,
+            "scaling_events": 31,
+            "shortage_minutes": 2.0,
+            "shortage_replicas_mean": 1.0,
+            "shortage_replicas_max": 1,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "trend_adaptive": {
+            "cost_proxy_mean": 246.6,
+            "mae": 160.8,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 20942.0,
+            "scaling_events": 33,
+            "shortage_minutes": 6.0,
+            "shortage_replicas_mean": 1.0,
+            "shortage_replicas_max": 1,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "lagged_linear": {
+            "cost_proxy_mean": 252.49,
+            "mae": 214.4,
+            "degraded_origins": 60,
+            "forecast_failures": 0,
+            "replica_minutes": 20782.0,
+            "scaling_events": 31,
+            "shortage_minutes": 12.0,
+            "shortage_replicas_mean": 1.0,
+            "shortage_replicas_max": 1,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "constant_blend": {
+            "cost_proxy_mean": 225.13,
+            "mae": 152.4,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 20952.0,
+            "scaling_events": 33,
+            "shortage_minutes": 4.0,
+            "shortage_replicas_mean": 1.0,
+            "shortage_replicas_max": 1,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "selector": {
+            "cost_proxy_mean": 193.63,
+            "mae": 150.9,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 20952.0,
+            "scaling_events": 31,
+            "shortage_minutes": 2.0,
+            "shortage_replicas_mean": 1.0,
+            "shortage_replicas_max": 1,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          }
+        }
+      },
+      "trend/seed11": {
+        "scenario": "trend",
+        "seed": 11,
+        "start": "2026-06-07T00:00:00",
+        "origins": 720,
+        "target_rpm_per_replica": 1626.2,
+        "switches": 54,
+        "switch_fraction": 0.075,
+        "served_share": {
+          "seasonal_pattern": 0.014,
+          "trend_adaptive": 0.447,
+          "lagged_linear": 0.539
+        },
+        "arms": {
+          "seasonal_pattern": {
+            "cost_proxy_mean": 384.68,
+            "mae": 210.2,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 25266.0,
+            "scaling_events": 73,
+            "shortage_minutes": 40.0,
+            "shortage_replicas_mean": 1.1,
+            "shortage_replicas_max": 3,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "trend_adaptive": {
+            "cost_proxy_mean": 307.93,
+            "mae": 198.8,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 25896.0,
+            "scaling_events": 68,
+            "shortage_minutes": 16.0,
+            "shortage_replicas_mean": 1.25,
+            "shortage_replicas_max": 3,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "lagged_linear": {
+            "cost_proxy_mean": 315.04,
+            "mae": 273.0,
+            "degraded_origins": 3,
+            "forecast_failures": 0,
+            "replica_minutes": 25516.0,
+            "scaling_events": 73,
+            "shortage_minutes": 38.0,
+            "shortage_replicas_mean": 1.11,
+            "shortage_replicas_max": 3,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "constant_blend": {
+            "cost_proxy_mean": 314.66,
+            "mae": 195.8,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 25756.0,
+            "scaling_events": 73,
+            "shortage_minutes": 18.0,
+            "shortage_replicas_mean": 1.22,
+            "shortage_replicas_max": 3,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "selector": {
+            "cost_proxy_mean": 303.27,
+            "mae": 237.1,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 25696.0,
+            "scaling_events": 72,
+            "shortage_minutes": 28.0,
+            "shortage_replicas_mean": 1.14,
+            "shortage_replicas_max": 3,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          }
+        }
+      },
+      "trend/seed12": {
+        "scenario": "trend",
+        "seed": 12,
+        "start": "2026-06-07T00:00:00",
+        "origins": 720,
+        "target_rpm_per_replica": 1621.8,
+        "switches": 42,
+        "switch_fraction": 0.0583,
+        "served_share": {
+          "seasonal_pattern": 0.028,
+          "trend_adaptive": 0.5,
+          "lagged_linear": 0.472
+        },
+        "arms": {
+          "seasonal_pattern": {
+            "cost_proxy_mean": 385.32,
+            "mae": 208.9,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 25305.0,
+            "scaling_events": 68,
+            "shortage_minutes": 40.0,
+            "shortage_replicas_mean": 1.1,
+            "shortage_replicas_max": 3,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "trend_adaptive": {
+            "cost_proxy_mean": 298.97,
+            "mae": 194.6,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 25805.0,
+            "scaling_events": 59,
+            "shortage_minutes": 18.0,
+            "shortage_replicas_mean": 1.22,
+            "shortage_replicas_max": 3,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "lagged_linear": {
+            "cost_proxy_mean": 310.35,
+            "mae": 260.9,
+            "degraded_origins": 3,
+            "forecast_failures": 0,
+            "replica_minutes": 25525.0,
+            "scaling_events": 67,
+            "shortage_minutes": 30.0,
+            "shortage_replicas_mean": 1.13,
+            "shortage_replicas_max": 3,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "constant_blend": {
+            "cost_proxy_mean": 307.19,
+            "mae": 191.5,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 25705.0,
+            "scaling_events": 63,
+            "shortage_minutes": 22.0,
+            "shortage_replicas_mean": 1.18,
+            "shortage_replicas_max": 3,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "selector": {
+            "cost_proxy_mean": 287.36,
+            "mae": 221.6,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 25685.0,
+            "scaling_events": 63,
+            "shortage_minutes": 22.0,
+            "shortage_replicas_mean": 1.18,
+            "shortage_replicas_max": 3,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          }
+        }
+      },
+      "trend/seed13": {
+        "scenario": "trend",
+        "seed": 13,
+        "start": "2026-06-07T00:00:00",
+        "origins": 720,
+        "target_rpm_per_replica": 1585.5,
+        "switches": 43,
+        "switch_fraction": 0.0597,
+        "served_share": {
+          "seasonal_pattern": 0.017,
+          "trend_adaptive": 0.547,
+          "lagged_linear": 0.436
+        },
+        "arms": {
+          "seasonal_pattern": {
+            "cost_proxy_mean": 382.95,
+            "mae": 205.8,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 25995.0,
+            "scaling_events": 68,
+            "shortage_minutes": 42.0,
+            "shortage_replicas_mean": 1.1,
+            "shortage_replicas_max": 3,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "trend_adaptive": {
+            "cost_proxy_mean": 298.08,
+            "mae": 193.9,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 26335.0,
+            "scaling_events": 73,
+            "shortage_minutes": 28.0,
+            "shortage_replicas_mean": 1.14,
+            "shortage_replicas_max": 3,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "lagged_linear": {
+            "cost_proxy_mean": 310.07,
+            "mae": 267.1,
+            "degraded_origins": 3,
+            "forecast_failures": 0,
+            "replica_minutes": 25985.0,
+            "scaling_events": 66,
+            "shortage_minutes": 50.0,
+            "shortage_replicas_mean": 1.08,
+            "shortage_replicas_max": 3,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "constant_blend": {
+            "cost_proxy_mean": 303.1,
+            "mae": 189.6,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 26155.0,
+            "scaling_events": 66,
+            "shortage_minutes": 36.0,
+            "shortage_replicas_mean": 1.11,
+            "shortage_replicas_max": 3,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "selector": {
+            "cost_proxy_mean": 293.91,
+            "mae": 222.3,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 26245.0,
+            "scaling_events": 69,
+            "shortage_minutes": 32.0,
+            "shortage_replicas_mean": 1.12,
+            "shortage_replicas_max": 3,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          }
+        }
+      },
+      "levelshift/seed11": {
+        "scenario": "levelshift",
+        "seed": 11,
+        "start": "2026-06-07T00:00:00",
+        "origins": 720,
+        "target_rpm_per_replica": 1717.9,
+        "switches": 43,
+        "switch_fraction": 0.0597,
+        "served_share": {
+          "seasonal_pattern": 0.635,
+          "trend_adaptive": 0.267,
+          "lagged_linear": 0.099
+        },
+        "arms": {
+          "seasonal_pattern": {
+            "cost_proxy_mean": 1010.76,
+            "mae": 550.2,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 25934.0,
+            "scaling_events": 54,
+            "shortage_minutes": 24.0,
+            "shortage_replicas_mean": 1.08,
+            "shortage_replicas_max": 2,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "trend_adaptive": {
+            "cost_proxy_mean": 367.49,
+            "mae": 289.5,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 26084.0,
+            "scaling_events": 55,
+            "shortage_minutes": 16.0,
+            "shortage_replicas_mean": 1.12,
+            "shortage_replicas_max": 2,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "lagged_linear": {
+            "cost_proxy_mean": 463.49,
+            "mae": 363.0,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 25644.0,
+            "scaling_events": 56,
+            "shortage_minutes": 44.0,
+            "shortage_replicas_mean": 1.05,
+            "shortage_replicas_max": 2,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "constant_blend": {
+            "cost_proxy_mean": 481.95,
+            "mae": 340.7,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 26014.0,
+            "scaling_events": 61,
+            "shortage_minutes": 22.0,
+            "shortage_replicas_mean": 1.09,
+            "shortage_replicas_max": 2,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "selector": {
+            "cost_proxy_mean": 357.85,
+            "mae": 297.8,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 26094.0,
+            "scaling_events": 51,
+            "shortage_minutes": 16.0,
+            "shortage_replicas_mean": 1.12,
+            "shortage_replicas_max": 2,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          }
+        }
+      },
+      "levelshift/seed12": {
+        "scenario": "levelshift",
+        "seed": 12,
+        "start": "2026-06-07T00:00:00",
+        "origins": 720,
+        "target_rpm_per_replica": 1710.8,
+        "switches": 24,
+        "switch_fraction": 0.0333,
+        "served_share": {
+          "seasonal_pattern": 0.657,
+          "trend_adaptive": 0.264,
+          "lagged_linear": 0.079
+        },
+        "arms": {
+          "seasonal_pattern": {
+            "cost_proxy_mean": 1029.82,
+            "mae": 563.0,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 25784.0,
+            "scaling_events": 44,
+            "shortage_minutes": 18.0,
+            "shortage_replicas_mean": 1.11,
+            "shortage_replicas_max": 2,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "trend_adaptive": {
+            "cost_proxy_mean": 382.35,
+            "mae": 304.8,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 26114.0,
+            "scaling_events": 47,
+            "shortage_minutes": 8.0,
+            "shortage_replicas_mean": 1.25,
+            "shortage_replicas_max": 2,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "lagged_linear": {
+            "cost_proxy_mean": 473.4,
+            "mae": 376.5,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 25544.0,
+            "scaling_events": 46,
+            "shortage_minutes": 40.0,
+            "shortage_replicas_mean": 1.05,
+            "shortage_replicas_max": 2,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "constant_blend": {
+            "cost_proxy_mean": 500.21,
+            "mae": 356.0,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 25954.0,
+            "scaling_events": 46,
+            "shortage_minutes": 14.0,
+            "shortage_replicas_mean": 1.14,
+            "shortage_replicas_max": 2,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "selector": {
+            "cost_proxy_mean": 362.18,
+            "mae": 312.5,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 26014.0,
+            "scaling_events": 47,
+            "shortage_minutes": 10.0,
+            "shortage_replicas_mean": 1.2,
+            "shortage_replicas_max": 2,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          }
+        }
+      },
+      "levelshift/seed13": {
+        "scenario": "levelshift",
+        "seed": 13,
+        "start": "2026-06-07T00:00:00",
+        "origins": 720,
+        "target_rpm_per_replica": 1697.9,
+        "switches": 28,
+        "switch_fraction": 0.0389,
+        "served_share": {
+          "seasonal_pattern": 0.597,
+          "trend_adaptive": 0.272,
+          "lagged_linear": 0.131
+        },
+        "arms": {
+          "seasonal_pattern": {
+            "cost_proxy_mean": 1005.69,
+            "mae": 547.4,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 25994.0,
+            "scaling_events": 48,
+            "shortage_minutes": 20.0,
+            "shortage_replicas_mean": 1.1,
+            "shortage_replicas_max": 2,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "trend_adaptive": {
+            "cost_proxy_mean": 370.48,
+            "mae": 292.2,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 26174.0,
+            "scaling_events": 45,
+            "shortage_minutes": 10.0,
+            "shortage_replicas_mean": 1.2,
+            "shortage_replicas_max": 2,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "lagged_linear": {
+            "cost_proxy_mean": 454.43,
+            "mae": 359.0,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 25744.0,
+            "scaling_events": 54,
+            "shortage_minutes": 42.0,
+            "shortage_replicas_mean": 1.05,
+            "shortage_replicas_max": 2,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "constant_blend": {
+            "cost_proxy_mean": 485.49,
+            "mae": 343.1,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 26104.0,
+            "scaling_events": 52,
+            "shortage_minutes": 18.0,
+            "shortage_replicas_mean": 1.11,
+            "shortage_replicas_max": 2,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "selector": {
+            "cost_proxy_mean": 350.1,
+            "mae": 300.7,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 26144.0,
+            "scaling_events": 47,
+            "shortage_minutes": 14.0,
+            "shortage_replicas_mean": 1.14,
+            "shortage_replicas_max": 2,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          }
+        }
+      },
+      "spike/seed11": {
+        "scenario": "spike",
+        "seed": 11,
+        "start": "2026-06-07T00:00:00",
+        "origins": 720,
+        "target_rpm_per_replica": 1532.9,
+        "switches": 17,
+        "switch_fraction": 0.0236,
+        "served_share": {
+          "seasonal_pattern": 0.915,
+          "trend_adaptive": 0.024,
+          "lagged_linear": 0.061
+        },
+        "arms": {
+          "seasonal_pattern": {
+            "cost_proxy_mean": 293.73,
+            "mae": 214.4,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 23294.0,
+            "scaling_events": 85,
+            "shortage_minutes": 30.0,
+            "shortage_replicas_mean": 1.27,
+            "shortage_replicas_max": 3,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "trend_adaptive": {
+            "cost_proxy_mean": 381.11,
+            "mae": 251.7,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 23034.0,
+            "scaling_events": 87,
+            "shortage_minutes": 36.0,
+            "shortage_replicas_mean": 1.33,
+            "shortage_replicas_max": 4,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "lagged_linear": {
+            "cost_proxy_mean": 372.26,
+            "mae": 313.7,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 22524.0,
+            "scaling_events": 79,
+            "shortage_minutes": 46.0,
+            "shortage_replicas_mean": 1.17,
+            "shortage_replicas_max": 3,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "constant_blend": {
+            "cost_proxy_mean": 349.93,
+            "mae": 237.0,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 23074.0,
+            "scaling_events": 84,
+            "shortage_minutes": 34.0,
+            "shortage_replicas_mean": 1.24,
+            "shortage_replicas_max": 3,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "selector": {
+            "cost_proxy_mean": 296.62,
+            "mae": 232.9,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 23244.0,
+            "scaling_events": 84,
+            "shortage_minutes": 30.0,
+            "shortage_replicas_mean": 1.27,
+            "shortage_replicas_max": 3,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          }
+        }
+      },
+      "spike/seed12": {
+        "scenario": "spike",
+        "seed": 12,
+        "start": "2026-06-07T00:00:00",
+        "origins": 720,
+        "target_rpm_per_replica": 1693.3,
+        "switches": 30,
+        "switch_fraction": 0.0417,
+        "served_share": {
+          "seasonal_pattern": 0.792,
+          "trend_adaptive": 0.067,
+          "lagged_linear": 0.142
+        },
+        "arms": {
+          "seasonal_pattern": {
+            "cost_proxy_mean": 320.36,
+            "mae": 273.7,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 22148.0,
+            "scaling_events": 49,
+            "shortage_minutes": 6.0,
+            "shortage_replicas_mean": 2.67,
+            "shortage_replicas_max": 4,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "trend_adaptive": {
+            "cost_proxy_mean": 393.98,
+            "mae": 290.6,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 21568.0,
+            "scaling_events": 41,
+            "shortage_minutes": 8.0,
+            "shortage_replicas_mean": 2.25,
+            "shortage_replicas_max": 4,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "lagged_linear": {
+            "cost_proxy_mean": 393.68,
+            "mae": 424.7,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 21108.0,
+            "scaling_events": 49,
+            "shortage_minutes": 38.0,
+            "shortage_replicas_mean": 1.26,
+            "shortage_replicas_max": 4,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "constant_blend": {
+            "cost_proxy_mean": 367.24,
+            "mae": 280.6,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 21708.0,
+            "scaling_events": 49,
+            "shortage_minutes": 8.0,
+            "shortage_replicas_mean": 2.25,
+            "shortage_replicas_max": 4,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "selector": {
+            "cost_proxy_mean": 365.15,
+            "mae": 319.7,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 22208.0,
+            "scaling_events": 51,
+            "shortage_minutes": 6.0,
+            "shortage_replicas_mean": 2.67,
+            "shortage_replicas_max": 4,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          }
+        }
+      },
+      "spike/seed13": {
+        "scenario": "spike",
+        "seed": 13,
+        "start": "2026-06-07T00:00:00",
+        "origins": 720,
+        "target_rpm_per_replica": 1634.9,
+        "switches": 27,
+        "switch_fraction": 0.0375,
+        "served_share": {
+          "seasonal_pattern": 0.728,
+          "trend_adaptive": 0.064,
+          "lagged_linear": 0.208
+        },
+        "arms": {
+          "seasonal_pattern": {
+            "cost_proxy_mean": 527.97,
+            "mae": 367.7,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 22684.0,
+            "scaling_events": 62,
+            "shortage_minutes": 18.0,
+            "shortage_replicas_mean": 2.11,
+            "shortage_replicas_max": 7,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "trend_adaptive": {
+            "cost_proxy_mean": 600.05,
+            "mae": 442.3,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 22464.0,
+            "scaling_events": 66,
+            "shortage_minutes": 20.0,
+            "shortage_replicas_mean": 2.0,
+            "shortage_replicas_max": 7,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "lagged_linear": {
+            "cost_proxy_mean": 500.35,
+            "mae": 512.4,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 22084.0,
+            "scaling_events": 62,
+            "shortage_minutes": 36.0,
+            "shortage_replicas_mean": 1.56,
+            "shortage_replicas_max": 7,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "constant_blend": {
+            "cost_proxy_mean": 574.45,
+            "mae": 418.4,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 22464.0,
+            "scaling_events": 64,
+            "shortage_minutes": 20.0,
+            "shortage_replicas_mean": 2.0,
+            "shortage_replicas_max": 7,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "selector": {
+            "cost_proxy_mean": 545.12,
+            "mae": 401.1,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 22664.0,
+            "scaling_events": 66,
+            "shortage_minutes": 20.0,
+            "shortage_replicas_mean": 2.0,
+            "shortage_replicas_max": 7,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          }
+        }
+      },
+      "weekly/seed11": {
+        "scenario": "weekly",
+        "seed": 11,
+        "start": "2026-06-07T00:00:00",
+        "origins": 720,
+        "target_rpm_per_replica": 1273.9,
+        "switches": 28,
+        "switch_fraction": 0.0389,
+        "served_share": {
+          "seasonal_pattern": 0.392,
+          "trend_adaptive": 0.386,
+          "lagged_linear": 0.222
+        },
+        "arms": {
+          "seasonal_pattern": {
+            "cost_proxy_mean": 1242.92,
+            "mae": 966.2,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 25812.0,
+            "scaling_events": 65,
+            "shortage_minutes": 14.0,
+            "shortage_replicas_mean": 1.0,
+            "shortage_replicas_max": 1,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "trend_adaptive": {
+            "cost_proxy_mean": 239.44,
+            "mae": 258.2,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 22432.0,
+            "scaling_events": 53,
+            "shortage_minutes": 12.0,
+            "shortage_replicas_mean": 1.0,
+            "shortage_replicas_max": 1,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "lagged_linear": {
+            "cost_proxy_mean": 284.92,
+            "mae": 250.7,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 22012.0,
+            "scaling_events": 39,
+            "shortage_minutes": 38.0,
+            "shortage_replicas_mean": 1.0,
+            "shortage_replicas_max": 1,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "constant_blend": {
+            "cost_proxy_mean": 434.79,
+            "mae": 410.6,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 23352.0,
+            "scaling_events": 53,
+            "shortage_minutes": 12.0,
+            "shortage_replicas_mean": 1.0,
+            "shortage_replicas_max": 1,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "selector": {
+            "cost_proxy_mean": 223.72,
+            "mae": 233.8,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 22392.0,
+            "scaling_events": 45,
+            "shortage_minutes": 12.0,
+            "shortage_replicas_mean": 1.0,
+            "shortage_replicas_max": 1,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          }
+        }
+      },
+      "weekly/seed12": {
+        "scenario": "weekly",
+        "seed": 12,
+        "start": "2026-06-07T00:00:00",
+        "origins": 720,
+        "target_rpm_per_replica": 1287.3,
+        "switches": 27,
+        "switch_fraction": 0.0375,
+        "served_share": {
+          "seasonal_pattern": 0.376,
+          "trend_adaptive": 0.353,
+          "lagged_linear": 0.271
+        },
+        "arms": {
+          "seasonal_pattern": {
+            "cost_proxy_mean": 1251.28,
+            "mae": 972.9,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 25522.0,
+            "scaling_events": 63,
+            "shortage_minutes": 14.0,
+            "shortage_replicas_mean": 1.0,
+            "shortage_replicas_max": 1,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "trend_adaptive": {
+            "cost_proxy_mean": 246.71,
+            "mae": 260.4,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 22292.0,
+            "scaling_events": 49,
+            "shortage_minutes": 12.0,
+            "shortage_replicas_mean": 1.0,
+            "shortage_replicas_max": 1,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "lagged_linear": {
+            "cost_proxy_mean": 285.21,
+            "mae": 251.1,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 21962.0,
+            "scaling_events": 35,
+            "shortage_minutes": 36.0,
+            "shortage_replicas_mean": 1.0,
+            "shortage_replicas_max": 1,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "constant_blend": {
+            "cost_proxy_mean": 435.18,
+            "mae": 410.8,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 23172.0,
+            "scaling_events": 53,
+            "shortage_minutes": 16.0,
+            "shortage_replicas_mean": 1.0,
+            "shortage_replicas_max": 1,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "selector": {
+            "cost_proxy_mean": 226.89,
+            "mae": 238.7,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 22242.0,
+            "scaling_events": 43,
+            "shortage_minutes": 12.0,
+            "shortage_replicas_mean": 1.0,
+            "shortage_replicas_max": 1,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          }
+        }
+      },
+      "weekly/seed13": {
+        "scenario": "weekly",
+        "seed": 13,
+        "start": "2026-06-07T00:00:00",
+        "origins": 720,
+        "target_rpm_per_replica": 1268.2,
+        "switches": 31,
+        "switch_fraction": 0.0431,
+        "served_share": {
+          "seasonal_pattern": 0.374,
+          "trend_adaptive": 0.314,
+          "lagged_linear": 0.312
+        },
+        "arms": {
+          "seasonal_pattern": {
+            "cost_proxy_mean": 1248.3,
+            "mae": 973.1,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 25952.0,
+            "scaling_events": 64,
+            "shortage_minutes": 16.0,
+            "shortage_replicas_mean": 1.0,
+            "shortage_replicas_max": 1,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "trend_adaptive": {
+            "cost_proxy_mean": 242.7,
+            "mae": 261.2,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 22562.0,
+            "scaling_events": 51,
+            "shortage_minutes": 16.0,
+            "shortage_replicas_mean": 1.0,
+            "shortage_replicas_max": 1,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "lagged_linear": {
+            "cost_proxy_mean": 273.1,
+            "mae": 244.0,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 22102.0,
+            "scaling_events": 41,
+            "shortage_minutes": 40.0,
+            "shortage_replicas_mean": 1.0,
+            "shortage_replicas_max": 1,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "constant_blend": {
+            "cost_proxy_mean": 436.44,
+            "mae": 414.4,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 23532.0,
+            "scaling_events": 53,
+            "shortage_minutes": 16.0,
+            "shortage_replicas_mean": 1.0,
+            "shortage_replicas_max": 1,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          },
+          "selector": {
+            "cost_proxy_mean": 219.93,
+            "mae": 232.5,
+            "degraded_origins": 0,
+            "forecast_failures": 0,
+            "replica_minutes": 22542.0,
+            "scaling_events": 47,
+            "shortage_minutes": 14.0,
+            "shortage_replicas_mean": 1.0,
+            "shortage_replicas_max": 1,
+            "minutes_demand_exceeded_ceiling": 0.0,
+            "decisions_from": "go_controller"
+          }
+        }
+      }
+    },
+    "pooled": {
+      "seasonal_pattern": {
+        "cost_proxy_mean": 642.92,
+        "mae": 432.1,
+        "replica_minutes": 362496.0,
+        "scaling_events": 838,
+        "shortage_minutes": 290.0,
+        "minutes_demand_exceeded_ceiling": 0.0
+      },
+      "trend_adaptive": {
+        "cost_proxy_mean": 325.08,
+        "mae": 248.4,
+        "replica_minutes": 353506.0,
+        "scaling_events": 793,
+        "shortage_minutes": 216.0,
+        "minutes_demand_exceeded_ceiling": 0.0
+      },
+      "lagged_linear": {
+        "cost_proxy_mean": 346.6,
+        "mae": 302.5,
+        "replica_minutes": 348046.0,
+        "scaling_events": 762,
+        "shortage_minutes": 508.0,
+        "minutes_demand_exceeded_ceiling": 0.0
+      },
+      "constant_blend": {
+        "cost_proxy_mean": 377.97,
+        "mae": 283.2,
+        "replica_minutes": 355776.0,
+        "scaling_events": 816,
+        "shortage_minutes": 248.0,
+        "minutes_demand_exceeded_ceiling": 0.0
+      },
+      "selector": {
+        "cost_proxy_mean": 293.68,
+        "mae": 246.1,
+        "replica_minutes": 353956.0,
+        "scaling_events": 780,
+        "shortage_minutes": 224.0,
+        "minutes_demand_exceeded_ceiling": 0.0
+      }
+    },
+    "best_fixed_arm_pooled": "trend_adaptive",
+    "comparisons_vs_selector": {
+      "seasonal_pattern": {
+        "mean_a": 293.68,
+        "mean_b": 642.92,
+        "diff": -349.23,
+        "diff_ci95": [
+          -526.56,
+          -190.3
+        ],
+        "rel": -0.5432,
+        "rel_ci95": [
+          -0.6391,
+          -0.3965
+        ],
+        "blocks": 84
+      },
+      "trend_adaptive": {
+        "mean_a": 293.68,
+        "mean_b": 325.08,
+        "diff": -31.4,
+        "diff_ci95": [
+          -41.81,
+          -19.9
+        ],
+        "rel": -0.0966,
+        "rel_ci95": [
+          -0.1327,
+          -0.0599
+        ],
+        "blocks": 84
+      },
+      "lagged_linear": {
+        "mean_a": 293.68,
+        "mean_b": 346.6,
+        "diff": -52.92,
+        "diff_ci95": [
+          -68.15,
+          -35.39
+        ],
+        "rel": -0.1527,
+        "rel_ci95": [
+          -0.1989,
+          -0.1005
+        ],
+        "blocks": 84
+      },
+      "constant_blend": {
+        "mean_a": 293.68,
+        "mean_b": 377.97,
+        "diff": -84.29,
+        "diff_ci95": [
+          -114.65,
+          -56.69
+        ],
+        "rel": -0.223,
+        "rel_ci95": [
+          -0.2796,
+          -0.1645
+        ],
+        "blocks": 84
+      }
+    },
+    "repeating_noninferiority": {
+      "comparator": "seasonal_pattern",
+      "mean_a": 191.06,
+      "mean_b": 186.67,
+      "diff": 4.39,
+      "diff_ci95": [
+        2.5,
+        6.37
+      ],
+      "rel": 0.0235,
+      "rel_ci95": [
+        0.0135,
+        0.0339
+      ],
+      "blocks": 15
+    },
+    "switch_fraction_mean": 0.0421,
+    "per_scenario_DIAGNOSTIC": {
+      "repeating": {
+        "arm_cost_proxy_mean": {
+          "seasonal_pattern": 186.67,
+          "trend_adaptive": 248.98,
+          "lagged_linear": 254.24,
+          "constant_blend": 226.32,
+          "selector": 191.06
+        },
+        "best_fixed_here": "seasonal_pattern",
+        "selector_vs_best_fixed_here": {
+          "mean_a": 191.06,
+          "mean_b": 186.67,
+          "diff": 4.39,
+          "diff_ci95": [
+            2.5,
+            6.37
+          ],
+          "rel": 0.0235,
+          "rel_ci95": [
+            0.0135,
+            0.0339
+          ],
+          "blocks": 15
+        },
+        "selector_vs_pooled_best_fixed": {
+          "mean_a": 191.06,
+          "mean_b": 248.98,
+          "diff": -57.92,
+          "diff_ci95": [
+            -64.21,
+            -51.69
+          ],
+          "rel": -0.2326,
+          "rel_ci95": [
+            -0.2565,
+            -0.2079
+          ],
+          "blocks": 15
+        }
+      },
+      "trend": {
+        "arm_cost_proxy_mean": {
+          "seasonal_pattern": 384.32,
+          "trend_adaptive": 301.66,
+          "lagged_linear": 311.82,
+          "constant_blend": 308.32,
+          "selector": 294.84
+        },
+        "best_fixed_here": "trend_adaptive",
+        "selector_vs_best_fixed_here": {
+          "mean_a": 294.84,
+          "mean_b": 301.66,
+          "diff": -6.82,
+          "diff_ci95": [
+            -13.76,
+            0.18
+          ],
+          "rel": -0.0226,
+          "rel_ci95": [
+            -0.0456,
+            0.0006
+          ],
+          "blocks": 18
+        },
+        "selector_vs_pooled_best_fixed": {
+          "mean_a": 294.84,
+          "mean_b": 301.66,
+          "diff": -6.82,
+          "diff_ci95": [
+            -13.76,
+            0.18
+          ],
+          "rel": -0.0226,
+          "rel_ci95": [
+            -0.0456,
+            0.0006
+          ],
+          "blocks": 18
+        }
+      },
+      "levelshift": {
+        "arm_cost_proxy_mean": {
+          "seasonal_pattern": 1015.42,
+          "trend_adaptive": 373.44,
+          "lagged_linear": 463.77,
+          "constant_blend": 489.22,
+          "selector": 356.71
+        },
+        "best_fixed_here": "trend_adaptive",
+        "selector_vs_best_fixed_here": {
+          "mean_a": 356.71,
+          "mean_b": 373.44,
+          "diff": -16.73,
+          "diff_ci95": [
+            -53.21,
+            24.58
+          ],
+          "rel": -0.0448,
+          "rel_ci95": [
+            -0.1589,
+            0.0586
+          ],
+          "blocks": 18
+        },
+        "selector_vs_pooled_best_fixed": {
+          "mean_a": 356.71,
+          "mean_b": 373.44,
+          "diff": -16.73,
+          "diff_ci95": [
+            -53.21,
+            24.58
+          ],
+          "rel": -0.0448,
+          "rel_ci95": [
+            -0.1589,
+            0.0586
+          ],
+          "blocks": 18
+        }
+      },
+      "spike": {
+        "arm_cost_proxy_mean": {
+          "seasonal_pattern": 380.69,
+          "trend_adaptive": 458.38,
+          "lagged_linear": 422.1,
+          "constant_blend": 430.54,
+          "selector": 402.29
+        },
+        "best_fixed_here": "seasonal_pattern",
+        "selector_vs_best_fixed_here": {
+          "mean_a": 402.29,
+          "mean_b": 380.69,
+          "diff": 21.61,
+          "diff_ci95": [
+            8.96,
+            40.72
+          ],
+          "rel": 0.0568,
+          "rel_ci95": [
+            0.025,
+            0.1218
+          ],
+          "blocks": 18
+        },
+        "selector_vs_pooled_best_fixed": {
+          "mean_a": 402.29,
+          "mean_b": 458.38,
+          "diff": -56.09,
+          "diff_ci95": [
+            -79.89,
+            -31.82
+          ],
+          "rel": -0.1224,
+          "rel_ci95": [
+            -0.1867,
+            -0.0677
+          ],
+          "blocks": 18
+        }
+      },
+      "weekly": {
+        "arm_cost_proxy_mean": {
+          "seasonal_pattern": 1247.5,
+          "trend_adaptive": 242.95,
+          "lagged_linear": 281.08,
+          "constant_blend": 435.47,
+          "selector": 223.51
+        },
+        "best_fixed_here": "trend_adaptive",
+        "selector_vs_best_fixed_here": {
+          "mean_a": 223.51,
+          "mean_b": 242.95,
+          "diff": -19.44,
+          "diff_ci95": [
+            -36.63,
+            -1.27
+          ],
+          "rel": -0.08,
+          "rel_ci95": [
+            -0.1523,
+            -0.0062
+          ],
+          "blocks": 15
+        },
+        "selector_vs_pooled_best_fixed": {
+          "mean_a": 223.51,
+          "mean_b": 242.95,
+          "diff": -19.44,
+          "diff_ci95": [
+            -36.63,
+            -1.27
+          ],
+          "rel": -0.08,
+          "rel_ci95": [
+            -0.1523,
+            -0.0062
+          ],
+          "blocks": 15
+        }
+      }
+    },
+    "bar": {
+      "S1_pooled_cost_improvement": {
+        "required": "<= -5% vs best fixed arm and CI upper < 0",
+        "observed_rel": -0.0966,
+        "observed_ci95": [
+          -41.81,
+          -19.9
+        ],
+        "pass": true
+      },
+      "S2_repeating_noninferiority": {
+        "required": "<= +2% and CI upper <= +5%",
+        "observed_rel": 0.0235,
+        "observed_rel_ci95": [
+          0.0135,
+          0.0339
+        ],
+        "pass": false
+      },
+      "S3_operational": {
+        "required": "shortage <= +10%, no new failures, switching <= 10% of origins",
+        "shortage_pass": true,
+        "failures_pass": true,
+        "switching_pass": true,
+        "pass": true
+      }
+    },
+    "verdict": "KEEP THE FIXED BASELINE",
+    "hindsight_per_run_winner_DIAGNOSTIC_ONLY": {
+      "repeating/seed11": "seasonal_pattern",
+      "repeating/seed12": "seasonal_pattern",
+      "repeating/seed13": "seasonal_pattern",
+      "trend/seed11": "trend_adaptive",
+      "trend/seed12": "trend_adaptive",
+      "trend/seed13": "trend_adaptive",
+      "levelshift/seed11": "trend_adaptive",
+      "levelshift/seed12": "trend_adaptive",
+      "levelshift/seed13": "trend_adaptive",
+      "spike/seed11": "seasonal_pattern",
+      "spike/seed12": "seasonal_pattern",
+      "spike/seed13": "lagged_linear",
+      "weekly/seed11": "trend_adaptive",
+      "weekly/seed12": "trend_adaptive",
+      "weekly/seed13": "trend_adaptive"
+    }
+  }
+}

@@ -72,3 +72,20 @@ Results land in `eval/results.json`; the written-up findings are in `eval/RESULT
 
 `eval/data/benchmark-nginx-test.json` is a read-only export from the benchmark cluster's
 Prometheus, kept so the real-data run is reproducible.
+
+## The selector experiment
+
+`eval/selector.py` is a separate offline experiment (D-116) asking a different question: given
+that the best cheap forecaster flips between `seasonal_pattern` and `trend_adaptive` depending on
+the workload, does an online selector that serves whichever has been cheapest lately beat serving
+a fixed one? It adds a cheap lagged-linear candidate, uses a constant blend as a control arm,
+preselects every parameter on validation seeds and dates the test set does not contain, and
+replays the real Go controller separately for each arm. The ranking metric is a documented
+asymmetric **absolute**-error proxy, not operating cost.
+
+```sh
+eval/.venv/bin/python eval/selector.py --out eval/selector-20260922.json   # ~4.5 min
+eval/.venv/bin/python eval/selector.py --no-replay                          # accuracy only
+```
+
+Findings: `eval/SELECTOR-RESULTS-2026-09-22.md`. It did not clear its predeclared bar.
