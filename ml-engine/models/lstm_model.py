@@ -165,12 +165,31 @@ class LSTMForecastModel:
         if len(values) < min_required:
             raise ValueError(f"Insufficient data: {len(values)} points (need {min_required})")
 
-        # Scale the data -- Phase 16 (D-08): RobustScaler for outlier-resistant normalization
-        self.scaler = RobustScaler()
-        scaled_data = self.scaler.fit_transform(values)
-
         # Phase 16 (D-05): Generate time features from DatetimeIndex
         time_features = generate_time_features(data.index)
+
+        # --- Split BEFORE fitting preprocessing (C-46) --------------------------------
+        # A sequence i reads rows i .. i+seq_len-1 and is labelled by rows
+        # i+seq_len .. i+seq_len+STEPS_AHEAD-1. Two defects were fixed here:
+        #   1. RobustScaler was fitted on the whole series, so the validation target
+        #      distribution leaked into the centre/scale used for training.
+        #   2. The 80/20 split cut the SEQUENCE list, but neighbouring sequences share
+        #      target rows, so the last training sequences were labelled by the same
+        #      timestamps as the first validation ones.
+        # Now the split is on the TIME AXIS, preprocessing is fitted on the training rows
+        # only, and a purge gap of (sequence_length + STEPS_AHEAD - 1) rows guarantees that
+        # no training label and no validation label share a timestamp.
+        n_rows = len(values)
+        n_seq_total = n_rows - self.sequence_length - STEPS_AHEAD + 1
+        split_row = int(0.8 * n_rows)
+        purge = self.sequence_length + STEPS_AHEAD - 1
+
+        fit_rows = values[:split_row]
+        if len(fit_rows) < 2:
+            fit_rows = values
+        self.scaler = RobustScaler()
+        self.scaler.fit(fit_rows)
+        scaled_data = self.scaler.transform(values)
 
         # Phase 16 (D-04): Create multi-step sequences with time features
         X, y = self._create_sequences(scaled_data.flatten(), time_features)
@@ -180,22 +199,38 @@ class LSTMForecastModel:
 
         # X already has shape (N, seq_len, 5) from _create_sequences -- no reshape needed
 
-        # Split data: 80% train, 20% validation
-        train_size = int(0.8 * len(X))
-        X_train, X_val = X[:train_size], X[train_size:]
-        y_train, y_val = y[:train_size], y[train_size:]
+        # Training sequences are those whose LAST target row is before the split; validation
+        # sequences are those whose FIRST input row starts after the purge gap.
+        train_idx = np.array([i for i in range(len(X))
+                              if i + self.sequence_length + STEPS_AHEAD - 1 < split_row], dtype=int)
+        val_idx = np.array([i for i in range(len(X)) if i >= split_row - self.sequence_length + purge],
+                           dtype=int)
+        if len(train_idx) == 0 or len(val_idx) == 0:
+            # Series too short for a purged split: fall back to the contiguous sequence split,
+            # and say so in the metadata rather than silently leaking.
+            train_size = int(0.8 * len(X))
+            train_idx = np.arange(0, train_size, dtype=int)
+            val_idx = np.arange(train_size, len(X), dtype=int)
+            self._purged_split = False
+        else:
+            self._purged_split = True
+
+        train_size = len(train_idx)
+        X_train, X_val = X[train_idx], X[val_idx]
+        y_train, y_val = y[train_idx], y[val_idx]
+        genuine_all = np.ones(len(X), dtype=bool)
 
         # Gap-filled (imputed) slots may serve as inputs, never as validation labels or as labels in the
         # reported training metrics (data/gapfill.py rule). A sequence i has targets at rows
         # i+seq_len .. i+seq_len+STEPS_AHEAD-1.
-        genuine_target = np.ones(len(X), dtype=bool)
+        genuine_target = genuine_all
         n_val_dropped = 0
         if imputed is not None and len(imputed) == len(values) and imputed.any():
             imp = np.asarray(imputed, dtype=bool)
             for i in range(len(X)):
                 if imp[i + self.sequence_length:i + self.sequence_length + STEPS_AHEAD].any():
                     genuine_target[i] = False
-            val_keep = genuine_target[train_size:]
+            val_keep = genuine_target[val_idx]
             n_val_dropped = int((~val_keep).sum())
             X_val, y_val = X_val[val_keep], y_val[val_keep]
         if len(X_val) == 0:
@@ -247,7 +282,7 @@ class LSTMForecastModel:
         self.training_timestamps = data.index  # Phase 16: store for pattern alignment
 
         # Calculate training metrics -- Phase 16: handle (N, 6) predictions; imputed-target sequences excluded
-        keep_train = genuine_target[:train_size]
+        keep_train = genuine_target[train_idx]
         X_metric, y_metric = (X_train[keep_train], y_train[keep_train]) if keep_train.any() else (X_train, y_train)
         train_pred = model.predict(X_metric, verbose=0)  # shape (N, 6)
         # Inverse transform each column separately (scaler was fit on (n,1))
@@ -264,6 +299,9 @@ class LSTMForecastModel:
             'target_column': target_column,
             'training_samples': len(X_train),
             'validation_samples': len(X_val),
+            'purged_split': bool(getattr(self, '_purged_split', False)),
+            'scaler_fitted_on': 'training rows only',
+            'purge_gap_rows': int(self.sequence_length + STEPS_AHEAD - 1),
             'validation_sequences_dropped_imputed_target': n_val_dropped,
             'training_metric_sequences': int(len(X_metric)),
             'epochs_trained': len(history.history['loss']),
@@ -563,27 +601,54 @@ class LSTMForecastModel:
         test_pred = self.scaler.inverse_transform(test_pred_scaled.reshape(-1, 1)).reshape(test_pred_scaled.shape)
         y_test_rescaled = self.scaler.inverse_transform(y_test.reshape(-1, 1)).reshape(y_test.shape)
 
-        # Calculate metrics (averaged across all steps)
-        rmse = np.sqrt(np.mean((y_test_rescaled - test_pred) ** 2))
-        mae = np.mean(np.abs(y_test_rescaled - test_pred))
+        # C-46: the raw network is NOT what is served. Reconstruct the served blend for the
+        # same sequences when a seasonal history is available, and report both, so "the model
+        # scored X" cannot be read as "the deployed forecaster scores X".
+        served_pred = None
+        seasonal = getattr(self, 'seasonal_history', None)
+        if seasonal is not None and len(seasonal) and len(X_test):
+            try:
+                rows = test_data.index
+                served = np.empty_like(test_pred)
+                for k in range(len(X_test)):
+                    origin = pd.Timestamp(rows[k + self.sequence_length - 1]).to_pydatetime()
+                    pattern, source = self._pattern_forecast(
+                        origin=origin, steps_ahead=test_pred.shape[1],
+                        seasonal_history=seasonal, effective_pct=75)
+                    if pattern is None:
+                        served[k] = test_pred[k]
+                        continue
+                    for step in range(test_pred.shape[1]):
+                        w = min(0.95, 0.7 + (step / max(test_pred.shape[1], 1)) * 0.25)
+                        served[k, step] = (1.0 - w) * test_pred[k, step] + w * pattern[step]
+                served_pred = served
+            except Exception as exc:  # pragma: no cover -- diagnostics only
+                logger.warning(f"evaluate(): could not reconstruct the served blend: {exc}")
 
-        # MAPE
-        mape = np.mean(np.abs((y_test_rescaled - test_pred) / (y_test_rescaled + 1e-8))) * 100
+        def _metrics(pred):
+            rmse = np.sqrt(np.mean((y_test_rescaled - pred) ** 2))
+            mae = np.mean(np.abs(y_test_rescaled - pred))
+            mape = np.mean(np.abs((y_test_rescaled - pred) / (y_test_rescaled + 1e-8))) * 100
+            bias = np.mean(pred - y_test_rescaled)
+            ss_res = np.sum((y_test_rescaled - pred) ** 2)
+            ss_tot = np.sum((y_test_rescaled - np.mean(y_test_rescaled)) ** 2)
+            r2 = 1 - (ss_res / (ss_tot + 1e-8))
+            return {'rmse': float(rmse), 'mae': float(mae), 'mape': float(mape),
+                    'bias': float(bias), 'r2': float(r2)}
 
-        # R2 score
-        ss_res = np.sum((y_test_rescaled - test_pred) ** 2)
-        ss_tot = np.sum((y_test_rescaled - np.mean(y_test_rescaled)) ** 2)
-        r2 = 1 - (ss_res / (ss_tot + 1e-8))
+        network = _metrics(test_pred)
+        scored = _metrics(served_pred) if served_pred is not None else network
 
         # Confidence
-        confidence = max(0.3, min(0.9, 1.0 - (rmse / (np.mean(y_test_rescaled) + 1e-8))))
+        confidence = max(0.3, min(0.9, 1.0 - (scored['rmse'] / (np.mean(y_test_rescaled) + 1e-8))))
 
         return {
-            'rmse': float(rmse),
-            'mae': float(mae),
-            'mape': float(mape),
-            'r2': float(r2),
-            'confidence': float(confidence)
+            **scored,
+            'confidence': float(confidence),
+            'scored': 'served_blend' if served_pred is not None else 'raw_network',
+            'network_only': network,
+            'sequences_scored': int(len(X_test)),
+            'sequences_dropped_imputed_target': int(n_eval_dropped),
         }
 
     def _create_sequences(self, scaled_values: np.ndarray,
