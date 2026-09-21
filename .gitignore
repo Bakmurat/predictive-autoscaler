@@ -19,3 +19,6 @@ k8s-operator/manager
 .vscode/
 *.log
 logs/
+
+# scripts/verify.sh run logs
+verify-*.log
