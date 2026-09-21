@@ -91,6 +91,12 @@ class LSTMPredictor:
         self.model_train_times = {}  # Track when each model was trained
         self.model_file_mtimes = {}  # Track file mtime for disk reload detection
         self.model_meta = {}  # model_key -> provenance sidecar (lstm_<key>.meta.json) written by the trainer
+        # C-47: a served model object carries per-request mutable state (last_sequence,
+        # input_timestamps, seasonal_history). Two concurrent requests for the same key would
+        # interleave their windows. One lock per model key serialises mutate-then-predict, and
+        # the same lock makes a reload swap atomic with respect to inference.
+        self._model_locks = {}
+        self._model_locks_guard = threading.Lock()
         try:
             from data import gapfill as _gf
             self.validity_mask = _gf.load_mask(os.getenv("VALIDITY_MASK"))
@@ -226,6 +232,25 @@ class LSTMPredictor:
         logger.info(f"Cleaned up model {model_key}: RSS {rss_before / 1024 / 1024:.1f}MB -> "
                     f"{rss_after / 1024 / 1024:.1f}MB (delta: {(rss_after - rss_before) / 1024 / 1024:+.1f}MB)")
 
+    def _release_model_object(self, detached) -> None:
+        """Free a model object that has ALREADY been swapped out of the registry (C-47).
+
+        _cleanup_old_model() frees whatever the registry currently holds, so it must never run
+        before a replacement is proven loadable. This variant takes the detached incumbent, so
+        the swap happens first and the service is never left without a model.
+        """
+        rss_before = self._get_rss_bytes()
+        if detached is not None:
+            if hasattr(detached, 'model') and detached.model is not None:
+                del detached.model
+            del detached
+        tf.keras.backend.clear_session()
+        gc.collect()
+        rss_after = self._get_rss_bytes()
+        RSS_BYTES_GAUGE.set(rss_after)
+        logger.info(f"Released the previous model object: RSS {rss_before / 1024 / 1024:.1f}MB -> "
+                    f"{rss_after / 1024 / 1024:.1f}MB (delta: {(rss_after - rss_before) / 1024 / 1024:+.1f}MB)")
+
     def _is_model_stale(self, model_key: str) -> bool:
         """Check if a model needs retraining."""
         if model_key not in self.model_train_times:
@@ -249,28 +274,76 @@ class LSTMPredictor:
         last_mtime = self.model_file_mtimes.get(model_key, 0)
 
         if current_mtime > last_mtime:
+            # C-47: load and validate the replacement BEFORE touching the incumbent. The previous
+            # order freed the running model first and then logged "keeping old model" on failure,
+            # which was false -- a bad artifact left the service with no model at all.
             try:
-                # Clean up old model memory before loading new one
-                if model_key in self.trained_models:
-                    self._cleanup_old_model(model_key)
-
-                model = joblib.load(model_path)
+                # The trainer renames the artifact into place and writes the sidecar afterwards
+                # (training/train_nginx_test.py), so a reload can catch a new artifact beside a
+                # stale sidecar. Refuse a mismatched pair and retry on the next call.
                 meta = self._read_meta(model_key)
+                declared = (meta or {}).get("artifact_sha256")
+                actual = self._file_sha256(model_path)
+                if declared and actual and declared != actual:
+                    logger.info(
+                        f"Model {model_key}: artifact/sidecar mismatch "
+                        f"(sidecar {declared[:12]}, file {actual[:12]}); publication is still in "
+                        f"progress. Incumbent kept; will retry on the next request."
+                    )
+                    return
+
+                candidate = joblib.load(model_path)
 
                 # Phase 16 (D-10, D-12): Check for old Dense(1) format
-                if LSTMForecastModel._is_old_model_format(model):
+                if LSTMForecastModel._is_old_model_format(candidate):
                     logger.warning(f"Old Dense(1) model on disk for {model_key} -- marking for retrain")
                     self.model_train_times[model_key] = datetime.min
+                    self.model_file_mtimes[model_key] = current_mtime  # don't re-read the same bad file
                     return  # Don't load old format
+            except Exception as e:
+                logger.error(
+                    f"Failed to load replacement model for {model_key} from disk: {e}. "
+                    f"The incumbent is untouched and still serving."
+                )
+                return
 
-                self.trained_models[model_key] = model
+            # The replacement is loaded and valid: swap it in, then release the old one.
+            with self._model_lock(model_key):
+                detached = self.trained_models.get(model_key)
+                self.trained_models[model_key] = candidate
                 self.model_meta[model_key] = meta
                 self.model_train_times[model_key] = _parse_iso(meta.get("trained_at")) or datetime.utcfromtimestamp(current_mtime)
                 self.model_file_mtimes[model_key] = current_mtime
-                RSS_BYTES_GAUGE.set(self._get_rss_bytes())
-                logger.info(f"Reloaded model {model_key} from disk (file updated)")
-            except Exception as e:
-                logger.error(f"Failed to reload model {model_key} from disk: {e}, keeping old model")
+            if detached is not None:
+                self._release_model_object(detached)
+            RSS_BYTES_GAUGE.set(self._get_rss_bytes())
+            logger.info(
+                f"Reloaded model {model_key} from disk (file updated); "
+                f"artifact sha256={(actual or 'unknown')[:12]}"
+            )
+
+    def _model_lock(self, model_key: str):
+        """Per-key lock serialising mutate-then-predict and the reload swap (C-47)."""
+        with self._model_locks_guard:
+            lock = self._model_locks.get(model_key)
+            if lock is None:
+                lock = threading.RLock()
+                self._model_locks[model_key] = lock
+            return lock
+
+    @staticmethod
+    def _file_sha256(path) -> str:
+        """sha256 of a published artifact, for the sidecar consistency check (C-47)."""
+        import hashlib
+        h = hashlib.sha256()
+        try:
+            with open(path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+        except Exception as e:
+            logger.warning(f"could not hash {path}: {e}")
+            return ""
+        return h.hexdigest()
 
     def _get_model_age_hours(self, model_key: str) -> float:
         """Get the age of a loaded model in hours."""
@@ -472,39 +545,44 @@ class LSTMPredictor:
                         [v for _, v in pts],
                         index=pd.DatetimeIndex([datetime.utcfromtimestamp(t) for t, _ in pts]),
                     ).sort_index()
-                if hasattr(model, 'scaler') and model.scaler is not None and len(all_values) >= model.sequence_length:
-                    recent_scaled = model.scaler.transform(
-                        all_values[-model.sequence_length:].reshape(-1, 1)
-                    ).flatten()
-                    model.last_sequence = recent_scaled
-                    logger.info(f"Updated model with fresh data: {len(all_values)} points "
-                                f"(range: {all_values.min():.0f} - {all_values.max():.0f}); "
-                                f"seasonal history: "
-                                f"{0 if seasonal_history is None else len(seasonal_history)} points")
+                # C-47: hold the per-key lock across mutate-then-predict. The model object carries
+                # request-scoped state (last_sequence, input_timestamps, seasonal_history); without
+                # this, two concurrent requests for the same application interleave their windows and
+                # one forecast is produced from the other's data.
+                with self._model_lock(model_key):
+                    if hasattr(model, 'scaler') and model.scaler is not None and len(all_values) >= model.sequence_length:
+                        recent_scaled = model.scaler.transform(
+                            all_values[-model.sequence_length:].reshape(-1, 1)
+                        ).flatten()
+                        model.last_sequence = recent_scaled
+                        logger.info(f"Updated model with fresh data: {len(all_values)} points "
+                                    f"(range: {all_values.min():.0f} - {all_values.max():.0f}); "
+                                    f"seasonal history: "
+                                    f"{0 if seasonal_history is None else len(seasonal_history)} points")
 
-                # Make predictions (at 10-min data resolution)
-                steps_ahead = horizon_minutes // 10  # Predictions every 10 minutes
-                if steps_ahead < 1:
-                    steps_ahead = 1
+                    # Make predictions (at 10-min data resolution)
+                    steps_ahead = horizon_minutes // 10  # Predictions every 10 minutes
+                    if steps_ahead < 1:
+                        steps_ahead = 1
 
-                # Phase 14 (PRED-01, D-02): Use pre-floor (blended) MAPE for floor calculation
-                # to break the safety floor feedback loop. Blended component is recorded
-                # on each predict call (lines 607-613) and tracks pre-floor prediction accuracy.
-                try:
-                    mape = accuracy_tracker.get_component_mape(application, namespace, metric_type, "blended")
-                    if mape == 0.0:
-                        # Fallback: blended component may not have enough entries yet (cold start)
-                        mape = accuracy_tracker.get_mape(application, namespace, metric_type)
-                except Exception:
-                    mape = 0.0
-                model.mape_for_floor = mape
+                    # Phase 14 (PRED-01, D-02): Use pre-floor (blended) MAPE for floor calculation
+                    # to break the safety floor feedback loop. Blended component is recorded
+                    # on each predict call and tracks pre-floor prediction accuracy.
+                    try:
+                        mape = accuracy_tracker.get_component_mape(application, namespace, metric_type, "blended")
+                        if mape == 0.0:
+                            # Fallback: blended component may not have enough entries yet (cold start)
+                            mape = accuracy_tracker.get_mape(application, namespace, metric_type)
+                    except Exception:
+                        mape = 0.0
+                    model.mape_for_floor = mape
 
-                prediction_result = model.predict(
-                    steps_ahead=steps_ahead, confidence_level=0.95,
-                    origin=forecast_origin,                 # C-45: the last OBSERVED timestamp
-                    input_timestamps=window_timestamps,     # C-45: real calendar features
-                    seasonal_history=seasonal_history,      # C-44: a real second component
-                )
+                    prediction_result = model.predict(
+                        steps_ahead=steps_ahead, confidence_level=0.95,
+                        origin=forecast_origin,                 # C-45: the last OBSERVED timestamp
+                        input_timestamps=window_timestamps,     # C-45: real calendar features
+                        seasonal_history=seasonal_history,      # C-44: a real second component
+                    )
 
                 # Return flat predictions array (Go operator compatible)
                 predicted_values = [round(float(v), 2) for v in prediction_result['predictions']]
