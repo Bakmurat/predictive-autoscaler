@@ -515,29 +515,43 @@ class LSTMForecastModel:
             effective_pct=effective_pct)
         pattern_available = pattern_preds is not None
         if not pattern_available:
-            # No seasonal history: serve the network alone and SAY SO. Substituting the network
-            # for the pattern (the pre-fix behaviour) made the blend a no-op and pinned agreement
-            # at 1.0, inflating confidence.
-            pattern_preds = lstm_rescaled.copy()
+            # No seasonal history at all: every step is unavailable and SAYS SO. The pattern
+            # component is all-NaN, never a copy of the network (the pre-C-44 behaviour that
+            # made the blend a no-op and pinned agreement at 1.0).
+            pattern_preds = np.full(steps_ahead, np.nan)
             step_available = np.zeros(steps_ahead, dtype=bool)
         else:
-            # D-88: availability is per step. A NaN step has no previous-day observation and
-            # falls back to the network for that step ALONE, rather than borrowing a neighbour.
+            # D-88 / C-75: availability is per step and the pattern component stays GENUINE.
+            # A NaN step has no previous-day observation. It is NOT replaced by the network's
+            # value here -- doing so turned a substituted number into a "pattern" value that the
+            # observer, the record and evaluate() then counted as a seasonal forecast. The
+            # fallback to the network happens in the blend below, for that step alone, and the
+            # component keeps its NaN so every consumer can see the gap.
             step_available = ~np.isnan(pattern_preds)
-            pattern_preds = np.where(step_available, pattern_preds, lstm_rescaled)
 
         # --- Blend strategies ---
+        # Weight schedule: the deployed ramp (0.70 -> 0.908 over six steps) unless overridden.
+        # `pattern_weight_override` is None (deployed), a float (constant), or a per-step list;
+        # it exists for the blend-selection experiment (D-89) and for tests that must exercise
+        # the zero-network-share branch (C-76). It never changes served behaviour by default.
+        override = getattr(self, 'pattern_weight_override', None)
         final_predictions = []
         blended_pre_floor = []
         pattern_weights = []
         for step in range(steps_ahead):
-            pattern_weight = min(0.95, 0.7 + (step / max(steps_ahead, 1)) * 0.25)
-            if not pattern_available or not bool(step_available[step]):
+            if override is None:
+                pattern_weight = min(0.95, 0.7 + (step / max(steps_ahead, 1)) * 0.25)
+            elif np.isscalar(override):
+                pattern_weight = float(override)
+            else:
+                pattern_weight = float(override[step])
+            if not bool(step_available[step]):
                 pattern_weight = 0.0  # network only; do not pretend a second opinion exists
             pattern_weights.append(float(pattern_weight))
             lstm_weight = 1.0 - pattern_weight
 
-            blended = lstm_weight * lstm_rescaled[step] + pattern_weight * pattern_preds[step]
+            pattern_term = pattern_preds[step] if bool(step_available[step]) else 0.0
+            blended = lstm_weight * lstm_rescaled[step] + pattern_weight * pattern_term
             blended_pre_floor.append(float(blended))
             # Phase 16 (D-13): Floor set to 0.0 (was 0.05 in Phase 14)
             floor_pct = 0.0  # Phase 16 (D-13, D-15): floor removed, code kept
@@ -592,7 +606,8 @@ class LSTMForecastModel:
         confidence = max(0.3, min(0.9, confidence))
 
         logger.info(f"Prediction blend: LSTM range [{lstm_rescaled.min():.0f}-{lstm_rescaled.max():.0f}], "
-                     f"Pattern range [{pattern_preds.min():.0f}-{pattern_preds.max():.0f}] "
+                     f"Pattern range [{np.nanmin(pattern_preds) if step_available.any() else float('nan'):.0f}-"
+                     f"{np.nanmax(pattern_preds) if step_available.any() else float('nan'):.0f}] "
                      f"(source={pattern_source}), "
                      f"Final range [{final_predictions.min():.0f}-{final_predictions.max():.0f}], "
                      f"pct={effective_pct:.0f}, origin={origin.isoformat()}, "
@@ -607,7 +622,9 @@ class LSTMForecastModel:
                                   for s in range(steps_ahead)],
             'components': {
                 'lstm': lstm_rescaled.tolist() if hasattr(lstm_rescaled, 'tolist') else list(lstm_rescaled),
-                'pattern': pattern_preds.tolist() if hasattr(pattern_preds, 'tolist') else list(pattern_preds),
+                # C-75: unavailable steps are None (JSON null), never a substituted number.
+                'pattern': [None if not bool(step_available[i]) else float(pattern_preds[i])
+                            for i in range(steps_ahead)],
                 'pattern_source': pattern_source,
                 'pattern_available': bool(pattern_available),
                 'pattern_available_per_step': [bool(x) for x in step_available],
