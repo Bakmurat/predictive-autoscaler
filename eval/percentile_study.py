@@ -24,6 +24,25 @@ No minimum-day threshold is invented (D-90); the rules are compared and the numb
 Usage:
     eval/.venv/bin/python eval/percentile_study.py --series eval/data/series-fresh.json \
         --out eval/percentile-study-<utc>.json
+
+LIMITATION (Codex C-77), recorded 2026-09-22
+--------------------------------------------
+The "adaptive_deployed" arm below calls effective_percentile(window) with the MAPE
+argument left at its default of 0.0 (accuracy_baseline.py:53). At MAPE 0 the mape_pct
+term is pinned at 75, so the arm exercises only the DIRECTIONAL 70/75 switch -- not the
+feedback loop that the deployed rule actually runs, where a matured-error MAPE above 10
+pulls the percentile down towards 50.
+
+So this study does not test the deployed adaptive rule. It tests one half of it. The
+conclusion it supports is narrower than "the adaptive rule is inside noise": it is
+"the directional switch alone is inside noise on these series".
+
+To mean more, the study needs: a chronological replay that feeds MATURED forecast errors
+back into mape_for_floor as the deployed API does, held-out paired errors per origin, a
+signed-bias column, and an uncertainty estimate -- "inside noise" is a claim about
+variance and requires one. None of those are present.
+
+The percentile policy is UNCHANGED as a result of this study.
 """
 from __future__ import annotations
 
@@ -148,6 +167,16 @@ def main() -> int:
             for a, b in zip(vals[50], vals[75]))
         inert_rows.append({"origin": origin.isoformat(), "supports": supports,
                            "pct50_equals_pct75": identical})
+    result["limitations"] = {
+        "adaptive_arm_is_partial": (
+            "effective_percentile() is called with mape_for_floor defaulting to 0.0, so the "
+            "MAPE feedback term is pinned at 75 and only the directional 70/75 switch is "
+            "exercised; the deployed rule's feedback loop is NOT tested (Codex C-77)"),
+        "no_uncertainty_estimate": (
+            "no held-out paired errors, no signed bias, no variance estimate -- 'inside noise' "
+            "is not supported by this design"),
+        "policy_unchanged": True,
+    }
     result["inertness_on_real_series"] = {
         "origins": len(inert_rows),
         "max_support_seen": int(max(support_counts)) if support_counts else 0,
