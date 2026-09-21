@@ -63,14 +63,43 @@ class Alignment(unittest.TestCase):
 
 
 class Acceptance(unittest.TestCase):
-    def test_sanity_rejected_event_excludes_its_issuance(self):
+    def test_sanity_rejection_never_removes_from_raw_set(self):
+        # Codex C-16: a controller rejection is not a structural rejection; the raw-model set keeps the issuance.
         r1 = rec(T0); r2 = rec(T0 + timedelta(minutes=5))
         ev = {"event": "sanity_rejected", "application": "a", "namespace": "n", "issued_at": r1["issued_at"],
               "rejected_at": r1["issued_at"], "near_prediction_rpm": 12000.0, "current_rpm": 120.0, "max_sane_rpm": 1200.0}
         acc, rej = score.accept_records([r1, ev, r2])
-        self.assertEqual([r["issued_at"] for r in acc], [r2["issued_at"]])
-        self.assertEqual(rej[0]["reason"], "sanity_rejected")
-        self.assertEqual(len(rej), 1)  # the event line itself is neither accepted nor counted as rejected
+        self.assertEqual([r["issued_at"] for r in acc], [r1["issued_at"], r2["issued_at"]])
+        self.assertEqual(rej, [])
+        # The controller subset drops the rejected issuance entirely when rejected at issuance (no step was in use).
+        sub, info = score.controller_subset(acc, score.controller_rejections([r1, ev, r2]))
+        self.assertEqual([r["issued_at"] for r in sub], [r2["issued_at"]])
+        self.assertEqual(info, {"rejected_issuances": 1, "steps_not_used_by_controller": 3})
+
+    def test_controller_rejection_is_contemporaneous_not_retroactive(self):
+        # Issued at T0 with steps +10, +20, +30; rejected at T0+22: steps +10 and +20 were in use, +30 was not.
+        r1 = rec(T0)
+        ev = {"event": "sanity_rejected", "application": "a", "namespace": "n", "issued_at": r1["issued_at"],
+              "rejected_at": iso(T0 + timedelta(minutes=22))}
+        acc, _ = score.accept_records([r1, ev])
+        sub, info = score.controller_subset(acc, score.controller_rejections([r1, ev]))
+        self.assertEqual([fc["step"] for fc in sub[0]["forecasts"]], [1, 2])
+        self.assertEqual(sub[0]["controller_rejected_at"], iso(T0 + timedelta(minutes=22)))
+        self.assertEqual(info, {"rejected_issuances": 1, "steps_not_used_by_controller": 1})
+        # The raw set still scores all three steps.
+        prom = FakeProm(lambda m: 100.0)
+        out, rows = score.score(acc, prom, "a", "n", T0, T0 + timedelta(hours=1), cadence_min=60)
+        self.assertEqual(out["forecast_steps_scored"], 3)
+
+    def test_later_rejection_does_not_erase_earlier_use(self):
+        # A rejection logged much later (T0+50) than the issuance keeps every step whose target <= T0+50.
+        r1 = rec(T0, steps=(1, 2, 3, 4, 5, 6))
+        ev = {"event": "sanity_rejected", "application": "a", "namespace": "n", "issued_at": r1["issued_at"],
+              "rejected_at": iso(T0 + timedelta(minutes=50))}
+        acc, _ = score.accept_records([r1, ev])
+        sub, info = score.controller_subset(acc, score.controller_rejections([r1, ev]))
+        self.assertEqual([fc["step"] for fc in sub[0]["forecasts"]], [1, 2, 3, 4, 5])
+        self.assertEqual(info["steps_not_used_by_controller"], 1)
 
     def test_duplicate_rejected_and_not_counted(self):
         r1 = rec(T0); r2 = dict(rec(T0)); r2["forecasts"] = [dict(f, rpm=999.0) for f in r2["forecasts"]]

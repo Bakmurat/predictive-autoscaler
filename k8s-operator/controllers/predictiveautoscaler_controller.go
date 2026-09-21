@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"math"
@@ -28,18 +29,18 @@ import (
 
 // Scaling configuration constants
 const (
-	predictionCacheTTL      = 5 * time.Minute   // How often to refresh ML API predictions
+	predictionCacheTTL      = 5 * time.Minute        // How often to refresh ML API predictions
 	predictionStaleMax      = 2 * predictionCacheTTL // Oldest cached forecast still usable while the ML API is unreachable
-	scaleDownStabilization  = 5 * time.Minute   // Wait after scale-up before any scale-down
-	scaleDownCooldown       = 2 * time.Minute   // Minimum time between scale-down operations
-	scaleDownMaxPercent     = 10                // Max % of pods to remove per scale-down
-	scaleDownMinPods        = 2                 // Min pods to remove per scale-down (whichever is greater)
-	defaultLeadTimeMinutes  = 20                // Default prediction lead time
-	defaultHorizonMinutes   = 60                // Default prediction horizon
-	defaultReconcileSeconds = 60                // Default reconcile interval (fast for reactive)
-	minReconcileSeconds     = 30                // Minimum reconcile interval
-	vmQueryTimeout          = 10 * time.Second  // VictoriaMetrics query timeout (short — it's lightweight)
-	mlAPITimeout            = 120 * time.Second // ML API timeout (long — allows for model training)
+	scaleDownStabilization  = 5 * time.Minute        // Wait after scale-up before any scale-down
+	scaleDownCooldown       = 2 * time.Minute        // Minimum time between scale-down operations
+	scaleDownMaxPercent     = 10                     // Max % of pods to remove per scale-down
+	scaleDownMinPods        = 2                      // Min pods to remove per scale-down (whichever is greater)
+	defaultLeadTimeMinutes  = 20                     // Default prediction lead time
+	defaultHorizonMinutes   = 60                     // Default prediction horizon
+	defaultReconcileSeconds = 60                     // Default reconcile interval (fast for reactive)
+	minReconcileSeconds     = 30                     // Minimum reconcile interval
+	vmQueryTimeout          = 10 * time.Second       // VictoriaMetrics query timeout (short — it's lightweight)
+	mlAPITimeout            = 120 * time.Second      // ML API timeout (long — allows for model training)
 )
 
 // cachedPrediction stores ML API predictions with a TTL to avoid
@@ -90,13 +91,18 @@ type MLPredictionResponse struct {
 	ModelVersion   string    `json:"model_version"`
 	ModelTrainedAt string    `json:"model_trained_at"`
 	// Provenance from the trainer's sidecar, passed through by the API (empty when unknown).
-	TrainingCutoff    string  `json:"training_cutoff"`
-	ArtifactSHA256    string  `json:"artifact_sha256"`
-	InferenceInputEnd string  `json:"inference_input_end"`
-	SequenceLength    int32   `json:"sequence_length"`
-	HorizonMinutes    int32   `json:"horizon_minutes"`
-	Timestamp         string  `json:"timestamp"`
-	MAPE              float64 `json:"mape"`
+	TrainingCutoff    string `json:"training_cutoff"`
+	ArtifactSHA256    string `json:"artifact_sha256"`
+	InferenceInputEnd string `json:"inference_input_end"`
+	SequenceLength    int32  `json:"sequence_length"`
+	HorizonMinutes    int32  `json:"horizon_minutes"`
+	Timestamp         string `json:"timestamp"`
+	// Set by the operator at fetch time (not part of the API payload): when the forecast was
+	// issued and the time its horizon steps are anchored on (inference_input_end when the API
+	// reports it, otherwise the issuance time). Used to exclude elapsed steps on cached reuse.
+	issuedAt time.Time
+	anchorAt time.Time
+	MAPE     float64 `json:"mape"`
 }
 
 // predictionEnabled reports whether the forecasting component is on for this autoscaler
@@ -197,7 +203,16 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	} else if predErr != nil {
 		log.Info("Prediction unavailable, using reactive only", "error", predErr.Error())
 	} else if prediction != nil {
-		predictedReplicas = r.calculatePredictedReplicas(&autoscaler, prediction)
+		var usable bool
+		predictedReplicas, usable = r.calculatePredictedReplicas(&autoscaler, prediction)
+		if !usable {
+			// The cached forecast's remaining horizon no longer covers the lead time (its steps have
+			// elapsed): it must not drive the decision. Treat as unavailable → reactive only.
+			log.Info("Prediction unavailable, using reactive only", "error", errForecastHorizonElapsed.Error())
+			predErr = errForecastHorizonElapsed
+			prediction = nil
+			predictedReplicas = 0
+		}
 	}
 
 	// --- REACTIVE COMPONENT ---
@@ -231,11 +246,7 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 			// overestimate override left by earlier reconciles: a discarded forecast must not keep
 			// bypassing the scale-down holds (observed in the 2026-09-20 functional test).
 			r.recordSanityRejection(&autoscaler, key, prediction.Predictions[0], currentRPM, maxSaneRPM)
-			if st := r.getOrCreateScaleState(key); st.overrideActive || st.overestimateStreak > 0 {
-				st.overrideActive = false
-				st.overestimateStreak = 0
-				st.reEvalCounter = 0
-			}
+			r.clearForecastOverride(log, r.getOrCreateScaleState(key), autoscaler.Spec.TargetDeployment.Name, autoscaler.Spec.TargetDeployment.Namespace, "sanity_rejected")
 			predictedReplicas = reactiveReplicas
 			prediction = nil // Clear so overestimate check doesn't use garbage
 		}
@@ -253,6 +264,16 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	if prediction != nil && predErr == nil {
 		predictedReplicas = adjustForOverestimation(
 			log, predictedReplicas, reactiveReplicas, state, currentRPM, prediction.Predictions, appName, appNS)
+	} else {
+		// No usable forecast participates in this reconcile (forecasting disabled, ML API
+		// unavailable with the cache expired, refusal, elapsed horizon, or a discarded forecast):
+		// any overestimate override left by earlier reconciles must not keep bypassing the
+		// scale-down holds. Cooldown and stabilization timestamps are preserved.
+		reason := "prediction_unavailable"
+		if !forecasting {
+			reason = "forecasting_disabled"
+		}
+		r.clearForecastOverride(log, state, appName, appNS, reason)
 	}
 	// Track RPM for next reconcile's ramp-up detection
 	state.lastRPM = currentRPM
@@ -378,12 +399,12 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 func (r *PredictiveAutoscalerReconciler) calculatePredictedReplicas(
 	autoscaler *autoscalerv1alpha1.PredictiveAutoscaler,
 	prediction *MLPredictionResponse,
-) int32 {
+) (int32, bool) {
 	log := r.Log.WithValues("predictiveautoscaler", autoscaler.Name)
 
 	if len(prediction.Predictions) == 0 {
 		log.Info("No predictions available, using minReplicas")
-		return autoscaler.Spec.MinReplicas
+		return autoscaler.Spec.MinReplicas, true
 	}
 
 	// Determine lead time and step size
@@ -396,22 +417,26 @@ func (r *PredictiveAutoscalerReconciler) calculatePredictedReplicas(
 		leadTimeMinutes = defaultLeadTimeMinutes
 	}
 
-	// Calculate how many prediction steps fall within the lead-time window
-	// e.g., 60-min horizon, 6 steps → 10-min/step. leadTime=20 → 2 steps.
-	stepSize := float64(horizonMinutes) / float64(len(prediction.Predictions))
-	leadTimeSteps := int(math.Ceil(float64(leadTimeMinutes) / stepSize))
-	if leadTimeSteps < 1 {
-		leadTimeSteps = 1
+	// Select the steps whose target times fall inside the lead-time window measured from NOW,
+	// not from the issuance: on cached reuse the first steps may already have elapsed. A forecast
+	// whose remaining horizon does not reach now+leadTime is not usable (caller falls back).
+	anchor := prediction.anchorAt
+	if anchor.IsZero() {
+		anchor = time.Now()
 	}
-	if leadTimeSteps > len(prediction.Predictions) {
-		leadTimeSteps = len(prediction.Predictions)
+	window, ok := selectLeadTimeWindow(prediction.Predictions, anchor, time.Now(), horizonMinutes, leadTimeMinutes)
+	if !ok {
+		log.Info("Forecast horizon no longer covers the lead time; not usable",
+			"anchor", anchor.UTC().Format(time.RFC3339), "leadTimeMinutes", leadTimeMinutes, "steps", len(prediction.Predictions))
+		return 0, false
 	}
+	leadTimeSteps := len(window)
 
 	// Peak RPM within lead-time window
-	peakRPM := prediction.Predictions[0]
-	for i := 1; i < leadTimeSteps; i++ {
-		if prediction.Predictions[i] > peakRPM {
-			peakRPM = prediction.Predictions[i]
+	peakRPM := window[0]
+	for i := 1; i < len(window); i++ {
+		if window[i] > peakRPM {
+			peakRPM = window[i]
 		}
 	}
 
@@ -448,7 +473,7 @@ func (r *PredictiveAutoscalerReconciler) calculatePredictedReplicas(
 		desiredReplicas = autoscaler.Spec.MaxReplicas
 	}
 
-	return desiredReplicas
+	return desiredReplicas, true
 }
 
 // queryCurrentRPM queries VictoriaMetrics for the current requests per minute
@@ -518,7 +543,15 @@ func (r *PredictiveAutoscalerReconciler) getCachedPrediction(
 	// Fetch fresh prediction from ML API
 	prediction, err := r.getPrediction(ctx, autoscaler)
 	if err != nil {
-		// On error, reuse the cached forecast only while it is younger than predictionStaleMax.
+		if isForecastRefusal(err) {
+			// The API refused the request as invalid input (for example its freshness guard: the
+			// latest observation is missing or too old). That is not a transport failure: a
+			// cached forecast must not stand in for it. Drop the cache → reactive only.
+			delete(r.predictionCache, key)
+			r.Log.Info("ML API refused the forecast request; not reusing the cache", "error", err.Error())
+			return nil, err
+		}
+		// On a transport-class error, reuse the cached forecast only while it is younger than predictionStaleMax.
 		// Beyond that the forecast no longer describes the horizon it was issued for, so the
 		// caller falls back to the reactive rule ("Prediction unavailable, using reactive only").
 		// Serving a stale forecast indefinitely was observed in the 2026-09-20 functional test.
@@ -540,6 +573,11 @@ func (r *PredictiveAutoscalerReconciler) getCachedPrediction(
 
 	// Update cache and record the forecast at issuance (before any outcome exists)
 	now := time.Now()
+	prediction.issuedAt = now
+	prediction.anchorAt = now
+	if t, err := time.Parse(time.RFC3339, normalizeRFC3339(prediction.InferenceInputEnd)); err == nil && !t.IsZero() {
+		prediction.anchorAt = t
+	}
 	r.predictionCache[key] = &cachedPrediction{
 		response:  prediction,
 		fetchedAt: now,
@@ -810,6 +848,9 @@ func (r *PredictiveAutoscalerReconciler) getPrediction(
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			return nil, &forecastRefusedError{status: resp.StatusCode, body: string(body)}
+		}
 		return nil, fmt.Errorf("ML API returned status %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -932,4 +973,84 @@ func normalizeRFC3339(v string) string {
 		}
 	}
 	return v
+}
+
+// errForecastHorizonElapsed marks a cached forecast whose remaining steps no longer cover the
+// lead time; the reconcile treats it exactly like an unavailable prediction.
+var errForecastHorizonElapsed = stderrors.New("cached forecast horizon no longer covers the lead time")
+
+// forecastRefusedError is returned when the ML API rejects the request as invalid input (HTTP 4xx,
+// e.g. 422 from its freshness guard). Unlike a transport failure, it must not fall back to a
+// cached forecast: the API is saying that no valid forecast can be issued right now.
+type forecastRefusedError struct {
+	status int
+	body   string
+}
+
+func (e *forecastRefusedError) Error() string {
+	return fmt.Sprintf("ML API refused the request (status %d): %s", e.status, e.body)
+}
+
+// isForecastRefusal reports whether err is (or wraps) a forecastRefusedError.
+func isForecastRefusal(err error) bool {
+	var fr *forecastRefusedError
+	return stderrors.As(err, &fr)
+}
+
+// selectLeadTimeWindow returns the forecast values whose target times lie in (now, now+lead],
+// excluding steps whose targets have already elapsed (relevant when a cached forecast is reused).
+// If no step lies inside the lead-time window but future steps exist, the first future step is
+// used (a lead time shorter than one step). ok is false when no future step remains or when the
+// forecast's furthest remaining target does not reach now+lead (insufficient coverage).
+func selectLeadTimeWindow(predictions []float64, anchor, now time.Time, horizonMinutes, leadTimeMinutes int32) ([]float64, bool) {
+	if len(predictions) == 0 {
+		return nil, false
+	}
+	stepMin := float64(horizonMinutes) / float64(len(predictions))
+	leadEnd := now.Add(time.Duration(leadTimeMinutes) * time.Minute)
+	var window []float64
+	var firstFuture *float64
+	var lastTarget time.Time
+	for i, v := range predictions {
+		target := anchor.Add(time.Duration(float64(i+1) * stepMin * float64(time.Minute)))
+		if !target.After(now) {
+			continue // elapsed
+		}
+		if firstFuture == nil {
+			vv := v
+			firstFuture = &vv
+		}
+		if !target.After(leadEnd) {
+			window = append(window, v)
+		}
+		if target.After(lastTarget) {
+			lastTarget = target
+		}
+	}
+	if firstFuture == nil {
+		return nil, false
+	}
+	if lastTarget.Before(leadEnd) {
+		return nil, false
+	}
+	if len(window) == 0 {
+		window = []float64{*firstFuture}
+	}
+	return window, true
+}
+
+// clearForecastOverride drops the forecast-dependent overestimate state (override, streak,
+// re-evaluation counter) when no usable forecast participates in a reconcile. The scale-down
+// holds (lastScaleUp, belowCurrentSince) and the cooldown (lastScaleDown) are untouched, so a
+// scale-down decided without a forecast goes through the normal stabilization rules.
+func (r *PredictiveAutoscalerReconciler) clearForecastOverride(log logr.Logger, state *scaleState, appName, appNS, reason string) {
+	if state == nil || (!state.overrideActive && state.overestimateStreak == 0 && state.reEvalCounter == 0) {
+		return
+	}
+	log.Info("Clearing overestimate override: no usable forecast in this reconcile",
+		"reason", reason, "hadOverride", state.overrideActive, "streak", state.overestimateStreak)
+	state.overrideActive = false
+	state.overestimateStreak = 0
+	state.reEvalCounter = 0
+	overestimateStreakGauge.WithLabelValues(appName, appNS).Set(0)
 }

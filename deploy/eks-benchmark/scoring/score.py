@@ -117,23 +117,28 @@ def load_forecasts(path, app, ns, start, end):
     return recs
 
 
-def sanity_rejected_keys(recs_and_events):
-    """Issuances the operator discarded by its divergence check ("event": "sanity_rejected" lines).
-    Keyed like accept_records: (application, namespace, issued_at ISO)."""
-    keys = set()
+def controller_rejections(recs_and_events):
+    """Issuances the operator discarded by its divergence check ("event": "sanity_rejected" lines),
+    keyed like accept_records: (application, namespace, issued_at ISO) -> earliest rejected_at.
+    A rejection never removes a forecast from the raw-model set: it only bounds, contemporaneously,
+    which of its steps the controller actually used (steps whose target_at <= rejected_at)."""
+    out = {}
     for r in recs_and_events:
         if r.get("event") == "sanity_rejected":
-            keys.add((r.get("application"), r.get("namespace"), iso(parse_ts(r["issued_at"]))))
-    return keys
+            key = (r.get("application"), r.get("namespace"), iso(parse_ts(r["issued_at"])))
+            at = parse_ts(r["rejected_at"]) if r.get("rejected_at") else parse_ts(r["issued_at"])
+            if key not in out or at < out[key]:
+                out[key] = at
+    return out
 
 
 def accept_records(recs):
-    """Apply the acceptance rules in log order. Returns (accepted, rejected[{line, issued_at, reason}]).
-    Event lines ("event" key) are never scored; a "sanity_rejected" event excludes the forecast record
-    with the same (application, namespace, issued_at)."""
+    """Apply the STRUCTURAL acceptance rules in log order. Returns (accepted, rejected[{line, issued_at, reason}]).
+    Event lines ("event" key) are never scored. Controller rejections (sanity_rejected) do NOT remove
+    an issuance from the raw-model set (Codex Task 03 C-16: no retroactive selection); they are applied
+    contemporaneously by controller_subset()."""
     accepted, rejected, seen = [], [], set()
     last_issued, last_cutoff, last_trained = None, None, None
-    rejected_keys = sanity_rejected_keys(recs)
     for r in recs:
         if r.get("event"):
             continue
@@ -142,9 +147,7 @@ def accept_records(recs):
         reason = None
         cutoff = parse_ts(r["training_cutoff"]) if r.get("training_cutoff") else None
         trained = parse_ts(r["model_trained_at"]) if r.get("model_trained_at") else None
-        if key in rejected_keys:
-            reason = "sanity_rejected"
-        elif key in seen:
+        if key in seen:
             reason = "duplicate"
         elif last_issued is not None and issued < last_issued:
             reason = "out_of_order"
@@ -167,6 +170,25 @@ def accept_records(recs):
         if cutoff: last_cutoff = cutoff
         if trained: last_trained = trained
     return accepted, rejected
+
+
+def controller_subset(accepted, rejections):
+    """The forecasts the controller actually acted on, decided contemporaneously: an issuance with a
+    sanity rejection at R keeps only the steps whose target_at <= R (they were in use between issuance
+    and R); steps targeted after R were never used. Issuances without a rejection are kept whole.
+    Returns (subset_records, info) where info counts rejections and the steps dropped."""
+    out, dropped, rejected_issuances = [], 0, 0
+    for r in accepted:
+        key = (r.get("application"), r.get("namespace"), iso(parse_ts(r["issued_at"])))
+        if key not in rejections:
+            out.append(r); continue
+        rejected_issuances += 1
+        at = rejections[key]
+        kept = [fc for fc in r["forecasts"] if parse_ts(fc["target_at"]) <= at]
+        dropped += len(r["forecasts"]) - len(kept)
+        if kept:
+            rr = dict(r); rr["forecasts"] = kept; rr["controller_rejected_at"] = iso(at); out.append(rr)
+    return out, {"rejected_issuances": rejected_issuances, "steps_not_used_by_controller": dropped}
 
 
 def expected_issuances(start, end, cadence_min):
@@ -288,10 +310,24 @@ def main(argv=None):
     accepted, rejected = accept_records(recs)
     if not accepted:
         raise SystemExit(f"FAIL: every forecast record was rejected: {rejected[:5]}")
+    # Raw-model accuracy: every structurally valid issued forecast (controller rejections never remove one).
     result, rows = score(accepted, prom, a.app, a.namespace, start, end, a.issuance_minutes)
+    result["set"] = "raw_model"
     result["records_in_window"] = len(recs)
-    result["records_rejected"] = len(rejected)
+    result["records_rejected_structural"] = len(rejected)
     result["rejected_list"] = rejected[:50]
+    # Controller-accepted subset: what the operator actually used, decided contemporaneously.
+    rejections = controller_rejections(recs)
+    subset, info = controller_subset(accepted, rejections)
+    if subset:
+        sub_result, _ = score(subset, prom, a.app, a.namespace, start, end, a.issuance_minutes)
+        sub_result["set"] = "controller_accepted"
+    else:
+        sub_result = {"set": "controller_accepted", "note": "no controller-accepted forecast steps in the window"}
+    sub_result.update({"controller_rejections": info["rejected_issuances"],
+                       "steps_not_used_by_controller": info["steps_not_used_by_controller"],
+                       "rejection_list": [{"issued_at": k[2], "rejected_at": iso(v)} for k, v in sorted(rejections.items(), key=lambda kv: kv[0][2])][:50]})
+    result["controller_accepted"] = sub_result
     result["observation_series"] = series_gaps(obs, start, end + timedelta(minutes=70))
     reps = {}
     for d in [a.app] + [c for c in a.controls.split(",") if c]:
