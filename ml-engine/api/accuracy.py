@@ -117,11 +117,20 @@ class AccuracyTracker:
     def take_matured(self, application: str, namespace: str, metric_type: str,
                      observation_at: datetime, tolerance_s: int = 300,
                      component: Optional[str] = None):
-        """Return queued forecasts whose target matches `observation_at`, and drop stale ones.
+        """Return queued forecasts whose target has PASSED and matches `observation_at`.
 
-        Returns a list of predicted values to score against the observation at that timestamp.
-        Entries whose target is still in the future are left queued; entries older than the
-        tolerance are discarded as unmatched (they can never be scored correctly).
+        Maturity and tolerance are separate requirements (C-87 / D-109):
+
+          * maturity  -- the target time must have passed: ``observation_at >= target_at``.
+            An observation taken BEFORE the target cannot score a forecast of it; the old
+            ``abs(delta) <= tolerance_s`` admitted an observation up to five minutes early,
+            so a 12:10 forecast was "scored" against the 12:05 reading. That measures the
+            forecast against a past it was given, not against what it predicted.
+          * tolerance -- once matured, how stale the observation may be:
+            ``observation_at - target_at <= tolerance_s``.
+
+        Entries whose target is still in the future stay queued. Entries whose observation
+        never arrived within the tolerance are dropped -- they can never be scored correctly.
         """
         key = (application, namespace, metric_type, component)
         pend = self.pending.get(key)
@@ -131,10 +140,10 @@ class AccuracyTracker:
         matured, keep = [], deque(maxlen=512)
         for target_at, predicted in pend:
             delta = (obs - target_at).total_seconds()
-            if abs(delta) <= tolerance_s:
-                matured.append(predicted)
-            elif delta < -tolerance_s:
+            if delta < 0:
                 keep.append((target_at, predicted))  # target still in the future
+            elif delta <= tolerance_s:
+                matured.append(predicted)            # matured, and the observation is fresh
             # delta > tolerance: the observation for that target never arrived -- drop it
         self.pending[key] = keep
         return matured
