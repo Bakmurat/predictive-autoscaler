@@ -588,16 +588,7 @@ class LSTMPredictor:
                     # Phase 14 (PRED-01, D-02): Use pre-floor (blended) MAPE for floor calculation
                     # to break the safety floor feedback loop. Blended component is recorded
                     # on each predict call and tracks pre-floor prediction accuracy.
-                    try:
-                        mape = accuracy_tracker.get_component_mape(application, namespace, metric_type, "blended")
-                        if mape == 0.0:
-                            # Fallback: blended component may not have enough entries yet (cold start)
-                            mape = accuracy_tracker.get_mape(application, namespace, metric_type)
-                    except Exception:
-                        mape = 0.0
-                    # C-85: None means not measured; the percentile rule's neutral input is 0.0
-                    # (no adjustment below 10), which is the same as its cold-start value.
-                    model.mape_for_floor = mape if mape is not None else 0.0
+                    model.mape_for_floor = resolve_floor_mape(application, namespace, metric_type)
 
                     prediction_result = model.predict(
                         steps_ahead=steps_ahead, confidence_level=0.95,
@@ -709,6 +700,36 @@ def _json_safe(obj):
     if isinstance(obj, (np.bool_,)):
         return bool(obj)
     return obj
+
+
+def resolve_floor_mape(application: str, namespace: str, metric_type: str) -> float:
+    """The error the percentile rule uses as its floor input, chosen on AVAILABILITY (C-88).
+
+    Phase 14 (PRED-01, D-02) uses the pre-floor (blended) error so the safety floor does not
+    feed on itself. The blended component may not have been scored yet, and the fallback for
+    that is the overall error.
+
+    The fallback used to test a zero sentinel -- `if mape == 0.0` -- which C-85 turned
+    backwards when the getters started returning None for "not measured":
+
+        component None (nothing scored)  -> `None == 0.0` is False -> overall IGNORED -> 0.0
+        component 0.0  (measured, perfect) -> looked missing -> REPLACED by overall
+
+    Both cases were wrong, and in opposite directions. A measured zero is evidence and
+    survives; an unmeasured component is exactly what the fallback is for. When nothing has
+    been scored anywhere the result is 0.0 -- the percentile rule's neutral input (no
+    adjustment below 10), which is also its cold-start value -- never a fabricated error.
+    """
+    try:
+        component = accuracy_tracker.get_component_mape(application, namespace, metric_type, "blended")
+        if component is not None:
+            return float(component)
+        overall = accuracy_tracker.get_mape(application, namespace, metric_type)
+        if overall is not None:
+            return float(overall)
+    except Exception as e:  # a tracker fault must not fail the forecast
+        logger.warning(f"floor MAPE lookup failed, using the neutral input (non-fatal): {e}")
+    return 0.0
 
 
 def _set_error_gauge(gauge, stats, **labels):
