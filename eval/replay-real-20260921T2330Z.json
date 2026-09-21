@@ -1,0 +1,237 @@
+{
+  "kind": "chronological_replay_of_real_benchmark_traffic",
+  "generated_utc": "2026-09-21T23:25:52Z",
+  "verdict": "CENSUS ONLY -- NOT SCORED",
+  "predeclared_minimum_scale": {
+    "min_origin_days": 3,
+    "min_warmup_days": 3,
+    "min_independent_blocks": 72,
+    "points_required": 870,
+    "points_available": 174,
+    "points_short": 696,
+    "hours_short": 116.0,
+    "stated": "in eval/replay_real.py before the data is read"
+  },
+  "provenance": {
+    "trainer_verdict": "insufficient history: have 174 of 235 ten-minute points",
+    "trainer_would_train": false,
+    "trainer_preflight": {
+      "raw_points": 175,
+      "offgrid_dropped": 0,
+      "expected_slots": 174,
+      "present_slots": 174,
+      "missing_slots": 0,
+      "contiguous_runs": 1,
+      "contiguous_run_points": 174,
+      "run_first": "2026-09-20T18:30:00Z",
+      "run_last": "2026-09-21T23:20:00Z"
+    },
+    "grid_normalisation": {
+      "nonfinite_dropped": 0,
+      "duplicates_dropped": 0,
+      "offgrid_dropped": 0
+    },
+    "mask": {
+      "mask_version": 2,
+      "mask_source": null,
+      "role": "benchmark",
+      "benchmark_history_start": "2026-09-20T18:20:00Z",
+      "dropped_before_history_start": 0,
+      "dropped_in_intervals": 1,
+      "intervals": [
+        {
+          "start": "2026-09-20T13:40:00Z",
+          "end": "2026-09-20T14:50:00Z",
+          "reason": "control-plane upgrades 1.33/1.34 (13:42-14:14Z), node rolls (to 13:59Z and 14:27Z), node-group replacement to t4g.medium (14:30-14:41Z); series missing 14:20-14:40Z",
+          "dropped": 0
+        },
+        {
+          "start": "2026-09-20T15:00:00Z",
+          "end": "2026-09-20T15:40:00Z",
+          "reason": "generator job k6-nginx-reactive-29831940 failed at 15:04:44Z; app pods Pending on memory until the sidecar-annotation fix; workloads redeployed at 15:37:37Z; series missing 15:10-15:20Z",
+          "dropped": 0
+        },
+        {
+          "start": "2026-09-20T15:50:00Z",
+          "end": "2026-09-20T16:30:00Z",
+          "reason": "r4 deploy moved generators cross-node (15:56Z) where node-to-node pod traffic was blocked by the node security group; repaired 16:18:21Z; replica reset to 1 by the r6 apply at 16:24Z; generator failures logged until 16:25:04Z",
+          "dropped": 0
+        },
+        {
+          "start": "2026-09-20T18:10:00Z",
+          "end": "2026-09-20T18:20:00Z",
+          "reason": "generator design change: Prometheus restarted to enable the remote-write receiver (18:13-18:17Z); hourly k6 Jobs deleted 18:17:12Z and replaced by long-running k6 Deployments started 18:17:43-18:17:46Z; 34 s traffic gap at cutover",
+          "dropped": 1
+        }
+      ]
+    },
+    "gap_fill": {
+      "algorithm": "linear-v1",
+      "grid_seconds": 600,
+      "max_missing_slots": 3,
+      "max_endpoint_gap_s": 2400,
+      "max_fill_fraction": 0.05,
+      "cutoff": "2026-09-21T23:20:00Z",
+      "boundaries": [],
+      "gaps_considered": [],
+      "gaps_filled": 0,
+      "slots_filled_in_window": 0,
+      "window_points": 174,
+      "fill_fraction": 0.0,
+      "cap_removed_gaps": [],
+      "window_start": "2026-09-20T18:30:00Z",
+      "window_end": "2026-09-21T23:20:00Z"
+    },
+    "export": {
+      "query": "sum(rate(istio_requests_total{reporter=\"destination\",destination_workload=\"nginx-test\",destination_workload_namespace=\"demo\"}[1m])) * 60",
+      "step_seconds": 600,
+      "start": "2026-09-20T18:20:00Z",
+      "end": "2026-09-21T23:20:00Z",
+      "validity_mask_version": 2,
+      "validity_mask_sha256": "f5612fcab1a5ffbf69eba6236066ff4bd1a9c56808b560f1c278e00befa16f1f",
+      "benchmark_history_start": "2026-09-20T18:20:00Z",
+      "mask_applied_here": false,
+      "mask_applied_by": "eval/replay_real.py, using ml-engine/data/gapfill.py -- the same rule the trainer applies"
+    },
+    "exported_at": "2026-09-21T23:21:52Z"
+  },
+  "census": {
+    "valid_points": 174,
+    "imputed_points": 0,
+    "span_hours": 28.83,
+    "first": "2026-09-20T18:30:00Z",
+    "last": "2026-09-21T23:20:00Z",
+    "checks": {
+      "origin_days": {
+        "observed": 0.17,
+        "required": 3,
+        "pass": false
+      },
+      "warmup_days_before_first_origin": {
+        "observed": 1.0,
+        "required": 3,
+        "pass": false
+      },
+      "independent_blocks": {
+        "observed": 4,
+        "required": 72,
+        "pass": false
+      }
+    },
+    "scoreable": false
+  },
+  "replay": {
+    "origins": 24,
+    "first_origin_index": 144,
+    "first_origin": "2026-09-21T18:30:00Z",
+    "last_origin": "2026-09-21T22:20:00Z",
+    "target_rpm_per_replica": 1000.0,
+    "genuine_previous_day_steps_per_origin": {
+      "min": 6,
+      "max": 6,
+      "all_six": 24
+    },
+    "arms": {
+      "persistence": {
+        "origins": 24,
+        "non_finite_origins": 0,
+        "mae": 369.08,
+        "bias": 368.72,
+        "per_step_mae": [
+          109.58,
+          217.17,
+          325.0,
+          433.75,
+          520.75,
+          608.25
+        ],
+        "seconds": 0.0,
+        "replica_minutes": 601.0,
+        "scaling_events": 5,
+        "shortage_minutes": 4.0,
+        "shortage_replicas_max": 3,
+        "minutes_demand_exceeded_ceiling": 0.0,
+        "decisions_from": "go_controller"
+      },
+      "previous_day": {
+        "origins": 24,
+        "non_finite_origins": 0,
+        "mae": 2.12,
+        "bias": -1.68,
+        "per_step_mae": [
+          2.58,
+          2.49,
+          2.49,
+          2.42,
+          2.42,
+          0.33
+        ],
+        "seconds": 0.03,
+        "replica_minutes": 611.0,
+        "scaling_events": 4,
+        "shortage_minutes": 2.0,
+        "shortage_replicas_max": 3,
+        "minutes_demand_exceeded_ceiling": 0.0,
+        "decisions_from": "go_controller"
+      },
+      "seasonal_pattern": {
+        "origins": 24,
+        "non_finite_origins": 0,
+        "mae": 2.12,
+        "bias": -1.68,
+        "per_step_mae": [
+          2.58,
+          2.49,
+          2.49,
+          2.42,
+          2.42,
+          0.33
+        ],
+        "seconds": 0.03,
+        "replica_minutes": 611.0,
+        "scaling_events": 4,
+        "shortage_minutes": 2.0,
+        "shortage_replicas_max": 3,
+        "minutes_demand_exceeded_ceiling": 0.0,
+        "decisions_from": "go_controller"
+      },
+      "trend_adaptive": {
+        "origins": 24,
+        "non_finite_origins": 0,
+        "mae": 2.78,
+        "bias": -0.8,
+        "per_step_mae": [
+          3.96,
+          3.55,
+          3.11,
+          2.82,
+          2.64,
+          0.63
+        ],
+        "seconds": 0.03,
+        "replica_minutes": 611.0,
+        "scaling_events": 4,
+        "shortage_minutes": 2.0,
+        "shortage_replicas_max": 3,
+        "minutes_demand_exceeded_ceiling": 0.0,
+        "decisions_from": "go_controller"
+      }
+    }
+  },
+  "what_this_can_establish": [
+    "that the real accumulated series runs end to end through the deployed forecasters and the real Go controller, in chronological order, with rolling origins and no look-ahead",
+    "how much genuine history exists after the validity mask, and how many origins it yields",
+    "which arms are even DEFINED on this much history, and how many of each forecast's six steps rest on a real same-time-yesterday observation"
+  ],
+  "what_this_cannot_establish": [
+    "which forecaster is better: the window covers too few whole daily cycles, and overlapping rolling origins are not independent samples",
+    "anything about the neural arm: no model has ever been trained on this history (the trainer requires 235 points and refuses below that), so there is no network forecast to replay",
+    "an operational benefit: the controller replay models capacity arriving after a readiness delay and prices no queueing, latency or dropped request",
+    "generalisation beyond this one workload, one cluster and one generator design"
+  ],
+  "refused_to_score_because": [
+    "origin_days: observed 0.17, required 3",
+    "warmup_days_before_first_origin: observed 1.0, required 3",
+    "independent_blocks: observed 4, required 72"
+  ]
+}

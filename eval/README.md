@@ -89,3 +89,35 @@ eval/.venv/bin/python eval/selector.py --no-replay                          # ac
 ```
 
 Findings: `eval/SELECTOR-RESULTS-2026-09-22.md`. It did not clear its predeclared bar.
+
+## Chronological replay of the real benchmark traffic
+
+`eval/export_benchmark_series.py` exports the canonical series from the benchmark cluster's
+Prometheus — a single read-only `query_range`, with the query and window read from the
+predeclared `deploy/eks-benchmark/validity-mask.json` rather than chosen at export time.
+`eval/replay_real.py` then replays that genuine history offline: rolling origins in
+chronological order, every forecaster seeing only `series[:i+1]`, and the real Go controller
+replayed separately per arm.
+
+It **refuses to score** below a minimum scale declared in the module before the data is read
+(three whole daily cycles of origins, three days of warmup, seventy-two non-overlapping origin
+blocks) and prints a census instead. As of 2026-09-22 the history is 174 valid points and
+yields 24 origins, so the run is a census.
+
+```sh
+kubectl -n monitoring port-forward svc/kps-kube-prometheus-stack-prometheus 19090:9090 &
+eval/.venv/bin/python eval/export_benchmark_series.py --base-url http://127.0.0.1:19090 \
+    --out eval/data/benchmark-real-<utc>.json
+eval/.venv/bin/python eval/replay_real.py \
+    --export eval/data/benchmark-real-<utc>.json --out eval/replay-real-<utc>.json
+```
+
+Findings: `eval/RESULTS-real-traffic-replay-2026-09-22.md`.
+
+## Other files here
+
+| File | What it is |
+|---|---|
+| `reproduce_divergence.py` | the arms re-run under the conditions that originally failed; `repair_divergence_record.py` rebuilds its record from the console log (Codex C-95) |
+| `PROTOCOL-seasonal-default-selector.md` | the predeclared design of the next selector experiment — written, **not run** |
+| `TOLERANCE-DERIVATION.md` | a non-inferiority margin derived from shortage, replica consumption and workload prevalence, replacing the underived 2 % |
