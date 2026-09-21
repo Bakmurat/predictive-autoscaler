@@ -563,9 +563,31 @@ class LSTMForecastModel:
             agreement = None
 
         horizon_penalty = max(0.4, 1.0 - (steps_ahead / 288))
-        # Without a second component there is no agreement evidence: use the neutral 0.5 that the
-        # single-step path has always used, never the 1.0 that self-comparison produced.
-        agreement_term = agreement if agreement is not None else 0.5
+        # D-92: confidence must describe what is ACTUALLY SERVED. Agreement between the two
+        # components is evidence only to the extent the network contributes to the blend. At
+        # pattern weight 1 the network is not in the served forecast at all, yet the old
+        # calculation still let its disagreement move confidence -- and the controller dampens
+        # below 0.7, so a configuration nominally "pattern-only" was still operationally
+        # steered by the network. Weight the agreement term by the network's mean share, and
+        # fall back to the pattern's own support when that share is zero.
+        network_share = float(np.mean([1.0 - w for w in pattern_weights])) if pattern_weights \
+            else 1.0
+        if agreement is not None and network_share > 0.0:
+            # Support term: one matched day is thin evidence, several days is better. Saturates
+            # at three days, which is the most the 0.3^(d-1) weighting meaningfully uses.
+            supports = [r["support"] for r in (getattr(self, "last_pattern_per_step", None) or [])
+                        if r.get("available")]
+            support_term = min(1.0, (float(np.mean(supports)) / 3.0)) if supports else 0.5
+            agreement_term = network_share * agreement + (1.0 - network_share) * support_term
+        elif agreement is None and pattern_available:
+            # Pattern serving alone with no network opinion to compare: judge it on its support.
+            supports = [r["support"] for r in (getattr(self, "last_pattern_per_step", None) or [])
+                        if r.get("available")]
+            agreement_term = min(1.0, (float(np.mean(supports)) / 3.0)) if supports else 0.5
+        else:
+            # No second component at all: the neutral 0.5 the single-step path has always used,
+            # never the 1.0 that self-comparison produced.
+            agreement_term = 0.5
         confidence = 0.5 * agreement_term + 0.5 * horizon_penalty
         confidence = max(0.3, min(0.9, confidence))
 
@@ -593,6 +615,8 @@ class LSTMForecastModel:
                 'pattern_per_step': getattr(self, 'last_pattern_per_step', None),
                 'pattern_weights': pattern_weights,
                 'agreement': agreement,
+                'network_share': float(np.mean([1.0 - w for w in pattern_weights]))
+                if pattern_weights else 1.0,
                 'blended': blended_pre_floor,
                 'final': [float(v) for v in final_predictions],
             },
