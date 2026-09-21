@@ -154,7 +154,10 @@ def test_pattern_only_confidence_reflects_support_and_differs_thin_vs_thick():
     """Codex C-76: with the weight forced to one, thin and thick history both returned
     0.73958, because non-null agreement plus zero network share fell through to the neutral
     default and bypassed support. This test drives the ACTUAL zero-share branch."""
-    thin_conf, thin_share, thin_support = _pattern_only_confidence(days=2)   # one matched day
+    # days=1 is exactly one window (144 points): every step matches d=1 and d=2 falls
+    # before the history start, so support is 1. (days=2 gives support 2 -- the first
+    # version of this test mislabelled it "one matched day"; the code was right.)
+    thin_conf, thin_share, thin_support = _pattern_only_confidence(days=1)   # one matched day
     thick_conf, thick_share, thick_support = _pattern_only_confidence(days=8)  # several
 
     assert thin_support < thick_support, "precondition: more history means more support"
