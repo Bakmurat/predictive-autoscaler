@@ -64,10 +64,35 @@ DEFAULT_TARGET_RPM_PER_REPLICA = 1800          # calibrated per scenario below
 # ======================================================================================
 # Scenario generation
 # ======================================================================================
+# The generator drives an hourly STEP profile (a ramping-arrival-rate stage per hour), not a
+# smooth curve. A cosine made the series easier to forecast than the real one (C-54).
+K6_HOURLY_MULTIPLIER = [
+    0.30, 0.25, 0.22, 0.20, 0.22, 0.30,   # 00-05 night trough
+    0.45, 0.65, 0.85, 0.95, 1.00, 0.98,   # 06-11 morning ramp to peak
+    0.92, 0.90, 0.94, 1.00, 0.97, 0.88,   # 12-17 plateau with a second peak
+    0.78, 0.68, 0.58, 0.48, 0.40, 0.34,   # 18-23 evening decay
+]
+
+
 def _daily_shape(ts: pd.Timestamp) -> float:
-    """The k6 profile's shape: a broad daytime peak with a quiet night."""
-    frac = (ts.hour * 60 + ts.minute) / (24 * 60.0)
-    return 0.25 + 0.75 * (0.5 * (1 - np.cos(2 * np.pi * frac))) ** 1.6
+    """The k6 profile: one constant arrival rate per hour, stepping on the hour."""
+    return K6_HOURLY_MULTIPLIER[ts.hour]
+
+
+def scenario_event_indices(kind: str, n: int, seed: int) -> list:
+    """Indices at which `kind` introduces its event, so the window can be asserted (C-51)."""
+    if kind in ("repeating",):
+        return []
+    if kind == "trend":
+        return [int(n * 0.35)]            # the trend is continuous; this is a mid-point probe
+    if kind == "levelshift":
+        return [int(n * 0.45)]
+    if kind == "spike":
+        rng = np.random.default_rng(seed)
+        return sorted(int(rng.integers(int(n * 0.35), int(n * 0.85))) for _ in range(3))
+    if kind == "weekly":
+        return [i for i in range(n) if i % PER_DAY == 0]
+    return []
 
 
 def make_series(kind: str, days: int, seed: int, base: float = 6000.0,
@@ -84,15 +109,14 @@ def make_series(kind: str, days: int, seed: int, base: float = 6000.0,
     elif kind == "trend":
         vals = vals * (1.0 + np.linspace(0, 0.6, n))
     elif kind == "levelshift":
-        cut = int(n * 0.62)
         vals = vals.copy()
+        cut = scenario_event_indices("levelshift", n, seed)[0]
         vals[cut:] *= 1.55
     elif kind == "spike":
         vals = vals.copy()
-        for _ in range(3):
-            at = rng.integers(int(n * 0.55), n - 12)
-            width = rng.integers(2, 6)
-            vals[at:at + width] *= rng.uniform(2.0, 3.0)
+        for at in scenario_event_indices("spike", n, seed):
+            width = int(rng.integers(2, 6))
+            vals[at:at + width] *= float(rng.uniform(2.0, 3.0))
     elif kind == "weekly":
         dow = np.array([t.weekday() for t in idx])
         vals = vals * np.where(dow >= 5, 0.55, 1.0)
@@ -228,100 +252,230 @@ class ControllerState:
     streak: int = 0
 
 
-def replica_need(rpm: float, target_rpm_per_replica: float, min_r: int, max_r: int) -> int:
-    return int(np.clip(np.ceil(rpm / target_rpm_per_replica), min_r, max_r))
+def go_controller_decisions(steps: list, min_r: int, max_r: int, timeout_s: int = 600):
+    """Run the REAL Go controller over a recorded input sequence (C-52).
+
+    Returns its per-step decisions, or None when the Go toolchain is unavailable. This
+    exists so the evaluation does not depend on a Python re-implementation of the
+    controller's safeguards: the first attempt omitted the ramp-up detection and diverged
+    from the real decisions, which the differential test caught.
+    """
+    import shutil, subprocess, tempfile
+    go_dir = ROOT / "k8s-operator"
+    if shutil.which("go") is None or not go_dir.exists():
+        return None
+    with tempfile.TemporaryDirectory() as td:
+        in_path, out_path = Path(td) / "in.json", Path(td) / "out.json"
+        in_path.write_text(json.dumps({"min": min_r, "max": max_r, "steps": steps}))
+        env = {**os.environ, "REPLAY_IN": str(in_path), "REPLAY_OUT": str(out_path)}
+        proc = subprocess.run(
+            ["go", "test", "./controllers", "-run", "TestReplayHarness", "-count=1"],
+            cwd=go_dir, env=env, capture_output=True, text=True, timeout=timeout_s)
+        if proc.returncode != 0 or not out_path.exists():
+            log.warning("go replay harness failed: %s", proc.stdout[-500:])
+            return None
+        return json.loads(out_path.read_text())["decisions"]
+
+
+def replica_need(rpm: float, target_rpm_per_replica: float) -> int:
+    """Replicas required by demand, UNCONSTRAINED by the ceiling (C-52).
+
+    Clipping the requirement to max_replicas hid overload: a workload needing 20 replicas
+    against a ceiling of 12 reported no deficit. Required capacity and permitted replicas
+    are now separate quantities.
+    """
+    return int(np.ceil(rpm / target_rpm_per_replica))
 
 
 def replay_controller(actual: pd.Series, forecasts: dict, target_rpm: float,
-                      min_r: int = 1, max_r: int = 12, lead_steps: int = 2):
-    """Replay max(forecast, reactive, min) with the real stabilization rules.
+                      min_r: int = 1, max_r: int = 12, lead_steps: int = 2,
+                      readiness_min: int = READINESS_DELAY_MIN,
+                      tick_min: int = 1, use_go: bool = True):
+    """Replay the controller on an EVENT-TIME grid (C-52).
 
-    Returns replica-minutes, churn, and the shortfall against what the reactive rule
-    would have required at each moment -- accounting for the readiness delay, so a
-    scale-up decided now only serves traffic READINESS_DELAY_MIN later.
+    Rebuilt after review. Three defects in the first version:
+      * pending readiness updates were overwritten before they took effect, so capacity
+        appeared instantly;
+      * a two-minute readiness delay was judged on ten-minute ticks, so every deficit was
+        counted as a full ten minutes;
+      * demand was clipped to the replica ceiling, hiding overload.
+
+    Now: decisions are taken on the observation grid, capacity is accounted on a
+    one-minute event-time grid with explicit ready-at times, and the deficit is measured
+    against unconstrained requirement.
+
+    NOTE: this remains a Python model of the controller. It is validated against the real
+    Go decision functions by eval/test_replay_differential.py; do not quote its output
+    without that check passing.
     """
-    st = ControllerState(current=min_r)
-    times = list(actual.index)
-    served_capacity = {}
+    obs_times = list(actual.index)
+    obs_value = {t: float(v) for t, v in actual.items()}
+    grid = pd.date_range(obs_times[0], obs_times[-1], freq=f"{tick_min}min")
+
+    # Decisions come from the REAL controller when the Go toolchain is present; the Python
+    # path below is a fallback and is labelled as unvalidated in the result.
+    go_decisions = None
+    if use_go:
+        steps = []
+        for t in obs_times:
+            required = replica_need(obs_value[t], target_rpm)
+            reactive = int(np.clip(required, min_r, max_r))
+            fc = forecasts.get(t)
+            if fc is not None and len(fc) >= lead_steps:
+                predicted = int(np.clip(replica_need(float(np.max(fc[:lead_steps])), target_rpm),
+                                        min_r, max_r))
+                preds = [float(x) for x in fc]
+            else:
+                predicted, preds = min_r, []
+            steps.append({"t": t.isoformat() + "Z", "reactive": reactive,
+                          "predicted": predicted, "current_rpm": obs_value[t],
+                          "predictions": preds})
+        go_decisions = go_controller_decisions(steps, min_r, max_r)
+    go_by_time = ({pd.Timestamp(d["t"].replace("Z", "")): d for d in go_decisions}
+                  if go_decisions else None)
+
+    current = min_r
+    ready_now = min_r
+    arrivals: list[tuple[pd.Timestamp, int]] = []
+    last_scale_up = last_scale_down = below_since = None
+    streak, override_active = 0, False
+
     replica_minutes = 0.0
-    churn = 0
-    pending = []  # (ready_at, replicas)
+    events = 0
+    deficit_minutes = 0.0
+    deficit_amounts: list[int] = []
+    over_ceiling_minutes = 0.0
+    decisions = []
 
-    for i, now in enumerate(times):
-        for ready_at, count in list(pending):
-            if now >= ready_at:
-                served_capacity[now] = count
-                pending.remove((ready_at, count))
+    obs_set = set(obs_times)
+    for now in grid:
+        # 1. Apply capacity that has become ready at or before this instant.
+        for at, count in [a for a in arrivals if a[0] <= now]:
+            ready_now = count
+            arrivals.remove((at, count))
 
-        reactive = replica_need(float(actual.iloc[i]), target_rpm, min_r, max_r)
-        fc = forecasts.get(now)
-        predicted = min_r
-        if fc is not None and len(fc) >= lead_steps:
-            predicted = replica_need(float(np.max(fc[:lead_steps])), target_rpm, min_r, max_r)
+        # 2. On an observation tick, take a decision.
+        if now in obs_set and go_by_time is not None:
+            # Authoritative path: the real controller decided this.
+            d = go_by_time.get(now)
+            if d is not None:
+                previous = current
+                current = int(d["applied"])
+                if current > previous:
+                    arrivals.append((now + pd.Timedelta(minutes=readiness_min), current))
+                elif current < previous:
+                    ready_now = min(ready_now, current)
+                if current != previous:
+                    events += 1
+                decisions.append(d)
+        elif now in obs_set:
+            required = replica_need(obs_value[now], target_rpm)      # unconstrained
+            reactive = int(np.clip(required, min_r, max_r))           # what the controller may ask
+            fc = forecasts.get(now)
+            predicted = min_r
+            if fc is not None and len(fc) >= lead_steps:
+                predicted = int(np.clip(replica_need(float(np.max(fc[:lead_steps])), target_rpm),
+                                        min_r, max_r))
 
-        # Overestimate detection, as implemented in controllers/overestimate.go
-        if reactive > 0 and predicted > reactive and predicted / reactive > OVERESTIMATE_RATIO:
-            st.streak += 1
-            if st.streak >= OVERESTIMATE_STREAK:
-                predicted = int(min(predicted, np.ceil(reactive * OVERESTIMATE_HEADROOM)))
-                st.override_active = True
-        else:
-            st.streak = 0
-            st.override_active = False
+            if reactive > 0 and predicted > reactive and predicted / reactive > OVERESTIMATE_RATIO:
+                streak += 1
+                if streak >= OVERESTIMATE_STREAK:
+                    predicted = int(min(predicted, np.ceil(reactive * OVERESTIMATE_HEADROOM)))
+                    override_active = True
+            else:
+                streak = 0
+                override_active = False
 
-        desired = max(predicted, reactive, min_r)
-        prev = st.current
+            desired = int(np.clip(max(predicted, reactive, min_r), min_r, max_r))
+            previous = current
 
-        if desired > st.current:
-            st.current = desired
-            st.last_scale_up = now
-            st.below_since = None
-            pending.append((now + timedelta(minutes=READINESS_DELAY_MIN), st.current))
-        elif desired < st.current:
-            blocked = False
-            if not st.override_active:
-                if st.last_scale_up and (now - st.last_scale_up) < timedelta(minutes=SCALE_DOWN_STABILIZATION_MIN):
+            if desired > current:
+                current = desired
+                last_scale_up = now
+                below_since = None
+                arrivals.append((now + pd.Timedelta(minutes=readiness_min), current))
+            elif desired < current:
+                blocked = False
+                if not override_active:
+                    if last_scale_up is not None and (now - last_scale_up) < pd.Timedelta(minutes=SCALE_DOWN_STABILIZATION_MIN):
+                        blocked = True
+                    elif below_since is None:
+                        below_since = now
+                        blocked = True
+                    elif (now - below_since) < pd.Timedelta(minutes=SCALE_DOWN_STABILIZATION_MIN):
+                        blocked = True
+                if not blocked and last_scale_down is not None and \
+                        (now - last_scale_down) < pd.Timedelta(minutes=SCALE_DOWN_COOLDOWN_MIN):
                     blocked = True
-                elif st.below_since is None:
-                    st.below_since = now
-                    blocked = True
-                elif (now - st.below_since) < timedelta(minutes=SCALE_DOWN_STABILIZATION_MIN):
-                    blocked = True
-            if not blocked and st.last_scale_down and \
-                    (now - st.last_scale_down) < timedelta(minutes=SCALE_DOWN_COOLDOWN_MIN):
-                blocked = True
-            if not blocked:
-                max_remove = max(SCALE_DOWN_MIN_PODS,
-                                 int(np.ceil(st.current * SCALE_DOWN_MAX_PERCENT / 100.0)))
-                st.current = max(desired, st.current - max_remove, 1)
-                st.last_scale_down = now
-                st.below_since = None
-        else:
-            st.below_since = None
+                if not blocked:
+                    max_remove = max(SCALE_DOWN_MIN_PODS,
+                                     int(np.ceil(current * SCALE_DOWN_MAX_PERCENT / 100.0)))
+                    current = max(desired, current - max_remove, 1)
+                    last_scale_down = now
+                    below_since = None
+                    ready_now = min(ready_now, current)   # removal is immediate
+            else:
+                below_since = None
 
-        if st.current != prev:
-            churn += 1
-        replica_minutes += st.current * GRID_MIN
+            if current != previous:
+                events += 1
+            decisions.append({"t": now.isoformat(), "current": previous, "desired": desired,
+                              "applied": current, "override_active": override_active,
+                              "streak": streak})
 
-        # Capacity actually serving: replicas that have finished starting.
-        effective = min(st.current, prev) if st.current > prev else st.current
-        served_capacity[now] = effective
+        # 3. Account capacity and shortfall for this minute, at event time.
+        replica_minutes += current * tick_min
+        last_obs = max((t for t in obs_times if t <= now), default=obs_times[0])
+        required = replica_need(obs_value[last_obs], target_rpm)
+        if required > max_r:
+            over_ceiling_minutes += tick_min
+        if ready_now < required:
+            deficit_minutes += tick_min
+            deficit_amounts.append(required - ready_now)
 
-    deficits, deficit_minutes = [], 0.0
-    for i, now in enumerate(times):
-        need = replica_need(float(actual.iloc[i]), target_rpm, min_r, max_r)
-        have = served_capacity.get(now, st.current)
-        if have < need:
-            deficits.append(need - have)
-            deficit_minutes += GRID_MIN
     return {
         "replica_minutes": round(replica_minutes, 1),
-        "scaling_events": churn,
-        "deficit_intervals": len(deficits),
+        "scaling_events": events,
         "deficit_minutes": round(deficit_minutes, 1),
-        "deficit_replicas_max": int(max(deficits)) if deficits else 0,
-        "deficit_replicas_mean": round(float(np.mean(deficits)), 2) if deficits else 0.0,
+        "deficit_replicas_max": int(max(deficit_amounts)) if deficit_amounts else 0,
+        "deficit_replicas_mean": round(float(np.mean(deficit_amounts)), 2) if deficit_amounts else 0.0,
+        "minutes_demand_exceeded_ceiling": round(over_ceiling_minutes, 1),
+        "decisions_from": "go_controller" if go_by_time is not None else "python_fallback",
+        "decisions": decisions,
     }
+
+
+class WindowCoverageError(AssertionError):
+    """The evaluation window does not contain the scenario's event (C-51)."""
+
+
+def assert_window_covers_events(scenario: str, seed: int, n: int, origins: list) -> None:
+    """Fail loudly unless the scored targets span pre-event, transition and recovery.
+
+    The first run of this harness reported level-shift and spike results that were in fact
+    ordinary repeating traffic, because every event lay beyond the last scored target. An
+    evaluation that cannot see its own event must stop, not publish.
+    """
+    events = scenario_event_indices(scenario, n, seed)
+    if not events:
+        return
+    first_target, last_target = origins[0] + 1, origins[-1] + STEPS_AHEAD
+    inside = [e for e in events if first_target <= e <= last_target]
+    if not inside:
+        raise WindowCoverageError(
+            f"{scenario} (seed {seed}): no event inside the scored targets "
+            f"[{first_target}, {last_target}]; events at {events}. "
+            f"This run would measure pre-event traffic and report it as a stress test.")
+    pre = [e for e in inside if e - first_target >= PER_DAY // 2]
+    post = [e for e in inside if last_target - e >= PER_DAY // 2]
+    if not pre:
+        raise WindowCoverageError(
+            f"{scenario} (seed {seed}): no event has at least half a day of pre-event "
+            f"targets before it; the baseline period is too short to compare against.")
+    if not post:
+        raise WindowCoverageError(
+            f"{scenario} (seed {seed}): no event has at least half a day of targets after "
+            f"it; recovery cannot be observed.")
 
 
 # ======================================================================================
@@ -353,9 +507,19 @@ class Score:
 
 def evaluate_scenario(series: pd.Series, scenario: str, seed: int, *,
                       retrain_every_h: int = 6, publication_delay_min: int = 20,
-                      epochs: int = 12, max_origins: int | None = None,
-                      target_rpm: float | None = None, verbose: bool = True):
-    """Rolling origins with a retrain schedule and a publication delay."""
+                      epochs: int = 50, max_origins: int | None = None,
+                      target_rpm: float | None = None, verbose: bool = True,
+                      model_seed: int = 0, train_window_days: int = 7):
+    """Rolling origins with a retrain schedule and a publication delay.
+
+    Production-equivalent by default (C-54): the trainer's 50 epochs, a rolling
+    seven-day training window rather than expanding history, a seeded TensorFlow
+    initialisation recorded separately from the data seed, and capacity calibrated on
+    training data only. Origins are paired -- a predictor that fails at an origin removes
+    that origin from EVERY predictor's score, so all columns cover the same targets.
+    """
+    import tensorflow as tf
+    tf.keras.utils.set_random_seed(model_seed)
     predictors = [Persistence(), PreviousDay(), SeasonalPattern(), TrendAdaptive(),
                   NetworkOnly(), ServedBlend()]
     per_step = {p.name: [Score() for _ in range(STEPS_AHEAD)] for p in predictors}
@@ -364,20 +528,37 @@ def evaluate_scenario(series: pd.Series, scenario: str, seed: int, *,
 
     warmup = max(SEQ + STEPS_AHEAD, 2 * PER_DAY)
     origins = list(range(warmup, len(series) - STEPS_AHEAD))
-    if max_origins:
-        origins = origins[:max_origins]
+    if max_origins and len(origins) > max_origins:
+        # C-51: when the origin count is capped, CENTRE the window on the scenario's events
+        # so the scored targets span pre-event, transition and recovery. Taking the first N
+        # (the original bug) or the last N both miss events that sit in between.
+        events = scenario_event_indices(scenario, len(series), seed)
+        if events:
+            focus = int(np.median(events))
+            want_start = focus - max_origins // 2
+            lo = min(max(origins[0], want_start), origins[-1] - max_origins + 1)
+            lo = max(lo, origins[0])
+            origins = [i for i in origins if lo <= i < lo + max_origins]
+        else:
+            origins = origins[:max_origins]
     if not origins:
         return None
+
+    assert_window_covers_events(scenario, seed, len(series), origins)
 
     model = None
     model_published_at = None
     pending_model = None
     last_train_idx = -10 ** 9
+    predictor_failures: list = []
+    scored_origins: list = []
     retrain_every = retrain_every_h * 60 // GRID_MIN
     train_failures = []
 
     if target_rpm is None:
-        target_rpm = float(np.percentile(series.values, 60)) / 3.0
+        # C-54: calibrate on the pre-origin (training) portion only -- using the whole
+        # series lets the future set the capacity denominator.
+        target_rpm = float(np.percentile(series.values[:origins[0]], 60)) / 3.0
 
     t_start = time.time()
     for k, i in enumerate(origins):
@@ -389,7 +570,10 @@ def evaluate_scenario(series: pd.Series, scenario: str, seed: int, *,
             last_train_idx = i
             try:
                 m = LSTMForecastModel(sequence_length=SEQ)
-                m.train(pd.DataFrame({"value": hist.values}, index=hist.index), epochs=epochs)
+                # Rolling seven-day window, as the deployed trainer uses (C-54).
+                train_hist = hist.iloc[-(train_window_days * PER_DAY):]
+                m.train(pd.DataFrame({"value": train_hist.values}, index=train_hist.index),
+                        epochs=epochs)
                 pending_model = (m, origin + pd.Timedelta(minutes=publication_delay_min))
             except Exception as exc:
                 train_failures.append(f"{origin.isoformat()}: {exc}")
@@ -403,19 +587,34 @@ def evaluate_scenario(series: pd.Series, scenario: str, seed: int, *,
         if len(truth) < STEPS_AHEAD:
             break
 
+        # C-54: score an origin only when EVERY predictor produced a forecast for it, so all
+        # columns cover identical targets. A predictor that fails is recorded, not skipped
+        # silently.
+        this_origin = {}
         for p in predictors:
             if p.needs_model and model is None:
-                continue                              # cold start: no published model yet
+                this_origin = {}                      # cold start: no published model yet
+                break
             try:
-                pred = p.forecast(hist, origin, STEPS_AHEAD, model=model)
+                pred = np.asarray(p.forecast(hist, origin, STEPS_AHEAD, model=model), dtype=float)
             except Exception as exc:
+                predictor_failures.append(f"{p.name} @ {origin.isoformat()}: {exc}")
                 log.warning("%s failed at %s: %s", p.name, origin, exc)
-                continue
-            pred = np.asarray(pred, dtype=float)
-            overall[p.name].add(pred, truth)
-            for s in range(STEPS_AHEAD):
-                per_step[p.name][s].add([pred[s]], [truth[s]])
-            forecast_by_origin[p.name][origin] = pred
+                this_origin = {}
+                break
+            if not np.all(np.isfinite(pred)):
+                predictor_failures.append(f"{p.name} @ {origin.isoformat()}: non-finite forecast")
+                this_origin = {}
+                break
+            this_origin[p.name] = pred
+
+        if len(this_origin) == len(predictors):
+            scored_origins.append(origin)
+            for name, pred in this_origin.items():
+                overall[name].add(pred, truth)
+                for st in range(STEPS_AHEAD):
+                    per_step[name][st].add([pred[st]], [truth[st]])
+                forecast_by_origin[name][origin] = pred
 
         if verbose and k % 25 == 0:
             print(f"    origin {k + 1}/{len(origins)} ({origin})  "
@@ -434,7 +633,13 @@ def evaluate_scenario(series: pd.Series, scenario: str, seed: int, *,
         "scenario": scenario,
         "seed": seed,
         "points": len(series),
-        "origins_scored": len(origins),
+        "origins_offered": len(origins),
+        "origins_scored": len(scored_origins),
+        "predictor_failures": predictor_failures,
+        "epochs": epochs,
+        "train_window_days": train_window_days,
+        "data_seed": seed,
+        "model_seed": model_seed,
         "target_rpm_per_replica": round(target_rpm, 1),
         "model_published_at": model_published_at.isoformat() if model_published_at is not None else None,
         "train_failures": train_failures,

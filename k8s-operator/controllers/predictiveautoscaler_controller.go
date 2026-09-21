@@ -59,6 +59,11 @@ type scaleState struct {
 	lastRPM            float64   // Previous reconcile's current RPM (for ramp-up detection)
 	reEvalCounter      int       // Counts reconciles since last periodic re-evaluation (OPER-01)
 	overrideActive     bool      // True when overestimate cap fired; bypasses stabilization (OPER-03)
+	// Replay-only (Codex C-52): the differential harness rebases wall-clock timestamps so a
+	// recorded sequence can be replayed at its own cadence through the real decision
+	// functions. Unused in production -- nothing outside replay_harness_test.go sets these.
+	replayAnchor time.Time
+	replayWall   time.Time
 }
 
 // PredictiveAutoscalerReconciler reconciles a PredictiveAutoscaler object.

@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -27,12 +28,14 @@ def series(n, end=datetime(2026, 3, 2, 12, 0), scale=1.0, offset=0.0):
 
 
 def split_plan(n_rows, seq=SEQ, steps=STEPS_AHEAD):
-    """Recompute the implementation's index plan without training a network."""
+    """Recompute the implementation's index plan without training a network.
+
+    C-53: the rule is disjoint TARGET periods. Input windows may overlap.
+    """
     split_row = int(0.8 * n_rows)
-    purge = seq + steps - 1
     n_seq = n_rows - seq - steps + 1
     train_idx = [i for i in range(n_seq) if i + seq + steps - 1 < split_row]
-    val_idx = [i for i in range(n_seq) if i >= split_row - seq + purge]
+    val_idx = [i for i in range(n_seq) if i + seq >= split_row]
     return train_idx, val_idx, split_row
 
 
@@ -95,7 +98,7 @@ def test_metadata_declares_the_split_discipline():
     meta = result["metadata"]
     assert meta["scaler_fitted_on"] == "training rows only"
     assert meta["purged_split"] is True
-    assert meta["purge_gap_rows"] == SEQ + STEPS_AHEAD - 1
+    assert meta["split_rule"] == "disjoint target periods; input windows may overlap"
     assert meta["training_samples"] > 0 and meta["validation_samples"] > 0
 
 
@@ -107,3 +110,23 @@ def test_evaluate_reports_what_it_scored():
     out = m.evaluate(series(120, end=datetime(2026, 3, 3, 12, 0)))
     assert out["scored"] in ("served_blend", "raw_network")
     assert "network_only" in out and "bias" in out
+
+def test_short_series_fails_loudly_instead_of_falling_back():
+    """C-53: the contiguous fallback silently restored the leak. It must not exist."""
+    m = LSTMForecastModel(sequence_length=SEQ)
+    tiny = series(SEQ + STEPS_AHEAD + 3)
+    with pytest.raises(ValueError, match="disjoint label periods"):
+        m.train(tiny, epochs=1)
+
+
+def test_input_windows_may_overlap_the_other_partition():
+    """Reading a shared historical row is not leakage; sharing a LABEL is."""
+    n = 400
+    train_idx, val_idx, split_row = split_plan(n)
+    # At least one validation sequence reads rows the training partition also read.
+    overlaps = [i for i in val_idx if i < split_row]
+    assert overlaps, "expected input overlap to be permitted"
+    # ...yet no target row is shared.
+    tt = set().union(*(target_rows(i) for i in train_idx))
+    vt = set().union(*(target_rows(i) for i in val_idx))
+    assert not (tt & vt)

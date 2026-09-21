@@ -127,7 +127,8 @@ class LSTMForecastModel:
         self.training_timestamps = None  # Store for pattern alignment
 
     def train(self, data: pd.DataFrame, target_column: str = 'value', epochs: int = 50,
-              imputed: Optional[np.ndarray] = None) -> Dict:
+              imputed: Optional[np.ndarray] = None, activation: str = 'relu',
+              clipnorm: Optional[float] = None) -> Dict:
         """
         Train LSTM model on the provided data.
 
@@ -138,6 +139,12 @@ class LSTMForecastModel:
             data: DataFrame with datetime index and target column
             target_column: Name of column to predict
             epochs: Number of training epochs
+            activation: LSTM activation. Default 'relu' is what has always shipped. Codex
+                C-55: 'relu' permits unbounded activations and is ONE hypothesis for the
+                divergences seen in evaluation; 'tanh' is the Keras default and bounds them.
+                This is an experiment arm -- change it alone, never together with clipnorm.
+            clipnorm: Optional gradient-norm clipping for Adam. The SECOND, separate arm.
+                Leave None when testing `activation`, so an improvement can be attributed.
 
         Returns:
             Dictionary with training results
@@ -199,21 +206,44 @@ class LSTMForecastModel:
 
         # X already has shape (N, seq_len, 5) from _create_sequences -- no reshape needed
 
-        # Training sequences are those whose LAST target row is before the split; validation
-        # sequences are those whose FIRST input row starts after the purge gap.
-        train_idx = np.array([i for i in range(len(X))
-                              if i + self.sequence_length + STEPS_AHEAD - 1 < split_row], dtype=int)
-        val_idx = np.array([i for i in range(len(X)) if i >= split_row - self.sequence_length + purge],
-                           dtype=int)
+        # Split by TARGET timestamps (C-53). What must not be shared between the two
+        # partitions is the LABEL period; the input windows may overlap historical data
+        # freely, because reading a row the other partition also reads is not leakage --
+        # being scored on a timestamp the model was trained to predict is.
+        #
+        # The previous rule additionally demanded a gap of sequence_length + STEPS_AHEAD - 1
+        # rows before any validation sequence could start, which no short series can supply;
+        # it then fell back to the contiguous sequence split, restoring the very overlap it
+        # was added to remove. That fallback was active in every evaluation run to date, so
+        # the fix was inert. There is no fallback now: if the series cannot support disjoint
+        # label periods, training fails loudly.
+        first_target = np.arange(len(X)) + self.sequence_length
+        last_target = first_target + STEPS_AHEAD - 1
+
+        train_idx = np.flatnonzero(last_target < split_row)
+        val_idx = np.flatnonzero(first_target >= split_row)
+
         if len(train_idx) == 0 or len(val_idx) == 0:
-            # Series too short for a purged split: fall back to the contiguous sequence split,
-            # and say so in the metadata rather than silently leaking.
-            train_size = int(0.8 * len(X))
-            train_idx = np.arange(0, train_size, dtype=int)
-            val_idx = np.arange(train_size, len(X), dtype=int)
-            self._purged_split = False
-        else:
-            self._purged_split = True
+            raise ValueError(
+                f"cannot form disjoint label periods: {len(values)} rows give "
+                f"{len(train_idx)} training and {len(val_idx)} validation sequences "
+                f"(split at row {split_row}). Supply more history; the contiguous fallback "
+                f"was removed because it shared target timestamps between the partitions."
+            )
+
+        # Belt and braces: assert the label periods really are disjoint.
+        train_targets = set()
+        for i in train_idx:
+            train_targets.update(range(first_target[i], last_target[i] + 1))
+        val_targets = set()
+        for i in val_idx:
+            val_targets.update(range(first_target[i], last_target[i] + 1))
+        shared = train_targets & val_targets
+        if shared:
+            raise AssertionError(
+                f"train/validation share {len(shared)} target rows after the split; "
+                f"this is the leak the split exists to prevent")
+        self._purged_split = True
 
         train_size = len(train_idx)
         X_train, X_val = X[train_idx], X[val_idx]
@@ -240,12 +270,12 @@ class LSTMForecastModel:
 
         # Build BiLSTM model -- Phase 16 (D-01): Dense(STEPS_AHEAD) output
         model = Sequential([
-            Bidirectional(LSTM(128, activation='relu', return_sequences=True),
+            Bidirectional(LSTM(128, activation=activation, return_sequences=True),
                           input_shape=(self.sequence_length, 5)),  # 5 input features
             Dropout(0.2),
-            Bidirectional(LSTM(64, activation='relu', return_sequences=True)),
+            Bidirectional(LSTM(64, activation=activation, return_sequences=True)),
             Dropout(0.2),
-            Bidirectional(LSTM(32, activation='relu')),
+            Bidirectional(LSTM(32, activation=activation)),
             Dropout(0.2),
             Dense(16, activation='relu'),
             Dense(STEPS_AHEAD)  # Phase 16 (D-01): 6-step direct output
@@ -253,7 +283,8 @@ class LSTMForecastModel:
 
         # Compile with Adam optimizer and asymmetric loss (ACC-01)
         # Asymmetric MSE penalizes under-prediction 2:1 vs over-prediction
-        optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
+        optimizer = (tf.keras.optimizers.Adam(learning_rate=0.001, clipnorm=clipnorm)
+                     if clipnorm else tf.keras.optimizers.Adam(learning_rate=0.001))
         model.compile(optimizer=optimizer, loss=asymmetric_mse, metrics=['mae'])
 
         # Train model
@@ -301,7 +332,10 @@ class LSTMForecastModel:
             'validation_samples': len(X_val),
             'purged_split': bool(getattr(self, '_purged_split', False)),
             'scaler_fitted_on': 'training rows only',
-            'purge_gap_rows': int(self.sequence_length + STEPS_AHEAD - 1),
+            'split_rule': 'disjoint target periods; input windows may overlap',
+            'activation': activation,
+            'clipnorm': clipnorm,
+            'split_row': int(split_row),
             'validation_sequences_dropped_imputed_target': n_val_dropped,
             'training_metric_sequences': int(len(X_metric)),
             'epochs_trained': len(history.history['loss']),
