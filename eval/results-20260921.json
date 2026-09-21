@@ -1,0 +1,3356 @@
+{
+  "generated_at": "2026-09-21T15:22:33.136752Z",
+  "preregistered_margin": 0.1,
+  "runs": [
+    {
+      "scenario": "repeating",
+      "seed": 1,
+      "points": 1728,
+      "origins_scored": 400,
+      "target_rpm_per_replica": 1262.9,
+      "model_published_at": "2026-03-05T18:20:00",
+      "train_failures": [],
+      "overall": {
+        "persistence": {
+          "origins": 400,
+          "mae": 270.4,
+          "bias": -8.2,
+          "mape": 8.04
+        },
+        "previous_day": {
+          "origins": 400,
+          "mae": 142.4,
+          "bias": -1.4,
+          "mape": 4.03
+        },
+        "seasonal_pattern": {
+          "origins": 400,
+          "mae": 131.1,
+          "bias": 43.2,
+          "mape": 3.73
+        },
+        "trend_adaptive": {
+          "origins": 400,
+          "mae": 148.1,
+          "bias": 0.3,
+          "mape": 4.24
+        },
+        "network_only": {
+          "origins": 398,
+          "mae": 417.8,
+          "bias": -25.9,
+          "mape": 15.72
+        },
+        "served_blend": {
+          "origins": 398,
+          "mae": 147.9,
+          "bias": 25.4,
+          "mape": 4.82
+        }
+      },
+      "per_step": {
+        "persistence": [
+          {
+            "origins": 400,
+            "mae": 151.9,
+            "bias": -3.1,
+            "mape": 4.3
+          },
+          {
+            "origins": 400,
+            "mae": 187.3,
+            "bias": -5.0,
+            "mape": 5.43
+          },
+          {
+            "origins": 400,
+            "mae": 235.7,
+            "bias": -7.2,
+            "mape": 6.97
+          },
+          {
+            "origins": 400,
+            "mae": 287.4,
+            "bias": -9.4,
+            "mape": 8.6
+          },
+          {
+            "origins": 400,
+            "mae": 351.5,
+            "bias": -11.4,
+            "mape": 10.61
+          },
+          {
+            "origins": 400,
+            "mae": 408.8,
+            "bias": -13.2,
+            "mape": 12.31
+          }
+        ],
+        "previous_day": [
+          {
+            "origins": 400,
+            "mae": 141.4,
+            "bias": -2.1,
+            "mape": 3.99
+          },
+          {
+            "origins": 400,
+            "mae": 142.3,
+            "bias": -1.2,
+            "mape": 4.03
+          },
+          {
+            "origins": 400,
+            "mae": 142.5,
+            "bias": -1.0,
+            "mape": 4.04
+          },
+          {
+            "origins": 400,
+            "mae": 142.9,
+            "bias": -1.3,
+            "mape": 4.05
+          },
+          {
+            "origins": 400,
+            "mae": 142.9,
+            "bias": -1.4,
+            "mape": 4.05
+          },
+          {
+            "origins": 400,
+            "mae": 142.7,
+            "bias": -1.1,
+            "mape": 4.04
+          }
+        ],
+        "seasonal_pattern": [
+          {
+            "origins": 400,
+            "mae": 130.3,
+            "bias": 42.5,
+            "mape": 3.7
+          },
+          {
+            "origins": 400,
+            "mae": 131.0,
+            "bias": 43.3,
+            "mape": 3.73
+          },
+          {
+            "origins": 400,
+            "mae": 131.2,
+            "bias": 43.5,
+            "mape": 3.74
+          },
+          {
+            "origins": 400,
+            "mae": 131.4,
+            "bias": 43.3,
+            "mape": 3.74
+          },
+          {
+            "origins": 400,
+            "mae": 131.4,
+            "bias": 43.2,
+            "mape": 3.74
+          },
+          {
+            "origins": 400,
+            "mae": 131.3,
+            "bias": 43.3,
+            "mape": 3.73
+          }
+        ],
+        "trend_adaptive": [
+          {
+            "origins": 400,
+            "mae": 153.2,
+            "bias": 0.2,
+            "mape": 4.34
+          },
+          {
+            "origins": 400,
+            "mae": 147.6,
+            "bias": 0.6,
+            "mape": 4.22
+          },
+          {
+            "origins": 400,
+            "mae": 147.0,
+            "bias": 0.7,
+            "mape": 4.24
+          },
+          {
+            "origins": 400,
+            "mae": 147.0,
+            "bias": 0.2,
+            "mape": 4.24
+          },
+          {
+            "origins": 400,
+            "mae": 147.5,
+            "bias": -0.0,
+            "mape": 4.22
+          },
+          {
+            "origins": 400,
+            "mae": 146.2,
+            "bias": 0.1,
+            "mape": 4.18
+          }
+        ],
+        "network_only": [
+          {
+            "origins": 398,
+            "mae": 426.8,
+            "bias": -143.2,
+            "mape": 14.24
+          },
+          {
+            "origins": 398,
+            "mae": 344.8,
+            "bias": 76.5,
+            "mape": 14.48
+          },
+          {
+            "origins": 398,
+            "mae": 338.7,
+            "bias": -58.2,
+            "mape": 12.01
+          },
+          {
+            "origins": 398,
+            "mae": 443.3,
+            "bias": -25.6,
+            "mape": 17.48
+          },
+          {
+            "origins": 398,
+            "mae": 457.4,
+            "bias": -14.4,
+            "mape": 16.61
+          },
+          {
+            "origins": 398,
+            "mae": 495.7,
+            "bias": 9.5,
+            "mape": 19.52
+          }
+        ],
+        "served_blend": [
+          {
+            "origins": 398,
+            "mae": 167.2,
+            "bias": -15.6,
+            "mape": 5.42
+          },
+          {
+            "origins": 398,
+            "mae": 155.2,
+            "bias": 49.6,
+            "mape": 5.42
+          },
+          {
+            "origins": 398,
+            "mae": 138.6,
+            "bias": 19.2,
+            "mape": 4.42
+          },
+          {
+            "origins": 398,
+            "mae": 151.2,
+            "bias": 28.9,
+            "mape": 5.02
+          },
+          {
+            "origins": 398,
+            "mae": 138.2,
+            "bias": 33.0,
+            "mape": 4.33
+          },
+          {
+            "origins": 398,
+            "mae": 137.1,
+            "bias": 37.4,
+            "mape": 4.3
+          }
+        ]
+      },
+      "operational": {
+        "persistence": {
+          "replica_minutes": 13450.0,
+          "scaling_events": 22,
+          "deficit_intervals": 12,
+          "deficit_minutes": 120.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "previous_day": {
+          "replica_minutes": 13680.0,
+          "scaling_events": 22,
+          "deficit_intervals": 4,
+          "deficit_minutes": 40.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "seasonal_pattern": {
+          "replica_minutes": 13690.0,
+          "scaling_events": 22,
+          "deficit_intervals": 4,
+          "deficit_minutes": 40.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "trend_adaptive": {
+          "replica_minutes": 13690.0,
+          "scaling_events": 22,
+          "deficit_intervals": 4,
+          "deficit_minutes": 40.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "network_only": {
+          "replica_minutes": 13950.0,
+          "scaling_events": 20,
+          "deficit_intervals": 5,
+          "deficit_minutes": 50.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "served_blend": {
+          "replica_minutes": 13640.0,
+          "scaling_events": 20,
+          "deficit_intervals": 3,
+          "deficit_minutes": 30.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "reactive_only": {
+          "replica_minutes": 13450.0,
+          "scaling_events": 22,
+          "deficit_intervals": 12,
+          "deficit_minutes": 120.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        }
+      }
+    },
+    {
+      "scenario": "repeating",
+      "seed": 2,
+      "points": 1728,
+      "origins_scored": 400,
+      "target_rpm_per_replica": 1255.7,
+      "model_published_at": "2026-03-05T18:20:00",
+      "train_failures": [],
+      "overall": {
+        "persistence": {
+          "origins": 400,
+          "mae": 266.2,
+          "bias": -8.4,
+          "mape": 8.01
+        },
+        "previous_day": {
+          "origins": 400,
+          "mae": 135.9,
+          "bias": -3.5,
+          "mape": 3.93
+        },
+        "seasonal_pattern": {
+          "origins": 400,
+          "mae": 129.9,
+          "bias": 52.0,
+          "mape": 3.82
+        },
+        "trend_adaptive": {
+          "origins": 400,
+          "mae": 142.6,
+          "bias": -1.6,
+          "mape": 4.18
+        },
+        "network_only": {
+          "origins": 398,
+          "mae": 6055.1,
+          "bias": 1107.6,
+          "mape": 167.07
+        },
+        "served_blend": {
+          "origins": 398,
+          "mae": 1021.1,
+          "bias": -17.9,
+          "mape": 28.91
+        }
+      },
+      "per_step": {
+        "persistence": [
+          {
+            "origins": 400,
+            "mae": 145.8,
+            "bias": -2.7,
+            "mape": 4.32
+          },
+          {
+            "origins": 400,
+            "mae": 186.2,
+            "bias": -5.3,
+            "mape": 5.48
+          },
+          {
+            "origins": 400,
+            "mae": 228.4,
+            "bias": -7.7,
+            "mape": 6.88
+          },
+          {
+            "origins": 400,
+            "mae": 282.7,
+            "bias": -9.6,
+            "mape": 8.59
+          },
+          {
+            "origins": 400,
+            "mae": 346.8,
+            "bias": -11.6,
+            "mape": 10.43
+          },
+          {
+            "origins": 400,
+            "mae": 407.1,
+            "bias": -13.3,
+            "mape": 12.37
+          }
+        ],
+        "previous_day": [
+          {
+            "origins": 400,
+            "mae": 135.3,
+            "bias": -2.9,
+            "mape": 3.91
+          },
+          {
+            "origins": 400,
+            "mae": 135.5,
+            "bias": -3.1,
+            "mape": 3.92
+          },
+          {
+            "origins": 400,
+            "mae": 135.9,
+            "bias": -3.5,
+            "mape": 3.93
+          },
+          {
+            "origins": 400,
+            "mae": 136.0,
+            "bias": -3.5,
+            "mape": 3.93
+          },
+          {
+            "origins": 400,
+            "mae": 136.2,
+            "bias": -3.8,
+            "mape": 3.94
+          },
+          {
+            "origins": 400,
+            "mae": 136.4,
+            "bias": -4.0,
+            "mape": 3.95
+          }
+        ],
+        "seasonal_pattern": [
+          {
+            "origins": 400,
+            "mae": 129.7,
+            "bias": 52.2,
+            "mape": 3.82
+          },
+          {
+            "origins": 400,
+            "mae": 129.8,
+            "bias": 52.3,
+            "mape": 3.82
+          },
+          {
+            "origins": 400,
+            "mae": 130.0,
+            "bias": 52.1,
+            "mape": 3.83
+          },
+          {
+            "origins": 400,
+            "mae": 130.0,
+            "bias": 52.1,
+            "mape": 3.82
+          },
+          {
+            "origins": 400,
+            "mae": 129.9,
+            "bias": 51.8,
+            "mape": 3.81
+          },
+          {
+            "origins": 400,
+            "mae": 130.0,
+            "bias": 51.7,
+            "mape": 3.82
+          }
+        ],
+        "trend_adaptive": [
+          {
+            "origins": 400,
+            "mae": 143.5,
+            "bias": -0.3,
+            "mape": 4.18
+          },
+          {
+            "origins": 400,
+            "mae": 143.3,
+            "bias": -0.9,
+            "mape": 4.2
+          },
+          {
+            "origins": 400,
+            "mae": 141.6,
+            "bias": -1.6,
+            "mape": 4.2
+          },
+          {
+            "origins": 400,
+            "mae": 143.2,
+            "bias": -1.8,
+            "mape": 4.22
+          },
+          {
+            "origins": 400,
+            "mae": 142.8,
+            "bias": -2.2,
+            "mape": 4.16
+          },
+          {
+            "origins": 400,
+            "mae": 141.2,
+            "bias": -2.7,
+            "mape": 4.12
+          }
+        ],
+        "network_only": [
+          {
+            "origins": 398,
+            "mae": 1392.9,
+            "bias": -872.0,
+            "mape": 44.88
+          },
+          {
+            "origins": 398,
+            "mae": 4040.0,
+            "bias": 3179.9,
+            "mape": 111.12
+          },
+          {
+            "origins": 398,
+            "mae": 9844.5,
+            "bias": -9389.9,
+            "mape": 286.14
+          },
+          {
+            "origins": 398,
+            "mae": 1571.4,
+            "bias": -491.5,
+            "mape": 47.51
+          },
+          {
+            "origins": 398,
+            "mae": 2765.3,
+            "bias": -2027.6,
+            "mape": 78.81
+          },
+          {
+            "origins": 398,
+            "mae": 16716.5,
+            "bias": 16246.4,
+            "mape": 433.95
+          }
+        ],
+        "served_blend": [
+          {
+            "origins": 398,
+            "mae": 454.4,
+            "bias": -227.6,
+            "mape": 14.62
+          },
+          {
+            "origins": 398,
+            "mae": 1092.1,
+            "bias": 857.8,
+            "mape": 30.21
+          },
+          {
+            "origins": 398,
+            "mae": 2172.5,
+            "bias": -1996.5,
+            "mape": 63.36
+          },
+          {
+            "origins": 398,
+            "mae": 334.5,
+            "bias": -46.0,
+            "mape": 10.1
+          },
+          {
+            "origins": 398,
+            "mae": 443.4,
+            "bias": -228.5,
+            "mape": 12.74
+          },
+          {
+            "origins": 398,
+            "mae": 1629.8,
+            "bias": 1533.1,
+            "mape": 42.43
+          }
+        ]
+      },
+      "operational": {
+        "persistence": {
+          "replica_minutes": 13380.0,
+          "scaling_events": 26,
+          "deficit_intervals": 14,
+          "deficit_minutes": 140.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "previous_day": {
+          "replica_minutes": 13690.0,
+          "scaling_events": 28,
+          "deficit_intervals": 4,
+          "deficit_minutes": 40.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "seasonal_pattern": {
+          "replica_minutes": 13760.0,
+          "scaling_events": 30,
+          "deficit_intervals": 4,
+          "deficit_minutes": 40.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "trend_adaptive": {
+          "replica_minutes": 13800.0,
+          "scaling_events": 34,
+          "deficit_intervals": 4,
+          "deficit_minutes": 40.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "network_only": {
+          "replica_minutes": 14570.0,
+          "scaling_events": 26,
+          "deficit_intervals": 4,
+          "deficit_minutes": 40.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "served_blend": {
+          "replica_minutes": 14110.0,
+          "scaling_events": 26,
+          "deficit_intervals": 3,
+          "deficit_minutes": 30.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "reactive_only": {
+          "replica_minutes": 13380.0,
+          "scaling_events": 26,
+          "deficit_intervals": 14,
+          "deficit_minutes": 140.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        }
+      }
+    },
+    {
+      "scenario": "repeating",
+      "seed": 3,
+      "points": 1728,
+      "origins_scored": 400,
+      "target_rpm_per_replica": 1276.2,
+      "model_published_at": "2026-03-05T18:20:00",
+      "train_failures": [],
+      "overall": {
+        "persistence": {
+          "origins": 400,
+          "mae": 268.3,
+          "bias": -8.3,
+          "mape": 8.06
+        },
+        "previous_day": {
+          "origins": 400,
+          "mae": 128.4,
+          "bias": -2.6,
+          "mape": 3.77
+        },
+        "seasonal_pattern": {
+          "origins": 400,
+          "mae": 125.1,
+          "bias": 43.4,
+          "mape": 3.63
+        },
+        "trend_adaptive": {
+          "origins": 400,
+          "mae": 135.3,
+          "bias": -0.1,
+          "mape": 3.96
+        },
+        "network_only": {
+          "origins": 398,
+          "mae": 463.4,
+          "bias": 18.1,
+          "mape": 17.04
+        },
+        "served_blend": {
+          "origins": 398,
+          "mae": 152.2,
+          "bias": 37.2,
+          "mape": 5.18
+        }
+      },
+      "per_step": {
+        "persistence": [
+          {
+            "origins": 400,
+            "mae": 146.5,
+            "bias": -2.7,
+            "mape": 4.31
+          },
+          {
+            "origins": 400,
+            "mae": 183.6,
+            "bias": -4.9,
+            "mape": 5.48
+          },
+          {
+            "origins": 400,
+            "mae": 229.6,
+            "bias": -7.4,
+            "mape": 6.92
+          },
+          {
+            "origins": 400,
+            "mae": 287.6,
+            "bias": -9.8,
+            "mape": 8.66
+          },
+          {
+            "origins": 400,
+            "mae": 349.6,
+            "bias": -11.5,
+            "mape": 10.52
+          },
+          {
+            "origins": 400,
+            "mae": 412.8,
+            "bias": -13.4,
+            "mape": 12.44
+          }
+        ],
+        "previous_day": [
+          {
+            "origins": 400,
+            "mae": 128.0,
+            "bias": -3.0,
+            "mape": 3.76
+          },
+          {
+            "origins": 400,
+            "mae": 128.4,
+            "bias": -2.3,
+            "mape": 3.77
+          },
+          {
+            "origins": 400,
+            "mae": 128.4,
+            "bias": -2.4,
+            "mape": 3.77
+          },
+          {
+            "origins": 400,
+            "mae": 128.5,
+            "bias": -2.7,
+            "mape": 3.77
+          },
+          {
+            "origins": 400,
+            "mae": 128.5,
+            "bias": -2.8,
+            "mape": 3.77
+          },
+          {
+            "origins": 400,
+            "mae": 128.5,
+            "bias": -2.8,
+            "mape": 3.77
+          }
+        ],
+        "seasonal_pattern": [
+          {
+            "origins": 400,
+            "mae": 124.7,
+            "bias": 42.9,
+            "mape": 3.63
+          },
+          {
+            "origins": 400,
+            "mae": 125.1,
+            "bias": 43.7,
+            "mape": 3.64
+          },
+          {
+            "origins": 400,
+            "mae": 125.1,
+            "bias": 43.7,
+            "mape": 3.64
+          },
+          {
+            "origins": 400,
+            "mae": 125.1,
+            "bias": 43.4,
+            "mape": 3.63
+          },
+          {
+            "origins": 400,
+            "mae": 125.1,
+            "bias": 43.4,
+            "mape": 3.63
+          },
+          {
+            "origins": 400,
+            "mae": 125.2,
+            "bias": 43.4,
+            "mape": 3.63
+          }
+        ],
+        "trend_adaptive": [
+          {
+            "origins": 400,
+            "mae": 141.6,
+            "bias": 0.6,
+            "mape": 4.13
+          },
+          {
+            "origins": 400,
+            "mae": 136.4,
+            "bias": 0.8,
+            "mape": 3.99
+          },
+          {
+            "origins": 400,
+            "mae": 134.8,
+            "bias": 0.3,
+            "mape": 3.95
+          },
+          {
+            "origins": 400,
+            "mae": 133.4,
+            "bias": -0.4,
+            "mape": 3.91
+          },
+          {
+            "origins": 400,
+            "mae": 133.2,
+            "bias": -0.7,
+            "mape": 3.91
+          },
+          {
+            "origins": 400,
+            "mae": 132.4,
+            "bias": -1.0,
+            "mape": 3.87
+          }
+        ],
+        "network_only": [
+          {
+            "origins": 398,
+            "mae": 459.8,
+            "bias": 30.0,
+            "mape": 17.14
+          },
+          {
+            "origins": 398,
+            "mae": 435.3,
+            "bias": 57.1,
+            "mape": 16.72
+          },
+          {
+            "origins": 398,
+            "mae": 400.4,
+            "bias": 0.3,
+            "mape": 14.14
+          },
+          {
+            "origins": 398,
+            "mae": 472.4,
+            "bias": 56.8,
+            "mape": 18.56
+          },
+          {
+            "origins": 398,
+            "mae": 518.2,
+            "bias": -76.7,
+            "mape": 17.67
+          },
+          {
+            "origins": 398,
+            "mae": 494.3,
+            "bias": 40.9,
+            "mape": 17.98
+          }
+        ],
+        "served_blend": [
+          {
+            "origins": 398,
+            "mae": 178.2,
+            "bias": 36.8,
+            "mape": 6.43
+          },
+          {
+            "origins": 398,
+            "mae": 166.7,
+            "bias": 44.6,
+            "mape": 5.93
+          },
+          {
+            "origins": 398,
+            "mae": 146.2,
+            "bias": 32.0,
+            "mape": 4.86
+          },
+          {
+            "origins": 398,
+            "mae": 150.4,
+            "bias": 43.5,
+            "mape": 5.21
+          },
+          {
+            "origins": 398,
+            "mae": 137.8,
+            "bias": 25.2,
+            "mape": 4.43
+          },
+          {
+            "origins": 398,
+            "mae": 133.9,
+            "bias": 41.1,
+            "mape": 4.21
+          }
+        ]
+      },
+      "operational": {
+        "persistence": {
+          "replica_minutes": 13320.0,
+          "scaling_events": 24,
+          "deficit_intervals": 13,
+          "deficit_minutes": 130.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "previous_day": {
+          "replica_minutes": 13550.0,
+          "scaling_events": 18,
+          "deficit_intervals": 4,
+          "deficit_minutes": 40.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "seasonal_pattern": {
+          "replica_minutes": 13570.0,
+          "scaling_events": 18,
+          "deficit_intervals": 3,
+          "deficit_minutes": 30.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "trend_adaptive": {
+          "replica_minutes": 13580.0,
+          "scaling_events": 22,
+          "deficit_intervals": 3,
+          "deficit_minutes": 30.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "network_only": {
+          "replica_minutes": 14020.0,
+          "scaling_events": 20,
+          "deficit_intervals": 4,
+          "deficit_minutes": 40.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "served_blend": {
+          "replica_minutes": 13590.0,
+          "scaling_events": 18,
+          "deficit_intervals": 3,
+          "deficit_minutes": 30.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "reactive_only": {
+          "replica_minutes": 13320.0,
+          "scaling_events": 24,
+          "deficit_intervals": 13,
+          "deficit_minutes": 130.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        }
+      }
+    },
+    {
+      "scenario": "trend",
+      "seed": 1,
+      "points": 1728,
+      "origins_scored": 400,
+      "target_rpm_per_replica": 1595.9,
+      "model_published_at": "2026-03-05T18:20:00",
+      "train_failures": [],
+      "overall": {
+        "persistence": {
+          "origins": 400,
+          "mae": 317.4,
+          "bias": -12.0,
+          "mape": 8.03
+        },
+        "previous_day": {
+          "origins": 400,
+          "mae": 220.3,
+          "bias": -175.3,
+          "mape": 5.32
+        },
+        "seasonal_pattern": {
+          "origins": 400,
+          "mae": 210.1,
+          "bias": -164.4,
+          "mape": 5.1
+        },
+        "trend_adaptive": {
+          "origins": 400,
+          "mae": 176.4,
+          "bias": -37.4,
+          "mape": 4.29
+        },
+        "network_only": {
+          "origins": 398,
+          "mae": 794.7,
+          "bias": -362.7,
+          "mape": 19.97
+        },
+        "served_blend": {
+          "origins": 398,
+          "mae": 278.4,
+          "bias": -203.1,
+          "mape": 6.26
+        }
+      },
+      "per_step": {
+        "persistence": [
+          {
+            "origins": 400,
+            "mae": 178.4,
+            "bias": -4.3,
+            "mape": 4.3
+          },
+          {
+            "origins": 400,
+            "mae": 219.9,
+            "bias": -7.3,
+            "mape": 5.43
+          },
+          {
+            "origins": 400,
+            "mae": 276.4,
+            "bias": -10.5,
+            "mape": 6.96
+          },
+          {
+            "origins": 400,
+            "mae": 337.4,
+            "bias": -13.7,
+            "mape": 8.6
+          },
+          {
+            "origins": 400,
+            "mae": 412.7,
+            "bias": -16.7,
+            "mape": 10.6
+          },
+          {
+            "origins": 400,
+            "mae": 479.7,
+            "bias": -19.4,
+            "mape": 12.3
+          }
+        ],
+        "previous_day": [
+          {
+            "origins": 400,
+            "mae": 219.6,
+            "bias": -175.9,
+            "mape": 5.3
+          },
+          {
+            "origins": 400,
+            "mae": 220.1,
+            "bias": -175.0,
+            "mape": 5.32
+          },
+          {
+            "origins": 400,
+            "mae": 220.1,
+            "bias": -174.8,
+            "mape": 5.31
+          },
+          {
+            "origins": 400,
+            "mae": 220.6,
+            "bias": -175.3,
+            "mape": 5.32
+          },
+          {
+            "origins": 400,
+            "mae": 220.8,
+            "bias": -175.5,
+            "mape": 5.33
+          },
+          {
+            "origins": 400,
+            "mae": 220.6,
+            "bias": -175.3,
+            "mape": 5.31
+          }
+        ],
+        "seasonal_pattern": [
+          {
+            "origins": 400,
+            "mae": 209.6,
+            "bias": -165.1,
+            "mape": 5.09
+          },
+          {
+            "origins": 400,
+            "mae": 210.1,
+            "bias": -164.2,
+            "mape": 5.1
+          },
+          {
+            "origins": 400,
+            "mae": 210.1,
+            "bias": -164.0,
+            "mape": 5.1
+          },
+          {
+            "origins": 400,
+            "mae": 210.3,
+            "bias": -164.3,
+            "mape": 5.1
+          },
+          {
+            "origins": 400,
+            "mae": 210.5,
+            "bias": -164.5,
+            "mape": 5.1
+          },
+          {
+            "origins": 400,
+            "mae": 210.3,
+            "bias": -164.3,
+            "mape": 5.09
+          }
+        ],
+        "trend_adaptive": [
+          {
+            "origins": 400,
+            "mae": 179.7,
+            "bias": 0.5,
+            "mape": 4.34
+          },
+          {
+            "origins": 400,
+            "mae": 173.1,
+            "bias": -16.3,
+            "mape": 4.21
+          },
+          {
+            "origins": 400,
+            "mae": 174.2,
+            "bias": -31.9,
+            "mape": 4.26
+          },
+          {
+            "origins": 400,
+            "mae": 175.2,
+            "bias": -46.5,
+            "mape": 4.29
+          },
+          {
+            "origins": 400,
+            "mae": 177.5,
+            "bias": -59.5,
+            "mape": 4.3
+          },
+          {
+            "origins": 400,
+            "mae": 178.4,
+            "bias": -70.7,
+            "mape": 4.31
+          }
+        ],
+        "network_only": [
+          {
+            "origins": 398,
+            "mae": 727.4,
+            "bias": -273.4,
+            "mape": 19.62
+          },
+          {
+            "origins": 398,
+            "mae": 812.1,
+            "bias": -441.6,
+            "mape": 19.55
+          },
+          {
+            "origins": 398,
+            "mae": 805.1,
+            "bias": -362.9,
+            "mape": 20.65
+          },
+          {
+            "origins": 398,
+            "mae": 882.6,
+            "bias": -370.8,
+            "mape": 22.57
+          },
+          {
+            "origins": 398,
+            "mae": 727.6,
+            "bias": -349.7,
+            "mape": 17.29
+          },
+          {
+            "origins": 398,
+            "mae": 813.7,
+            "bias": -377.7,
+            "mape": 20.12
+          }
+        ],
+        "served_blend": [
+          {
+            "origins": 398,
+            "mae": 315.1,
+            "bias": -198.5,
+            "mape": 7.45
+          },
+          {
+            "origins": 398,
+            "mae": 313.5,
+            "bias": -236.7,
+            "mape": 6.89
+          },
+          {
+            "origins": 398,
+            "mae": 291.4,
+            "bias": -207.9,
+            "mape": 6.52
+          },
+          {
+            "origins": 398,
+            "mae": 277.0,
+            "bias": -201.1,
+            "mape": 6.22
+          },
+          {
+            "origins": 398,
+            "mae": 243.1,
+            "bias": -189.9,
+            "mape": 5.4
+          },
+          {
+            "origins": 398,
+            "mae": 230.5,
+            "bias": -184.7,
+            "mape": 5.09
+          }
+        ]
+      },
+      "operational": {
+        "persistence": {
+          "replica_minutes": 12770.0,
+          "scaling_events": 26,
+          "deficit_intervals": 14,
+          "deficit_minutes": 140.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "previous_day": {
+          "replica_minutes": 12830.0,
+          "scaling_events": 22,
+          "deficit_intervals": 10,
+          "deficit_minutes": 100.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "seasonal_pattern": {
+          "replica_minutes": 12830.0,
+          "scaling_events": 22,
+          "deficit_intervals": 10,
+          "deficit_minutes": 100.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "trend_adaptive": {
+          "replica_minutes": 13130.0,
+          "scaling_events": 24,
+          "deficit_intervals": 3,
+          "deficit_minutes": 30.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "network_only": {
+          "replica_minutes": 13220.0,
+          "scaling_events": 24,
+          "deficit_intervals": 9,
+          "deficit_minutes": 90.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "served_blend": {
+          "replica_minutes": 12860.0,
+          "scaling_events": 24,
+          "deficit_intervals": 9,
+          "deficit_minutes": 90.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "reactive_only": {
+          "replica_minutes": 12770.0,
+          "scaling_events": 26,
+          "deficit_intervals": 14,
+          "deficit_minutes": 140.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        }
+      }
+    },
+    {
+      "scenario": "trend",
+      "seed": 2,
+      "points": 1728,
+      "origins_scored": 400,
+      "target_rpm_per_replica": 1604.3,
+      "model_published_at": "2026-03-05T18:20:00",
+      "train_failures": [],
+      "overall": {
+        "persistence": {
+          "origins": 400,
+          "mae": 312.0,
+          "bias": -12.2,
+          "mape": 8.0
+        },
+        "previous_day": {
+          "origins": 400,
+          "mae": 216.9,
+          "bias": -178.6,
+          "mape": 5.28
+        },
+        "seasonal_pattern": {
+          "origins": 400,
+          "mae": 204.2,
+          "bias": -165.6,
+          "mape": 4.96
+        },
+        "trend_adaptive": {
+          "origins": 400,
+          "mae": 170.1,
+          "bias": -39.9,
+          "mape": 4.23
+        },
+        "network_only": {
+          "origins": 398,
+          "mae": 499.5,
+          "bias": -154.8,
+          "mape": 13.81
+        },
+        "served_blend": {
+          "origins": 398,
+          "mae": 220.9,
+          "bias": -160.3,
+          "mape": 5.2
+        }
+      },
+      "per_step": {
+        "persistence": [
+          {
+            "origins": 400,
+            "mae": 170.9,
+            "bias": -3.9,
+            "mape": 4.31
+          },
+          {
+            "origins": 400,
+            "mae": 218.5,
+            "bias": -7.6,
+            "mape": 5.47
+          },
+          {
+            "origins": 400,
+            "mae": 267.5,
+            "bias": -11.1,
+            "mape": 6.88
+          },
+          {
+            "origins": 400,
+            "mae": 331.2,
+            "bias": -14.0,
+            "mape": 8.58
+          },
+          {
+            "origins": 400,
+            "mae": 406.5,
+            "bias": -17.0,
+            "mape": 10.42
+          },
+          {
+            "origins": 400,
+            "mae": 477.6,
+            "bias": -19.6,
+            "mape": 12.36
+          }
+        ],
+        "previous_day": [
+          {
+            "origins": 400,
+            "mae": 215.9,
+            "bias": -177.6,
+            "mape": 5.26
+          },
+          {
+            "origins": 400,
+            "mae": 216.3,
+            "bias": -178.0,
+            "mape": 5.27
+          },
+          {
+            "origins": 400,
+            "mae": 217.0,
+            "bias": -178.6,
+            "mape": 5.28
+          },
+          {
+            "origins": 400,
+            "mae": 217.1,
+            "bias": -178.8,
+            "mape": 5.28
+          },
+          {
+            "origins": 400,
+            "mae": 217.5,
+            "bias": -179.2,
+            "mape": 5.29
+          },
+          {
+            "origins": 400,
+            "mae": 217.8,
+            "bias": -179.5,
+            "mape": 5.29
+          }
+        ],
+        "seasonal_pattern": [
+          {
+            "origins": 400,
+            "mae": 203.5,
+            "bias": -164.8,
+            "mape": 4.95
+          },
+          {
+            "origins": 400,
+            "mae": 203.7,
+            "bias": -165.0,
+            "mape": 4.95
+          },
+          {
+            "origins": 400,
+            "mae": 204.1,
+            "bias": -165.5,
+            "mape": 4.95
+          },
+          {
+            "origins": 400,
+            "mae": 204.3,
+            "bias": -165.6,
+            "mape": 4.95
+          },
+          {
+            "origins": 400,
+            "mae": 204.7,
+            "bias": -166.1,
+            "mape": 4.96
+          },
+          {
+            "origins": 400,
+            "mae": 205.0,
+            "bias": -166.4,
+            "mape": 4.97
+          }
+        ],
+        "trend_adaptive": [
+          {
+            "origins": 400,
+            "mae": 168.1,
+            "bias": -0.1,
+            "mape": 4.18
+          },
+          {
+            "origins": 400,
+            "mae": 168.6,
+            "bias": -18.3,
+            "mape": 4.2
+          },
+          {
+            "origins": 400,
+            "mae": 167.4,
+            "bias": -34.8,
+            "mape": 4.21
+          },
+          {
+            "origins": 400,
+            "mae": 170.7,
+            "bias": -49.2,
+            "mape": 4.27
+          },
+          {
+            "origins": 400,
+            "mae": 172.7,
+            "bias": -62.5,
+            "mape": 4.26
+          },
+          {
+            "origins": 400,
+            "mae": 173.3,
+            "bias": -74.6,
+            "mape": 4.28
+          }
+        ],
+        "network_only": [
+          {
+            "origins": 398,
+            "mae": 464.1,
+            "bias": -48.7,
+            "mape": 14.36
+          },
+          {
+            "origins": 398,
+            "mae": 396.3,
+            "bias": -129.5,
+            "mape": 10.86
+          },
+          {
+            "origins": 398,
+            "mae": 561.4,
+            "bias": -185.0,
+            "mape": 15.67
+          },
+          {
+            "origins": 398,
+            "mae": 492.2,
+            "bias": -77.2,
+            "mape": 13.95
+          },
+          {
+            "origins": 398,
+            "mae": 487.3,
+            "bias": -249.5,
+            "mape": 12.79
+          },
+          {
+            "origins": 398,
+            "mae": 595.9,
+            "bias": -238.7,
+            "mape": 15.22
+          }
+        ],
+        "served_blend": [
+          {
+            "origins": 398,
+            "mae": 232.8,
+            "bias": -130.9,
+            "mape": 5.85
+          },
+          {
+            "origins": 398,
+            "mae": 210.1,
+            "bias": -156.6,
+            "mape": 5.0
+          },
+          {
+            "origins": 398,
+            "mae": 239.1,
+            "bias": -170.7,
+            "mape": 5.53
+          },
+          {
+            "origins": 398,
+            "mae": 207.5,
+            "bias": -151.3,
+            "mape": 4.76
+          },
+          {
+            "origins": 398,
+            "mae": 217.1,
+            "bias": -178.2,
+            "mape": 5.01
+          },
+          {
+            "origins": 398,
+            "mae": 218.9,
+            "bias": -174.0,
+            "mape": 5.07
+          }
+        ]
+      },
+      "operational": {
+        "persistence": {
+          "replica_minutes": 12750.0,
+          "scaling_events": 24,
+          "deficit_intervals": 13,
+          "deficit_minutes": 130.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "previous_day": {
+          "replica_minutes": 12840.0,
+          "scaling_events": 20,
+          "deficit_intervals": 6,
+          "deficit_minutes": 60.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "seasonal_pattern": {
+          "replica_minutes": 12840.0,
+          "scaling_events": 20,
+          "deficit_intervals": 6,
+          "deficit_minutes": 60.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "trend_adaptive": {
+          "replica_minutes": 13050.0,
+          "scaling_events": 26,
+          "deficit_intervals": 2,
+          "deficit_minutes": 20.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "network_only": {
+          "replica_minutes": 13080.0,
+          "scaling_events": 26,
+          "deficit_intervals": 7,
+          "deficit_minutes": 70.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "served_blend": {
+          "replica_minutes": 12840.0,
+          "scaling_events": 22,
+          "deficit_intervals": 8,
+          "deficit_minutes": 80.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "reactive_only": {
+          "replica_minutes": 12750.0,
+          "scaling_events": 24,
+          "deficit_intervals": 13,
+          "deficit_minutes": 130.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        }
+      }
+    },
+    {
+      "scenario": "levelshift",
+      "seed": 1,
+      "points": 1728,
+      "origins_scored": 400,
+      "target_rpm_per_replica": 1453.0,
+      "model_published_at": "2026-03-05T18:20:00",
+      "train_failures": [],
+      "overall": {
+        "persistence": {
+          "origins": 400,
+          "mae": 270.4,
+          "bias": -8.2,
+          "mape": 8.04
+        },
+        "previous_day": {
+          "origins": 400,
+          "mae": 142.4,
+          "bias": -1.4,
+          "mape": 4.03
+        },
+        "seasonal_pattern": {
+          "origins": 400,
+          "mae": 131.1,
+          "bias": 43.2,
+          "mape": 3.73
+        },
+        "trend_adaptive": {
+          "origins": 400,
+          "mae": 148.1,
+          "bias": 0.3,
+          "mape": 4.24
+        },
+        "network_only": {
+          "origins": 398,
+          "mae": 433.4,
+          "bias": -1.2,
+          "mape": 15.67
+        },
+        "served_blend": {
+          "origins": 398,
+          "mae": 152.1,
+          "bias": 29.7,
+          "mape": 4.95
+        }
+      },
+      "per_step": {
+        "persistence": [
+          {
+            "origins": 400,
+            "mae": 151.9,
+            "bias": -3.1,
+            "mape": 4.3
+          },
+          {
+            "origins": 400,
+            "mae": 187.3,
+            "bias": -5.0,
+            "mape": 5.43
+          },
+          {
+            "origins": 400,
+            "mae": 235.7,
+            "bias": -7.2,
+            "mape": 6.97
+          },
+          {
+            "origins": 400,
+            "mae": 287.4,
+            "bias": -9.4,
+            "mape": 8.6
+          },
+          {
+            "origins": 400,
+            "mae": 351.5,
+            "bias": -11.4,
+            "mape": 10.61
+          },
+          {
+            "origins": 400,
+            "mae": 408.8,
+            "bias": -13.2,
+            "mape": 12.31
+          }
+        ],
+        "previous_day": [
+          {
+            "origins": 400,
+            "mae": 141.4,
+            "bias": -2.1,
+            "mape": 3.99
+          },
+          {
+            "origins": 400,
+            "mae": 142.3,
+            "bias": -1.2,
+            "mape": 4.03
+          },
+          {
+            "origins": 400,
+            "mae": 142.5,
+            "bias": -1.0,
+            "mape": 4.04
+          },
+          {
+            "origins": 400,
+            "mae": 142.9,
+            "bias": -1.3,
+            "mape": 4.05
+          },
+          {
+            "origins": 400,
+            "mae": 142.9,
+            "bias": -1.4,
+            "mape": 4.05
+          },
+          {
+            "origins": 400,
+            "mae": 142.7,
+            "bias": -1.1,
+            "mape": 4.04
+          }
+        ],
+        "seasonal_pattern": [
+          {
+            "origins": 400,
+            "mae": 130.3,
+            "bias": 42.5,
+            "mape": 3.7
+          },
+          {
+            "origins": 400,
+            "mae": 131.0,
+            "bias": 43.3,
+            "mape": 3.73
+          },
+          {
+            "origins": 400,
+            "mae": 131.2,
+            "bias": 43.5,
+            "mape": 3.74
+          },
+          {
+            "origins": 400,
+            "mae": 131.4,
+            "bias": 43.3,
+            "mape": 3.74
+          },
+          {
+            "origins": 400,
+            "mae": 131.4,
+            "bias": 43.2,
+            "mape": 3.74
+          },
+          {
+            "origins": 400,
+            "mae": 131.3,
+            "bias": 43.3,
+            "mape": 3.73
+          }
+        ],
+        "trend_adaptive": [
+          {
+            "origins": 400,
+            "mae": 153.2,
+            "bias": 0.2,
+            "mape": 4.34
+          },
+          {
+            "origins": 400,
+            "mae": 147.6,
+            "bias": 0.6,
+            "mape": 4.22
+          },
+          {
+            "origins": 400,
+            "mae": 147.0,
+            "bias": 0.7,
+            "mape": 4.24
+          },
+          {
+            "origins": 400,
+            "mae": 147.0,
+            "bias": 0.2,
+            "mape": 4.24
+          },
+          {
+            "origins": 400,
+            "mae": 147.5,
+            "bias": -0.0,
+            "mape": 4.22
+          },
+          {
+            "origins": 400,
+            "mae": 146.2,
+            "bias": 0.1,
+            "mape": 4.18
+          }
+        ],
+        "network_only": [
+          {
+            "origins": 398,
+            "mae": 499.5,
+            "bias": -69.0,
+            "mape": 17.32
+          },
+          {
+            "origins": 398,
+            "mae": 421.2,
+            "bias": -38.2,
+            "mape": 14.73
+          },
+          {
+            "origins": 398,
+            "mae": 323.3,
+            "bias": -2.4,
+            "mape": 11.42
+          },
+          {
+            "origins": 398,
+            "mae": 384.8,
+            "bias": 70.2,
+            "mape": 14.52
+          },
+          {
+            "origins": 398,
+            "mae": 500.3,
+            "bias": 13.1,
+            "mape": 18.71
+          },
+          {
+            "origins": 398,
+            "mae": 471.2,
+            "bias": 18.8,
+            "mape": 17.31
+          }
+        ],
+        "served_blend": [
+          {
+            "origins": 398,
+            "mae": 186.2,
+            "bias": 6.7,
+            "mape": 6.36
+          },
+          {
+            "origins": 398,
+            "mae": 158.8,
+            "bias": 20.0,
+            "mape": 5.3
+          },
+          {
+            "origins": 398,
+            "mae": 140.3,
+            "bias": 31.3,
+            "mape": 4.45
+          },
+          {
+            "origins": 398,
+            "mae": 145.4,
+            "bias": 45.6,
+            "mape": 4.7
+          },
+          {
+            "origins": 398,
+            "mae": 145.7,
+            "bias": 36.6,
+            "mape": 4.72
+          },
+          {
+            "origins": 398,
+            "mae": 136.0,
+            "bias": 38.3,
+            "mape": 4.17
+          }
+        ]
+      },
+      "operational": {
+        "persistence": {
+          "replica_minutes": 12140.0,
+          "scaling_events": 31,
+          "deficit_intervals": 16,
+          "deficit_minutes": 160.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "previous_day": {
+          "replica_minutes": 12480.0,
+          "scaling_events": 23,
+          "deficit_intervals": 2,
+          "deficit_minutes": 20.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "seasonal_pattern": {
+          "replica_minutes": 12530.0,
+          "scaling_events": 19,
+          "deficit_intervals": 1,
+          "deficit_minutes": 10.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "trend_adaptive": {
+          "replica_minutes": 12530.0,
+          "scaling_events": 23,
+          "deficit_intervals": 2,
+          "deficit_minutes": 20.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "network_only": {
+          "replica_minutes": 12630.0,
+          "scaling_events": 27,
+          "deficit_intervals": 9,
+          "deficit_minutes": 90.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "served_blend": {
+          "replica_minutes": 12440.0,
+          "scaling_events": 25,
+          "deficit_intervals": 6,
+          "deficit_minutes": 60.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "reactive_only": {
+          "replica_minutes": 12140.0,
+          "scaling_events": 31,
+          "deficit_intervals": 16,
+          "deficit_minutes": 160.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        }
+      }
+    },
+    {
+      "scenario": "levelshift",
+      "seed": 2,
+      "points": 1728,
+      "origins_scored": 400,
+      "target_rpm_per_replica": 1455.9,
+      "model_published_at": "2026-03-05T18:20:00",
+      "train_failures": [],
+      "overall": {
+        "persistence": {
+          "origins": 400,
+          "mae": 266.2,
+          "bias": -8.4,
+          "mape": 8.01
+        },
+        "previous_day": {
+          "origins": 400,
+          "mae": 135.9,
+          "bias": -3.5,
+          "mape": 3.93
+        },
+        "seasonal_pattern": {
+          "origins": 400,
+          "mae": 129.9,
+          "bias": 52.0,
+          "mape": 3.82
+        },
+        "trend_adaptive": {
+          "origins": 400,
+          "mae": 142.6,
+          "bias": -1.6,
+          "mape": 4.18
+        },
+        "network_only": {
+          "origins": 398,
+          "mae": 34064429798471.3,
+          "bias": 25201015383310.3,
+          "mape": 1366339271151.18
+        },
+        "served_blend": {
+          "origins": 398,
+          "mae": 6518428904057.2,
+          "bias": 4228711101694.5,
+          "mape": 265254898923.85
+        }
+      },
+      "per_step": {
+        "persistence": [
+          {
+            "origins": 400,
+            "mae": 145.8,
+            "bias": -2.7,
+            "mape": 4.32
+          },
+          {
+            "origins": 400,
+            "mae": 186.2,
+            "bias": -5.3,
+            "mape": 5.48
+          },
+          {
+            "origins": 400,
+            "mae": 228.4,
+            "bias": -7.7,
+            "mape": 6.88
+          },
+          {
+            "origins": 400,
+            "mae": 282.7,
+            "bias": -9.6,
+            "mape": 8.59
+          },
+          {
+            "origins": 400,
+            "mae": 346.8,
+            "bias": -11.6,
+            "mape": 10.43
+          },
+          {
+            "origins": 400,
+            "mae": 407.1,
+            "bias": -13.3,
+            "mape": 12.37
+          }
+        ],
+        "previous_day": [
+          {
+            "origins": 400,
+            "mae": 135.3,
+            "bias": -2.9,
+            "mape": 3.91
+          },
+          {
+            "origins": 400,
+            "mae": 135.5,
+            "bias": -3.1,
+            "mape": 3.92
+          },
+          {
+            "origins": 400,
+            "mae": 135.9,
+            "bias": -3.5,
+            "mape": 3.93
+          },
+          {
+            "origins": 400,
+            "mae": 136.0,
+            "bias": -3.5,
+            "mape": 3.93
+          },
+          {
+            "origins": 400,
+            "mae": 136.2,
+            "bias": -3.8,
+            "mape": 3.94
+          },
+          {
+            "origins": 400,
+            "mae": 136.4,
+            "bias": -4.0,
+            "mape": 3.95
+          }
+        ],
+        "seasonal_pattern": [
+          {
+            "origins": 400,
+            "mae": 129.7,
+            "bias": 52.2,
+            "mape": 3.82
+          },
+          {
+            "origins": 400,
+            "mae": 129.8,
+            "bias": 52.3,
+            "mape": 3.82
+          },
+          {
+            "origins": 400,
+            "mae": 130.0,
+            "bias": 52.1,
+            "mape": 3.83
+          },
+          {
+            "origins": 400,
+            "mae": 130.0,
+            "bias": 52.1,
+            "mape": 3.82
+          },
+          {
+            "origins": 400,
+            "mae": 129.9,
+            "bias": 51.8,
+            "mape": 3.81
+          },
+          {
+            "origins": 400,
+            "mae": 130.0,
+            "bias": 51.7,
+            "mape": 3.82
+          }
+        ],
+        "trend_adaptive": [
+          {
+            "origins": 400,
+            "mae": 143.5,
+            "bias": -0.3,
+            "mape": 4.18
+          },
+          {
+            "origins": 400,
+            "mae": 143.3,
+            "bias": -0.9,
+            "mape": 4.2
+          },
+          {
+            "origins": 400,
+            "mae": 141.6,
+            "bias": -1.6,
+            "mape": 4.2
+          },
+          {
+            "origins": 400,
+            "mae": 143.2,
+            "bias": -1.8,
+            "mape": 4.22
+          },
+          {
+            "origins": 400,
+            "mae": 142.8,
+            "bias": -2.2,
+            "mape": 4.16
+          },
+          {
+            "origins": 400,
+            "mae": 141.2,
+            "bias": -2.7,
+            "mape": 4.12
+          }
+        ],
+        "network_only": [
+          {
+            "origins": 398,
+            "mae": 9648418721592.2,
+            "bias": 9647939291817.0,
+            "mape": 425092524519.31
+          },
+          {
+            "origins": 398,
+            "mae": 26590165552582.5,
+            "bias": -26589796609347.7,
+            "mape": 1133811844687.3
+          },
+          {
+            "origins": 398,
+            "mae": 77709977161627.9,
+            "bias": 77709977161226.1,
+            "mape": 3190101397807.17
+          },
+          {
+            "origins": 398,
+            "mae": 40375254649515.8,
+            "bias": 40375230919987.2,
+            "mape": 1576040955758.93
+          },
+          {
+            "origins": 398,
+            "mae": 20520092233758.5,
+            "bias": 20520092233346.7,
+            "mape": 777930959312.27
+          },
+          {
+            "origins": 398,
+            "mae": 29542670471750.8,
+            "bias": 29542649302832.5,
+            "mape": 1095057944822.12
+          }
+        ],
+        "served_blend": [
+          {
+            "origins": 398,
+            "mae": 2894525616510.9,
+            "bias": 2894381787579.1,
+            "mape": 127527757356.86
+          },
+          {
+            "origins": 398,
+            "mae": 6869126101125.4,
+            "bias": -6869030790711.9,
+            "mape": 292901393212.1
+          },
+          {
+            "origins": 398,
+            "mae": 16837161718404.8,
+            "bias": 16837161718303.7,
+            "mape": 691188636193.12
+          },
+          {
+            "origins": 398,
+            "mae": 7065669563728.1,
+            "bias": 7065665411037.7,
+            "mape": 275807167259.47
+          },
+          {
+            "origins": 398,
+            "mae": 2736012297908.1,
+            "bias": 2736012297821.4,
+            "mape": 103724127910.42
+          },
+          {
+            "origins": 398,
+            "mae": 2708078126665.8,
+            "bias": 2708076186136.8,
+            "mape": 100380311611.11
+          }
+        ]
+      },
+      "operational": {
+        "persistence": {
+          "replica_minutes": 12190.0,
+          "scaling_events": 32,
+          "deficit_intervals": 17,
+          "deficit_minutes": 170.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "previous_day": {
+          "replica_minutes": 12430.0,
+          "scaling_events": 24,
+          "deficit_intervals": 5,
+          "deficit_minutes": 50.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "seasonal_pattern": {
+          "replica_minutes": 12480.0,
+          "scaling_events": 22,
+          "deficit_intervals": 4,
+          "deficit_minutes": 40.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "trend_adaptive": {
+          "replica_minutes": 12460.0,
+          "scaling_events": 26,
+          "deficit_intervals": 5,
+          "deficit_minutes": 50.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "network_only": {
+          "replica_minutes": 12980.0,
+          "scaling_events": 37,
+          "deficit_intervals": 10,
+          "deficit_minutes": 100.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "served_blend": {
+          "replica_minutes": 13030.0,
+          "scaling_events": 33,
+          "deficit_intervals": 6,
+          "deficit_minutes": 60.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "reactive_only": {
+          "replica_minutes": 12190.0,
+          "scaling_events": 32,
+          "deficit_intervals": 17,
+          "deficit_minutes": 170.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        }
+      }
+    },
+    {
+      "scenario": "spike",
+      "seed": 1,
+      "points": 1728,
+      "origins_scored": 400,
+      "target_rpm_per_replica": 1273.1,
+      "model_published_at": "2026-03-05T18:20:00",
+      "train_failures": [],
+      "overall": {
+        "persistence": {
+          "origins": 400,
+          "mae": 271.7,
+          "bias": -7.9,
+          "mape": 8.09
+        },
+        "previous_day": {
+          "origins": 400,
+          "mae": 142.7,
+          "bias": -1.2,
+          "mape": 4.04
+        },
+        "seasonal_pattern": {
+          "origins": 400,
+          "mae": 131.3,
+          "bias": 43.0,
+          "mape": 3.75
+        },
+        "trend_adaptive": {
+          "origins": 400,
+          "mae": 148.5,
+          "bias": 0.3,
+          "mape": 4.25
+        },
+        "network_only": {
+          "origins": 398,
+          "mae": 1894.3,
+          "bias": 888.0,
+          "mape": 44.48
+        },
+        "served_blend": {
+          "origins": 398,
+          "mae": 441.4,
+          "bias": 189.6,
+          "mape": 10.82
+        }
+      },
+      "per_step": {
+        "persistence": [
+          {
+            "origins": 400,
+            "mae": 155.1,
+            "bias": -2.6,
+            "mape": 4.37
+          },
+          {
+            "origins": 400,
+            "mae": 188.8,
+            "bias": -5.2,
+            "mape": 5.46
+          },
+          {
+            "origins": 400,
+            "mae": 233.5,
+            "bias": -7.5,
+            "mape": 6.91
+          },
+          {
+            "origins": 400,
+            "mae": 286.9,
+            "bias": -9.2,
+            "mape": 8.66
+          },
+          {
+            "origins": 400,
+            "mae": 352.4,
+            "bias": -10.5,
+            "mape": 10.66
+          },
+          {
+            "origins": 400,
+            "mae": 413.4,
+            "bias": -12.2,
+            "mape": 12.44
+          }
+        ],
+        "previous_day": [
+          {
+            "origins": 400,
+            "mae": 142.6,
+            "bias": -1.5,
+            "mape": 4.04
+          },
+          {
+            "origins": 400,
+            "mae": 142.7,
+            "bias": -1.6,
+            "mape": 4.04
+          },
+          {
+            "origins": 400,
+            "mae": 142.7,
+            "bias": -1.6,
+            "mape": 4.04
+          },
+          {
+            "origins": 400,
+            "mae": 142.5,
+            "bias": -1.4,
+            "mape": 4.03
+          },
+          {
+            "origins": 400,
+            "mae": 142.7,
+            "bias": -0.6,
+            "mape": 4.03
+          },
+          {
+            "origins": 400,
+            "mae": 142.8,
+            "bias": -0.5,
+            "mape": 4.03
+          }
+        ],
+        "seasonal_pattern": [
+          {
+            "origins": 400,
+            "mae": 131.1,
+            "bias": 42.7,
+            "mape": 3.74
+          },
+          {
+            "origins": 400,
+            "mae": 131.2,
+            "bias": 42.6,
+            "mape": 3.75
+          },
+          {
+            "origins": 400,
+            "mae": 131.3,
+            "bias": 42.7,
+            "mape": 3.75
+          },
+          {
+            "origins": 400,
+            "mae": 131.2,
+            "bias": 42.8,
+            "mape": 3.74
+          },
+          {
+            "origins": 400,
+            "mae": 131.5,
+            "bias": 43.6,
+            "mape": 3.75
+          },
+          {
+            "origins": 400,
+            "mae": 131.6,
+            "bias": 43.7,
+            "mape": 3.75
+          }
+        ],
+        "trend_adaptive": [
+          {
+            "origins": 400,
+            "mae": 154.6,
+            "bias": 0.6,
+            "mape": 4.39
+          },
+          {
+            "origins": 400,
+            "mae": 148.6,
+            "bias": 0.0,
+            "mape": 4.25
+          },
+          {
+            "origins": 400,
+            "mae": 147.1,
+            "bias": -0.1,
+            "mape": 4.25
+          },
+          {
+            "origins": 400,
+            "mae": 146.8,
+            "bias": 0.0,
+            "mape": 4.23
+          },
+          {
+            "origins": 400,
+            "mae": 147.6,
+            "bias": 0.7,
+            "mape": 4.21
+          },
+          {
+            "origins": 400,
+            "mae": 146.1,
+            "bias": 0.7,
+            "mape": 4.17
+          }
+        ],
+        "network_only": [
+          {
+            "origins": 398,
+            "mae": 2097.8,
+            "bias": 1626.6,
+            "mape": 52.0
+          },
+          {
+            "origins": 398,
+            "mae": 1813.8,
+            "bias": -1438.0,
+            "mape": 43.51
+          },
+          {
+            "origins": 398,
+            "mae": 1768.1,
+            "bias": 1316.5,
+            "mape": 41.61
+          },
+          {
+            "origins": 398,
+            "mae": 2033.0,
+            "bias": 1533.4,
+            "mape": 45.23
+          },
+          {
+            "origins": 398,
+            "mae": 1979.6,
+            "bias": 1534.9,
+            "mape": 46.0
+          },
+          {
+            "origins": 398,
+            "mae": 1673.7,
+            "bias": 754.3,
+            "mape": 38.51
+          }
+        ],
+        "served_blend": [
+          {
+            "origins": 398,
+            "mae": 674.8,
+            "bias": 515.7,
+            "mape": 16.94
+          },
+          {
+            "origins": 398,
+            "mae": 510.6,
+            "bias": -342.0,
+            "mape": 12.56
+          },
+          {
+            "origins": 398,
+            "mae": 438.1,
+            "bias": 316.8,
+            "mape": 10.7
+          },
+          {
+            "origins": 398,
+            "mae": 421.8,
+            "bias": 301.3,
+            "mape": 9.96
+          },
+          {
+            "origins": 398,
+            "mae": 351.9,
+            "bias": 239.8,
+            "mape": 8.57
+          },
+          {
+            "origins": 398,
+            "mae": 251.0,
+            "bias": 106.3,
+            "mape": 6.22
+          }
+        ]
+      },
+      "operational": {
+        "persistence": {
+          "replica_minutes": 13310.0,
+          "scaling_events": 20,
+          "deficit_intervals": 11,
+          "deficit_minutes": 110.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "previous_day": {
+          "replica_minutes": 13490.0,
+          "scaling_events": 22,
+          "deficit_intervals": 3,
+          "deficit_minutes": 30.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "seasonal_pattern": {
+          "replica_minutes": 13540.0,
+          "scaling_events": 22,
+          "deficit_intervals": 2,
+          "deficit_minutes": 20.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "trend_adaptive": {
+          "replica_minutes": 13500.0,
+          "scaling_events": 22,
+          "deficit_intervals": 3,
+          "deficit_minutes": 30.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "network_only": {
+          "replica_minutes": 14910.0,
+          "scaling_events": 34,
+          "deficit_intervals": 4,
+          "deficit_minutes": 40.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "served_blend": {
+          "replica_minutes": 14000.0,
+          "scaling_events": 30,
+          "deficit_intervals": 3,
+          "deficit_minutes": 30.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "reactive_only": {
+          "replica_minutes": 13310.0,
+          "scaling_events": 20,
+          "deficit_intervals": 11,
+          "deficit_minutes": 110.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        }
+      }
+    },
+    {
+      "scenario": "spike",
+      "seed": 2,
+      "points": 1728,
+      "origins_scored": 400,
+      "target_rpm_per_replica": 1274.2,
+      "model_published_at": "2026-03-05T18:20:00",
+      "train_failures": [],
+      "overall": {
+        "persistence": {
+          "origins": 400,
+          "mae": 266.8,
+          "bias": -8.2,
+          "mape": 8.03
+        },
+        "previous_day": {
+          "origins": 400,
+          "mae": 136.7,
+          "bias": -4.3,
+          "mape": 3.95
+        },
+        "seasonal_pattern": {
+          "origins": 400,
+          "mae": 129.9,
+          "bias": 51.0,
+          "mape": 3.83
+        },
+        "trend_adaptive": {
+          "origins": 400,
+          "mae": 143.4,
+          "bias": -0.9,
+          "mape": 4.2
+        },
+        "network_only": {
+          "origins": 398,
+          "mae": 489.8,
+          "bias": 25.5,
+          "mape": 18.51
+        },
+        "served_blend": {
+          "origins": 398,
+          "mae": 153.6,
+          "bias": 49.5,
+          "mape": 5.42
+        }
+      },
+      "per_step": {
+        "persistence": [
+          {
+            "origins": 400,
+            "mae": 144.4,
+            "bias": -2.7,
+            "mape": 4.25
+          },
+          {
+            "origins": 400,
+            "mae": 187.4,
+            "bias": -4.9,
+            "mape": 5.51
+          },
+          {
+            "origins": 400,
+            "mae": 229.4,
+            "bias": -7.3,
+            "mape": 6.91
+          },
+          {
+            "origins": 400,
+            "mae": 283.8,
+            "bias": -9.6,
+            "mape": 8.66
+          },
+          {
+            "origins": 400,
+            "mae": 345.9,
+            "bias": -11.5,
+            "mape": 10.43
+          },
+          {
+            "origins": 400,
+            "mae": 410.0,
+            "bias": -13.2,
+            "mape": 12.44
+          }
+        ],
+        "previous_day": [
+          {
+            "origins": 400,
+            "mae": 136.1,
+            "bias": -4.7,
+            "mape": 3.94
+          },
+          {
+            "origins": 400,
+            "mae": 136.5,
+            "bias": -4.3,
+            "mape": 3.95
+          },
+          {
+            "origins": 400,
+            "mae": 136.9,
+            "bias": -3.9,
+            "mape": 3.97
+          },
+          {
+            "origins": 400,
+            "mae": 136.8,
+            "bias": -4.0,
+            "mape": 3.96
+          },
+          {
+            "origins": 400,
+            "mae": 136.9,
+            "bias": -4.4,
+            "mape": 3.96
+          },
+          {
+            "origins": 400,
+            "mae": 136.8,
+            "bias": -4.2,
+            "mape": 3.95
+          }
+        ],
+        "seasonal_pattern": [
+          {
+            "origins": 400,
+            "mae": 129.5,
+            "bias": 50.6,
+            "mape": 3.82
+          },
+          {
+            "origins": 400,
+            "mae": 129.9,
+            "bias": 50.9,
+            "mape": 3.83
+          },
+          {
+            "origins": 400,
+            "mae": 130.2,
+            "bias": 51.2,
+            "mape": 3.84
+          },
+          {
+            "origins": 400,
+            "mae": 130.1,
+            "bias": 51.2,
+            "mape": 3.83
+          },
+          {
+            "origins": 400,
+            "mae": 130.0,
+            "bias": 50.8,
+            "mape": 3.83
+          },
+          {
+            "origins": 400,
+            "mae": 130.0,
+            "bias": 51.0,
+            "mape": 3.82
+          }
+        ],
+        "trend_adaptive": [
+          {
+            "origins": 400,
+            "mae": 143.6,
+            "bias": -0.2,
+            "mape": 4.18
+          },
+          {
+            "origins": 400,
+            "mae": 144.1,
+            "bias": -0.4,
+            "mape": 4.21
+          },
+          {
+            "origins": 400,
+            "mae": 142.7,
+            "bias": -0.5,
+            "mape": 4.24
+          },
+          {
+            "origins": 400,
+            "mae": 144.4,
+            "bias": -0.9,
+            "mape": 4.26
+          },
+          {
+            "origins": 400,
+            "mae": 143.8,
+            "bias": -1.7,
+            "mape": 4.19
+          },
+          {
+            "origins": 400,
+            "mae": 142.0,
+            "bias": -1.9,
+            "mape": 4.14
+          }
+        ],
+        "network_only": [
+          {
+            "origins": 398,
+            "mae": 438.6,
+            "bias": 112.7,
+            "mape": 17.01
+          },
+          {
+            "origins": 398,
+            "mae": 508.6,
+            "bias": 86.3,
+            "mape": 20.84
+          },
+          {
+            "origins": 398,
+            "mae": 466.3,
+            "bias": 114.4,
+            "mape": 19.37
+          },
+          {
+            "origins": 398,
+            "mae": 448.2,
+            "bias": 58.0,
+            "mape": 17.73
+          },
+          {
+            "origins": 398,
+            "mae": 548.7,
+            "bias": -55.7,
+            "mape": 19.1
+          },
+          {
+            "origins": 398,
+            "mae": 528.0,
+            "bias": -162.8,
+            "mape": 16.99
+          }
+        ],
+        "served_blend": [
+          {
+            "origins": 398,
+            "mae": 177.2,
+            "bias": 66.6,
+            "mape": 6.44
+          },
+          {
+            "origins": 398,
+            "mae": 175.1,
+            "bias": 57.1,
+            "mape": 6.74
+          },
+          {
+            "origins": 398,
+            "mae": 155.3,
+            "bias": 61.9,
+            "mape": 5.75
+          },
+          {
+            "origins": 398,
+            "mae": 148.5,
+            "bias": 49.5,
+            "mape": 5.1
+          },
+          {
+            "origins": 398,
+            "mae": 135.6,
+            "bias": 33.8,
+            "mape": 4.46
+          },
+          {
+            "origins": 398,
+            "mae": 129.9,
+            "bias": 28.3,
+            "mape": 4.05
+          }
+        ]
+      },
+      "operational": {
+        "persistence": {
+          "replica_minutes": 13280.0,
+          "scaling_events": 20,
+          "deficit_intervals": 11,
+          "deficit_minutes": 110.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "previous_day": {
+          "replica_minutes": 13480.0,
+          "scaling_events": 22,
+          "deficit_intervals": 3,
+          "deficit_minutes": 30.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "seasonal_pattern": {
+          "replica_minutes": 13510.0,
+          "scaling_events": 22,
+          "deficit_intervals": 3,
+          "deficit_minutes": 30.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "trend_adaptive": {
+          "replica_minutes": 13500.0,
+          "scaling_events": 22,
+          "deficit_intervals": 3,
+          "deficit_minutes": 30.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "network_only": {
+          "replica_minutes": 14060.0,
+          "scaling_events": 22,
+          "deficit_intervals": 4,
+          "deficit_minutes": 40.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "served_blend": {
+          "replica_minutes": 13510.0,
+          "scaling_events": 22,
+          "deficit_intervals": 4,
+          "deficit_minutes": 40.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "reactive_only": {
+          "replica_minutes": 13280.0,
+          "scaling_events": 20,
+          "deficit_intervals": 11,
+          "deficit_minutes": 110.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        }
+      }
+    },
+    {
+      "scenario": "weekly",
+      "seed": 1,
+      "points": 1728,
+      "origins_scored": 400,
+      "target_rpm_per_replica": 1027.2,
+      "model_published_at": "2026-03-05T18:20:00",
+      "train_failures": [],
+      "overall": {
+        "persistence": {
+          "origins": 400,
+          "mae": 270.4,
+          "bias": -8.2,
+          "mape": 8.04
+        },
+        "previous_day": {
+          "origins": 400,
+          "mae": 142.4,
+          "bias": -1.4,
+          "mape": 4.03
+        },
+        "seasonal_pattern": {
+          "origins": 400,
+          "mae": 138.3,
+          "bias": 27.2,
+          "mape": 3.91
+        },
+        "trend_adaptive": {
+          "origins": 400,
+          "mae": 151.5,
+          "bias": 4.8,
+          "mape": 4.46
+        },
+        "network_only": {
+          "origins": 398,
+          "mae": 79447.8,
+          "bias": 77721.0,
+          "mape": 2702.01
+        },
+        "served_blend": {
+          "origins": 398,
+          "mae": 14121.7,
+          "bias": 13769.2,
+          "mape": 471.02
+        }
+      },
+      "per_step": {
+        "persistence": [
+          {
+            "origins": 400,
+            "mae": 151.9,
+            "bias": -3.1,
+            "mape": 4.3
+          },
+          {
+            "origins": 400,
+            "mae": 187.3,
+            "bias": -5.0,
+            "mape": 5.43
+          },
+          {
+            "origins": 400,
+            "mae": 235.7,
+            "bias": -7.2,
+            "mape": 6.97
+          },
+          {
+            "origins": 400,
+            "mae": 287.4,
+            "bias": -9.4,
+            "mape": 8.6
+          },
+          {
+            "origins": 400,
+            "mae": 351.5,
+            "bias": -11.4,
+            "mape": 10.61
+          },
+          {
+            "origins": 400,
+            "mae": 408.8,
+            "bias": -13.2,
+            "mape": 12.31
+          }
+        ],
+        "previous_day": [
+          {
+            "origins": 400,
+            "mae": 141.4,
+            "bias": -2.1,
+            "mape": 3.99
+          },
+          {
+            "origins": 400,
+            "mae": 142.3,
+            "bias": -1.2,
+            "mape": 4.03
+          },
+          {
+            "origins": 400,
+            "mae": 142.5,
+            "bias": -1.0,
+            "mape": 4.04
+          },
+          {
+            "origins": 400,
+            "mae": 142.9,
+            "bias": -1.3,
+            "mape": 4.05
+          },
+          {
+            "origins": 400,
+            "mae": 142.9,
+            "bias": -1.4,
+            "mape": 4.05
+          },
+          {
+            "origins": 400,
+            "mae": 142.7,
+            "bias": -1.1,
+            "mape": 4.04
+          }
+        ],
+        "seasonal_pattern": [
+          {
+            "origins": 400,
+            "mae": 137.4,
+            "bias": 26.4,
+            "mape": 3.87
+          },
+          {
+            "origins": 400,
+            "mae": 138.2,
+            "bias": 27.2,
+            "mape": 3.9
+          },
+          {
+            "origins": 400,
+            "mae": 138.4,
+            "bias": 27.5,
+            "mape": 3.91
+          },
+          {
+            "origins": 400,
+            "mae": 138.6,
+            "bias": 27.3,
+            "mape": 3.92
+          },
+          {
+            "origins": 400,
+            "mae": 138.7,
+            "bias": 27.2,
+            "mape": 3.92
+          },
+          {
+            "origins": 400,
+            "mae": 138.5,
+            "bias": 27.5,
+            "mape": 3.91
+          }
+        ],
+        "trend_adaptive": [
+          {
+            "origins": 400,
+            "mae": 158.0,
+            "bias": 6.0,
+            "mape": 4.66
+          },
+          {
+            "origins": 400,
+            "mae": 151.9,
+            "bias": 5.8,
+            "mape": 4.51
+          },
+          {
+            "origins": 400,
+            "mae": 150.5,
+            "bias": 5.4,
+            "mape": 4.47
+          },
+          {
+            "origins": 400,
+            "mae": 150.2,
+            "bias": 4.4,
+            "mape": 4.45
+          },
+          {
+            "origins": 400,
+            "mae": 149.9,
+            "bias": 3.7,
+            "mape": 4.38
+          },
+          {
+            "origins": 400,
+            "mae": 148.3,
+            "bias": 3.6,
+            "mape": 4.32
+          }
+        ],
+        "network_only": [
+          {
+            "origins": 398,
+            "mae": 33221.0,
+            "bias": 31519.7,
+            "mape": 991.28
+          },
+          {
+            "origins": 398,
+            "mae": 41467.0,
+            "bias": 39685.8,
+            "mape": 1349.49
+          },
+          {
+            "origins": 398,
+            "mae": 127123.2,
+            "bias": 125338.9,
+            "mape": 4161.03
+          },
+          {
+            "origins": 398,
+            "mae": 103009.5,
+            "bias": 101267.4,
+            "mape": 3489.37
+          },
+          {
+            "origins": 398,
+            "mae": 60627.5,
+            "bias": 58983.6,
+            "mape": 2175.43
+          },
+          {
+            "origins": 398,
+            "mae": 111238.8,
+            "bias": 109530.4,
+            "mape": 4045.45
+          }
+        ],
+        "served_blend": [
+          {
+            "origins": 398,
+            "mae": 9983.2,
+            "bias": 9473.2,
+            "mape": 298.03
+          },
+          {
+            "origins": 398,
+            "mae": 10734.7,
+            "bias": 10271.1,
+            "mape": 349.43
+          },
+          {
+            "origins": 398,
+            "mae": 27564.8,
+            "bias": 27177.1,
+            "mape": 902.45
+          },
+          {
+            "origins": 398,
+            "mae": 18063.3,
+            "bias": 17743.2,
+            "mape": 611.93
+          },
+          {
+            "origins": 398,
+            "mae": 8129.0,
+            "bias": 7886.9,
+            "mape": 291.64
+          },
+          {
+            "origins": 398,
+            "mae": 10255.5,
+            "bias": 10063.9,
+            "mape": 372.63
+          }
+        ]
+      },
+      "operational": {
+        "persistence": {
+          "replica_minutes": 15720.0,
+          "scaling_events": 38,
+          "deficit_intervals": 20,
+          "deficit_minutes": 200.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "previous_day": {
+          "replica_minutes": 16090.0,
+          "scaling_events": 32,
+          "deficit_intervals": 5,
+          "deficit_minutes": 50.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "seasonal_pattern": {
+          "replica_minutes": 16090.0,
+          "scaling_events": 32,
+          "deficit_intervals": 5,
+          "deficit_minutes": 50.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "trend_adaptive": {
+          "replica_minutes": 16040.0,
+          "scaling_events": 37,
+          "deficit_intervals": 8,
+          "deficit_minutes": 80.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "network_only": {
+          "replica_minutes": 16940.0,
+          "scaling_events": 46,
+          "deficit_intervals": 14,
+          "deficit_minutes": 140.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "served_blend": {
+          "replica_minutes": 16230.0,
+          "scaling_events": 44,
+          "deficit_intervals": 13,
+          "deficit_minutes": 130.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        },
+        "reactive_only": {
+          "replica_minutes": 15720.0,
+          "scaling_events": 38,
+          "deficit_intervals": 20,
+          "deficit_minutes": 200.0,
+          "deficit_replicas_max": 1,
+          "deficit_replicas_mean": 1.0
+        }
+      }
+    }
+  ]
+}

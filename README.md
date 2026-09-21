@@ -2,7 +2,7 @@
 
 **Scale before the traffic arrives, not after.**
 
-Predictive Autoscaler is an open-source Kubernetes autoscaler that forecasts request demand with a deep-learning model and provisions capacity ahead of the load. Conventional autoscalers react to metrics that have already crossed a threshold, which means the first users of every traffic surge pay for it in latency and errors. Predictive Autoscaler is built to close that gap: it learns each workload's daily rhythm, predicts the next hour, and aims to have pods ready before the wave hits. A reactive floor means the forecast can only add capacity on top of what live metrics require.
+Predictive Autoscaler is an open-source Kubernetes autoscaler that forecasts request demand and provisions capacity ahead of the load. Conventional autoscalers react to metrics that have already crossed a threshold, which means the first users of every traffic surge pay for it in latency and errors. Predictive Autoscaler is built to close that gap: it learns each workload's daily rhythm, predicts the next hour, and aims to have pods ready before the wave hits. A reactive floor means the forecast can only add capacity on top of what live metrics require.
 
 Built by [Bakmurat Kubanaliev](#author). Apache-2.0.
 
@@ -126,7 +126,9 @@ Both suites pass. Last full run 2026-09-20: Go `go vet` + `go test -race` green;
 
 ## Roadmap
 
-1. Controlled accuracy benchmark with held-out days and a documented metric; published results.
+1. Switch the LSTM activation off `relu` and clamp the served forecast against the seasonal
+   pattern, then re-run `eval/offline_eval.py`. If the network still cannot beat previous-day
+   by 10%, remove it and serve the seasonal pattern alone.
 2. Validation of the newest forecasting model (five input features, direct six-step output, robust scaling) against the benchmark.
 3. Adaptive blend weights in place of the fixed 0.70-to-0.908 schedule.
 4. A training-time validation gate so a new model can never replace a better one.
@@ -138,9 +140,35 @@ Predictive Autoscaler is an actively developed personal research project (Octobe
 
 Note on numbers: request-rate figures in the simulator configuration (for example a 60,000 requests-per-minute peak) are the synthetic load generator's settings, not measured throughput.
 
+## What the measurements say
+
+An offline evaluation on 2026-09-21 drove this repository's own training, inference and
+control code over rolling origins across five scenario families and multiple seeds
+(`eval/RESULTS-2026-09-21.md`). Two findings, and they disagree:
+
+**Forecasting works.** Replaying the operator's real rules, scaling from a forecast cut the
+ten-minute intervals where capacity was short from **12 to 3-5**, for about **1.4% more
+replica-minutes**, against purely reactive scaling. That is the premise of this project and
+it held up.
+
+**The neural network does not.** The LSTM lost to a one-line previous-day baseline in **10
+of 10 runs**, and in **4 of 10** its output diverged by one to eleven orders of magnitude.
+The best forecaster measured was this project's own seasonal-pattern component on its own -
+the arithmetic one, not the learned one. The preregistered bar (10% lower error than the
+strongest baseline) was not approached in any run.
+
+So: keep the predictive layer, and treat the network as an experiment that has not paid off
+on this workload. The roadmap below reflects that. If you are looking for a forecaster to
+copy, copy the seasonal pattern.
+
+Every number above comes from synthetic traffic. The benchmark cluster had not yet
+accumulated enough real history to score, and nothing here measures latency - replay models
+capacity arriving, not response time.
+
 ## Limitations
 
-- Not deployed to production anywhere; evaluated so far only against synthetic traffic in the author's own environments. No accuracy figures are published yet; a controlled benchmark is in progress (`deploy/eks-benchmark/`), and its results will be published with their method, whatever they show.
+- Not deployed to production anywhere; evaluated so far only against synthetic traffic in the author's own environments. The first controlled evaluation is published in `eval/RESULTS-2026-09-21.md` and it is not flattering to the neural component; a live benchmark is running (`deploy/eks-benchmark/`) and its results will be published the same way, whatever they show.
+- The LSTM's training is not numerically stable: four of ten evaluation runs diverged. The `relu` activation inside the LSTM layers is the first suspect. Until that is resolved the served forecast has no clamp against a diverged network.
 - One target metric in practice (request rate per pod); CPU and memory paths exist in the schema but are not trained.
 - Model files live on a ReadWriteOnce volume, so a single forecasting replica is supported.
 - The API group `autoscaler.example.com` is a placeholder to rename before use.
