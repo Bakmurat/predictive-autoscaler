@@ -644,6 +644,25 @@ def _parse_iso(value):
         return None
 
 
+def _observation_timestamp(point):
+    """Timestamp of an observation supplied by the caller, as naive UTC, or None (C-48).
+
+    Accuracy scoring needs the observation's own time, not the moment the request arrived:
+    a delayed sample must be matched to the forecast that targeted it.
+    """
+    if not isinstance(point, dict):
+        return None
+    raw = point.get("timestamp")
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        try:
+            return datetime.utcfromtimestamp(float(raw))
+        except Exception:
+            return None
+    return _parse_iso(raw)
+
+
 # Initialize predictor
 predictor = LSTMPredictor()
 
@@ -751,36 +770,49 @@ async def predict(request: Dict):
             # includes "Model must be trained" and inference-window refusals; the operator falls back to reactive
             raise HTTPException(status_code=422, detail=f"forecast refused: {e}")
 
-        # --- ACCURACY TRACKING ---
-        # Compare previous prediction against current actual
+        # --- ACCURACY TRACKING (C-48: timestamp-matched, matured targets only) ---
+        # A forecast for t+10min becomes an error signal only once t+10min has passed and the
+        # observation for THAT timestamp exists. The previous code compared the last stored
+        # forecast against whatever arrived next -- typically 60 s later -- which is not a
+        # forecast error at all, and it also fed that number back into the adaptive percentile.
         try:
             if metric_data and len(metric_data) > 0:
                 current_actual = float(metric_data[-1].get("value", 0))
+                observation_at = _observation_timestamp(metric_data[-1])
 
-                # Get what we predicted last time for this point
-                last_pred = accuracy_tracker.get_last_prediction(application, namespace, metric_type)
+                if observation_at is not None and current_actual > 0:
+                    matured = accuracy_tracker.take_matured(
+                        application, namespace, metric_type, observation_at)
+                    for predicted in matured:
+                        accuracy_tracker.record(application, namespace, metric_type,
+                                                predicted, current_actual)
+                    if matured:
+                        mape = accuracy_tracker.get_mape(application, namespace, metric_type)
+                        mae = accuracy_tracker.get_mae(application, namespace, metric_type)
+                        MAPE_GAUGE.labels(application=application, namespace=namespace, metric_type=metric_type).set(mape)
+                        MAE_GAUGE.labels(application=application, namespace=namespace, metric_type=metric_type).set(mae)
+                        logger.info(
+                            f"Accuracy for {application}/{metric_type}: MAPE={mape:.1f}%, MAE={mae:.1f}, "
+                            f"scored {len(matured)} forecast(s) whose target was {observation_at.isoformat()}, "
+                            f"actual={current_actual:.1f}")
 
-                if last_pred is not None and current_actual > 0:
-                    # Record the comparison: what we predicted vs what actually happened
-                    accuracy_tracker.record(application, namespace, metric_type, last_pred, current_actual)
-
-                    # Update Prometheus gauges
-                    mape = accuracy_tracker.get_mape(application, namespace, metric_type)
-                    mae = accuracy_tracker.get_mae(application, namespace, metric_type)
-                    MAPE_GAUGE.labels(application=application, namespace=namespace, metric_type=metric_type).set(mape)
-                    MAE_GAUGE.labels(application=application, namespace=namespace, metric_type=metric_type).set(mae)
-
-                    logger.info(f"Accuracy for {application}/{metric_type}: MAPE={mape:.1f}%, MAE={mae:.1f}, "
-                                f"predicted={last_pred:.1f}, actual={current_actual:.1f}")
-
-
-            # Store current prediction's first step for comparison on next call
-            # predictions[0] is the +10min prediction (nearest future step)
-            if prediction and "predictions" in prediction and len(prediction["predictions"]) > 0:
-                accuracy_tracker.store_prediction(
-                    application, namespace, metric_type,
-                    float(prediction["predictions"][0])
-                )
+            # Queue every step of THIS forecast against its own target timestamp.
+            targets = (prediction or {}).get("target_timestamps") or []
+            preds = (prediction or {}).get("predictions") or []
+            for step, value in enumerate(preds):
+                if step >= len(targets):
+                    break
+                target_at = _parse_iso(targets[step])
+                if target_at is None:
+                    continue
+                accuracy_tracker.store_forecast(application, namespace, metric_type,
+                                                target_at, float(value))
+                for comp in ("lstm", "pattern", "blended"):
+                    series = (prediction.get("components") or {}).get(comp)
+                    if isinstance(series, (list, tuple)) and step < len(series):
+                        accuracy_tracker.store_forecast(application, namespace, metric_type,
+                                                        target_at, float(series[step]),
+                                                        component=comp)
         except Exception as e:
             logger.warning(f"Accuracy tracking error (non-fatal): {e}")
 
@@ -810,17 +842,19 @@ async def predict(request: Dict):
                 namespace=namespace
             ).set(float(floor_pct))
 
-            # Per-component MAPE tracking
+            # Per-component MAPE tracking (C-48: score matured targets, never the value
+            # that was just issued for a time that has not arrived).
             if components and metric_data and len(metric_data) > 0:
                 current_actual = float(metric_data[-1].get("value", 0))
-                if current_actual > 0:
-                    # Record per-component step-1 predictions for MAPE comparison
+                observation_at = _observation_timestamp(metric_data[-1])
+                if current_actual > 0 and observation_at is not None:
                     for comp_name in ["lstm", "pattern", "blended"]:
-                        comp_values = components.get(comp_name, [])
-                        if comp_values:
+                        for predicted in accuracy_tracker.take_matured(
+                                application, namespace, metric_type, observation_at,
+                                component=comp_name):
                             accuracy_tracker.record_component(
                                 application, namespace, metric_type,
-                                comp_name, float(comp_values[0]), current_actual
+                                comp_name, float(predicted), current_actual
                             )
                             comp_mape = accuracy_tracker.get_component_mape(
                                 application, namespace, metric_type, comp_name

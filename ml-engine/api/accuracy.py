@@ -24,6 +24,9 @@ class AccuracyTracker:
         self.last_predictions: Dict[tuple, Tuple[datetime, float]] = {}
         # Per-component tracking: key (app, ns, metric_type, component) -> deque of (ts, predicted, actual)
         self.component_history: Dict[tuple, deque] = {}
+        # C-48: forecasts awaiting their target time.
+        # Key: (application, namespace, metric_type, component|None) -> deque of (target_at, predicted)
+        self.pending: Dict[tuple, deque] = {}
 
     def _key(self, application: str, namespace: str, metric_type: str) -> tuple:
         return (application, namespace, metric_type)
@@ -79,9 +82,59 @@ class AccuracyTracker:
 
     def store_prediction(self, application: str, namespace: str, metric_type: str,
                          predicted_value: float) -> None:
-        """Store a prediction value for later comparison against actuals."""
+        """Store a prediction value for later comparison against actuals.
+
+        Deprecated for accuracy purposes (C-48): it carries no target timestamp, so the
+        consumer cannot tell whether the target has matured. Kept for compatibility;
+        use store_forecast()/take_matured() instead.
+        """
         key = self._key(application, namespace, metric_type)
         self.last_predictions[key] = (datetime.now(timezone.utc), predicted_value)
+
+    # --- timestamp-matched scoring (C-48) ------------------------------------------------
+    def store_forecast(self, application: str, namespace: str, metric_type: str,
+                       target_at: datetime, predicted_value: float,
+                       component: Optional[str] = None) -> None:
+        """Queue a forecast for scoring WHEN ITS TARGET TIME ARRIVES.
+
+        A forecast for t+10min is not an error signal until t+10min has actually passed and
+        the observation for that timestamp exists. Comparing it against 'now' -- which the
+        previous code did on every call, typically 60 s later -- measures nothing.
+        """
+        key = (application, namespace, metric_type, component)
+        pend = self.pending.setdefault(key, deque(maxlen=512))
+        pend.append((self._as_utc(target_at), float(predicted_value)))
+
+    def take_matured(self, application: str, namespace: str, metric_type: str,
+                     observation_at: datetime, tolerance_s: int = 300,
+                     component: Optional[str] = None):
+        """Return queued forecasts whose target matches `observation_at`, and drop stale ones.
+
+        Returns a list of predicted values to score against the observation at that timestamp.
+        Entries whose target is still in the future are left queued; entries older than the
+        tolerance are discarded as unmatched (they can never be scored correctly).
+        """
+        key = (application, namespace, metric_type, component)
+        pend = self.pending.get(key)
+        if not pend:
+            return []
+        obs = self._as_utc(observation_at)
+        matured, keep = [], deque(maxlen=512)
+        for target_at, predicted in pend:
+            delta = (obs - target_at).total_seconds()
+            if abs(delta) <= tolerance_s:
+                matured.append(predicted)
+            elif delta < -tolerance_s:
+                keep.append((target_at, predicted))  # target still in the future
+            # delta > tolerance: the observation for that target never arrived -- drop it
+        self.pending[key] = keep
+        return matured
+
+    @staticmethod
+    def _as_utc(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
 
     def get_last_prediction(self, application: str, namespace: str,
                             metric_type: str) -> Optional[float]:
