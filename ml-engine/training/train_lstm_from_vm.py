@@ -40,7 +40,7 @@ STEPS_AHEAD = 6                # one hour of ten-minute steps (LSTMForecastModel
 
 
 def sequence_budget(n_points: int, sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
-                    steps_ahead: int = STEPS_AHEAD) -> dict:
+                    steps_ahead: int = STEPS_AHEAD, imputed=None) -> dict:
     """How many sequences a contiguous run of n_points ten-minute observations yields.
 
     The outer split is train_rows = int(0.8 * n) (train_lstm_for_metric). The inner split is
@@ -51,19 +51,19 @@ def sequence_budget(n_points: int, sequence_length: int = DEFAULT_SEQUENCE_LENGT
     zero training sequences there and raises. Evaluation needs the remaining test rows to hold
     at least one sequence as well; it is optional.
     """
-    b = _budget(n_points, sequence_length, steps_ahead)
+    b = _budget(n_points, sequence_length, steps_ahead, imputed=imputed)
     b["min_points_for_training"] = min_points_for_training(sequence_length, steps_ahead)
     return b
 
 
-def _budget(n_points, sequence_length, steps_ahead):
+def _budget(n_points, sequence_length, steps_ahead, imputed=None):
     window = sequence_length + steps_ahead
     train_rows = int(0.8 * n_points)
     test_rows = n_points - train_rows
     seqs = max(0, train_rows - window + 1)
     # The inner split comes from the model itself, not from a second implementation here.
     train_idx, val_idx = purged_split_indices(train_rows, sequence_length, steps_ahead,
-                                              n_sequences=seqs)
+                                              n_sequences=seqs, imputed=imputed)
     return {"points": n_points, "train_rows": train_rows, "test_rows": test_rows, "window": window,
             "sequences": seqs, "train_sequences": int(len(train_idx)),
             "validation_sequences": int(len(val_idx)),
@@ -141,11 +141,15 @@ def preflight_history(df, sequence_length: int = DEFAULT_SEQUENCE_LENGTH, steps_
     info["gap_fill"] = fill_rec
     info.update({"contiguous_run_points": len(run),
                  "run_first": gapfill._iso(run[0][0]) if run else None, "run_last": gapfill._iso(run[-1][0]) if run else None})
-    budget = sequence_budget(len(run), sequence_length, steps_ahead)
-    # eligible sequences after filling: a validation/evaluation sequence whose target window contains an
-    # imputed slot is not counted (imputed labels never enter validation or reported accuracy)
+    # The gate must use the counts TRAINING will get, not the unfiltered ones (Codex C-60):
+    # the model drops validation sequences whose target window touches a gap-filled slot and
+    # then refuses an empty remainder, so gating on unfiltered counts can promise a run that
+    # immediately raises. `flags` is the per-row imputed mask for `run`; the model sees only
+    # the outer training rows, so that prefix of the mask is what decides.
     n = len(run); window = sequence_length + steps_ahead
     train_rows = int(0.8 * n)
+    budget = sequence_budget(len(run), sequence_length, steps_ahead,
+                             imputed=list(flags)[:train_rows] if flags else None)
     def _valid_targets(lo, hi):  # sequences fully inside rows [lo, hi) with genuine target labels
         cnt = 0
         for i in range(lo, hi - window + 1):

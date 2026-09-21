@@ -75,3 +75,67 @@ def test_there_is_no_contaminated_fallback():
     """Below the minimum the split must yield an empty side, never a contiguous rescue."""
     train_idx, _ = purged_split_indices(187, L, STEPS_AHEAD)
     assert len(train_idx) == 0
+
+
+# --- Codex C-60: imputation must not make the preflight disagree with training ----------
+
+IMPUTED_ROWS = (155, 161, 167, 173, 179, 185)
+
+
+def _mask(n, rows=IMPUTED_ROWS):
+    m = [False] * n
+    for r in rows:
+        m[r] = True
+    return m
+
+
+def test_codex_c60_case_every_validation_sequence_is_eliminated():
+    """The exact adversarial case: a 235-point window missing zero-based rows
+    155, 161, 167, 173, 179, 185. All six fill within policy, and because the imputed rows
+    are spaced exactly STEPS_AHEAD apart, every six-wide target window touches one -- so no
+    genuine validation sequence survives, while the unfiltered count still says 33."""
+    n = MINIMUM
+    train_rows = int(0.8 * n)                      # 188: what the model actually receives
+    unfiltered = sequence_budget(n, L, STEPS_AHEAD)
+    filtered = sequence_budget(n, L, STEPS_AHEAD, imputed=_mask(n)[:train_rows])
+    assert unfiltered["validation_sequences"] == 33
+    assert filtered["validation_sequences"] == 0, filtered
+    assert filtered["train_sequences"] == unfiltered["train_sequences"], \
+        "training sequences are kept; only validation labels must be genuine"
+
+
+def test_preflight_and_model_agree_under_imputation():
+    """One helper decides both sides, so the counts cannot diverge."""
+    n = MINIMUM
+    train_rows = int(0.8 * n)
+    mask = _mask(n)[:train_rows]
+    b = sequence_budget(n, L, STEPS_AHEAD, imputed=mask)
+    seqs = max(0, train_rows - L - STEPS_AHEAD + 1)
+    train_idx, val_idx = purged_split_indices(train_rows, L, STEPS_AHEAD,
+                                              n_sequences=seqs, imputed=mask)
+    assert (b["train_sequences"], b["validation_sequences"]) == (len(train_idx), len(val_idx))
+
+
+def test_a_single_imputed_row_removes_only_the_windows_touching_it():
+    """The rule is targeted, not blanket: one gap-filled row costs STEPS_AHEAD sequences."""
+    n = 600
+    train_rows = int(0.8 * n)
+    seqs = max(0, train_rows - L - STEPS_AHEAD + 1)
+    clean_t, clean_v = purged_split_indices(train_rows, L, STEPS_AHEAD, n_sequences=seqs)
+    mask = [False] * train_rows
+    victim = clean_v[len(clean_v) // 2] + L          # a target row of a middle validation sequence
+    mask[victim] = True
+    _, dirty_v = purged_split_indices(train_rows, L, STEPS_AHEAD, n_sequences=seqs, imputed=mask)
+    assert 0 < len(clean_v) - len(dirty_v) <= STEPS_AHEAD
+
+
+def test_imputed_inputs_are_allowed_only_labels_are_not():
+    """A gap-filled row inside an INPUT window is fine; only target windows are filtered."""
+    n = 600
+    train_rows = int(0.8 * n)
+    seqs = max(0, train_rows - L - STEPS_AHEAD + 1)
+    _, clean_v = purged_split_indices(train_rows, L, STEPS_AHEAD, n_sequences=seqs)
+    mask = [False] * train_rows
+    mask[0] = True                                   # row 0 is only ever an input
+    _, dirty_v = purged_split_indices(train_rows, L, STEPS_AHEAD, n_sequences=seqs, imputed=mask)
+    assert len(dirty_v) == len(clean_v)

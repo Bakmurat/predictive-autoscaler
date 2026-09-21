@@ -104,7 +104,8 @@ def asymmetric_mse(y_true, y_pred):
     return tf.reduce_mean(under_weight * step_weights * squared_error)
 
 
-def purged_split_indices(n_rows, sequence_length, steps_ahead, n_sequences=None):
+def purged_split_indices(n_rows, sequence_length, steps_ahead, n_sequences=None,
+                         imputed=None):
     """The ONE definition of the purged train/validation split (Codex C-57).
 
     Both `LSTMForecastModel.train` and the trainer's preflight call this, so eligibility
@@ -122,6 +123,15 @@ def purged_split_indices(n_rows, sequence_length, steps_ahead, n_sequences=None)
     There is no fallback. If the series cannot supply disjoint label periods the caller
     raises; the contiguous fallback was removed because it restored the very overlap the
     split exists to prevent.
+
+    `imputed` (Codex C-60): a per-row boolean mask of gap-filled slots. A gap-filled slot
+    may serve as an INPUT but never as a validation label, so validation sequences whose
+    target window touches one are dropped here -- by the same rule, in the same place, that
+    training uses. Training sequences are kept (their imputed targets are excluded from the
+    reported metrics instead). Passing the mask is what stops the preflight promising
+    validation sequences that training will then discard: a 235-point window missing rows
+    155, 161, 167, 173, 179 and 185 fills all six within policy and leaves ZERO genuine
+    validation sequences, while the unfiltered count still says 33.
     """
     if n_sequences is None:
         n_sequences = max(0, n_rows - sequence_length - steps_ahead + 1)
@@ -129,13 +139,20 @@ def purged_split_indices(n_rows, sequence_length, steps_ahead, n_sequences=None)
     # Deliberately plain Python: the benchmark tooling lifts this function to decide
     # eligibility without importing the model's dependencies, and one definition must
     # serve both. The caller converts to arrays where it needs to index with them.
+    def _target_is_imputed(i):
+        if imputed is None:
+            return False
+        return any(bool(imputed[r]) for r in range(i + sequence_length,
+                                                   i + sequence_length + steps_ahead)
+                   if r < len(imputed))
+
     train_idx, val_idx = [], []
     for i in range(n_sequences):
         first_target = i + sequence_length
         last_target = first_target + steps_ahead - 1
         if last_target < split_row:
             train_idx.append(i)
-        elif first_target >= split_row:
+        elif first_target >= split_row and not _target_is_imputed(i):
             val_idx.append(i)
     return train_idx, val_idx
 
@@ -253,8 +270,12 @@ class LSTMForecastModel:
         # was added to remove. That fallback was active in every evaluation run to date, so
         # the fix was inert. There is no fallback now: if the series cannot support disjoint
         # label periods, training fails loudly.
+        # The imputed mask goes INTO the split, so the counts the preflight publishes are the
+        # counts training gets (Codex C-60). Previously the split ignored it and the exclusion
+        # happened afterwards, here, where the preflight could not see it.
         train_list, val_list = purged_split_indices(
-            len(values), self.sequence_length, STEPS_AHEAD, n_sequences=len(X))
+            len(values), self.sequence_length, STEPS_AHEAD, n_sequences=len(X),
+            imputed=imputed if (imputed is not None and len(imputed) == len(values)) else None)
         train_idx = np.asarray(train_list, dtype=int)
         val_idx = np.asarray(val_list, dtype=int)
 
@@ -289,18 +310,24 @@ class LSTMForecastModel:
         # Gap-filled (imputed) slots may serve as inputs, never as validation labels or as labels in the
         # reported training metrics (data/gapfill.py rule). A sequence i has targets at rows
         # i+seq_len .. i+seq_len+STEPS_AHEAD-1.
+        # Validation sequences whose target window touches a gap-filled slot were already
+        # removed inside purged_split_indices (C-60). Recover how many, for the log and the
+        # provenance record, by asking the same helper without the mask.
         genuine_target = genuine_all
         n_val_dropped = 0
-        if imputed is not None and len(imputed) == len(values) and imputed.any():
+        if imputed is not None and len(imputed) == len(values):
+            _, val_unfiltered = purged_split_indices(
+                len(values), self.sequence_length, STEPS_AHEAD, n_sequences=len(X))
+            n_val_dropped = len(val_unfiltered) - len(val_idx)
             imp = np.asarray(imputed, dtype=bool)
             for i in range(len(X)):
                 if imp[i + self.sequence_length:i + self.sequence_length + STEPS_AHEAD].any():
                     genuine_target[i] = False
-            val_keep = genuine_target[val_idx]
-            n_val_dropped = int((~val_keep).sum())
-            X_val, y_val = X_val[val_keep], y_val[val_keep]
         if len(X_val) == 0:
-            raise ValueError("no validation sequences with genuine target labels")
+            raise ValueError(
+                "no validation sequences with genuine target labels: "
+                f"{n_val_dropped} were dropped because their target window contains a "
+                "gap-filled slot. Supply more history, or history with fewer gaps.")
 
         logger.info(f"Training set: {len(X_train)}, Validation set: {len(X_val)} (imputed-target sequences excluded: {n_val_dropped})")
 
