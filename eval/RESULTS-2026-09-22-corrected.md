@@ -8,23 +8,33 @@ below comes from a fresh run of the rebuilt harness.
 
 ## Verdict
 
-**The neural component does not earn its place on any workload tested, and the gap is not
-close.** Across ten runs it failed the preregistered bar — 10% lower MAE than the strongest
-baseline — **twenty times out of twenty** (both the raw network and the served blend, in
-every run). Ratios to the strongest baseline run from **0.98 to 4.16**; the single best case
-is a 2% improvement, against a 10% requirement.
+**Neither neural arm achieved a 10% improvement over the strongest baseline in these ten
+runs at model seed 101.** That is the claim the evidence supports, and it is narrower than
+it sounds:
 
-**What the best forecaster is depends on the workload**, which is the more interesting
-result and the one the withdrawn run could not have found:
+- The ten runs are **not twenty independent experiments**. They are 10 runs scored for two
+  arms, and the arms are not independent of each other — the served blend contains the
+  network — nor of the baselines, since the blend also contains the seasonal pattern.
+- In **one run the served blend was the single best predictor**: spike, seed 2, where it beat
+  the strongest baseline (seasonal pattern) by **1.7%** — 365.1 against 371.3 MAE. It did not
+  reach the 10% bar, but "the network never wins" and "the gap is not close" would both be
+  false, and an earlier draft of this document said them. Withdrawn.
+- Ratios of arm MAE to the strongest baseline run from **0.98 to 4.16** across the ten runs.
+
+**The best forecaster depends on the workload**, which is the more useful finding and the one
+the withdrawn 2026-09-21 run could not have reached:
 
 - steady daily traffic → the **seasonal pattern** (this project's own arithmetic component)
 - gradual trend, level shift, weekly cycle → the **trend-adaptive** baseline
-- neither is the neural network, in any scenario
+
+Note what this does *not* say: no arm here selects between those two automatically. A
+combined seasonal/trend forecaster that picks per workload — the obvious thing to build from
+this result — **has not been tested**, and might well beat everything in the table.
 
 **Not established:** anything about real traffic (all series are synthetic), anything about
-latency (the replay models capacity, not response time), and whether the network's
-across-seed divergence is fixable — that is the separate stabilisation experiment, still
-running at the time of writing.
+latency (the replay models capacity, not response time), operational benefit (one run per
+scenario), and whether the network's across-seed divergence is fixable — that is a separate
+experiment.
 
 ## Method
 
@@ -109,7 +119,7 @@ arms equally.
 | weekly | 2 | served blend | 773.9 | trend adaptive | 265.9 | 2.91 | fail |
 | weekly | 2 | network only | 825.4 | trend adaptive | 265.9 | 3.10 | fail |
 
-Twenty comparisons, zero passes.
+Twenty scored comparisons across ten runs — **not twenty independent experiments**: two correlated arms per run, and the blend shares components with both the network and the seasonal baseline. None reached the 10% bar. One (spike, seed 2) has the blend ahead of the strongest baseline by 1.7%, below the bar but not a loss.
 
 ## Per-step MAE and signed bias
 
@@ -184,16 +194,15 @@ operational benefit needs repetition across seeds and scenarios with an uncertai
 
 ## Decision for the user
 
-The evidence supports removing the neural network and shipping the seasonal pattern —
-together with the trend-adaptive rule, which is the stronger choice whenever the level
-moves. It does not *compel* that, and the choice is the user's:
+The evidence points towards removing the neural network and shipping the arithmetic
+forecasters, but it does not compel it, and the choice is the user's:
 
-1. **Remove the network**, ship the seasonal pattern with trend adaptation, and keep the
-   operator, the guard rails and the controller as they are. The project keeps its premise
-   and loses a component that has never beaten fifty lines of arithmetic.
-2. **Keep the network as an option**, default off, pending the stabilisation arms and a run
-   against real traffic. Costs nothing to leave in place; costs credibility if it is
-   described as the reason the system works.
+1. **Remove the network**, ship the seasonal pattern together with the trend-adaptive rule.
+   The obvious follow-up — a forecaster that selects between them per workload — is untested
+   and would need its own evaluation before it is claimed to be better.
+2. **Keep the network as an option**, default off, pending the stabilisation arms, a run
+   against real traffic, and an explanation of why it won the one run it won.
 
-I recommend (1) and am not taking it: this is a design decision about the user's own
-project, and the numbers, not I, should persuade.
+I recommend (1) and am not taking it: this is a design decision about the user's own project.
+The one run where the blend came first is a real datum, not noise to be dismissed, and it
+deserves an explanation before the component is deleted.

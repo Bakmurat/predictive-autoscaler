@@ -144,34 +144,30 @@ Note on numbers: request-rate figures in the simulator configuration (for exampl
 
 ## What the measurements say
 
-An offline evaluation on 2026-09-21 drove this repository's own training and inference code
-over rolling origins (`eval/RESULTS-2026-09-21.md`). One finding survived review:
+A production-equivalent evaluation on 2026-09-22 drove this repository's own training and
+inference code over rolling origins across five scenario families, with decisions taken by
+the real Go controller ([`eval/RESULTS-2026-09-22-corrected.md`](eval/RESULTS-2026-09-22-corrected.md)).
 
-**The neural forecaster's errors are large and unstable on synthetic repeating traffic.**
-On five interpretable runs it was the worst of six forecasters tested, behind this project's
-own seasonal-pattern component and behind a one-line previous-day baseline. Worse, on
-*identical* input data two runs differed by ten orders of magnitude in error (6.1x10^3
-against 3.4x10^13 MAE) because the network's initialisation is unseeded. A forecaster whose
-error varies that much between runs on the same data is not ready to be relied on.
+**Neither neural arm reached a 10% improvement over the strongest baseline in those ten runs.**
+In one run of the ten the served blend was the single best predictor, ahead of the strongest
+baseline by 1.7% — below the bar, but the network is not uniformly beaten.
 
-That is the whole claim. Three things it is **not**:
+**The best forecaster depends on the workload.** Steady daily traffic favours the seasonal
+pattern, this project's own arithmetic component; trend, level shift and weekly cycles favour
+a simple trend-adaptive rule. A forecaster that selects between those two automatically is the
+obvious thing to build from this and **has not been tested**.
 
-- It is not a verdict on predictive autoscaling. An earlier version of this section claimed
-  forecasting beat reactive scaling on a capacity replay; that replay was a flawed
-  approximation of the real controller and its numbers are withdrawn.
-- It is not a verdict on regime change. The level-shift, spike and weekly scenarios never
-  entered the scored window, so they measured ordinary repeating traffic. Those results are
-  withdrawn.
-- It is not grounds to delete the network. Five runs on one synthetic profile, with a
-  training setup that is not production-equivalent, do not settle that. The roadmap below
-  gives it one bounded, properly controlled attempt.
+Treat the neural component as experimental and optional. It is not the reason this system
+works, and the project should not be described as though it were.
 
-Every number is from synthetic traffic: the benchmark cluster had not accumulated enough
-real history to score. Nothing here measures latency.
+Every number is from synthetic traffic: the benchmark cluster has not accumulated enough real
+history to score. Nothing here measures latency — the replay models capacity arriving, not
+response time. An earlier version of this section, built on a run whose stress scenarios never
+entered the scored window, has been withdrawn.
 
 ## Limitations
 
-- Not deployed to production anywhere; evaluated so far only against synthetic traffic in the author's own environments. The first controlled evaluation is published in `eval/RESULTS-2026-09-21.md` and it is not flattering to the neural component; a live benchmark is running (`deploy/eks-benchmark/`) and its results will be published the same way, whatever they show.
+- Not deployed to production anywhere; evaluated so far only against synthetic traffic in the author's own environments. The first controlled evaluation is published in `eval/RESULTS-2026-09-22-corrected.md` (the 2026-09-21 run was withdrawn) and it does not support the neural component; a live benchmark is running (`deploy/eks-benchmark/`) and its results will be published the same way, whatever they show.
 - The LSTM's training is not numerically stable: on identical data, separate runs produced errors ten orders of magnitude apart. The cause is not established -- the `relu` activation in the LSTM layers is one hypothesis, and the unseeded initialisation is another. Until it is understood, an invalid forecast has no documented rejection path.
 - One target metric in practice (request rate per pod); CPU and memory paths exist in the schema but are not trained.
 - Model files live on a ReadWriteOnce volume, so a single forecasting replica is supported.
