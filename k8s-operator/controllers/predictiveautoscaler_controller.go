@@ -107,7 +107,13 @@ type MLPredictionResponse struct {
 	// reports it, otherwise the issuance time). Used to exclude elapsed steps on cached reuse.
 	issuedAt time.Time
 	anchorAt time.Time
-	MAPE     float64 `json:"mape"`
+	// C-85: the API's error figure travels with its provenance. A null/absent mape with
+	// MAPEMeasured=false means NOTHING WAS SCORED -- it is not a perfect score. Go's json
+	// decoder leaves a float64 at 0 for null, which is exactly the ambiguity these two fields
+	// resolve; consult them before reading MAPE.
+	MAPE         float64 `json:"mape"`
+	MAPEMeasured bool    `json:"mape_measured"`
+	MAPEScored   int     `json:"mape_scored"`
 }
 
 // predictionEnabled reports whether the forecasting component is on for this autoscaler

@@ -39,46 +39,55 @@ class AccuracyTracker:
             self.history[key] = deque(maxlen=WINDOW_SIZE)
         self.history[key].append((datetime.now(timezone.utc), predicted, actual))
 
-    def get_mape(self, application: str, namespace: str, metric_type: str) -> float:
-        """Calculate traffic-weighted MAPE over rolling window.
+    def mape_stats(self, application: str, namespace: str, metric_type: str) -> Dict:
+        """Traffic-weighted MAPE over the rolling window, WITH its provenance (C-85).
 
-        Returns 0.0 if fewer than 2 valid entries. Skips entries where actual < MIN_TRAFFIC_RPM (1000 RPM).
+        A zero from an empty window used to read as perfect accuracy when it meant nothing
+        had been scored. Every error figure now travels with `scored` (entries that entered
+        the calculation), `recorded` (entries in the window), `availability` (scored /
+        recorded) and `measured`. `value` is None -- never 0.0 -- when nothing was measured.
+
+        Entries whose actual is below MIN_TRAFFIC_RPM are recorded but not scored (the
+        documented trough filter); the counts make that visible instead of silent.
         Formula: sum(abs(actual - predicted)) / sum(actual) * 100, rounded to 2 decimals.
-        Traffic-weighted -- errors at higher traffic contribute proportionally more.
         """
         key = self._key(application, namespace, metric_type)
-        entries = self.history.get(key, [])
-
-        # Filter to entries above minimum traffic threshold
+        entries = list(self.history.get(key, []))
         valid = [(p, a) for (_, p, a) in entries if a >= MIN_TRAFFIC_RPM]
-
-        if len(valid) < 2:
-            return 0.0
-
-        numerator = sum(abs(a - p) for p, a in valid)
+        recorded, scored = len(entries), len(valid)
+        out = {"value": None, "scored": scored, "recorded": recorded,
+               "availability": (round(scored / recorded, 4) if recorded else None),
+               "measured": False}
+        if scored < 1:
+            return out
         denominator = sum(a for _, a in valid)
-
         if denominator < 0.01:
-            return 0.0
+            return out
+        numerator = sum(abs(a - p) for p, a in valid)
+        out["value"] = round((numerator / denominator) * 100, 2)
+        out["measured"] = True
+        return out
 
-        mape = (numerator / denominator) * 100
-        return round(mape, 2)
+    def get_mape(self, application: str, namespace: str, metric_type: str) -> Optional[float]:
+        """MAPE value, or None when nothing was measured (C-85: never 0.0 for "unknown")."""
+        return self.mape_stats(application, namespace, metric_type)["value"]
 
-    def get_mae(self, application: str, namespace: str, metric_type: str) -> float:
-        """Calculate MAE over rolling window.
-
-        Returns 0.0 if fewer than 2 entries.
-        Formula: mean(abs(actual - predicted)), rounded to 2 decimals.
-        """
+    def mae_stats(self, application: str, namespace: str, metric_type: str) -> Dict:
+        """MAE over the rolling window, with provenance (C-85). See mape_stats()."""
         key = self._key(application, namespace, metric_type)
-        entries = self.history.get(key, [])
+        entries = list(self.history.get(key, []))
+        recorded = scored = len(entries)
+        out = {"value": None, "scored": scored, "recorded": recorded,
+               "availability": (1.0 if recorded else None), "measured": False}
+        if scored < 1:
+            return out
+        out["value"] = round(sum(abs(a - p) for (_, p, a) in entries) / scored, 2)
+        out["measured"] = True
+        return out
 
-        if len(entries) < 2:
-            return 0.0
-
-        total = sum(abs(a - p) for (_, p, a) in entries)
-        mae = total / len(entries)
-        return round(mae, 2)
+    def get_mae(self, application: str, namespace: str, metric_type: str) -> Optional[float]:
+        """MAE value, or None when nothing was measured (C-85)."""
+        return self.mae_stats(application, namespace, metric_type)["value"]
 
     def store_prediction(self, application: str, namespace: str, metric_type: str,
                          predicted_value: float) -> None:
@@ -161,21 +170,26 @@ class AccuracyTracker:
             self.component_history[key] = deque(maxlen=WINDOW_SIZE)
         self.component_history[key].append((datetime.now(timezone.utc), predicted, actual))
 
-    def get_component_mape(self, application: str, namespace: str, metric_type: str,
-                           component: str) -> float:
-        """Calculate traffic-weighted MAPE for a specific component over rolling window.
-
-        Same formula as get_mape() but scoped to a single component.
-        Returns 0.0 if fewer than 2 valid entries.
-        """
+    def component_mape_stats(self, application: str, namespace: str, metric_type: str,
+                             component: str) -> Dict:
+        """Per-component traffic-weighted MAPE with provenance (C-85). See mape_stats()."""
         key = (application, namespace, metric_type, component)
-        entries = self.component_history.get(key, [])
+        entries = list(self.component_history.get(key, []))
         valid = [(p, a) for (_, p, a) in entries if a >= MIN_TRAFFIC_RPM]
-        if len(valid) < 2:
-            return 0.0
-        numerator = sum(abs(a - p) for p, a in valid)
+        recorded, scored = len(entries), len(valid)
+        out = {"value": None, "scored": scored, "recorded": recorded,
+               "availability": (round(scored / recorded, 4) if recorded else None),
+               "measured": False}
+        if scored < 1:
+            return out
         denominator = sum(a for _, a in valid)
         if denominator < 0.01:
-            return 0.0
-        mape = (numerator / denominator) * 100
-        return round(mape, 2)
+            return out
+        out["value"] = round((sum(abs(a - p) for p, a in valid) / denominator) * 100, 2)
+        out["measured"] = True
+        return out
+
+    def get_component_mape(self, application: str, namespace: str, metric_type: str,
+                           component: str) -> Optional[float]:
+        """Component MAPE value, or None when nothing was measured (C-85)."""
+        return self.component_mape_stats(application, namespace, metric_type, component)["value"]

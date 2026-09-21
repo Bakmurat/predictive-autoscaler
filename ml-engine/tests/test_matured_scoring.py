@@ -24,7 +24,7 @@ def test_a_forecast_is_not_scored_before_its_target_arrives():
 
     # The next observation is 60 s later -- the reconcile interval, not the horizon.
     assert t.take_matured(APP, NS, MT, observation_at=T0 + timedelta(seconds=60)) == []
-    assert t.get_mape(APP, NS, MT) == 0.0
+    assert t.get_mape(APP, NS, MT) is None  # C-85: nothing scored -> None, not 0.0
 
 
 def test_the_forecast_is_scored_when_its_target_arrives():

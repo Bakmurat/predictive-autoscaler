@@ -41,6 +41,17 @@ MAPE_GAUGE = Gauge(
     'Traffic-weighted MAPE of predictions (rolling 24h)',
     ['application', 'namespace', 'metric_type']
 )
+ACCURACY_SCORED_GAUGE = Gauge(
+    'predictive_autoscaler_accuracy_scored_forecasts',
+    'Number of matured forecasts that entered the MAPE/MAE calculation (C-85: an error figure '
+    'without this count cannot be told from "nothing measured")',
+    ['application', 'namespace', 'metric_type']
+)
+COMPONENT_SCORED_GAUGE = Gauge(
+    'predictive_autoscaler_component_accuracy_scored_forecasts',
+    'Number of matured forecasts that entered the per-component MAPE calculation (C-85)',
+    ['application', 'namespace', 'component']
+)
 MAE_GAUGE = Gauge(
     'predictive_autoscaler_mae',
     'Mean Absolute Error of predictions (rolling 24h)',
@@ -352,11 +363,13 @@ class LSTMPredictor:
             return (datetime.utcnow() - self.model_train_times[model_key]).total_seconds() / 3600
         return -1.0
 
-    def _update_validation_metadata(self, model_key, status, new_mape, old_mape=None, age_hours=None, decay_factor=None):
+    def _update_validation_metadata(self, model_key, status, new_mape, old_mape=None, age_hours=None,
+                                    decay_factor=None, scored=None):
         """Update validation metadata for a model after accept/reject decision."""
         self.validation_metadata[model_key] = {
             "status": status,
             "mape": round(new_mape, 2),
+            "scored": scored,  # C-85: how many holdout sequences the validation mape rests on
             "old_mape": round(old_mape, 2) if old_mape is not None else None,
             "age_hours": round(age_hours, 1) if age_hours is not None else None,
             "decay_factor": round(decay_factor, 3) if decay_factor is not None else None,
@@ -393,6 +406,7 @@ class LSTMPredictor:
             holdout_df = df.iloc[holdout_start:]
             new_metrics = new_model.evaluate(holdout_df, target_column='value')
             new_mape = new_metrics['mape']
+            new_scored = new_metrics.get('sequences_scored')  # C-85
 
             old_mape = None
             age_h = None       # set below if existing model
@@ -417,7 +431,7 @@ class LSTMPredictor:
                             logger.info(f"Model {model_key} rejected: new MAPE={new_mape:.2f}% >= 100% sanity floor "
                                         f"(age={age_h:.1f}h, staleness bypass denied)")
                             self._update_validation_metadata(model_key, "rejected", new_mape, old_mape,
-                                                             age_hours=age_h, decay_factor=None)
+                                                             age_hours=age_h, decay_factor=None, scored=new_scored)
                             self.model_train_times[model_key] = datetime.utcnow()
                             return training_result
                         logger.info(f"Model {model_key} accepted (staleness bypass): new MAPE={new_mape:.2f}% "
@@ -432,7 +446,7 @@ class LSTMPredictor:
                                         f"threshold={threshold:.2f}% (old MAPE={old_mape:.2f}%, "
                                         f"age={age_h:.1f}h, decay_factor={decay_factor:.3f})")
                             self._update_validation_metadata(model_key, "rejected", new_mape, old_mape,
-                                                             age_hours=age_h, decay_factor=decay_factor)
+                                                             age_hours=age_h, decay_factor=decay_factor, scored=new_scored)
                             self.model_train_times[model_key] = datetime.utcnow()
                             return training_result
                         logger.info(f"Model {model_key} accepted: new MAPE={new_mape:.2f}% <= "
@@ -454,7 +468,7 @@ class LSTMPredictor:
 
             # Update validation metadata (age_h/decay_factor set above if existing model)
             self._update_validation_metadata(model_key, "accepted", new_mape, old_mape,
-                                             age_hours=age_h, decay_factor=decay_factor)
+                                             age_hours=age_h, decay_factor=decay_factor, scored=new_scored)
 
             # Clean up old model before promoting new one
             if model_key in self.trained_models:
@@ -581,7 +595,9 @@ class LSTMPredictor:
                             mape = accuracy_tracker.get_mape(application, namespace, metric_type)
                     except Exception:
                         mape = 0.0
-                    model.mape_for_floor = mape
+                    # C-85: None means not measured; the percentile rule's neutral input is 0.0
+                    # (no adjustment below 10), which is the same as its cold-start value.
+                    model.mape_for_floor = mape if mape is not None else 0.0
 
                     prediction_result = model.predict(
                         steps_ahead=steps_ahead, confidence_level=0.95,
@@ -640,6 +656,12 @@ class LSTMPredictor:
                 PREDICTION_ERRORS.labels(error_type=type(e).__name__).inc()
                 raise e
 
+def _fmt_err(stats, unit=""):
+    """'not measured' or the value -- never a bare 0.0 for an empty window (C-85)."""
+    v = stats.get("value")
+    return "not measured" if v is None else f"{v:.1f}{unit}"
+
+
 def _json_safe(obj):
     """Recursively map non-finite floats to None so the response is JSON-compliant (C-83).
 
@@ -661,6 +683,21 @@ def _json_safe(obj):
     if isinstance(obj, (np.bool_,)):
         return bool(obj)
     return obj
+
+
+def _set_error_gauge(gauge, stats, **labels):
+    """Set a labelled error gauge from a stats dict, or REMOVE it when not measured (C-85).
+
+    A gauge that reads 0.0 because nothing was scored is indistinguishable from a perfect
+    score. An unmeasured value must be absent from the scrape, not zero.
+    """
+    if stats.get("measured") and stats.get("value") is not None:
+        gauge.labels(**labels).set(float(stats["value"]))
+    else:
+        try:
+            gauge.remove(*labels.values())
+        except KeyError:
+            pass
 
 
 def _finite_or_none(value):
@@ -832,13 +869,17 @@ async def predict(request: Dict):
                         accuracy_tracker.record(application, namespace, metric_type,
                                                 predicted, current_actual)
                     if matured:
-                        mape = accuracy_tracker.get_mape(application, namespace, metric_type)
-                        mae = accuracy_tracker.get_mae(application, namespace, metric_type)
-                        MAPE_GAUGE.labels(application=application, namespace=namespace, metric_type=metric_type).set(mape)
-                        MAE_GAUGE.labels(application=application, namespace=namespace, metric_type=metric_type).set(mae)
+                        mape_st = accuracy_tracker.mape_stats(application, namespace, metric_type)
+                        mae_st = accuracy_tracker.mae_stats(application, namespace, metric_type)
+                        labels = dict(application=application, namespace=namespace, metric_type=metric_type)
+                        _set_error_gauge(MAPE_GAUGE, mape_st, **labels)
+                        _set_error_gauge(MAE_GAUGE, mae_st, **labels)
+                        ACCURACY_SCORED_GAUGE.labels(**labels).set(mape_st["scored"])
                         logger.info(
-                            f"Accuracy for {application}/{metric_type}: MAPE={mape:.1f}%, MAE={mae:.1f}, "
-                            f"scored {len(matured)} forecast(s) whose target was {observation_at.isoformat()}, "
+                            f"Accuracy for {application}/{metric_type}: "
+                            f"MAPE={_fmt_err(mape_st, '%')} ({mape_st['scored']} scored of "
+                            f"{mape_st['recorded']} recorded), MAE={_fmt_err(mae_st)}; "
+                            f"matured {len(matured)} forecast(s) whose target was {observation_at.isoformat()}, "
                             f"actual={current_actual:.1f}")
 
             # Queue every step of THIS forecast against its own target timestamp.
@@ -925,26 +966,35 @@ async def predict(request: Dict):
                                 application, namespace, metric_type,
                                 comp_name, float(predicted), current_actual
                             )
-                            comp_mape = accuracy_tracker.get_component_mape(
+                            comp_st = accuracy_tracker.component_mape_stats(
                                 application, namespace, metric_type, comp_name
                             )
-                            COMPONENT_MAPE_GAUGE.labels(
-                                application=application,
-                                namespace=namespace,
-                                component=comp_name
-                            ).set(comp_mape)
+                            clabels = dict(application=application, namespace=namespace,
+                                           component=comp_name)
+                            _set_error_gauge(COMPONENT_MAPE_GAUGE, comp_st, **clabels)
+                            COMPONENT_SCORED_GAUGE.labels(**clabels).set(comp_st["scored"])
         except Exception as e:
             logger.warning(f"Component gauge update error (non-fatal): {e}")
 
         # Include MAPE for requests metric type in the response
         # The operator always wants requests MAPE regardless of which metric was predicted
+        # C-85: the error figure travels with its provenance. `mape` is null -- never 0.0 --
+        # when nothing has been scored; `mape_scored` and `mape_availability` say how much
+        # evidence stands behind a value that IS present.
         try:
-            response_mape = accuracy_tracker.get_mape(application, namespace, "requests")
+            mape_st = accuracy_tracker.mape_stats(application, namespace, "requests")
+            mae_st = accuracy_tracker.mae_stats(application, namespace, "requests")
         except Exception:
-            response_mape = 0.0
-
+            mape_st = {"value": None, "scored": 0, "recorded": 0, "availability": None, "measured": False}
+            mae_st = dict(mape_st)
+        accuracy = {
+            "mape": mape_st["value"], "mape_measured": mape_st["measured"],
+            "mape_scored": mape_st["scored"], "mape_recorded": mape_st["recorded"],
+            "mape_availability": mape_st["availability"],
+            "mae": mae_st["value"], "mae_measured": mae_st["measured"], "mae_scored": mae_st["scored"],
+        }
         # C-83: the whole payload is swept for non-finite floats at the boundary.
-        return JSONResponse(content=_json_safe({**prediction, "mape": response_mape}))
+        return JSONResponse(content=_json_safe({**prediction, **accuracy}))
         
     except ValueError as e:
         logger.error(f"Validation error: {e}")
@@ -1031,6 +1081,7 @@ async def get_models():
         models_info[model_key] = {
             "validation_status": validation.get("status"),
             "validation_mape": validation.get("mape"),
+            "validation_scored": validation.get("scored"),  # C-85
             "validation_old_mape": validation.get("old_mape"),
             "validation_timestamp": validation.get("timestamp"),
             "validation_age_hours": validation.get("age_hours"),

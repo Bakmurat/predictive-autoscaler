@@ -58,11 +58,18 @@ class TestGetMAPE:
         mape = tracker.get_mape("a", "b", "c")
         assert mape == 10.0
 
-    def test_mape_returns_zero_fewer_than_2_entries(self):
+    def test_mape_is_none_not_zero_when_nothing_is_measured(self):
+        """Superseded 2026-09-21 (Codex C-85): a zero from an empty window read as perfect
+        accuracy when it meant nothing was scored. Unmeasured is None; ONE scored entry is
+        a measurement, reported with scored=1 so the reader knows how thin it is."""
         tracker = AccuracyTracker()
-        assert tracker.get_mape("a", "b", "c") == 0.0
+        assert tracker.get_mape("a", "b", "c") is None
+        st = tracker.mape_stats("a", "b", "c")
+        assert st == {"value": None, "scored": 0, "recorded": 0, "availability": None, "measured": False}
         tracker.record("a", "b", "c", 1100.0, 1000.0)
-        assert tracker.get_mape("a", "b", "c") == 0.0
+        st = tracker.mape_stats("a", "b", "c")
+        assert st["measured"] is True and st["scored"] == 1 and st["recorded"] == 1
+        assert st["value"] == 10.0
 
     def test_mape_skips_below_threshold_actual(self):
         """Entries with actual < MIN_TRAFFIC_RPM (1000 RPM) should be skipped (Phase 14 D-08)."""
@@ -82,12 +89,16 @@ class TestGetMAPE:
         mape = tracker.get_mape("a", "b", "c")
         assert mape == 10.0
 
-    def test_mape_all_below_threshold_returns_zero(self):
-        """If all actuals are below 1000 RPM threshold, MAPE should return 0.0."""
+    def test_mape_all_below_threshold_is_recorded_but_not_measured(self):
+        """All actuals below the 1000 RPM trough filter: recorded, none scored, value None --
+        and the counts make the filtering visible (C-85)."""
         tracker = AccuracyTracker()
         tracker.record("a", "b", "c", 200.0, 500.0)
         tracker.record("a", "b", "c", 300.0, 800.0)
-        assert tracker.get_mape("a", "b", "c") == 0.0
+        assert tracker.get_mape("a", "b", "c") is None
+        st = tracker.mape_stats("a", "b", "c")
+        assert st["recorded"] == 2 and st["scored"] == 0 and st["availability"] == 0.0
+        assert st["measured"] is False
 
     def test_mape_night_filter_entries_still_stored(self):
         """Entries below threshold are stored in deque but excluded from MAPE calculation (D-08)."""
@@ -137,13 +148,14 @@ class TestGetMAPE:
         mape = tracker.get_mape("a", "b", "c")
         assert mape == 2.44
 
-    def test_mape_all_below_threshold_is_zero(self):
-        """When all entries are below MIN_TRAFFIC_RPM, MAPE returns 0.0."""
+    def test_mape_all_below_threshold_is_none(self):
+        """When all entries are below MIN_TRAFFIC_RPM nothing is scored: None, not 0.0 (C-85)."""
         tracker = AccuracyTracker()
         tracker.record("a", "b", "c", 1.0, 10.0)
         tracker.record("a", "b", "c", 2.0, 20.0)
         mape = tracker.get_mape("a", "b", "c")
-        assert mape == 0.0
+        assert mape is None
+        assert tracker.mape_stats("a", "b", "c")["scored"] == 0
 
 
 class TestGetMAE:
@@ -157,11 +169,14 @@ class TestGetMAE:
         mae = tracker.get_mae("a", "b", "c")
         assert mae == 10.0
 
-    def test_mae_returns_zero_fewer_than_2_entries(self):
+    def test_mae_is_none_when_unmeasured_and_one_entry_is_a_measurement(self):
+        """Superseded 2026-09-21 (Codex C-85): unmeasured is None, and one scored entry is
+        reported as a measurement with scored=1 rather than hidden behind a 2-entry floor."""
         tracker = AccuracyTracker()
-        assert tracker.get_mae("a", "b", "c") == 0.0
+        assert tracker.get_mae("a", "b", "c") is None
         tracker.record("a", "b", "c", 110.0, 100.0)
-        assert tracker.get_mae("a", "b", "c") == 0.0
+        assert tracker.get_mae("a", "b", "c") == 10.0
+        assert tracker.mae_stats("a", "b", "c")["scored"] == 1
 
     def test_mae_rounded_to_2_decimals(self):
         tracker = AccuracyTracker()
@@ -204,11 +219,11 @@ class TestRecordAndUpdate:
         assert mape == 10.0
         assert mae == 100.0
 
-    def test_record_and_update_first_entry_returns_zeros(self):
+    def test_record_and_update_first_entry_is_a_one_sample_measurement(self):
         tracker = AccuracyTracker()
         mape, mae = tracker.record_and_update("a", "b", "c", 1100.0, 1000.0)
-        assert mape == 0.0
-        assert mae == 0.0
+        assert mape is not None  # C-85: one entry is a measurement, not 0.0
+        assert mae is not None
 
 
 # ---------------------------------------------------------------------------
@@ -271,9 +286,10 @@ class TestGetComponentMape:
     def test_get_component_mape_returns_zero_with_fewer_than_2_entries(self):
         """Returns 0.0 when there are 0 or 1 valid entries."""
         tracker = AccuracyTracker()
-        assert tracker.get_component_mape("a", "b", "c", "lstm") == 0.0
+        assert tracker.get_component_mape("a", "b", "c", "lstm") is None  # C-85
         tracker.record_component("a", "b", "c", "lstm", 1100.0, 1000.0)
-        assert tracker.get_component_mape("a", "b", "c", "lstm") == 0.0
+        assert tracker.get_component_mape("a", "b", "c", "lstm") == 10.0
+        assert tracker.component_mape_stats("a", "b", "c", "lstm")["scored"] == 1
 
     def test_get_component_mape_skips_below_threshold_actual(self):
         """Entries where actual < MIN_TRAFFIC_RPM (1000) must be excluded from MAPE calculation."""
@@ -320,8 +336,11 @@ class TestGetComponentMape:
         assert lstm_mape == 0.0
         assert pattern_mape == 50.0
 
-    def test_get_component_mape_returns_float(self):
-        """Return type must always be float."""
+    def test_get_component_mape_is_none_unmeasured_and_float_when_measured(self):
+        """Superseded 2026-09-21 (Codex C-85): the return type is Optional[float] -- None
+        when nothing was scored, so an empty window can never read as a 0.0 error."""
         tracker = AccuracyTracker()
+        assert tracker.get_component_mape("a", "b", "c", "lstm") is None
+        tracker.record_component("a", "b", "c", "lstm", 1100.0, 1000.0)
         result = tracker.get_component_mape("a", "b", "c", "lstm")
-        assert isinstance(result, float)
+        assert isinstance(result, float) and result == 10.0
