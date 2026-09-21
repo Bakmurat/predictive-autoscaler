@@ -126,9 +126,11 @@ Both suites pass. Last full run 2026-09-20: Go `go vet` + `go test -race` green;
 
 ## Roadmap
 
-1. Switch the LSTM activation off `relu` and clamp the served forecast against the seasonal
-   pattern, then re-run `eval/offline_eval.py`. If the network still cannot beat previous-day
-   by 10%, remove it and serve the seasonal pattern alone.
+1. One bounded stabilisation experiment, properly controlled: `tanh` activation as one arm
+   and gradient clipping as a separate arm, never both at once, with seeded initialisation
+   and a production-equivalent training configuration, judged against the strongest baseline.
+   Reject invalid forecasts through a documented fallback and report raw and guarded outputs
+   separately.
 2. Validation of the newest forecasting model (five input features, direct six-step output, robust scaling) against the benchmark.
 3. Adaptive blend weights in place of the fixed 0.70-to-0.908 schedule.
 4. A training-time validation gate so a new model can never replace a better one.
@@ -142,33 +144,35 @@ Note on numbers: request-rate figures in the simulator configuration (for exampl
 
 ## What the measurements say
 
-An offline evaluation on 2026-09-21 drove this repository's own training, inference and
-control code over rolling origins across five scenario families and multiple seeds
-(`eval/RESULTS-2026-09-21.md`). Two findings, and they disagree:
+An offline evaluation on 2026-09-21 drove this repository's own training and inference code
+over rolling origins (`eval/RESULTS-2026-09-21.md`). One finding survived review:
 
-**Forecasting works.** Replaying the operator's real rules, scaling from a forecast cut the
-ten-minute intervals where capacity was short from **12 to 3-5**, for about **1.4% more
-replica-minutes**, against purely reactive scaling. That is the premise of this project and
-it held up.
+**The neural forecaster's errors are large and unstable on synthetic repeating traffic.**
+On five interpretable runs it was the worst of six forecasters tested, behind this project's
+own seasonal-pattern component and behind a one-line previous-day baseline. Worse, on
+*identical* input data two runs differed by ten orders of magnitude in error (6.1x10^3
+against 3.4x10^13 MAE) because the network's initialisation is unseeded. A forecaster whose
+error varies that much between runs on the same data is not ready to be relied on.
 
-**The neural network does not.** The LSTM lost to a one-line previous-day baseline in **10
-of 10 runs**, and in **4 of 10** its output diverged by one to eleven orders of magnitude.
-The best forecaster measured was this project's own seasonal-pattern component on its own -
-the arithmetic one, not the learned one. The preregistered bar (10% lower error than the
-strongest baseline) was not approached in any run.
+That is the whole claim. Three things it is **not**:
 
-So: keep the predictive layer, and treat the network as an experiment that has not paid off
-on this workload. The roadmap below reflects that. If you are looking for a forecaster to
-copy, copy the seasonal pattern.
+- It is not a verdict on predictive autoscaling. An earlier version of this section claimed
+  forecasting beat reactive scaling on a capacity replay; that replay was a flawed
+  approximation of the real controller and its numbers are withdrawn.
+- It is not a verdict on regime change. The level-shift, spike and weekly scenarios never
+  entered the scored window, so they measured ordinary repeating traffic. Those results are
+  withdrawn.
+- It is not grounds to delete the network. Five runs on one synthetic profile, with a
+  training setup that is not production-equivalent, do not settle that. The roadmap below
+  gives it one bounded, properly controlled attempt.
 
-Every number above comes from synthetic traffic. The benchmark cluster had not yet
-accumulated enough real history to score, and nothing here measures latency - replay models
-capacity arriving, not response time.
+Every number is from synthetic traffic: the benchmark cluster had not accumulated enough
+real history to score. Nothing here measures latency.
 
 ## Limitations
 
 - Not deployed to production anywhere; evaluated so far only against synthetic traffic in the author's own environments. The first controlled evaluation is published in `eval/RESULTS-2026-09-21.md` and it is not flattering to the neural component; a live benchmark is running (`deploy/eks-benchmark/`) and its results will be published the same way, whatever they show.
-- The LSTM's training is not numerically stable: four of ten evaluation runs diverged. The `relu` activation inside the LSTM layers is the first suspect. Until that is resolved the served forecast has no clamp against a diverged network.
+- The LSTM's training is not numerically stable: on identical data, separate runs produced errors ten orders of magnitude apart. The cause is not established -- the `relu` activation in the LSTM layers is one hypothesis, and the unseeded initialisation is another. Until it is understood, an invalid forecast has no documented rejection path.
 - One target metric in practice (request rate per pod); CPU and memory paths exist in the schema but are not trained.
 - Model files live on a ReadWriteOnce volume, so a single forecasting replica is supported.
 - The API group `autoscaler.example.com` is a placeholder to rename before use.
