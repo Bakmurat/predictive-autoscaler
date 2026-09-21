@@ -586,18 +586,22 @@ class LSTMForecastModel:
         # fall back to the pattern's own support when that share is zero.
         network_share = float(np.mean([1.0 - w for w in pattern_weights])) if pattern_weights \
             else 1.0
-        if agreement is not None and network_share > 0.0:
+        if pattern_available:
             # Support term: one matched day is thin evidence, several days is better. Saturates
             # at three days, which is the most the 0.3^(d-1) weighting meaningfully uses.
             supports = [r["support"] for r in (getattr(self, "last_pattern_per_step", None) or [])
                         if r.get("available")]
             support_term = min(1.0, (float(np.mean(supports)) / 3.0)) if supports else 0.5
-            agreement_term = network_share * agreement + (1.0 - network_share) * support_term
-        elif agreement is None and pattern_available:
-            # Pattern serving alone with no network opinion to compare: judge it on its support.
-            supports = [r["support"] for r in (getattr(self, "last_pattern_per_step", None) or [])
-                        if r.get("available")]
-            agreement_term = min(1.0, (float(np.mean(supports)) / 3.0)) if supports else 0.5
+            if network_share > 0.0 and agreement is not None:
+                agreement_term = network_share * agreement + (1.0 - network_share) * support_term
+            else:
+                # C-76: the network is NOT in the served forecast (zero share), or there is no
+                # opinion to compare. Either way the served forecast is the pattern, and its
+                # confidence rests on the pattern's own support. The previous branch order let
+                # "agreement is not None and share == 0" fall through to the neutral 0.5, so a
+                # forced pattern-only forecast scored 0.73958 whether it stood on one matched
+                # day or seven -- support was bypassed exactly where it was the only evidence.
+                agreement_term = support_term
         else:
             # No second component at all: the neutral 0.5 the single-step path has always used,
             # never the 1.0 that self-comparison produced.

@@ -130,3 +130,39 @@ def test_evaluate_with_partial_history_returns_finite_mae_and_reports_genuine_st
     assert out["pattern_steps_total"] == out["sequences_scored"] * STEPS_AHEAD
     assert 0 < out["pattern_steps_genuine"] < out["pattern_steps_total"], (
         "precondition: this history must leave some steps genuine and some not")
+
+
+# ---------------------------------------------------------------------------------------
+# 4. Pattern-only confidence must rest on the pattern's support (the zero-share branch).
+# ---------------------------------------------------------------------------------------
+def _pattern_only_confidence(days: int) -> tuple[float, float, int]:
+    seasonal = daily_series(8, END)
+    m = fitted(seasonal, history=daily_series(days, END))
+    m.pattern_weight_override = 1.0          # the network is NOT in the served forecast
+    out = m.predict(steps_ahead=STEPS_AHEAD, origin=END)
+    comp = out["components"]
+    assert comp["pattern_available"] is True and all(comp["pattern_available_per_step"])
+    assert comp["network_share"] == 0.0, "precondition: this must exercise the zero-share branch"
+    supports = [r["support"] for r in comp["pattern_per_step"] if r["available"]]
+    return out["confidence"], comp["network_share"], int(np.mean(supports))
+
+
+NEUTRAL_FALLTHROUGH = 0.5 * 0.5 + 0.5 * max(0.4, 1.0 - (STEPS_AHEAD / 288))   # 0.73958
+
+
+def test_pattern_only_confidence_reflects_support_and_differs_thin_vs_thick():
+    """Codex C-76: with the weight forced to one, thin and thick history both returned
+    0.73958, because non-null agreement plus zero network share fell through to the neutral
+    default and bypassed support. This test drives the ACTUAL zero-share branch."""
+    thin_conf, thin_share, thin_support = _pattern_only_confidence(days=2)   # one matched day
+    thick_conf, thick_share, thick_support = _pattern_only_confidence(days=8)  # several
+
+    assert thin_support < thick_support, "precondition: more history means more support"
+    assert thin_conf != pytest.approx(NEUTRAL_FALLTHROUGH, abs=1e-6), (
+        f"thin history fell through to the neutral value {thin_conf:.5f}")
+    assert thick_conf != pytest.approx(NEUTRAL_FALLTHROUGH, abs=1e-6), (
+        f"thick history fell through to the neutral value {thick_conf:.5f}")
+    assert thick_conf > thin_conf, (thin_conf, thick_conf)
+    # One matched day is thin evidence: support term 1/3.
+    horizon = max(0.4, 1.0 - (STEPS_AHEAD / 288))
+    assert thin_conf == pytest.approx(max(0.3, min(0.9, 0.5 * (1 / 3) + 0.5 * horizon)), abs=1e-6)
