@@ -731,11 +731,59 @@ def failure_modes(verbose: bool = True):
 
 
 # ======================================================================================
+def _print_run(r):
+    o = r["overall"]
+    order = ("served_blend", "network_only", "seasonal_pattern", "previous_day",
+             "persistence", "trend_adaptive")
+    best = min((k for k in order if o.get(k, {}).get("mae") is not None),
+               key=lambda k: o[k]["mae"])
+    print("   " + "  ".join(f"{k.split('_')[0]}={o[k]['mae']}" for k in order
+                            if o.get(k, {}).get("mae") is not None), flush=True)
+    print(f"   scored={r['origins_scored']}/{r['origins_offered']}  "
+          f"strongest baseline/arm: {best}  decisions={r['operational'].get('reactive_only', {}).get('decisions_from')}",
+          flush=True)
+
+
+def run_sweep(out_path: Path, days: int = 12, cap: int = 400, epochs: int = 50,
+              data_seeds=(1, 2), model_seed: int = 101):
+    """The production-equivalent sweep (Codex C-54)."""
+    scenarios = ("repeating", "trend", "levelshift", "spike", "weekly")
+    runs, skipped = [], []
+    for scenario in scenarios:
+        for seed in data_seeds:
+            print(f"\n== {scenario} (data seed {seed}, model seed {model_seed})", flush=True)
+            series = make_series(scenario, days=days, seed=seed)
+            try:
+                r = evaluate_scenario(series, scenario, seed, epochs=epochs, max_origins=cap,
+                                      model_seed=model_seed, verbose=False)
+            except WindowCoverageError as exc:
+                print(f"   SKIPPED (window coverage): {exc}", flush=True)
+                skipped.append({"scenario": scenario, "seed": seed, "reason": str(exc)})
+                continue
+            if r:
+                runs.append(r)
+                _print_run(r)
+
+    out = {"generated_at": datetime.utcnow().isoformat() + "Z",
+           "kind": "production_equivalent_sweep",
+           "preregistered_margin": PREREGISTERED_MARGIN,
+           "config": {"days": days, "origin_cap": cap, "epochs": epochs,
+                      "train_window_days": 7, "data_seeds": list(data_seeds),
+                      "model_seed": model_seed, "profile": "k6 hourly step"},
+           "skipped": skipped, "runs": runs}
+    out_path.write_text(json.dumps(out, indent=2, default=str))
+    print(f"\nwrote {out_path}", flush=True)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--quick", action="store_true", help="smoke run")
-    ap.add_argument("--full", action="store_true", help="the reported run")
+    ap.add_argument("--full", action="store_true", help="the production-equivalent sweep")
     ap.add_argument("--failure-modes", action="store_true")
+    ap.add_argument("--epochs", type=int, default=50)
+    ap.add_argument("--cap", type=int, default=400)
+    ap.add_argument("--model-seed", type=int, default=101)
     ap.add_argument("--out", default=str(Path(__file__).parent / "results.json"))
     args = ap.parse_args()
 
@@ -746,45 +794,11 @@ def main():
         return
 
     if args.quick:
-        plan = [("repeating", [1], 6, 5, 40)]
-        days = 6
-    else:
-        # Origins are capped at 400 per run (about 2.8 days of rolling origins) to keep the
-        # whole sweep under half an hour on one laptop CPU. The cap is stated in RESULTS.
-        plan = [("repeating", [1, 2, 3], 12, 12, 400),
-                ("trend", [1, 2], 12, 12, 400),
-                ("levelshift", [1, 2], 12, 12, 400),
-                ("spike", [1, 2], 12, 12, 400),
-                ("weekly", [1], 12, 12, 400)]
-        days = 12
+        run_sweep(Path(args.out), days=8, cap=200, epochs=5, data_seeds=(1,),
+                  model_seed=args.model_seed)
+        return
 
-    all_results = []
-    for scenario, seeds, epochs, _e2, cap in plan:
-        for seed in seeds:
-            print(f"\n== {scenario} (seed {seed})", flush=True)
-            s = make_series(scenario, days=days, seed=seed)
-            r = evaluate_scenario(s, scenario, seed, epochs=epochs, max_origins=cap)
-            if r:
-                all_results.append(r)
-                b = r["overall"]
-                print(f"   served_blend MAE {b['served_blend']['mae']}  "
-                      f"network_only MAE {b['network_only']['mae']}  "
-                      f"previous_day MAE {b['previous_day']['mae']}  "
-                      f"seasonal MAE {b['seasonal_pattern']['mae']}", flush=True)
-
-    bench = load_benchmark_series(Path(__file__).parent / "data" / "benchmark-nginx-test.json")
-    if bench is not None and len(bench) > SEQ + 2 * STEPS_AHEAD:
-        print(f"\n== benchmark cluster history ({len(bench)} points)", flush=True)
-        r = evaluate_scenario(bench, "benchmark_real", 0, epochs=12,
-                              max_origins=None if args.full else 20)
-        if r:
-            all_results.append(r)
-
-    out = {"generated_at": datetime.utcnow().isoformat() + "Z",
-           "preregistered_margin": PREREGISTERED_MARGIN,
-           "runs": all_results}
-    Path(args.out).write_text(json.dumps(out, indent=2, default=str))
-    print(f"\nwrote {args.out}")
+    run_sweep(Path(args.out), epochs=args.epochs, cap=args.cap, model_seed=args.model_seed)
 
 
 if __name__ == "__main__":
