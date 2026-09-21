@@ -182,6 +182,8 @@ pattern, this project's own arithmetic component; trend, level shift and weekly 
 a simple trend-adaptive rule. A forecaster that selects between those two automatically is the
 obvious thing to build from this and **has not been tested**.
 
+A bounded stabilisation experiment ([`eval/RESULTS-stabilization-2026-09-22.md`](eval/RESULTS-stabilization-2026-09-22.md)) found that `tanh` activation cuts the network's seed-to-seed error spread sharply — 7.42x down to 1.08x on the workload where `relu` is worst — while gradient clipping made things worse and was the only change that caused divergences. Neither was shown to remove the divergence outright, because the original failure did not reproduce under single-training repetitions.
+
 Treat the neural component as experimental and optional. It is not the reason this system
 works, and the project should not be described as though it were.
 

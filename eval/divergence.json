@@ -1,0 +1,219 @@
+{
+  "generated_at": "2026-09-21T22:53:49.186027Z",
+  "kind": "divergence_reproduction",
+  "original_conditions": {
+    "epochs": 12,
+    "history": "expanding",
+    "seeded": false
+  },
+  "divergence_factor": 10.0,
+  "arms": {
+    "original_relu": {
+      "activation": "relu",
+      "clipnorm": null
+    },
+    "a_tanh": {
+      "activation": "tanh",
+      "clipnorm": null
+    },
+    "b_clipnorm": {
+      "activation": "relu",
+      "clipnorm": 1.0
+    },
+    "c_both": {
+      "activation": "tanh",
+      "clipnorm": 1.0
+    }
+  },
+  "results": [
+    {
+      "scenario": "repeating",
+      "data_seed": 2,
+      "epochs": 12,
+      "history": "expanding",
+      "train_points": 1642,
+      "scored_origins": 80,
+      "seasonal_baseline_mae": 174.64,
+      "divergence_threshold": 1746.4,
+      "arms": {
+        "original_relu": {
+          "config": {
+            "activation": "relu",
+            "clipnorm": null
+          },
+          "seeds": {
+            "None": {
+              "mae": 199.09,
+              "worst_abs_error": 604.62,
+              "train_seconds": 94.9,
+              "diverged": false
+            }
+          },
+          "runs": 5,
+          "diverged_runs": 0,
+          "diverged_seeds": [],
+          "mae_min": 175.55,
+          "mae_max": 209.81,
+          "max_over_min": 1.2
+        },
+        "a_tanh": {
+          "config": {
+            "activation": "tanh",
+            "clipnorm": null
+          },
+          "seeds": {
+            "None": {
+              "mae": 170.51,
+              "worst_abs_error": 673.97,
+              "train_seconds": 95.5,
+              "diverged": false
+            }
+          },
+          "runs": 5,
+          "diverged_runs": 0,
+          "diverged_seeds": [],
+          "mae_min": 170.51,
+          "mae_max": 231.52,
+          "max_over_min": 1.36
+        },
+        "b_clipnorm": {
+          "config": {
+            "activation": "relu",
+            "clipnorm": 1.0
+          },
+          "seeds": {
+            "None": {
+              "mae": 198.98,
+              "worst_abs_error": 598.62,
+              "train_seconds": 100.9,
+              "diverged": false
+            }
+          },
+          "runs": 5,
+          "diverged_runs": 2,
+          "diverged_seeds": [
+            "None",
+            "None"
+          ],
+          "mae_min": 180.54,
+          "mae_max": 216.62,
+          "max_over_min": 1.2
+        },
+        "c_both": {
+          "config": {
+            "activation": "tanh",
+            "clipnorm": 1.0
+          },
+          "seeds": {
+            "None": {
+              "mae": 197.75,
+              "worst_abs_error": 649.3,
+              "train_seconds": 97.4,
+              "diverged": false
+            }
+          },
+          "runs": 5,
+          "diverged_runs": 0,
+          "diverged_seeds": [],
+          "mae_min": 181.38,
+          "mae_max": 204.38,
+          "max_over_min": 1.13
+        }
+      }
+    },
+    {
+      "scenario": "weekly",
+      "data_seed": 2,
+      "epochs": 12,
+      "history": "expanding",
+      "train_points": 1642,
+      "scored_origins": 80,
+      "seasonal_baseline_mae": 175.23,
+      "divergence_threshold": 1752.3,
+      "arms": {
+        "original_relu": {
+          "config": {
+            "activation": "relu",
+            "clipnorm": null
+          },
+          "seeds": {
+            "None": {
+              "mae": 1485.85,
+              "worst_abs_error": 3009.96,
+              "train_seconds": 94.6,
+              "diverged": false
+            }
+          },
+          "runs": 5,
+          "diverged_runs": 0,
+          "diverged_seeds": [],
+          "mae_min": 200.12,
+          "mae_max": 1485.85,
+          "max_over_min": 7.42
+        },
+        "a_tanh": {
+          "config": {
+            "activation": "tanh",
+            "clipnorm": null
+          },
+          "seeds": {
+            "None": {
+              "mae": 215.46,
+              "worst_abs_error": 693.55,
+              "train_seconds": 95.2,
+              "diverged": false
+            }
+          },
+          "runs": 5,
+          "diverged_runs": 0,
+          "diverged_seeds": [],
+          "mae_min": 201.22,
+          "mae_max": 216.79,
+          "max_over_min": 1.08
+        },
+        "b_clipnorm": {
+          "config": {
+            "activation": "relu",
+            "clipnorm": 1.0
+          },
+          "seeds": {
+            "None": {
+              "mae": 202.16,
+              "worst_abs_error": 573.46,
+              "train_seconds": 95.3,
+              "diverged": false
+            }
+          },
+          "runs": 5,
+          "diverged_runs": 1,
+          "diverged_seeds": [
+            "None"
+          ],
+          "mae_min": 202.16,
+          "mae_max": 564.68,
+          "max_over_min": 2.79
+        },
+        "c_both": {
+          "config": {
+            "activation": "tanh",
+            "clipnorm": 1.0
+          },
+          "seeds": {
+            "None": {
+              "mae": 231.68,
+              "worst_abs_error": 816.76,
+              "train_seconds": 96.2,
+              "diverged": false
+            }
+          },
+          "runs": 5,
+          "diverged_runs": 0,
+          "diverged_seeds": [],
+          "mae_min": 187.22,
+          "mae_max": 233.82,
+          "max_over_min": 1.25
+        }
+      }
+    }
+  ]
+}

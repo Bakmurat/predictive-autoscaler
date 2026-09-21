@@ -31,6 +31,11 @@ Note what this does *not* say: no arm here selects between those two automatical
 combined seasonal/trend forecaster that picks per workload — the obvious thing to build from
 this result — **has not been tested**, and might well beat everything in the table.
 
+The stabilisation arms are now reported separately in
+[`RESULTS-stabilization-2026-09-22.md`](RESULTS-stabilization-2026-09-22.md): no arm was shown
+to remove the divergence, `tanh` reduces seed-to-seed spread substantially, and gradient
+clipping was the only change that *caused* divergences.
+
 **Not established:** anything about real traffic (all series are synthetic), anything about
 latency (the replay models capacity, not response time), operational benefit (one run per
 scenario), and whether the network's across-seed divergence is fixable — that is a separate
@@ -76,6 +81,14 @@ eval/.venv/bin/python eval/offline_eval.py --full --epochs 50 --cap 400 \
 Raw output: `eval/results-corrected.json`.
 
 ## Accuracy — MAE, lower is better
+
+> **Equivalence caveat (applies to every table below).** This is a *modified-model,
+> partial-controller* evaluation. The trainer's outer 80/20 split is now mirrored, but the
+> API's matured-error feedback loop (matured MAPE into the effective percentile) is **not**
+> exercised, and the Go replay calls selected controller functions rather than the full
+> forecasting and reconciliation path, with confidence dampening absent. Numbers here are not
+> production measurements.
+
 
 | Scenario | data seed | origins scored | served blend | network only | seasonal pattern | previous day | persistence | trend adaptive | strongest |
 |---|---|---|---|---|---|---|---|---|---|
