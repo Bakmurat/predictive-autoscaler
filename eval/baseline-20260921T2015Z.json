@@ -1,0 +1,560 @@
+{
+  "kind": "accuracy_baseline_pre_change",
+  "generated_at": "2026-09-21T20:03:00.158318+00:00",
+  "series": "eval/data/series-fresh.json",
+  "history_start": "2026-09-20T18:30:00Z",
+  "series_points": 153,
+  "series_span_hours": 25.333,
+  "window": 144,
+  "counts": {
+    "origins": 4,
+    "deployed_pattern_unavailable": 1,
+    "deployed_pattern_available": 3,
+    "api_gate_withheld": 1,
+    "span_guard_refused": 1,
+    "steps_possible": 24,
+    "steps_served_by_deployed": 18,
+    "steps_discarded": 6,
+    "neighbour_substituted_steps": 0,
+    "network_unavailable": 4
+  },
+  "records": [
+    {
+      "origin": "2026-09-21T18:25:28",
+      "window_points": 144,
+      "window_span_hours": 23.833,
+      "full_history_points": 144,
+      "full_span_hours": 23.833,
+      "api_gate_passed": false,
+      "span_guard_refused": true,
+      "percentile": {
+        "direction": "falling",
+        "direction_pct": 70,
+        "mape_pct": 75,
+        "effective_pct": 70,
+        "prev_mean": 4601.074692187937,
+        "last_mean": 3625.0331482489687
+      },
+      "blend_weights_pattern": [
+        0.7,
+        0.7416666666666666,
+        0.7833333333333333,
+        0.825,
+        0.8666666666666666,
+        0.9083333333333333
+      ],
+      "network": {
+        "available": false,
+        "reason": "no trained model on the benchmark"
+      },
+      "confidence_deployed": 0.7395833333333333,
+      "pattern_possible_per_step": [
+        {
+          "step": 1,
+          "target_at": "2026-09-21T18:35:28",
+          "support": 1,
+          "matched_source_timestamps": [
+            "2026-09-20T18:35:28"
+          ],
+          "available": true,
+          "value": 3000.0
+        },
+        {
+          "step": 2,
+          "target_at": "2026-09-21T18:45:28",
+          "support": 1,
+          "matched_source_timestamps": [
+            "2026-09-20T18:45:28"
+          ],
+          "available": true,
+          "value": 3000.0
+        },
+        {
+          "step": 3,
+          "target_at": "2026-09-21T18:55:28",
+          "support": 1,
+          "matched_source_timestamps": [
+            "2026-09-20T18:55:28"
+          ],
+          "available": true,
+          "value": 3000.0
+        },
+        {
+          "step": 4,
+          "target_at": "2026-09-21T19:05:28",
+          "support": 1,
+          "matched_source_timestamps": [
+            "2026-09-20T19:05:28"
+          ],
+          "available": true,
+          "value": 2399.777777777778
+        },
+        {
+          "step": 5,
+          "target_at": "2026-09-21T19:15:28",
+          "support": 1,
+          "matched_source_timestamps": [
+            "2026-09-20T19:15:28"
+          ],
+          "available": true,
+          "value": 2400.0
+        },
+        {
+          "step": 6,
+          "target_at": "2026-09-21T19:25:28",
+          "support": 1,
+          "matched_source_timestamps": [
+            "2026-09-20T19:25:28"
+          ],
+          "available": true,
+          "value": 2400.0
+        }
+      ],
+      "pattern_deployed": {
+        "source": "withheld_by_api_gate",
+        "values": null,
+        "steps_served": 0
+      },
+      "matured": [
+        {
+          "step": 1,
+          "actual": 2999.777777777778,
+          "signed_error": 0.2222222222221717
+        },
+        {
+          "step": 2,
+          "actual": 3000.444444444445,
+          "signed_error": -0.44444444444479814
+        },
+        {
+          "step": 3,
+          "actual": 3000.2222222222226,
+          "signed_error": -0.22222222222262644
+        },
+        {
+          "step": 4,
+          "actual": 2400.2222222222226,
+          "signed_error": -0.44444444444479814
+        },
+        {
+          "step": 5,
+          "actual": 2400.0,
+          "signed_error": 0.0
+        },
+        {
+          "step": 6,
+          "actual": 2399.9917039187876,
+          "signed_error": 0.008296081212392892
+        }
+      ]
+    },
+    {
+      "origin": "2026-09-21T18:35:28",
+      "window_points": 144,
+      "window_span_hours": 23.833,
+      "full_history_points": 145,
+      "full_span_hours": 24.0,
+      "api_gate_passed": true,
+      "span_guard_refused": false,
+      "percentile": {
+        "direction": "falling",
+        "direction_pct": 70,
+        "mape_pct": 75,
+        "effective_pct": 70,
+        "prev_mean": 4476.000618113864,
+        "last_mean": 3416.699814915635
+      },
+      "blend_weights_pattern": [
+        0.7,
+        0.7416666666666666,
+        0.7833333333333333,
+        0.825,
+        0.8666666666666666,
+        0.9083333333333333
+      ],
+      "network": {
+        "available": false,
+        "reason": "no trained model on the benchmark"
+      },
+      "confidence_deployed": 0.7395833333333333,
+      "pattern_possible_per_step": [
+        {
+          "step": 1,
+          "target_at": "2026-09-21T18:45:28",
+          "support": 1,
+          "matched_source_timestamps": [
+            "2026-09-20T18:45:28"
+          ],
+          "available": true,
+          "value": 3000.0
+        },
+        {
+          "step": 2,
+          "target_at": "2026-09-21T18:55:28",
+          "support": 1,
+          "matched_source_timestamps": [
+            "2026-09-20T18:55:28"
+          ],
+          "available": true,
+          "value": 3000.0
+        },
+        {
+          "step": 3,
+          "target_at": "2026-09-21T19:05:28",
+          "support": 1,
+          "matched_source_timestamps": [
+            "2026-09-20T19:05:28"
+          ],
+          "available": true,
+          "value": 2399.777777777778
+        },
+        {
+          "step": 4,
+          "target_at": "2026-09-21T19:15:28",
+          "support": 1,
+          "matched_source_timestamps": [
+            "2026-09-20T19:15:28"
+          ],
+          "available": true,
+          "value": 2400.0
+        },
+        {
+          "step": 5,
+          "target_at": "2026-09-21T19:25:28",
+          "support": 1,
+          "matched_source_timestamps": [
+            "2026-09-20T19:25:28"
+          ],
+          "available": true,
+          "value": 2400.0
+        },
+        {
+          "step": 6,
+          "target_at": "2026-09-21T19:35:28",
+          "support": 1,
+          "matched_source_timestamps": [
+            "2026-09-20T19:35:28"
+          ],
+          "available": true,
+          "value": 2399.5555555555557
+        }
+      ],
+      "pattern_deployed": {
+        "source": "seasonal_history",
+        "values": [
+          3000.0,
+          3000.0,
+          2399.777777777778,
+          2400.0,
+          2400.0,
+          2399.5555555555557
+        ],
+        "steps_served": 6
+      },
+      "matured": [
+        {
+          "step": 1,
+          "actual": 3000.444444444445,
+          "signed_error": -0.44444444444479814
+        },
+        {
+          "step": 2,
+          "actual": 3000.2222222222226,
+          "signed_error": -0.22222222222262644
+        },
+        {
+          "step": 3,
+          "actual": 2400.2222222222226,
+          "signed_error": -0.44444444444479814
+        },
+        {
+          "step": 4,
+          "actual": 2400.0,
+          "signed_error": 0.0
+        },
+        {
+          "step": 5,
+          "actual": 2399.9917039187876,
+          "signed_error": 0.008296081212392892
+        },
+        {
+          "step": 6,
+          "actual": 2400.0,
+          "signed_error": -0.4444444444443434
+        }
+      ]
+    },
+    {
+      "origin": "2026-09-21T18:45:28",
+      "window_points": 144,
+      "window_span_hours": 23.833,
+      "full_history_points": 146,
+      "full_span_hours": 24.167,
+      "api_gate_passed": true,
+      "span_guard_refused": false,
+      "percentile": {
+        "direction": "falling",
+        "direction_pct": 70,
+        "mape_pct": 75,
+        "effective_pct": 70,
+        "prev_mean": 4350.963581076827,
+        "last_mean": 3208.403518619339
+      },
+      "blend_weights_pattern": [
+        0.7,
+        0.7416666666666666,
+        0.7833333333333333,
+        0.825,
+        0.8666666666666666,
+        0.9083333333333333
+      ],
+      "network": {
+        "available": false,
+        "reason": "no trained model on the benchmark"
+      },
+      "confidence_deployed": 0.7395833333333333,
+      "pattern_possible_per_step": [
+        {
+          "step": 1,
+          "target_at": "2026-09-21T18:55:28",
+          "support": 1,
+          "matched_source_timestamps": [
+            "2026-09-20T18:55:28"
+          ],
+          "available": true,
+          "value": 3000.0
+        },
+        {
+          "step": 2,
+          "target_at": "2026-09-21T19:05:28",
+          "support": 1,
+          "matched_source_timestamps": [
+            "2026-09-20T19:05:28"
+          ],
+          "available": true,
+          "value": 2399.777777777778
+        },
+        {
+          "step": 3,
+          "target_at": "2026-09-21T19:15:28",
+          "support": 1,
+          "matched_source_timestamps": [
+            "2026-09-20T19:15:28"
+          ],
+          "available": true,
+          "value": 2400.0
+        },
+        {
+          "step": 4,
+          "target_at": "2026-09-21T19:25:28",
+          "support": 1,
+          "matched_source_timestamps": [
+            "2026-09-20T19:25:28"
+          ],
+          "available": true,
+          "value": 2400.0
+        },
+        {
+          "step": 5,
+          "target_at": "2026-09-21T19:35:28",
+          "support": 1,
+          "matched_source_timestamps": [
+            "2026-09-20T19:35:28"
+          ],
+          "available": true,
+          "value": 2399.5555555555557
+        },
+        {
+          "step": 6,
+          "target_at": "2026-09-21T19:45:28",
+          "support": 1,
+          "matched_source_timestamps": [
+            "2026-09-20T19:45:28"
+          ],
+          "available": true,
+          "value": 2400.2222222222226
+        }
+      ],
+      "pattern_deployed": {
+        "source": "seasonal_history",
+        "values": [
+          3000.0,
+          2399.777777777778,
+          2400.0,
+          2400.0,
+          2399.5555555555557,
+          2400.2222222222226
+        ],
+        "steps_served": 6
+      },
+      "matured": [
+        {
+          "step": 1,
+          "actual": 3000.2222222222226,
+          "signed_error": -0.22222222222262644
+        },
+        {
+          "step": 2,
+          "actual": 2400.2222222222226,
+          "signed_error": -0.44444444444479814
+        },
+        {
+          "step": 3,
+          "actual": 2400.0,
+          "signed_error": 0.0
+        },
+        {
+          "step": 4,
+          "actual": 2399.9917039187876,
+          "signed_error": 0.008296081212392892
+        },
+        {
+          "step": 5,
+          "actual": 2400.0,
+          "signed_error": -0.4444444444443434
+        },
+        {
+          "step": 6,
+          "actual": 2400.003555595062,
+          "signed_error": 0.21866662716047358
+        }
+      ]
+    },
+    {
+      "origin": "2026-09-21T18:55:28",
+      "window_points": 144,
+      "window_span_hours": 23.833,
+      "full_history_points": 147,
+      "full_span_hours": 24.333,
+      "api_gate_passed": true,
+      "span_guard_refused": false,
+      "percentile": {
+        "direction": "falling",
+        "direction_pct": 70,
+        "mape_pct": 75,
+        "effective_pct": 70,
+        "prev_mean": 4225.888888888889,
+        "last_mean": 3000.14425936008
+      },
+      "blend_weights_pattern": [
+        0.7,
+        0.7416666666666666,
+        0.7833333333333333,
+        0.825,
+        0.8666666666666666,
+        0.9083333333333333
+      ],
+      "network": {
+        "available": false,
+        "reason": "no trained model on the benchmark"
+      },
+      "confidence_deployed": 0.7395833333333333,
+      "pattern_possible_per_step": [
+        {
+          "step": 1,
+          "target_at": "2026-09-21T19:05:28",
+          "support": 1,
+          "matched_source_timestamps": [
+            "2026-09-20T19:05:28"
+          ],
+          "available": true,
+          "value": 2399.777777777778
+        },
+        {
+          "step": 2,
+          "target_at": "2026-09-21T19:15:28",
+          "support": 1,
+          "matched_source_timestamps": [
+            "2026-09-20T19:15:28"
+          ],
+          "available": true,
+          "value": 2400.0
+        },
+        {
+          "step": 3,
+          "target_at": "2026-09-21T19:25:28",
+          "support": 1,
+          "matched_source_timestamps": [
+            "2026-09-20T19:25:28"
+          ],
+          "available": true,
+          "value": 2400.0
+        },
+        {
+          "step": 4,
+          "target_at": "2026-09-21T19:35:28",
+          "support": 1,
+          "matched_source_timestamps": [
+            "2026-09-20T19:35:28"
+          ],
+          "available": true,
+          "value": 2399.5555555555557
+        },
+        {
+          "step": 5,
+          "target_at": "2026-09-21T19:45:28",
+          "support": 1,
+          "matched_source_timestamps": [
+            "2026-09-20T19:45:28"
+          ],
+          "available": true,
+          "value": 2400.2222222222226
+        },
+        {
+          "step": 6,
+          "target_at": "2026-09-21T19:55:28",
+          "support": 1,
+          "matched_source_timestamps": [
+            "2026-09-20T19:55:28"
+          ],
+          "available": true,
+          "value": 2400.2222222222226
+        }
+      ],
+      "pattern_deployed": {
+        "source": "seasonal_history",
+        "values": [
+          2399.777777777778,
+          2400.0,
+          2400.0,
+          2399.5555555555557,
+          2400.2222222222226,
+          2400.2222222222226
+        ],
+        "steps_served": 6
+      },
+      "matured": [
+        {
+          "step": 1,
+          "actual": 2400.2222222222226,
+          "signed_error": -0.44444444444479814
+        },
+        {
+          "step": 2,
+          "actual": 2400.0,
+          "signed_error": 0.0
+        },
+        {
+          "step": 3,
+          "actual": 2399.9917039187876,
+          "signed_error": 0.008296081212392892
+        },
+        {
+          "step": 4,
+          "actual": 2400.0,
+          "signed_error": -0.4444444444443434
+        },
+        {
+          "step": 5,
+          "actual": 2400.003555595062,
+          "signed_error": 0.21866662716047358
+        },
+        {
+          "step": 6,
+          "actual": 2400.0,
+          "signed_error": 0.22222222222262644
+        }
+      ]
+    }
+  ]
+}

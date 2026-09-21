@@ -519,6 +519,12 @@ class LSTMForecastModel:
             # for the pattern (the pre-fix behaviour) made the blend a no-op and pinned agreement
             # at 1.0, inflating confidence.
             pattern_preds = lstm_rescaled.copy()
+            step_available = np.zeros(steps_ahead, dtype=bool)
+        else:
+            # D-88: availability is per step. A NaN step has no previous-day observation and
+            # falls back to the network for that step ALONE, rather than borrowing a neighbour.
+            step_available = ~np.isnan(pattern_preds)
+            pattern_preds = np.where(step_available, pattern_preds, lstm_rescaled)
 
         # --- Blend strategies ---
         final_predictions = []
@@ -526,7 +532,7 @@ class LSTMForecastModel:
         pattern_weights = []
         for step in range(steps_ahead):
             pattern_weight = min(0.95, 0.7 + (step / max(steps_ahead, 1)) * 0.25)
-            if not pattern_available:
+            if not pattern_available or not bool(step_available[step]):
                 pattern_weight = 0.0  # network only; do not pretend a second opinion exists
             pattern_weights.append(float(pattern_weight))
             lstm_weight = 1.0 - pattern_weight
@@ -543,10 +549,15 @@ class LSTMForecastModel:
         floor_pct_value = 0.0  # Phase 16 (D-13): was 0.05
 
         # --- Confidence calculation ---
-        # Agreement is only meaningful when two independent components exist (C-44).
-        if pattern_available and len(final_predictions) > 1:
-            agreement = 1.0 - np.mean(np.abs(lstm_rescaled - pattern_preds) /
-                                      (np.maximum(lstm_rescaled, pattern_preds) + 1e-8))
+        # Agreement is only meaningful on steps where two INDEPENDENT components exist (C-44,
+        # D-88). A step that fell back to the network holds the network's own value in
+        # pattern_preds; including it would compare the network with itself and drive agreement
+        # towards 1.0 on exactly the steps with no second opinion.
+        agree_steps = np.flatnonzero(step_available) if pattern_available else np.array([], int)
+        if len(agree_steps) > 0:
+            agreement = 1.0 - np.mean(
+                np.abs(lstm_rescaled[agree_steps] - pattern_preds[agree_steps]) /
+                (np.maximum(lstm_rescaled[agree_steps], pattern_preds[agree_steps]) + 1e-8))
             agreement = float(max(0.0, min(1.0, agreement)))
         else:
             agreement = None
@@ -577,6 +588,9 @@ class LSTMForecastModel:
                 'pattern': pattern_preds.tolist() if hasattr(pattern_preds, 'tolist') else list(pattern_preds),
                 'pattern_source': pattern_source,
                 'pattern_available': bool(pattern_available),
+                'pattern_available_per_step': [bool(x) for x in step_available],
+                'pattern_steps_available': int(np.count_nonzero(step_available)),
+                'pattern_per_step': getattr(self, 'last_pattern_per_step', None),
                 'pattern_weights': pattern_weights,
                 'agreement': agreement,
                 'blended': blended_pre_floor,
@@ -608,16 +622,18 @@ class LSTMForecastModel:
             logger.warning("pattern lookup: seasonal history is not timestamp-indexed")
             return None, "unindexed"
 
-        span = (s.index[-1] - s.index[0]).total_seconds()
-        if span < 24 * 3600:
-            # Less than one full day cannot contain yesterday's value for any target.
-            return None, "network_fallback"
-
+        # D-88: there is no span guard. The old one refused the whole lookup below a 24h span on
+        # the premise that "less than one full day cannot contain yesterday's value for any
+        # target". The premise is false: targets lie in the FUTURE of the last observation, so a
+        # 23h50m window already contains yesterday's value for every step (step k's target is
+        # origin+10(k+1)min, whose previous-day time is origin-1440+10(k+1)min, i.e. no earlier
+        # than origin-23h50m). Availability is decided per step, below, and reported per step.
         tolerance = pd.Timedelta(minutes=5)
         pattern, any_hit = [], False
+        per_step = []
         for step in range(steps_ahead):
             target = pd.Timestamp(origin) + pd.Timedelta(minutes=10 * (step + 1))
-            day_values, day_weights = [], []
+            day_values, day_weights, matched = [], [], []
             for d in range(1, 8):
                 want = target - pd.Timedelta(days=d)
                 if want < s.index[0] - tolerance:
@@ -628,22 +644,31 @@ class LSTMForecastModel:
                 if abs(s.index[pos] - want) <= tolerance:
                     day_values.append(float(s.iloc[pos]))
                     day_weights.append(0.3 ** (d - 1))
+                    matched.append(s.index[pos].isoformat())
             if day_values:
                 any_hit = True
                 pattern.append(float(weighted_percentile(day_values, day_weights, effective_pct)))
             else:
                 pattern.append(np.nan)
+            per_step.append({
+                "step": step + 1,
+                "target_at": target.isoformat(),
+                "available": bool(day_values),
+                "support": len(day_values),
+                "matched_source_timestamps": matched,
+            })
 
+        self.last_pattern_per_step = per_step
         if not any_hit:
             return None, "no_matching_history"
 
-        # Fill any step with no history from the nearest step that had one.
+        # D-88: no neighbour substitution. A step with no previous-day observation must SAY SO
+        # (NaN) so the caller can fall back to the network for that step alone. Borrowing the
+        # nearest step's value invented a previous-day observation that does not exist and hid
+        # the gap from the confidence calculation and from the forecast record.
         arr = np.array(pattern, dtype=float)
-        if np.isnan(arr).any():
-            good = np.flatnonzero(~np.isnan(arr))
-            for i in np.flatnonzero(np.isnan(arr)):
-                arr[i] = arr[good[np.argmin(np.abs(good - i))]]
-        return arr, "seasonal_history"
+        source = "seasonal_history" if not np.isnan(arr).any() else "seasonal_history_partial"
+        return arr, source
 
     def evaluate(self, test_data: pd.DataFrame, target_column: str = 'value',
                  imputed: Optional[np.ndarray] = None) -> Dict:

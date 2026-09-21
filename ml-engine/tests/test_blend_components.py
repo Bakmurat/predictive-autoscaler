@@ -82,28 +82,41 @@ def test_pattern_component_differs_from_network():
     assert np.all(final >= lo - 1e-6) and np.all(final <= hi + 1e-6)
 
 
-def test_one_day_of_history_is_not_enough_and_is_declared():
-    """Exactly sequence_length points cannot supply a previous-day lookup: say so."""
+def test_one_day_of_history_does_supply_the_lookup():
+    """Exactly sequence_length points DO supply a previous-day lookup for every step.
+
+    Superseded 2026-09-21 (Codex C-67 / D-88). This test previously asserted
+    `pattern_source == "network_fallback"` for a one-window history, encoding the premise that
+    "less than one full day cannot contain yesterday's value". That premise is false: the
+    targets lie in the FUTURE of the last observation, so step k's previous-day time is
+    origin-1440+10(k+1) min, no earlier than origin-23h50m -- inside a complete 144-point
+    window. The old expectation was stale, not a regression; the code now serves those steps.
+    """
     end = datetime(2026, 3, 2, 12, 0, tzinfo=timezone.utc).replace(tzinfo=None)
     seasonal = daily_series(days=8, end=end)
     m = _fitted_model(seasonal)
     m.seasonal_history = seasonal.iloc[-PER_DAY:]  # the inference window only
 
     out = m.predict(steps_ahead=STEPS_AHEAD, origin=end)
-    assert out["components"]["pattern_source"] == "network_fallback"
-    assert out["components"]["pattern_available"] is False
+    assert out["components"]["pattern_source"] == "seasonal_history"
+    assert out["components"]["pattern_available"] is True
+    assert out["components"]["pattern_steps_available"] == STEPS_AHEAD
     assert out["confidence"] <= 0.9
 
 
 def test_agreement_is_not_pinned_when_pattern_is_missing():
-    """A missing pattern must not be reported as perfect component agreement."""
+    """A missing pattern must not be reported as perfect component agreement.
+
+    The "missing" setup was updated with D-88: a single inference window is no longer missing
+    a pattern, so genuinely-insufficient history (two hours) is used instead.
+    """
     end = datetime(2026, 3, 2, 12, 0, tzinfo=timezone.utc).replace(tzinfo=None)
     seasonal = daily_series(days=8, end=end)
 
     with_pattern = _fitted_model(seasonal)
     with_pattern.seasonal_history = seasonal
     without = _fitted_model(seasonal)
-    without.seasonal_history = seasonal.iloc[-PER_DAY:]
+    without.seasonal_history = seasonal.iloc[-12:]  # two hours: no step reaches yesterday
 
     a = with_pattern.predict(steps_ahead=STEPS_AHEAD, origin=end)
     b = without.predict(steps_ahead=STEPS_AHEAD, origin=end)
@@ -112,6 +125,7 @@ def test_agreement_is_not_pinned_when_pattern_is_missing():
         "agreement was computed from the pattern standing in for the network, "
         "which pins it at 1.0"
     )
+    assert b["components"]["pattern_available"] is False
     assert a["components"]["agreement"] is not None
 
 

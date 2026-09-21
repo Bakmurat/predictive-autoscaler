@@ -535,12 +535,17 @@ class LSTMPredictor:
                 all_values = np.array([v for _, v in window])
                 window_timestamps = [datetime.utcfromtimestamp(t) for t, _ in window]
                 forecast_origin = window_timestamps[-1]
-                # C-44: the pattern lookup needs MORE than one day of history, indexed by
-                # timestamp. `window` is exactly sequence_length points (one day), so passing it
-                # as the seasonal history silently disabled the pattern and made the blend a
-                # no-op. Use the full masked, validated series the caller supplied instead.
+                # C-44: the pattern lookup needs history indexed by timestamp; `window` is exactly
+                # sequence_length points, so passing it as the seasonal history silently disabled
+                # the pattern and made the blend a no-op.
+                # D-88: the old `len(pts) > len(window)` gate withheld the history entirely when
+                # the caller supplied exactly one window. That threw away a usable lookup: a
+                # complete 144-point window spans 23h50m and already contains yesterday's value
+                # for all six targets, because the targets lie in the FUTURE of the last
+                # observation. Hand over whatever timestamped history exists and let the model
+                # decide availability per step.
                 seasonal_history = None
-                if len(pts) > len(window):
+                if pts:
                     seasonal_history = pd.Series(
                         [v for _, v in pts],
                         index=pd.DatetimeIndex([datetime.utcfromtimestamp(t) for t, _ in pts]),
