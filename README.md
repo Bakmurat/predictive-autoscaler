@@ -18,7 +18,7 @@ Built by [Bakmurat Kubanaliev](#author). Apache-2.0.
 |---|---|
 | **Demand forecasting** | A three-layer bidirectional LSTM (128/64/32 units) forecasts the next 60 minutes of request rate in six 10-minute steps from the last 24 hours of history. |
 | **Asymmetric training objective** | The loss penalizes under-prediction twice as heavily as over-prediction, because scaling too late costs more than scaling too early. |
-| **Hybrid forecast** | Model output is blended with the workload's own seven-day time-of-day pattern (blend weight 0.70 to 0.95 across the horizon), so forecasts keep the true shape of the daily peak instead of regressing to the mean. |
+| **Hybrid forecast** | Model output is blended with the workload's own previous-day time-of-day pattern, looked up by timestamp over up to seven prior days (pattern weight 0.70 at the first step rising to 0.908 at the sixth), so forecasts keep the shape of the daily peak instead of regressing to the mean. When less than a day of history is available the pattern is unavailable and the network is served alone, which the response reports. |
 | **Continuous learning** | A scheduled job retrains every six hours on the previous seven days and publishes the model to the forecasting service without downtime. |
 | **Declarative operator** | A Go operator (controller-runtime) driven by a `PredictiveAutoscaler` custom resource: target Deployment, replica bounds, per-pod targets, horizon, lead time, and reconcile interval. |
 | **Additive safety model** | Replicas are set to the **highest** of the forecast baseline, the live reactive requirement, and the configured minimum. The forecast can only add capacity. |
@@ -128,7 +128,7 @@ Both suites pass. Last full run 2026-09-20: Go `go vet` + `go test -race` green;
 
 1. Controlled accuracy benchmark with held-out days and a documented metric; published results.
 2. Validation of the newest forecasting model (five input features, direct six-step output, robust scaling) against the benchmark.
-3. Adaptive blend weights in place of the fixed 0.70 to 0.95 schedule.
+3. Adaptive blend weights in place of the fixed 0.70-to-0.908 schedule.
 4. A training-time validation gate so a new model can never replace a better one.
 5. Multi-tenant model management, CPU and memory forecasting paths, CRD validation and defaults via webhooks, Helm chart, end-to-end operator tests on kind.
 

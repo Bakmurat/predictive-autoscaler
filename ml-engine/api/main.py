@@ -460,16 +460,27 @@ class LSTMPredictor:
                 # 1. last_sequence reflects current state (not training-time state)
                 # 2. raw_training_values is time-aligned for historical pattern lookup
                 all_values = np.array([v for _, v in window])
+                window_timestamps = [datetime.utcfromtimestamp(t) for t, _ in window]
+                forecast_origin = window_timestamps[-1]
+                # C-44: the pattern lookup needs MORE than one day of history, indexed by
+                # timestamp. `window` is exactly sequence_length points (one day), so passing it
+                # as the seasonal history silently disabled the pattern and made the blend a
+                # no-op. Use the full masked, validated series the caller supplied instead.
+                seasonal_history = None
+                if len(pts) > len(window):
+                    seasonal_history = pd.Series(
+                        [v for _, v in pts],
+                        index=pd.DatetimeIndex([datetime.utcfromtimestamp(t) for t, _ in pts]),
+                    ).sort_index()
                 if hasattr(model, 'scaler') and model.scaler is not None and len(all_values) >= model.sequence_length:
                     recent_scaled = model.scaler.transform(
                         all_values[-model.sequence_length:].reshape(-1, 1)
                     ).flatten()
                     model.last_sequence = recent_scaled
-                    # Update raw_training_values so historical pattern lookup
-                    # is aligned with the current prediction time, not training time
-                    model.raw_training_values = all_values
                     logger.info(f"Updated model with fresh data: {len(all_values)} points "
-                                f"(range: {all_values.min():.0f} - {all_values.max():.0f})")
+                                f"(range: {all_values.min():.0f} - {all_values.max():.0f}); "
+                                f"seasonal history: "
+                                f"{0 if seasonal_history is None else len(seasonal_history)} points")
 
                 # Make predictions (at 10-min data resolution)
                 steps_ahead = horizon_minutes // 10  # Predictions every 10 minutes
@@ -488,7 +499,12 @@ class LSTMPredictor:
                     mape = 0.0
                 model.mape_for_floor = mape
 
-                prediction_result = model.predict(steps_ahead=steps_ahead, confidence_level=0.95)
+                prediction_result = model.predict(
+                    steps_ahead=steps_ahead, confidence_level=0.95,
+                    origin=forecast_origin,                 # C-45: the last OBSERVED timestamp
+                    input_timestamps=window_timestamps,     # C-45: real calendar features
+                    seasonal_history=seasonal_history,      # C-44: a real second component
+                )
 
                 # Return flat predictions array (Go operator compatible)
                 predicted_values = [round(float(v), 2) for v in prediction_result['predictions']]
@@ -694,7 +710,14 @@ async def predict(request: Dict):
         try:
             components = prediction.get("components", {})
             if components:
-                for component_name, values in components.items():
+                # Only the numeric per-step series are gauges. `components` also carries
+                # descriptive fields (pattern_source, pattern_available, agreement,
+                # pattern_weights) added with the C-44 fix; iterating those blindly would
+                # emit one gauge per character of a string.
+                for component_name in ("lstm", "pattern", "blended", "final"):
+                    values = components.get(component_name)
+                    if not isinstance(values, (list, tuple)):
+                        continue
                     for i, val in enumerate(values):
                         PREDICTION_RPM_GAUGE.labels(
                             application=application,

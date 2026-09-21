@@ -282,18 +282,30 @@ class LSTMForecastModel:
             'metadata': self.metadata
         }
 
-    def predict(self, steps_ahead: int = STEPS_AHEAD, confidence_level: float = 0.95) -> Dict:
+    def predict(self, steps_ahead: int = STEPS_AHEAD, confidence_level: float = 0.95,
+                origin: Optional[datetime] = None,
+                input_timestamps: Optional[list] = None,
+                seasonal_history: Optional[pd.Series] = None) -> Dict:
         """
         Make predictions using Dense(6) direct multi-step output with hybrid blending.
 
         Phase 16: Single forward pass replaces autoregressive loop.
         1. LSTM direct multi-step prediction (single model.predict call)
-        2. Historical pattern lookup (same time-of-day from recent days)
+        2. Historical pattern lookup (same time-of-day on previous days)
         3. Blend both, weighted toward the pattern for longer horizons
 
         Args:
             steps_ahead: Number of future steps (Dense(6) always outputs 6, sliced if fewer requested)
             confidence_level: Confidence level
+            origin: Forecast origin -- the timestamp of the LAST input observation. Targets are
+                origin + 10min * (step + 1). Defaults to `input_timestamps[-1]`, else wall-clock UTC.
+                (C-45: wall clock is only a last resort; it makes replay non-deterministic.)
+            input_timestamps: Actual timestamps of `last_sequence`, used for the calendar features.
+                Falls back to `self.input_timestamps`, then to a grid ending at `origin`.
+            seasonal_history: Timestamp-indexed observations covering MORE than one day, used for
+                the previous-day pattern lookup. Falls back to `self.seasonal_history`.
+                (C-44: the 144-point inference window cannot supply a previous-day value; passing it
+                here silently turned the blend into a no-op.)
 
         Returns:
             Dictionary with predictions and confidence
@@ -301,11 +313,24 @@ class LSTMForecastModel:
         if not self.is_trained:
             raise ValueError("Model must be trained before making predictions")
 
-        # --- Strategy 1: LSTM direct multi-step prediction (Phase 16) ---
-        # Generate time features for the 144-point last_sequence ending at "now"
-        now = datetime.utcnow()
-        seq_timestamps = [now - timedelta(minutes=10 * (self.sequence_length - 1 - i))
-                          for i in range(self.sequence_length)]
+        # --- Forecast origin and input calendar features (C-45) ---
+        if input_timestamps is None:
+            input_timestamps = getattr(self, 'input_timestamps', None)
+        if origin is None:
+            if input_timestamps is not None and len(input_timestamps):
+                origin = pd.Timestamp(input_timestamps[-1]).to_pydatetime()
+            else:
+                origin = datetime.utcnow()
+                logger.warning("predict(): no origin and no input timestamps; "
+                               "falling back to wall-clock UTC, which is not replayable")
+        origin = pd.Timestamp(origin).tz_localize(None).to_pydatetime() \
+            if pd.Timestamp(origin).tzinfo is not None else pd.Timestamp(origin).to_pydatetime()
+
+        if input_timestamps is not None and len(input_timestamps) == self.sequence_length:
+            seq_timestamps = [pd.Timestamp(t).to_pydatetime() for t in input_timestamps]
+        else:
+            seq_timestamps = [origin - timedelta(minutes=10 * (self.sequence_length - 1 - i))
+                              for i in range(self.sequence_length)]
         seq_time_features = generate_time_features(seq_timestamps)
 
         # Build input: (1, 144, 5) -- [scaled_value, hour_sin, hour_cos, dow_sin, dow_cos]
@@ -347,36 +372,28 @@ class LSTMForecastModel:
         else:
             effective_pct = max(50, min(75, min(direction_pct, mape_pct)))
 
-        # --- Strategy 2: Historical pattern lookup ---
-        raw_values = getattr(self, 'raw_training_values', None)
-        if raw_values is not None and len(raw_values) > 144:
-            points_per_day = 144
-            n_days = len(raw_values) // points_per_day
-
-            pattern_predictions = []
-            for step in range(steps_ahead):
-                day_values = []
-                day_weights = []
-                for d in range(1, min(n_days, 8)):
-                    idx = len(raw_values) - (d * points_per_day) + step
-                    if 0 <= idx < len(raw_values):
-                        day_values.append(raw_values[idx])
-                        day_weights.append(0.3 ** (d - 1))
-
-                if day_values:
-                    pattern_predictions.append(float(weighted_percentile(day_values, day_weights, effective_pct)))
-                else:
-                    pattern_predictions.append(float(lstm_rescaled[step]))
-
-            pattern_preds = np.array(pattern_predictions)
-        else:
+        # --- Strategy 2: previous-day pattern, looked up BY TIMESTAMP (C-44, C-45) ---
+        if seasonal_history is None:
+            seasonal_history = getattr(self, 'seasonal_history', None)
+        pattern_preds, pattern_source = self._pattern_forecast(
+            origin=origin, steps_ahead=steps_ahead, seasonal_history=seasonal_history,
+            effective_pct=effective_pct)
+        pattern_available = pattern_preds is not None
+        if not pattern_available:
+            # No seasonal history: serve the network alone and SAY SO. Substituting the network
+            # for the pattern (the pre-fix behaviour) made the blend a no-op and pinned agreement
+            # at 1.0, inflating confidence.
             pattern_preds = lstm_rescaled.copy()
 
         # --- Blend strategies ---
         final_predictions = []
         blended_pre_floor = []
+        pattern_weights = []
         for step in range(steps_ahead):
             pattern_weight = min(0.95, 0.7 + (step / max(steps_ahead, 1)) * 0.25)
+            if not pattern_available:
+                pattern_weight = 0.0  # network only; do not pretend a second opinion exists
+            pattern_weights.append(float(pattern_weight))
             lstm_weight = 1.0 - pattern_weight
 
             blended = lstm_weight * lstm_rescaled[step] + pattern_weight * pattern_preds[step]
@@ -391,34 +408,107 @@ class LSTMForecastModel:
         floor_pct_value = 0.0  # Phase 16 (D-13): was 0.05
 
         # --- Confidence calculation ---
-        if len(final_predictions) > 1:
-            agreement = 1.0 - np.mean(np.abs(lstm_rescaled - pattern_preds) / (np.maximum(lstm_rescaled, pattern_preds) + 1e-8))
-            agreement = max(0.0, min(1.0, agreement))
+        # Agreement is only meaningful when two independent components exist (C-44).
+        if pattern_available and len(final_predictions) > 1:
+            agreement = 1.0 - np.mean(np.abs(lstm_rescaled - pattern_preds) /
+                                      (np.maximum(lstm_rescaled, pattern_preds) + 1e-8))
+            agreement = float(max(0.0, min(1.0, agreement)))
         else:
-            agreement = 0.5
+            agreement = None
 
         horizon_penalty = max(0.4, 1.0 - (steps_ahead / 288))
-        confidence = 0.5 * agreement + 0.5 * horizon_penalty
+        # Without a second component there is no agreement evidence: use the neutral 0.5 that the
+        # single-step path has always used, never the 1.0 that self-comparison produced.
+        agreement_term = agreement if agreement is not None else 0.5
+        confidence = 0.5 * agreement_term + 0.5 * horizon_penalty
         confidence = max(0.3, min(0.9, confidence))
 
         logger.info(f"Prediction blend: LSTM range [{lstm_rescaled.min():.0f}-{lstm_rescaled.max():.0f}], "
-                     f"Pattern range [{pattern_preds.min():.0f}-{pattern_preds.max():.0f}], "
+                     f"Pattern range [{pattern_preds.min():.0f}-{pattern_preds.max():.0f}] "
+                     f"(source={pattern_source}), "
                      f"Final range [{final_predictions.min():.0f}-{final_predictions.max():.0f}], "
-                     f"pct={effective_pct:.0f}, "
+                     f"pct={effective_pct:.0f}, origin={origin.isoformat()}, "
                      f"confidence={confidence:.3f}")
 
         return {
             'predictions': final_predictions,
             'confidence': float(confidence),
             'model_type': 'lstm',
+            'origin': origin.isoformat(),
+            'target_timestamps': [(origin + timedelta(minutes=10 * (s + 1))).isoformat()
+                                  for s in range(steps_ahead)],
             'components': {
                 'lstm': lstm_rescaled.tolist() if hasattr(lstm_rescaled, 'tolist') else list(lstm_rescaled),
                 'pattern': pattern_preds.tolist() if hasattr(pattern_preds, 'tolist') else list(pattern_preds),
+                'pattern_source': pattern_source,
+                'pattern_available': bool(pattern_available),
+                'pattern_weights': pattern_weights,
+                'agreement': agreement,
                 'blended': blended_pre_floor,
                 'final': [float(v) for v in final_predictions],
             },
             'floor_pct': float(floor_pct_value)
         }
+
+    def _pattern_forecast(self, origin: datetime, steps_ahead: int,
+                          seasonal_history, effective_pct: float):
+        """Previous-day-same-time lookup, indexed by timestamp.
+
+        Returns (values, source). `values` is None when no genuine previous-day observation is
+        available for any step -- the caller must then serve the network alone rather than
+        blending the network with itself (C-44).
+
+        Each step's target time is origin + 10min*(step+1); we look for that clock time on each of
+        the previous up to seven days, weighting the most recent day most heavily.
+        """
+        if seasonal_history is None or len(seasonal_history) == 0:
+            return None, "unavailable"
+        try:
+            s = pd.Series(seasonal_history)
+            idx = pd.DatetimeIndex(s.index)
+            if idx.tz is not None:
+                idx = idx.tz_convert(None)
+            s = pd.Series(s.values, index=idx).sort_index()
+        except Exception:
+            logger.warning("pattern lookup: seasonal history is not timestamp-indexed")
+            return None, "unindexed"
+
+        span = (s.index[-1] - s.index[0]).total_seconds()
+        if span < 24 * 3600:
+            # Less than one full day cannot contain yesterday's value for any target.
+            return None, "network_fallback"
+
+        tolerance = pd.Timedelta(minutes=5)
+        pattern, any_hit = [], False
+        for step in range(steps_ahead):
+            target = pd.Timestamp(origin) + pd.Timedelta(minutes=10 * (step + 1))
+            day_values, day_weights = [], []
+            for d in range(1, 8):
+                want = target - pd.Timedelta(days=d)
+                if want < s.index[0] - tolerance:
+                    break
+                pos = s.index.get_indexer([want], method="nearest")[0]
+                if pos < 0:
+                    continue
+                if abs(s.index[pos] - want) <= tolerance:
+                    day_values.append(float(s.iloc[pos]))
+                    day_weights.append(0.3 ** (d - 1))
+            if day_values:
+                any_hit = True
+                pattern.append(float(weighted_percentile(day_values, day_weights, effective_pct)))
+            else:
+                pattern.append(np.nan)
+
+        if not any_hit:
+            return None, "no_matching_history"
+
+        # Fill any step with no history from the nearest step that had one.
+        arr = np.array(pattern, dtype=float)
+        if np.isnan(arr).any():
+            good = np.flatnonzero(~np.isnan(arr))
+            for i in np.flatnonzero(np.isnan(arr)):
+                arr[i] = arr[good[np.argmin(np.abs(good - i))]]
+        return arr, "seasonal_history"
 
     def evaluate(self, test_data: pd.DataFrame, target_column: str = 'value',
                  imputed: Optional[np.ndarray] = None) -> Dict:
