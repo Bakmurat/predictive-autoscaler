@@ -768,6 +768,7 @@ class LSTMForecastModel:
         # same sequences when a seasonal history is available, and report both, so "the model
         # scored X" cannot be read as "the deployed forecaster scores X".
         served_pred = None
+        genuine_pattern_steps = 0
         seasonal = getattr(self, 'seasonal_history', None)
         if seasonal is not None and len(seasonal) and len(X_test):
             try:
@@ -782,6 +783,14 @@ class LSTMForecastModel:
                         served[k] = test_pred[k]
                         continue
                     for step in range(test_pred.shape[1]):
+                        # C-75: per-step fallback, exactly as predict() serves it. A NaN
+                        # pattern step means no previous-day observation; the served value
+                        # there is the network alone. Without this, one missing step made
+                        # the whole MAE NaN.
+                        if np.isnan(pattern[step]):
+                            served[k, step] = test_pred[k, step]
+                            continue
+                        genuine_pattern_steps += 1
                         w = min(0.95, 0.7 + (step / max(test_pred.shape[1], 1)) * 0.25)
                         served[k, step] = (1.0 - w) * test_pred[k, step] + w * pattern[step]
                 served_pred = served
@@ -812,6 +821,10 @@ class LSTMForecastModel:
             'network_only': network,
             'sequences_scored': int(len(X_test)),
             'sequences_dropped_imputed_target': int(n_eval_dropped),
+            # C-75: how much of the served score rests on a genuine pattern vs the network
+            # alone. Total cells = sequences * horizon steps.
+            'pattern_steps_genuine': int(genuine_pattern_steps),
+            'pattern_steps_total': int(len(X_test) * test_pred.shape[1]),
         }
 
     def _create_sequences(self, scaled_values: np.ndarray,

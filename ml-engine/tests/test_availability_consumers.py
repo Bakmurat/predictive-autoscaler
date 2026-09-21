@@ -100,3 +100,33 @@ def test_pattern_weight_override_is_honoured_only_where_the_pattern_exists():
     comp = out["components"]
     for i, a in enumerate(comp["pattern_available_per_step"]):
         assert comp["pattern_weights"][i] == (1.0 if a else 0.0)
+
+
+# ---------------------------------------------------------------------------------------
+# 3. evaluate() must score over the steps that have genuine values, never NaN the whole score.
+# ---------------------------------------------------------------------------------------
+class _StubModelN(_StubModel):
+    """Same constant network, but shaped (N, STEPS) for batched evaluate()."""
+
+    def predict(self, x, verbose=0):
+        return np.full((x.shape[0], STEPS_AHEAD), self.value_scaled, dtype=float)
+
+
+def test_evaluate_with_partial_history_returns_finite_mae_and_reports_genuine_steps():
+    seasonal = daily_series(8, END)
+    m = fitted(seasonal)
+    m.model = _StubModelN(m.model.value_scaled)
+    # A seasonal history that is deliberately SHORT relative to the evaluation window, so
+    # some evaluated origins cannot find a previous-day value for every step.
+    m.seasonal_history = seasonal.iloc[-(PER_DAY + 30):]
+
+    test_df = pd.DataFrame({"value": seasonal.values[-(PER_DAY + 60):]},
+                           index=seasonal.index[-(PER_DAY + 60):])
+    out = m.evaluate(test_df, target_column="value")
+
+    assert out["scored"] == "served_blend"
+    assert np.isfinite(out["mae"]), "pre-fix: one NaN pattern step made the whole MAE NaN"
+    assert np.isfinite(out["rmse"])
+    assert out["pattern_steps_total"] == out["sequences_scored"] * STEPS_AHEAD
+    assert 0 < out["pattern_steps_genuine"] < out["pattern_steps_total"], (
+        "precondition: this history must leave some steps genuine and some not")
