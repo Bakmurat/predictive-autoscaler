@@ -226,6 +226,15 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 				"nearPredictionRPM", fmt.Sprintf("%.0f", prediction.Predictions[0]),
 				"currentRPM", fmt.Sprintf("%.0f", currentRPM),
 				"maxSaneRPM", fmt.Sprintf("%.0f", maxSaneRPM))
+			// Mark the recorded issuance as rejected so a scorer never scores it, and clear any
+			// overestimate override left by earlier reconciles: a discarded forecast must not keep
+			// bypassing the scale-down holds (observed in the 2026-09-20 functional test).
+			r.recordSanityRejection(&autoscaler, key, prediction.Predictions[0], currentRPM, maxSaneRPM)
+			if st := r.getOrCreateScaleState(key); st.overrideActive || st.overestimateStreak > 0 {
+				st.overrideActive = false
+				st.overestimateStreak = 0
+				st.reEvalCounter = 0
+			}
 			predictedReplicas = reactiveReplicas
 			prediction = nil // Clear so overestimate check doesn't use garbage
 		}
@@ -614,17 +623,56 @@ func (r *PredictiveAutoscalerReconciler) recordForecast(
 			RPM      float64 `json:"rpm"`
 		}{Step: step, TargetAt: target.UTC().Format(time.RFC3339), RPM: v})
 	}
-	if path := os.Getenv("FORECAST_LOG"); path != "" {
-		if f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err != nil {
-			r.Log.Error(err, "forecast log not writable", "path", path)
-		} else {
-			line, _ := json.Marshal(rec)
-			if _, err := f.Write(append(line, '\n')); err != nil {
-				r.Log.Error(err, "forecast log write failed", "path", path)
-			}
-			_ = f.Close()
-		}
+	r.appendForecastLog(rec)
+}
+
+// appendForecastLog appends one JSON line to FORECAST_LOG (no-op when unset).
+func (r *PredictiveAutoscalerReconciler) appendForecastLog(v interface{}) {
+	path := os.Getenv("FORECAST_LOG")
+	if path == "" {
+		return
 	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		r.Log.Error(err, "forecast log not writable", "path", path)
+		return
+	}
+	defer f.Close()
+	line, _ := json.Marshal(v)
+	if _, err := f.Write(append(line, '\n')); err != nil {
+		r.Log.Error(err, "forecast log write failed", "path", path)
+	}
+}
+
+// sanityRejectionEvent is the JSON line written when a recorded forecast is discarded by the
+// divergence check. `issued_at` equals the `issued_at` of the forecast record it refers to, so a
+// scorer can exclude that issuance ("event":"sanity_rejected").
+type sanityRejectionEvent struct {
+	Event            string  `json:"event"`
+	IssuedAt         string  `json:"issued_at"`
+	Application      string  `json:"application"`
+	Namespace        string  `json:"namespace"`
+	RejectedAt       string  `json:"rejected_at"`
+	NearPredictionRP float64 `json:"near_prediction_rpm"`
+	CurrentRPM       float64 `json:"current_rpm"`
+	MaxSaneRPM       float64 `json:"max_sane_rpm"`
+}
+
+// recordSanityRejection writes the rejection event for the cached forecast of `key`.
+func (r *PredictiveAutoscalerReconciler) recordSanityRejection(
+	autoscaler *autoscalerv1alpha1.PredictiveAutoscaler, key string, near, current, maxSane float64,
+) {
+	issued := time.Now()
+	if c, ok := r.predictionCache[key]; ok && c != nil {
+		issued = c.fetchedAt
+	}
+	ev := sanityRejectionEvent{
+		Event: "sanity_rejected", IssuedAt: issued.UTC().Format(time.RFC3339),
+		Application: autoscaler.Spec.TargetDeployment.Name, Namespace: autoscaler.Spec.TargetDeployment.Namespace,
+		RejectedAt: time.Now().UTC().Format(time.RFC3339), NearPredictionRP: near, CurrentRPM: current, MaxSaneRPM: maxSane,
+	}
+	sanityRejectionsTotal.WithLabelValues(ev.Application, ev.Namespace).Inc()
+	r.appendForecastLog(ev)
 }
 
 // calculateScaleDownTarget applies stabilization and gradual reduction to scale-down.

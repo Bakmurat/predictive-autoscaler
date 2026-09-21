@@ -30,6 +30,15 @@ var (
 		[]string{"application", "namespace"},
 	)
 
+	// sanityRejectionsTotal counts forecasts discarded by the divergence check (first step > 10x live rate).
+	sanityRejectionsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "predictive_autoscaler_sanity_rejections_total",
+			Help: "Forecasts discarded by the divergence sanity check",
+		},
+		[]string{"application", "namespace"},
+	)
+
 	overestimateOverridesTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "predictive_autoscaler_overestimate_overrides_total",
@@ -135,6 +144,7 @@ func init() {
 		actualNeededReplicasGauge,
 		predictionErrorPercentGauge,
 		overestimateOverridesTotal,
+		sanityRejectionsTotal,
 		overestimateStreakGauge,
 		predictedRpmGauge,
 		currentRpmGauge,
