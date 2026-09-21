@@ -28,6 +28,8 @@ from __future__ import annotations
 import json
 import logging
 import math
+
+import numpy as np
 import os
 import time
 from dataclasses import asdict, dataclass, field
@@ -173,21 +175,34 @@ class ShadowObserver:
             return {k: [StepObservation.failed(i + 1, targets[i], why) for i in range(steps)]
                     for k in ("served_hybrid", "raw_network", "seasonal_only")}
         comp = out.get("components", {}) or {}
+        # C-75: per-step availability, not the all-or-nothing flag. A step with no genuine
+        # previous-day backing is unavailable even when other steps are served.
+        per_step_avail = comp.get("pattern_available_per_step")
+        if not isinstance(per_step_avail, (list, tuple)) or len(per_step_avail) < steps:
+            per_step_avail = [bool(comp.get("pattern_available", False))] * steps
         res = {}
         for key, src in (("served_hybrid", out.get("predictions")),
                          ("raw_network", comp.get("lstm")),
                          ("seasonal_only", comp.get("pattern"))):
-            if key == "seasonal_only" and not comp.get("pattern_available", False):
-                res[key] = [StepObservation.unavailable(i + 1, targets[i], "no genuine previous-day backing")
-                            for i in range(steps)]
-                continue
-            if not isinstance(src, (list, tuple)) or len(src) < steps:
+            # C-75: `predictions` is a NumPy array; rejecting it made EVERY hybrid step read
+            # as unavailable. Accept anything array-like.
+            try:
+                arr = list(np.asarray(src, dtype=object).ravel()) if src is not None else None
+            except Exception:
+                arr = None
+            if arr is None or len(arr) < steps:
                 res[key] = [StepObservation.unavailable(i + 1, targets[i], "component absent from the prediction")
                             for i in range(steps)]
                 continue
-            res[key] = [StepObservation(i + 1, targets[i], float(src[i])) if _finite(src[i])
-                        else StepObservation(i + 1, targets[i], None, "non_finite", key)
-                        for i in range(steps)]
+            obs = []
+            for i in range(steps):
+                if key == "seasonal_only" and not per_step_avail[i]:
+                    obs.append(StepObservation.unavailable(i + 1, targets[i], "no genuine previous-day backing"))
+                elif _finite(arr[i]):
+                    obs.append(StepObservation(i + 1, targets[i], float(arr[i])))
+                else:
+                    obs.append(StepObservation(i + 1, targets[i], None, "non_finite", key))
+            res[key] = obs
         return res
 
     # -- one issuance -----------------------------------------------------------------

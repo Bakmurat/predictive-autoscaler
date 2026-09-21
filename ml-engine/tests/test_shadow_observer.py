@@ -304,3 +304,43 @@ def test_memory_does_not_grow_with_the_number_of_records(tmp_path):
     after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     growth_mb = (after - before) / (1024 * 1024 if sys.platform == "darwin" else 1024)
     assert growth_mb < 50, f"grew {growth_mb:.1f} MB over 50 records"
+
+
+# C-75 ------------------------------------------------------------------------------------
+class ArrayModel(FakeModel):
+    """What the real API returns: `predictions` is a NumPy array, availability is per step."""
+    def __init__(self, per_step, **kw):
+        super().__init__(**kw)
+        self.per_step = list(per_step)
+
+    def predict(self, steps_ahead=STEPS, origin=None, seasonal_history=None, **kw):
+        self.calls += 1
+        import numpy as np
+        return {"predictions": np.full(steps_ahead, self.hybrid),
+                "components": {"lstm": np.full(steps_ahead, self.network),
+                               "pattern": [self.pattern if a else None for a in self.per_step],
+                               "pattern_available": any(self.per_step),
+                               "pattern_available_per_step": self.per_step}}
+
+
+def test_hybrid_step_is_recorded_available_when_the_api_served_it():
+    """`predictions` is a NumPy array in the real API; rejecting it made every hybrid step
+    read as unavailable, so the shadow comparison had nothing to compare."""
+    pts = series(END - GRID * (SEQ - 1), END)
+    rec = observer_with(pts, ArrayModel([True] * STEPS)).observe(issuance())
+    assert all(o["status"] == "ok" for o in rec.predictors["served_hybrid"]), (
+        [o["status"] for o in rec.predictors["served_hybrid"]])
+    assert [o["value"] for o in rec.predictors["served_hybrid"]] == [700.0] * STEPS
+
+
+def test_seasonal_only_honours_per_step_availability_not_the_global_flag():
+    """Two early steps have no previous-day backing; they must not be counted as seasonal
+    forecasts just because the global flag is true for the others."""
+    per_step = [False, False, True, True, True, True]
+    pts = series(END - GRID * (SEQ - 1), END)
+    rec = observer_with(pts, ArrayModel(per_step)).observe(issuance())
+    statuses = [o["status"] for o in rec.predictors["seasonal_only"]]
+    assert statuses[:2] == ["unavailable"] * 2, statuses
+    assert statuses[2:] == ["ok"] * 4, statuses
+    # And the raw network is unaffected by pattern availability.
+    assert all(o["status"] == "ok" for o in rec.predictors["raw_network"])
