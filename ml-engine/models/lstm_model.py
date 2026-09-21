@@ -126,10 +126,17 @@ def purged_split_indices(n_rows, sequence_length, steps_ahead, n_sequences=None)
     if n_sequences is None:
         n_sequences = max(0, n_rows - sequence_length - steps_ahead + 1)
     split_row = int(0.8 * n_rows)
-    first_target = np.arange(n_sequences) + sequence_length
-    last_target = first_target + steps_ahead - 1
-    train_idx = np.flatnonzero(last_target < split_row)
-    val_idx = np.flatnonzero(first_target >= split_row)
+    # Deliberately plain Python: the benchmark tooling lifts this function to decide
+    # eligibility without importing the model's dependencies, and one definition must
+    # serve both. The caller converts to arrays where it needs to index with them.
+    train_idx, val_idx = [], []
+    for i in range(n_sequences):
+        first_target = i + sequence_length
+        last_target = first_target + steps_ahead - 1
+        if last_target < split_row:
+            train_idx.append(i)
+        elif first_target >= split_row:
+            val_idx.append(i)
     return train_idx, val_idx
 
 
@@ -246,8 +253,10 @@ class LSTMForecastModel:
         # was added to remove. That fallback was active in every evaluation run to date, so
         # the fix was inert. There is no fallback now: if the series cannot support disjoint
         # label periods, training fails loudly.
-        train_idx, val_idx = purged_split_indices(
+        train_list, val_list = purged_split_indices(
             len(values), self.sequence_length, STEPS_AHEAD, n_sequences=len(X))
+        train_idx = np.asarray(train_list, dtype=int)
+        val_idx = np.asarray(val_list, dtype=int)
 
         if len(train_idx) == 0 or len(val_idx) == 0:
             raise ValueError(
