@@ -110,6 +110,23 @@ suite's exit status through its own logging (`set -o pipefail`, status read from
 proves the wrapper returns non-zero for a deliberately failing test and zero for a passing one.
 Nothing is pushed or deployed on a run that did not go through it.
 
+**The commit gate verifies the tree being committed, not the working directory.** Enable it
+once with `make setup` (`git config core.hooksPath .githooks`). `.githooks/pre-commit` runs
+`scripts/precommit-verify.sh`, which exports the *staged* tree with `git checkout-index` into a
+temporary directory and verifies that — never `git stash`, never `git reset`, never touching
+files you have not staged. The pass is bound to the staged tree hash plus the hashes of the
+verification script, the Makefile and the dependency manifests, and the staged hash is
+re-checked immediately before the commit is allowed, so a stage that changed while the suite
+ran does not inherit the pass. Partial-suite flags and an inherited `PYTEST_ARGS` are refused:
+a gate runs the whole suite or it is not a gate. It exists because a commit chain once ran the
+suite over a working directory holding a later change's tests against an earlier change's
+source, saw failures, and committed anyway. `make precommit-selftest` proves both halves: a
+clean staged tree commits even with an unstaged failing test present, and a staged failing test
+is refused.
+
+A local hook is bypassable (`git commit --no-verify`); it narrows the window rather than
+closing it. Protected CI on the remote is the stronger guarantee and is not yet configured.
+
 Both suites pass. Last full run 2026-09-20: Go `go vet` + `go test -race` green; Python 170 passed, 0 failed, executed inside a Kubernetes cluster on the runtime image (arm64) via `ml-engine/Dockerfile.tests`, which adds `requirements-dev.txt` (pytest, httpx) to the ml-api image and runs `python -m pytest -q ml-engine/tests` from the repository root. Build it with `docker build -f ml-engine/Dockerfile.tests --build-arg BASE=<ml-api image> .`.
 
 ## Repository layout

@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Publication gate: verify the exact tree being committed (Codex D-111).
+# Enable with:  git config core.hooksPath .githooks   (or: make setup)
+# See scripts/precommit-verify.sh for what it checks and why.
+exec "$(git rev-parse --show-toplevel)/scripts/precommit-verify.sh"
