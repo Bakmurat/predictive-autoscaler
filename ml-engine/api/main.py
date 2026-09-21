@@ -7,6 +7,7 @@ from typing import Dict, List, Optional
 import logging
 import os
 import json
+import math
 import sys
 import gc
 import asyncio
@@ -621,6 +622,10 @@ class LSTMPredictor:
                     "inference_window": {k: inference_fill[k] for k in ("window_slots", "imputed_in_window", "latest_observed", "latest_is_imputed", "gaps_filled", "mask")},
                     "provenance": "sidecar" if meta else "unknown",
                     "predictions": predicted_values,
+                    # C-79: the accuracy queue keys every step on ITS target timestamp. This key
+                    # was read at the queue loop but never written here, so `targets` was always
+                    # empty and the loop broke at step 0: nothing was ever queued for scoring.
+                    "target_timestamps": list(prediction_result.get("target_timestamps") or []),
                     "confidence": round(prediction_result['confidence'], 3),
                     "model_name": f"lstm_{application}_{metric_type}",
                     "timestamp": datetime.utcnow().isoformat(),
@@ -634,6 +639,18 @@ class LSTMPredictor:
             except Exception as e:
                 PREDICTION_ERRORS.labels(error_type=type(e).__name__).inc()
                 raise e
+
+def _finite_or_none(value):
+    """A finite float, or None for None/NaN/inf/unparseable. Used by the accuracy queue and
+    the per-component gauges so an unavailable step is skipped, not fatal (C-79)."""
+    if value is None:
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
 
 def _parse_iso(value):
     """ISO-8601 (with or without Z) -> naive UTC datetime, or None."""
@@ -804,20 +821,36 @@ async def predict(request: Dict):
             # Queue every step of THIS forecast against its own target timestamp.
             targets = (prediction or {}).get("target_timestamps") or []
             preds = (prediction or {}).get("predictions") or []
+            queued = {"final": 0, "lstm": 0, "pattern": 0, "blended": 0}
+            skipped_unavailable = {"lstm": 0, "pattern": 0, "blended": 0}
             for step, value in enumerate(preds):
                 if step >= len(targets):
                     break
                 target_at = _parse_iso(targets[step])
                 if target_at is None:
                     continue
-                accuracy_tracker.store_forecast(application, namespace, metric_type,
-                                                target_at, float(value))
+                # C-79: a component may be unavailable at THIS step (a pattern step with no
+                # previous-day observation is None; a failed network is NaN). float(None)
+                # raised here and aborted the loop after the first forecast, so later steps
+                # and components were never queued. Skip the unavailable value, keep going.
+                if _finite_or_none(value) is not None:
+                    accuracy_tracker.store_forecast(application, namespace, metric_type,
+                                                    target_at, float(value))
+                    queued["final"] += 1
                 for comp in ("lstm", "pattern", "blended"):
                     series = (prediction.get("components") or {}).get(comp)
-                    if isinstance(series, (list, tuple)) and step < len(series):
-                        accuracy_tracker.store_forecast(application, namespace, metric_type,
-                                                        target_at, float(series[step]),
-                                                        component=comp)
+                    if not isinstance(series, (list, tuple)) or step >= len(series):
+                        continue
+                    v = _finite_or_none(series[step])
+                    if v is None:
+                        skipped_unavailable[comp] += 1
+                        continue
+                    accuracy_tracker.store_forecast(application, namespace, metric_type,
+                                                    target_at, v, component=comp)
+                    queued[comp] += 1
+            if any(skipped_unavailable.values()):
+                logger.info(f"Accuracy queue for {application}/{metric_type}: queued {queued}, "
+                            f"skipped unavailable {skipped_unavailable}")
         except Exception as e:
             logger.warning(f"Accuracy tracking error (non-fatal): {e}")
 
@@ -834,12 +867,20 @@ async def predict(request: Dict):
                     if not isinstance(values, (list, tuple)):
                         continue
                     for i, val in enumerate(values):
-                        PREDICTION_RPM_GAUGE.labels(
-                            application=application,
-                            namespace=namespace,
-                            component=component_name,
-                            step=str(i + 1)
-                        ).set(float(val))
+                        labels = dict(application=application, namespace=namespace,
+                                      component=component_name, step=str(i + 1))
+                        v = _finite_or_none(val)
+                        if v is None:
+                            # C-79: float(None) aborted this loop mid-way and left the
+                            # remaining gauges STALE from the previous issuance. An
+                            # unavailable step must not keep showing last time's value:
+                            # remove the labelled series so scrapes see its absence.
+                            try:
+                                PREDICTION_RPM_GAUGE.remove(*labels.values())
+                            except KeyError:
+                                pass
+                            continue
+                        PREDICTION_RPM_GAUGE.labels(**labels).set(v)
 
             floor_pct = prediction.get("floor_pct", 0.0)
             FLOOR_PCT_GAUGE.labels(
