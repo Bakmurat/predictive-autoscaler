@@ -1,5 +1,39 @@
 # Online selector between cheap forecasters — offline experiment, 2026-09-22
 
+> ### ⚠ Corrected 2026-09-22 after Codex round 25 (C-96, C-97 / D-121, D-122)
+>
+> **The numbers in §3 and §4 are DESCRIPTIVE, not a clean comparison of optimised
+> alternatives.** Two defects in the experiment's machinery, both now repaired in
+> [`eval/selector.py`](selector.py):
+>
+> 1. **The parameter sweep changed the scoring objective as it went.** Each setting was ranked
+>    using *that setting's own* horizon weights, so a setting scoring only the two nearest
+>    steps was compared against one scoring all six. That ranks the difficulty of the horizon,
+>    not the quality of the forecast. The constant blend had the mirror fault: chosen under
+>    `uniform`, reported under `lead2`. There is now **one external objective** (`uniform`,
+>    the weighting the decision rule preregistered in `evaluation-protocol.md` §9) used for
+>    every score that is compared against another score; the selector's internal horizon
+>    weighting is tuned *against* it like any other parameter.
+> 2. **Two implementation promises failed.** An exact tie on penalised cost switched away from
+>    the incumbent, and the selector's own degradation and failure counts were hardcoded to
+>    zero so the S3 failure gate could not see a failure the selector had itself served.
+>
+> **What changed when the objective was fixed** (validation only — see the box in §3): the
+> preselected setting moves from `lead2`/min-obs 6 to **`uniform`/min-obs 18**, and the
+> `lead2` settings that topped the defective table at an apparent **295.04 rpm** become the
+> grid's **worst** at **391.89 rpm**. That 295 was two of six horizon steps, not a better
+> forecast.
+>
+> **The test numbers below have NOT been re-scored, deliberately.** Test seeds 11–13 are
+> consumed evidence (Codex D-124): re-running a repaired selection rule on a used test set is
+> a second look, not a fresh evaluation. The next evaluation uses new held-out seeds, dates
+> and preferably unseen regime shapes, frozen before the run — the protocol is
+> [`PROTOCOL-seasonal-default-selector.md`](PROTOCOL-seasonal-default-selector.md).
+>
+> The **verdict is unchanged and is not waived**: the recorded S2 rule rejects, and a
+> rejection recorded before the data is not reversed by discovering that the machinery was
+> also flawed. See §5 for how the rejection is now stated.
+
 **Verdict: the selector does not clear its predeclared bar. Keep the fixed baseline.**
 
 It clears the pooled-cost bar comfortably and it never loses badly, but it is **2.4 % worse than
@@ -106,6 +140,29 @@ Validation reference points, under the chosen weights: `seasonal_pattern` 651.4,
 *worst* setting scored 349.5, so the selector is not razor-sensitive to these choices — the whole
 216-point spread is 295–350 rpm.
 
+> **The table above is the DEFECTIVE preselection** (C-96): each row was ranked under its own
+> horizon weights. Re-running the identical grid, on the identical validation seeds, under the
+> single external objective gives a different winner —
+> [`selector-validation-20260922.json`](selector-validation-20260922.json),
+> `eval/selector.py --validation-only`:
+>
+> | | defective ranking | single external objective (`uniform`) |
+> |---|---|---|
+> | EWMA half-life | 6 | 6 |
+> | Horizon weights (selector-internal) | `lead2` | **`uniform`** |
+> | Minimum matured observations | 6 | **18** |
+> | Switching penalty | 5.402 rpm | 5.402 rpm |
+> | Startup default arm | `trend_adaptive` | `trend_adaptive` |
+> | Control blend weight | 0.25 | 0.25 |
+> | Winner's validation cost | 295.04 rpm (`lead2`-weighted) | **333.98 rpm** (`uniform`) |
+> | Winner's switch fraction | 0.044 | **0.020** |
+> | Grid's worst setting | 349.5 rpm | **391.89 rpm** — a `lead2` setting |
+> | Fixed arms on validation | seasonal 651.4 / trend 332.5 / lagged 354.4 | seasonal 651.4 / trend **388.9** / lagged **466.9** |
+>
+> The grid size (216), the median per-origin cost (270.09 rpm) and the control blend's scores
+> (438.49 / 503.90 / 574.28 for w = 0.25 / 0.5 / 0.75) are unchanged, because those were
+> already computed under `uniform`. What changed is every comparison that crossed a weighting.
+
 **Test set, built only after the parameters were frozen:** data seeds 11, 12, 13 from 2026-06-07,
 5 scenarios × 3 seeds = **15 runs, 10 800 origins**, 14-day series at 10-minute resolution, 720
 origins per run centred on each scenario's event, replica bounds 1–12, capacity denominator
@@ -114,7 +171,14 @@ the `weekly` scenario is genuinely a different series and not a reseeding of the
 
 ---
 
-## 4. Results
+## 4. Results — DESCRIPTIVE
+
+Everything in §4 was produced under the defective machinery described in the banner: scores
+weighted by `lead2` throughout the test evaluation, an incumbent that lost exact ties, and a
+selector whose failure count was asserted to be zero rather than measured. Read these as a
+**description of what that configuration did on those seeds**, not as a comparison of
+optimised alternatives. The ordering of the arms may well survive re-evaluation; nothing here
+establishes that it does.
 
 ### 4.1 Pooled over the test set (10 800 origins, 84 whole-day bootstrap blocks)
 
@@ -196,9 +260,30 @@ Predeclared in `eval/selector.py` before the test set existed.
 | **S3** no unacceptable operational regression | shortage ≤ +10 %, no new forecast failures, switching ≤ 10 % of origins | +3.7 % shortage, 0 failures, 4.2 % switching | **PASS** |
 
 **Verdict: KEEP THE FIXED BASELINE.** Two of three clear; the one that fails is the workload the
-benchmark actually runs, and it fails by a margin whose confidence interval does not contain
-zero. A 2.4 % regression on steady traffic is not catastrophic, but the bar said 2 %, the bar was
-written first, and moving it after seeing the number would make every future bar worthless.
+benchmark actually runs. A 2.4 % regression on steady traffic is not catastrophic, but the bar
+said 2 %, the bar was written first, and moving it after seeing the number would make every
+future bar worthless.
+
+> ### How the S2 rejection is correctly stated (Codex C-98 / D-123)
+>
+> **The rejection stands and is not waived retrospectively.** But the statistical claim must
+> be narrower than the first version of this section made it. The observed relative gap is
+> **+2.35 %** with a 95 % interval of **[+1.4 %, +3.4 %]**. That interval **excludes zero**
+> and **contains 2 %**. So the evidence supports *a regression relative to no regression*; it
+> does **not** support *confident exceedance of the 2 % tolerance*. Saying "the interval is
+> tight, so it is a real difference and not noise" conflates those two questions.
+>
+> Two further corrections to what §4 was read as saying:
+>
+> * **The pooled −9.7 % proxy gain does not establish operational benefit.** Shortage minutes
+>   went **up** (216 → 224). A proxy improvement alongside an operational regression is not an
+>   improvement; it is a reason to distrust the proxy as a stand-in for operating cost.
+> * **The 2 % tolerance itself was never derived.** It was a round number chosen because it
+>   sounded tolerable. A tolerance has to come from acceptable additional shortage, replica
+>   consumption and workload prevalence, and be judged with an uncertainty bound against that
+>   justified margin. That derivation now exists —
+>   [`TOLERANCE-DERIVATION.md`](TOLERANCE-DERIVATION.md) — and it is derived from operating
+>   consequences, never from the observed miss.
 
 ### What this does establish
 

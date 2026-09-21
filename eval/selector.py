@@ -44,6 +44,8 @@ INFORMATION HYGIENE (the rules this file must not break)
    is inferred from another arm's decisions.
 5. Selector parameters are chosen on VALIDATION series only (seeds and calendar dates that
    the test set does not contain) and then frozen. `_assert_disjoint()` enforces it.
+6. ONE external objective (`EVAL_OBJECTIVE`) scores everything that is compared against
+   anything else. A parameter setting is never ranked by the weighting it chose for itself.
 
 TWO NOTES CARRIED FROM THE REVIEW (D-117)
 -----------------------------------------
@@ -114,6 +116,29 @@ HORIZON_WEIGHTS = {
     "deployed": np.array([1.0, 0.9, 0.8, 0.7, 0.6, 0.5])[:STEPS_AHEAD],
     "lead2": np.array([1.0, 1.0, 0.0, 0.0, 0.0, 0.0])[:STEPS_AHEAD],
 }
+
+# ---- THE SINGLE EXTERNAL EVALUATION OBJECTIVE (Codex C-96 / D-121) --------------------
+# Fixed here, before any comparison, and used for EVERY score that is compared against any
+# other score: the parameter sweep's ranking, the control blend's weight, the test tables,
+# the bootstrap and the bar.
+#
+# The defect this replaces: the sweep ranked each parameter setting using THAT SETTING'S OWN
+# horizon weights, so a setting scoring only the two nearest steps (`lead2`) was compared
+# against a setting scoring all six. That ranks the difficulty of the horizon, not the
+# quality of the forecast, and it let the sweep "win" by choosing an easier question. The
+# control blend had the mirror-image fault: chosen under `uniform`, reported under `lead2`.
+#
+# `uniform` is the choice because the preregistered decision rule (evaluation-protocol.md
+# section 9, D-86) already states uniform horizon weights with per-step MAE reported in full.
+# The objective is a PROPERTY OF THE EXPERIMENT; `SelectorParams.weights` is a knob INSIDE
+# the selector -- which horizon weighting it uses to rank candidates while it is running --
+# and is tuned against the external objective like any other parameter.
+EVAL_OBJECTIVE = "uniform"
+
+
+def eval_weights() -> np.ndarray:
+    return HORIZON_WEIGHTS[EVAL_OBJECTIVE]
+
 
 # ---- Predeclared success bar (D-116). Written before any test number was produced. -----
 BAR_POOLED_IMPROVEMENT = 0.05     # S1: >= 5% lower pooled cost proxy than the best fixed arm
@@ -244,6 +269,10 @@ class Run:
     truth: np.ndarray = field(default_factory=lambda: np.empty(0))
     degraded: dict = field(default_factory=dict)    # arm -> count
     failures: dict = field(default_factory=dict)    # arm -> count of non-finite forecasts
+    # Per-ORIGIN masks, so a derived arm (the blend, the selector) inherits the failures of
+    # whatever it was built from at each origin instead of asserting zero (Codex C-97).
+    degraded_mask: dict = field(default_factory=dict)   # arm -> bool array over origins
+    failure_mask: dict = field(default_factory=dict)    # arm -> bool array over origins
 
     @property
     def key(self) -> str:
@@ -277,8 +306,8 @@ def build_run(scenario: str, seed: int, start: datetime, helper: LSTMForecastMod
     sp, ta = oe.SeasonalPattern(), oe.TrendAdaptive()
     ll = LaggedLinear(series)
     fc = {a: np.empty((len(origins), STEPS_AHEAD)) for a in CANDIDATES}
-    degraded = {a: 0 for a in CANDIDATES}
-    failures = {a: 0 for a in CANDIDATES}
+    deg_mask = {a: np.zeros(len(origins), dtype=bool) for a in CANDIDATES}
+    fail_mask = {a: np.zeros(len(origins), dtype=bool) for a in CANDIDATES}
 
     for k, i in enumerate(origins):
         hist = series.iloc[:i + 1]                    # identical information for every arm
@@ -288,30 +317,64 @@ def build_run(scenario: str, seed: int, start: datetime, helper: LSTMForecastMod
         lin, deg = ll.forecast(i)
         fc["lagged_linear"][k] = lin
         if deg:
-            degraded["lagged_linear"] += 1
+            deg_mask["lagged_linear"][k] = True
 
     for a in CANDIDATES:
         bad = ~np.all(np.isfinite(fc[a]), axis=1)
-        failures[a] = int(bad.sum())
-        if failures[a]:
+        fail_mask[a] = bad
+        if bad.any():
             # Documented repair: a non-finite forecast is replaced by the last observation,
             # which is what the deployed service would fall back to, and counted.
             for k in np.flatnonzero(bad):
                 fc[a][k] = float(series.values[origins[k]])
-            degraded[a] += failures[a]
+            deg_mask[a] |= bad
 
     run.forecasts = fc
-    run.degraded = degraded
-    run.failures = failures
+    run.degraded_mask = deg_mask
+    run.failure_mask = fail_mask
+    run.degraded = {a: int(deg_mask[a].sum()) for a in CANDIDATES}
+    run.failures = {a: int(fail_mask[a].sum()) for a in CANDIDATES}
     return run
 
 
+BLEND_INPUTS = ("seasonal_pattern", "trend_adaptive")
+
+
 def add_blend(run: Run, weight: float) -> None:
-    """Control arm: a constant mixture of the two incumbent forecasters."""
+    """Control arm: a constant mixture of the two incumbent forecasters.
+
+    It inherits its inputs' failures at each origin (C-97): a mixture containing a repaired
+    forecast is itself a repaired forecast, and asserting zero would exempt the control from
+    the same gate the selector is judged by.
+    """
     run.forecasts[CONTROL_ARM] = (weight * run.forecasts["seasonal_pattern"]
                                   + (1.0 - weight) * run.forecasts["trend_adaptive"])
-    run.degraded[CONTROL_ARM] = 0
-    run.failures[CONTROL_ARM] = 0
+    deg = np.zeros_like(run.degraded_mask[BLEND_INPUTS[0]])
+    fail = np.zeros_like(run.failure_mask[BLEND_INPUTS[0]])
+    for a in BLEND_INPUTS:
+        deg |= run.degraded_mask[a]
+        fail |= run.failure_mask[a]
+    run.degraded_mask[CONTROL_ARM] = deg
+    run.failure_mask[CONTROL_ARM] = fail
+    run.degraded[CONTROL_ARM] = int(deg.sum())
+    run.failures[CONTROL_ARM] = int(fail.sum())
+
+
+def attach_selector_arm(run: Run, served: list) -> None:
+    """Materialise the selector as an arm, INCLUDING what it inherited (Codex C-97 / D-122).
+
+    The defect this replaces hardcoded the selector's degradation and failure counts to zero,
+    so the S3 failure gate could not see a failure the selector had served. The selector owns
+    whatever the arm it chose did at that origin -- serving a repaired forecast is serving a
+    repaired forecast, whoever computed it.
+    """
+    run.forecasts["selector"] = selector_forecasts(run, served)
+    deg = np.array([bool(run.degraded_mask[a][k]) for k, a in enumerate(served)])
+    fail = np.array([bool(run.failure_mask[a][k]) for k, a in enumerate(served)])
+    run.degraded_mask["selector"] = deg
+    run.failure_mask["selector"] = fail
+    run.degraded["selector"] = int(deg.sum())
+    run.failures["selector"] = int(fail.sum())
 
 
 def per_origin_costs(run: Run, weights: np.ndarray, arms) -> dict:
@@ -350,9 +413,15 @@ def run_selector(costs: dict, params: SelectorParams) -> dict:
     Maturation, deterministically: at origin k the newest usable evidence is origin
     k - STEPS_AHEAD, whose six targets are all observed by k. Nothing newer is consulted.
 
-    Ties, deterministically: the incumbent arm wins an exact tie (its switching penalty is
-    zero, so it already wins any tie it is part of); among non-incumbents, the earliest arm
-    in CANDIDATES order wins. Comparisons use a 1e-9 relative tolerance.
+    Ties, deterministically: the INCUMBENT wins an exact tie on the penalised cost; among
+    non-incumbents, the earliest arm in CANDIDATES order wins. Comparisons use a 1e-9
+    relative tolerance.
+
+    Codex C-97 / D-122: the previous implementation scanned CANDIDATES in canonical order and
+    replaced the best only on a strict improvement, so the FIRST arm scanned won every tie --
+    including ties the incumbent was part of. An exact tie therefore switched, which is the
+    opposite of what a switching penalty is for: a penalty that does not make the incumbent
+    win an equal contest is not a switching penalty.
     """
     n = len(next(iter(costs.values())))
     decay = 1.0 - 0.5 ** (1.0 / params.half_life)
@@ -374,12 +443,13 @@ def run_selector(costs: dict, params: SelectorParams) -> dict:
         if min(n_obs[a] for a in CANDIDATES) < params.min_obs:
             choice = params.default_arm
         else:
-            best, best_key = None, None
-            for a in CANDIDATES:
-                key = ewma[a] + (0.0 if a == current else params.switch_penalty)
-                if best_key is None or key < best_key * (1.0 - 1e-9):
-                    best, best_key = a, key
-            choice = best
+            keys = {a: ewma[a] + (0.0 if a == current else params.switch_penalty)
+                    for a in CANDIDATES}
+            best_key = min(keys.values())
+            tol = 1e-9 * max(1.0, abs(best_key))
+            tied = [a for a in CANDIDATES if keys[a] <= best_key + tol]
+            # The incumbent first: an equal contest is not a reason to move.
+            choice = current if current in tied else tied[0]
         if choice != current:
             switches += 1
         current = choice
@@ -403,14 +473,18 @@ def preselect(runs: list, log=print) -> tuple[SelectorParams, list]:
     # The switching penalty is expressed in cost units, scaled from the median per-origin
     # cost on validation so that "5% of a typical origin's cost" is a stated quantity.
     base = np.median(np.concatenate([
-        np.concatenate(list(per_origin_costs(r, HORIZON_WEIGHTS["uniform"], CANDIDATES).values()))
+        np.concatenate(list(per_origin_costs(r, eval_weights(), CANDIDATES).values()))
         for r in runs]))
-    log(f"validation median per-origin cost proxy: {base:.1f} rpm")
+    log(f"validation median per-origin cost proxy ({EVAL_OBJECTIVE}): {base:.1f} rpm")
 
+    # Two distinct things, kept distinct (C-96):
+    #   cost_cache  -- what the SELECTOR sees while running, under its own internal weights;
+    #   ext_cost    -- the single EXTERNAL objective every setting is ranked by.
     cost_cache = {}
     for wname, w in HORIZON_WEIGHTS.items():
         for r in runs:
             cost_cache[(wname, r.key)] = per_origin_costs(r, w, CANDIDATES)
+    ext_cost = {r.key: cost_cache[(EVAL_OBJECTIVE, r.key)] for r in runs}
 
     # The control arm's mixture weight is chosen separately -- it has no effect on the
     # selector -- by giving the control its own best-on-validation setting, so the selector
@@ -420,7 +494,7 @@ def preselect(runs: list, log=print) -> tuple[SelectorParams, list]:
         vals = []
         for r in runs:
             mix = bw * r.forecasts["seasonal_pattern"] + (1 - bw) * r.forecasts["trend_adaptive"]
-            vals += [origin_cost(mix[k], r.truth[k], HORIZON_WEIGHTS["uniform"])
+            vals += [origin_cost(mix[k], r.truth[k], eval_weights())
                      for k in range(len(r.origins))]
         blend_scores[bw] = float(np.mean(vals))
     best_bw = min(GRID_BLEND_WEIGHT, key=lambda b: (round(blend_scores[b], 6), b))
@@ -436,9 +510,12 @@ def preselect(runs: list, log=print) -> tuple[SelectorParams, list]:
         p = SelectorParams(hl, wname, mo, frac * float(base), dflt, best_bw)
         tot, cnt, sw, org = 0.0, 0, 0, 0
         for r in runs:
-            c = cost_cache[(wname, r.key)]
-            res = run_selector(c, p)
-            picked = np.array([c[a][k] for k, a in enumerate(res["served"])])
+            # The selector RUNS on its own internal weighting ...
+            res = run_selector(cost_cache[(wname, r.key)], p)
+            # ... and is SCORED on the single external objective, so settings that score an
+            # easier horizon cannot win by scoring an easier horizon (C-96).
+            ext = ext_cost[r.key]
+            picked = np.array([ext[a][k] for k, a in enumerate(res["served"])])
             tot += float(picked.sum()); cnt += len(picked)
             sw += res["switches"]; org += len(picked)
         table.append({"params": p, "mean_cost": tot / cnt,
@@ -452,12 +529,16 @@ def preselect(runs: list, log=print) -> tuple[SelectorParams, list]:
     # Fixed-arm reference on validation, for the write-up only.
     fixed = {}
     for a in CANDIDATES:
-        vals = np.concatenate([cost_cache[(best.weights, r.key)][a] for r in runs])
+        vals = np.concatenate([ext_cost[r.key][a] for r in runs])
         fixed[a] = float(vals.mean())
     log(f"validation winner: {best.as_dict()}  mean={table[0]['mean_cost']:.1f} rpm "
-        f"switch_frac={table[0]['switch_fraction']:.3f}")
+        f"({EVAL_OBJECTIVE}) switch_frac={table[0]['switch_fraction']:.3f}")
     log("validation fixed arms: " + ", ".join(f"{a}={v:.1f}" for a, v in fixed.items()))
     summary = {
+        "external_objective": EVAL_OBJECTIVE,
+        "scored_by": f"every entry below is the mean per-origin cost proxy under the single "
+                     f"external objective '{EVAL_OBJECTIVE}', whatever internal horizon "
+                     f"weighting the setting itself uses",
         "median_per_origin_cost_rpm": round(float(base), 2),
         "constant_blend_weight_scores": {str(b): round(v, 2) for b, v in blend_scores.items()},
         "fixed_arm_validation_cost": {a: round(v, 2) for a, v in fixed.items()},
@@ -513,17 +594,19 @@ def block_bootstrap(blocks: dict, arm_a: str, arm_b: str, draws=BOOTSTRAP_DRAWS)
 # Test evaluation
 # ======================================================================================
 def evaluate_test(runs: list, params: SelectorParams, use_replay: bool, log=print) -> dict:
-    w = HORIZON_WEIGHTS[params.weights]
+    # ONE external objective for every number that is compared against another number
+    # (C-96). The selector's own internal weighting is a parameter of the selector, used
+    # only to decide what it serves.
+    w = eval_weights()
+    w_internal = HORIZON_WEIGHTS[params.weights]
     arms = list(CANDIDATES) + [CONTROL_ARM, "selector"]
     per_run, blocks = {}, {}
 
     for r in runs:
         add_blend(r, params.blend_weight)
-        costs = per_origin_costs(r, w, CANDIDATES)
+        costs = per_origin_costs(r, w_internal, CANDIDATES)
         sel = run_selector(costs, params)
-        r.forecasts["selector"] = selector_forecasts(r, sel["served"])
-        r.degraded["selector"] = 0
-        r.failures["selector"] = 0
+        attach_selector_arm(r, sel["served"])
         all_costs = per_origin_costs(r, w, arms)
 
         # Blocks for the bootstrap: one per (run, calendar day of the origin).
@@ -621,6 +704,9 @@ def evaluate_test(runs: list, params: SelectorParams, use_replay: bool, log=prin
     if use_replay:
         s3_short = pooled["selector"]["shortage_minutes"] <= \
             pooled[best_fixed]["shortage_minutes"] * (1.0 + BAR_SHORTAGE_TOLERANCE)
+    # The selector's failure count is now INHERITED from the arms it served (C-97), so this
+    # gate can actually fire. It asks: did serving the selector expose more repaired
+    # forecasts than serving the worst fixed arm would have?
     s3_fail = all(per_run[r.key]["arms"]["selector"]["forecast_failures"] <=
                   max(per_run[r.key]["arms"][a]["forecast_failures"] for a in fixed_arms)
                   for r in runs)
@@ -634,6 +720,11 @@ def evaluate_test(runs: list, params: SelectorParams, use_replay: bool, log=prin
                                key=lambda a: per_run[r.key]["arms"][a]["cost_proxy_mean"])
 
     return {
+        "external_objective": EVAL_OBJECTIVE,
+        "objective_note": ("every cost proxy, bootstrap and bar reading below uses the single "
+                           f"external objective '{EVAL_OBJECTIVE}'; "
+                           f"preselected_parameters.horizon_weights ('{params.weights}') is "
+                           "the selector's INTERNAL ranking weight only"),
         "per_run": per_run,
         "pooled": pooled,
         "best_fixed_arm_pooled": best_fixed,
@@ -676,6 +767,11 @@ def main():
     ap.add_argument("--out", default=str(HERE / "selector.json"))
     ap.add_argument("--no-replay", action="store_true",
                     help="skip the controller replay (accuracy tables only)")
+    ap.add_argument("--validation-only", action="store_true",
+                    help="re-derive the preselected parameters on the validation seeds and "
+                         "STOP. Use this after any change to the objective or the selection "
+                         "rule: the test seeds are consumed evidence (D-124) and re-scoring "
+                         "them after a repair would be a second look at a used test set.")
     args = ap.parse_args()
     _assert_disjoint()
 
@@ -691,6 +787,22 @@ def main():
 
     print("=== validation: parameter preselection ===")
     params, sweep = preselect(val)
+
+    if args.validation_only:
+        payload = {
+            "generated_utc": datetime.utcnow().isoformat() + "Z",
+            "experiment": "offline selector -- VALIDATION PRESELECTION ONLY; no test run",
+            "external_evaluation_objective": EVAL_OBJECTIVE,
+            "why_no_test": "test seeds %s are consumed evidence (Codex D-124); a repaired "
+                           "selection rule must be evaluated on new held-out seeds, dates "
+                           "and regime shapes, frozen before the run"
+                           % (list(TEST_SEEDS),),
+            "preselected_parameters": params.as_dict(),
+            "validation_sweep": sweep,
+        }
+        Path(args.out).write_text(json.dumps(payload, indent=2))
+        print(f"\nvalidation-only: wrote {args.out}  ({time.time()-t0:.0f}s)")
+        return
 
     print(f"=== test: building runs (seeds {TEST_SEEDS}, from {TEST_START.date()}) "
           "-- untouched by preselection ===")
@@ -711,6 +823,13 @@ def main():
                       "no stabilisation, no dropped request, no dollars",
         },
         "design": {
+            "external_evaluation_objective": {
+                "horizon_weights": EVAL_OBJECTIVE,
+                "fixed_before": "any comparison; used for the sweep ranking, the control "
+                                "blend's weight, the test tables, the bootstrap and the bar",
+                "rationale": "evaluation-protocol.md section 9 (D-86) preregisters uniform "
+                             "horizon weights with per-step MAE reported in full",
+            },
             "scenarios": list(SCENARIOS), "days": DAYS, "origins_per_run": MAX_ORIGINS,
             "validation_seeds": list(VALIDATION_SEEDS),
             "validation_start": VALIDATION_START.isoformat(),

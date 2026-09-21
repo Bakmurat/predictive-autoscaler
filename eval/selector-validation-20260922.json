@@ -1,0 +1,187 @@
+{
+  "generated_utc": "2026-09-21T23:21:58.683581Z",
+  "experiment": "offline selector -- VALIDATION PRESELECTION ONLY; no test run",
+  "external_evaluation_objective": "uniform",
+  "why_no_test": "test seeds [11, 12, 13] are consumed evidence (Codex D-124); a repaired selection rule must be evaluated on new held-out seeds, dates and regime shapes, frozen before the run",
+  "preselected_parameters": {
+    "ewma_half_life_matured_origins": 6,
+    "horizon_weights": "uniform",
+    "min_matured_observations": 18,
+    "switching_penalty_rpm": 5.402,
+    "startup_default_arm": "trend_adaptive",
+    "control_blend_seasonal_weight": 0.25
+  },
+  "validation_sweep": {
+    "external_objective": "uniform",
+    "scored_by": "every entry below is the mean per-origin cost proxy under the single external objective 'uniform', whatever internal horizon weighting the setting itself uses",
+    "median_per_origin_cost_rpm": 270.09,
+    "constant_blend_weight_scores": {
+      "0.25": 438.49,
+      "0.5": 503.9,
+      "0.75": 574.28
+    },
+    "fixed_arm_validation_cost": {
+      "seasonal_pattern": 651.42,
+      "trend_adaptive": 388.86,
+      "lagged_linear": 466.92
+    },
+    "top12": [
+      {
+        "params": {
+          "ewma_half_life_matured_origins": 6,
+          "horizon_weights": "uniform",
+          "min_matured_observations": 18,
+          "switching_penalty_rpm": 5.402,
+          "startup_default_arm": "trend_adaptive",
+          "control_blend_seasonal_weight": 0.25
+        },
+        "mean_cost": 333.98,
+        "switch_fraction": 0.02
+      },
+      {
+        "params": {
+          "ewma_half_life_matured_origins": 6,
+          "horizon_weights": "uniform",
+          "min_matured_observations": 18,
+          "switching_penalty_rpm": 13.504,
+          "startup_default_arm": "trend_adaptive",
+          "control_blend_seasonal_weight": 0.25
+        },
+        "mean_cost": 333.99,
+        "switch_fraction": 0.0153
+      },
+      {
+        "params": {
+          "ewma_half_life_matured_origins": 6,
+          "horizon_weights": "uniform",
+          "min_matured_observations": 6,
+          "switching_penalty_rpm": 5.402,
+          "startup_default_arm": "trend_adaptive",
+          "control_blend_seasonal_weight": 0.25
+        },
+        "mean_cost": 334.05,
+        "switch_fraction": 0.0204
+      },
+      {
+        "params": {
+          "ewma_half_life_matured_origins": 6,
+          "horizon_weights": "uniform",
+          "min_matured_observations": 6,
+          "switching_penalty_rpm": 13.504,
+          "startup_default_arm": "trend_adaptive",
+          "control_blend_seasonal_weight": 0.25
+        },
+        "mean_cost": 334.08,
+        "switch_fraction": 0.0157
+      },
+      {
+        "params": {
+          "ewma_half_life_matured_origins": 6,
+          "horizon_weights": "uniform",
+          "min_matured_observations": 18,
+          "switching_penalty_rpm": 0.0,
+          "startup_default_arm": "trend_adaptive",
+          "control_blend_seasonal_weight": 0.25
+        },
+        "mean_cost": 334.24,
+        "switch_fraction": 0.0258
+      },
+      {
+        "params": {
+          "ewma_half_life_matured_origins": 6,
+          "horizon_weights": "uniform",
+          "min_matured_observations": 6,
+          "switching_penalty_rpm": 0.0,
+          "startup_default_arm": "trend_adaptive",
+          "control_blend_seasonal_weight": 0.25
+        },
+        "mean_cost": 334.32,
+        "switch_fraction": 0.0265
+      },
+      {
+        "params": {
+          "ewma_half_life_matured_origins": 6,
+          "horizon_weights": "uniform",
+          "min_matured_observations": 6,
+          "switching_penalty_rpm": 5.402,
+          "startup_default_arm": "seasonal_pattern",
+          "control_blend_seasonal_weight": 0.25
+        },
+        "mean_cost": 334.32,
+        "switch_fraction": 0.0193
+      },
+      {
+        "params": {
+          "ewma_half_life_matured_origins": 6,
+          "horizon_weights": "uniform",
+          "min_matured_observations": 6,
+          "switching_penalty_rpm": 13.504,
+          "startup_default_arm": "seasonal_pattern",
+          "control_blend_seasonal_weight": 0.25
+        },
+        "mean_cost": 334.33,
+        "switch_fraction": 0.0146
+      },
+      {
+        "params": {
+          "ewma_half_life_matured_origins": 6,
+          "horizon_weights": "uniform",
+          "min_matured_observations": 6,
+          "switching_penalty_rpm": 27.009,
+          "startup_default_arm": "trend_adaptive",
+          "control_blend_seasonal_weight": 0.25
+        },
+        "mean_cost": 334.37,
+        "switch_fraction": 0.0117
+      },
+      {
+        "params": {
+          "ewma_half_life_matured_origins": 6,
+          "horizon_weights": "uniform",
+          "min_matured_observations": 6,
+          "switching_penalty_rpm": 27.009,
+          "startup_default_arm": "seasonal_pattern",
+          "control_blend_seasonal_weight": 0.25
+        },
+        "mean_cost": 334.38,
+        "switch_fraction": 0.0106
+      },
+      {
+        "params": {
+          "ewma_half_life_matured_origins": 6,
+          "horizon_weights": "uniform",
+          "min_matured_observations": 6,
+          "switching_penalty_rpm": 0.0,
+          "startup_default_arm": "seasonal_pattern",
+          "control_blend_seasonal_weight": 0.25
+        },
+        "mean_cost": 334.61,
+        "switch_fraction": 0.026
+      },
+      {
+        "params": {
+          "ewma_half_life_matured_origins": 6,
+          "horizon_weights": "uniform",
+          "min_matured_observations": 18,
+          "switching_penalty_rpm": 5.402,
+          "startup_default_arm": "seasonal_pattern",
+          "control_blend_seasonal_weight": 0.25
+        },
+        "mean_cost": 334.68,
+        "switch_fraction": 0.0192
+      }
+    ],
+    "worst": {
+      "params": {
+        "ewma_half_life_matured_origins": 72,
+        "horizon_weights": "lead2",
+        "min_matured_observations": 18,
+        "switching_penalty_rpm": 27.009,
+        "startup_default_arm": "lagged_linear",
+        "control_blend_seasonal_weight": 0.25
+      },
+      "mean_cost": 391.89
+    },
+    "grid_size": 216
+  }
+}

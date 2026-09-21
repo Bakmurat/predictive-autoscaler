@@ -1,0 +1,94 @@
+
+=== repeating (data seed 2, expanding history, 12 epochs, unseeded)
+Restoring model weights from the end of the best epoch: 11.
+  original_relu  seed  None: MAE 197.18  [98.0s]
+Restoring model weights from the end of the best epoch: 12.
+  original_relu  seed  None: MAE 198.59  [96.8s]
+Restoring model weights from the end of the best epoch: 12.
+  original_relu  seed  None: MAE 175.55  [96.7s]
+Restoring model weights from the end of the best epoch: 9.
+  original_relu  seed  None: MAE 209.81  [99.2s]
+Restoring model weights from the end of the best epoch: 8.
+  original_relu  seed  None: MAE 199.09  [94.9s]
+  -> original_relu: 0/5 diverged, spread 1.2
+Restoring model weights from the end of the best epoch: 10.
+  a_tanh         seed  None: MAE 202.97  [95.4s]
+Restoring model weights from the end of the best epoch: 12.
+  a_tanh         seed  None: MAE 193.63  [95.2s]
+Restoring model weights from the end of the best epoch: 10.
+  a_tanh         seed  None: MAE 174.93  [95.1s]
+Restoring model weights from the end of the best epoch: 12.
+  a_tanh         seed  None: MAE 231.52  [95.0s]
+Restoring model weights from the end of the best epoch: 12.
+  a_tanh         seed  None: MAE 170.51  [95.5s]
+  -> a_tanh: 0/5 diverged, spread 1.36
+Restoring model weights from the end of the best epoch: 1.
+  b_clipnorm     seed  None: MAE non-finite forecast  DIVERGED  [92.8s]
+Restoring model weights from the end of the best epoch: 1.
+  b_clipnorm     seed  None: MAE non-finite forecast  DIVERGED  [94.0s]
+Restoring model weights from the end of the best epoch: 7.
+  b_clipnorm     seed  None: MAE 180.54  [96.2s]
+Restoring model weights from the end of the best epoch: 11.
+  b_clipnorm     seed  None: MAE 216.62  [107.1s]
+Restoring model weights from the end of the best epoch: 10.
+  b_clipnorm     seed  None: MAE 198.98  [100.9s]
+  -> b_clipnorm: 2/5 diverged, spread 1.2
+Restoring model weights from the end of the best epoch: 10.
+  c_both         seed  None: MAE 189.3  [96.7s]
+Restoring model weights from the end of the best epoch: 11.
+  c_both         seed  None: MAE 181.38  [107.3s]
+Restoring model weights from the end of the best epoch: 11.
+  c_both         seed  None: MAE 204.38  [102.6s]
+Restoring model weights from the end of the best epoch: 10.
+  c_both         seed  None: MAE 192.04  [95.7s]
+Restoring model weights from the end of the best epoch: 10.
+  c_both         seed  None: MAE 197.75  [97.4s]
+  -> c_both: 0/5 diverged, spread 1.13
+
+=== weekly (data seed 2, expanding history, 12 epochs, unseeded)
+Restoring model weights from the end of the best epoch: 12.
+  original_relu  seed  None: MAE 236.36  [97.1s]
+Restoring model weights from the end of the best epoch: 11.
+  original_relu  seed  None: MAE 200.12  [97.8s]
+Restoring model weights from the end of the best epoch: 11.
+  original_relu  seed  None: MAE 277.26  [95.2s]
+Restoring model weights from the end of the best epoch: 1.
+  original_relu  seed  None: MAE 1128.46  [95.0s]
+Restoring model weights from the end of the best epoch: 1.
+  original_relu  seed  None: MAE 1485.85  [94.6s]
+  -> original_relu: 0/5 diverged, spread 7.42
+Restoring model weights from the end of the best epoch: 12.
+  a_tanh         seed  None: MAE 215.61  [96.3s]
+Restoring model weights from the end of the best epoch: 11.
+  a_tanh         seed  None: MAE 201.22  [96.0s]
+Restoring model weights from the end of the best epoch: 10.
+  a_tanh         seed  None: MAE 216.79  [95.4s]
+Restoring model weights from the end of the best epoch: 9.
+  a_tanh         seed  None: MAE 214.93  [95.5s]
+Restoring model weights from the end of the best epoch: 12.
+  a_tanh         seed  None: MAE 215.46  [95.2s]
+  -> a_tanh: 0/5 diverged, spread 1.08
+Restoring model weights from the end of the best epoch: 1.
+  b_clipnorm     seed  None: MAE non-finite forecast  DIVERGED  [93.6s]
+Restoring model weights from the end of the best epoch: 12.
+  b_clipnorm     seed  None: MAE 227.11  [95.4s]
+Restoring model weights from the end of the best epoch: 3.
+  b_clipnorm     seed  None: MAE 564.68  [95.3s]
+Restoring model weights from the end of the best epoch: 10.
+  b_clipnorm     seed  None: MAE 246.32  [96.9s]
+Restoring model weights from the end of the best epoch: 7.
+  b_clipnorm     seed  None: MAE 202.16  [95.3s]
+  -> b_clipnorm: 1/5 diverged, spread 2.79
+Restoring model weights from the end of the best epoch: 11.
+  c_both         seed  None: MAE 187.22  [95.7s]
+Restoring model weights from the end of the best epoch: 11.
+  c_both         seed  None: MAE 233.82  [97.4s]
+Restoring model weights from the end of the best epoch: 11.
+  c_both         seed  None: MAE 198.98  [96.0s]
+Restoring model weights from the end of the best epoch: 11.
+  c_both         seed  None: MAE 221.4  [96.1s]
+Restoring model weights from the end of the best epoch: 10.
+  c_both         seed  None: MAE 231.68  [96.2s]
+  -> c_both: 0/5 diverged, spread 1.25
+
+wrote eval/divergence.json
