@@ -29,6 +29,7 @@ import (
 // Scaling configuration constants
 const (
 	predictionCacheTTL      = 5 * time.Minute   // How often to refresh ML API predictions
+	predictionStaleMax      = 2 * predictionCacheTTL // Oldest cached forecast still usable while the ML API is unreachable
 	scaleDownStabilization  = 5 * time.Minute   // Wait after scale-up before any scale-down
 	scaleDownCooldown       = 2 * time.Minute   // Minimum time between scale-down operations
 	scaleDownMaxPercent     = 10                // Max % of pods to remove per scale-down
@@ -517,12 +518,22 @@ func (r *PredictiveAutoscalerReconciler) getCachedPrediction(
 	// Fetch fresh prediction from ML API
 	prediction, err := r.getPrediction(ctx, autoscaler)
 	if err != nil {
-		// On error, return stale cache if available (better than nothing)
+		// On error, reuse the cached forecast only while it is younger than predictionStaleMax.
+		// Beyond that the forecast no longer describes the horizon it was issued for, so the
+		// caller falls back to the reactive rule ("Prediction unavailable, using reactive only").
+		// Serving a stale forecast indefinitely was observed in the 2026-09-20 functional test.
 		if cached, ok := r.predictionCache[key]; ok {
-			r.Log.Info("Using stale prediction cache due to ML API error",
-				"cacheAge", time.Since(cached.fetchedAt).Round(time.Second),
-				"error", err.Error())
-			return cached.response, nil
+			age := time.Since(cached.fetchedAt)
+			if age < predictionStaleMax {
+				r.Log.Info("Using stale prediction cache due to ML API error",
+					"cacheAge", age.Round(time.Second),
+					"staleMax", predictionStaleMax,
+					"error", err.Error())
+				return cached.response, nil
+			}
+			delete(r.predictionCache, key)
+			return nil, fmt.Errorf("ML API unreachable and cached forecast too old (%s > %s): %w",
+				age.Round(time.Second), predictionStaleMax, err)
 		}
 		return nil, err
 	}
