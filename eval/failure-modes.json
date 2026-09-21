@@ -1,0 +1,18 @@
+{
+  "failure_modes": {
+    "cold_start": "refused cleanly: Insufficient data: 72 points (need 150)",
+    "all_zeros": "handled: finite output",
+    "gap_in_history": "pattern source=seasonal_history, finite=True",
+    "delayed_observation": "anchored to the data",
+    "levelshift_recovery": {
+      "served_blend_mae": 172.5,
+      "previous_day_mae": 90.6
+    },
+    "spike_recovery": {
+      "served_blend_mae": 127.1,
+      "previous_day_mae": 84.1
+    },
+    "old_format_artifact": "detected",
+    "retrain_midpeak": "no failures"
+  }
+}
