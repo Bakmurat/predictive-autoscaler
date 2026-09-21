@@ -102,6 +102,14 @@ cd k8s-operator && go test -race ./...
 cd ml-engine    && pip install -r requirements.txt && python -m pytest tests
 ```
 
+**Publication is gated on `make verify` returning 0.** `scripts/verify.sh` is the one checked
+verification entry point: it runs `go vet`, `go test -race` and `pytest` and preserves each
+suite's exit status through its own logging (`set -o pipefail`, status read from
+`PIPESTATUS[0]` before anything else runs). It exists because a pytest run piped through
+`grep` for a tidy summary once swallowed a red test into a green push; `make verify-selftest`
+proves the wrapper returns non-zero for a deliberately failing test and zero for a passing one.
+Nothing is pushed or deployed on a run that did not go through it.
+
 Both suites pass. Last full run 2026-09-20: Go `go vet` + `go test -race` green; Python 170 passed, 0 failed, executed inside a Kubernetes cluster on the runtime image (arm64) via `ml-engine/Dockerfile.tests`, which adds `requirements-dev.txt` (pytest, httpx) to the ml-api image and runs `python -m pytest -q ml-engine/tests` from the repository root. Build it with `docker build -f ml-engine/Dockerfile.tests --build-arg BASE=<ml-api image> .`.
 
 ## Repository layout
