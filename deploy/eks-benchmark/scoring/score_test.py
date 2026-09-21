@@ -71,35 +71,31 @@ class Acceptance(unittest.TestCase):
         acc, rej = score.accept_records([r1, ev, r2])
         self.assertEqual([r["issued_at"] for r in acc], [r1["issued_at"], r2["issued_at"]])
         self.assertEqual(rej, [])
-        # The controller subset drops the rejected issuance entirely when rejected at issuance (no step was in use).
-        sub, info = score.controller_subset(acc, score.controller_rejections([r1, ev, r2]))
-        self.assertEqual([r["issued_at"] for r in sub], [r2["issued_at"]])
-        self.assertEqual(info, {"rejected_issuances": 1, "steps_not_used_by_controller": 3})
+        # The rejection is a diagnostic: counted and listed, earliest rejected_at kept.
+        rejections = score.controller_rejections([r1, ev, r2])
+        self.assertEqual(len(rejections), 1)
+        self.assertEqual(list(rejections.values())[0], score.parse_ts(r1["issued_at"]))
 
-    def test_controller_rejection_is_contemporaneous_not_retroactive(self):
-        # Issued at T0 with steps +10, +20, +30; rejected at T0+22: steps +10 and +20 were in use, +30 was not.
+    def test_no_controller_used_subset_is_derived(self):
+        # Codex C-19: no "controller-used" subset exists in the scorer; the raw set scores every step of a
+        # rejected issuance, and rejections are reported only as diagnostics.
+        self.assertFalse(hasattr(score, "controller_subset"))
         r1 = rec(T0)
         ev = {"event": "sanity_rejected", "application": "a", "namespace": "n", "issued_at": r1["issued_at"],
               "rejected_at": iso(T0 + timedelta(minutes=22))}
         acc, _ = score.accept_records([r1, ev])
-        sub, info = score.controller_subset(acc, score.controller_rejections([r1, ev]))
-        self.assertEqual([fc["step"] for fc in sub[0]["forecasts"]], [1, 2])
-        self.assertEqual(sub[0]["controller_rejected_at"], iso(T0 + timedelta(minutes=22)))
-        self.assertEqual(info, {"rejected_issuances": 1, "steps_not_used_by_controller": 1})
-        # The raw set still scores all three steps.
         prom = FakeProm(lambda m: 100.0)
         out, rows = score.score(acc, prom, "a", "n", T0, T0 + timedelta(hours=1), cadence_min=60)
         self.assertEqual(out["forecast_steps_scored"], 3)
+        self.assertNotIn("controller_accepted", out)
 
-    def test_later_rejection_does_not_erase_earlier_use(self):
-        # A rejection logged much later (T0+50) than the issuance keeps every step whose target <= T0+50.
+    def test_later_rejection_keeps_earliest_rejected_at(self):
         r1 = rec(T0, steps=(1, 2, 3, 4, 5, 6))
-        ev = {"event": "sanity_rejected", "application": "a", "namespace": "n", "issued_at": r1["issued_at"],
-              "rejected_at": iso(T0 + timedelta(minutes=50))}
-        acc, _ = score.accept_records([r1, ev])
-        sub, info = score.controller_subset(acc, score.controller_rejections([r1, ev]))
-        self.assertEqual([fc["step"] for fc in sub[0]["forecasts"]], [1, 2, 3, 4, 5])
-        self.assertEqual(info["steps_not_used_by_controller"], 1)
+        ev1 = {"event": "sanity_rejected", "application": "a", "namespace": "n", "issued_at": r1["issued_at"],
+               "rejected_at": iso(T0 + timedelta(minutes=50))}
+        ev2 = dict(ev1, rejected_at=iso(T0 + timedelta(minutes=30)))
+        rejections = score.controller_rejections([r1, ev1, ev2])
+        self.assertEqual(list(rejections.values())[0], T0 + timedelta(minutes=30))
 
     def test_duplicate_rejected_and_not_counted(self):
         r1 = rec(T0); r2 = dict(rec(T0)); r2["forecasts"] = [dict(f, rpm=999.0) for f in r2["forecasts"]]
