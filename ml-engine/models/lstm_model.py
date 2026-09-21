@@ -157,6 +157,60 @@ def purged_split_indices(n_rows, sequence_length, steps_ahead, n_sequences=None,
     return train_idx, val_idx
 
 
+
+# --------------------------------------------------------------------------------------
+# ONE weighting-and-fallback implementation, shared by predict() and evaluate() (C-80).
+# Inference and evaluation used two copies of the ramp; an override changed one and not the
+# other, so evaluate() could not be used to select blend weights (overrides 0 and 1 both gave
+# MAE 802.95073). Everything that serves or scores a blended step goes through here.
+# --------------------------------------------------------------------------------------
+def deployed_pattern_weight(step: int, steps_ahead: int) -> float:
+    """The deployed ramp: 0.70 at step 0 rising to 0.908 at step 5 (six steps)."""
+    return min(0.95, 0.7 + (step / max(steps_ahead, 1)) * 0.25)
+
+
+def validate_weight_override(override, steps_ahead: int):
+    """None, a finite scalar in [0, 1], or a length-`steps_ahead` list of such. Anything else
+    is refused before it can reach a served forecast (C-81)."""
+    if override is None:
+        return None
+    if np.isscalar(override):
+        w = float(override)
+        if not np.isfinite(w) or not (0.0 <= w <= 1.0):
+            raise ValueError(f"pattern_weight_override must be finite and within [0, 1], got {override!r}")
+        return w
+    arr = np.asarray(override, dtype=float).ravel()
+    if arr.shape[0] != steps_ahead:
+        raise ValueError(f"pattern_weight_override has {arr.shape[0]} entries, need {steps_ahead}")
+    if not np.all(np.isfinite(arr)) or np.any(arr < 0.0) or np.any(arr > 1.0):
+        raise ValueError("pattern_weight_override entries must be finite and within [0, 1]")
+    return [float(x) for x in arr]
+
+
+def pattern_weight_for(step: int, steps_ahead: int, override, pattern_step_available: bool) -> float:
+    """Weight given to the pattern at one step. Zero whenever that step has no genuine
+    previous-day observation, regardless of the schedule."""
+    if not pattern_step_available:
+        return 0.0
+    if override is None:
+        return deployed_pattern_weight(step, steps_ahead)
+    return float(override) if np.isscalar(override) else float(override[step])
+
+
+def serve_step(network_value, pattern_value, pattern_weight: float):
+    """Blend ONE step, bypassing any term whose weight is zero (C-81).
+
+    `0 * NaN` is NaN, so multiplying an unused term by a zero weight let a NaN or infinite
+    network output poison a pattern-only forecast (weight 1) -- all six served values became
+    NaN while confidence stayed 0.9. Terms with zero weight are never touched.
+    """
+    if pattern_weight >= 1.0:
+        return float(pattern_value)
+    if pattern_weight <= 0.0:
+        return float(network_value)
+    return float((1.0 - pattern_weight) * network_value + pattern_weight * pattern_value)
+
+
 class LSTMForecastModel:
     """LSTM-based forecasting model for time series prediction."""
 
@@ -473,13 +527,20 @@ class LSTMForecastModel:
         X_input = np.hstack([seq_values, seq_time_features])  # (144, 5)
         X_input = X_input.reshape(1, self.sequence_length, 5)
 
-        # Single forward pass -- outputs (1, 6) scaled values
-        pred_scaled = self.model.predict(X_input, verbose=0)  # shape (1, 6)
-
-        # Inverse transform: reshape to (6, 1) for scaler compatibility
-        lstm_rescaled = self.scaler.inverse_transform(
-            pred_scaled.reshape(-1, 1)
-        ).flatten()  # shape (6,)
+        # Single forward pass -- outputs (1, 6) scaled values. C-81: a network failure must not
+        # take the pattern down with it. It is recorded and the network is treated as
+        # non-finite at every step; if a genuine pattern exists it is served alone.
+        network_failed = None
+        try:
+            pred_scaled = self.model.predict(X_input, verbose=0)  # shape (1, 6)
+            lstm_rescaled = self.scaler.inverse_transform(
+                np.asarray(pred_scaled, dtype=float).reshape(-1, 1)
+            ).flatten()  # shape (6,)
+        except Exception as exc:
+            network_failed = f"{type(exc).__name__}: {exc}"
+            logger.warning(f"predict(): network inference failed ({network_failed}); "
+                           f"serving the pattern where it exists")
+            lstm_rescaled = np.full(STEPS_AHEAD, np.nan)
 
         # Handle steps_ahead != 6: slice or pad
         if steps_ahead < STEPS_AHEAD:
@@ -530,28 +591,29 @@ class LSTMForecastModel:
             step_available = ~np.isnan(pattern_preds)
 
         # --- Blend strategies ---
-        # Weight schedule: the deployed ramp (0.70 -> 0.908 over six steps) unless overridden.
-        # `pattern_weight_override` is None (deployed), a float (constant), or a per-step list;
-        # it exists for the blend-selection experiment (D-89) and for tests that must exercise
-        # the zero-network-share branch (C-76). It never changes served behaviour by default.
-        override = getattr(self, 'pattern_weight_override', None)
+        # Weight schedule: the deployed ramp unless overridden. `pattern_weight_override` is
+        # None (deployed), a float (constant), or a per-step list; it exists for the blend-
+        # selection experiment (D-89) and for tests that must exercise the zero-network-share
+        # branch (C-76). It never changes served behaviour by default, and it is validated
+        # (bounds, finiteness, length) before it can touch a forecast (C-81).
+        override = validate_weight_override(getattr(self, 'pattern_weight_override', None),
+                                            steps_ahead)
+        # C-81: the network's output may be NaN, infinite, or absent (an exception above is
+        # caught into `network_failed`). Pattern-only serving must not depend on it.
+        network_finite = np.isfinite(lstm_rescaled)
         final_predictions = []
         blended_pre_floor = []
         pattern_weights = []
         for step in range(steps_ahead):
-            if override is None:
-                pattern_weight = min(0.95, 0.7 + (step / max(steps_ahead, 1)) * 0.25)
-            elif np.isscalar(override):
-                pattern_weight = float(override)
-            else:
-                pattern_weight = float(override[step])
-            if not bool(step_available[step]):
-                pattern_weight = 0.0  # network only; do not pretend a second opinion exists
+            pattern_weight = pattern_weight_for(step, steps_ahead, override,
+                                                bool(step_available[step]))
+            if not network_finite[step] and bool(step_available[step]):
+                # The network cannot contribute at this step; serve the pattern alone and say
+                # so through the weight, rather than blending with a non-finite number.
+                pattern_weight = 1.0
             pattern_weights.append(float(pattern_weight))
-            lstm_weight = 1.0 - pattern_weight
-
-            pattern_term = pattern_preds[step] if bool(step_available[step]) else 0.0
-            blended = lstm_weight * lstm_rescaled[step] + pattern_weight * pattern_term
+            pattern_term = pattern_preds[step] if bool(step_available[step]) else np.nan
+            blended = serve_step(lstm_rescaled[step], pattern_term, pattern_weight)
             blended_pre_floor.append(float(blended))
             # Phase 16 (D-13): Floor set to 0.0 (was 0.05 in Phase 14)
             floor_pct = 0.0  # Phase 16 (D-13, D-15): floor removed, code kept
@@ -567,12 +629,16 @@ class LSTMForecastModel:
         # D-88). A step that fell back to the network holds the network's own value in
         # pattern_preds; including it would compare the network with itself and drive agreement
         # towards 1.0 on exactly the steps with no second opinion.
-        agree_steps = np.flatnonzero(step_available) if pattern_available else np.array([], int)
+        # C-81: a NaN network value made the agreement NaN, and max(0, min(1, nan)) == 1.0, so
+        # confidence sat at its ceiling while every served value was NaN. Compare only where
+        # BOTH components are finite.
+        agree_steps = (np.flatnonzero(step_available & network_finite)
+                       if pattern_available else np.array([], int))
         if len(agree_steps) > 0:
             agreement = 1.0 - np.mean(
                 np.abs(lstm_rescaled[agree_steps] - pattern_preds[agree_steps]) /
                 (np.maximum(lstm_rescaled[agree_steps], pattern_preds[agree_steps]) + 1e-8))
-            agreement = float(max(0.0, min(1.0, agreement)))
+            agreement = float(np.clip(agreement, 0.0, 1.0)) if np.isfinite(agreement) else None
         else:
             agreement = None
 
@@ -636,6 +702,8 @@ class LSTMForecastModel:
                 'pattern_per_step': getattr(self, 'last_pattern_per_step', None),
                 'pattern_weights': pattern_weights,
                 'agreement': agreement,
+                'network_failed': network_failed,
+                'network_finite_per_step': [bool(x) for x in network_finite],
                 'network_share': float(np.mean([1.0 - w for w in pattern_weights]))
                 if pattern_weights else 1.0,
                 'blended': blended_pre_floor,
@@ -773,6 +841,8 @@ class LSTMForecastModel:
         # scored X" cannot be read as "the deployed forecaster scores X".
         served_pred = None
         genuine_pattern_steps = 0
+        eval_override = validate_weight_override(
+            getattr(self, 'pattern_weight_override', None), test_pred.shape[1])
         seasonal = getattr(self, 'seasonal_history', None)
         if seasonal is not None and len(seasonal) and len(X_test):
             try:
@@ -786,17 +856,17 @@ class LSTMForecastModel:
                     if pattern is None:
                         served[k] = test_pred[k]
                         continue
-                    for step in range(test_pred.shape[1]):
-                        # C-75: per-step fallback, exactly as predict() serves it. A NaN
-                        # pattern step means no previous-day observation; the served value
-                        # there is the network alone. Without this, one missing step made
-                        # the whole MAE NaN.
-                        if np.isnan(pattern[step]):
-                            served[k, step] = test_pred[k, step]
-                            continue
-                        genuine_pattern_steps += 1
-                        w = min(0.95, 0.7 + (step / max(test_pred.shape[1], 1)) * 0.25)
-                        served[k, step] = (1.0 - w) * test_pred[k, step] + w * pattern[step]
+                    n_steps = test_pred.shape[1]
+                    for step in range(n_steps):
+                        # C-75 / C-80: per-step fallback and weighting through the SAME helpers
+                        # predict() serves with, so an override changes both identically and
+                        # evaluation of the deployed ramp equals what is served.
+                        available = not np.isnan(pattern[step])
+                        if available:
+                            genuine_pattern_steps += 1
+                        w = pattern_weight_for(step, n_steps, eval_override, available)
+                        served[k, step] = serve_step(test_pred[k, step],
+                                                     pattern[step] if available else np.nan, w)
                 served_pred = served
             except Exception as exc:  # pragma: no cover -- diagnostics only
                 logger.warning(f"evaluate(): could not reconstruct the served blend: {exc}")
