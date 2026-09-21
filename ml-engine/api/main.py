@@ -609,6 +609,32 @@ class LSTMPredictor:
                 # Return flat predictions array (Go operator compatible)
                 predicted_values = [round(float(v), 2) for v in prediction_result['predictions']]
 
+                # C-86 / D-108: a SERVED step must be a number, or the forecast is refused.
+                #
+                # C-83's boundary sweep maps non-finite floats to null so the payload is valid
+                # JSON. That is right for diagnostics and wrong here: the operator decodes
+                # `predictions` into []float64 (predictiveautoscaler_controller.go:93) and
+                # encoding/json leaves a null as the ZERO VALUE. A step the model could not
+                # forecast would arrive as a forecast of zero requests per minute --
+                # indistinguishable from a genuine quiet period, and able to drive a
+                # scale-down. Refuse instead: 422 is the documented refusal the operator
+                # already maps to forecastRefusedError and reactive fallback (C-17).
+                unservable = [i for i, v in enumerate(predicted_values) if not math.isfinite(v)]
+                if unservable:
+                    comp = prediction_result.get("components", {}) or {}
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"forecast refused: no finite value for step(s) "
+                            f"{', '.join(str(i + 1) for i in unservable)} of {len(predicted_values)} "
+                            f"(pattern_available_per_step="
+                            f"{comp.get('pattern_available_per_step')}, "
+                            f"network_finite_per_step={comp.get('network_finite_per_step')}, "
+                            f"network_failed={comp.get('network_failed')}); "
+                            f"serving null would be read downstream as a forecast of zero"
+                        ),
+                    )
+
                 PREDICTION_REQUESTS.labels(application=application).inc()
 
                 logger.info(f"Predictions for {application}/{metric_type}: "
