@@ -449,33 +449,44 @@ class WindowCoverageError(AssertionError):
     """The evaluation window does not contain the scenario's event (C-51)."""
 
 
-def assert_window_covers_events(scenario: str, seed: int, n: int, origins: list) -> None:
-    """Fail loudly unless the scored targets span pre-event, transition and recovery.
+def assert_window_covers_events(scenario: str, seed: int, n: int, origins: list,
+                                min_side: int = PER_DAY // 2) -> None:
+    """Fail loudly unless the ORIGINS ACTUALLY PRESENT cover pre-event, transition, recovery.
 
-    The first run of this harness reported level-shift and spike results that were in fact
-    ordinary repeating traffic, because every event lay beyond the last scored target. An
-    evaluation that cannot see its own event must stop, not publish.
+    Two defects this has had to survive:
+      * the first harness scored windows that ended before the event ever occurred;
+      * the first version of this check tested only origins[0]..origins[-1], i.e. the RANGE,
+        so a window whose event-region origins had all been excluded still passed (C-74).
+    It now counts origins that are actually in the list, on each side of and spanning each
+    event, so exclusions cannot hollow out the evaluation unnoticed.
     """
     events = scenario_event_indices(scenario, n, seed)
     if not events:
         return
-    first_target, last_target = origins[0] + 1, origins[-1] + STEPS_AHEAD
-    inside = [e for e in events if first_target <= e <= last_target]
-    if not inside:
+    present = set(origins)
+    if not present:
+        raise WindowCoverageError(f"{scenario} (seed {seed}): no origins at all")
+
+    covered = []
+    for e in events:
+        # An origin "spans" the event when one of its six targets lands on it.
+        spanning = [o for o in origins if o + 1 <= e <= o + STEPS_AHEAD]
+        before = [o for o in origins if o + STEPS_AHEAD < e]
+        after = [o for o in origins if o + 1 > e]
+        if spanning and len(before) >= min_side and len(after) >= min_side:
+            covered.append({"event": e, "spanning_origins": len(spanning),
+                            "origins_before": len(before), "origins_after": len(after)})
+    if not covered:
+        detail = []
+        for e in events[:5]:
+            detail.append(
+                f"event {e}: spanning={len([o for o in origins if o + 1 <= e <= o + STEPS_AHEAD])} "
+                f"before={len([o for o in origins if o + STEPS_AHEAD < e])} "
+                f"after={len([o for o in origins if o + 1 > e])}")
         raise WindowCoverageError(
-            f"{scenario} (seed {seed}): no event inside the scored targets "
-            f"[{first_target}, {last_target}]; events at {events}. "
-            f"This run would measure pre-event traffic and report it as a stress test.")
-    pre = [e for e in inside if e - first_target >= PER_DAY // 2]
-    post = [e for e in inside if last_target - e >= PER_DAY // 2]
-    if not pre:
-        raise WindowCoverageError(
-            f"{scenario} (seed {seed}): no event has at least half a day of pre-event "
-            f"targets before it; the baseline period is too short to compare against.")
-    if not post:
-        raise WindowCoverageError(
-            f"{scenario} (seed {seed}): no event has at least half a day of targets after "
-            f"it; recovery cannot be observed.")
+            f"{scenario} (seed {seed}): no event is covered by origins that are actually "
+            f"present with at least {min_side} origins on each side. "
+            f"{'; '.join(detail)}. Scored origins: {len(origins)}.")
 
 
 # ======================================================================================
@@ -552,6 +563,9 @@ def evaluate_scenario(series: pd.Series, scenario: str, seed: int, *,
     last_train_idx = -10 ** 9
     predictor_failures: list = []
     scored_origins: list = []
+    scored_indices: list = []
+    availability: dict = {}
+    exclusions: list = []
     retrain_every = retrain_every_h * 60 // GRID_MIN
     train_failures = []
 
@@ -571,7 +585,12 @@ def evaluate_scenario(series: pd.Series, scenario: str, seed: int, *,
             try:
                 m = LSTMForecastModel(sequence_length=SEQ)
                 # Rolling seven-day window, as the deployed trainer uses (C-54).
-                train_hist = hist.iloc[-(train_window_days * PER_DAY):]
+                window = hist.iloc[-(train_window_days * PER_DAY):]
+                # C-73: the deployed trainer applies an OUTER 80/20 split first
+                # (train_lstm_from_vm.py:222-224) and fits on the first 80% only. Training
+                # on the whole window gave the evaluation more data than production gets.
+                outer = int(0.8 * len(window))
+                train_hist = window.iloc[:outer]
                 m.train(pd.DataFrame({"value": train_hist.values}, index=train_hist.index),
                         epochs=epochs)
                 pending_model = (m, origin + pd.Timedelta(minutes=publication_delay_min))
@@ -590,26 +609,36 @@ def evaluate_scenario(series: pd.Series, scenario: str, seed: int, *,
         # C-54: score an origin only when EVERY predictor produced a forecast for it, so all
         # columns cover identical targets. A predictor that fails is recorded, not skipped
         # silently.
-        this_origin = {}
+        # C-74: compute EVERY arm's forecast and record its availability BEFORE forming the
+        # intersection. Breaking out of the loop early (the previous behaviour) hid which
+        # arms could have produced a value, so per-arm availability could not be reported
+        # and the exclusion reason was attributed to whichever arm happened to fail first.
+        this_origin, reasons = {}, {}
         for p in predictors:
             if p.needs_model and model is None:
-                this_origin = {}                      # cold start: no published model yet
-                break
+                reasons[p.name] = "no published model (cold start)"
+                continue
             try:
                 pred = np.asarray(p.forecast(hist, origin, STEPS_AHEAD, model=model), dtype=float)
             except Exception as exc:
+                reasons[p.name] = f"error: {type(exc).__name__}: {exc}"
                 predictor_failures.append(f"{p.name} @ {origin.isoformat()}: {exc}")
                 log.warning("%s failed at %s: %s", p.name, origin, exc)
-                this_origin = {}
-                break
+                continue
             if not np.all(np.isfinite(pred)):
+                reasons[p.name] = "non-finite forecast"
                 predictor_failures.append(f"{p.name} @ {origin.isoformat()}: non-finite forecast")
-                this_origin = {}
-                break
+                continue
             this_origin[p.name] = pred
+
+        for name in this_origin:
+            availability[name] = availability.get(name, 0) + 1
+        if reasons:
+            exclusions.append({"origin": origin.isoformat(), "index": i, "reasons": reasons})
 
         if len(this_origin) == len(predictors):
             scored_origins.append(origin)
+            scored_indices.append(i)
             for name, pred in this_origin.items():
                 overall[name].add(pred, truth)
                 for st in range(STEPS_AHEAD):
@@ -619,6 +648,24 @@ def evaluate_scenario(series: pd.Series, scenario: str, seed: int, *,
         if verbose and k % 25 == 0:
             print(f"    origin {k + 1}/{len(origins)} ({origin})  "
                   f"[{time.time() - t_start:.0f}s]", flush=True)
+
+    # C-74: the pre-scoring assertion cannot see exclusions. Re-check coverage against the
+    # origins that were ACTUALLY scored -- an evaluation whose event origins were all
+    # excluded looks fine to the pre-check and is still worthless.
+    coverage_after = {"ok": True, "detail": "no events (by design)"}
+    if scored_indices:
+        try:
+            assert_window_covers_events(scenario, seed, len(series), scored_indices)
+            ev = scenario_event_indices(scenario, len(series), seed)
+            coverage_after = {"ok": True, "events_in_scored_window":
+                              len([e for e in ev
+                                   if scored_indices[0] + 1 <= e <= scored_indices[-1] + STEPS_AHEAD]),
+                              "events_total": len(ev)}
+        except WindowCoverageError as exc:
+            coverage_after = {"ok": False, "detail": str(exc)}
+            log.warning("post-exclusion coverage FAILED: %s", exc)
+    else:
+        coverage_after = {"ok": False, "detail": "no origins scored"}
 
     actual_window = series.iloc[origins[0]:origins[-1] + 1]
     operational = {}
@@ -636,6 +683,17 @@ def evaluate_scenario(series: pd.Series, scenario: str, seed: int, *,
         "origins_offered": len(origins),
         "origins_scored": len(scored_origins),
         "predictor_failures": predictor_failures,
+        "availability_per_arm": availability,
+        "exclusions": exclusions[:200],
+        "exclusions_total": len(exclusions),
+        "event_coverage_after_exclusions": coverage_after,
+        "equivalence_caveats": [
+            "trainer: outer 80/20 split applied (C-73), matching train_lstm_from_vm.py",
+            "NOT production-equivalent: the API's matured-error feedback loop "
+            "(mape_for_floor -> effective percentile) is not exercised",
+            "NOT production-equivalent: the Go replay calls selected controller functions, "
+            "not the full forecasting and reconciliation path; confidence dampening absent",
+        ],
         "epochs": epochs,
         "train_window_days": train_window_days,
         "data_seed": seed,
