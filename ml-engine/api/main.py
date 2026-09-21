@@ -640,6 +640,29 @@ class LSTMPredictor:
                 PREDICTION_ERRORS.labels(error_type=type(e).__name__).inc()
                 raise e
 
+def _json_safe(obj):
+    """Recursively map non-finite floats to None so the response is JSON-compliant (C-83).
+
+    FastAPI's JSONResponse uses json.dumps(allow_nan=False); a single NaN anywhere in the
+    payload -- even an unused diagnostic -- became HTTP 400 "Out of range float values are
+    not JSON compliant" and a finite seasonal forecast was refused. The model already emits
+    None for its known diagnostic fields; this sweep is the guarantee at the boundary.
+    """
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, (float, np.floating)):
+        return float(obj) if math.isfinite(obj) else None
+    if isinstance(obj, np.ndarray):
+        return _json_safe(obj.tolist())
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    return obj
+
+
 def _finite_or_none(value):
     """A finite float, or None for None/NaN/inf/unparseable. Used by the accuracy queue and
     the per-component gauges so an unavailable step is skipped, not fatal (C-79)."""
@@ -920,7 +943,8 @@ async def predict(request: Dict):
         except Exception:
             response_mape = 0.0
 
-        return JSONResponse(content={**prediction, "mape": response_mape})
+        # C-83: the whole payload is swept for non-finite floats at the boundary.
+        return JSONResponse(content=_json_safe({**prediction, "mape": response_mape}))
         
     except ValueError as e:
         logger.error(f"Validation error: {e}")

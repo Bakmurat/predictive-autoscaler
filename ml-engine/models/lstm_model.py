@@ -691,7 +691,12 @@ class LSTMForecastModel:
             'target_timestamps': [(origin + timedelta(minutes=10 * (s + 1))).isoformat()
                                   for s in range(steps_ahead)],
             'components': {
-                'lstm': lstm_rescaled.tolist() if hasattr(lstm_rescaled, 'tolist') else list(lstm_rescaled),
+                # C-83: a non-finite network value is a DIAGNOSTIC of failure, not a number to
+                # serialize. JSON has no NaN/inf; leaving them here turned a finite served
+                # forecast into HTTP 400 at the response boundary. None, with the failure
+                # status kept in network_failed / network_finite_per_step.
+                'lstm': [float(v) if bool(network_finite[i]) else None
+                         for i, v in enumerate(lstm_rescaled)],
                 # C-75: unavailable steps are None (JSON null), never a substituted number.
                 'pattern': [None if not bool(step_available[i]) else float(pattern_preds[i])
                             for i in range(steps_ahead)],
@@ -706,8 +711,8 @@ class LSTMForecastModel:
                 'network_finite_per_step': [bool(x) for x in network_finite],
                 'network_share': float(np.mean([1.0 - w for w in pattern_weights]))
                 if pattern_weights else 1.0,
-                'blended': blended_pre_floor,
-                'final': [float(v) for v in final_predictions],
+                'blended': [float(v) if np.isfinite(v) else None for v in blended_pre_floor],
+                'final': [float(v) if np.isfinite(v) else None for v in final_predictions],
             },
             'floor_pct': float(floor_pct_value)
         }
