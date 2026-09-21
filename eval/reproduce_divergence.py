@@ -11,6 +11,22 @@ So the honest experiment is: reproduce that configuration, confirm the failure s
 occurs, and only then ask whether activation or gradient clipping prevents it. Anything
 else is testing a fix against conditions that never failed.
 
+RECORD SHAPE (Codex C-95 / D-120)
+---------------------------------
+The first version of this file keyed every repetition by `str(model_seed)`. Unseeded
+repetitions all have the seed `None`, so all five landed under the single key "None" and
+overwrote each other: the JSON kept one outcome per arm while the console log held five.
+Every repetition now carries a UNIQUE id (`rep01`...), its own `failure_type`, and the
+spread is computed over SUCCESSFUL repetitions only, with the denominator stated.
+
+WHAT THIS EXPERIMENT CAN AND CANNOT SAY
+---------------------------------------
+Supported: "failures occurred only in the clipping arm here."
+NOT supported: "clipping caused divergence." The comparison is small, unmatched (unseeded
+initialisations are not paired across arms) and each repetition trains ONCE, whereas the
+withdrawn sweep retrained on a rolling schedule roughly eleven times per run. Single-training
+trials therefore do not reproduce the original rolling-retraining exposure at all.
+
 Usage:
     eval/.venv/bin/python eval/reproduce_divergence.py --out eval/divergence.json
 """
@@ -43,11 +59,30 @@ ARMS = {
     "c_both": {"activation": "tanh", "clipnorm": 1.0},
 }
 
-DIVERGENCE_FACTOR = 10.0   # network MAE this many times the seasonal baseline's = diverged
+DIVERGENCE_FACTOR = 10.0   # network MAE this many times the seasonal baseline's = threshold
+
+# The only claim this experiment supports, carried inside its own artifact so that no reader
+# has to go looking for the caveat (Codex C-95 / D-120).
+PERMITTED_CLAIM = "failures occurred only in the clipping arm here"
+WITHHELD_CLAIM = ("clipping caused divergence -- NOT supported: the comparison is small and "
+                  "unmatched (unseeded initialisations are not paired across arms), and each "
+                  "repetition trains ONCE while the withdrawn sweep retrained on a rolling "
+                  "schedule roughly eleven times per run, so single-training trials do not "
+                  "reproduce the original rolling-retraining exposure")
+
+# Every repetition ends in exactly one of these states. `None` means it produced a finite MAE.
+FAILURE_TRAIN = "train_exception"
+FAILURE_PREDICT = "predict_exception"
+FAILURE_NON_FINITE = "non_finite_forecast"
+FAILURE_NO_ORIGINS = "no_scored_origins"
 
 
 def score_network(model, series, origins):
-    """MAE of the raw network over the origins, and the worst single error."""
+    """MAE of the raw network over the origins, and the worst single error.
+
+    On failure returns {"failure_type": ...} and NO `mae`, so a failed repetition can never
+    enter a spread denominator.
+    """
     errs, worst = [], 0.0
     for i in origins:
         origin = series.index[i]
@@ -59,16 +94,54 @@ def score_network(model, series, origins):
             out = _model_predict(model, hist, origin, STEPS_AHEAD, seasonal=None)
             pred = np.asarray(out["components"]["lstm"], dtype=float)
         except Exception as exc:
-            return {"failed": f"{type(exc).__name__}: {exc}", "diverged": True}
+            return {"failure_type": FAILURE_PREDICT,
+                    "failure_detail": f"{type(exc).__name__}: {exc}"}
         if not np.all(np.isfinite(pred)):
-            return {"failed": "non-finite forecast", "diverged": True}
+            return {"failure_type": FAILURE_NON_FINITE,
+                    "failure_detail": "non-finite forecast"}
         for p, t in zip(pred, truth):
             errs.append(abs(p - t))
             worst = max(worst, abs(p - t))
     if not errs:
-        return {"failed": "no scored origins"}
-    return {"mae": round(float(np.mean(errs)), 2),
+        return {"failure_type": FAILURE_NO_ORIGINS, "failure_detail": "no scored origins"}
+    return {"failure_type": None,
+            "mae": round(float(np.mean(errs)), 2),
             "worst_abs_error": round(float(worst), 2)}
+
+
+def summarise_arm(reps: list, threshold=None) -> dict:
+    """Roll repetitions up WITHOUT losing any of them.
+
+    `reps` is the ordered, complete list of repetition records -- one per repetition, each with
+    a unique `rep_id`. Failures and threshold exceedances are counted SEPARATELY: a repetition
+    that produced no finite MAE cannot be compared against a threshold, and a repetition whose
+    MAE merely exceeded the threshold did not fail. Spread is max/min over the SUCCESSFUL
+    repetitions only, and the denominator is reported next to it.
+    """
+    ok = [r for r in reps if r.get("failure_type") is None and r.get("mae") is not None]
+    failed = [r for r in reps if r.get("failure_type") is not None]
+    maes = [r["mae"] for r in ok]
+    over = [r["rep_id"] for r in ok
+            if threshold is not None and r["mae"] > threshold]
+    by_type = {}
+    for r in failed:
+        by_type.setdefault(r["failure_type"], []).append(r["rep_id"])
+    return {
+        "repetitions": reps,
+        "runs": len(reps),
+        "successful_runs": len(ok),
+        "failed_runs": len(failed),
+        "failed_rep_ids": [r["rep_id"] for r in failed],
+        "failures_by_type": by_type,
+        "threshold_exceeded_runs": len(over),
+        "threshold_exceeded_rep_ids": over,
+        "mae_min": round(min(maes), 2) if maes else None,
+        "mae_max": round(max(maes), 2) if maes else None,
+        "max_over_min": (round(max(maes) / min(maes), 2)
+                         if maes and min(maes) > 0 else None),
+        "spread_basis": {"over": "successful repetitions only",
+                         "n_successful": len(ok), "n_total": len(reps)},
+    }
 
 
 def baseline_mae(series, origins):
@@ -109,12 +182,19 @@ def run(scenario: str, data_seed: int, model_seeds, epochs: int, origins_n: int,
            "history": history, "train_points": len(train_hist),
            "scored_origins": len(origins), "seasonal_baseline_mae": ref,
            "divergence_threshold": None if ref is None else round(ref * DIVERGENCE_FACTOR, 2),
+           "trainings_per_repetition": 1,
+           "trainings_per_run_in_the_withdrawn_sweep": "~11 (rolling retrain) -- NOT matched here",
            "arms": {}}
+
+    threshold = None if ref is None else ref * DIVERGENCE_FACTOR
 
     import tensorflow as tf
     for arm, cfg in ARMS.items():
-        seeds_out, maes, diverged = {}, [], []
-        for ms in model_seeds:
+        reps = []
+        for n, ms in enumerate(model_seeds, start=1):
+            # Every repetition gets its own id. Unseeded repetitions all carry model_seed
+            # None, which is exactly why the seed cannot be the key (C-95).
+            rec = {"rep_id": f"rep{n:02d}", "model_seed": ms}
             t0 = time.time()
             if ms is not None:
                 tf.keras.utils.set_random_seed(ms)
@@ -124,32 +204,31 @@ def run(scenario: str, data_seed: int, model_seeds, epochs: int, origins_n: int,
                 m.train(pd.DataFrame({"value": train_hist.values}, index=train_hist.index),
                         epochs=epochs, **cfg)
             except Exception as exc:
-                seeds_out[str(ms)] = {"failed": f"train: {exc}", "diverged": True}
-                diverged.append(str(ms))
+                rec.update({"failure_type": FAILURE_TRAIN,
+                            "failure_detail": f"{type(exc).__name__}: {exc}",
+                            "train_seconds": round(time.time() - t0, 1)})
+                reps.append(rec)
+                print(f"  {arm:14s} {rec['rep_id']}: FAILED ({FAILURE_TRAIN})", flush=True)
                 continue
-            sc = score_network(m, series, origins)
-            sc["train_seconds"] = round(time.time() - t0, 1)
-            is_div = bool(sc.get("diverged") or
-                          (ref and sc.get("mae") and sc["mae"] > ref * DIVERGENCE_FACTOR))
-            sc["diverged"] = is_div
-            if is_div:
-                diverged.append(str(ms))
-            if sc.get("mae") is not None:
-                maes.append(sc["mae"])
-            seeds_out[str(ms)] = sc
-            print(f"  {arm:14s} seed {str(ms):>5s}: MAE {sc.get('mae', sc.get('failed'))}"
-                  f"{'  DIVERGED' if is_div else ''}  [{sc.get('train_seconds')}s]", flush=True)
+            rec.update(score_network(m, series, origins))
+            rec["train_seconds"] = round(time.time() - t0, 1)
+            rec["exceeded_threshold"] = bool(
+                threshold is not None and rec.get("mae") is not None
+                and rec["mae"] > threshold)
+            reps.append(rec)
+            shown = rec.get("mae") if rec.get("failure_type") is None else rec["failure_type"]
+            print(f"  {arm:14s} {rec['rep_id']} seed {str(ms):>5s}: MAE {shown}"
+                  f"{'  OVER THRESHOLD' if rec.get('exceeded_threshold') else ''}"
+                  f"{'  FAILED' if rec.get('failure_type') else ''}"
+                  f"  [{rec['train_seconds']}s]", flush=True)
 
-        out["arms"][arm] = {
-            "config": cfg, "seeds": seeds_out,
-            "runs": len(model_seeds), "diverged_runs": len(diverged),
-            "diverged_seeds": diverged,
-            "mae_min": round(min(maes), 2) if maes else None,
-            "mae_max": round(max(maes), 2) if maes else None,
-            "max_over_min": round(max(maes) / min(maes), 2) if maes and min(maes) > 0 else None,
-        }
-        print(f"  -> {arm}: {len(diverged)}/{len(model_seeds)} diverged, "
-              f"spread {out['arms'][arm]['max_over_min']}", flush=True)
+        summary = summarise_arm(reps, threshold=threshold)
+        summary["config"] = cfg
+        out["arms"][arm] = summary
+        print(f"  -> {arm}: {summary['failed_runs']}/{summary['runs']} failed, "
+              f"{summary['threshold_exceeded_runs']}/{summary['successful_runs']} over "
+              f"threshold, spread {summary['max_over_min']} "
+              f"(over {summary['successful_runs']} successful)", flush=True)
     return out
 
 
@@ -176,8 +255,11 @@ def main():
     Path(args.out).write_text(json.dumps(
         {"generated_at": datetime.utcnow().isoformat() + "Z",
          "kind": "divergence_reproduction",
+         "record_version": 2,
          "original_conditions": ORIGINAL,
          "divergence_factor": DIVERGENCE_FACTOR,
+         "permitted_claim": PERMITTED_CLAIM,
+         "withheld_claim": WITHHELD_CLAIM,
          "arms": ARMS, "results": results}, indent=2, default=str))
     print(f"\nwrote {args.out}")
 

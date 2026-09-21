@@ -1,0 +1,633 @@
+{
+  "generated_at": "2026-09-21T23:16:27.634468Z",
+  "kind": "divergence_reproduction",
+  "record_version": 2,
+  "rebuilt_from": {
+    "log": "/Users/bakmuratkubanaliev/Desktop/3.OpenSource/predictive-autoscaler/eval/divergence.log",
+    "defective_json": "/Users/bakmuratkubanaliev/Desktop/3.OpenSource/predictive-autoscaler/eval/divergence.json",
+    "why": "reproduce_divergence.py keyed repetitions by model seed; every unseeded repetition had the seed None, so four of five were overwritten per arm (Codex C-95 / D-120). The log is the surviving complete record.",
+    "not_recoverable": "per-repetition worst_abs_error, except the one repetition the defective record happened to keep"
+  },
+  "original_conditions": {
+    "epochs": 12,
+    "history": "expanding",
+    "seeded": false
+  },
+  "divergence_factor": 10.0,
+  "permitted_claim": "failures occurred only in the clipping arm here",
+  "withheld_claim": "clipping caused divergence -- NOT supported: the comparison is small and unmatched (unseeded initialisations are not paired across arms), and each repetition trains ONCE while the withdrawn sweep retrained on a rolling schedule roughly eleven times per run, so single-training trials do not reproduce the original rolling-retraining exposure",
+  "arms": {
+    "original_relu": {
+      "activation": "relu",
+      "clipnorm": null
+    },
+    "a_tanh": {
+      "activation": "tanh",
+      "clipnorm": null
+    },
+    "b_clipnorm": {
+      "activation": "relu",
+      "clipnorm": 1.0
+    },
+    "c_both": {
+      "activation": "tanh",
+      "clipnorm": 1.0
+    }
+  },
+  "results": [
+    {
+      "scenario": "repeating",
+      "data_seed": 2,
+      "history": "expanding",
+      "epochs": 12,
+      "train_points": 1642,
+      "scored_origins": 80,
+      "seasonal_baseline_mae": 174.64,
+      "divergence_threshold": 1746.4,
+      "trainings_per_repetition": 1,
+      "trainings_per_run_in_the_withdrawn_sweep": "~11 (rolling retrain) -- NOT matched here",
+      "arms": {
+        "original_relu": {
+          "repetitions": [
+            {
+              "rep_id": "rep01",
+              "model_seed": null,
+              "train_seconds": 98.0,
+              "worst_abs_error": null,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 197.18
+            },
+            {
+              "rep_id": "rep02",
+              "model_seed": null,
+              "train_seconds": 96.8,
+              "worst_abs_error": null,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 198.59
+            },
+            {
+              "rep_id": "rep03",
+              "model_seed": null,
+              "train_seconds": 96.7,
+              "worst_abs_error": null,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 175.55
+            },
+            {
+              "rep_id": "rep04",
+              "model_seed": null,
+              "train_seconds": 99.2,
+              "worst_abs_error": null,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 209.81
+            },
+            {
+              "rep_id": "rep05",
+              "model_seed": null,
+              "train_seconds": 94.9,
+              "worst_abs_error": 604.62,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 199.09,
+              "worst_abs_error_note": "the only repetition the old record kept"
+            }
+          ],
+          "runs": 5,
+          "successful_runs": 5,
+          "failed_runs": 0,
+          "failed_rep_ids": [],
+          "failures_by_type": {},
+          "threshold_exceeded_runs": 0,
+          "threshold_exceeded_rep_ids": [],
+          "mae_min": 175.55,
+          "mae_max": 209.81,
+          "max_over_min": 1.2,
+          "spread_basis": {
+            "over": "successful repetitions only",
+            "n_successful": 5,
+            "n_total": 5
+          },
+          "config": {
+            "activation": "relu",
+            "clipnorm": null
+          }
+        },
+        "a_tanh": {
+          "repetitions": [
+            {
+              "rep_id": "rep01",
+              "model_seed": null,
+              "train_seconds": 95.4,
+              "worst_abs_error": null,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 202.97
+            },
+            {
+              "rep_id": "rep02",
+              "model_seed": null,
+              "train_seconds": 95.2,
+              "worst_abs_error": null,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 193.63
+            },
+            {
+              "rep_id": "rep03",
+              "model_seed": null,
+              "train_seconds": 95.1,
+              "worst_abs_error": null,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 174.93
+            },
+            {
+              "rep_id": "rep04",
+              "model_seed": null,
+              "train_seconds": 95.0,
+              "worst_abs_error": null,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 231.52
+            },
+            {
+              "rep_id": "rep05",
+              "model_seed": null,
+              "train_seconds": 95.5,
+              "worst_abs_error": 673.97,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 170.51,
+              "worst_abs_error_note": "the only repetition the old record kept"
+            }
+          ],
+          "runs": 5,
+          "successful_runs": 5,
+          "failed_runs": 0,
+          "failed_rep_ids": [],
+          "failures_by_type": {},
+          "threshold_exceeded_runs": 0,
+          "threshold_exceeded_rep_ids": [],
+          "mae_min": 170.51,
+          "mae_max": 231.52,
+          "max_over_min": 1.36,
+          "spread_basis": {
+            "over": "successful repetitions only",
+            "n_successful": 5,
+            "n_total": 5
+          },
+          "config": {
+            "activation": "tanh",
+            "clipnorm": null
+          }
+        },
+        "b_clipnorm": {
+          "repetitions": [
+            {
+              "rep_id": "rep01",
+              "model_seed": null,
+              "train_seconds": 92.8,
+              "worst_abs_error": null,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": "non_finite_forecast",
+              "failure_detail": "non-finite forecast"
+            },
+            {
+              "rep_id": "rep02",
+              "model_seed": null,
+              "train_seconds": 94.0,
+              "worst_abs_error": null,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": "non_finite_forecast",
+              "failure_detail": "non-finite forecast"
+            },
+            {
+              "rep_id": "rep03",
+              "model_seed": null,
+              "train_seconds": 96.2,
+              "worst_abs_error": null,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 180.54
+            },
+            {
+              "rep_id": "rep04",
+              "model_seed": null,
+              "train_seconds": 107.1,
+              "worst_abs_error": null,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 216.62
+            },
+            {
+              "rep_id": "rep05",
+              "model_seed": null,
+              "train_seconds": 100.9,
+              "worst_abs_error": 598.62,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 198.98,
+              "worst_abs_error_note": "the only repetition the old record kept"
+            }
+          ],
+          "runs": 5,
+          "successful_runs": 3,
+          "failed_runs": 2,
+          "failed_rep_ids": [
+            "rep01",
+            "rep02"
+          ],
+          "failures_by_type": {
+            "non_finite_forecast": [
+              "rep01",
+              "rep02"
+            ]
+          },
+          "threshold_exceeded_runs": 0,
+          "threshold_exceeded_rep_ids": [],
+          "mae_min": 180.54,
+          "mae_max": 216.62,
+          "max_over_min": 1.2,
+          "spread_basis": {
+            "over": "successful repetitions only",
+            "n_successful": 3,
+            "n_total": 5
+          },
+          "config": {
+            "activation": "relu",
+            "clipnorm": 1.0
+          }
+        },
+        "c_both": {
+          "repetitions": [
+            {
+              "rep_id": "rep01",
+              "model_seed": null,
+              "train_seconds": 96.7,
+              "worst_abs_error": null,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 189.3
+            },
+            {
+              "rep_id": "rep02",
+              "model_seed": null,
+              "train_seconds": 107.3,
+              "worst_abs_error": null,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 181.38
+            },
+            {
+              "rep_id": "rep03",
+              "model_seed": null,
+              "train_seconds": 102.6,
+              "worst_abs_error": null,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 204.38
+            },
+            {
+              "rep_id": "rep04",
+              "model_seed": null,
+              "train_seconds": 95.7,
+              "worst_abs_error": null,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 192.04
+            },
+            {
+              "rep_id": "rep05",
+              "model_seed": null,
+              "train_seconds": 97.4,
+              "worst_abs_error": 649.3,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 197.75,
+              "worst_abs_error_note": "the only repetition the old record kept"
+            }
+          ],
+          "runs": 5,
+          "successful_runs": 5,
+          "failed_runs": 0,
+          "failed_rep_ids": [],
+          "failures_by_type": {},
+          "threshold_exceeded_runs": 0,
+          "threshold_exceeded_rep_ids": [],
+          "mae_min": 181.38,
+          "mae_max": 204.38,
+          "max_over_min": 1.13,
+          "spread_basis": {
+            "over": "successful repetitions only",
+            "n_successful": 5,
+            "n_total": 5
+          },
+          "config": {
+            "activation": "tanh",
+            "clipnorm": 1.0
+          }
+        }
+      }
+    },
+    {
+      "scenario": "weekly",
+      "data_seed": 2,
+      "history": "expanding",
+      "epochs": 12,
+      "train_points": 1642,
+      "scored_origins": 80,
+      "seasonal_baseline_mae": 175.23,
+      "divergence_threshold": 1752.3,
+      "trainings_per_repetition": 1,
+      "trainings_per_run_in_the_withdrawn_sweep": "~11 (rolling retrain) -- NOT matched here",
+      "arms": {
+        "original_relu": {
+          "repetitions": [
+            {
+              "rep_id": "rep01",
+              "model_seed": null,
+              "train_seconds": 97.1,
+              "worst_abs_error": null,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 236.36
+            },
+            {
+              "rep_id": "rep02",
+              "model_seed": null,
+              "train_seconds": 97.8,
+              "worst_abs_error": null,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 200.12
+            },
+            {
+              "rep_id": "rep03",
+              "model_seed": null,
+              "train_seconds": 95.2,
+              "worst_abs_error": null,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 277.26
+            },
+            {
+              "rep_id": "rep04",
+              "model_seed": null,
+              "train_seconds": 95.0,
+              "worst_abs_error": null,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 1128.46
+            },
+            {
+              "rep_id": "rep05",
+              "model_seed": null,
+              "train_seconds": 94.6,
+              "worst_abs_error": 3009.96,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 1485.85,
+              "worst_abs_error_note": "the only repetition the old record kept"
+            }
+          ],
+          "runs": 5,
+          "successful_runs": 5,
+          "failed_runs": 0,
+          "failed_rep_ids": [],
+          "failures_by_type": {},
+          "threshold_exceeded_runs": 0,
+          "threshold_exceeded_rep_ids": [],
+          "mae_min": 200.12,
+          "mae_max": 1485.85,
+          "max_over_min": 7.42,
+          "spread_basis": {
+            "over": "successful repetitions only",
+            "n_successful": 5,
+            "n_total": 5
+          },
+          "config": {
+            "activation": "relu",
+            "clipnorm": null
+          }
+        },
+        "a_tanh": {
+          "repetitions": [
+            {
+              "rep_id": "rep01",
+              "model_seed": null,
+              "train_seconds": 96.3,
+              "worst_abs_error": null,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 215.61
+            },
+            {
+              "rep_id": "rep02",
+              "model_seed": null,
+              "train_seconds": 96.0,
+              "worst_abs_error": null,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 201.22
+            },
+            {
+              "rep_id": "rep03",
+              "model_seed": null,
+              "train_seconds": 95.4,
+              "worst_abs_error": null,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 216.79
+            },
+            {
+              "rep_id": "rep04",
+              "model_seed": null,
+              "train_seconds": 95.5,
+              "worst_abs_error": null,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 214.93
+            },
+            {
+              "rep_id": "rep05",
+              "model_seed": null,
+              "train_seconds": 95.2,
+              "worst_abs_error": 693.55,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 215.46,
+              "worst_abs_error_note": "the only repetition the old record kept"
+            }
+          ],
+          "runs": 5,
+          "successful_runs": 5,
+          "failed_runs": 0,
+          "failed_rep_ids": [],
+          "failures_by_type": {},
+          "threshold_exceeded_runs": 0,
+          "threshold_exceeded_rep_ids": [],
+          "mae_min": 201.22,
+          "mae_max": 216.79,
+          "max_over_min": 1.08,
+          "spread_basis": {
+            "over": "successful repetitions only",
+            "n_successful": 5,
+            "n_total": 5
+          },
+          "config": {
+            "activation": "tanh",
+            "clipnorm": null
+          }
+        },
+        "b_clipnorm": {
+          "repetitions": [
+            {
+              "rep_id": "rep01",
+              "model_seed": null,
+              "train_seconds": 93.6,
+              "worst_abs_error": null,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": "non_finite_forecast",
+              "failure_detail": "non-finite forecast"
+            },
+            {
+              "rep_id": "rep02",
+              "model_seed": null,
+              "train_seconds": 95.4,
+              "worst_abs_error": null,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 227.11
+            },
+            {
+              "rep_id": "rep03",
+              "model_seed": null,
+              "train_seconds": 95.3,
+              "worst_abs_error": null,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 564.68
+            },
+            {
+              "rep_id": "rep04",
+              "model_seed": null,
+              "train_seconds": 96.9,
+              "worst_abs_error": null,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 246.32
+            },
+            {
+              "rep_id": "rep05",
+              "model_seed": null,
+              "train_seconds": 95.3,
+              "worst_abs_error": 573.46,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 202.16,
+              "worst_abs_error_note": "the only repetition the old record kept"
+            }
+          ],
+          "runs": 5,
+          "successful_runs": 4,
+          "failed_runs": 1,
+          "failed_rep_ids": [
+            "rep01"
+          ],
+          "failures_by_type": {
+            "non_finite_forecast": [
+              "rep01"
+            ]
+          },
+          "threshold_exceeded_runs": 0,
+          "threshold_exceeded_rep_ids": [],
+          "mae_min": 202.16,
+          "mae_max": 564.68,
+          "max_over_min": 2.79,
+          "spread_basis": {
+            "over": "successful repetitions only",
+            "n_successful": 4,
+            "n_total": 5
+          },
+          "config": {
+            "activation": "relu",
+            "clipnorm": 1.0
+          }
+        },
+        "c_both": {
+          "repetitions": [
+            {
+              "rep_id": "rep01",
+              "model_seed": null,
+              "train_seconds": 95.7,
+              "worst_abs_error": null,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 187.22
+            },
+            {
+              "rep_id": "rep02",
+              "model_seed": null,
+              "train_seconds": 97.4,
+              "worst_abs_error": null,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 233.82
+            },
+            {
+              "rep_id": "rep03",
+              "model_seed": null,
+              "train_seconds": 96.0,
+              "worst_abs_error": null,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 198.98
+            },
+            {
+              "rep_id": "rep04",
+              "model_seed": null,
+              "train_seconds": 96.1,
+              "worst_abs_error": null,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 221.4
+            },
+            {
+              "rep_id": "rep05",
+              "model_seed": null,
+              "train_seconds": 96.2,
+              "worst_abs_error": 816.76,
+              "source": "eval/divergence.log (2026-09-21T22:53Z run)",
+              "failure_type": null,
+              "mae": 231.68,
+              "worst_abs_error_note": "the only repetition the old record kept"
+            }
+          ],
+          "runs": 5,
+          "successful_runs": 5,
+          "failed_runs": 0,
+          "failed_rep_ids": [],
+          "failures_by_type": {},
+          "threshold_exceeded_runs": 0,
+          "threshold_exceeded_rep_ids": [],
+          "mae_min": 187.22,
+          "mae_max": 233.82,
+          "max_over_min": 1.25,
+          "spread_basis": {
+            "over": "successful repetitions only",
+            "n_successful": 5,
+            "n_total": 5
+          },
+          "config": {
+            "activation": "tanh",
+            "clipnorm": 1.0
+          }
+        }
+      }
+    }
+  ]
+}
