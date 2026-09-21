@@ -1,0 +1,58 @@
+{
+  "failure_modes": {
+    "cold_start": {
+      "status": "SCORED",
+      "detail": "refused cleanly: Insufficient data: 72 points (need 150)"
+    },
+    "all_zeros": {
+      "status": "SCORED",
+      "detail": "handled: finite output"
+    },
+    "gap_in_history": {
+      "status": "SCORED",
+      "detail": "pattern source=seasonal_history, finite=True"
+    },
+    "delayed_observation": {
+      "status": "SCORED",
+      "detail": "anchored to the data"
+    },
+    "levelshift_recovery": {
+      "status": "SCORED",
+      "detail": {
+        "served_blend_mae": 1064.9,
+        "strongest_baseline": "trend_adaptive",
+        "coverage_after_exclusions": {
+          "ok": true,
+          "events_in_scored_window": 1,
+          "events_total": 1
+        },
+        "origins_scored": 298
+      }
+    },
+    "spike_recovery": {
+      "status": "SCORED",
+      "detail": {
+        "served_blend_mae": 457.4,
+        "strongest_baseline": "seasonal_pattern",
+        "coverage_after_exclusions": {
+          "ok": true,
+          "events_in_scored_window": 2,
+          "events_total": 3
+        },
+        "origins_scored": 298
+      }
+    },
+    "old_format_artifact": {
+      "status": "SCORED",
+      "detail": "detected"
+    },
+    "api_failure": {
+      "status": "NOT SCORED",
+      "detail": "exercised in k8s-operator/controllers (refusal vs transport failure, bounded cache) and ml-engine/tests/test_model_swap.py, not by this harness"
+    },
+    "retrain_midpeak": {
+      "status": "SCORED",
+      "detail": "no failures"
+    }
+  }
+}

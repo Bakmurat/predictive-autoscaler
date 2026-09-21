@@ -122,6 +122,26 @@ the sweep to score every published model separately — not done.
    probability compounds over the retrain schedule. That is the question this experiment
    raised and did not answer.
 
+## Failure-mode suite, re-run with corrected windows
+
+Every entry is now marked scored or not scored; the two "recovery" cases that the withdrawn
+run reported without ever seeing their events are genuinely scored here, with event coverage
+confirmed **after** exclusions.
+
+| Condition | Status | Result |
+|---|---|---|
+| Cold start, less than one window | SCORED | refused cleanly: "Insufficient data: 72 points (need 150)" |
+| All-zero series | SCORED | finite output, no crash |
+| Gap in the seasonal history | SCORED | pattern still sourced from real history; no invented values |
+| Delayed observation (40 min stale) | SCORED | anchored to the data's clock |
+| Level-shift recovery | **SCORED** | 1 of 1 event inside the window after exclusions; blend 1064.9 MAE, strongest baseline trend-adaptive |
+| Spike recovery | **SCORED** | 2 of 3 events inside the window after exclusions; blend 457.4 MAE, strongest baseline seasonal |
+| Old-format / mismatched artifact | SCORED | detected and refused |
+| API failure (refusal vs transport, bounded cache) | NOT SCORED | covered by the operator's Go tests and `test_model_swap.py`, not by this harness |
+| Retrain landing mid-peak | SCORED | completed without error |
+
+Raw: `eval/failure-modes-corrected.json`.
+
 ## Reproducing
 
 ```sh

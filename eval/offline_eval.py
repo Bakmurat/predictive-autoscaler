@@ -711,7 +711,12 @@ def evaluate_scenario(series: pd.Series, scenario: str, seed: int, *,
 # Failure modes
 # ======================================================================================
 def failure_modes(verbose: bool = True):
-    """Deliberately provoke the conditions a forecaster meets in production."""
+    """Deliberately provoke the conditions a forecaster meets in production.
+
+    Every entry is marked SCORED or NOT SCORED (C-51/C-74). The first version of this suite
+    reported level-shift and spike "recovery" results whose events lay outside the evaluation
+    window -- they measured ordinary traffic. Anything that cannot be scored now says so.
+    """
     results = {}
     base = make_series("repeating", days=10, seed=1)
 
@@ -720,12 +725,15 @@ def failure_modes(verbose: bool = True):
         m.train(pd.DataFrame({"value": series.values}, index=series.index), epochs=5, **kw)
         return m
 
+    def mark(status, detail):
+        return {"status": status, "detail": detail}
+
     # 1. Cold start -- no history at all.
     try:
         _train(base.iloc[:SEQ // 2])
-        results["cold_start"] = "FAIL: trained on a series shorter than one window"
+        results["cold_start"] = mark("SCORED", "FAIL: trained on a series shorter than one window")
     except ValueError as e:
-        results["cold_start"] = f"refused cleanly: {e}"
+        results["cold_start"] = mark("SCORED", f"refused cleanly: {e}")
 
     # 2. All zeros.
     zeros = pd.Series(np.zeros(len(base)), index=base.index)
@@ -733,19 +741,19 @@ def failure_modes(verbose: bool = True):
         m = _train(zeros)
         out = _model_predict(m, zeros, zeros.index[-1], STEPS_AHEAD, seasonal=zeros)
         vals = np.asarray(out["predictions"])
-        results["all_zeros"] = ("handled: finite output"
-                                if np.all(np.isfinite(vals)) else "FAIL: non-finite output")
+        results["all_zeros"] = mark("SCORED", "handled: finite output"
+                                    if np.all(np.isfinite(vals)) else "FAIL: non-finite output")
     except Exception as e:
-        results["all_zeros"] = f"raised: {type(e).__name__}: {e}"
+        results["all_zeros"] = mark("SCORED", f"raised: {type(e).__name__}: {e}")
 
     # 3. A gap in the seasonal history -- the pattern must not invent a value.
-    gapped = base.copy()
-    gapped = gapped.drop(gapped.index[-(PER_DAY + 30):-(PER_DAY + 10)])
+    gapped = base.drop(base.index[-(PER_DAY + 30):-(PER_DAY + 10)])
     helper = LSTMForecastModel(sequence_length=SEQ)
     vals, src = helper._pattern_forecast(origin=base.index[-1].to_pydatetime(),
                                          steps_ahead=STEPS_AHEAD,
                                          seasonal_history=gapped, effective_pct=75)
-    results["gap_in_history"] = f"pattern source={src}, finite={bool(vals is None or np.all(np.isfinite(vals)))}"
+    results["gap_in_history"] = mark(
+        "SCORED", f"pattern source={src}, finite={bool(vals is None or np.all(np.isfinite(vals)))}")
 
     # 4. Delayed observation -- origin must follow the data, not the wall clock.
     stale_origin = base.index[-1] - pd.Timedelta(minutes=40)
@@ -753,38 +761,60 @@ def failure_modes(verbose: bool = True):
     out = _model_predict(m, base.loc[:stale_origin], stale_origin, STEPS_AHEAD,
                          seasonal=base.loc[:stale_origin])
     first_target = pd.Timestamp(out["target_timestamps"][0])
-    results["delayed_observation"] = (
-        "anchored to the data"
-        if first_target == stale_origin + pd.Timedelta(minutes=GRID_MIN)
+    results["delayed_observation"] = mark(
+        "SCORED",
+        "anchored to the data" if first_target == stale_origin + pd.Timedelta(minutes=GRID_MIN)
         else f"FAIL: first target {first_target} for origin {stale_origin}")
 
-    # 5. Phase shift and 6. level shift: how fast does the error recover?
+    # 5/6. Level shift and spike recovery -- scored ONLY if the window covers the event.
     for kind in ("levelshift", "spike"):
-        s = make_series(kind, days=8, seed=3)
-        r = evaluate_scenario(s, kind, 3, epochs=5, max_origins=40, verbose=False)
-        if r:
-            results[f"{kind}_recovery"] = {
-                "served_blend_mae": r["overall"]["served_blend"]["mae"],
-                "previous_day_mae": r["overall"]["previous_day"]["mae"],
-            }
+        s_series = make_series(kind, days=12, seed=3)
+        try:
+            r = evaluate_scenario(s_series, kind, 3, epochs=5, max_origins=300, verbose=False)
+        except WindowCoverageError as exc:
+            results[f"{kind}_recovery"] = mark("NOT SCORED", f"window coverage: {exc}")
+            continue
+        if not r:
+            results[f"{kind}_recovery"] = mark("NOT SCORED", "no origins")
+            continue
+        cov = r.get("event_coverage_after_exclusions", {})
+        status = "SCORED" if cov.get("ok") else "NOT SCORED"
+        results[f"{kind}_recovery"] = mark(status, {
+            "served_blend_mae": r["overall"]["served_blend"]["mae"],
+            "strongest_baseline": min(
+                (k for k in ("seasonal_pattern", "previous_day", "persistence", "trend_adaptive")),
+                key=lambda k: r["overall"][k]["mae"]),
+            "coverage_after_exclusions": cov,
+            "origins_scored": r["origins_scored"],
+        })
 
-    # 7. Corrupt artifact -- covered by the API tests; assert the format guard here.
+    # 7. Corrupt / mismatched artifact -- the format guard.
     class _Old:
         model = type("m", (), {"output_shape": (None, 1)})()
-    results["old_format_artifact"] = ("detected"
-                                      if LSTMForecastModel._is_old_model_format(_Old())
-                                      else "FAIL: old format not detected")
+    results["old_format_artifact"] = mark(
+        "SCORED", "detected" if LSTMForecastModel._is_old_model_format(_Old())
+        else "FAIL: old format not detected")
 
-    # 8. Retrain landing mid-peak.
+    # 8. API failure -- covered by the operator's Go tests and the API unit tests, not here.
+    results["api_failure"] = mark(
+        "NOT SCORED",
+        "exercised in k8s-operator/controllers (refusal vs transport failure, bounded cache) "
+        "and ml-engine/tests/test_model_swap.py, not by this harness")
+
+    # 9. Retrain landing mid-peak.
     peak = make_series("repeating", days=8, seed=7)
-    r = evaluate_scenario(peak, "repeating", 7, epochs=5, max_origins=40,
-                          publication_delay_min=20, verbose=False)
-    results["retrain_midpeak"] = ("no failures" if r and not r["train_failures"]
-                                  else f"train failures: {r['train_failures'] if r else 'n/a'}")
+    try:
+        r = evaluate_scenario(peak, "repeating", 7, epochs=5, max_origins=300,
+                              publication_delay_min=20, verbose=False)
+        results["retrain_midpeak"] = mark(
+            "SCORED", "no failures" if r and not r["train_failures"]
+            else f"train failures: {r['train_failures'] if r else 'n/a'}")
+    except WindowCoverageError as exc:
+        results["retrain_midpeak"] = mark("NOT SCORED", str(exc))
 
     if verbose:
         for k, v in results.items():
-            print(f"  {k}: {v}")
+            print(f"  [{v['status']:10s}] {k}: {v['detail']}")
     return results
 
 
