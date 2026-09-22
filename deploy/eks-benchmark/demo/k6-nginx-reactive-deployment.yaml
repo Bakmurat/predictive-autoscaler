@@ -35,7 +35,12 @@ spec:
       containers:
         - name: k6
           image: grafana/k6:0.48.0
-          args: ["run", "--quiet", "-o", "experimental-prometheus-rw", "--tag", "testid=nginx-reactive", "/scripts/load.js"]
+          # 2026-09-22 (Codex D-137): --no-summary --no-thresholds stop k6's end-of-test metrics engine,
+          # which kept every Trend sample for the whole 8-day run, and the remote-write output sends
+          # trends as native histograms instead of a Trend sink that also kept every sample. Together
+          # they were ~300 bytes per request, unbounded: five OOM kills per generator at 384Mi.
+          # Measured bounded afterwards; the offered traffic (load.js, rates, executor) is unchanged.
+          args: ["run", "--quiet", "--no-summary", "--no-thresholds", "-o", "experimental-prometheus-rw", "--tag", "testid=nginx-reactive", "/scripts/load.js"]
           env:
             - name: TARGET_URL
               value: "http://nginx-reactive.demo.svc.cluster.local/"
@@ -45,11 +50,12 @@ spec:
               value: "VM_WRITE_URL"
             - name: K6_PROMETHEUS_RW_PUSH_INTERVAL
               value: "10s"
-            - name: K6_PROMETHEUS_RW_TREND_STATS
-              value: "p(95),p(99),avg"
+            - name: K6_PROMETHEUS_RW_TREND_AS_NATIVE_HISTOGRAM   # k6_http_req_duration_seconds (native histogram)
+              value: "true"
           resources:
-            requests: { cpu: 100m, memory: 128Mi }
-            limits: { cpu: 500m, memory: 384Mi }
+            # memory request == limit (D-137); identical for all three generators
+            requests: { cpu: 100m, memory: 160Mi }
+            limits: { cpu: 500m, memory: 160Mi }
           volumeMounts:
             - name: script
               mountPath: /scripts

@@ -66,7 +66,14 @@ def main():
             dropped = q(a.prom, f'sum(increase(k6_dropped_iterations_total{{testid="{app}"}}[{w}]))', at) or 0.0
             failed = q(a.prom, f'sum(increase(k6_http_reqs_total{{testid="{app}",expected_response="false"}}[{w}]))', at) or 0.0
             observed = q(a.prom, f'sum(increase(istio_requests_total{{reporter="destination",destination_workload="{app}",destination_workload_namespace="demo"}}[{w}]))', at)
-            p95_s = q(a.prom, f'max(k6_http_req_duration_p95{{testid="{app}"}})', at)   # k6 remote-write exports durations in seconds
+            # Informational only (not a gate item). From 2026-09-22 (D-137) the generators send request
+            # duration as a native histogram, so p95 is computed over THIS hour's window; before that
+            # the only series was k6's cumulative-since-start p95 gauge, used as a labelled fallback.
+            p95_s = q(a.prom, f'histogram_quantile(0.95, sum(rate(k6_http_req_duration_seconds{{testid="{app}"}}[{w}])))', at)
+            p95_src = "native_histogram_hour_window"
+            if p95_s is None or p95_s != p95_s:
+                p95_s = q(a.prom, f'max(k6_http_req_duration_p95{{testid="{app}"}})', at)   # seconds
+                p95_src = "cumulative_since_generator_start" if p95_s is not None else None
             p95 = round(p95_s * 1000, 3) if p95_s is not None else None
             gate = {"k6_series_present": delivered is not None, "destination_series_present": observed is not None,
                     "delivered_within_5pct": delivered is not None and planned > 0 and abs(delivered / planned - 1) <= 0.05,
@@ -79,7 +86,8 @@ def main():
                          "delivered_pct": None if delivered is None or not planned else round(100 * delivered / planned, 2),
                          "dropped": round(dropped), "dropped_pct": round(100 * dropped / planned, 3) if planned else None,
                          "failed": round(failed), "failed_pct": round(100 * failed / delivered, 3) if delivered else None,
-                         "destination_observed": None if observed is None else round(observed), "p95_ms": p95, "gate": gate, "pass": ok})
+                         "destination_observed": None if observed is None else round(observed), "p95_ms": p95, "p95_source": p95_src,
+                         "gate": gate, "pass": ok})
     finally:
         if pf:
             pf.terminate()
