@@ -209,5 +209,135 @@ class MainGate(unittest.TestCase):
         os.unlink(path); self.assertIn("issuance coverage", str(cm.exception))
 
 
+FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testdata", "transition-forecasts.jsonl")
+ART_A, ART_B = "a" * 64, "b" * 64
+
+
+class ArtifactTransition(unittest.TestCase):
+    """Codex round 28 / D-136: attribution by full artifact hash across a rolling-retraining transition.
+    Fixture: artifact A issues every 5 min 00:00-00:55, artifact B 01:00-01:25; six 10-min steps each, so
+    A's targets keep maturing (up to 01:55) after B has appeared. Observation is a constant 1000 rpm; A
+    forecasts 1050 (AE 50), B forecasts 1010 (AE 10). Decision lines are interleaved every minute."""
+    def load(self):
+        recs = score.load_forecasts(FIXTURE, "nginx-test", "demo", T0, T0 + timedelta(minutes=90))
+        acc, rej = score.accept_records(recs)
+        return recs, acc, rej
+
+    def test_decision_lines_are_not_issuances_or_rejections(self):
+        recs, acc, rej = self.load()
+        self.assertEqual(len(recs), 18); self.assertEqual(len(acc), 18); self.assertEqual(rej, [])
+        self.assertEqual(score.controller_rejections(recs), {})
+        self.assertEqual(len(score.load_decisions(FIXTURE, "nginx-test", "demo")), 90)
+
+    def test_no_missing_or_duplicate_issuance_across_the_change(self):
+        _, acc, _ = self.load()
+        out, rows = score.score(acc, FakeProm(lambda m: 1000.0), "nginx-test", "demo", T0, T0 + timedelta(minutes=90),
+                                cadence_min=5, as_of=T0 + timedelta(hours=3))
+        pa = out["per_artifact"]
+        self.assertEqual(set(pa), {ART_A, ART_B})
+        self.assertEqual((pa[ART_A]["issuances"], pa[ART_B]["issuances"]), (12, 6))
+        self.assertEqual(sum(v["issuances"] for v in pa.values()), out["issuances_accepted"])
+        self.assertEqual(sum(v["steps_scored"] for v in pa.values()), out["forecast_steps_scored"])
+        # every issuance appears exactly once, in exactly its own artifact's group
+        by_art = {}
+        for r in rows:
+            by_art.setdefault(r["artifact_sha256"], set()).add(r["issued_at"])
+        self.assertFalse(by_art[ART_A] & by_art[ART_B])
+        self.assertEqual(by_art[ART_A] | by_art[ART_B], {r["issued_at"] for r in acc})
+        per_iss = {}
+        for r in rows:
+            per_iss[(r["issued_at"], r["step"])] = per_iss.get((r["issued_at"], r["step"]), 0) + 1
+        self.assertTrue(all(v == 1 for v in per_iss.values())); self.assertEqual(len(per_iss), 108)
+
+    def test_old_artifact_targets_after_the_switch_stay_attributed_to_it(self):
+        _, acc, _ = self.load()
+        _, rows = score.score(acc, FakeProm(lambda m: 1000.0), "nginx-test", "demo", T0, T0 + timedelta(minutes=90),
+                              cadence_min=5, as_of=T0 + timedelta(hours=3))
+        late_a = [r for r in rows if r["artifact_sha256"] == ART_A and score.parse_ts(r["target_at"]) > T0 + timedelta(hours=1)]
+        self.assertEqual(len(late_a), 36)              # retained, scored, and still A's
+        self.assertTrue(all(r["ae"] == 50.0 for r in late_a))
+
+    def test_pooled_aggregate_is_not_an_equal_average_of_artifacts(self):
+        _, acc, _ = self.load()
+        out, _ = score.score(acc, FakeProm(lambda m: 1000.0), "nginx-test", "demo", T0, T0 + timedelta(minutes=90),
+                             cadence_min=5, as_of=T0 + timedelta(hours=3))
+        self.assertEqual(out["per_artifact"][ART_A]["MAE_rpm"], 50.0); self.assertEqual(out["per_artifact"][ART_B]["MAE_rpm"], 10.0)
+        self.assertEqual(out["overall"]["MAE_rpm"], 36.7)     # (72*50 + 36*10) / 108
+        self.assertNotEqual(out["overall"]["MAE_rpm"], 30.0)  # the equal average it must not be
+
+    def test_unmatured_targets_are_outstanding_not_gaps(self):
+        _, acc, _ = self.load()
+        out, _ = score.score(acc, FakeProm(lambda m: 1000.0), "nginx-test", "demo", T0, T0 + timedelta(minutes=90),
+                             cadence_min=5, as_of=T0 + timedelta(hours=2))
+        self.assertEqual(out["forecast_steps_outstanding"], 9); self.assertEqual(out["gaps"], 0)
+        self.assertFalse(out["final_horizon_matured"])
+        self.assertEqual(out["per_artifact"][ART_B]["outstanding"], 9); self.assertEqual(out["per_artifact"][ART_A]["outstanding"], 0)
+        self.assertEqual(out["step_coverage"], 1.0)
+
+    def test_missing_hash_goes_to_unknown(self):
+        r = rec(T0); out, _ = score.score([r], FakeProm(lambda m: 100.0), "a", "n", T0, T0 + timedelta(hours=1), cadence_min=60)
+        self.assertEqual(list(out["per_artifact"]), ["unknown"])
+
+    def test_transition_events_are_separate_and_null_when_unknown(self):
+        _, acc, _ = self.load()
+        ev = score.transition_events(acc, {ART_B: {"published_at": "2026-09-24T00:52:00Z", "api_reloaded_at": "2026-09-24T00:53:10Z"}})
+        self.assertEqual(ev[ART_A], {"published_at": None, "api_reloaded_at": None,
+                                     "first_operator_issuance_at": "2026-09-24T00:00:00Z", "issuances": 12})
+        self.assertEqual(ev[ART_B]["first_operator_issuance_at"], "2026-09-24T01:00:00Z")
+        self.assertEqual(ev[ART_B]["api_reloaded_at"], "2026-09-24T00:53:10Z")
+
+
+def dec(at, src, raw=5, adj=5, pred=5, status="used", guards=()):
+    return {"event": "decision", "at": iso(at), "application": "a", "namespace": "n", "forecast_status": status,
+            "raw_predicted_replicas": raw, "confidence_adjusted_replicas": adj, "predicted_replicas": pred,
+            "safeguards": list(guards), "desired_source": src}
+
+
+class Participation(unittest.TestCase):
+    """D-140: fraction of reconciles whose decision the prediction SET, by daily phase, complete instances only."""
+    PEAK = T0 + timedelta(hours=15)
+
+    def full_peak(self):
+        srcs = ["prediction"] * 20 + ["tie"] * 30 + ["reactive"] * 10
+        return [dec(self.PEAK + timedelta(minutes=i), s, raw=9, adj=7 if i < 12 else 9, pred=7 if i < 12 else 9,
+                    guards=("confidence_damping",) if i < 12 else ()) for i, s in enumerate(srcs)]
+
+    def test_complete_peak_fraction_and_separate_ties(self):
+        out = score.participation(self.full_peak())
+        h = out["headline_complete_phases"]["peak"]
+        self.assertEqual((h["reconciles"], h["prediction_set"], h["tie"], h["reactive"]), (60, 20, 30, 10))
+        self.assertEqual(h["prediction_set_fraction"], 0.3333); self.assertEqual(h["damping_changed"], 12)
+        self.assertEqual(h["safeguard_changed"], 12); self.assertEqual(h["safeguards"], {"confidence_damping": 12})
+        self.assertEqual(out["incomplete_instances"], [])
+
+    def test_gap_longer_than_three_intervals_makes_instance_incomplete(self):
+        d = [x for i, x in enumerate(self.full_peak()) if not 30 <= i < 34]   # 5-minute hole
+        out = score.participation(d)
+        self.assertNotIn("peak", out["headline_complete_phases"])
+        self.assertEqual(out["incomplete_instances"][0]["phase"], "peak")
+
+    def test_partial_phase_is_not_headline(self):
+        d = self.full_peak() + [dec(T0 + timedelta(hours=10, minutes=i), "prediction") for i in range(30)]
+        out = score.participation(d)
+        self.assertEqual(set(out["headline_complete_phases"]), {"peak"})
+        self.assertEqual([x["phase"] for x in out["incomplete_instances"]], ["rising"])
+
+    def test_phase_definition(self):
+        P = lambda h: score.phase_instance(T0 + timedelta(hours=h))[0]
+        self.assertEqual([P(h) for h in (5, 6, 14, 15, 16, 20, 21, 23)],
+                         ["trough", "rising", "rising", "peak", "falling", "falling", "trough", "trough"])
+        # the trough spans midnight as ONE instance
+        self.assertEqual(score.phase_instance(T0 + timedelta(hours=23))[1:], score.phase_instance(T0 + timedelta(days=1, hours=2))[1:])
+
+    def test_participation_only_cli(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            path = f.name
+        score.main(["--forecast-log", FIXTURE, "--start", iso(T0), "--end", iso(T0 + timedelta(hours=2)),
+                    "--app", "nginx-test", "--namespace", "demo", "--participation-only", "--out", path])
+        d = json.load(open(path)); os.unlink(path)
+        self.assertEqual(d["decision_records"], 90)
+        self.assertEqual(d["participation"]["incomplete_instances"][0]["phase"], "trough")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

@@ -25,6 +25,20 @@ Semantics (Codex C-04/C-09):
   operator's own counter; a sampled count of replica changes is reported separately as a cross-check.
 * Zero or missing observations are reported and excluded from MAPE (APE is undefined at 0); MAE keeps
   them.
+* Attribution (Codex round 28, D-136): every scored step is attributed to the FULL artifact_sha256 of
+  the issuance that produced it (a record without one goes to the explicit group "unknown"). Results
+  are reported pooled over all scored steps AND per artifact, each with counts; the pooled figure is
+  never an equal average of per-artifact figures. Rolling retraining replaces the artifact mid-window;
+  an issuance's targets stay attributed to its own artifact even when they mature after the next
+  artifact appears. Targets later than --as-of (default: now) are OUTSTANDING, not gaps, and the
+  output says whether the window's final horizon has matured.
+* Transition events (D-136): per artifact, the first operator issuance comes from the log; publication
+  and API reload come from --transition-events (JSON {sha256: {published_at, api_reloaded_at}}) and
+  are null when not supplied. The three are separate events and are never inferred from one another.
+* Participation (D-140): "event":"decision" lines (one per reconcile) are summarised by daily phase of
+  the generator pattern -- the fraction of reconciles whose unified decision was SET by the prediction
+  (desired_source == "prediction"), with ties and max-clamped decisions separate and counts always
+  shown. Only complete phase instances form the headline. Decision lines are never issuances.
 The script exits non-zero when nothing can be scored, a required series is missing, or coverage is
 below the gate. Known-answer tests: score_test.py.
 
@@ -97,7 +111,34 @@ class NoPeeking:
         return self.prom.instant(query, when)
 
 
+def _read_jsonl(path):
+    with open(path, encoding="utf-8") as f:
+        for n, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield n, json.loads(line)
+            except json.JSONDecodeError as e:
+                raise SystemExit(f"{path}:{n}: bad JSON: {e}")
+
+
+def load_decisions(path, app, ns, start=None, end=None):
+    """Per-reconcile decision records ("event": "decision", D-140) for one application, in log order."""
+    out = []
+    for n, r in _read_jsonl(path):
+        if r.get("event") != "decision" or r.get("application") != app or r.get("namespace") != ns:
+            continue
+        at = parse_ts(r["at"])
+        if (start is None or at >= start) and (end is None or at < end):
+            r["_line"] = n
+            out.append(r)
+    return out
+
+
 def load_forecasts(path, app, ns, start, end):
+    """Issuance records and issuance-keyed events (sanity_rejected) in the window. Per-reconcile
+    decision lines are NOT issuances and are skipped here (see load_decisions)."""
     recs = []
     with open(path, encoding="utf-8") as f:
         for n, line in enumerate(f, 1):
@@ -109,6 +150,8 @@ def load_forecasts(path, app, ns, start, end):
             except json.JSONDecodeError as e:
                 raise SystemExit(f"{path}:{n}: bad JSON: {e}")
             if r.get("application") != app or r.get("namespace") != ns:
+                continue
+            if r.get("event") == "decision" or "issued_at" not in r:
                 continue
             r["_line"] = n
             issued = parse_ts(r["issued_at"])
@@ -178,27 +221,49 @@ def expected_issuances(start, end, cadence_min):
     return max(1, int(math.floor((end - start).total_seconds() / (cadence_min * 60))))
 
 
-def score(accepted, prom, app, ns, start, end, cadence_min=5.0):
+UNKNOWN_ARTIFACT = "unknown"
+
+
+def artifact_of(r):
+    return r.get("artifact_sha256") or UNKNOWN_ARTIFACT
+
+
+def score(accepted, prom, app, ns, start, end, cadence_min=5.0, as_of=None):
     """Score accepted records against point samples at their target times. prom must provide
-    instant(query, at). Returns (summary, rows)."""
+    instant(query, at). Targets later than `as_of` (None = no limit) are OUTSTANDING: neither scored
+    nor gaps. Returns (summary, rows)."""
     q = CANONICAL.format(app=app, ns=ns)
     guard = NoPeeking(prom)
     per_step, rows, gaps, zero_obs = {}, [], [], 0
     steps_total = 0
+    outstanding = []
+    art = {}   # full artifact hash -> counts (D-136)
     for r in accepted:
         issued = parse_ts(r["issued_at"])
+        a = art.setdefault(artifact_of(r), {"issuances": 0, "steps_issued": 0, "steps_scored": 0, "gaps": 0,
+                                             "outstanding": 0, "first_issued_at": r["issued_at"],
+                                             "last_issued_at": r["issued_at"], "model_versions": set()})
+        a["issuances"] += 1; a["last_issued_at"] = r["issued_at"]; a["model_versions"].add(r.get("model_version") or "?")
         persist = guard.at(q, issued, issued)
         for fc in r["forecasts"]:
-            steps_total += 1
+            steps_total += 1; a["steps_issued"] += 1
             target = parse_ts(fc["target_at"])
+            if as_of is not None and target > as_of:
+                outstanding.append({"issued_at": r["issued_at"], "step": fc["step"], "target_at": fc["target_at"],
+                                    "artifact_sha256": artifact_of(r)})
+                a["outstanding"] += 1
+                continue
             y = prom.instant(q, target)
             if y is None:
-                gaps.append({"issued_at": r["issued_at"], "step": fc["step"], "target_at": fc["target_at"], "reason": "no observation at target"})
+                gaps.append({"issued_at": r["issued_at"], "step": fc["step"], "target_at": fc["target_at"], "reason": "no observation at target",
+                             "artifact_sha256": artifact_of(r)})
+                a["gaps"] += 1
                 continue
             f = float(fc["rpm"])
             prev = guard.at(q, target - timedelta(hours=24), issued)
             row = {"issued_at": r["issued_at"], "target_at": fc["target_at"], "step": fc["step"],
                    "model_version": r.get("model_version"), "training_cutoff": r.get("training_cutoff"),
+                   "artifact_sha256": artifact_of(r),
                    "target_anchor": r.get("target_anchor"),
                    "forecast": f, "actual": y, "ae": abs(f - y),
                    "ape": (abs(f - y) / y) if y > 0 else None,
@@ -208,7 +273,7 @@ def score(accepted, prom, app, ns, start, end, cadence_min=5.0):
                    "prevday_ae": abs(prev - y) if prev is not None else None}
             if y <= 0:
                 zero_obs += 1
-            rows.append(row)
+            rows.append(row); a["steps_scored"] += 1
             per_step.setdefault(int(fc["step"]), []).append(row)
 
     def agg(rs, key):
@@ -223,7 +288,9 @@ def score(accepted, prom, app, ns, start, end, cadence_min=5.0):
         "issuances_expected": n_exp, "issuances_accepted": len(accepted),
         "issuance_coverage": round(len(accepted) / n_exp, 4),
         "forecast_steps_issued": steps_total, "forecast_steps_scored": len(rows),
-        "step_coverage": round(len(rows) / steps_total, 4) if steps_total else 0.0,
+        "step_coverage": round(len(rows) / (steps_total - len(outstanding)), 4) if steps_total > len(outstanding) else 0.0,
+        "forecast_steps_outstanding": len(outstanding), "outstanding_list": outstanding[:50],
+        "final_horizon_matured": not outstanding,
         "zero_observations": zero_obs, "gaps": len(gaps), "gap_list": gaps[:50],
         "overall": {"MAPE_percent": agg(rows, "ape"), "MAE_rpm": agg(rows, "ae"),
                     "persistence_MAPE_percent": agg(rows, "persistence_ape"), "persistence_MAE_rpm": agg(rows, "persistence_ae"),
@@ -232,11 +299,133 @@ def score(accepted, prom, app, ns, start, end, cadence_min=5.0):
         "per_step": {str(k): {"n": len(v), "MAPE_percent": agg(v, "ape"), "MAE_rpm": agg(v, "ae"),
                               "persistence_MAPE_percent": agg(v, "persistence_ape"), "prevday_MAPE_percent": agg(v, "prevday_ape")}
                      for k, v in sorted(per_step.items())},
+        "aggregate_rule": "pooled over every scored step of every artifact; never an equal average of per-artifact figures",
+        "per_artifact": {k: {"issuances": v["issuances"], "steps_issued": v["steps_issued"], "steps_scored": v["steps_scored"],
+                             "gaps": v["gaps"], "outstanding": v["outstanding"],
+                             "first_issued_at": v["first_issued_at"], "last_issued_at": v["last_issued_at"],
+                             "model_versions": sorted(v["model_versions"]),
+                             "MAPE_percent": agg([x for x in rows if x["artifact_sha256"] == k], "ape"),
+                             "MAE_rpm": agg([x for x in rows if x["artifact_sha256"] == k], "ae"),
+                             "persistence_MAE_rpm": agg([x for x in rows if x["artifact_sha256"] == k], "persistence_ae"),
+                             "prevday_MAE_rpm": agg([x for x in rows if x["artifact_sha256"] == k], "prevday_ae")}
+                         for k, v in art.items()},
+        "artifacts_seen": list(art.keys()),
         "models_seen": sorted({(x["model_version"] or "?") for x in rows}),
         "training_cutoffs_seen": sorted({(x["training_cutoff"] or "?") for x in rows}),
         "target_anchors_seen": sorted({(x["target_anchor"] or "?") for x in rows}),
     }
     return out, rows
+
+
+def transition_events(accepted, extra=None):
+    """Per artifact (full hash, log order of first appearance): publication, API reload and FIRST
+    OPERATOR ISSUANCE as three separate events (D-136). Only the last comes from the forecast log;
+    the other two come from `extra` ({sha: {"published_at", "api_reloaded_at"}}) and are None when
+    unknown -- never inferred from the issuance (the operator's cache can delay it)."""
+    extra = extra or {}
+    out = {}
+    for r in accepted:
+        k = artifact_of(r)
+        if k not in out:
+            e = extra.get(k) or {}
+            out[k] = {"published_at": e.get("published_at"), "api_reloaded_at": e.get("api_reloaded_at"),
+                      "first_operator_issuance_at": r["issued_at"], "issuances": 0}
+        out[k]["issuances"] += 1
+    return out
+
+
+# Daily phases of the generator pattern (collect-k6-summaries.py PATTERN; peak 6000 rpm at 15Z).
+PATTERN = {0: 250, 1: 200, 2: 150, 3: 150, 4: 200, 5: 300, 6: 750, 7: 1250, 8: 2000, 9: 3000, 10: 3750, 11: 4250,
+           12: 4500, 13: 5000, 14: 5500, 15: 6000, 16: 5000, 17: 4250, 18: 3000, 19: 2400, 20: 1000, 21: 600, 22: 400, 23: 300}
+PHASE_DEFINITION = ("UTC hour of the generator pattern: rising = 06-14Z, peak = 15Z, falling = 16-20Z, "
+                    "trough = 21Z-05Z (one instance spans midnight)")
+
+
+def phase_instance(t):
+    """(phase, instance_start, instance_end) for UTC time t."""
+    d = t.replace(minute=0, second=0, microsecond=0)
+    h = t.hour
+    day = d.replace(hour=0)
+    if 6 <= h <= 14:
+        return "rising", day + timedelta(hours=6), day + timedelta(hours=15)
+    if h == 15:
+        return "peak", day + timedelta(hours=15), day + timedelta(hours=16)
+    if 16 <= h <= 20:
+        return "falling", day + timedelta(hours=16), day + timedelta(hours=21)
+    if h >= 21:
+        return "trough", day + timedelta(hours=21), day + timedelta(hours=30)
+    return "trough", day - timedelta(hours=3), day + timedelta(hours=6)
+
+
+def participation(decisions, reconcile_s=60.0, max_gap_intervals=3):
+    """Summarise the predictive component's participation (D-140) by daily phase.
+    Headline = COMPLETE phase instances only: decision records cover the instance from its start to
+    its end with no gap (including the edges) longer than max_gap_intervals x reconcile_s.
+    'prediction_set' = desired_source == "prediction" (the prediction strictly exceeded reactive and
+    minReplicas and was not max-clamped). Ties and max-clamped decisions are counted separately."""
+    max_gap = max_gap_intervals * reconcile_s
+    inst = {}
+    for d in decisions:
+        at = parse_ts(d["at"])
+        ph, s0, e0 = phase_instance(at)
+        inst.setdefault((ph, s0, e0), []).append((at, d))
+
+    def blank():
+        return {"reconciles": 0, "forecast_used": 0, "prediction_set": 0, "tie": 0, "reactive": 0, "min_replicas": 0,
+                "max_replicas": 0, "keep_current": 0, "damping_changed": 0, "safeguard_changed": 0, "safeguards": {}}
+
+    def add(acc, d):
+        acc["reconciles"] += 1
+        if d.get("forecast_status") == "used":
+            acc["forecast_used"] += 1
+        src = d.get("desired_source")
+        key = {"prediction": "prediction_set"}.get(src, src)
+        if key in acc:
+            acc[key] += 1
+        raw, adj = d.get("raw_predicted_replicas"), d.get("confidence_adjusted_replicas")
+        if raw is not None and adj is not None and adj != raw:
+            acc["damping_changed"] += 1
+        if raw is not None and d.get("forecast_status") == "used" and d.get("predicted_replicas") != raw:
+            acc["safeguard_changed"] += 1
+        for g in d.get("safeguards") or []:
+            acc["safeguards"][g] = acc["safeguards"].get(g, 0) + 1
+
+    def finish(acc):
+        n = acc["reconciles"]
+        acc["prediction_set_fraction"] = round(acc["prediction_set"] / n, 4) if n else None
+        acc["tie_fraction"] = round(acc["tie"] / n, 4) if n else None
+        return acc
+
+    headline, incomplete, instances = {}, [], []
+    for (ph, s0, e0), items in sorted(inst.items(), key=lambda kv: kv[0][1]):
+        items.sort(key=lambda x: x[0])
+        times = [s0] + [t for t, _ in items] + [e0]
+        longest = max((b - a).total_seconds() for a, b in zip(times, times[1:]))
+        complete = longest <= max_gap
+        acc = blank()
+        for _, d in items:
+            add(acc, d)
+        row = {"phase": ph, "start": iso(s0), "end": iso(e0), "complete": complete,
+               "longest_gap_seconds": round(longest, 1), **finish(acc)}
+        instances.append(row)
+        if complete:
+            h = headline.setdefault(ph, blank())
+            for _, d in items:
+                add(h, d)
+            h.setdefault("instances", 0)
+            h["instances"] += 1
+        else:
+            incomplete.append({"phase": ph, "start": iso(s0), "end": iso(e0), "reconciles": acc["reconciles"],
+                               "longest_gap_seconds": round(longest, 1)})
+    return {"phase_definition": PHASE_DEFINITION,
+            "completeness_rule": f"an instance is complete when no gap between consecutive decision records, or "
+                                 f"between an edge of the instance and the nearest record, exceeds "
+                                 f"{max_gap_intervals} x {reconcile_s:g} s",
+            "prediction_set_definition": 'desired_source == "prediction": the prediction strictly exceeded the '
+                                         "reactive replicas and minReplicas and was not max-clamped; ties and "
+                                         "max-clamped decisions are reported separately",
+            "headline_complete_phases": {k: finish(v) for k, v in headline.items()},
+            "incomplete_instances": incomplete, "instances": instances}
 
 
 def series_gaps(series, start, end, step_s=60, max_gap_s=None):
@@ -272,7 +461,7 @@ def sampled_changes(series):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--prom", required=True); ap.add_argument("--forecast-log", required=True)
+    ap.add_argument("--prom"); ap.add_argument("--forecast-log", required=True)
     ap.add_argument("--start", required=True); ap.add_argument("--end", required=True)
     ap.add_argument("--app", default="nginx-test"); ap.add_argument("--namespace", default="demo")
     ap.add_argument("--controls", default="nginx-reactive,myapptwo", help="comma-separated comparison deployments")
@@ -280,8 +469,24 @@ def main(argv=None):
     ap.add_argument("--min-coverage", type=float, default=0.8)
     ap.add_argument("--max-gap-minutes", type=float, default=5.0, help="replica sample interval above which time is a gap")
     ap.add_argument("--out", default="-")
+    ap.add_argument("--as-of", help="targets later than this are outstanding, not gaps (default: now)")
+    ap.add_argument("--transition-events", help="JSON {artifact_sha256: {published_at, api_reloaded_at}}")
+    ap.add_argument("--reconcile-seconds", type=float, default=60.0, help="operator reconcile interval (participation completeness)")
+    ap.add_argument("--participation-only", action="store_true", help="summarise decision records only; no Prometheus needed")
     a = ap.parse_args(argv)
     start, end = parse_ts(a.start), parse_ts(a.end)
+    decisions = load_decisions(a.forecast_log, a.app, a.namespace, start, end)
+    part = participation(decisions, a.reconcile_seconds) if decisions else None
+    if a.participation_only:
+        if not decisions:
+            raise SystemExit("FAIL: no decision records for the app in the window")
+        text = json.dumps({"window": [iso(start), iso(end)], "app": a.app, "namespace": a.namespace,
+                           "decision_records": len(decisions), "participation": part}, indent=2)
+        print(text) if a.out == "-" else open(a.out, "w").write(text + "\n")
+        return 0
+    if not a.prom:
+        raise SystemExit("FAIL: --prom is required unless --participation-only")
+    as_of = parse_ts(a.as_of) if a.as_of else datetime.now(timezone.utc)
     prom = Prom(a.prom)
     q = CANONICAL.format(app=a.app, ns=a.namespace)
     obs = prom.range(q, start, end + timedelta(minutes=70), 60)
@@ -294,8 +499,13 @@ def main(argv=None):
     if not accepted:
         raise SystemExit(f"FAIL: every forecast record was rejected: {rejected[:5]}")
     # Raw-model accuracy: every structurally valid issued forecast (controller rejections never remove one).
-    result, rows = score(accepted, prom, a.app, a.namespace, start, end, a.issuance_minutes)
+    result, rows = score(accepted, prom, a.app, a.namespace, start, end, a.issuance_minutes, as_of=as_of)
     result["set"] = "raw_model"
+    result["as_of"] = iso(as_of)
+    extra = json.load(open(a.transition_events)) if a.transition_events else None
+    result["transition_events"] = transition_events(accepted, extra)
+    result["decision_records"] = len(decisions)
+    result["participation"] = part if part else "no decision records in the window"
     result["records_in_window"] = len(recs)
     result["records_rejected_structural"] = len(rejected)
     result["rejected_list"] = rejected[:50]
