@@ -21,14 +21,40 @@ answer. The replay REFUSES to report a comparison unless all three hold:
      pattern component averages up to seven same-time-yesterday observations; with one day
      back it collapses to a single unweighted value per step (D-84) -- that is a different
      estimator, and scoring it would not be scoring what is deployed.
-  3. At least `MIN_INDEPENDENT_BLOCKS` non-overlapping origin blocks. Origins six steps
-     apart share no target, origins closer than that do; overlapping rolling origins are
-     not independent samples (Codex C-92), so the honest count is origins / STEPS_AHEAD.
+  3. At least `MIN_NON_OVERLAPPING_BLOCKS` non-overlapping origin blocks. Origins six steps
+     apart share no TARGET, origins closer than that do; overlapping rolling origins are
+     plainly not independent samples (Codex C-92), so the honest count is
+     origins / STEPS_AHEAD.
+
+     NOT INDEPENDENT, ONLY NON-OVERLAPPING (Codex C-100). Disjoint targets are the weakest
+     of the things independence would require. Blocks that share no target still share the
+     history every forecaster reads, the same daily periodicity, the same generator, and --
+     because the controller is replayed as one continuous run per arm -- the carried
+     controller state that entered the block. Treat the count as a bound on how much
+     non-overlapping evidence exists, never as a sample size for an interval that assumes
+     independence. A block bootstrap over WHOLE DAYS remains the honest resampling unit.
+
+TWO MODES, WHICH CANNOT BE CONFUSED FOR EACH OTHER (Codex C-100)
+---------------------------------------------------------------
+The warmup used to be a free `--warmup-days` flag defaulting to 1 while the scoring rule
+required `MIN_WARMUP_DAYS` = 3. The same export therefore produced two different answers
+and only the flag said which: on an 870-point history, 720 origins and FAIL under the
+default, 432 origins and PASS with three days. That is exactly the confusion a predeclared
+gate exists to prevent, so the flag no longer decides it -- `--mode` does, and it is
+REQUIRED so that neither mode can be reached by accident:
+
+  --mode scoring   warmup is FORCED to MIN_WARMUP_DAYS. `--warmup-days` is refused. This is
+                   the only mode that can ever emit SCORED, and only when all three checks
+                   pass.
+  --mode census    warmup is free (default `CENSUS_WARMUP_DAYS` = 1). The verdict is ALWAYS
+                   "CENSUS ONLY -- NOT SCORED", even if the checks happen to pass, because a
+                   census run measures how much history exists, not which arm is better.
 
 Below the bar the run still executes end to end -- the forecasters and the real controller
 do run over the real history -- but the output is a CENSUS, explicitly not a comparison.
+Descriptive measurement before the bar is met is legitimate; calling it a score is not.
 
-    eval/.venv/bin/python eval/replay_real.py \
+    eval/.venv/bin/python eval/replay_real.py --mode census \
         --export eval/data/benchmark-real-<utc>.json --out eval/replay-real-<utc>.json
 """
 from __future__ import annotations
@@ -60,7 +86,13 @@ GRID_MIN = oe.GRID_MIN
 # ---- Predeclared minimum scale (see the module docstring) -----------------------------
 MIN_ORIGIN_DAYS = 3
 MIN_WARMUP_DAYS = 3
-MIN_INDEPENDENT_BLOCKS = 72          # = MIN_ORIGIN_DAYS * PER_DAY / STEPS_AHEAD
+MIN_NON_OVERLAPPING_BLOCKS = 72      # = MIN_ORIGIN_DAYS * PER_DAY / STEPS_AHEAD
+                                     # non-overlapping, NOT independent -- see the docstring
+
+CENSUS_WARMUP_DAYS = 1               # census mode only; can never produce a SCORED verdict
+
+MODE_SCORING = "scoring"
+MODE_CENSUS = "census"
 
 MIN_REPLICAS, MAX_REPLICAS = 1, 12
 
@@ -241,8 +273,13 @@ def census(series, imputed, origins_n: int, first_origin_index: int | None) -> d
         "warmup_days_before_first_origin": {
             "observed": round(warmup_days, 2), "required": MIN_WARMUP_DAYS,
             "pass": warmup_days >= MIN_WARMUP_DAYS},
-        "independent_blocks": {"observed": blocks, "required": MIN_INDEPENDENT_BLOCKS,
-                               "pass": blocks >= MIN_INDEPENDENT_BLOCKS},
+        "non_overlapping_blocks": {"observed": blocks,
+                                   "required": MIN_NON_OVERLAPPING_BLOCKS,
+                                   "pass": blocks >= MIN_NON_OVERLAPPING_BLOCKS,
+                                   "note": "non-overlapping TARGETS only; these blocks still "
+                                           "share history, daily structure and carried "
+                                           "controller state, so this is NOT an independent "
+                                           "sample count (Codex C-100)"},
     }
     return {
         "valid_points": int(len(series)),
@@ -256,24 +293,58 @@ def census(series, imputed, origins_n: int, first_origin_index: int | None) -> d
 
 
 def points_needed() -> int:
-    """History length at which the predeclared minimum scale is first met."""
+    """History length at which the predeclared minimum scale is first met.
+
+    Independent of the mode: the SCORING gate always requires MIN_WARMUP_DAYS of warmup and
+    MIN_ORIGIN_DAYS of origins, so the answer is the same however a census was run.
+    """
     return (MIN_WARMUP_DAYS + MIN_ORIGIN_DAYS) * PER_DAY + STEPS_AHEAD
+
+
+def resolve_warmup_days(mode: str, warmup_days: int | None) -> int:
+    """The warmup a mode is allowed to use. Scoring does not get a choice (Codex C-100)."""
+    if mode == MODE_SCORING:
+        if warmup_days is not None and warmup_days != MIN_WARMUP_DAYS:
+            raise ValueError(
+                f"--warmup-days is refused in scoring mode: the gate requires "
+                f"{MIN_WARMUP_DAYS} days of warmup and the run may not choose another. "
+                f"Use --mode census to run a descriptive replay with a shorter warmup.")
+        return MIN_WARMUP_DAYS
+    if mode == MODE_CENSUS:
+        return CENSUS_WARMUP_DAYS if warmup_days is None else warmup_days
+    raise ValueError(f"unknown mode {mode!r}")
+
+
+def verdict_for(mode: str, scoreable: bool) -> str:
+    """Three outcomes, worded so no two of them can be read as each other."""
+    if mode == MODE_CENSUS:
+        return "CENSUS ONLY -- NOT SCORED (census mode: scoring not attempted)"
+    if scoreable:
+        return "SCORED"
+    return "NOT SCORED -- SCORING GATE FAILED"
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--export", required=True)
     ap.add_argument("--mask", default=str(ROOT / "deploy/eks-benchmark/validity-mask.json"))
-    ap.add_argument("--warmup-days", type=int, default=1,
-                    help="days of history required before the first origin. The DEFAULT of 1 "
-                         "is deliberately the smallest value that lets the census run at all; "
-                         "it is NOT the value the scoring rule requires (MIN_WARMUP_DAYS).")
+    ap.add_argument("--mode", required=True, choices=[MODE_CENSUS, MODE_SCORING],
+                    help="census: descriptive only, free warmup, NEVER emits SCORED. "
+                         "scoring: warmup forced to MIN_WARMUP_DAYS, the only mode that can.")
+    ap.add_argument("--warmup-days", type=int, default=None,
+                    help=f"census mode only (default {CENSUS_WARMUP_DAYS}). Refused in "
+                         f"scoring mode, where the gate fixes it at {MIN_WARMUP_DAYS}.")
     ap.add_argument("--no-replay", action="store_true")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
+    try:
+        warmup_days = resolve_warmup_days(args.mode, args.warmup_days)
+    except ValueError as exc:
+        ap.error(str(exc))
+
     series, imputed, prov = load_series(args.export, args.mask)
-    warmup_points = args.warmup_days * PER_DAY
+    warmup_points = warmup_days * PER_DAY
     print(f"series: {len(series)} valid points, {imputed.sum()} imputed, "
           f"{series.index[0]} -> {series.index[-1]}")
 
@@ -283,16 +354,19 @@ def main():
     have = len(series)
     need = points_needed()
     short_by = max(0, need - have)
-    verdict = "SCORED" if cen["scoreable"] else "CENSUS ONLY -- NOT SCORED"
+    verdict = verdict_for(args.mode, cen["scoreable"])
 
     payload = {
         "kind": "chronological_replay_of_real_benchmark_traffic",
         "generated_utc": datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "mode": args.mode,
+        "warmup_days_used": warmup_days,
         "verdict": verdict,
         "predeclared_minimum_scale": {
             "min_origin_days": MIN_ORIGIN_DAYS,
             "min_warmup_days": MIN_WARMUP_DAYS,
-            "min_independent_blocks": MIN_INDEPENDENT_BLOCKS,
+            "min_non_overlapping_blocks": MIN_NON_OVERLAPPING_BLOCKS,
+            "blocks_are_non_overlapping_not_independent": True,
             "points_required": need,
             "points_available": have,
             "points_short": short_by,
@@ -314,6 +388,9 @@ def main():
         "what_this_cannot_establish": [
             "which forecaster is better: the window covers too few whole daily cycles, and "
             "overlapping rolling origins are not independent samples",
+            "an independent sample count: non-overlapping blocks share history, daily "
+            "structure and carried controller state, so the block count bounds the evidence "
+            "rather than sizing an interval (Codex C-100)",
             "anything about the neural arm: no model has ever been trained on this history "
             "(the trainer requires 235 points and refuses below that), so there is no "
             "network forecast to replay",
@@ -322,16 +399,21 @@ def main():
             "generalisation beyond this one workload, one cluster and one generator design",
         ],
     }
-    if not cen["scoreable"]:
+    if args.mode == MODE_CENSUS:
+        payload["not_scored_because"] = [
+            "census mode: this run measures how much history exists and that the pipeline "
+            "runs end to end. Scoring was not attempted, whatever the checks say."]
+    elif not cen["scoreable"]:
         payload["refused_to_score_because"] = [
             f"{k}: observed {v['observed']}, required {v['required']}"
             for k, v in cen["checks"].items() if not v["pass"]]
 
     Path(args.out).write_text(json.dumps(payload, indent=2, default=str))
-    print(f"\nverdict: {verdict}")
+    print(f"\nmode: {args.mode} (warmup {warmup_days} d)")
+    print(f"verdict: {verdict}")
     print(f"origins: {result['origins']}  "
           f"({result['origins'] / PER_DAY:.2f} daily cycles, "
-          f"{result['origins'] // STEPS_AHEAD} non-overlapping blocks)")
+          f"{result['origins'] // STEPS_AHEAD} non-overlapping -- not independent -- blocks)")
     if short_by:
         print(f"short by {short_by} points = {short_by * GRID_MIN / 60.0:.1f} h of history")
     print(f"wrote {args.out}")

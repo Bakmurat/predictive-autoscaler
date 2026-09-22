@@ -1,8 +1,27 @@
 # Protocol — seasonal-default selector with hysteresis and minimum dwell
 
-**Status: WRITTEN, NOT RUN.** Nothing in this file has been executed. It is the predeclared
-design for the next offline experiment (Codex D-124), written before any of its data exists,
-so that "we chose this afterwards" is not available as an explanation of the result.
+**Status: WRITTEN, NOT RUN — and now BLOCKED.** Nothing in this file has been executed. It is
+the predeclared design for the next offline experiment (Codex D-124), written before any of its
+data exists, so that "we chose this afterwards" is not available as an explanation of the
+result.
+
+> ### ⛔ Blocked on an owner decision (Codex C-99 / D-125), 2026-09-22
+>
+> **S2 has no threshold.** The 21.3 % "derived" margin this file was written against is
+> withdrawn — `TOLERANCE-DERIVATION.md` now presents the shortage and replica budgets as a
+> choice the owner must make, with three worked options and none of them in force. This
+> experiment **cannot consume its test set** until Q1, Q2 and the measured Q3 are recorded
+> here with a commit hash. Everything else in this file is unaffected.
+>
+> ### ⚠ Corrected 2026-09-22 after Codex round 26 (C-101 / D-127)
+>
+> **S4 compared incompatible objectives.** It required beating the historical **2.35 %**, a
+> number measured under `lead2` horizon weights, while this experiment scores everything under
+> `uniform` (§3). The two are not commensurable: re-running the same grid under the repaired
+> objective moved the winner from `lead2`/min-obs 6 to `uniform`/min-obs 18 and turned the
+> `lead2` rows that had topped the table at 295.04 rpm into the grid's **worst** at 391.89 rpm.
+> S4 is now a **paired comparison against the frozen unhysteretic selector, run on the identical
+> new data under the identical objective** — see §6.
 
 Prerequisites, in order, per D-124: the evaluation defects C-95, C-96 and C-97 are repaired
 (done, 2026-09-22); the 2026-09-22T12:00Z capture is preserved; the serving repairs are
@@ -68,7 +87,7 @@ this objective, never used to score itself (that was C-96).
 
 MAE is reported separately and in full, per step, alongside signed bias. The proxy is a
 screening statistic, not operating cost; **the controller-replay comparison in operating units
-is primary** (see `TOLERANCE-DERIVATION.md` §6).
+is primary**, and the proxy never converts into a margin (see `TOLERANCE-DERIVATION.md` §4).
 
 ## 4. Parameters, all preselected on development data
 
@@ -121,8 +140,13 @@ moving part.
 
 **Freeze before the run.** Before the test series are generated, append to this file: the
 chosen parameter values, the chosen test seeds and start date, the list of regime shapes, the
-derived margins from §6, and the commit hash of the code that will run. After that, `git
-commit`. Any change afterwards makes it a new experiment with a new test set.
+frozen unhysteretic selector's parameters (S4), **the owner's answers to Q1, Q2 and the measured
+Q3 together with the resulting per-shape margin in operating units**, and the commit hash of the
+code that will run. After that, `git commit`. Any change afterwards makes it a new experiment
+with a new test set.
+
+**The margin line is the blocking one.** If it is absent, the run does not start — S2 has no
+threshold and a non-inferiority test without a threshold is not a test.
 
 ## 6. The bar
 
@@ -132,15 +156,28 @@ calendar days as blocks (overlapping rolling origins are not independent samples
 | | Requirement |
 |---|---|
 | **S1** pooled improvement | ≥ 5 % lower pooled cost proxy than the best fixed arm, 95 % CI on the difference excluding zero |
-| **S2** repeating-workload non-inferiority | regression ≤ the **derived** margin from `TOLERANCE-DERIVATION.md`, recomputed on development data for this window, with the **95 % CI upper bound** ≤ that margin. **Not** a round number this time |
-| **S3a** operational shortage | additional shortage within the declared availability budget (§2 of the derivation), measured by controller replay, **primary** |
-| **S3b** operational replicas | additional replica-minutes ≤ 1 % of the incumbent's |
+| **S2** repeating-workload non-inferiority | **⛔ NO THRESHOLD YET.** The margin comes from the owner's answers to Q1/Q2/Q3 in `TOLERANCE-DERIVATION.md` §3, recomputed on development data for this window and divided by measured prevalence. Judged on the **95 % CI upper bound**, **in operating units** — never via a proxy conversion (§4 there). The run may not start until the chosen budgets and the resulting margin are written into §5 of this file |
+| **S3a** operational shortage | additional shortage ≤ the owner's **Q1** budget, measured by controller replay, **primary**. Note the word is *shortage*, not availability: it counts minutes of under-capacity and prices no queueing, latency or dropped request |
+| **S3b** operational replicas | additional replica-minutes ≤ the owner's **Q2** budget. Not a fixed 1 % — that figure was one of the withdrawn inventions |
 | **S3c** failures | inherited failure count ≤ the worst fixed arm's, per run — now actually measurable (C-97) |
 | **S3d** switching | ≤ 10 % of origins, and — new — **median dwell ≥ `D`**, which is a check that the mechanism did what it says |
-| **S4** the hypothesis itself | the repeating-workload regression must be **smaller than the 2.35 % the unmodified selector showed**. If hysteresis and dwell do not reduce the tax they were added to reduce, the hypothesis failed even if S1–S3 pass |
+| **S4** the hypothesis itself | **paired comparison, same data, same objective.** Run the **frozen unhysteretic selector** (`H = 1`, `D = 0`, `B = 0` — the mechanism this one is meant to improve on) as a fifth arm over the **identical** new seeds, dates and regime shapes, scored under the **same** `EVAL_OBJECTIVE = "uniform"`. The hysteretic selector's repeating-workload regression must be **lower than the unhysteretic selector's, per paired run**, with the 95 % CI on the paired difference excluding zero. If hysteresis and dwell do not reduce the tax they were added to reduce, the hypothesis failed even if S1–S3 pass |
 
 S4 is the point of the experiment. A selector that clears S1–S3 by being a different selector,
 rather than by fixing the thing that failed, has not answered the question.
+
+**Why S4 is paired and not a comparison against 2.35 % (Codex C-101).** The 2.35 % was measured
+under `lead2` horizon weights on seeds 11–13; this experiment scores under `uniform` on new
+seeds. Comparing across a changed objective would attribute the difference between two
+weightings to hysteresis. The paired form removes both confounds at once: the two selectors see
+the same series, the same origins and the same scorer, differing only in the mechanism under
+test, and the difference is taken **within** each run before it is pooled. It also removes the
+one-sided ratchet in the old wording — a historical number can only be beaten or missed, while a
+paired contrast can also come back **null**, which is a real and publishable answer here.
+
+**The frozen unhysteretic selector is a preselected artifact, not a re-run of the old
+experiment.** Its parameters are fixed at the values recorded in §5 before any test data exists,
+and its seeds 11–13 results stay consumed and are not reused.
 
 ## 7. Repeating-workload constraints, explicitly
 
@@ -149,9 +186,10 @@ other shapes do not:
 
 1. **It is tested separately, never pooled away.** A pooled gain that hides a repeating-workload
    regression is not an improvement to this system.
-2. **Its margin is derived, not assumed** — from the incumbent's own measured shortage and
-   replica consumption in the development window, divided by measured prevalence
-   (`TOLERANCE-DERIVATION.md` §1).
+2. **Its margin comes from declared budgets, not from a round number and not from the observed
+   miss** — the owner's Q1/Q2 minus the incumbent's own measured consumption in the development
+   window, divided by measured prevalence (`TOLERANCE-DERIVATION.md` §1 and §3). Unanswered as
+   of 2026-09-22.
 3. **Prevalence is measured, not asserted.** If the evaluation runs a workload mixture, *p* is
    the fraction of *hours* the repeating profile occupies in that mixture.
 4. **The default arm must win by default there.** On repeating, `seasonal_pattern` is already
@@ -160,6 +198,7 @@ other shapes do not:
    of the mechanism, not only as a summary statistic.
 5. **Operating units decide.** If the proxy regresses on repeating but shortage and
    replica-minutes do not move, say exactly that — as happened at +2.35 % proxy with zero
+   *observed*
    additional shortage-minutes — and do not dress a proxy difference as an operational one.
 
 ## 8. What this experiment still cannot establish

@@ -3,6 +3,32 @@
 **Verdict: CENSUS ONLY — NOT SCORED.** The pipeline runs end to end on genuine history; the
 history is too short to compare forecasters, and the predeclared rule refuses to try.
 
+> ### ⚠ Corrected 2026-09-22 after Codex round 26 (C-100 / D-126)
+>
+> Two things in the first version of this file were wrong, and the census numbers below are
+> not among them — 174 valid points, 24 origins, 4 blocks and the three ✗ checks all stand.
+>
+> 1. **The gate could be reached two ways and only a flag said which.** `replay_real.py` took
+>    a free `--warmup-days` defaulting to 1 while the scoring rule required 3. On an
+>    870-point history that is **720 origins and FAIL** under the default against **432
+>    origins and PASS** with three days — the same data, two verdicts. The run is now split
+>    into an explicitly `--mode census` (free warmup, **can never** emit SCORED) and an
+>    explicitly `--mode scoring` (warmup forced to `MIN_WARMUP_DAYS`, `--warmup-days`
+>    refused), `--mode` is required, and each mode has a test at exactly that 870-point
+>    boundary. This run was, and remains, a census.
+> 2. **"Independent blocks" claimed more than disjoint targets buy.** Non-overlapping blocks
+>    still share the history every forecaster reads, the daily period, the generator, and the
+>    controller state carried in from the preceding block. The check is renamed
+>    `non_overlapping_blocks`, the payload carries a note saying so, and no interval anywhere
+>    may be sized from that count. The honest resampling unit stays a block bootstrap over
+>    whole days.
+>
+> The **earliest scoring date is unchanged at ≈ 2026-09-26T19:20Z** — the scoring gate always
+> required three warmup days, so correcting the default moved no bar — but §3 now states what
+> it is conditional on. The JSON artifact
+> [`replay-real-20260921T2330Z.json`](replay-real-20260921T2330Z.json) is left exactly as it
+> was written, under the old key names; it is the record of the run, not a live document.
+
 Codex D-124 put this ahead of any further neural-architecture change: every comparison in
 this repository so far has run on **synthetic** series, so nothing yet establishes anything
 about the traffic the benchmark actually accumulated. This replays that real traffic in
@@ -81,8 +107,24 @@ same-time-yesterday observations and collapses to a different estimator with onl
 back (D-84); and overlapping rolling origins are not independent samples (C-92), so the
 honest count is origins ÷ 6.
 
-**Short by 696 points = 116 h ≈ 4.8 days.** At the current cadence and with no further mask
-intervals, the earliest the bar could be met is about **2026-09-26T19:20Z**.
+**Short by 696 points = 116 h ≈ 4.8 days**, recomputed under the corrected gate: scoring needs
+`(MIN_WARMUP_DAYS + MIN_ORIGIN_DAYS) × 144 + 6 = 870` contiguous valid points, 174 exist, and
+696 × 10 min = 116.0 h from the last sample at 2026-09-21T23:20Z gives
+**2026-09-26T19:20Z**.
+
+**That date is a floor, not a schedule** (Codex C-100). It assumes every one of the next 696
+ten-minute slots lands on the grid, passes the validity mask, and extends the *same* contiguous
+run. It is not automatic in three further ways:
+
+* **Any gap restarts the count.** The 870 points must be contiguous, so a masked interval or a
+  scrape gap does not delay the date by its own length — it discards the run before it and
+  pushes the date out by up to the whole 116 h again.
+* **A mask amendment is retroactive.** Adding an interval to `validity-mask.json` removes
+  points already banked.
+* **Meeting the gate is permission to score, not a result.** The three checks are this
+  repository's protocol choice about when a comparison becomes worth reporting. They are not a
+  prohibition on descriptive measurement before then — that is what `--mode census` is for —
+  and passing them establishes scale, not that the workload has anything to learn.
 
 ## 4. What ran anyway, and why it is not a result
 
@@ -127,6 +169,8 @@ The full pipeline executed: four history-only forecasters at each of the 24 orig
 ## 6. What it cannot establish
 
 * Which forecaster is better — too few whole daily cycles, and non-independent origins.
+* A sample size. The 4 blocks are non-overlapping, not independent: they share history, daily
+  structure and carried controller state (C-100).
 * Anything about the neural arm — no model has ever trained on this history.
 * An operational benefit — the replay models capacity arriving after a readiness delay and
   prices no queueing, latency or dropped request.
@@ -134,14 +178,16 @@ The full pipeline executed: four history-only forecasters at each of the 24 orig
 
 ## 7. Next
 
-1. **Let the history accumulate.** Re-export and re-run after ~2026-09-26T19:20Z; the same two
-   commands produce a scored run automatically once the three checks pass, with no change to
-   the rule.
+1. **Let the history accumulate, then ask for a score explicitly.** Re-export after
+   ~2026-09-26T19:20Z and re-run with **`--mode scoring`** — which is a different command from
+   the one that produced this census, deliberately (C-100). Re-running the census command can
+   never produce a score however much history exists. The rule itself is unchanged.
 2. **Re-export rather than extend.** Each export carries the mask version and its SHA-256, so
    a later export is a new artifact, not an edit of this one.
 3. **When it scores, it scores in operating units first** — shortage and replica-minutes from
    the controller replay — with the cost proxy as a screening statistic only
-   (`TOLERANCE-DERIVATION.md` §6).
+   (`TOLERANCE-DERIVATION.md` §4 — the proxy-to-shortage conversion is withdrawn and no
+   margin may use it).
 4. **Watch for a mask amendment.** Any new interval added to `validity-mask.json` shortens the
    contiguous run and pushes the date out; the census reports `missing_slots` and
    `contiguous_runs` precisely so that is visible rather than silent.
@@ -154,8 +200,14 @@ eval/.venv/bin/python eval/export_benchmark_series.py \
     --base-url http://127.0.0.1:19090 --out eval/data/benchmark-real-<utc>.json
 kill %1
 
-eval/.venv/bin/python eval/replay_real.py \
+# what produced THIS file: descriptive, cannot score, free warmup
+eval/.venv/bin/python eval/replay_real.py --mode census --warmup-days 1 \
+    --export eval/data/benchmark-real-<utc>.json --out eval/replay-real-<utc>.json
+
+# what a scored run will be, once 870 contiguous valid points exist: warmup fixed at 3 days
+eval/.venv/bin/python eval/replay_real.py --mode scoring \
     --export eval/data/benchmark-real-<utc>.json --out eval/replay-real-<utc>.json
 ```
 
+`--mode` is required; there is no default, so neither mode can be reached by accident.
 The export is read-only; the replay is entirely offline and never contacts the cluster.

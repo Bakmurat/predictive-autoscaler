@@ -104,11 +104,24 @@ It **refuses to score** below a minimum scale declared in the module before the 
 blocks) and prints a census instead. As of 2026-09-22 the history is 174 valid points and
 yields 24 origins, so the run is a census.
 
+**`--mode` is required and has no default** (Codex C-100). `census` runs descriptively with a
+free warmup and can **never** emit a score; `scoring` forces the warmup the gate requires and is
+the only mode that can. The same 870-point history gives 720 origins in census mode and 432 in
+scoring mode, so the two are kept apart by the mode rather than by a flag. The seventy-two
+blocks are **non-overlapping, not independent** — they share history, daily structure and
+carried controller state, so no interval may be sized from that count.
+
 ```sh
 kubectl -n monitoring port-forward svc/kps-kube-prometheus-stack-prometheus 19090:9090 &
 eval/.venv/bin/python eval/export_benchmark_series.py --base-url http://127.0.0.1:19090 \
     --out eval/data/benchmark-real-<utc>.json
-eval/.venv/bin/python eval/replay_real.py \
+
+# descriptive, cannot score:
+eval/.venv/bin/python eval/replay_real.py --mode census \
+    --export eval/data/benchmark-real-<utc>.json --out eval/replay-real-<utc>.json
+
+# a scored run, once 870 contiguous valid points exist (earliest ~2026-09-26T19:20Z):
+eval/.venv/bin/python eval/replay_real.py --mode scoring \
     --export eval/data/benchmark-real-<utc>.json --out eval/replay-real-<utc>.json
 ```
 
@@ -120,4 +133,6 @@ Findings: `eval/RESULTS-real-traffic-replay-2026-09-22.md`.
 |---|---|
 | `reproduce_divergence.py` | the arms re-run under the conditions that originally failed; `repair_divergence_record.py` rebuilds its record from the console log (Codex C-95) |
 | `PROTOCOL-seasonal-default-selector.md` | the predeclared design of the next selector experiment — written, **not run** |
-| `TOLERANCE-DERIVATION.md` | a non-inferiority margin derived from shortage, replica consumption and workload prevalence, replacing the underived 2 % |
+| `TOLERANCE-DERIVATION.md` | the non-inferiority margin as a **decision for the owner**: the three quantities it must come from, three worked options, and **none in force**. Records that the old 2 % was underived and that the 21.3 % that briefly replaced it is withdrawn |
+| `PROTOCOL-clipping-resolution.md` | one bounded matched-seed rolling-retraining experiment to settle whether gradient clipping earns a place in the serving pipeline — written, **not run**; clipping is not adopted |
+| `PROTOCOL-challenge-workload.md` | the separately versioned `challenge-v1` generator profile — bounded correlated noise, drift and level shifts, after the capture and the repaired deployment — written, **not run, nothing deployed** |

@@ -281,9 +281,17 @@ future bar worthless.
 > * **The 2 % tolerance itself was never derived.** It was a round number chosen because it
 >   sounded tolerable. A tolerance has to come from acceptable additional shortage, replica
 >   consumption and workload prevalence, and be judged with an uncertainty bound against that
->   justified margin. That derivation now exists —
->   [`TOLERANCE-DERIVATION.md`](TOLERANCE-DERIVATION.md) — and it is derived from operating
->   consequences, never from the observed miss.
+>   justified margin. **No such margin exists yet.**
+>   [`TOLERANCE-DERIVATION.md`](TOLERANCE-DERIVATION.md) now states those three quantities as a
+>   decision for the owner, with worked options and **none in force** — an earlier version of
+>   that file proposed 21.3 % and has been withdrawn, because substituting two freshly invented
+>   budgets for one arbitrary number is the same act with more arithmetic (Codex C-99).
+>
+> **How to cite this rejection.** It is a **procedural** outcome: a preregistered bar was
+> missed. The bar was underived, the interval **contains** 2 % so exceedance was not
+> statistically established, and the operating measurements moved either not at all or in the
+> selector's favour. It is **not** evidence that the selector is worse in practice, and citing
+> it that way misstates it (`TOLERANCE-DERIVATION.md` §6).
 
 ### What this does establish
 

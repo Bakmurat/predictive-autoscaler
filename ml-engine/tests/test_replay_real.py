@@ -101,7 +101,7 @@ def test_a_short_history_is_refused_rather_than_scored():
     assert cen["scoreable"] is False
     failed = [k for k, v in cen["checks"].items() if not v["pass"]]
     assert set(failed) == {"origin_days", "warmup_days_before_first_origin",
-                           "independent_blocks"}
+                           "non_overlapping_blocks"}
 
 
 def test_the_rule_passes_once_there_is_enough_history():
@@ -128,9 +128,85 @@ def test_each_check_can_fail_on_its_own():
     assert not cen["checks"]["origin_days"]["pass"]
 
 
-def test_independent_blocks_count_non_overlapping_origins():
+def test_blocks_count_non_overlapping_origins():
     """Origins closer than STEPS_AHEAD share targets and are not independent samples."""
     s = series(PER_DAY + 40)
     imputed = np.zeros(len(s), dtype=bool)
     cen = rr.census(s, imputed, origins_n=STEPS * 5 + 3, first_origin_index=PER_DAY)
-    assert cen["checks"]["independent_blocks"]["observed"] == 5
+    assert cen["checks"]["non_overlapping_blocks"]["observed"] == 5
+
+
+def test_the_block_check_does_not_claim_independence():
+    """Codex C-100: disjoint targets are not independent samples, and the record says so."""
+    s = series(PER_DAY + 40)
+    imputed = np.zeros(len(s), dtype=bool)
+    cen = rr.census(s, imputed, origins_n=STEPS * 5, first_origin_index=PER_DAY)
+    assert "independent_blocks" not in cen["checks"], "the old name claimed independence"
+    note = cen["checks"]["non_overlapping_blocks"]["note"].lower()
+    assert "not an independent sample count" in note
+    for word in ("history", "controller state"):
+        assert word in note, f"the note must say what the blocks still share: {word}"
+
+
+# ------------------------------------------------ census and scoring cannot be confused
+# Codex C-100 reproduced exactly: ONE 870-point history, TWO modes, two different answers.
+# 870 = (MIN_WARMUP_DAYS + MIN_ORIGIN_DAYS) * PER_DAY + STEPS -- the scoring boundary itself.
+
+def _boundary_census(warmup_days):
+    n = rr.points_needed()
+    s = series(n)
+    imputed = np.zeros(n, dtype=bool)
+    origins = rr.eligible_origins(s, imputed, warmup_days * PER_DAY)
+    return origins, rr.census(s, imputed, len(origins), origins[0])
+
+
+def test_scoring_mode_at_the_boundary_passes_with_432_origins():
+    warmup = rr.resolve_warmup_days(rr.MODE_SCORING, None)
+    assert warmup == rr.MIN_WARMUP_DAYS
+    origins, cen = _boundary_census(warmup)
+    assert rr.points_needed() == 870
+    assert len(origins) == 432
+    assert cen["checks"]["non_overlapping_blocks"]["observed"] == 72
+    assert cen["scoreable"] is True, cen["checks"]
+    assert rr.verdict_for(rr.MODE_SCORING, cen["scoreable"]) == "SCORED"
+
+
+def test_census_mode_at_the_boundary_yields_720_origins_and_never_scores():
+    warmup = rr.resolve_warmup_days(rr.MODE_CENSUS, None)
+    assert warmup == rr.CENSUS_WARMUP_DAYS == 1
+    origins, cen = _boundary_census(warmup)
+    assert len(origins) == 720                       # more origins, from a shorter warmup
+    assert cen["checks"]["warmup_days_before_first_origin"]["pass"] is False
+    assert cen["scoreable"] is False
+    verdict = rr.verdict_for(rr.MODE_CENSUS, cen["scoreable"])
+    assert verdict.startswith("CENSUS ONLY")
+
+
+def test_census_mode_refuses_to_score_even_when_every_check_passes():
+    """The mode decides, not the checks: a census is descriptive by construction."""
+    assert rr.verdict_for(rr.MODE_CENSUS, True).startswith("CENSUS ONLY")
+    assert rr.verdict_for(rr.MODE_CENSUS, True) != "SCORED"
+
+
+def test_scoring_mode_refuses_a_warmup_of_its_own_choosing():
+    """The defect: a flag, not the gate, decided the warmup a scored run used."""
+    with pytest.raises(ValueError) as exc:
+        rr.resolve_warmup_days(rr.MODE_SCORING, 1)
+    assert "refused in scoring mode" in str(exc.value)
+    # the gate's own value is not an error, it is simply redundant
+    assert rr.resolve_warmup_days(rr.MODE_SCORING, rr.MIN_WARMUP_DAYS) == rr.MIN_WARMUP_DAYS
+
+
+def test_a_failed_scoring_run_is_not_worded_like_a_census():
+    assert rr.verdict_for(rr.MODE_SCORING, False) == "NOT SCORED -- SCORING GATE FAILED"
+    assert not rr.verdict_for(rr.MODE_SCORING, False).startswith("CENSUS")
+
+
+def test_census_mode_honours_an_explicit_warmup():
+    assert rr.resolve_warmup_days(rr.MODE_CENSUS, 3) == 3
+    assert rr.resolve_warmup_days(rr.MODE_CENSUS, None) == rr.CENSUS_WARMUP_DAYS
+
+
+def test_points_needed_does_not_depend_on_the_mode():
+    """Whatever a census used, the scoring bar is reached at the same amount of history."""
+    assert rr.points_needed() == (rr.MIN_WARMUP_DAYS + rr.MIN_ORIGIN_DAYS) * PER_DAY + STEPS
