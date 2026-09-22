@@ -209,13 +209,17 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		prediction, predErr = r.getCachedPrediction(ctx, &autoscaler, key)
 	}
 	predictedReplicas := int32(0)
+	// Codex D-140: one decision record per reconcile (observation only; no decision changes).
+	dec := newDecisionRecord(&autoscaler, forecasting, currentReplicas)
 	if !forecasting {
 		log.V(1).Info("Forecasting disabled for this autoscaler; reactive rule only")
 	} else if predErr != nil {
 		log.Info("Prediction unavailable, using reactive only", "error", predErr.Error())
 	} else if prediction != nil {
 		var usable bool
-		predictedReplicas, usable = r.calculatePredictedReplicas(&autoscaler, prediction)
+		var det predictedDetail
+		predictedReplicas, usable, det = r.calculatePredictedReplicasDetail(&autoscaler, prediction)
+		dec.setForecast(prediction, det, usable)
 		if !usable {
 			// The cached forecast's remaining horizon no longer covers the lead time (its steps have
 			// elapsed): it must not drive the decision. Treat as unavailable → reactive only.
@@ -241,6 +245,7 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 			reactiveReplicas = int32(math.Ceil(currentRPM / float64(targetRPM)))
 		}
 	}
+	dec.ReactiveReplicas, dec.CurrentRPM = reactiveReplicas, currentRPM
 
 	// --- PREDICTION SANITY CHECK ---
 	// Guard against diverging LSTM predictions (exponential blowup).
@@ -260,6 +265,8 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 			r.clearForecastOverride(log, r.getOrCreateScaleState(key), autoscaler.Spec.TargetDeployment.Name, autoscaler.Spec.TargetDeployment.Namespace, "sanity_rejected")
 			predictedReplicas = reactiveReplicas
 			prediction = nil // Clear so overestimate check doesn't use garbage
+			dec.ForecastStatus = "sanity_rejected"
+			dec.Safeguards = append(dec.Safeguards, "sanity_rejected")
 		}
 	}
 
@@ -273,8 +280,12 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		appNS = req.NamespacedName.Namespace
 	}
 	if prediction != nil && predErr == nil {
+		before := predictedReplicas
 		predictedReplicas = adjustForOverestimation(
 			log, predictedReplicas, reactiveReplicas, state, currentRPM, prediction.Predictions, appName, appNS)
+		if predictedReplicas != before {
+			dec.Safeguards = append(dec.Safeguards, "overestimate_cap")
+		}
 	} else {
 		// No usable forecast participates in this reconcile (forecasting disabled, ML API
 		// unavailable with the cache expired, refusal, elapsed horizon, or a discarded forecast):
@@ -303,11 +314,14 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	}
 
 	// No usable input (forecast off or failed, and the metrics query failed) — keep current replicas
+	keepCurrent := false
 	if (predErr != nil || !forecasting) && vmErr != nil {
 		log.Info("Both prediction and VM query failed, keeping current replicas",
 			"current", currentReplicas)
 		desiredReplicas = currentReplicas
+		keepCurrent = true
 	}
+	dec.setDecision(predictedReplicas, desiredReplicas, keepCurrent)
 
 	// --- ACCURACY METRICS ---
 	actualNeeded := reactiveReplicas
@@ -359,8 +373,10 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 			"reactiveComponent", reactiveReplicas)
 		if err := r.scaleDeployment(ctx, deployment, desiredReplicas); err != nil {
 			log.Error(err, "Failed to scale up")
+			r.recordDecision(dec, "scale_error", currentReplicas)
 			return r.updateStatusWithError(ctx, &autoscaler, "ScalingError", err.Error())
 		}
+		r.recordDecision(dec, "scale_up", desiredReplicas)
 		state.lastScaleUp = time.Now()
 		state.belowCurrentSince = time.Time{} // reset scale-down timer
 		log.Info("Scaled deployment", "from", currentReplicas, "to", desiredReplicas)
@@ -373,8 +389,10 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 				"from", currentReplicas, "to", target, "eventualTarget", desiredReplicas)
 			if err := r.scaleDeployment(ctx, deployment, target); err != nil {
 				log.Error(err, "Failed to scale down")
+				r.recordDecision(dec, "scale_error", currentReplicas)
 				return r.updateStatusWithError(ctx, &autoscaler, "ScalingError", err.Error())
 			}
+			r.recordDecision(dec, "scale_down", target)
 			state.lastScaleDown = time.Now()
 			state.overrideActive = false // clear override after scale-down completes (per D-12)
 			log.Info("Scaled deployment", "from", currentReplicas, "to", target)
@@ -389,12 +407,18 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 			}
 			log.Info("Scale-down pending ("+reason+")",
 				"desired", desiredReplicas, "current", currentReplicas)
+			r.recordDecision(dec, "hold_"+reason, currentReplicas)
 		}
 
 	} else {
 		// AT TARGET: reset scale-down timer
 		state.belowCurrentSince = time.Time{}
 		log.Info("At target replicas", "replicas", currentReplicas)
+		action := "at_target"
+		if keepCurrent {
+			action = "keep_current"
+		}
+		r.recordDecision(dec, action, currentReplicas)
 	}
 
 	// Update status
@@ -405,17 +429,39 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	return ctrl.Result{RequeueAfter: reconcileInterval}, nil
 }
 
+// predictedDetail carries every intermediate value of the predictive component for the
+// per-reconcile decision record (Codex D-140). It changes no decision.
+type predictedDetail struct {
+	PeakRPM    float64
+	Confidence float64
+	Raw        int32 // ceil(peak / targetRPM), before confidence damping
+	Damped     int32 // after confidence damping (== Raw when damping did not apply)
+	Clamped    int32 // after the min/max clamp
+	Safeguards []string
+}
+
 // calculatePredictedReplicas computes replica count from ML predictions
 // using only the lead-time window (e.g., first 20 min of a 60-min horizon).
 func (r *PredictiveAutoscalerReconciler) calculatePredictedReplicas(
 	autoscaler *autoscalerv1alpha1.PredictiveAutoscaler,
 	prediction *MLPredictionResponse,
 ) (int32, bool) {
+	n, ok, _ := r.calculatePredictedReplicasDetail(autoscaler, prediction)
+	return n, ok
+}
+
+// calculatePredictedReplicasDetail is calculatePredictedReplicas plus its intermediate values.
+func (r *PredictiveAutoscalerReconciler) calculatePredictedReplicasDetail(
+	autoscaler *autoscalerv1alpha1.PredictiveAutoscaler,
+	prediction *MLPredictionResponse,
+) (int32, bool, predictedDetail) {
 	log := r.Log.WithValues("predictiveautoscaler", autoscaler.Name)
+	det := predictedDetail{Confidence: prediction.Confidence}
 
 	if len(prediction.Predictions) == 0 {
 		log.Info("No predictions available, using minReplicas")
-		return autoscaler.Spec.MinReplicas, true
+		det.Raw, det.Damped, det.Clamped = autoscaler.Spec.MinReplicas, autoscaler.Spec.MinReplicas, autoscaler.Spec.MinReplicas
+		return autoscaler.Spec.MinReplicas, true, det
 	}
 
 	// Determine lead time and step size
@@ -439,7 +485,7 @@ func (r *PredictiveAutoscalerReconciler) calculatePredictedReplicas(
 	if !ok {
 		log.Info("Forecast horizon no longer covers the lead time; not usable",
 			"anchor", anchor.UTC().Format(time.RFC3339), "leadTimeMinutes", leadTimeMinutes, "steps", len(prediction.Predictions))
-		return 0, false
+		return 0, false, det
 	}
 	leadTimeSteps := len(window)
 
@@ -458,6 +504,7 @@ func (r *PredictiveAutoscalerReconciler) calculatePredictedReplicas(
 	}
 
 	desiredReplicas := int32(math.Ceil(peakRPM / float64(targetRPM)))
+	det.PeakRPM, det.Raw = peakRPM, desiredReplicas
 
 	log.Info("Predicted replicas (lead-time window)",
 		"leadTimeMinutes", leadTimeMinutes,
@@ -474,17 +521,24 @@ func (r *PredictiveAutoscalerReconciler) calculatePredictedReplicas(
 		desiredReplicas = int32(math.Ceil(dampened))
 		log.Info("Low confidence dampening",
 			"confidence", prediction.Confidence, "dampened", desiredReplicas)
+		if desiredReplicas != det.Raw {
+			det.Safeguards = append(det.Safeguards, "confidence_damping")
+		}
 	}
+	det.Damped = desiredReplicas
 
 	// Apply min/max constraints
 	if desiredReplicas < autoscaler.Spec.MinReplicas {
 		desiredReplicas = autoscaler.Spec.MinReplicas
+		det.Safeguards = append(det.Safeguards, "min_clamp")
 	}
 	if desiredReplicas > autoscaler.Spec.MaxReplicas {
 		desiredReplicas = autoscaler.Spec.MaxReplicas
+		det.Safeguards = append(det.Safeguards, "max_clamp")
 	}
+	det.Clamped = desiredReplicas
 
-	return desiredReplicas, true
+	return desiredReplicas, true, det
 }
 
 // queryCurrentRPM queries VictoriaMetrics for the current requests per minute
