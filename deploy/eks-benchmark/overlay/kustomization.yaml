@@ -18,6 +18,7 @@ patches:
   - path: delete-predictive-autoscaler-controller.yaml
   - path: operator-vm-url.yaml
   - path: placement.yaml
+  - path: operator-security-handoff.yaml
   - path: validity-mask.yaml
   - target: { kind: PersistentVolumeClaim, name: ".*" }
     patch: |-
