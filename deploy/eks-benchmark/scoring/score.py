@@ -44,11 +44,12 @@ below the gate. Known-answer tests: score_test.py.
 
 Usage:
   kubectl -n monitoring port-forward svc/kps-kube-prometheus-stack-prometheus 9090:9090 &
-  kubectl -n ml-engine exec deploy/predictive-operator -- cat /var/lib/predictive-autoscaler/forecasts.jsonl > forecasts.jsonl
-  python3 score.py --prom http://localhost:9090 --forecast-log forecasts.jsonl \
+  bash read-forecast-log.sh --all --out forecasts.jsonl
+  python3 score.py --prom http://localhost:9090 --forecast-log forecasts.jsonl --forecast-receipt forecasts.jsonl.receipt.json \
       --start 2026-09-24T00:00:00Z --end 2026-09-26T00:00:00Z --app nginx-test --namespace demo
 """
-import argparse, json, math, sys, urllib.parse, urllib.request
+import argparse, io, json, math, sys, urllib.parse, urllib.request
+from forecast_log import load_verified
 from datetime import datetime, timezone, timedelta
 
 CANONICAL = 'sum(rate(istio_requests_total{{reporter="destination",destination_workload="{app}",destination_workload_namespace="{ns}"}}[1m])) * 60'
@@ -112,7 +113,7 @@ class NoPeeking:
 
 
 def _read_jsonl(path):
-    with open(path, encoding="utf-8") as f:
+    with (io.StringIO(path.decode("utf-8")) if isinstance(path, bytes) else open(path, encoding="utf-8")) as f:
         for n, line in enumerate(f, 1):
             line = line.strip()
             if not line:
@@ -140,7 +141,7 @@ def load_forecasts(path, app, ns, start, end):
     """Issuance records and issuance-keyed events (sanity_rejected) in the window. Per-reconcile
     decision lines are NOT issuances and are skipped here (see load_decisions)."""
     recs = []
-    with open(path, encoding="utf-8") as f:
+    with (io.StringIO(path.decode("utf-8")) if isinstance(path, bytes) else open(path, encoding="utf-8")) as f:
         for n, line in enumerate(f, 1):
             line = line.strip()
             if not line:
@@ -462,6 +463,8 @@ def sampled_changes(series):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--prom"); ap.add_argument("--forecast-log", required=True)
+    ap.add_argument("--forecast-receipt", required=True, help="verified remote-prefix receipt from the reader")
+    ap.add_argument("--allow-fixture-receipt", action="store_true", help="TEST ONLY: mark output as fixture evidence")
     ap.add_argument("--start", required=True); ap.add_argument("--end", required=True)
     ap.add_argument("--app", default="nginx-test"); ap.add_argument("--namespace", default="demo")
     ap.add_argument("--controls", default="nginx-reactive,myapptwo", help="comma-separated comparison deployments")
@@ -475,13 +478,14 @@ def main(argv=None):
     ap.add_argument("--participation-only", action="store_true", help="summarise decision records only; no Prometheus needed")
     a = ap.parse_args(argv)
     start, end = parse_ts(a.start), parse_ts(a.end)
-    decisions = load_decisions(a.forecast_log, a.app, a.namespace, start, end)
+    snapshot, provenance = load_verified(a.forecast_log, a.forecast_receipt, end, a.allow_fixture_receipt)
+    decisions = load_decisions(snapshot, a.app, a.namespace, start, end)
     part = participation(decisions, a.reconcile_seconds) if decisions else None
     if a.participation_only:
         if not decisions:
             raise SystemExit("FAIL: no decision records for the app in the window")
         text = json.dumps({"window": [iso(start), iso(end)], "app": a.app, "namespace": a.namespace,
-                           "decision_records": len(decisions), "participation": part}, indent=2)
+                           "decision_records": len(decisions), "participation": part, "forecast_log_provenance": provenance}, indent=2)
         print(text) if a.out == "-" else open(a.out, "w").write(text + "\n")
         return 0
     if not a.prom:
@@ -492,7 +496,7 @@ def main(argv=None):
     obs = prom.range(q, start, end + timedelta(minutes=70), 60)
     if not obs:
         raise SystemExit("FAIL: no observations for the canonical request-count query in the window")
-    recs = load_forecasts(a.forecast_log, a.app, a.namespace, start, end)
+    recs = load_forecasts(snapshot, a.app, a.namespace, start, end)
     if not recs:
         raise SystemExit("FAIL: no forecast issuances for the app in the window (is the forecast log complete?)")
     accepted, rejected = accept_records(recs)
@@ -500,6 +504,7 @@ def main(argv=None):
         raise SystemExit(f"FAIL: every forecast record was rejected: {rejected[:5]}")
     # Raw-model accuracy: every structurally valid issued forecast (controller rejections never remove one).
     result, rows = score(accepted, prom, a.app, a.namespace, start, end, a.issuance_minutes, as_of=as_of)
+    result["forecast_log_provenance"] = provenance
     result["set"] = "raw_model"
     result["as_of"] = iso(as_of)
     extra = json.load(open(a.transition_events)) if a.transition_events else None

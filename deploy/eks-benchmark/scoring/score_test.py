@@ -4,9 +4,27 @@ import json, os, sys, tempfile, unittest
 from datetime import datetime, timedelta, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import score
+import forecast_log
+import hashlib
+import atexit
+import subprocess
+from pathlib import Path
+from unittest.mock import patch
 
 T0 = datetime(2026, 9, 24, 0, 0, tzinfo=timezone.utc)
 def iso(t): return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def fixture_args(path):
+    data = Path(path).read_bytes()
+    receipt = dict(schema_version=1, kind='fixture', bytes=len(data),
+                   sha256=hashlib.sha256(data).hexdigest(), reader_fingerprint='f' * 64,
+                   remote_probe_at='2026-09-30T00:00:00Z', collected_at='2026-09-30T00:00:01Z',
+                   source={key: 'fixture' for key in forecast_log.SOURCE_FIELDS})
+    with tempfile.NamedTemporaryFile('w', suffix='.receipt.json', delete=False) as f:
+        json.dump(receipt, f)
+    atexit.register(os.unlink, f.name)
+    return ['--forecast-receipt', f.name, '--allow-fixture-receipt']
 
 
 class FakeProm:
@@ -180,6 +198,15 @@ class Replicas(unittest.TestCase):
 
 
 class MainGate(unittest.TestCase):
+    def test_cli_refuses_log_without_transfer_receipt(self):
+        with tempfile.TemporaryDirectory() as root:
+            output = os.path.join(root, 'result.json')
+            with self.assertRaises(SystemExit):
+                score.main(['--forecast-log', FIXTURE, '--start', iso(T0),
+                            '--end', iso(T0 + timedelta(hours=2)), '--app', 'nginx-test',
+                            '--namespace', 'demo', '--participation-only', '--out', output])
+            self.assertFalse(os.path.exists(output))
+
     def test_main_fails_loudly_without_forecasts(self):
         class P:
             def __init__(self, *_): pass
@@ -189,7 +216,7 @@ class MainGate(unittest.TestCase):
         with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
             path = f.name
         with self.assertRaises(SystemExit) as cm:
-            score.main(["--prom", "http://x", "--forecast-log", path, "--start", iso(T0), "--end", iso(T0 + timedelta(hours=1))])
+            score.main(fixture_args(path) + ["--prom", "http://x", "--forecast-log", path, "--start", iso(T0), "--end", iso(T0 + timedelta(hours=1))])
         os.unlink(path); self.assertIn("no forecast issuances", str(cm.exception))
 
     def test_main_fails_on_low_issuance_coverage(self):
@@ -204,7 +231,7 @@ class MainGate(unittest.TestCase):
         with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
             f.write(json.dumps(rec(T0)) + "\n"); path = f.name
         with self.assertRaises(SystemExit) as cm:
-            score.main(["--prom", "http://x", "--forecast-log", path, "--start", iso(T0), "--end", iso(T0 + timedelta(hours=1)),
+            score.main(fixture_args(path) + ["--prom", "http://x", "--forecast-log", path, "--start", iso(T0), "--end", iso(T0 + timedelta(hours=1)),
                         "--app", "a", "--namespace", "n", "--controls", "", "--out", os.devnull])
         os.unlink(path); self.assertIn("issuance coverage", str(cm.exception))
 
@@ -332,11 +359,152 @@ class Participation(unittest.TestCase):
     def test_participation_only_cli(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             path = f.name
-        score.main(["--forecast-log", FIXTURE, "--start", iso(T0), "--end", iso(T0 + timedelta(hours=2)),
+        score.main(fixture_args(FIXTURE) + ["--forecast-log", FIXTURE, "--start", iso(T0), "--end", iso(T0 + timedelta(hours=2)),
                     "--app", "nginx-test", "--namespace", "demo", "--participation-only", "--out", path])
         d = json.load(open(path)); os.unlink(path)
         self.assertEqual(d["decision_records"], 90)
         self.assertEqual(d["participation"]["incomplete_instances"][0]["phase"], "trough")
+
+
+class ReceiptIntegrity(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.log = Path(self.temp.name) / 'forecasts.jsonl'
+        self.log.write_bytes(Path(FIXTURE).read_bytes())
+        self.args = fixture_args(self.log)
+        self.receipt = Path(self.args[1])
+        self.end = T0 + timedelta(hours=2)
+
+    def test_matching_fixture_is_explicit_and_bound(self):
+        snapshot, provenance = forecast_log.load_verified(self.log, self.receipt, self.end, True)
+        self.assertEqual(snapshot, self.log.read_bytes())
+        self.assertTrue(provenance['fixture'])
+        self.assertEqual(provenance['receipt_sha256'], hashlib.sha256(self.receipt.read_bytes()).hexdigest())
+
+    def test_fixture_requires_explicit_opt_in(self):
+        with self.assertRaises(SystemExit):
+            forecast_log.load_verified(self.log, self.receipt, self.end)
+
+    def test_truncated_and_same_length_modified_files_are_rejected(self):
+        original = self.log.read_bytes()
+        for data in (original[:-1], b'X' + original[1:]):
+            self.log.write_bytes(data)
+            with self.assertRaises(SystemExit):
+                forecast_log.load_verified(self.log, self.receipt, self.end, True)
+
+    def test_malformed_receipts_are_rejected(self):
+        original = json.loads(self.receipt.read_text())
+        for change in ({'bytes': True}, {'bytes': original['bytes'] + 1}, {'sha256': 'bad'},
+                       {'kind': 'complete'}, {'schema_version': 2}, {'source': {}},
+                       {'remote_probe_at': 'unknown'}, {'collected_at': '2020-01-01T00:00:00Z'}):
+            with self.subTest(change=change):
+                self.receipt.write_text(json.dumps(dict(original, **change)))
+                with self.assertRaises(SystemExit):
+                    forecast_log.load_verified(self.log, self.receipt, self.end, True)
+
+    def test_end_after_probe_rejected_before_prometheus(self):
+        with patch.object(score, 'Prom', side_effect=AssertionError('network must not be called')):
+            with self.assertRaisesRegex(SystemExit, 'ends after remote probe'):
+                score.main(self.args + ['--forecast-log', str(self.log), '--prom', 'http://unused',
+                           '--start', iso(T0), '--end', '2026-10-01T00:00:00Z'])
+
+    def test_replacing_source_after_verification_cannot_change_scored_bytes(self):
+        output = Path(self.temp.name) / 'result.json'
+        original_loader = score.load_decisions
+        def replace_then_load(snapshot, *args):
+            self.log.write_text('not the verified file')
+            return original_loader(snapshot, *args)
+        with patch.object(score, 'load_decisions', side_effect=replace_then_load):
+            score.main(self.args + ['--forecast-log', str(self.log), '--start', iso(T0),
+                       '--end', iso(self.end), '--app', 'nginx-test', '--namespace', 'demo',
+                       '--participation-only', '--out', str(output)])
+        result = json.loads(output.read_text())
+        self.assertEqual(result['decision_records'], 90)
+        self.assertTrue(result['forecast_log_provenance']['fixture'])
+
+    def test_receipt_emission_checks_remote_hash_and_refuses_reuse(self):
+        receipt = Path(self.temp.name) / 'remote.json'
+        data = self.log.read_bytes()
+        source = {k: 'test-' + k for k in forecast_log.SOURCE_FIELDS}
+        with self.assertRaises(ValueError):
+            forecast_log.emit(self.log, receipt, len(data), '0' * 64, '2026-09-23T00:00:00Z', source, 'f' * 64)
+        self.assertFalse(receipt.exists())
+        forecast_log.emit(self.log, receipt, len(data), hashlib.sha256(data).hexdigest(), '2026-09-23T00:00:00Z', source, 'f' * 64)
+        before = receipt.read_bytes()
+        with self.assertRaises(ValueError):
+            forecast_log.emit(self.log, receipt, len(data), hashlib.sha256(data).hexdigest(), '2026-09-23T00:00:00Z', source, 'f' * 64)
+        self.assertEqual(receipt.read_bytes(), before)
+
+
+class ReaderTransport(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name); self.full = self.root / 'source'
+        self.full.write_bytes(Path(FIXTURE).read_bytes())
+        self.commands = self.root / 'commands'
+        fake = self.root / 'kubectl'
+        fake.write_text(r"""#!/usr/bin/env python3
+import hashlib,json,os,pathlib,sys
+args=sys.argv[1:]
+with open(os.environ['COMMANDS'],'a') as f:f.write(' '.join(args)+'\n')
+if 'get' in args and 'pods' in args:
+    pod={'metadata':{'name':'operator','uid':'pod-uid'},'spec':{'nodeName':'node-a'}}
+    print(json.dumps({'items':[pod,pod] if os.environ.get('MULTI') else [pod]}))
+elif 'get' in args and 'deploy' in args:
+    print(json.dumps({'spec':{'template':{'spec':{'containers':[{'env':[{'name':'FORECAST_LOG','value':'/data/forecasts.jsonl'}]}],'volumes':[{'name':'forecast-log','persistentVolumeClaim':{'claimName':'forecast-pvc'}}]}}}}))
+elif 'get' in args and 'pvc' in args:
+    changed=os.environ.get('UID_CHANGE') and pathlib.Path(os.environ['COMMANDS']).read_text().count('get pvc')>1
+    print(json.dumps({'metadata':{'uid':'new-pvc-uid' if changed else 'pvc-uid'},'spec':{'volumeName':'pv-id'}}))
+elif 'exec' in args:
+    data=pathlib.Path(os.environ['FULL']).read_bytes()
+    if any('__META__' in x for x in args):print(str(len(data))+' '+hashlib.sha256(data).hexdigest())
+    else:sys.stdout.buffer.write(data[:-10] if os.environ.get('TRUNCATE') else data)
+""")
+        fake.chmod(0o755)
+        self.env=dict(os.environ, PATH=str(self.root)+':'+os.environ['PATH'],
+                      FULL=str(self.full), COMMANDS=str(self.commands))
+        self.script=Path(__file__).parent/'read-forecast-log.sh'
+        self.out=self.root/'output'
+
+    def run_reader(self, mode='--all', **env):
+        return subprocess.run(['bash',str(self.script),mode,'--out',str(self.out)],
+                              env=dict(self.env,**env),capture_output=True,text=True)
+
+    def test_full_transfer_produces_remote_receipt_and_cleans_pod(self):
+        p=self.run_reader();self.assertEqual(p.returncode,0,p.stdout+p.stderr)
+        receipt=json.loads(Path(str(self.out)+'.receipt.json').read_text())
+        self.assertEqual(receipt['source']['pvc_uid'],'pvc-uid')
+        self.assertEqual(receipt['source']['operator_pod_uid'],'pod-uid')
+        self.assertEqual(receipt['reader_fingerprint'],hashlib.sha256(self.script.read_bytes()).hexdigest())
+        self.assertEqual(self.out.read_bytes(),self.full.read_bytes())
+        self.assertIn('delete pod',self.commands.read_text())
+
+    def test_truncation_with_success_exit_emits_no_receipt(self):
+        p=self.run_reader(TRUNCATE='1');self.assertEqual(p.returncode,2,p.stdout+p.stderr)
+        self.assertFalse(self.out.exists());self.assertFalse(Path(str(self.out)+'.receipt.json').exists())
+
+    def test_recreated_pvc_same_name_rejected(self):
+        p=self.run_reader(UID_CHANGE='1');self.assertEqual(p.returncode,2,p.stdout+p.stderr)
+        self.assertIn('identity changed',p.stderr)
+        self.assertFalse(self.out.exists())
+        self.assertFalse(Path(str(self.out)+'.receipt.json').exists())
+
+    def test_multiple_operator_pods_fail_before_reader_created(self):
+        p=self.run_reader(MULTI='1');self.assertEqual(p.returncode,2,p.stdout+p.stderr)
+        self.assertNotIn(' run ',self.commands.read_text())
+
+    def test_existing_output_refused_before_cluster_access(self):
+        self.out.write_text('preserve')
+        p=self.run_reader();self.assertEqual(p.returncode,2)
+        self.assertEqual(self.out.read_text(),'preserve');self.assertFalse(self.commands.exists())
+
+    def test_partial_modes_emit_no_receipt(self):
+        for mode in ['--last','--count']:
+            with self.subTest(mode=mode):
+                if self.out.exists():self.out.unlink()
+                p=self.run_reader(mode);self.assertEqual(p.returncode,0,p.stdout+p.stderr)
+                self.assertFalse(Path(str(self.out)+'.receipt.json').exists())
 
 
 if __name__ == "__main__":
