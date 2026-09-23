@@ -48,7 +48,8 @@ Usage:
   python3 score.py --prom http://localhost:9090 --forecast-log forecasts.jsonl --forecast-receipt forecasts.jsonl.receipt.json \
       --start 2026-09-24T00:00:00Z --end 2026-09-26T00:00:00Z --app nginx-test --namespace demo
 """
-import argparse, io, json, math, sys, urllib.parse, urllib.request
+import argparse, io, json, math, os, sys, tempfile, urllib.parse, urllib.request
+from pathlib import Path
 from forecast_log import load_verified
 from datetime import datetime, timezone, timedelta
 
@@ -460,6 +461,23 @@ def sampled_changes(series):
     return sum(1 for (_, a), (_, b) in zip(series, series[1:]) if a != b)
 
 
+def write_result(text, destination):
+    """Publish a complete result exclusively; preserve any earlier evidence."""
+    if destination == '-':
+        print(text)
+        return
+    fd, staged = tempfile.mkstemp(prefix='.score-', dir=Path(destination).parent)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(text + '\n')
+        try:
+            os.link(staged, destination)
+        except FileExistsError as exc:
+            raise SystemExit('FAIL: output already exists: ' + destination) from exc
+    finally:
+        os.unlink(staged)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--prom"); ap.add_argument("--forecast-log", required=True)
@@ -477,6 +495,8 @@ def main(argv=None):
     ap.add_argument("--reconcile-seconds", type=float, default=60.0, help="operator reconcile interval (participation completeness)")
     ap.add_argument("--participation-only", action="store_true", help="summarise decision records only; no Prometheus needed")
     a = ap.parse_args(argv)
+    if a.out != '-' and os.path.lexists(a.out):
+        raise SystemExit('FAIL: output already exists: ' + a.out)
     start, end = parse_ts(a.start), parse_ts(a.end)
     snapshot, provenance = load_verified(a.forecast_log, a.forecast_receipt, end, a.allow_fixture_receipt)
     decisions = load_decisions(snapshot, a.app, a.namespace, start, end)
@@ -486,7 +506,7 @@ def main(argv=None):
             raise SystemExit("FAIL: no decision records for the app in the window")
         text = json.dumps({"window": [iso(start), iso(end)], "app": a.app, "namespace": a.namespace,
                            "decision_records": len(decisions), "participation": part, "forecast_log_provenance": provenance}, indent=2)
-        print(text) if a.out == "-" else open(a.out, "w").write(text + "\n")
+        write_result(text, a.out)
         return 0
     if not a.prom:
         raise SystemExit("FAIL: --prom is required unless --participation-only")
@@ -536,10 +556,9 @@ def main(argv=None):
                    "scale_events_from_operator_counter": ev, "sampled_replica_changes": sampled_changes(s)}
     result["replicas"] = reps
     text = json.dumps(result, indent=2)
-    if a.out == "-":
-        print(text)
-    else:
-        open(a.out, "w").write(text + "\n"); print(f"written {a.out}")
+    write_result(text, a.out)
+    if a.out != "-":
+        print(f"written {a.out}")
     if result["issuance_coverage"] < a.min_coverage:
         raise SystemExit(f"FAIL: issuance coverage {result['issuance_coverage']} below {a.min_coverage}")
     if result["step_coverage"] < a.min_coverage:

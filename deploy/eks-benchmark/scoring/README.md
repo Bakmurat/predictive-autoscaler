@@ -43,3 +43,7 @@ Tests may explicitly pass `--allow-fixture-receipt` for a receipt with
 `kind: fixture`; output then carries `forecast_log_provenance.fixture: true`.
 Production capture must never use that switch. Missing, malformed, mismatched,
 or unapproved fixture receipts fail before querying Prometheus.
+
+Scorer `--out` destinations must also be new. Results are staged completely and
+published exclusively; an existing result or concurrent writer is never replaced.
+Use the default `--out -` to print to stdout.

@@ -232,8 +232,8 @@ class MainGate(unittest.TestCase):
             f.write(json.dumps(rec(T0)) + "\n"); path = f.name
         with self.assertRaises(SystemExit) as cm:
             score.main(fixture_args(path) + ["--prom", "http://x", "--forecast-log", path, "--start", iso(T0), "--end", iso(T0 + timedelta(hours=1)),
-                        "--app", "a", "--namespace", "n", "--controls", "", "--out", os.devnull])
-        os.unlink(path); self.assertIn("issuance coverage", str(cm.exception))
+                        "--app", "a", "--namespace", "n", "--controls", "", "--out", path + ".result"])
+        os.unlink(path); os.unlink(path + ".result"); self.assertIn("issuance coverage", str(cm.exception))
 
 
 FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testdata", "transition-forecasts.jsonl")
@@ -359,6 +359,7 @@ class Participation(unittest.TestCase):
     def test_participation_only_cli(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             path = f.name
+        os.unlink(path)  # report destination must be new
         score.main(fixture_args(FIXTURE) + ["--forecast-log", FIXTURE, "--start", iso(T0), "--end", iso(T0 + timedelta(hours=2)),
                     "--app", "nginx-test", "--namespace", "demo", "--participation-only", "--out", path])
         d = json.load(open(path)); os.unlink(path)
@@ -375,6 +376,28 @@ class ReceiptIntegrity(unittest.TestCase):
         self.args = fixture_args(self.log)
         self.receipt = Path(self.args[1])
         self.end = T0 + timedelta(hours=2)
+
+    def test_existing_report_is_never_overwritten(self):
+        output = Path(self.temp.name) / 'original.json'
+        output.write_text('original evidence')
+        with patch.object(score, 'Prom', side_effect=AssertionError('network must not be called')):
+            with self.assertRaisesRegex(SystemExit, 'output already exists'):
+                score.main(self.args + ['--forecast-log', str(self.log), '--start', iso(T0),
+                           '--end', iso(self.end), '--app', 'nginx-test', '--namespace', 'demo',
+                           '--participation-only', '--out', str(output)])
+        self.assertEqual(output.read_text(), 'original evidence')
+
+    def test_concurrent_report_creation_is_not_overwritten(self):
+        output = Path(self.temp.name) / 'result.json'
+        real_link = os.link
+        def concurrent_creator(source, destination):
+            Path(destination).write_text('concurrent evidence')
+            return real_link(source, destination)
+        with patch.object(score.os, 'link', side_effect=concurrent_creator):
+            with self.assertRaisesRegex(SystemExit, 'output already exists'):
+                score.write_result('{"new": true}', str(output))
+        self.assertEqual(output.read_text(), 'concurrent evidence')
+        self.assertEqual(list(Path(self.temp.name).glob('.score-*')), [])
 
     def test_matching_fixture_is_explicit_and_bound(self):
         snapshot, provenance = forecast_log.load_verified(self.log, self.receipt, self.end, True)
