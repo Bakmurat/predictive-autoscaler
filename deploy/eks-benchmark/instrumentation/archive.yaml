@@ -1,0 +1,136 @@
+# In-cluster evidence archive (declared benchmark instrumentation; additive only).
+#
+# Namespace ml-engine: the source is ml-models-pvc, and a PVC can only be mounted by pods in its own
+# namespace. Nothing here modifies the operator, the API, the trainer CronJob or the demo apps.
+#
+# Placement: ml-models-pvc is ReadWriteOnce and already attached to the ml-api node, so the archive pod
+# is co-located with ml-api by required pod affinity (the same rule the trainer uses), never by a
+# hardcoded hostname. The archive volume uses the WaitForFirstConsumer gp3 class, so it is created in
+# the zone of that first pod, which is the zone of the model volume.
+#
+# Security: no service-account permissions beyond get/list on pods, pods/log and jobs in ml-engine;
+# no Istio sidecar; the model volume is mounted read-only. The container runs as uid 0 with EVERY
+# capability dropped, no privilege escalation and a read-only root filesystem. uid 0 is used only to
+# own the fresh archive volume's root directory; the alternative (a pod-level fsGroup) would ask the
+# kubelet to change group ownership on volumes, and the shared model volume must not be touched.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: evidence-archive
+  namespace: ml-engine
+  labels: {app: evidence-archive, component: instrumentation}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: evidence-archive-reader
+  namespace: ml-engine
+  labels: {app: evidence-archive, component: instrumentation}
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: evidence-archive-reader
+  namespace: ml-engine
+  labels: {app: evidence-archive, component: instrumentation}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: evidence-archive-reader
+subjects:
+  - kind: ServiceAccount
+    name: evidence-archive
+    namespace: ml-engine
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: evidence-archive-pvc
+  namespace: ml-engine
+  labels: {app: evidence-archive, component: instrumentation}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: gp3
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: evidence-archive
+  namespace: ml-engine
+  labels: {app: evidence-archive, component: instrumentation}
+spec:
+  schedule: "5,20,35,50 * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 240
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels: {app: evidence-archive, component: instrumentation}
+          annotations:
+            sidecar.istio.io/inject: "false"
+        spec:
+          serviceAccountName: evidence-archive
+          restartPolicy: Never
+          affinity:
+            podAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels: {app: ml-api}
+                  topologyKey: kubernetes.io/hostname
+          securityContext:
+            seccompProfile: {type: RuntimeDefault}
+          containers:
+            - name: archive
+              # python:3.12-alpine, multi-arch index pinned by digest
+              image: public.ecr.aws/docker/library/python@sha256:4c47124a8391cb7a9f571164147d154777cf012a4ece5f86097130d7a4478111
+              imagePullPolicy: IfNotPresent
+              command: ["python3", "-B", "/opt/archive/archive.py"]
+              env:
+                - {name: NAMESPACE, value: ml-engine}
+                - {name: SOURCE_DIR, value: /models}
+                - {name: ARCHIVE_DIR, value: /archive}
+                - {name: ARTIFACT, value: lstm_nginx-test_requests.pkl}
+                - {name: SIDECAR, value: lstm_nginx-test_requests.meta.json}
+                - {name: TRAINER_SELECTOR, value: app=ml-training}
+                - {name: API_SELECTOR, value: app=ml-api}
+                - {name: API_CONTAINER, value: api}
+                - name: POD_NAME
+                  valueFrom: {fieldRef: {fieldPath: metadata.name}}
+                - name: JOB_NAME
+                  valueFrom: {fieldRef: {fieldPath: "metadata.labels['job-name']"}}
+              resources:
+                requests: {cpu: 20m, memory: 48Mi}
+                limits: {cpu: 200m, memory: 96Mi}
+              securityContext:
+                runAsUser: 0
+                runAsGroup: 0
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: ["ALL"]}
+              volumeMounts:
+                - {name: models, mountPath: /models, readOnly: true}
+                - {name: archive, mountPath: /archive}
+                - {name: code, mountPath: /opt/archive, readOnly: true}
+          volumes:
+            - name: models
+              persistentVolumeClaim: {claimName: ml-models-pvc, readOnly: true}
+            - name: archive
+              persistentVolumeClaim: {claimName: evidence-archive-pvc}
+            - name: code
+              configMap: {name: evidence-archive-code}

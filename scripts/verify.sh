@@ -74,6 +74,9 @@ if [ "$run_py" = 1 ]; then
   # The benchmark scorer's own suite (artifact attribution, transition and participation fixtures).
   ( cd deploy/eks-benchmark/scoring && "$PYTHON" -W ignore score_test.py ) 2>&1 | tee -a "$LOG"; rc=${PIPESTATUS[0]}
   status_line "scorer tests" "$rc" | tee -a "$LOG"; [ "$rc" -eq 0 ] || overall=1
+  # The in-cluster evidence archive (verified-pair archiving, log preservation, gap detection).
+  ( cd deploy/eks-benchmark/instrumentation && "$PYTHON" -W ignore archive_test.py ) 2>&1 | tee -a "$LOG"; rc=${PIPESTATUS[0]}
+  status_line "archive tests" "$rc" | tee -a "$LOG"; [ "$rc" -eq 0 ] || overall=1
 fi
 
 if [ "$overall" -eq 0 ]; then
