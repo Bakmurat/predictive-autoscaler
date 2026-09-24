@@ -27,6 +27,13 @@ k() { kubectl --request-timeout=30s --context "$CTX" "$@"; }
 if [ -n "$OUT" ] && { [ -e "$OUT" ] || [ -e "$OUT.receipt.json" ]; }; then
   echo "COLLECTION FAILED: output or receipt already exists" >&2; exit 2
 fi
+if [ -n "$OUT" ]; then
+  diagnostics="$OUT.transfer"
+  mkdir "$diagnostics" || { echo "COLLECTION FAILED: diagnostics must be new: $diagnostics" >&2; exit 2; }
+else
+  diagnostics=$(mktemp -d) || exit 2
+fi
+echo "transfer diagnostics: $diagnostics" >&2
 work=$(mktemp -d); pod=""
 cleanup() { rm -rf "$work"; if [ -n "$pod" ]; then k delete pod -n "$NS_ML" "$pod" --wait=false >/dev/null 2>&1; fi; }
 trap cleanup EXIT
@@ -81,17 +88,20 @@ fi
 if ! k wait -n "$NS_ML" --for=condition=Ready "pod/$pod" --timeout=180s >/dev/null 2>&1; then
   echo "COLLECTION FAILED: reader pod not Ready — this says nothing about the file" >&2; exit 2
 fi
+k get pod -n "$NS_ML" "$pod" -o json > "$diagnostics/reader-before.json" || exit 2
 probe_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-meta=$(k exec -n "$NS_ML" "$pod" -- sh -c ': __META__; f="$1"; if [ ! -e "$f" ]; then echo __MISSING__; elif [ ! -s "$f" ]; then echo __EMPTY__; else n=$(wc -c < "$f" | tr -d " "); echo "$n $(head -c "$n" "$f" | sha256sum | cut -d" " -f1)"; fi' _ "$file" 2>"$work/probe.err") \
-  || { echo "COLLECTION FAILED: remote probe failed" >&2; cat "$work/probe.err" >&2; exit 2; }
+meta=$(k exec -n "$NS_ML" "$pod" -- sh -c ': __META__; f="$1"; if [ ! -e "$f" ]; then echo __MISSING__; elif [ ! -s "$f" ]; then echo __EMPTY__; else n=$(wc -c < "$f" | tr -d " "); echo "$n $(head -c "$n" "$f" | sha256sum | cut -d" " -f1)"; fi' _ "$file" 2>"$diagnostics/probe.stderr") \
+  || { echo "COLLECTION FAILED: remote probe failed" >&2; cat "$diagnostics/probe.stderr" >&2; exit 2; }
+printf '%s\n' "$meta" > "$diagnostics/probe.txt"
 case "$meta" in
   *__MISSING__*) echo "FILE MISSING: $file has never been created" >&2; exit 1 ;;
   *__EMPTY__*)   echo "FILE EMPTY: $file exists but holds no records" >&2; exit 1 ;;
 esac
 want_n=${meta%% *}; want_s=${meta##* }
 case "$want_n" in ''|*[!0-9]*) echo "COLLECTION FAILED: unusable probe output '$meta'" >&2; exit 2 ;; esac
-tmpf="$work/transfer"
-k exec -n "$NS_ML" "$pod" -- head -c "$want_n" "$file" > "$tmpf" 2>/dev/null || { echo "COLLECTION FAILED: exec read failed" >&2; exit 2; }
+tmpf="$diagnostics/prefix.partial"
+python3 "$HERE/forecast_transfer.py" "$CTX" "$NS_ML" "$pod" "$file" "$want_n" "$want_s" \
+  "$tmpf" "$diagnostics" "$diagnostics/reader-before.json" || exit 2
 got_n=$(wc -c < "$tmpf" | tr -d ' '); got_s=$(shasum -a 256 "$tmpf" | cut -d' ' -f1)
 if [ "$got_n" != "$want_n" ] || [ "$got_s" != "$want_s" ]; then
   echo "COLLECTION FAILED: transport truncated or altered the file (got $got_n bytes, expected $want_n; hash match: $([ "$got_s" = "$want_s" ] && echo yes || echo no))" >&2
@@ -123,7 +133,7 @@ os.link(stage,out)
 SAVE
     then rm -f "$staged"; exit 2; fi
     rm -f "$staged"
-    fingerprint=$(shasum -a 256 "$HERE/read-forecast-log.sh" | cut -d' ' -f1)
+    fingerprint=$(python3 "$HERE/forecast_transfer.py" --fingerprint "$HERE") || exit 2
     python3 "$HERE/forecast_log.py" --log "$OUT" --receipt "$OUT.receipt.json" \
       --remote-bytes "$want_n" --remote-sha256 "$want_s" --probe-at "$probe_at" \
       --source "$work/source.json" --reader-fingerprint "$fingerprint" || exit 2
@@ -137,6 +147,11 @@ else
     --all) cat "$tmpf" ;;
     --last) tail -n 1 "$tmpf" ;;
     --count) wc -l < "$tmpf" | tr -d ' ' ;;
-  esac
+  esac || exit 2
+fi
+rm -f "$tmpf"
+if [ -z "$OUT" ] && ! grep -q '"event": "retry"' "$diagnostics/attempts.jsonl"; then
+  rm -rf "$diagnostics"
+  echo "temporary diagnostics removed after clean stdout success" >&2
 fi
 exit 0

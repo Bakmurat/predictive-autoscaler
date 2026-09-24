@@ -47,3 +47,32 @@ or unapproved fixture receipts fail before querying Prometheus.
 Scorer `--out` destinations must also be new. Results are staged completely and
 published exclusively; an existing result or concurrent writer is never replaced.
 Use the default `--out -` to print to stdout.
+
+The forecast reader transfers the probed prefix in 1 MiB chunks, each with its
+own remote length and SHA-256, before checking the original whole-prefix hash.
+Each chunk has at most three attempts, a 45-second subprocess timeout and a
+30-second kubectl request timeout. The helper enforces a 900-second budget using
+both monotonic and wall time, including a final check before success. Failed
+bytes are never appended to the accepted prefix. Reader pod UID/restart count
+must stay unchanged from before the probe through completion. Appends after the
+probe are allowed; the final chunk stops exactly at the probed byte count.
+
+`--out FILE` also exclusively creates `FILE.transfer` before cluster access.
+It retains the remote probe, reader identity, per-attempt stderr, exit status,
+chunk index/offset and elapsed times. Failed reads retain `prefix.partial`
+(possibly incomplete); successful output removes this duplicate copy.
+Without `--out`, clean success removes temporary diagnostics; failure or recovery
+after retries retains them, with the directory printed on stderr. Use a
+new destination after failure; neither a partial prefix nor successful transport
+alone is a valid scored input. The complete file still needs its receipt and
+the scorer's parsing/coverage checks. A probe can intersect a partially written
+JSONL line; this reader preserves those exact bytes, and the parser fails closed.
+Newline-aligned probing is a separate framing change, not part of transport retries.
+Repeated failures can accumulate retained partial copies, including under the
+temporary directory; preserve or inspect this failure evidence before removing it.
+
+New `reader_fingerprint` values hash this fixed ordered UTF-8 string:
+`v2\n<SHA256(read-forecast-log.sh)>\n<SHA256(forecast_transfer.py)>\n`.
+Earlier receipts retain their single-script fingerprint meaning. The receipt
+schema and source-prefix semantics are unchanged. Keep both scripts together
+when copying the reader. Collection tooling does not require a serving rollout.

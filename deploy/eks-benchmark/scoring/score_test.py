@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import score
 import forecast_log
+import forecast_transfer
 import hashlib
 import atexit
 import subprocess
@@ -479,10 +480,26 @@ elif 'get' in args and 'deploy' in args:
 elif 'get' in args and 'pvc' in args:
     changed=os.environ.get('UID_CHANGE') and pathlib.Path(os.environ['COMMANDS']).read_text().count('get pvc')>1
     print(json.dumps({'metadata':{'uid':'new-pvc-uid' if changed else 'pvc-uid'},'spec':{'volumeName':'pv-id'}}))
+elif 'get' in args and 'pod' in args:
+    changed=os.environ.get('READER_CHANGE') and pathlib.Path(os.environ['COMMANDS']).with_suffix('.attempted').exists()
+    print(json.dumps({'metadata':{'uid':'reader-new' if changed else 'reader-uid'},'status':{'containerStatuses':[{'name':'reader','restartCount':0}]}}))
 elif 'exec' in args:
     data=pathlib.Path(os.environ['FULL']).read_bytes()
-    if any('__META__' in x for x in args):print(str(len(data))+' '+hashlib.sha256(data).hexdigest())
-    else:sys.stdout.buffer.write(data[:-10] if os.environ.get('TRUNCATE') else data)
+    if any('__META__' in x for x in args):
+        print(str(len(data))+' '+('0'*64 if os.environ.get('BAD_PREFIX_HASH') else hashlib.sha256(data).hexdigest()))
+        if os.environ.get('APPEND'):
+            with open(os.environ['FULL'],'ab') as f:f.write(b'new appended bytes\n')
+    else:
+        marker=pathlib.Path(os.environ['COMMANDS']).with_suffix('.attempted')
+        first=not marker.exists();marker.touch()
+        if first and os.environ.get('FAIL_ONCE'):
+            print('fixture connection reset',file=sys.stderr);raise SystemExit(7)
+        if 'forecast-chunk' in args:
+            index,length=map(int,args[-2:]);data=data[index*1048576:index*1048576+length]
+            sys.stdout.buffer.write(str(len(data)).encode()+b'\n'+hashlib.sha256(data).hexdigest().encode()+b'  chunk\n')
+        if os.environ.get('CORRUPT') and data:data=bytes([data[0]^1])+data[1:]
+        if os.environ.get('TRUNCATE') or (first and os.environ.get('TRUNCATE_ONCE')):data=data[:-10]
+        sys.stdout.buffer.write(data)
 """)
         fake.chmod(0o755)
         self.env=dict(os.environ, PATH=str(self.root)+':'+os.environ['PATH'],
@@ -499,13 +516,101 @@ elif 'exec' in args:
         receipt=json.loads(Path(str(self.out)+'.receipt.json').read_text())
         self.assertEqual(receipt['source']['pvc_uid'],'pvc-uid')
         self.assertEqual(receipt['source']['operator_pod_uid'],'pod-uid')
-        self.assertEqual(receipt['reader_fingerprint'],hashlib.sha256(self.script.read_bytes()).hexdigest())
+        self.assertEqual(receipt['reader_fingerprint'],forecast_transfer.reader_fingerprint(self.script.parent))
         self.assertEqual(self.out.read_bytes(),self.full.read_bytes())
         self.assertIn('delete pod',self.commands.read_text())
 
     def test_truncation_with_success_exit_emits_no_receipt(self):
         p=self.run_reader(TRUNCATE='1');self.assertEqual(p.returncode,2,p.stdout+p.stderr)
         self.assertFalse(self.out.exists());self.assertFalse(Path(str(self.out)+'.receipt.json').exists())
+
+    def test_transient_exec_failure_recovers_and_preserves_stderr(self):
+        p=self.run_reader(FAIL_ONCE='1')
+        self.assertEqual(p.returncode,0,p.stdout+p.stderr)
+        self.assertEqual(self.out.read_bytes(),self.full.read_bytes())
+        diagnostic=Path(str(self.out)+'.transfer')
+        self.assertTrue(any('fixture connection reset' in f.read_text()
+                            for f in diagnostic.glob('*.stderr')))
+        attempts=[json.loads(line) for line in (diagnostic/'attempts.jsonl').read_text().splitlines()]
+        failed=next(row for row in attempts if row['event']=='retry')
+        self.assertEqual(failed['exit_code'],7)
+        self.assertEqual(failed['offset'],0)
+
+    def test_transient_success_exit_truncation_retries(self):
+        p=self.run_reader(TRUNCATE_ONCE='1')
+        self.assertEqual(p.returncode,0,p.stderr)
+        self.assertEqual(self.out.read_bytes(),self.full.read_bytes())
+
+    def test_append_after_probe_does_not_change_verified_prefix(self):
+        before=self.full.read_bytes()
+        p=self.run_reader(APPEND='1')
+        self.assertEqual(p.returncode,0,p.stderr)
+        self.assertEqual(self.out.read_bytes(),before)
+        self.assertGreater(self.full.stat().st_size,len(before))
+
+    def test_corrupt_chunk_and_bad_whole_hash_cannot_publish_receipt(self):
+        for env in [{'CORRUPT':'1'}, {'BAD_PREFIX_HASH':'1'}]:
+            self.out=self.root/next(iter(env))
+            p=self.run_reader(**env)
+            self.assertEqual(p.returncode,2,p.stderr)
+            self.assertFalse(self.out.exists())
+            self.assertFalse(Path(str(self.out)+'.receipt.json').exists())
+
+    def test_changed_reader_identity_cannot_retry_another_reader(self):
+        p=self.run_reader(FAIL_ONCE='1',READER_CHANGE='1')
+        self.assertEqual(p.returncode,2)
+        self.assertIn('reader identity',p.stderr)
+        events=[json.loads(line) for line in Path(str(self.out)+'.transfer/attempts.jsonl').read_text().splitlines()]
+        self.assertEqual(sum(x['event']=='retry' for x in events),1)
+
+    def test_diagnostic_collision_refused_before_cluster_access(self):
+        Path(str(self.out)+'.transfer').mkdir()
+        p=self.run_reader()
+        self.assertEqual(p.returncode,2)
+        self.assertIn(str(self.out)+'.transfer',p.stderr)
+        self.assertFalse(self.commands.exists())
+
+    def test_clean_stdout_success_removes_temporary_diagnostics(self):
+        p=subprocess.run(['bash',str(self.script),'--count'],
+                         env=dict(self.env,TMPDIR=str(self.root)),capture_output=True,text=True)
+        self.assertEqual(p.returncode,0,p.stderr)
+        diagnostic=Path(next(line.removeprefix('transfer diagnostics: ') for line in p.stderr.splitlines()
+                             if line.startswith('transfer diagnostics: ')))
+        self.assertFalse(diagnostic.exists())
+
+    def test_recovered_stdout_failure_keeps_logs_without_duplicate_prefix(self):
+        p=subprocess.run(['bash',str(self.script),'--count'],
+                         env=dict(self.env,TMPDIR=str(self.root),FAIL_ONCE='1'),capture_output=True,text=True)
+        self.assertEqual(p.returncode,0,p.stderr)
+        diagnostic=Path(next(line.removeprefix('transfer diagnostics: ') for line in p.stderr.splitlines()
+                             if line.startswith('transfer diagnostics: ')))
+        self.assertTrue((diagnostic/'attempts.jsonl').exists())
+        self.assertFalse((diagnostic/'prefix.partial').exists())
+
+    def test_exact_and_partial_chunk_boundaries(self):
+        for size in [forecast_transfer.CHUNK*2,forecast_transfer.CHUNK+17]:
+            self.out=self.root/str(size)
+            self.full.write_bytes(bytes(i%251 for i in range(size)))
+            p=self.run_reader(APPEND='1')
+            self.assertEqual(p.returncode,0,p.stderr)
+            self.assertEqual(self.out.read_bytes(),self.full.read_bytes()[:size])
+
+    def test_new_receipt_is_accepted_by_existing_participation_cli(self):
+        # Keep this real-receipt integration independent of the benchmark's
+        # future-dated fixtures and of the machine's current date.
+        sample=datetime(2000,1,1,0,30,tzinfo=timezone.utc)
+        self.full.write_text(json.dumps(dict(dec(sample,'tie'),application='nginx-test',namespace='demo'))+'\n')
+        p=self.run_reader()
+        self.assertEqual(p.returncode,0,p.stderr)
+        raw,meta=forecast_log.load_verified(self.out,Path(str(self.out)+'.receipt.json'),
+                                          sample+timedelta(minutes=1))
+        self.assertEqual(raw,self.full.read_bytes())
+        result=subprocess.run([sys.executable,str(self.script.parent/'score.py'),
+                               '--forecast-log',str(self.out),'--forecast-receipt',str(self.out)+'.receipt.json',
+                               '--start',iso(sample),'--end',iso(sample+timedelta(minutes=1)),
+                               '--participation-only'],capture_output=True,text=True)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertFalse(json.loads(result.stdout)['forecast_log_provenance']['fixture'])
 
     def test_recreated_pvc_same_name_rejected(self):
         p=self.run_reader(UID_CHANGE='1');self.assertEqual(p.returncode,2,p.stdout+p.stderr)
@@ -525,9 +630,50 @@ elif 'exec' in args:
     def test_partial_modes_emit_no_receipt(self):
         for mode in ['--last','--count']:
             with self.subTest(mode=mode):
-                if self.out.exists():self.out.unlink()
+                self.out=self.root/mode
                 p=self.run_reader(mode);self.assertEqual(p.returncode,0,p.stdout+p.stderr)
                 self.assertFalse(Path(str(self.out)+'.receipt.json').exists())
+
+
+class TransferDeadline(unittest.TestCase):
+    def test_deadline_checked_again_after_final_identity(self):
+        clock=[0.0];identities=[0]
+        def execute(command,**kwargs):
+            if 'get' in command:
+                identities[0]+=1
+                raw=json.dumps({'metadata':{'uid':'uid'},'status':{'containerStatuses':[{'name':'reader','restartCount':0}]}}).encode()
+                if identities[0]==2:clock[0]=901
+            else:raw=b'1\n'+hashlib.sha256(b'x').hexdigest().encode()+b'  chunk\nx'
+            return subprocess.CompletedProcess(command,0,raw,b'')
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            with patch.object(forecast_transfer.time,'monotonic',side_effect=lambda:clock[0]), \
+                 patch.object(forecast_transfer.time,'time',return_value=1000), \
+                 patch.object(forecast_transfer.subprocess,'run',side_effect=execute):
+                with self.assertRaises(TimeoutError):
+                    forecast_transfer.transfer('c','n','pod','/file',1,hashlib.sha256(b'x').hexdigest(),
+                                               root/'prefix',root,('uid',0))
+            self.assertNotIn('"event": "complete"',(root/'attempts.jsonl').read_text())
+
+    def test_suspended_monotonic_clock_does_not_extend_wall_deadline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            with patch.object(forecast_transfer.time,'monotonic',return_value=0), \
+                 patch.object(forecast_transfer.time,'time',side_effect=[1000,1901]), \
+                 patch.object(forecast_transfer.subprocess,'run') as execute:
+                with self.assertRaises(TimeoutError):
+                    forecast_transfer.transfer('c','n','pod','/file',1,hashlib.sha256(b'x').hexdigest(),
+                                               root/'prefix',root,('uid',0))
+                execute.assert_not_called()
+
+    def test_combined_fingerprint_changes_when_helper_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            (root/'read-forecast-log.sh').write_text('reader')
+            helper=root/'forecast_transfer.py';helper.write_text('helper')
+            old=forecast_transfer.reader_fingerprint(root)
+            helper.write_text('changed helper')
+            self.assertNotEqual(old,forecast_transfer.reader_fingerprint(root))
 
 
 if __name__ == "__main__":
