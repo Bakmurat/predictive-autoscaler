@@ -16,6 +16,7 @@ import time
 from datetime import datetime, timedelta
 
 import pytest
+import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -61,26 +62,44 @@ def issuance(end=END, steps=STEPS, seq=SEQ, **over):
     return rec
 
 
+class IdentityScaler:
+    def transform(self, values):
+        return np.asarray(values, dtype=float)
+
+
 class FakeModel:
     """Returns distinguishable components so independence can be checked."""
     def __init__(self, hybrid=700.0, network=500.0, pattern=900.0, available=True, raises=None):
         self.hybrid, self.network, self.pattern = hybrid, network, pattern
         self.available, self.raises = available, raises
-        self.calls = 0
+        self._call_counter = [0]
+        self.sequence_length = SEQ
+        self.scaler = IdentityScaler()
         self.seen_origins = []
+
+    @property
+    def calls(self):
+        return self._call_counter[0]
+
+    @calls.setter
+    def calls(self, value):
+        self._call_counter[0] = value
 
     def predict(self, steps_ahead=STEPS, origin=None, seasonal_history=None, **kw):
         self.calls += 1
         self.seen_origins.append(origin)
         if self.raises:
             raise self.raises
-        return {"predictions": [self.hybrid] * steps_ahead,
+        return {"origin": origin.isoformat(),
+                "target_timestamps": [(origin + GRID*(i+1)).isoformat() for i in range(steps_ahead)],
+                "predictions": [self.hybrid] * steps_ahead,
                 "components": {"lstm": [self.network] * steps_ahead,
                                "pattern": [self.pattern] * steps_ahead,
                                "pattern_available": self.available}}
 
 
 def observer_with(points, model=None, **kw):
+    kw.setdefault("replay_state_lookup", lambda _: {"mape_for_floor": 0., "source": "fixture"})
     return ShadowObserver(make_history(points), (lambda _h: model), **kw)
 
 
@@ -221,7 +240,8 @@ def test_model_failure_is_recorded_as_failed_not_skipped():
     pts = series(END - GRID * (SEQ - 1), END)
     m = FakeModel(raises=RuntimeError("boom"))
     rec = observer_with(pts, m).observe(issuance())
-    for name in ("served_hybrid", "raw_network", "seasonal_only"):
+    assert all(o["value"] == 700.0 for o in rec.predictors["served_hybrid"])
+    for name in ("raw_network", "seasonal_only"):
         obs = rec.predictors[name]
         assert len(obs) == STEPS
         assert all(o["status"] == "failed" and "boom" in o["detail"] for o in obs), name
@@ -234,7 +254,8 @@ def test_history_lookup_failure_is_recorded_for_every_predictor():
         raise IOError("prometheus unreachable")
     rec = ShadowObserver(boom, lambda _h: FakeModel()).observe(issuance())
     assert any("history lookup failed" in n for n in rec.notes)
-    assert all(o["status"] == "failed" for o in rec.predictors["served_hybrid"])
+    assert all(o["status"] == "ok" and o["value"] == 700.0
+               for o in rec.predictors["served_hybrid"])
 
 
 def test_unusable_issuance_is_recorded_with_a_note():
@@ -316,7 +337,9 @@ class ArrayModel(FakeModel):
     def predict(self, steps_ahead=STEPS, origin=None, seasonal_history=None, **kw):
         self.calls += 1
         import numpy as np
-        return {"predictions": np.full(steps_ahead, self.hybrid),
+        return {"origin": origin.isoformat(),
+                "target_timestamps": [(origin + GRID*(i+1)).isoformat() for i in range(steps_ahead)],
+                "predictions": np.full(steps_ahead, self.hybrid),
                 "components": {"lstm": np.full(steps_ahead, self.network),
                                "pattern": [self.pattern if a else None for a in self.per_step],
                                "pattern_available": any(self.per_step),
