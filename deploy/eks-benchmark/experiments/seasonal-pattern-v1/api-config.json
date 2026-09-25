@@ -1,0 +1,7 @@
+{
+  "id": "seasonal-pattern-v1",
+  "application": "nginx-seasonal",
+  "namespace": "demo",
+  "source_application": "nginx-test",
+  "source_namespace": "demo"
+}

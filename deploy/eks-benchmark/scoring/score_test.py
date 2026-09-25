@@ -57,6 +57,20 @@ def rec(issued, steps=(1, 2, 3), rpm=lambda k: 100.0, cutoff=None, trained=None,
 
 
 class Alignment(unittest.TestCase):
+    def test_shared_checkpoint_arms_are_filtered_before_hash_attribution(self):
+        rows = []
+        for app, ns in (("a", "n"), ("seasonal", "n"), ("a", "other")):
+            rows.append(dict(rec(T0), application=app, namespace=ns, artifact_sha256="a" * 64))
+            rows.append(dict(event="decision", application=app, namespace=ns,
+                             at=iso(T0), artifact_sha256="a" * 64))
+        raw = "\n".join(json.dumps(r) for r in rows).encode()
+        for app, ns in (("a", "n"), ("seasonal", "n"), ("a", "other")):
+            forecasts = score.load_forecasts(raw, app, ns, T0, T0 + timedelta(hours=1))
+            decisions = score.load_decisions(raw, app, ns, T0, T0 + timedelta(hours=1))
+            self.assertEqual(len(forecasts), 1)
+            self.assertEqual(len(decisions), 1)
+            self.assertEqual((forecasts[0]["application"], forecasts[0]["namespace"]), (app, ns))
+
     def test_exact_point_sample_at_plus_20_minutes(self):
         # ramp 100 + 10*minute; forecast for step 2 (T0+20) says 300 = exactly the point sample -> 0 error
         prom = FakeProm(lambda m: 100 + 10 * m)

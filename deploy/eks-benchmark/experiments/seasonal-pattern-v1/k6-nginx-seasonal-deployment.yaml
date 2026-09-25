@@ -1,0 +1,67 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k6-nginx-seasonal
+  namespace: demo
+  labels:
+    app: k6
+    target: nginx-seasonal
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate   # never two generators for one app at once (the rate would double during a rollout)
+  selector:
+    matchLabels:
+      app: k6
+      target: nginx-seasonal
+  template:
+    metadata:
+      labels:
+        app: k6
+        target: nginx-seasonal
+      annotations:
+        sidecar.istio.io/inject: "false"   # requests are counted by the destination sidecar (reporter="destination")
+    spec:
+      nodeSelector:
+        predictive-bench/seasonal-generator: "true"
+      # Generators never share a node with ml-api (whose node also hosts the training job), so the
+      # training node's budget is deterministic (Codex C-12).
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels: { app: ml-api }
+              namespaces: [ml-engine]
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: k6
+          image: grafana/k6:0.48.0
+          # 2026-09-22 (Codex D-137): --no-summary --no-thresholds stop k6's end-of-test metrics engine,
+          # which kept every Trend sample for the whole 8-day run, and the remote-write output sends
+          # trends as native histograms instead of a Trend sink that also kept every sample. Together
+          # they were ~300 bytes per request, unbounded: five OOM kills per generator at 384Mi.
+          # Measured bounded afterwards; the offered traffic (load.js, rates, executor) is unchanged.
+          args: ["run", "--quiet", "--no-summary", "--no-thresholds", "-o", "experimental-prometheus-rw", "--tag", "testid=nginx-seasonal", "/scripts/load.js"]
+          env:
+            - name: TARGET_URL
+              value: "http://nginx-seasonal.demo.svc.cluster.local/"
+            - name: TARGET_NAME
+              value: "nginx-seasonal"
+            - name: K6_PROMETHEUS_RW_SERVER_URL
+              value: "VM_WRITE_URL"
+            - name: K6_PROMETHEUS_RW_PUSH_INTERVAL
+              value: "10s"
+            - name: K6_PROMETHEUS_RW_TREND_AS_NATIVE_HISTOGRAM   # k6_http_req_duration_seconds (native histogram)
+              value: "true"
+          resources:
+            # memory request == limit (D-137); identical to the original three generators
+            requests: { cpu: 100m, memory: 160Mi }
+            limits: { cpu: 500m, memory: 160Mi }
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+      volumes:
+        - name: script
+          configMap:
+            name: k6-load-script

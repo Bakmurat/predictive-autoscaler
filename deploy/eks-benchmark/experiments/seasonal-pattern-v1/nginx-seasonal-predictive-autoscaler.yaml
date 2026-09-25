@@ -1,0 +1,47 @@
+apiVersion: autoscaler.example.com/v1alpha1
+kind: PredictiveAutoscaler
+metadata:
+  name: nginx-seasonal-autoscaler
+  namespace: demo
+  labels:
+    app: nginx-seasonal
+    scaler-type: seasonal-experiment
+    experiment: seasonal-pattern-v1
+  annotations:
+    description: "S1 seasonal component from demo/nginx-test; own reactive demand"
+spec:
+  targetDeployment:
+    name: nginx-seasonal
+    namespace: demo
+    container: nginx
+
+  minReplicas: 1
+  maxReplicas: 12
+
+  metrics:
+    # Request rate is PRIMARY metric (leading indicator)
+    # Matches Grafana: sum(rate(istio_requests_total{...}[1m]))
+    # Same request-count definition and per-replica target as the KEDA comparison
+    requests:
+      enabled: true
+      targetRPS: 10          # requests/s per replica; same value in the KEDA comparison
+
+    # CPU as supplementary signal
+    cpu:
+      enabled: true
+      targetPercent: 70
+
+    # Memory as supplementary signal
+    memory:
+      enabled: true
+      targetPercent: 70
+
+  prediction:
+    horizonMinutes: 60          # ML API predicts 1 hour ahead (full context)
+    leadTimeMinutes: 20         # Use predictions within 20-min window for scaling
+    updateIntervalSeconds: 60   # Reconcile every 60s (reactive needs fast cycles)
+
+  resources:
+    cpuRequestMillicores: 10    # From nginx-deployment.yaml: cpu: 20m
+    memoryRequestMB: 16         # From nginx-deployment.yaml: memory: 32Mi
+    baselineRPM: 6000          # Baseline RPM at 2 replicas (night minimum ~3k, peak ~120k)

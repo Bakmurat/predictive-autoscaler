@@ -1,0 +1,63 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-seasonal
+  namespace: demo
+  labels:
+    app: nginx-seasonal
+spec:
+  # no `replicas`: the autoscalers own the count; a re-apply must not reset it (kubectl apply would)
+  selector:
+    matchLabels:
+      app: nginx-seasonal
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }   # rollout overlap bounded to one extra pod per app (budget, Codex C-12)
+  template:
+    metadata:
+      labels:
+        app: nginx-seasonal
+      annotations:
+        sidecar.istio.io/proxyCPU: "25m"       # measured: ~63m at 100 req/s per pod (2 replicas), ~10m at the 10 req/s per-replica target; CPU is the binding constraint on two t4g.medium
+        sidecar.istio.io/proxyCPULimit: "200m"
+        sidecar.istio.io/proxyMemory: "48Mi"
+        sidecar.istio.io/proxyMemoryLimit: "128Mi"
+    spec:
+      # Spread across the three eligible nodes: at most four pods per node at the ceiling.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: nginx-seasonal
+      containers:
+      - name: nginx
+        image: nginx:1.25-alpine
+        ports:
+        - containerPort: 80
+          name: http
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi
+        livenessProbe:
+          httpGet:
+            path: /
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3

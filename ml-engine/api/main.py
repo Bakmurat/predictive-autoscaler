@@ -12,6 +12,7 @@ import sys
 import gc
 import asyncio
 import functools
+import copy
 import threading
 import subprocess
 import psutil
@@ -27,6 +28,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 from models.lstm_model import LSTMForecastModel, asymmetric_mse  # noqa: F401 — registers custom loss for keras model loading
 from data.victoriametrics_collector import VictoriaMetricsCollector
 from api.accuracy import AccuracyTracker
+from api.seasonal_experiment import SeasonalExperiment
 
 # Set up logging
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -98,6 +100,9 @@ class LSTMPredictor:
     MODEL_MAX_AGE_HOURS = 6
 
     def __init__(self):
+        raw_experiment = os.getenv("SEASONAL_EXPERIMENT")
+        self.seasonal_experiment = (SeasonalExperiment.parse(raw_experiment)
+                                    if raw_experiment is not None else None)
         self.lstm_model = LSTMForecastModel(sequence_length=144)
         self.trained_models = {}
         self.model_train_times = {}  # Track when each model was trained
@@ -513,15 +518,31 @@ class LSTMPredictor:
                 if len(metric_data) < 60:
                     logger.warning(f"Limited data ({len(metric_data)} points), predictions may be less accurate")
 
-                # Check if model file on disk has been updated (by CronJob)
-                model_key = f"{application}_{metric_type}"
-                self._check_and_reload_model(model_key)
-
-                # Get the model
-                model = self.trained_models.get(model_key, self.lstm_model)
+                experiment = getattr(self, "seasonal_experiment", None)
+                if experiment and not experiment.matches(application, namespace, metric_type):
+                    experiment = None
+                model_key = f"{experiment.source_application if experiment else application}_{metric_type}"
+                if experiment:
+                    # Baseline owns checkpoint reload. Snapshot its wrapper and provenance
+                    # together; never write request state into the shared source wrapper.
+                    with self._model_lock(model_key):
+                        if model_key not in self.trained_models:
+                            raise HTTPException(422, "seasonal forecast refused: source model unavailable")
+                        model = copy.copy(self.trained_models[model_key])
+                        model.pattern_weight_override = 1.0
+                        experiment_meta = copy.deepcopy(self.model_meta.get(model_key, {}))
+                        experiment_trained_at = self.model_train_times.get(model_key)
+                        if not experiment_meta.get("artifact_sha256"):
+                            raise HTTPException(422, "seasonal forecast refused: source artifact hash unavailable")
+                else:
+                    self._check_and_reload_model(model_key)
+                    model = self.trained_models.get(model_key, self.lstm_model)
 
                 # Track model age
                 age_hours = self._get_model_age_hours(model_key)
+                if experiment:
+                    age_hours = ((datetime.utcnow() - experiment_trained_at).total_seconds() / 3600
+                                 if experiment_trained_at and experiment_trained_at != datetime.min else -1)
                 if age_hours > self.MODEL_MAX_AGE_HOURS:
                     logger.warning(f"Model {model_key} is stale (age: {age_hours:.1f}h > {self.MODEL_MAX_AGE_HOURS}h), serving from disk anyway")
 
@@ -597,6 +618,17 @@ class LSTMPredictor:
                         seasonal_history=seasonal_history,      # C-44: a real second component
                     )
 
+                if experiment:
+                    comp = prediction_result.get("components") or {}
+                    pattern = comp.get("pattern") or []
+                    available = comp.get("pattern_available_per_step") or []
+                    weights = comp.get("pattern_weights") or []
+                    if (len(pattern) != steps_ahead or len(available) != steps_ahead
+                            or len(weights) != steps_ahead or not all(available)
+                            or any(v is None or not math.isfinite(float(v)) for v in pattern)
+                            or any(w != 1.0 for w in weights)):
+                        raise HTTPException(422, "seasonal forecast refused: incomplete seasonal support")
+
                 # Return flat predictions array (Go operator compatible)
                 predicted_values = [round(float(v), 2) for v in prediction_result['predictions']]
 
@@ -632,9 +664,9 @@ class LSTMPredictor:
                            f"min={min(predicted_values):.2f}, max={max(predicted_values):.2f}, "
                            f"confidence={prediction_result['confidence']:.3f}")
 
-                meta = self.model_meta.get(model_key, {})
+                meta = experiment_meta if experiment else self.model_meta.get(model_key, {})
                 sha = meta.get("artifact_sha256") or ""
-                trained_dt = self.model_train_times.get(model_key)
+                trained_dt = experiment_trained_at if experiment else self.model_train_times.get(model_key)
                 trained_at = (trained_dt.isoformat() + "Z") if trained_dt and trained_dt != datetime.min else ""
                 if model_key not in self.trained_models:
                     version = f"{model_key}@untrained"
@@ -642,8 +674,11 @@ class LSTMPredictor:
                     version = f"{model_key}@{sha[:12]}"
                 else:
                     version = f"{model_key}@mtime{int(self.model_file_mtimes.get(model_key, 0))}"
+                if experiment:
+                    version = f"{experiment.id}:{experiment.config_sha256}:{model_key}@{sha}"
                 inference_input_end = gapfill._iso(window[-1][0])
                 return {
+                    **({"experiment": experiment.provenance()} if experiment else {}),
                     "application": application,
                     "metric_type": metric_type,
                     "model_version": version,
@@ -878,11 +913,19 @@ async def predict(request: Dict):
 
         if metric_type != "requests":
             raise HTTPException(status_code=400, detail="metric_type must be 'requests'")
+
+        experiment = getattr(predictor, "seasonal_experiment", None)
+        if experiment and not experiment.matches(application, namespace, metric_type):
+            experiment = None
+        if experiment and "metric_data" in request:
+            raise HTTPException(422, "seasonal forecast refused: history must be fetched from configured source")
         
         # If no metric_data provided, fetch from VictoriaMetrics
         if not metric_data:
             logger.info(f"No metric_data provided, fetching from VictoriaMetrics for {application}")
-            metric_data = await fetch_metrics_from_vm(application, namespace, metric_type)
+            metric_data = await fetch_metrics_from_vm(
+                experiment.source_application if experiment else application,
+                experiment.source_namespace if experiment else namespace, metric_type)
             if not metric_data:
                 raise HTTPException(status_code=400, detail=f"Could not fetch {metric_type} metrics for {application}")
         
