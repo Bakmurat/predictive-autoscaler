@@ -58,7 +58,7 @@ var (
 	predictedRpmGauge = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "predictive_autoscaler_predicted_rpm",
-			Help: "Peak predicted RPM from ML model lead-time window",
+			Help: "Raw lead-window peak RPM selected for the last scaling decision, before replica safeguards; absent when no nonempty usable forecast participated. Early reconcile errors do not refresh this metric.",
 		},
 		[]string{"application", "namespace"},
 	)

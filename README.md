@@ -95,6 +95,8 @@ spec:
 
 `spec.metrics.cpu` and `spec.metrics.memory` are reserved in the schema; the request-rate model is the one trained today.
 
+The operator's `predictive_autoscaler_predicted_rpm` gauge reports the raw peak selected for the last scaling decision's lead-time window, before confidence adjustment and replica safeguards. Cached forecasts exclude elapsed steps, and the configured lead time determines the window. Earlier versions reported the first two steps regardless of the selected window. The series is now removed when a decision has no nonempty usable forecast, including refusal, an elapsed horizon, sanity rejection or disabled forecasting; a valid forecast of zero RPM remains a present zero. Errors that return before a scaling decision leave the metric unchanged. Dashboards should distinguish an absent series from zero demand. Per-step forecast metrics remain separate issuance records.
+
 ### Tests
 
 ```sh

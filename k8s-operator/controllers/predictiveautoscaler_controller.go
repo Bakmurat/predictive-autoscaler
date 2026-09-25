@@ -340,15 +340,13 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	predictionErrorPercentGauge.WithLabelValues(appName, appNS).Set(errorPct)
 
 	// RPM gauges (D-08, D-09) — update every reconcile cycle
-	if prediction != nil && len(prediction.Predictions) > 0 {
-		// Report peak RPM from lead-time window (first 2 steps) — matches replica calculation input
-		peakRPM := prediction.Predictions[0]
-		for i := 1; i < len(prediction.Predictions) && i < 2; i++ {
-			if prediction.Predictions[i] > peakRPM {
-				peakRPM = prediction.Predictions[i]
-			}
-		}
-		predictedRpmGauge.WithLabelValues(appName, appNS).Set(peakRPM)
+	if dec.ForecastStatus == "used" && dec.LeadWindowPeak != nil && prediction != nil && len(prediction.Predictions) > 0 {
+		// Reuse the exact window selected for this decision, including on cached reuse.
+		// Recalculating here could select a different window at a target-time boundary.
+		predictedRpmGauge.WithLabelValues(appName, appNS).Set(*dec.LeadWindowPeak)
+	} else {
+		// Absence distinguishes an unused/empty forecast from a usable forecast of zero RPM.
+		predictedRpmGauge.DeleteLabelValues(appName, appNS)
 	}
 	if currentRPM > 0 {
 		currentRpmGauge.WithLabelValues(appName, appNS).Set(currentRPM)
