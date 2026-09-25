@@ -78,8 +78,9 @@ charges. Record the user's cost notice before provisioning.
 All four app Deployments use hostname spread, maxSkew 1, DoNotSchedule. At each
 12-pod ceiling, each node has at most four pods per app. Each app pod requests
 35m CPU/64Mi including the native Istio sidecar. The fourth generator requests
-100m/160Mi and must run on the added node labelled
-`predictive-bench/seasonal-generator=true`. Verify actual node allocatable,
+100m/160Mi and must run on exactly one dedicated Ready node labelled
+`predictive-bench/seasonal-generator=true`, selected after the API rollout and
+not hosting the API. Remove that label from every other node. Verify actual node allocatable,
 daemon/system requests and training overlap before starting load. The inspected
 budget covers one new-arm surge, not simultaneous rollouts of all four apps.
 The original workloads can spread onto the new node; this is an explicit change
@@ -87,7 +88,7 @@ to the benchmark environment requiring requalification.
 
 Apply in this order, recording bounded command results and before/after state:
 
-1. Add the node, wait for Ready and label it. Recheck capacity including training.
+1. Add the node and wait for Ready. Recheck capacity including training.
 2. Build only the API, using the deployed immutable image digest as the dependency
    base and overlaying the reviewed API source. Test that image, publish its
    digest, and preserve the previous Deployment for rollback. Trainer/operator
@@ -95,7 +96,10 @@ Apply in this order, recording bounded command results and before/after state:
 3. Render the live API Deployment with only image and `SEASONAL_EXPERIMENT`
    changes. Inspect `kubectl diff`; retain `strategy: Recreate`. Apply and check
    health plus the normal source route's forecasts.
-4. Apply the fourth service and app, wait for Ready. Replace `VM_WRITE_URL` in the
+4. Inspect actual API placement after rollout: the scheduler may choose the added
+   node. Select a different Ready node with the verified generator capacity and
+   give only that node the generator label. Do not assume the API stayed on its
+   original node. Apply the fourth service and app, wait for Ready. Replace `VM_WRITE_URL` in the
    generator manifest with the existing generators' exact remote-write URL,
    then fail the pre-apply check if `VM_WRITE_URL` remains anywhere in the rendered
    manifest (`if rg -q VM_WRITE_URL rendered.yaml; then exit 1; fi`). Apply the
@@ -112,8 +116,18 @@ The dedicated label must be verified/reapplied if that node is replaced. A
 missing label intentionally leaves the generator Pending; monitor that as a
 failure rather than removing its placement constraint.
 
+Required anti-affinity also constrains future API placement while the generator
+is running. With a zonal model volume and only two eligible nodes in its zone,
+putting the generator on one leaves only the other for the API and trainer.
+Loss of that API node can leave the API Pending and predictive arms using their
+reactive fallback. Record the volume zone, actual placement and this failure
+domain in the deployment receipt. A node label does not make the setup highly
+available. Count the Recreate interval and any forecast gap in qualification.
+
 Rollback removes the fourth generator, PredictiveAutoscaler, app and service,
 then restores the recorded previous API Deployment with Recreate. Remove only
-the experiment label. Reduce capacity after checking that original workloads
+the experiment label. Remove the generator before expecting the restored API to
+use its node; while the generator remains, anti-affinity still excludes that
+node. Reduce capacity after checking that original workloads
 and training fit, and record the resulting new qualification boundary. Never
 delete the model or evidence PVCs, archived artifacts, or original workloads.
