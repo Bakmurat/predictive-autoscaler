@@ -1147,7 +1147,7 @@ async def train_model(request: Dict):
 
 @app.get("/models")
 async def get_models():
-    """Get information about available trained models."""
+    """Get trained-model information; null means missing or non-finite metadata."""
     models_info = {}
     for model_key, model in predictor.trained_models.items():
         if not model_key.endswith("_requests"):
@@ -1182,13 +1182,13 @@ async def get_models():
             "provenance": predictor.model_meta.get(model_key) or {"provenance": "unknown"},
         }
 
-    return {
+    return _json_safe({
         "model_type": "lstm",
         "trained_models": [k for k in predictor.trained_models if k.endswith("_requests")],
         "models": models_info,
         "model_directory": str(predictor.model_dir),
         "version": "3.8.0"
-    }
+    })
 
 @app.get("/")
 async def root():
