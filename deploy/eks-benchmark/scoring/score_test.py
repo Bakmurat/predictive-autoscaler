@@ -690,5 +690,68 @@ class TransferDeadline(unittest.TestCase):
             self.assertNotEqual(old,forecast_transfer.reader_fingerprint(root))
 
 
+class BiasReporting(unittest.TestCase):
+    def test_signed_bias_and_step_mae_preserve_opposite_errors(self):
+        prom = FakeProm(lambda m: 200.0)
+        r = rec(T0, steps=(1, 2), rpm=lambda k: 250.0 if k == 1 else 150.0)
+        out, rows = score.score([r], prom, "a", "n", T0, T0 + timedelta(hours=1))
+        self.assertEqual(out["overall"]["MAE_rpm"], 50.0)
+        self.assertEqual(out["overall"]["signed_bias_rpm"], 0.0)
+        self.assertEqual(out["overall"]["n"], 2)
+        for step, error in (("1", 50.0), ("2", -50.0)):
+            self.assertEqual(out["per_step"][step]["MAE_rpm"], 50.0)
+            self.assertEqual(out["per_step"][step]["signed_bias_rpm"], error)
+        self.assertEqual([r["error"] for r in rows], [50.0, -50.0])
+        self.assertEqual(prom.calls, [T0, T0 + timedelta(minutes=10),
+                                     T0 + timedelta(minutes=10, days=-1),
+                                     T0 + timedelta(minutes=20),
+                                     T0 + timedelta(minutes=20, days=-1)])
+
+    def test_missing_baseline_is_not_zero_and_counts_show_intersection(self):
+        prom = FakeProm(lambda m: 0.0 if m < 0 else 100.0,
+                        missing=lambda m: m in (0, -1420))
+        out, rows = score.score([rec(T0, steps=(1, 2))], prom, "a", "n", T0, T0 + timedelta(hours=1))
+        overall = out["overall"]
+        self.assertEqual((overall["n"], overall["persistence_n"], overall["prevday_n"]), (2, 0, 1))
+        self.assertIsNone(overall["persistence_signed_bias_rpm"])
+        self.assertEqual(overall["prevday_signed_bias_rpm"], -100.0)
+        self.assertEqual(out["per_step"]["1"]["prevday_MAE_rpm"], 100.0)
+        self.assertEqual(out["per_step"]["1"]["prevday_n"], 1)
+        self.assertIsNone(out["per_step"]["2"]["prevday_MAE_rpm"])
+        self.assertEqual(out["per_step"]["2"]["prevday_n"], 0)
+        self.assertEqual(rows[0]["prevday"], 0.0)
+        self.assertEqual(rows[0]["prevday_error"], -100.0)
+        self.assertIsNone(rows[1]["prevday"])
+        self.assertIsNone(rows[1]["prevday_error"])
+        self.assertTrue(all(r["persistence"] is None and r["persistence_error"] is None for r in rows))
+
+    def test_artifact_bias_is_pooled_by_rows_and_retains_unrounded_errors(self):
+        first = dict(rec(T0, steps=(1,), rpm=lambda k: 110.125), artifact_sha256="a" * 64)
+        second = dict(rec(T0 + timedelta(minutes=5), steps=(1, 2, 3), rpm=lambda k: 90.0),
+                      artifact_sha256="b" * 64)
+        out, rows = score.score([first, second], FakeProm(lambda m: 100.0),
+                                "a", "n", T0, T0 + timedelta(hours=1))
+        self.assertEqual(out["overall"]["signed_bias_rpm"], -5.0)
+        self.assertEqual(out["overall"]["n"], 4)
+        self.assertEqual(out["per_artifact"]["a" * 64]["signed_bias_rpm"], 10.1)
+        self.assertEqual(out["per_artifact"]["b" * 64]["signed_bias_rpm"], -10.0)
+        self.assertEqual(out["per_artifact"]["b" * 64]["n"], 3)
+        self.assertEqual(rows[0]["error"], 10.125)
+        for metrics in (out["overall"], *out["per_step"].values(), *out["per_artifact"].values()):
+            self.assertEqual(metrics["persistence_signed_bias_rpm"], 0.0)
+            self.assertEqual(metrics["prevday_signed_bias_rpm"], 0.0)
+            self.assertEqual(metrics["n"], metrics["persistence_n"])
+            self.assertEqual(metrics["n"], metrics["prevday_n"])
+
+    def test_absent_actuals_have_no_diagnostic_mean(self):
+        out, rows = score.score([rec(T0)], FakeProm(lambda m: 100.0, missing=lambda m: m > 0),
+                                "a", "n", T0, T0 + timedelta(hours=1))
+        self.assertEqual(rows, [])
+        for metrics in (out["overall"], *out["per_artifact"].values()):
+            for prefix in ("", "persistence_", "prevday_"):
+                self.assertEqual(metrics[prefix + "n"], 0)
+                self.assertIsNone(metrics[prefix + "signed_bias_rpm"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

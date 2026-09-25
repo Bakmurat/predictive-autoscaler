@@ -1,5 +1,26 @@
 # Verified forecast-log inputs
 
+The diagnostic score output includes signed bias (forecast minus actual, in
+requests/minute) overall, per horizon step and per artifact. Per-step MAE is
+reported for the forecast, persistence and previous-day baselines. Means use
+one-decimal rounding; the rows returned by the Python `score()` function retain
+unrounded signed errors and baseline values. The CLI does not export these rows.
+
+`n`, `persistence_n` and `prevday_n` count the contributing rows for each
+diagnostic mean. A missing baseline is null, not zero. Every scored row contains
+the forecast and an actual observation, so each baseline's count also gives its
+intersection with those forecast rows. The displayed means can use different
+denominators: they are unpaired diagnostics, not a paired comparison or a winner
+decision. Counts exclude missing actuals and outstanding targets; they are not
+forecaster-availability coverage over all eligible origins. Existing issuance
+and step coverage gates remain separate and unchanged.
+
+The previous-day baseline reads the scored application's canonical request rate
+at `target_at - 24 hours`, guarded against reads after issuance. It is distinct
+from a model's seasonal component or another application's served forecasts.
+Controller sanity-rejection events are diagnostics and do not remove a
+structurally accepted issuance from the raw-model score.
+
 The scoring CLI requires the log **and its collector receipt**, including for
 `--participation-only`. Existing function-level fixture tests do not need one.
 

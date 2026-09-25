@@ -267,7 +267,9 @@ def score(accepted, prom, app, ns, start, end, cadence_min=5.0, as_of=None):
                    "model_version": r.get("model_version"), "training_cutoff": r.get("training_cutoff"),
                    "artifact_sha256": artifact_of(r),
                    "target_anchor": r.get("target_anchor"),
-                   "forecast": f, "actual": y, "ae": abs(f - y),
+                   "forecast": f, "actual": y, "error": f - y, "ae": abs(f - y),
+                   "persistence": persist, "persistence_error": persist - y if persist is not None else None,
+                   "prevday": prev, "prevday_error": prev - y if prev is not None else None,
                    "ape": (abs(f - y) / y) if y > 0 else None,
                    "persistence_ape": (abs(persist - y) / y) if (persist is not None and y > 0) else None,
                    "persistence_ae": abs(persist - y) if persist is not None else None,
@@ -316,6 +318,23 @@ def score(accepted, prom, app, ns, start, end, cadence_min=5.0, as_of=None):
         "training_cutoffs_seen": sorted({(x["training_cutoff"] or "?") for x in rows}),
         "target_anchors_seen": sorted({(x["target_anchor"] or "?") for x in rows}),
     }
+    def bias_metrics(rs):
+        """Diagnostic means use each predictor's available rows, with explicit counts."""
+        metrics = {}
+        for prefix in ("", "persistence_", "prevday_"):
+            key = prefix + "error"
+            metrics[prefix + "n"] = sum(x[key] is not None for x in rs)
+            metrics[prefix + "signed_bias_rpm"] = agg(rs, key)
+        return metrics
+
+    out["overall"].update(bias_metrics(rows))
+    for step, step_rows in per_step.items():
+        metrics = out["per_step"][str(step)]
+        metrics.update(bias_metrics(step_rows))
+        for prefix in ("", "persistence_", "prevday_"):
+            metrics[prefix + "MAE_rpm"] = agg(step_rows, prefix + "ae")
+    for artifact, metrics in out["per_artifact"].items():
+        metrics.update(bias_metrics([x for x in rows if x["artifact_sha256"] == artifact]))
     return out, rows
 
 
