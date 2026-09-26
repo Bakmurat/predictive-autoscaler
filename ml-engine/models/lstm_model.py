@@ -760,7 +760,13 @@ class LSTMForecastModel:
                 if pos < 0:
                     continue
                 if abs(s.index[pos] - want) <= tolerance:
-                    day_values.append(float(s.iloc[pos]))
+                    value = float(s.iloc[pos])
+                    # A timestamp match is support only when its observation is finite.
+                    # Skip this day without searching a neighbouring timestamp; older
+                    # valid days can still supply the target under the existing weights.
+                    if not np.isfinite(value):
+                        continue
+                    day_values.append(value)
                     day_weights.append(0.3 ** (d - 1))
                     matched.append(s.index[pos].isoformat())
             if day_values:
