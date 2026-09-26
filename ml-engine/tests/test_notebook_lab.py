@@ -157,3 +157,53 @@ def test_missing_target_excludes_origin_for_every_arm(tmp_path):
     assert not any(pd.Timestamp(r['origin']) in (s.index[1008], s.index[1011]) for r in rows)
     groups = pd.DataFrame(rows).groupby('model').origin.apply(set)
     assert all(origins == groups.iloc[0] for origins in groups)
+
+
+def test_future_changes_cannot_reach_neural_or_classical_inputs(tmp_path, monkeypatch):
+    """Spy on harness inputs; this does not assert model-specific determinism."""
+    s = pd.Series(np.arange(1026.) + 1, index=pd.date_range('2020-01-01', periods=1026, freq='10min'))
+    cutoff = s.index[1011]
+    seen = []
+
+    def classical_fit(name, history):
+        seen.append(('classical_fit', str(history.index[-1]), history.to_list()))
+        return history.iloc[-1]
+
+    def neural_fit(history, seed, artifact_dir, epochs):
+        seen.append(('neural_fit', str(history.index[-1]), history.to_list()))
+        return history.iloc[-1], {}
+
+    def classical_predict(name, model, fit_history, history):
+        seen.append(('classical_predict', str(history.index[-1]), history.to_list()))
+        return np.full(6, model + history.iloc[-1])
+
+    def neural_predict(model, history):
+        seen.append(('neural_predict', str(history.index[-1]), history.to_list()))
+        return np.full(6, model + history.iloc[-1])
+
+    monkeypatch.setattr(lab, 'fit_classical', classical_fit)
+    monkeypatch.setattr(lab, 'fit_lstm', neural_fit)
+    monkeypatch.setattr(lab, 'predict_classical', classical_predict)
+    monkeypatch.setattr(lab, 'predict_lstm', neural_predict)
+    config = {'classical': ['probe'], 'model_seeds': [1], 'first_scored_day': 7,
+              'adaptive_k': 6, 'epochs': 1, 'origin_refit_prophet': True}
+    a, _ = lab.run_dataset('before', s, 'units', config, tmp_path)
+    before_inputs = [r for r in seen if pd.Timestamp(r[1]) <= cutoff]
+    seen.clear()
+    s.loc[s.index > cutoff] = 1e9
+    b, _ = lab.run_dataset('after', s, 'units', config, tmp_path)
+    assert before_inputs == [r for r in seen if pd.Timestamp(r[1]) <= cutoff]
+    keys = lambda rows: [(r['model'], r['origin'], r['forecast']) for r in rows
+                         if pd.Timestamp(r['origin']) <= cutoff]
+    assert keys(a) == keys(b)
+
+
+def test_shock_must_be_inside_scored_origins():
+    import pytest
+    s = pd.Series(100., index=pd.date_range('2020-01-01', periods=14*144, freq='10min'))
+    for name in ('level_shift', 'burst_revert'):
+        lab.validate_event_coverage(name, s, 7)
+        with pytest.raises(ValueError, match='event'):
+            lab.validate_event_coverage(name, s, 13)
+        with pytest.raises(ValueError, match='event'):
+            lab.validate_event_coverage(name, s.iloc[:12*144], 7)

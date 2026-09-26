@@ -245,11 +245,23 @@ def build_datasets(csv_path, data_seed):
     return datasets
 
 
+def validate_event_coverage(name, series, first_scored_day):
+    """Reject synthetic shock runs that cannot score before and after the event."""
+    events = {'level_shift': [(12.5, 0)],
+              'burst_revert': [(12.5, 3), (13.5, 3)]}.get(name, [])
+    origins = range(first_scored_day * PER_DAY, len(series) - STEPS, 3)
+    for day, width in events:
+        at = int(day * PER_DAY)
+        if not origins or origins[0] >= at or origins[-1] < at + width:
+            raise ValueError(f'{name}: event at day {day} is outside scored origins')
+
+
 def run_dataset(name, series, units, config, output):
     """Identical rolling origins, six-hour refits and explicit failure accounting."""
     import json
     import time
     import warnings
+    validate_event_coverage(name, series, config.get('first_scored_day', 12))
     out = Path(output)/name
     out.mkdir(exist_ok=False)
     series.to_csv(out/'observations.csv', header=['value'], index_label='time')
