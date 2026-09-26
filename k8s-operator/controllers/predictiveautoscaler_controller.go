@@ -114,6 +114,8 @@ type MLPredictionResponse struct {
 	MAPE         float64 `json:"mape"`
 	MAPEMeasured bool    `json:"mape_measured"`
 	MAPEScored   int     `json:"mape_scored"`
+	// Optional diagnostics never participate in the core prediction decode or scaling policy.
+	components *forecastComponents
 }
 
 // predictionEnabled reports whether the forecasting component is on for this autoscaler
@@ -661,12 +663,13 @@ type forecastRecord struct {
 	ModelTrainedAt string  `json:"model_trained_at"`
 	// TrainingCutoff is the last observation timestamp the model was trained on; every target_at
 	// below is later than it, which is what makes the record forward-looking.
-	TrainingCutoff    string  `json:"training_cutoff"`
-	ArtifactSHA256    string  `json:"artifact_sha256"`
-	InferenceInputEnd string  `json:"inference_input_end"`
-	SequenceLength    int32   `json:"sequence_length"`
-	TargetAnchor      string  `json:"target_anchor"` // "inference_input_end" or "issued_at"
-	Confidence        float64 `json:"confidence"`
+	TrainingCutoff    string              `json:"training_cutoff"`
+	ArtifactSHA256    string              `json:"artifact_sha256"`
+	InferenceInputEnd string              `json:"inference_input_end"`
+	SequenceLength    int32               `json:"sequence_length"`
+	TargetAnchor      string              `json:"target_anchor"` // "inference_input_end" or "issued_at"
+	Confidence        float64             `json:"confidence"`
+	Components        *forecastComponents `json:"components"`
 	Forecasts         []struct {
 		Step     int     `json:"step"`
 		TargetAt string  `json:"target_at"`
@@ -735,6 +738,11 @@ func (r *PredictiveAutoscalerReconciler) recordForecast(
 			RPM      float64 `json:"rpm"`
 		}{Step: step, TargetAt: target.UTC().Format(time.RFC3339), RPM: v})
 	}
+	targets := make([]string, len(rec.Forecasts))
+	for i, forecast := range rec.Forecasts {
+		targets[i] = forecast.TargetAt
+	}
+	rec.Components = prediction.components.forTargets(prediction.Predictions, targets, horizon)
 	r.appendForecastLog(rec)
 }
 
@@ -918,9 +926,11 @@ func (r *PredictiveAutoscalerReconciler) getPrediction(
 	}
 
 	var prediction MLPredictionResponse
-	if err := json.NewDecoder(resp.Body).Decode(&prediction); err != nil {
+	var captured bytes.Buffer
+	if err := json.NewDecoder(io.TeeReader(resp.Body, &captured)).Decode(&prediction); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
+	prediction.components = decodeForecastComponents(captured.Bytes())
 
 	return &prediction, nil
 }

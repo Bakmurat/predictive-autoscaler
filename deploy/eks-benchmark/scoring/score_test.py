@@ -57,6 +57,36 @@ def rec(issued, steps=(1, 2, 3), rpm=lambda k: 100.0, cutoff=None, trained=None,
 
 
 class Alignment(unittest.TestCase):
+    def test_mixed_legacy_and_component_records_preserve_raw_scoring(self):
+        old = rec(T0, steps=tuple(range(1, 7)))
+        new = rec(T0 + timedelta(minutes=5), steps=tuple(range(1, 7)))
+        new["components"] = {
+            "schema": "component-v1", "status": "ok", "reason": None,
+            "target_timestamps": [f["target_at"] for f in new["forecasts"]],
+            "pattern": [100.0] * 6, "pattern_available_per_step": [True] * 6,
+            "pattern_weights": [1.0] * 6, "pattern_source": "seasonal_history",
+            "lstm": [None] * 6, "network_failed": "RuntimeError: synthetic network failure",
+            "network_finite_per_step": [False] * 6,
+            "blended": [100.0] * 6, "final": [100.0] * 6,
+        }
+        raw = b"\n".join(json.dumps(r).encode() for r in (old, new)) + b"\n"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "forecasts.jsonl"
+            path.write_bytes(raw)
+            args = fixture_args(path)
+            verified, provenance = forecast_log.load_verified(path, args[1], T0 + timedelta(hours=1), True)
+        self.assertEqual(verified, raw)
+        self.assertTrue(provenance["fixture"])
+        records = score.load_forecasts(verified, "a", "n", T0, T0 + timedelta(hours=1))
+        self.assertNotIn("components", records[0])
+        self.assertEqual(records[1]["components"], new["components"])
+        accepted, rejected = score.accept_records(records)
+        self.assertEqual(rejected, [])
+        out, rows = score.score(accepted, FakeProm(lambda m: 100.0), "a", "n", T0, T0 + timedelta(hours=1))
+        self.assertEqual(out["forecast_steps_scored"], 12)
+        self.assertEqual(out["overall"]["MAE_rpm"], 0.0)
+        self.assertEqual(len(rows), 12)
+
     def test_shared_checkpoint_arms_are_filtered_before_hash_attribution(self):
         rows = []
         for app, ns in (("a", "n"), ("seasonal", "n"), ("a", "other")):
@@ -533,6 +563,20 @@ elif 'exec' in args:
         self.assertEqual(receipt['reader_fingerprint'],forecast_transfer.reader_fingerprint(self.script.parent))
         self.assertEqual(self.out.read_bytes(),self.full.read_bytes())
         self.assertIn('delete pod',self.commands.read_text())
+
+    def test_reader_preserves_mixed_legacy_and_component_bytes(self):
+        old = rec(T0)
+        new = rec(T0 + timedelta(minutes=5))
+        new['components'] = {'schema': 'component-v1', 'status': 'absent',
+                             'reason': 'components_not_provided'}
+        raw = b'\n'.join(json.dumps(r).encode() for r in (old, new)) + b'\n'
+        self.full.write_bytes(raw)
+        result = self.run_reader()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.out.read_bytes(), raw)
+        receipt = json.loads(Path(str(self.out) + '.receipt.json').read_text())
+        self.assertEqual(receipt['bytes'], len(raw))
+        self.assertEqual(receipt['sha256'], hashlib.sha256(raw).hexdigest())
 
     def test_truncation_with_success_exit_emits_no_receipt(self):
         p=self.run_reader(TRUNCATE='1');self.assertEqual(p.returncode,2,p.stdout+p.stderr)

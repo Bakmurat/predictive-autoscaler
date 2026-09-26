@@ -1,0 +1,434 @@
+{
+  "fixture_kind": "offline_synthetic_inputs_actual_api_response",
+  "tensorflow": "2.21.0",
+  "baseline": {
+    "application": "nginx-test",
+    "metric_type": "requests",
+    "model_version": "nginx-test_requests@9be93eac9158",
+    "model_trained_at": "2026-09-25T06:06:40.137531Z",
+    "training_cutoff": "2026-09-25T06:00:00Z",
+    "artifact_sha256": "9be93eac91587be362990156a560968cc76d594f3e1f779871502742d64b2e97",
+    "sequence_length": 144,
+    "inference_input_end": "2026-09-25T08:10:00Z",
+    "inference_window": {
+      "window_slots": 144,
+      "imputed_in_window": 0,
+      "latest_observed": "2026-09-25T08:10:00Z",
+      "latest_is_imputed": false,
+      "gaps_filled": 0,
+      "mask": {
+        "mask_version": 0,
+        "dropped_in_intervals": 0
+      }
+    },
+    "provenance": "sidecar",
+    "predictions": [
+      1156.62,
+      1155.94,
+      1126.86,
+      1074.12,
+      1040.15,
+      992.38
+    ],
+    "target_timestamps": [
+      "2026-09-25T08:20:00",
+      "2026-09-25T08:30:00",
+      "2026-09-25T08:40:00",
+      "2026-09-25T08:50:00",
+      "2026-09-25T09:00:00",
+      "2026-09-25T09:10:00"
+    ],
+    "confidence": 0.9,
+    "model_name": "lstm_nginx-test_requests",
+    "timestamp": "2026-09-25T08:16:18.102072",
+    "horizon_minutes": 60,
+    "data_points_used": 1008,
+    "model_age_hours": 2.16,
+    "components": {
+      "lstm": [
+        1690.8493905365467,
+        1840.9574074223638,
+        1923.8251670971513,
+        1918.9911772236228,
+        2062.665042027831,
+        2202.6924014240503
+      ],
+      "pattern": [
+        927.6608177155967,
+        917.3413361164941,
+        906.4177772475912,
+        894.9109347240496,
+        882.842712474619,
+        870.2360830462642
+      ],
+      "pattern_source": "seasonal_history",
+      "pattern_available": true,
+      "pattern_available_per_step": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "pattern_steps_available": 6,
+      "pattern_per_step": [
+        {
+          "step": 1,
+          "target_at": "2026-09-25T08:20:00",
+          "available": true,
+          "support": 7,
+          "matched_source_timestamps": [
+            "2026-09-24T08:20:00",
+            "2026-09-23T08:20:00",
+            "2026-09-22T08:20:00",
+            "2026-09-21T08:20:00",
+            "2026-09-20T08:20:00",
+            "2026-09-19T08:20:00",
+            "2026-09-18T08:20:00"
+          ]
+        },
+        {
+          "step": 2,
+          "target_at": "2026-09-25T08:30:00",
+          "available": true,
+          "support": 7,
+          "matched_source_timestamps": [
+            "2026-09-24T08:30:00",
+            "2026-09-23T08:30:00",
+            "2026-09-22T08:30:00",
+            "2026-09-21T08:30:00",
+            "2026-09-20T08:30:00",
+            "2026-09-19T08:30:00",
+            "2026-09-18T08:30:00"
+          ]
+        },
+        {
+          "step": 3,
+          "target_at": "2026-09-25T08:40:00",
+          "available": true,
+          "support": 7,
+          "matched_source_timestamps": [
+            "2026-09-24T08:40:00",
+            "2026-09-23T08:40:00",
+            "2026-09-22T08:40:00",
+            "2026-09-21T08:40:00",
+            "2026-09-20T08:40:00",
+            "2026-09-19T08:40:00",
+            "2026-09-18T08:40:00"
+          ]
+        },
+        {
+          "step": 4,
+          "target_at": "2026-09-25T08:50:00",
+          "available": true,
+          "support": 7,
+          "matched_source_timestamps": [
+            "2026-09-24T08:50:00",
+            "2026-09-23T08:50:00",
+            "2026-09-22T08:50:00",
+            "2026-09-21T08:50:00",
+            "2026-09-20T08:50:00",
+            "2026-09-19T08:50:00",
+            "2026-09-18T08:50:00"
+          ]
+        },
+        {
+          "step": 5,
+          "target_at": "2026-09-25T09:00:00",
+          "available": true,
+          "support": 7,
+          "matched_source_timestamps": [
+            "2026-09-24T09:00:00",
+            "2026-09-23T09:00:00",
+            "2026-09-22T09:00:00",
+            "2026-09-21T09:00:00",
+            "2026-09-20T09:00:00",
+            "2026-09-19T09:00:00",
+            "2026-09-18T09:00:00"
+          ]
+        },
+        {
+          "step": 6,
+          "target_at": "2026-09-25T09:10:00",
+          "available": true,
+          "support": 7,
+          "matched_source_timestamps": [
+            "2026-09-24T09:10:00",
+            "2026-09-23T09:10:00",
+            "2026-09-22T09:10:00",
+            "2026-09-21T09:10:00",
+            "2026-09-20T09:10:00",
+            "2026-09-19T09:10:00",
+            "2026-09-18T09:10:00"
+          ]
+        }
+      ],
+      "pattern_weights": [
+        0.7,
+        0.7416666666666666,
+        0.7833333333333333,
+        0.825,
+        0.8666666666666666,
+        0.9083333333333333
+      ],
+      "agreement": 0.46791987209386265,
+      "network_failed": null,
+      "network_finite_per_step": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "network_share": 0.1958333333333334,
+      "blended": [
+        1156.6173895618817,
+        1155.942154537177,
+        1126.8560450483292,
+        1074.124977161475,
+        1040.1523564150473,
+        992.3779122308947
+      ],
+      "final": [
+        1156.6173895618817,
+        1155.942154537177,
+        1126.8560450483292,
+        1074.124977161475,
+        1040.1523564150473,
+        992.3779122308947
+      ]
+    },
+    "floor_pct": 0.0,
+    "mape": null,
+    "mape_measured": false,
+    "mape_scored": 0,
+    "mape_recorded": 0,
+    "mape_availability": null,
+    "mae": null,
+    "mae_measured": false,
+    "mae_scored": 0
+  },
+  "seasonal": {
+    "experiment": {
+      "id": "seasonal-pattern-v1",
+      "application": "nginx-seasonal",
+      "namespace": "demo",
+      "source_application": "nginx-test",
+      "source_namespace": "demo",
+      "config_sha256": "1616e3691f80639951850ef15b0e77620ce036f71211ff2ded1ef460a8fe9c43",
+      "forecast_mode": "seasonal-only",
+      "feedback_actuals": "source",
+      "checkpoint_reload": "source-route",
+      "pattern_weight": 1.0
+    },
+    "application": "nginx-seasonal",
+    "metric_type": "requests",
+    "model_version": "seasonal-pattern-v1:1616e3691f80639951850ef15b0e77620ce036f71211ff2ded1ef460a8fe9c43:nginx-test_requests@9be93eac91587be362990156a560968cc76d594f3e1f779871502742d64b2e97",
+    "model_trained_at": "2026-09-25T06:06:40.137531Z",
+    "training_cutoff": "2026-09-25T06:00:00Z",
+    "artifact_sha256": "9be93eac91587be362990156a560968cc76d594f3e1f779871502742d64b2e97",
+    "sequence_length": 144,
+    "inference_input_end": "2026-09-25T08:10:00Z",
+    "inference_window": {
+      "window_slots": 144,
+      "imputed_in_window": 0,
+      "latest_observed": "2026-09-25T08:10:00Z",
+      "latest_is_imputed": false,
+      "gaps_filled": 0,
+      "mask": {
+        "mask_version": 0,
+        "dropped_in_intervals": 0
+      }
+    },
+    "provenance": "sidecar",
+    "predictions": [
+      927.66,
+      917.34,
+      906.42,
+      894.91,
+      882.84,
+      870.24
+    ],
+    "target_timestamps": [
+      "2026-09-25T08:20:00",
+      "2026-09-25T08:30:00",
+      "2026-09-25T08:40:00",
+      "2026-09-25T08:50:00",
+      "2026-09-25T09:00:00",
+      "2026-09-25T09:10:00"
+    ],
+    "confidence": 0.9,
+    "model_name": "lstm_nginx-seasonal_requests",
+    "timestamp": "2026-09-25T08:16:18.159394",
+    "horizon_minutes": 60,
+    "data_points_used": 1008,
+    "model_age_hours": 2.16,
+    "components": {
+      "lstm": [
+        1690.8493905365467,
+        1840.9574074223638,
+        1923.8251670971513,
+        1918.9911772236228,
+        2062.665042027831,
+        2202.6924014240503
+      ],
+      "pattern": [
+        927.6608177155967,
+        917.3413361164941,
+        906.4177772475912,
+        894.9109347240496,
+        882.842712474619,
+        870.2360830462642
+      ],
+      "pattern_source": "seasonal_history",
+      "pattern_available": true,
+      "pattern_available_per_step": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "pattern_steps_available": 6,
+      "pattern_per_step": [
+        {
+          "step": 1,
+          "target_at": "2026-09-25T08:20:00",
+          "available": true,
+          "support": 7,
+          "matched_source_timestamps": [
+            "2026-09-24T08:20:00",
+            "2026-09-23T08:20:00",
+            "2026-09-22T08:20:00",
+            "2026-09-21T08:20:00",
+            "2026-09-20T08:20:00",
+            "2026-09-19T08:20:00",
+            "2026-09-18T08:20:00"
+          ]
+        },
+        {
+          "step": 2,
+          "target_at": "2026-09-25T08:30:00",
+          "available": true,
+          "support": 7,
+          "matched_source_timestamps": [
+            "2026-09-24T08:30:00",
+            "2026-09-23T08:30:00",
+            "2026-09-22T08:30:00",
+            "2026-09-21T08:30:00",
+            "2026-09-20T08:30:00",
+            "2026-09-19T08:30:00",
+            "2026-09-18T08:30:00"
+          ]
+        },
+        {
+          "step": 3,
+          "target_at": "2026-09-25T08:40:00",
+          "available": true,
+          "support": 7,
+          "matched_source_timestamps": [
+            "2026-09-24T08:40:00",
+            "2026-09-23T08:40:00",
+            "2026-09-22T08:40:00",
+            "2026-09-21T08:40:00",
+            "2026-09-20T08:40:00",
+            "2026-09-19T08:40:00",
+            "2026-09-18T08:40:00"
+          ]
+        },
+        {
+          "step": 4,
+          "target_at": "2026-09-25T08:50:00",
+          "available": true,
+          "support": 7,
+          "matched_source_timestamps": [
+            "2026-09-24T08:50:00",
+            "2026-09-23T08:50:00",
+            "2026-09-22T08:50:00",
+            "2026-09-21T08:50:00",
+            "2026-09-20T08:50:00",
+            "2026-09-19T08:50:00",
+            "2026-09-18T08:50:00"
+          ]
+        },
+        {
+          "step": 5,
+          "target_at": "2026-09-25T09:00:00",
+          "available": true,
+          "support": 7,
+          "matched_source_timestamps": [
+            "2026-09-24T09:00:00",
+            "2026-09-23T09:00:00",
+            "2026-09-22T09:00:00",
+            "2026-09-21T09:00:00",
+            "2026-09-20T09:00:00",
+            "2026-09-19T09:00:00",
+            "2026-09-18T09:00:00"
+          ]
+        },
+        {
+          "step": 6,
+          "target_at": "2026-09-25T09:10:00",
+          "available": true,
+          "support": 7,
+          "matched_source_timestamps": [
+            "2026-09-24T09:10:00",
+            "2026-09-23T09:10:00",
+            "2026-09-22T09:10:00",
+            "2026-09-21T09:10:00",
+            "2026-09-20T09:10:00",
+            "2026-09-19T09:10:00",
+            "2026-09-18T09:10:00"
+          ]
+        }
+      ],
+      "pattern_weights": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "agreement": 0.46791987209386265,
+      "network_failed": null,
+      "network_finite_per_step": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "network_share": 0.0,
+      "blended": [
+        927.6608177155967,
+        917.3413361164941,
+        906.4177772475912,
+        894.9109347240496,
+        882.842712474619,
+        870.2360830462642
+      ],
+      "final": [
+        927.6608177155967,
+        917.3413361164941,
+        906.4177772475912,
+        894.9109347240496,
+        882.842712474619,
+        870.2360830462642
+      ]
+    },
+    "floor_pct": 0.0,
+    "mape": null,
+    "mape_measured": false,
+    "mape_scored": 0,
+    "mape_recorded": 0,
+    "mape_availability": null,
+    "mae": null,
+    "mae_measured": false,
+    "mae_scored": 0
+  }
+}
