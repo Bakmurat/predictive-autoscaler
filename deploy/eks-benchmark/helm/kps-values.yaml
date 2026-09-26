@@ -21,13 +21,15 @@ prometheus:
     ruleSelectorNilUsesHelmValues: false
 grafana:
   enabled: true
+  deploymentStrategy:
+    type: Recreate   # one writer for the persistent SQLite database
   persistence:
     enabled: true
     storageClassName: gp3
     size: 2Gi
   resources:
     requests: { cpu: 50m, memory: 128Mi }
-    limits: { memory: 320Mi }               # measured ~200Mi
+    limits: { memory: 512Mi }               # 320Mi OOMed under live dashboard queries
   sidecar:
     dashboards:
       enabled: true

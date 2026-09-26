@@ -6,9 +6,9 @@
   "schemaVersion": 39,
   "editable": true,
   "timezone": "utc",
-  "refresh": "30s",
+  "refresh": "1m",
   "time": {
-    "from": "now-24h",
+    "from": "now-6h",
     "to": "now"
   },
   "tags": [
@@ -150,7 +150,9 @@
         "graphMode": "area",
         "textMode": "auto",
         "justifyMode": "auto"
-      }
+      },
+      "maxDataPoints": 360,
+      "interval": "1m"
     },
     {
       "id": 3,
@@ -270,7 +272,9 @@
         "graphMode": "area",
         "textMode": "auto",
         "justifyMode": "auto"
-      }
+      },
+      "maxDataPoints": 360,
+      "interval": "1m"
     },
     {
       "id": 4,
@@ -390,7 +394,9 @@
         "graphMode": "area",
         "textMode": "auto",
         "justifyMode": "auto"
-      }
+      },
+      "maxDataPoints": 360,
+      "interval": "1m"
     },
     {
       "id": 5,
@@ -510,7 +516,9 @@
         "graphMode": "area",
         "textMode": "auto",
         "justifyMode": "auto"
-      }
+      },
+      "maxDataPoints": 360,
+      "interval": "1m"
     },
     {
       "id": 6,
@@ -684,7 +692,9 @@
             "lastNotNull"
           ]
         }
-      }
+      },
+      "maxDataPoints": 360,
+      "interval": "1m"
     },
     {
       "id": 7,
@@ -893,7 +903,9 @@
             "lastNotNull"
           ]
         }
-      }
+      },
+      "maxDataPoints": 360,
+      "interval": "1m"
     },
     {
       "id": 8,
@@ -1067,7 +1079,9 @@
             "lastNotNull"
           ]
         }
-      }
+      },
+      "maxDataPoints": 360,
+      "interval": "1m"
     },
     {
       "id": 9,
@@ -1236,7 +1250,9 @@
             "lastNotNull"
           ]
         }
-      }
+      },
+      "maxDataPoints": 360,
+      "interval": "1m"
     },
     {
       "id": 10,
@@ -1405,7 +1421,9 @@
             "lastNotNull"
           ]
         }
-      }
+      },
+      "maxDataPoints": 360,
+      "interval": "1m"
     },
     {
       "id": 11,
@@ -1534,7 +1552,9 @@
             "lastNotNull"
           ]
         }
-      }
+      },
+      "maxDataPoints": 360,
+      "interval": "1m"
     },
     {
       "id": 12,
@@ -1683,7 +1703,9 @@
             "lastNotNull"
           ]
         }
-      }
+      },
+      "maxDataPoints": 360,
+      "interval": "1m"
     }
   ],
   "templating": {
