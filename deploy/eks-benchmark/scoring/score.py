@@ -53,6 +53,9 @@ from pathlib import Path
 from forecast_log import load_verified
 from datetime import datetime, timezone, timedelta
 
+from component_report import summarize_components
+
+
 CANONICAL = 'sum(rate(istio_requests_total{{reporter="destination",destination_workload="{app}",destination_workload_namespace="{ns}"}}[1m])) * 60'
 REPLICAS = 'kube_deployment_status_replicas{{deployment="{d}",namespace="{ns}"}}'
 SCALE_EVENTS = 'increase(predictive_autoscaler_scale_events_total{{application="{d}",namespace="{ns}",direction="{dir}"}}[{secs}s])'
@@ -316,6 +319,7 @@ def score(accepted, prom, app, ns, start, end, cadence_min=5.0, as_of=None):
         "training_cutoffs_seen": sorted({(x["training_cutoff"] or "?") for x in rows}),
         "target_anchors_seen": sorted({(x["target_anchor"] or "?") for x in rows}),
     }
+    out["recorded_components"] = summarize_components(accepted, rows, as_of)
     return out, rows
 
 

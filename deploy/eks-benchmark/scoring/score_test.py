@@ -734,5 +734,131 @@ class TransferDeadline(unittest.TestCase):
             self.assertNotEqual(old,forecast_transfer.reader_fingerprint(root))
 
 
+class RecordedComponents(unittest.TestCase):
+    def component_record(self, issued=T0, pattern=80.0, served=100.0, artifact='a' * 64, anchor=None):
+        r = dict(rec(issued, steps=tuple(range(1, 7)), rpm=lambda k: served, anchor=anchor), artifact_sha256=artifact)
+        if anchor is not None:
+            r['inference_input_end'] = iso(anchor)
+        r['components'] = dict(schema='component-v1', status='ok', reason=None,
+            target_timestamps=[f['target_at'] for f in r['forecasts']], pattern=[pattern] * 6,
+            lstm=[served] * 6, blended=[served] * 6, final=[served] * 6,
+            pattern_available_per_step=[True] * 6, network_finite_per_step=[True] * 6,
+            pattern_weights=[0.0] * 6, pattern_source='seasonal_history', network_failed=None)
+        return r
+
+    def report(self, records, prom=None, as_of=None):
+        out, rows = score.score(records, prom or FakeProm(lambda m: 90.0), 'a', 'n', T0,
+                                T0 + timedelta(hours=1), as_of=as_of)
+        return out['recorded_components'], out, rows
+
+    def test_paired_errors_zero_values_and_no_extra_actual_queries(self):
+        prom = FakeProm(lambda m: 0.0)
+        report, out, rows = self.report([self.component_record(pattern=0.0, served=10.0)], prom)
+        s = report['per_step']['1']
+        self.assertEqual((s['issued_steps_matured'], s['actual_available'], s['paired_n']), (1, 1, 1))
+        self.assertEqual(s['paired']['pattern'], {'MAE_rpm': 0.0, 'signed_bias_rpm': 0.0})
+        self.assertEqual(s['paired']['hybrid'], {'MAE_rpm': 10.0, 'signed_bias_rpm': 10.0})
+        self.assertEqual(len(prom.calls), 13)  # existing persistence + 6 actual + 6 previous-day calls
+        self.assertEqual(report['targets'][0]['actual'], rows[0]['actual'])
+        self.assertFalse(report['formal_comparison_complete'])
+
+    def test_legacy_unavailable_kept_in_matured_denominator(self):
+        legacy = rec(T0 + timedelta(minutes=5), steps=tuple(range(1, 7)))
+        report, _, _ = self.report([self.component_record(), legacy])
+        s = report['per_step']['1']
+        self.assertEqual((s['issued_steps_matured'], s['hybrid_finite'], s['pattern_usable'], s['paired_n']), (2, 2, 1, 1))
+        self.assertEqual(s['pattern_unavailable_reasons'], {'absent': 1})
+        self.assertEqual(s['pattern_available_fraction_of_issued'], .5)
+
+    def test_actual_missing_and_outstanding_do_not_erase_forecast_availability(self):
+        report, _, _ = self.report([self.component_record()], FakeProm(lambda m: 90., missing=lambda m: m == 10), T0 + timedelta(minutes=20))
+        first, future = report['per_step']['1'], report['per_step']['3']
+        self.assertEqual((first['issued_steps_matured'], first['actual_available'], first['pattern_usable'], first['paired_n']), (1, 0, 1, 0))
+        self.assertIsNone(first['paired']['hybrid']['MAE_rpm'])
+        self.assertEqual((future['issued_steps_matured'], future['outstanding']), (0, 1))
+        self.assertIsNone(future['pattern_available_fraction_of_issued'])
+
+    def test_invalid_components_do_not_change_raw_scoring(self):
+        import copy
+        record = self.component_record()
+        baseline, _ = score.score([record], FakeProm(lambda m: 90.), 'a', 'n', T0, T0 + timedelta(hours=1))
+        for field, value, reason in [('final', [110.] * 6, 'final_mismatch'),
+                                      ('target_timestamps', [iso(T0)] * 6, 'misaligned'),
+                                      ('pattern', [80.], 'length'), ('schema', 'unknown', 'schema')]:
+            changed = copy.deepcopy(record); changed['components'][field] = value
+            report, out, _ = self.report([changed])
+            self.assertEqual(report['per_step']['1']['pattern_unavailable_reasons'], {reason: 1})
+            self.assertEqual({k: v for k, v in out.items() if k != 'recorded_components'},
+                             {k: v for k, v in baseline.items() if k != 'recorded_components'})
+
+    def test_two_decimal_binding_and_missing_pattern(self):
+        r = self.component_record(); r['components']['final'] = [100.004] * 6
+        r['components']['pattern'][0] = None; r['components']['pattern_available_per_step'][0] = False
+        report, _, _ = self.report([r])
+        self.assertEqual(report['per_step']['1']['pattern_usable'], 0)
+        self.assertEqual(report['per_step']['2']['paired_n'], 1)
+        r['components']['final'][1] = 100.006
+        report, _, _ = self.report([r])
+        self.assertEqual(report['per_step']['2']['pattern_unavailable_reasons'], {'final_mismatch': 1})
+
+    def test_shared_input_windows_and_artifact_attribution(self):
+        records = [self.component_record(T0, anchor=T0),
+                   self.component_record(T0 + timedelta(minutes=5), anchor=T0),
+                   self.component_record(T0 + timedelta(minutes=7), artifact='b' * 64, anchor=T0)]
+        report, _, _ = self.report(records)
+        s = report['per_step']['1']
+        self.assertEqual((s['paired_n'], s['unique_paired_target_times'], s['unique_paired_input_windows']), (3, 1, 1))
+        self.assertEqual(report['per_artifact']['a' * 64]['per_step']['1']['paired_n'], 2)
+        self.assertEqual(report['per_artifact']['b' * 64]['per_step']['1']['paired_n'], 1)
+        self.assertEqual(report['targets'][2 * 6]['effective_lead_seconds'], 180.0)
+
+    def test_blend_mismatch_is_diagnostic_not_an_availability_filter(self):
+        r = self.component_record(); r['components']['blended'][0] = 999.0
+        report, _, _ = self.report([r])
+        self.assertEqual(report['per_step']['1']['blend_identity_mismatch'], 1)
+        self.assertEqual(report['per_step']['1']['paired_n'], 1)
+
+    def test_oversized_component_number_is_unavailable_not_a_raw_scoring_error(self):
+        r = self.component_record(); r['components']['pattern'][0] = 10 ** 400
+        report, out, _ = self.report([r])
+        self.assertEqual(out['forecast_steps_scored'], 6)
+        self.assertEqual(report['per_step']['1']['pattern_unavailable_reasons'], {'invalid': 1})
+
+    def test_duplicate_target_identity_invalidates_only_component_report(self):
+        r = self.component_record(); r['forecasts'] = [r['forecasts'][0], dict(r['forecasts'][0])]
+        report, out, _ = self.report([r])
+        self.assertEqual(out['forecast_steps_scored'], 2)
+        self.assertEqual(report['status'], 'invalid')
+        self.assertEqual(report['reason'], 'duplicate_target_identity')
+        self.assertEqual(report['duplicate_identity'], {'issued': 1, 'actual_rows': 1})
+        self.assertEqual(report['per_step'], {})
+        self.assertFalse(report['formal_comparison_complete'])
+
+    def test_optional_anchor_metadata_cannot_break_raw_scoring(self):
+        r = self.component_record(); r['inference_input_end'] = {'bad': 'metadata'}
+        report, out, _ = self.report([r])
+        self.assertEqual(out['forecast_steps_scored'], 6)
+        self.assertEqual(report['per_step']['1']['paired_input_window_unknown'], 1)
+
+    def test_legacy_naive_timestamps_keep_existing_raw_parser_behavior(self):
+        r = self.component_record(); del r['components']
+        r['issued_at'] = r['issued_at'].removesuffix('Z')
+        for f in r['forecasts']: f['target_at'] = f['target_at'].removesuffix('Z')
+        report, out, _ = self.report([r])
+        self.assertEqual(out['forecast_steps_scored'], 6)
+        self.assertEqual(report['per_step']['1']['pattern_usable'], 0)
+
+    def test_cli_emits_section_from_same_verified_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'forecasts.jsonl'; output = Path(directory) / 'score.json'
+            source.write_text(json.dumps(self.component_record()) + '\n')
+            with patch.object(score, 'Prom', return_value=FakeProm(lambda m: 90.0)):
+                code = score.main(fixture_args(source) + ['--forecast-log', str(source), '--prom', 'http://fixture',
+                    '--start', iso(T0), '--end', iso(T0 + timedelta(minutes=5)), '--as-of', iso(T0 + timedelta(hours=1)),
+                    '--app', 'a', '--namespace', 'n', '--controls', '', '--out', str(output)])
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(output.read_text())['recorded_components']['per_step']['6']['paired_n'], 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

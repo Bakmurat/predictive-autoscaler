@@ -76,3 +76,42 @@ New `reader_fingerprint` values hash this fixed ordered UTF-8 string:
 Earlier receipts retain their single-script fingerprint meaning. The receipt
 schema and source-prefix semantics are unchanged. Keep both scripts together
 when copying the reader. Collection tooling does not require a serving rollout.
+
+### Recorded component comparison
+
+Normal scoring also emits `recorded_components`: the served forecast and its
+recorded `component-v1` seasonal pattern, joined to the **same canonical actual
+rows** already used by the raw scorer. This is neither the previous-day point
+query nor a different application's forecast. No additional Prometheus queries
+are made. Legacy, malformed, misaligned and unavailable component evidence is
+retained as unavailable; zero remains a valid value.
+
+For each step, globally and per artifact, `issued_steps_matured` is the conditional
+availability denominator. `actual_available`, `hybrid_finite`, `pattern_usable`
+and `network_finite` are separate counts. `paired_n` counts the intersection with
+finite actual, served and pattern values; both paired MAE and signed bias use
+that same intersection. Positive bias means overprediction. Outstanding targets
+are excluded from matured denominators. Empty comparisons are null, not zero.
+The unrounded `targets` retain alignment, availability and effective lead time.
+Unique paired target/input timestamps are reported because repeated observations
+and input windows are not independent samples; absent input anchors are counted
+as unknown. Blend-weight discrepancies are non-fatal diagnostics, not filters.
+
+This is **conditional availability among accepted issued targets**, not protocol
+availability across all attempted or scheduled prediction origins. Refusals and
+missing issuance records require separate evidence; decision records are not a
+one-to-one attempt log. The section does not implement pilot sizing, whole-day
+uncertainty, a pooled improvement estimate or a winner decision. Its
+`formal_comparison_complete` remains false. Existing acceptance, raw scores,
+coverage exit gates and the participation-only path are unchanged.
+
+Component-v1 validation supports six ten-minute steps. Unsupported geometry is
+unavailable component evidence, while raw scoring remains unchanged. Finite
+inputs can still overflow when subtracting; `paired_loss_nonfinite` counts those
+pairs and affected loss summaries are null rather than infinite or zero.
+
+Duplicate issued/actual target identities invalidate only the component section
+(`status: invalid`, reason and duplicate counts, no paired metrics); they never
+cause a silent join or change the raw scoring gates. Synthetic unit fixtures
+do not prove deployed operator serialization. Verify that boundary against a
+privately retained, receipt-bound operator log before using a new operator build.
