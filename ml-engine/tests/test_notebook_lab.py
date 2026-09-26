@@ -207,3 +207,63 @@ def test_shock_must_be_inside_scored_origins():
             lab.validate_event_coverage(name, s, 13)
         with pytest.raises(ValueError, match='event'):
             lab.validate_event_coverage(name, s.iloc[:12*144], 7)
+
+
+def test_classical_state_updates_match_reference_forecasts():
+    import pytest
+    pytest.importorskip('statsmodels')
+    x = np.arange(4*144+4)
+    # A noisy fixture avoids near-zero innovation variance in this ARIMA fit.
+    noise = np.random.default_rng(37).normal(0, .5, len(x))
+    s = pd.Series(50 + .01*x + 10*np.sin(2*np.pi*x/144) + noise,
+                  index=pd.date_range('2020-01-01', periods=len(x), freq='10min'))
+    history, updated = s.iloc[:-3], s.copy()
+    updated.iloc[-3:] += 20
+    hw = lab.fit_classical('holt_winters', history)
+    np.testing.assert_allclose(lab.predict_classical('holt_winters', hw, history, history),
+                               hw.forecast(6), rtol=0, atol=1e-9)
+    arima = lab.fit_classical('arima', history)
+    prediction = lab.predict_classical('arima', arima, history, updated)
+    reference = arima.append(updated.iloc[-3:].to_numpy(), refit=False).forecast(6)
+    np.testing.assert_allclose(prediction, reference, rtol=0, atol=1e-7)
+    assert not np.allclose(prediction, arima.forecast(6))
+
+
+def test_failed_refit_does_not_serve_previous_model(tmp_path, monkeypatch):
+    s = pd.Series(100., index=pd.date_range('2020-01-01', periods=1086, freq='10min'))
+    calls = []
+
+    def fit(name, history):
+        calls.append(history.index[-1])
+        if len(calls) == 2:
+            raise RuntimeError('second refit failed')
+        return 100.
+
+    monkeypatch.setattr(lab, 'fit_classical', fit)
+    monkeypatch.setattr(lab, 'predict_classical', lambda *args: np.full(6, 100.))
+    config = {'classical': ['probe'], 'model_seeds': [], 'first_scored_day': 7,
+              'adaptive_k': 6, 'epochs': 1}
+    rows, _ = lab.run_dataset('fixture', s, 'units', config, tmp_path)
+    arm = [r for r in rows if r['model'] == 'probe']
+    assert len(calls) == 2
+    assert all(r['forecast'] == 100 for r in arm if pd.Timestamp(r['origin']) < calls[1])
+    failed = [r for r in arm if pd.Timestamp(r['origin']) >= calls[1]]
+    assert len({r['origin'] for r in failed}) == 12
+    assert all(r['forecast'] is None for r in failed)
+
+
+def test_summary_positive_bias_means_overprediction(tmp_path):
+    rows = [dict(dataset='fixture', model='probe', horizon_minutes=10,
+                 units='units', forecast=7., actual=5.)]
+    _, score = lab.summarize(rows, [], tmp_path)
+    assert score.iloc[0].bias == 2
+
+
+def test_off_grid_values_do_not_become_observed_targets():
+    s = pd.Series([1., 7., 9.], index=pd.to_datetime(['2020-01-01 00:02',
+                                                    '2020-01-01 00:09',
+                                                    '2020-01-01 00:12']))
+    observed, filled = lab.regularize(s)
+    assert len(observed) == 1
+    assert np.isnan(observed.iloc[0])
+    assert np.isnan(filled.iloc[0])

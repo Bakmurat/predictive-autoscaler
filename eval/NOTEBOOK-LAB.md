@@ -12,7 +12,7 @@ observed targets, and that exclusion applies to every arm.
 
 Candidates include persistence, yesterday, the repository's seven-day weighted
 pattern at a fixed 70th percentile, a fixed median-ratio adjustment, the existing
-damped trend predictor, ARIMA(5,1,2), additive Holt–Winters with period144, Prophet,
+damped trend predictor, ARIMA(5,1,2), additive Holt–Winters with period 144, Prophet,
 and a compact direct six-output tanh LSTM. These are explicit forecasting pipelines,
 not a claim about every possible configuration of each model family.
 
@@ -39,15 +39,18 @@ records imported package versions, source/data hashes and per-fit losses and war
 
 The protocol supplies `csv_sha256`, `source_sha256` (paths relative to `eval/`),
 `datasets`, `data_seed`, `model_seeds`, `epochs`, `adaptive_k`, and `classical`.
-Optional fields are `dataset_sha256`, `first_scored_day` (default12),
+Optional fields are `dataset_sha256`, `first_scored_day` (default 12),
 `include_existing_trend_adaptive`, and `origin_refit_prophet`. Source hashes cover
 `notebook_lab.py`, `offline_eval.py`, and `../ml-engine/models/lstm_model.py`.
 Never overwrite a run; freeze settings before examining its outcomes.
 
-Built-in synthetic cases reuse `offline_eval.make_series` with a declared14-day
-calendar and noise seed: repeating, trend, a1.55× level shift at day12.5, and two
-2.5× three-slot bursts at days12.5 and13.5. The second burst repeats at yesterday's
+Built-in synthetic cases reuse `offline_eval.make_series` with a declared 14-day
+calendar and noise seed: repeating, trend, a 1.55× level shift at day 12.5, and two
+2.5× three-slot bursts at days 12.5 and 13.5. The second burst repeats at yesterday's
 clock time; it is not another unpredictable event. Compare the bursts separately.
+The runner rejects shock scenarios without scored origins before and after their
+built-in events. An `events` field in a protocol is descriptive; it does not
+configure the generator. Source and prepared-data hashes bind the actual series.
 
 `predictions.csv` retains origin, exact target, horizon, actual and forecast;
 `fits.json` retains fit times and warnings; LSTM artifacts include weights and
