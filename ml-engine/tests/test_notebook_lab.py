@@ -131,3 +131,29 @@ def test_trend_exception_does_not_erase_other_arms(tmp_path, monkeypatch):
     rows, _ = lab.run_dataset('fixture', s, 'units', config, tmp_path)
     assert all(r['forecast'] is None for r in rows if r['model'] == 'trend_adaptive')
     assert all(r['forecast'] == 100 for r in rows if r['model'] == 'persistence')
+
+
+def test_pattern_skips_missing_day_but_yesterday_keeps_gap():
+    s = pd.Series(100., index=pd.date_range('2020-01-01', periods=1296, freq='10min'))
+    origin = s.index[1200]
+    s.iloc[1201-144] = np.nan
+    forecasts = lab.baselines(s, origin)
+    np.testing.assert_allclose(forecasts['pattern70'], 100.)
+    assert np.isnan(forecasts['yesterday'][0])
+
+
+def test_yesterday_matches_exact_target_clock_time():
+    s = pd.Series(np.arange(1296.), index=pd.date_range('2020-01-01', periods=1296, freq='10min'))
+    np.testing.assert_array_equal(lab.baselines(s, s.index[1200])['yesterday'], np.arange(1201,1207)-144)
+
+
+def test_missing_target_excludes_origin_for_every_arm(tmp_path):
+    s = pd.Series(100., index=pd.date_range('2020-01-01', periods=1026, freq='10min'))
+    s.iloc[1012] = np.nan
+    config = {'classical': [], 'model_seeds': [], 'first_scored_day': 7,
+              'adaptive_k': 6, 'epochs': 1}
+    rows, _ = lab.run_dataset('fixture', s, 'units', config, tmp_path)
+    assert rows
+    assert not any(pd.Timestamp(r['origin']) in (s.index[1008], s.index[1011]) for r in rows)
+    groups = pd.DataFrame(rows).groupby('model').origin.apply(set)
+    assert all(origins == groups.iloc[0] for origins in groups)

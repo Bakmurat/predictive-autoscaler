@@ -77,7 +77,8 @@ def baselines(series, origin, k=6):
     helper = LSTMForecastModel(sequence_length=PER_DAY)
     pattern, _ = helper._pattern_forecast(
         origin=pd.Timestamp(origin).to_pydatetime(), steps_ahead=STEPS,
-        seasonal_history=history, effective_pct=70)
+        seasonal_history=history[np.isfinite(history.to_numpy(dtype=float))],
+        effective_pct=70)
     if pattern is None:
         pattern = np.full(STEPS, np.nan)
     targets = pd.date_range(pd.Timestamp(origin) + pd.Timedelta(minutes=GRID),
