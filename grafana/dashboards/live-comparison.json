@@ -44,7 +44,7 @@
       },
       "options": {
         "mode": "html",
-        "content": "<table style=\"width:100%;text-align:center;border-spacing:12px\"><tr><th>1 \u00b7 SIMULATE</th><th></th><th>2 \u00b7 OBSERVE</th><th></th><th>3 \u00b7 PREDICT</th><th></th><th>4 \u00b7 DECIDE</th><th></th><th>5 \u00b7 SERVE</th></tr><tr><td>k6 daily schedule<br/>Quiet \u2192 rise \u2192 peak \u2192 fall</td><td>\u2192</td><td>Measured requests/minute<br/>Prometheus traffic history</td><td>\u2192</td><td><b>LSTM + daily pattern</b><br/>or <b>seasonal pattern only</b><br/>Six steps: +10 to +60 min</td><td>\u2192</td><td>Peak forecast in lead window<br/>plus live-traffic safety floor<br/>600 RPM per replica</td><td>\u2192</td><td>Desired pods \u2192 Ready pods<br/>Limits, guards and scale-down<br/>timers also apply</td></tr></table><hr/><p><b>Blue \u00b7 Hybrid:</b> a trained LSTM neural network blended with the same clock-time pattern from previous days. Training runs every 6 hours. <b>Green \u00b7 Seasonal:</b> uses only the daily pattern in its final prediction; the shared service still computes network diagnostics.</p><p><b>Orange \u00b7 Reactive:</b> scales from traffic already observed. <b>Prediction success:</b> forecast dots would overlap actual traffic at the target time if accurate, and Ready capacity should arrive before demand rises. A running model alone does not prove either.</p><p><b>Timing:</b> the 20-minute step is measured from the last input timestamp, so actual advance notice is shorter when that input is old. Unpredictable bursts still need the reactive safety floor.</p>"
+        "content": "<table style=\"width:100%;text-align:center;border-spacing:12px\"><tr><th>1 \u00b7 SIMULATE</th><th></th><th>2 \u00b7 OBSERVE</th><th></th><th>3 \u00b7 PREDICT</th><th></th><th>4 \u00b7 DECIDE</th><th></th><th>5 \u00b7 SERVE</th></tr><tr><td>k6 daily schedule<br/>Quiet \u2192 rise \u2192 peak \u2192 fall</td><td>\u2192</td><td>Measured requests/minute<br/>Prometheus traffic history</td><td>\u2192</td><td><b>LSTM + daily pattern</b><br/>or <b>seasonal pattern only</b><br/>Six steps: +10 to +60 min</td><td>\u2192</td><td>Peak forecast in lead window<br/>plus live-traffic safety floor<br/>600 RPM per replica</td><td>\u2192</td><td>Desired pods \u2192 Ready pods<br/>Limits, guards and scale-down<br/>timers also apply</td></tr></table><hr/><p><b>Blue \u00b7 Hybrid:</b> a trained LSTM neural network blended with the same clock-time pattern from previous days. At +10 min: 30% LSTM + 70% pattern. At +60 min: about 9% LSTM + 91% pattern. Training runs every 6 hours. <b>Green \u00b7 Seasonal:</b> uses only the daily pattern in its final prediction; the shared service still computes network diagnostics.</p><p><b>Orange \u00b7 Reactive:</b> scales from traffic already observed. <b>Prediction success:</b> forecast dots would overlap actual traffic at the target time if accurate, and Ready capacity should arrive before demand rises. A running model alone does not prove either.</p><p><b>Timing:</b> the 20-minute step is measured from the last input timestamp, so actual advance notice is shorter when that input is old. Unpredictable bursts still need the reactive safety floor.</p>"
       }
     },
     {
@@ -156,9 +156,7 @@
         "legend": {
           "displayMode": "table",
           "placement": "bottom",
-          "calcs": [
-            "lastNotNull"
-          ]
+          "calcs": []
         }
       },
       "maxDataPoints": 360,
@@ -273,9 +271,7 @@
         "legend": {
           "displayMode": "table",
           "placement": "bottom",
-          "calcs": [
-            "lastNotNull"
-          ]
+          "calcs": []
         }
       },
       "maxDataPoints": 360,
