@@ -62,3 +62,12 @@ score. A failed refit makes that arm unavailable, rather than serving its old mo
 Historical data that already informed model development is exploratory evidence.
 Different target units must never be pooled. A favourable offline result requires a
 separate prospective experiment before changing live model policy.
+
+`seasonal_shape_lab.py` supplies a separate offline factorial probe: the existing
+weighted percentile versus an equal mean of the same finite daily observations,
+with or without a recent level adjustment. The adjustment is the median of six
+actual/shape ratios known at issuance. All six pairs must be finite and positive;
+otherwise the unadjusted shape is retained and the fallback is reported. It has no
+serving integration. Exact fixtures demonstrate adaptation lag, anniversary
+overcorrection, and false echoes after a repeated burst; the adjustment is not
+assumed to improve either shape. Keep settings and seeds fixed before experiments.
