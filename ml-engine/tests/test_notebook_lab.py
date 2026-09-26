@@ -97,3 +97,37 @@ def test_missing_forecasts_cannot_receive_complete_mae(tmp_path):
     assert scores.iloc[0]['unavailable'] == 1
     assert pd.isna(scores.iloc[0]['mae'])
 
+
+
+def test_baseline_exception_is_unavailable_not_whole_run_abort(tmp_path, monkeypatch):
+    s = pd.Series(100., index=pd.date_range('2020-01-01', periods=1020, freq='10min'))
+
+    def failed(*args, **kwargs):
+        raise ValueError('deliberate baseline failure')
+
+    monkeypatch.setattr(lab, 'baselines', failed)
+    monkeypatch.setattr(lab, 'fit_classical', lambda *args: None)
+    monkeypatch.setattr(lab, 'predict_classical', lambda *args: np.full(6, 100.))
+    config = {'classical': ['probe'], 'model_seeds': [], 'first_scored_day': 7,
+              'adaptive_k': 6, 'epochs': 1}
+    rows, _ = lab.run_dataset('fixture', s, 'units', config, tmp_path)
+    assert all(r['forecast'] is None for r in rows if r['model'] == 'pattern70')
+    assert all(r['forecast'] == 100 for r in rows if r['model'] == 'probe')
+    assert any(r['model'] == 'pattern70' for r in rows)
+
+
+def test_trend_exception_does_not_erase_other_arms(tmp_path, monkeypatch):
+    import sys
+    import types
+    s = pd.Series(100., index=pd.date_range('2020-01-01', periods=1020, freq='10min'))
+
+    class BrokenTrend:
+        def forecast(self, *args):
+            raise RuntimeError('deliberate trend failure')
+
+    monkeypatch.setitem(sys.modules, 'offline_eval', types.SimpleNamespace(TrendAdaptive=BrokenTrend))
+    config = {'classical': [], 'model_seeds': [], 'first_scored_day': 7,
+              'adaptive_k': 6, 'epochs': 1, 'include_existing_trend_adaptive': True}
+    rows, _ = lab.run_dataset('fixture', s, 'units', config, tmp_path)
+    assert all(r['forecast'] is None for r in rows if r['model'] == 'trend_adaptive')
+    assert all(r['forecast'] == 100 for r in rows if r['model'] == 'persistence')

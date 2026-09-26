@@ -293,10 +293,20 @@ def run_dataset(name, series, units, config, output):
             skips.append(str(origin))
             continue  # Excluded for EVERY arm, solely because target evidence is absent.
         history = series.iloc[:i+1]
-        forecasts = baselines(series, origin, config['adaptive_k'])
+        try:
+            forecasts = baselines(series, origin, config['adaptive_k'])
+        except Exception as exc:
+            forecasts = {arm: np.full(STEPS, np.nan) for arm in
+                         ('persistence', 'yesterday', 'pattern70', 'adaptive')}
+            for arm in forecasts:
+                errors.append(dict(model=arm, origin=str(origin), error=repr(exc)))
         if config.get('include_existing_trend_adaptive', False):
-            from offline_eval import TrendAdaptive
-            forecasts['trend_adaptive'] = TrendAdaptive().forecast(history, origin, STEPS)
+            try:
+                from offline_eval import TrendAdaptive
+                forecasts['trend_adaptive'] = TrendAdaptive().forecast(history, origin, STEPS)
+            except Exception as exc:
+                forecasts['trend_adaptive'] = np.full(STEPS, np.nan)
+                errors.append(dict(model='trend_adaptive', origin=str(origin), error=repr(exc)))
         _, fallback = adaptive(history.to_numpy(), forecasts['pattern70'], config['adaptive_k'])
         if config.get('origin_refit_prophet', False):
             started = time.monotonic()
