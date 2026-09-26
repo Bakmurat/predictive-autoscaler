@@ -25,12 +25,261 @@
         "x": 0,
         "y": 0,
         "w": 24,
-        "h": 4
+        "h": 3
       },
       "options": {
         "mode": "markdown",
-        "content": "**Blue: hybrid predictive \u00b7 Green: seasonal only \u00b7 Orange: reactive \u00b7 Purple: KEDA**\n\nAll four apps receive the same daily simulated traffic schedule. Traffic is **requests/minute**; capacity is **Ready replicas**. Forecast curves below are shown at the time they were observed and refer to future targets\u2014not accuracy scores against traffic at the same chart time. Missing observations remain gaps. **Development observation; formal scoring has not started.**"
+        "content": "**Blue: LSTM + daily pattern \u00b7 Green: seasonal pattern only \u00b7 Orange: reactive \u00b7 Purple: KEDA**\n\nSame daily simulated schedule, four separate apps. Compare predictions with actual traffic in the **target-matched** charts; later forecast charts show predictions at observation time. Development observation; formal scoring has not started."
       }
+    },
+    {
+      "id": 13,
+      "type": "text",
+      "title": "How simulated traffic becomes a scaling decision",
+      "gridPos": {
+        "x": 0,
+        "y": 3,
+        "w": 24,
+        "h": 10
+      },
+      "options": {
+        "mode": "html",
+        "content": "<table style=\"width:100%;text-align:center;border-spacing:12px\"><tr><th>1 \u00b7 SIMULATE</th><th></th><th>2 \u00b7 OBSERVE</th><th></th><th>3 \u00b7 PREDICT</th><th></th><th>4 \u00b7 DECIDE</th><th></th><th>5 \u00b7 SERVE</th></tr><tr><td>k6 daily schedule<br/>Quiet \u2192 rise \u2192 peak \u2192 fall</td><td>\u2192</td><td>Measured requests/minute<br/>Prometheus traffic history</td><td>\u2192</td><td><b>LSTM + daily pattern</b><br/>or <b>seasonal pattern only</b><br/>Six steps: +10 to +60 min</td><td>\u2192</td><td>Peak forecast in lead window<br/>plus live-traffic safety floor<br/>600 RPM per replica</td><td>\u2192</td><td>Desired pods \u2192 Ready pods<br/>Limits, guards and scale-down<br/>timers also apply</td></tr></table><hr/><p><b>Blue \u00b7 Hybrid:</b> a trained LSTM neural network blended with the same clock-time pattern from previous days. Training runs every 6 hours. <b>Green \u00b7 Seasonal:</b> uses only the daily pattern in its final prediction; the shared service still computes network diagnostics.</p><p><b>Orange \u00b7 Reactive:</b> scales from traffic already observed. <b>Prediction success:</b> forecast dots would overlap actual traffic at the target time if accurate, and Ready capacity should arrive before demand rises. A running model alone does not prove either.</p><p><b>Timing:</b> the 20-minute step is measured from the last input timestamp, so actual advance notice is shorter when that input is old. Unpredictable bursts still need the reactive safety floor.</p>"
+      }
+    },
+    {
+      "id": 14,
+      "title": "LSTM + pattern \u00b7 predicted vs actual at target time",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 13,
+        "w": 12,
+        "h": 10
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(istio_requests_total{reporter=\"destination\",destination_workload=\"nginx-test\",destination_workload_namespace=\"demo\"}[1m])) * 60",
+          "legendFormat": "Actual traffic",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "range": true
+        },
+        {
+          "expr": "max(predictive_autoscaler_forecast_rpm{namespace=\"ml-engine\",exported_namespace=\"demo\",application=\"nginx-test\",step=\"2\"} offset 15m and (abs(predictive_autoscaler_forecast_target_timestamp_seconds{namespace=\"ml-engine\",exported_namespace=\"demo\",application=\"nginx-test\",step=\"2\"} offset 15m - time()) <= 30))",
+          "legendFormat": "Predicted \u00b7 20-minute step",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "range": true
+        }
+      ],
+      "description": "Forecast samples are read 15 minutes earlier and included ONLY when their recorded target timestamp matches chart time within 30 seconds. This shows a subset of 20-minute-step forecasts, not every issuance. Dots are not joined or filled. The step starts at the input anchor, not issuance time. Scrape delays/held gauges can leave gaps. Diagnostic timing tolerance is not formal scored accuracy; use the verified forecast log for exact target scoring. Best viewed at 6 hours or less; wider ranges show fewer matched points. Pairing uses matching source labels before aggregation, including across controller restarts.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqpm",
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "axisBorderShow": false
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Actual traffic"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#B0B0B0"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Predicted \u00b7 20-minute step"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#5794F2"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 0
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "always"
+              },
+              {
+                "id": "custom.pointSize",
+                "value": 7
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "maxDataPoints": 360,
+      "interval": "1m"
+    },
+    {
+      "id": 15,
+      "title": "Seasonal pattern only \u00b7 predicted vs actual at target time",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 13,
+        "w": 12,
+        "h": 10
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(istio_requests_total{reporter=\"destination\",destination_workload=\"nginx-seasonal\",destination_workload_namespace=\"demo\"}[1m])) * 60",
+          "legendFormat": "Actual traffic",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "range": true
+        },
+        {
+          "expr": "max(predictive_autoscaler_forecast_rpm{namespace=\"ml-engine\",exported_namespace=\"demo\",application=\"nginx-seasonal\",step=\"2\"} offset 15m and (abs(predictive_autoscaler_forecast_target_timestamp_seconds{namespace=\"ml-engine\",exported_namespace=\"demo\",application=\"nginx-seasonal\",step=\"2\"} offset 15m - time()) <= 30))",
+          "legendFormat": "Predicted \u00b7 20-minute step",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "range": true
+        }
+      ],
+      "description": "Forecast samples are read 15 minutes earlier and included ONLY when their recorded target timestamp matches chart time within 30 seconds. This shows a subset of 20-minute-step forecasts, not every issuance. Dots are not joined or filled. The step starts at the input anchor, not issuance time. Scrape delays/held gauges can leave gaps. Diagnostic timing tolerance is not formal scored accuracy; use the verified forecast log for exact target scoring. Best viewed at 6 hours or less; wider ranges show fewer matched points. Pairing uses matching source labels before aggregation, including across controller restarts.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqpm",
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "axisBorderShow": false
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Actual traffic"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#B0B0B0"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Predicted \u00b7 20-minute step"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#73BF69"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 0
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "always"
+              },
+              {
+                "id": "custom.pointSize",
+                "value": 7
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "maxDataPoints": 360,
+      "interval": "1m"
     },
     {
       "id": 2,
@@ -38,7 +287,7 @@
       "type": "stat",
       "gridPos": {
         "x": 0,
-        "y": 4,
+        "y": 23,
         "w": 6,
         "h": 4
       },
@@ -160,7 +409,7 @@
       "type": "stat",
       "gridPos": {
         "x": 6,
-        "y": 4,
+        "y": 23,
         "w": 6,
         "h": 4
       },
@@ -282,7 +531,7 @@
       "type": "stat",
       "gridPos": {
         "x": 12,
-        "y": 4,
+        "y": 23,
         "w": 6,
         "h": 4
       },
@@ -404,7 +653,7 @@
       "type": "stat",
       "gridPos": {
         "x": 18,
-        "y": 4,
+        "y": 23,
         "w": 6,
         "h": 4
       },
@@ -526,7 +775,7 @@
       "type": "timeseries",
       "gridPos": {
         "x": 0,
-        "y": 8,
+        "y": 27,
         "w": 12,
         "h": 9
       },
@@ -702,7 +951,7 @@
       "type": "timeseries",
       "gridPos": {
         "x": 12,
-        "y": 8,
+        "y": 27,
         "w": 12,
         "h": 9
       },
@@ -913,7 +1162,7 @@
       "type": "timeseries",
       "gridPos": {
         "x": 0,
-        "y": 17,
+        "y": 36,
         "w": 24,
         "h": 9
       },
@@ -1089,7 +1338,7 @@
       "type": "timeseries",
       "gridPos": {
         "x": 0,
-        "y": 26,
+        "y": 45,
         "w": 12,
         "h": 8
       },
@@ -1260,7 +1509,7 @@
       "type": "timeseries",
       "gridPos": {
         "x": 12,
-        "y": 26,
+        "y": 45,
         "w": 12,
         "h": 8
       },
@@ -1431,7 +1680,7 @@
       "type": "timeseries",
       "gridPos": {
         "x": 0,
-        "y": 34,
+        "y": 53,
         "w": 12,
         "h": 7
       },
@@ -1562,7 +1811,7 @@
       "type": "timeseries",
       "gridPos": {
         "x": 12,
-        "y": 34,
+        "y": 53,
         "w": 12,
         "h": 7
       },
