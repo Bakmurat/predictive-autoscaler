@@ -14,6 +14,9 @@ package controllers
 //
 // Input JSON:  {"min":1,"max":12,"steps":[{"t":"RFC3339","reactive":3,"predicted":5,
 //               "current_rpm":1234.5,"predictions":[...]}, ...]}
+// A keep_current step represents BOTH an unavailable forecast and a telemetry query
+// error (not an empty successful metrics response); counts/RPM/vector must be empty.
+// API/cache/deployment failures and the live reconciliation cadence are not simulated.
 // Output JSON: {"decisions":[{"t":...,"current":N,"desired":N,"applied":N,
 //               "override_active":bool,"streak":N}, ...]}
 
@@ -32,6 +35,7 @@ type replayStep struct {
 	Predicted   int32     `json:"predicted"`
 	CurrentRPM  float64   `json:"current_rpm"`
 	Predictions []float64 `json:"predictions"`
+	KeepCurrent bool      `json:"keep_current,omitempty"`
 }
 
 type replayInput struct {
@@ -78,6 +82,9 @@ func TestReplayHarness(t *testing.T) {
 	out := replayOutput{}
 
 	for _, s := range in.Steps {
+		if s.KeepCurrent && (s.Reactive != 0 || s.Predicted != 0 || s.CurrentRPM != 0 || len(s.Predictions) != 0) {
+			t.Fatal("keep_current requires unavailable forecast and telemetry")
+		}
 		ts, err := time.Parse(time.RFC3339, s.T)
 		if err != nil {
 			t.Fatalf("bad timestamp %q: %v", s.T, err)
@@ -100,6 +107,10 @@ func TestReplayHarness(t *testing.T) {
 		}
 		if desired > in.Max {
 			desired = in.Max
+		}
+		// Live reconciliation applies the both-input-error hold after clamping.
+		if s.KeepCurrent {
+			desired = current
 		}
 
 		applied := current

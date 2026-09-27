@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func runLifecycleReplay(t *testing.T, input replayInput) []replayDecision {
+func runLifecycleReplay(t *testing.T, input any) []replayDecision {
 	t.Helper()
 	dir := t.TempDir()
 	in, out := filepath.Join(dir, "input.json"), filepath.Join(dir, "output.json")
