@@ -11,11 +11,32 @@ delivered; destination-observed within ±5 % of delivered. A missing series fail
 Usage: collect-k6-summaries.py [--hour H] [--date YYYY-MM-DD] [--prom http://localhost:9090] [--json out]
 Default: the last completed UTC hour; --port-forward opens a temporary port-forward to Prometheus.
 """
-import argparse, json, subprocess, sys, time, datetime, urllib.request, urllib.parse
+import argparse, os, json, subprocess, sys, time, datetime, urllib.request, urllib.parse
 
 PATTERN = {0: 250, 1: 200, 2: 150, 3: 150, 4: 200, 5: 300, 6: 750, 7: 1250, 8: 2000, 9: 3000, 10: 3750, 11: 4250,
            12: 4500, 13: 5000, 14: 5500, 15: 6000, 16: 5000, 17: 4250, 18: 3000, 19: 2400, 20: 1000, 21: 600, 22: 400, 23: 300}
 APPS = ("nginx-test", "nginx-reactive", "myapptwo")
+
+# 2026-09-27 (Task 03 U-22): planned load comes from the workload profile's reference schedule, so the
+# gate stays correct when the challenge-v1 regime starts (2026-09-28T00:00Z). Before that regime the
+# reference returns exactly PATTERN, so every earlier gate is unchanged (tested).
+_WORKLOAD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "workload", "challenge-v1")
+sys.path.insert(0, _WORKLOAD)
+import challenge_profile  # noqa: E402
+
+
+def planned_requests(start, end, sched_s):
+    """Planned requests in the last `sched_s` seconds of [start, end): the sum over ten-minute slots
+    of the scheduled rate times the scheduled seconds inside each slot."""
+    t0 = end.timestamp() - sched_s
+    total, slot = 0.0, challenge_profile.SLOT
+    k = int(start.timestamp()) // slot * slot
+    while k < end.timestamp():
+        lo, hi = max(k, t0), min(k + slot, end.timestamp())
+        if hi > lo:
+            total += challenge_profile.rate_at(k) * (hi - lo) / 60.0
+        k += slot
+    return total
 
 
 def q(prom, query, at):
@@ -31,6 +52,7 @@ def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--hour", type=int); ap.add_argument("--date"); ap.add_argument("--prom", default="http://localhost:9090")
     ap.add_argument("--port-forward", action="store_true"); ap.add_argument("--context", default="predictive-bench"); ap.add_argument("--json")
     ap.add_argument("--generator-start", help="ISO time the long-running generators started (partial first hour)")
+    ap.add_argument("--apps", help="comma-separated arms (default: the original three)")
     a = ap.parse_args()
     now = datetime.datetime.now(datetime.timezone.utc)
     end = now.replace(minute=0, second=0, microsecond=0)
@@ -53,11 +75,11 @@ def main():
     gen_start = datetime.datetime.fromisoformat(a.generator_start.replace("Z", "+00:00")) if a.generator_start else None
     rows, verdict = [], True
     try:
-        for app in APPS:
+        for app in (tuple(a.apps.split(",")) if a.apps else APPS):
             sched_s = 3600.0
             if gen_start and gen_start > start:
                 sched_s = max(0.0, (end - gen_start).total_seconds())
-            planned = PATTERN[hour] * sched_s / 60.0
+            planned = planned_requests(start, end, sched_s)
             at = end.timestamp()
             # every counter is read over the SAME window (the seconds the generator was scheduled in this
             # hour), so a partial first hour compares like with like
@@ -81,7 +103,8 @@ def main():
                     "failed_le_0.1pct": (delivered or 0) > 0 and failed / delivered <= 0.001,
                     "observed_within_5pct_of_delivered": delivered and observed is not None and abs(observed / delivered - 1) <= 0.05}
             ok = all(gate.values()); verdict = verdict and ok
-            rows.append({"target": app, "hour_start": start.strftime("%Y-%m-%dT%H:%M:%SZ"), "scheduled_seconds": sched_s, "planned_rpm": PATTERN[hour],
+            rows.append({"target": app, "hour_start": start.strftime("%Y-%m-%dT%H:%M:%SZ"), "scheduled_seconds": sched_s, "planned_rpm": round(planned * 60.0 / sched_s, 2) if sched_s else None,
+                         "profile": "challenge-v1" if end.timestamp() > challenge_profile.START else "repeating-v2",
                          "planned_requests": round(planned), "k6_delivered": None if delivered is None else round(delivered),
                          "delivered_pct": None if delivered is None or not planned else round(100 * delivered / planned, 2),
                          "dropped": round(dropped), "dropped_pct": round(100 * dropped / planned, 3) if planned else None,
