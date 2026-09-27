@@ -1,0 +1,122 @@
+---
+# challenge-v1 load script (eval/PROTOCOL-challenge-workload.md; user decision U-22, 2026-09-27).
+# Same open-loop arrival-rate generator design as k6-load-script (one long-running k6 per app,
+# wall-clock aligned, remote write to Prometheus). The offered rate is a pure function of time,
+# the sealed seed and profile.json, so all five generators offer identical traffic. Before
+# regime_start it is EXACTLY the repeating-v2 hourly profile; from regime_start the hourly
+# profile is multiplied, per ten-minute slot, by bounded correlated noise, a slow drift and level
+# shifts. The schedule block is mirrored by challenge_profile.py and checked bit-for-bit by
+# ml-engine/tests/test_challenge_workload.py.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k6-load-script-challenge-v1
+  namespace: demo
+  labels:
+    workload-profile: challenge-v1
+data:
+  load.js: |
+    import http from 'k6/http';
+
+    // BEGIN SCHEDULE
+    const PROFILE = {
+      profile: 'challenge-v1',
+      regimeStart: Date.UTC(2026, 8, 28, 0, 0, 0) / 1000,
+      seed: 20260928,
+      slot: 600,
+      base: [250, 200, 150, 150, 200, 300, 750, 1250, 2000, 3000, 3750, 4250,
+             4500, 5000, 5500, 6000, 5000, 4250, 3000, 2400, 1000, 600, 400, 300],
+      phi: 0.85, sigma: 0.05, noiseClip: 0.12,
+      driftAmplitude: 0.06, driftPeriodHours: 72,
+      shiftProbability: 1 / 72, shiftMinDwell: 12, shiftMaxAbs: 0.12,
+      lo: 0.75, hi: 1.15,
+    };
+
+    function u01(seed, k, j) {
+      let a = (seed + Math.imul(k, 0x9E3779B1) + Math.imul(j, 0x85EBCA6B)) >>> 0;
+      a = (a + 0x6D2B79F5) >>> 0;
+      let t = Math.imul(a ^ (a >>> 15), a | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    }
+
+    function normal(seed, k) {
+      const u1 = u01(seed, k, 0), u2 = u01(seed, k, 1);
+      return Math.sqrt(-2 * Math.log(1 - u1)) * Math.cos(2 * Math.PI * u2);
+    }
+
+    function drift(k) {
+      const x = ((k * PROFILE.slot / 3600) % PROFILE.driftPeriodHours) / PROFILE.driftPeriodHours;
+      let tri;
+      if (x < 0.25) tri = x / 0.25;
+      else if (x < 0.75) tri = 1 - (x - 0.25) / 0.25;
+      else tri = -1 + (x - 0.75) / 0.25;
+      return PROFILE.driftAmplitude * tri;
+    }
+
+    function multipliers(nSlots) {
+      const out = [];
+      const a = PROFILE.sigma * Math.sqrt(1 - PROFILE.phi * PROFILE.phi);
+      let n = 0, level = 0, last = -1000000000;
+      for (let k = 0; k < nSlots; k++) {
+        n = PROFILE.phi * n + a * normal(PROFILE.seed, k);
+        const nc = Math.max(-PROFILE.noiseClip, Math.min(PROFILE.noiseClip, n));
+        if (k - last >= PROFILE.shiftMinDwell && u01(PROFILE.seed, k, 2) < PROFILE.shiftProbability) {
+          level = (2 * u01(PROFILE.seed, k, 3) - 1) * PROFILE.shiftMaxAbs;
+          last = k;
+        }
+        out.push(Math.max(PROFILE.lo, Math.min(PROFILE.hi, 1 + nc + drift(k) + level)));
+      }
+      return out;
+    }
+
+    function makeRateAt(untilSeconds) {
+      const n = untilSeconds > PROFILE.regimeStart
+        ? Math.floor((untilSeconds - PROFILE.regimeStart) / PROFILE.slot) + 2 : 0;
+      const m = multipliers(n);
+      return function rateAt(t) {
+        const base = PROFILE.base[new Date(t * 1000).getUTCHours()];
+        if (t < PROFILE.regimeStart) return Math.floor(base + 0.5);
+        const k = Math.floor((t - PROFILE.regimeStart) / PROFILE.slot);
+        return Math.floor(base * m[k] + 0.5);
+      };
+    }
+    // END SCHEDULE
+
+    const DAYS = 8;                       // schedule length; k6 exits afterwards and the Deployment
+                                          // restarts it, re-aligned to the wall clock
+    const nowS = Date.now() / 1000;
+    const rateAt = makeRateAt(nowS + DAYS * 86400 + PROFILE.slot);
+    const slotStart = Math.floor(nowS / PROFILE.slot) * PROFILE.slot;
+    const stages = [{ duration: `${Math.max(1, Math.round(slotStart + PROFILE.slot - nowS))}s`,
+                      target: rateAt(slotStart) }];
+    for (let b = slotStart + PROFILE.slot; b < nowS + DAYS * 86400; b += PROFILE.slot) {
+      const r = rateAt(b);
+      stages.push({ duration: '1s', target: r });                    // step at the slot boundary
+      stages.push({ duration: `${PROFILE.slot - 1}s`, target: r });  // hold for the rest of the slot
+    }
+
+    export const options = {
+      discardResponseBodies: true,
+      scenarios: {
+        pattern: {
+          executor: 'ramping-arrival-rate',
+          startRate: rateAt(slotStart),
+          timeUnit: '1m',
+          preAllocatedVUs: 30,
+          maxVUs: 60,
+          stages,
+          gracefulStop: '5s',
+        },
+      },
+    };
+
+    export function setup() {
+      console.log(JSON.stringify({ kind: 'k6-schedule', profile: PROFILE.profile, target: __ENV.TARGET_NAME,
+                                   started_at: new Date(nowS * 1000).toISOString(),
+                                   start_rate_rpm: rateAt(slotStart), stages: stages.length, days: DAYS }));
+    }
+
+    export default function () {
+      http.get(__ENV.TARGET_URL);
+    }

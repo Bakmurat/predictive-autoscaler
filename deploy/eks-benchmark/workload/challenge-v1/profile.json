@@ -1,0 +1,13 @@
+{
+  "profile": "challenge-v1",
+  "regime_start": "2026-09-28T00:00:00Z",
+  "seed": 20260928,
+  "slot_seconds": 600,
+  "base_pattern_utc_rpm": [250, 200, 150, 150, 200, 300, 750, 1250, 2000, 3000, 3750, 4250,
+                           4500, 5000, 5500, 6000, 5000, 4250, 3000, 2400, 1000, 600, 400, 300],
+  "noise": {"phi": 0.85, "sigma": 0.05, "clip": 0.12},
+  "drift": {"amplitude": 0.06, "period_hours": 72},
+  "shifts": {"probability_per_slot": 0.013888888888888888, "min_dwell_slots": 12, "max_abs_level": 0.12},
+  "multiplier_bounds": [0.75, 1.15],
+  "rounding": "floor(rate + 0.5) requests per minute"
+}
