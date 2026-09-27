@@ -1,0 +1,7 @@
+{
+  "id": "seasonal-ensemble-q90-v1",
+  "application": "nginx-ensemble",
+  "namespace": "demo",
+  "source_application": "nginx-test",
+  "source_namespace": "demo"
+}

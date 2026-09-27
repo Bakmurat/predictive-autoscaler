@@ -29,6 +29,8 @@ from models.lstm_model import LSTMForecastModel, asymmetric_mse  # noqa: F401 â€
 from data.victoriametrics_collector import VictoriaMetricsCollector
 from api.accuracy import AccuracyTracker
 from api.seasonal_experiment import SeasonalExperiment
+from api.ensemble_experiment import EnsembleExperiment
+from models import seasonal_ensemble
 
 # Set up logging
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -78,6 +80,18 @@ PREDICTION_RPM_GAUGE = Gauge(
 FLOOR_PCT_GAUGE = Gauge(
     'ml_api_floor_pct',
     'Safety floor percentage currently applied to predictions',
+    ['application', 'namespace']
+)
+
+ENSEMBLE_MARGIN_GAUGE = Gauge(
+    'ml_api_ensemble_margin_rpm',
+    'q90 capacity margin added to every served step of the seasonal-ensemble arm',
+    ['application', 'namespace']
+)
+
+ENSEMBLE_MARGIN_SAMPLES_GAUGE = Gauge(
+    'ml_api_ensemble_margin_samples',
+    'Matured lead-window errors behind the seasonal-ensemble margin (zero margin below 30)',
     ['application', 'namespace']
 )
 
@@ -833,6 +847,11 @@ predictor = LSTMPredictor()
 # Initialize accuracy tracker
 accuracy_tracker = AccuracyTracker()
 
+# Seasonal-ensemble arm (Task 03 U-21): opt-in, malformed configuration fails at startup.
+_raw_ensemble = os.getenv("ENSEMBLE_EXPERIMENT")
+ensemble_experiment = EnsembleExperiment.parse(_raw_ensemble) if _raw_ensemble is not None else None
+ENSEMBLE_HISTORY_HOURS = int(os.getenv("ENSEMBLE_HISTORY_HOURS", "360"))
+
 # Initialize VictoriaMetrics collector
 vm_url = os.getenv("VICTORIA_METRICS_URL", "http://vmselect-vmst.monitoring.svc.cluster.local:8481/select/0/prometheus")
 vm_collector = VictoriaMetricsCollector(vm_url)
@@ -913,6 +932,11 @@ async def predict(request: Dict):
 
         if metric_type != "requests":
             raise HTTPException(status_code=400, detail="metric_type must be 'requests'")
+
+        if ensemble_experiment and ensemble_experiment.matches(application, namespace, metric_type):
+            if "metric_data" in request:
+                raise HTTPException(422, "ensemble forecast refused: history must be fetched from configured source")
+            return await predict_ensemble(ensemble_experiment, application, namespace, metric_type, horizon_minutes)
 
         experiment = getattr(predictor, "seasonal_experiment", None)
         if experiment and not experiment.matches(application, namespace, metric_type):
@@ -1094,6 +1118,127 @@ async def predict(request: Dict):
     except Exception as e:
         logger.error(f"Prediction error: {e}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+def _naive_iso(value: str) -> str:
+    """The seasonal-ensemble module writes 'Z' ISO strings; the API serves naive UTC like the LSTM."""
+    return value[:-1] if value.endswith("Z") else value
+
+
+async def predict_ensemble(experiment, application, namespace, metric_type, horizon_minutes):
+    """Serve the seasonal-ensemble forecast plus its q90 margin (Task 03 U-21).
+
+    The served `predictions` already include the margin; `ensemble.raw` keeps the margin-free
+    forecast for scoring. Any refusal is a 422, which the operator maps to reactive fallback.
+    """
+    if horizon_minutes != 60:
+        raise HTTPException(422, "ensemble forecast refused: only a 60-minute horizon is supported")
+    metric_data = await fetch_metrics_from_vm(experiment.source_application, experiment.source_namespace,
+                                              metric_type, hours=ENSEMBLE_HISTORY_HOURS)
+    if not metric_data:
+        raise HTTPException(422, "ensemble forecast refused: no source history")
+    from data import gapfill
+    pts = []
+    for dpt in metric_data:
+        try:
+            pts.append((gapfill._ts(dpt["timestamp"]), float(dpt["value"])))
+        except Exception:
+            continue
+    pts, mask_info = gapfill.apply_mask(pts, predictor.validity_mask, role="benchmark")
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    loop = asyncio.get_event_loop()
+    try:
+        with PREDICTION_DURATION.time():
+            result = await loop.run_in_executor(
+                None, functools.partial(seasonal_ensemble.forecast, pts, now_ts,
+                                        f"{experiment.source_namespace}/{experiment.source_application}"))
+    except (seasonal_ensemble.ForecastUnavailable, ValueError) as e:
+        PREDICTION_ERRORS.labels(error_type="EnsembleUnavailable").inc()
+        raise HTTPException(422, f"forecast refused: {e}")
+    served = [round(float(v), 2) for v in result["served"]]
+    if not all(math.isfinite(v) for v in served):
+        raise HTTPException(422, "forecast refused: non-finite ensemble step")
+    targets = [_naive_iso(t) for t in result["target_timestamps"]]
+    gen = result["generation"]
+    PREDICTION_REQUESTS.labels(application=application).inc()
+
+    # Accuracy queue: the served value (final) and the margin-free forecast (component "raw").
+    try:
+        last = metric_data[-1]
+        current_actual = float(last.get("value", 0))
+        observation_at = _observation_timestamp(last)
+        if observation_at is not None and current_actual > 0:
+            for predicted in accuracy_tracker.take_matured(application, namespace, metric_type, observation_at):
+                accuracy_tracker.record(application, namespace, metric_type, predicted, current_actual)
+            for predicted in accuracy_tracker.take_matured(application, namespace, metric_type,
+                                                           observation_at, component="raw"):
+                accuracy_tracker.record_component(application, namespace, metric_type, "raw",
+                                                  float(predicted), current_actual)
+            raw_st = accuracy_tracker.component_mape_stats(application, namespace, metric_type, "raw")
+            clabels = dict(application=application, namespace=namespace, component="raw")
+            _set_error_gauge(COMPONENT_MAPE_GAUGE, raw_st, **clabels)
+            COMPONENT_SCORED_GAUGE.labels(**clabels).set(raw_st["scored"])
+            mape_st = accuracy_tracker.mape_stats(application, namespace, metric_type)
+            mae_st = accuracy_tracker.mae_stats(application, namespace, metric_type)
+            labels = dict(application=application, namespace=namespace, metric_type=metric_type)
+            _set_error_gauge(MAPE_GAUGE, mape_st, **labels)
+            _set_error_gauge(MAE_GAUGE, mae_st, **labels)
+            ACCURACY_SCORED_GAUGE.labels(**labels).set(mape_st["scored"])
+        for step, target in enumerate(targets):
+            target_at = _parse_iso(target)
+            if target_at is None:
+                continue
+            accuracy_tracker.store_forecast(application, namespace, metric_type, target_at, served[step])
+            accuracy_tracker.store_forecast(application, namespace, metric_type, target_at,
+                                            float(result["raw"][step]), component="raw")
+    except Exception as e:
+        logger.warning(f"Ensemble accuracy tracking error (non-fatal): {e}")
+
+    try:
+        for name, values in (("ensemble_hw", result["hw"]), ("ensemble_profile_ar", result["profile_ar"]),
+                             ("ensemble_raw", result["raw"]), ("final", served)):
+            for i, v in enumerate(values):
+                PREDICTION_RPM_GAUGE.labels(application=application, namespace=namespace,
+                                            component=name, step=str(i + 1)).set(float(v))
+        ENSEMBLE_MARGIN_GAUGE.labels(application=application, namespace=namespace).set(result["margin"])
+        ENSEMBLE_MARGIN_SAMPLES_GAUGE.labels(application=application, namespace=namespace).set(
+            result["margin_samples"])
+    except Exception as e:
+        logger.warning(f"Ensemble gauge update error (non-fatal): {e}")
+
+    boundary = gen["boundary"]
+    age_hours = (datetime.now(timezone.utc) - datetime.fromisoformat(boundary.replace("Z", "+00:00"))
+                 ).total_seconds() / 3600
+    logger.info("ENSEMBLE_ISSUANCE " + json.dumps({
+        "application": application, "namespace": namespace, "origin": result["origin"],
+        "raw": [round(v, 2) for v in result["raw"]], "margin": round(result["margin"], 2),
+        "margin_samples": result["margin_samples"], "served": served, "generation": gen,
+        "stale_generation": result["stale_generation"]}, sort_keys=True))
+    payload = {
+        "experiment": experiment.provenance(),
+        "application": application,
+        "metric_type": metric_type,
+        "model_version": f"{experiment.id}:{experiment.config_sha256[:12]}:{seasonal_ensemble.VERSION}@{gen['fingerprint'][:12]}",
+        "model_trained_at": _naive_iso(boundary),
+        "training_cutoff": boundary,
+        "artifact_sha256": gen["fingerprint"],
+        "sequence_length": 0,
+        "inference_input_end": result["origin"],
+        "inference_window": {"mask": {k: mask_info[k] for k in ("mask_version", "dropped_in_intervals")},
+                             "latest_observed": result["origin"]},
+        "provenance": "seasonal-ensemble",
+        "predictions": served,
+        "target_timestamps": targets,
+        "confidence": 0.95,
+        "model_name": f"ensemble_{application}_{metric_type}",
+        "timestamp": datetime.utcnow().isoformat(),
+        "horizon_minutes": horizon_minutes,
+        "data_points_used": len(pts),
+        "model_age_hours": round(age_hours, 2),
+        "ensemble": {k: result[k] for k in ("origin", "hw", "profile_ar", "raw", "margin", "margin_samples",
+                                              "generation", "stale_generation", "settings")},
+    }
+    return JSONResponse(content=_json_safe(payload))
+
 
 @app.post("/train")
 async def train_model(request: Dict):
