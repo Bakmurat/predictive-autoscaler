@@ -13,20 +13,21 @@ import (
 // It is observation only: nothing here feeds back into the decision. Lines carry "event":"decision",
 // so readers that treat event lines as non-issuance records keep working.
 type decisionRecord struct {
-	Event            string   `json:"event"`
-	At               string   `json:"at"`
-	Application      string   `json:"application"`
-	Namespace        string   `json:"namespace"`
-	Forecasting      bool     `json:"forecasting"`
-	ForecastStatus   string   `json:"forecast_status"` // used|unavailable|horizon_elapsed|sanity_rejected|disabled
-	ForecastIssuedAt *string  `json:"forecast_issued_at"`
-	ArtifactSHA256   *string  `json:"artifact_sha256"`
-	ModelVersion     *string  `json:"model_version"`
-	LeadWindowPeak   *float64 `json:"lead_window_peak_rpm"`
-	Confidence       *float64 `json:"confidence"`
-	RawPredicted     *int32   `json:"raw_predicted_replicas"`
-	ConfidenceAdj    *int32   `json:"confidence_adjusted_replicas"`
-	PredictedClamped *int32   `json:"predicted_after_clamp"`
+	ForecastLookup   *forecastLookup `json:"forecast_lookup,omitempty"`
+	Event            string          `json:"event"`
+	At               string          `json:"at"`
+	Application      string          `json:"application"`
+	Namespace        string          `json:"namespace"`
+	Forecasting      bool            `json:"forecasting"`
+	ForecastStatus   string          `json:"forecast_status"` // used|unavailable|horizon_elapsed|sanity_rejected|disabled
+	ForecastIssuedAt *string         `json:"forecast_issued_at"`
+	ArtifactSHA256   *string         `json:"artifact_sha256"`
+	ModelVersion     *string         `json:"model_version"`
+	LeadWindowPeak   *float64        `json:"lead_window_peak_rpm"`
+	Confidence       *float64        `json:"confidence"`
+	RawPredicted     *int32          `json:"raw_predicted_replicas"`
+	ConfidenceAdj    *int32          `json:"confidence_adjusted_replicas"`
+	PredictedClamped *int32          `json:"predicted_after_clamp"`
 	// PredictedReplicas is the value that entered max(predicted, reactive, min): after the sanity
 	// and overestimate safeguards; 0 when no usable forecast participated.
 	PredictedReplicas int32    `json:"predicted_replicas"`

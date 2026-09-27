@@ -860,5 +860,12 @@ class RecordedComponents(unittest.TestCase):
             self.assertEqual(json.loads(output.read_text())['recorded_components']['per_step']['6']['paired_n'], 1)
 
 
+def load_tests(loader, tests, pattern):
+    """Keep the standalone ledger reader regressions in the existing verify gate."""
+    import attempt_report_test
+    tests.addTests(loader.loadTestsFromModule(attempt_report_test))
+    return tests
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

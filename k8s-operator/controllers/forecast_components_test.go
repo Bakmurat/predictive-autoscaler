@@ -57,7 +57,10 @@ func componentRows(t *testing.T, path string) []map[string]interface{} {
 		if err = json.Unmarshal([]byte(line), &r); err != nil {
 			t.Fatal(err)
 		}
-		rows = append(rows, r)
+		// Mixed FORECAST_LOG now includes observational RPC events, not issuances.
+		if r["event"] == nil {
+			rows = append(rows, r)
+		}
 	}
 	return rows
 }

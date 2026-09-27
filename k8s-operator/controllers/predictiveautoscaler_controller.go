@@ -77,6 +77,7 @@ type PredictiveAutoscalerReconciler struct {
 	Scheme           *runtime.Scheme
 	lastReconcileMap map[string]time.Time
 	predictionCache  map[string]*cachedPrediction
+	forecastLedger   forecastLedgerState
 	scaleStates      map[string]*scaleState
 }
 
@@ -115,7 +116,8 @@ type MLPredictionResponse struct {
 	MAPEMeasured bool    `json:"mape_measured"`
 	MAPEScored   int     `json:"mape_scored"`
 	// Optional diagnostics never participate in the core prediction decode or scaling policy.
-	components *forecastComponents
+	components                                     *forecastComponents
+	operatorRunID, lookupID, attemptID, issuanceID string
 }
 
 // predictionEnabled reports whether the forecasting component is on for this autoscaler
@@ -206,13 +208,15 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	// Get ML prediction (cached, refresh every 5 min)
 	var prediction *MLPredictionResponse
 	var predErr error
+	var lookup *forecastLookup
 	forecasting := predictionEnabled(&autoscaler)
 	if forecasting {
-		prediction, predErr = r.getCachedPrediction(ctx, &autoscaler, key)
+		prediction, predErr, lookup = r.getCachedPredictionObserved(ctx, &autoscaler, key)
 	}
 	predictedReplicas := int32(0)
 	// Codex D-140: one decision record per reconcile (observation only; no decision changes).
 	dec := newDecisionRecord(&autoscaler, forecasting, currentReplicas)
+	dec.ForecastLookup = lookup
 	if !forecasting {
 		log.V(1).Info("Forecasting disabled for this autoscaler; reactive rule only")
 	} else if predErr != nil {
@@ -598,23 +602,40 @@ func (r *PredictiveAutoscalerReconciler) getCachedPrediction(
 	autoscaler *autoscalerv1alpha1.PredictiveAutoscaler,
 	key string,
 ) (*MLPredictionResponse, error) {
+	prediction, err, _ := r.getCachedPredictionObserved(ctx, autoscaler, key)
+	return prediction, err
+}
+
+func (r *PredictiveAutoscalerReconciler) getCachedPredictionObserved(
+	ctx context.Context, autoscaler *autoscalerv1alpha1.PredictiveAutoscaler, key string,
+) (*MLPredictionResponse, error, *forecastLookup) {
+	lookup := r.newForecastLookup(autoscaler)
+	defer r.recordForecastCompletion(lookup)
 	// Check cache
 	if cached, ok := r.predictionCache[key]; ok {
-		if time.Since(cached.fetchedAt) < predictionCacheTTL {
-			return cached.response, nil
+		age := time.Since(cached.fetchedAt)
+		seconds := age.Seconds()
+		lookup.CacheAgeSeconds = &seconds
+		if cached.response != nil {
+			lookup.PriorIssuanceID = cached.response.issuanceID
+		}
+		if age < predictionCacheTTL {
+			lookup.returned(cached.response, "cache_hit", "keep")
+			return cached.response, nil, lookup
 		}
 	}
 
 	// Fetch fresh prediction from ML API
-	prediction, err := r.getPrediction(ctx, autoscaler)
+	prediction, err := r.getPredictionObserved(ctx, autoscaler, lookup)
 	if err != nil {
 		if isForecastRefusal(err) {
 			// The API refused the request as invalid input (for example its freshness guard: the
 			// latest observation is missing or too old). That is not a transport failure: a
 			// cached forecast must not stand in for it. Drop the cache → reactive only.
 			delete(r.predictionCache, key)
+			lookup.returned(nil, "unavailable", "delete")
 			r.Log.Info("ML API refused the forecast request; not reusing the cache", "error", err.Error())
-			return nil, err
+			return nil, err, lookup
 		}
 		// On a transport-class error, reuse the cached forecast only while it is younger than predictionStaleMax.
 		// Beyond that the forecast no longer describes the horizon it was issued for, so the
@@ -622,22 +643,30 @@ func (r *PredictiveAutoscalerReconciler) getCachedPrediction(
 		// Serving a stale forecast indefinitely was observed in the 2026-09-20 functional test.
 		if cached, ok := r.predictionCache[key]; ok {
 			age := time.Since(cached.fetchedAt)
+			seconds := age.Seconds()
+			lookup.CacheAgeSeconds = &seconds
 			if age < predictionStaleMax {
 				r.Log.Info("Using stale prediction cache due to ML API error",
 					"cacheAge", age.Round(time.Second),
 					"staleMax", predictionStaleMax,
 					"error", err.Error())
-				return cached.response, nil
+				lookup.returned(cached.response, "stale_after_error", "keep")
+				return cached.response, nil, lookup
 			}
 			delete(r.predictionCache, key)
+			lookup.returned(nil, "unavailable", "delete")
 			return nil, fmt.Errorf("ML API unreachable and cached forecast too old (%s > %s): %w",
-				age.Round(time.Second), predictionStaleMax, err)
+				age.Round(time.Second), predictionStaleMax, err), lookup
 		}
-		return nil, err
+		return nil, err, lookup
 	}
 
 	// Update cache and record the forecast at issuance (before any outcome exists)
 	now := time.Now()
+	if lookup.InstrumentationStatus == "enabled" && len(prediction.Predictions) != 0 {
+		prediction.operatorRunID, prediction.lookupID = lookup.OperatorRunID, lookup.LookupID
+		prediction.attemptID, prediction.issuanceID = lookup.FreshAttemptID, lookup.FreshAttemptID+":issuance"
+	}
 	prediction.issuedAt = now
 	prediction.anchorAt = now
 	if t, err := time.Parse(time.RFC3339, normalizeRFC3339(prediction.InferenceInputEnd)); err == nil && !t.IsZero() {
@@ -648,11 +677,16 @@ func (r *PredictiveAutoscalerReconciler) getCachedPrediction(
 		fetchedAt: now,
 	}
 	r.recordForecast(autoscaler, prediction, now)
-	return prediction, nil
+	lookup.returned(prediction, "fresh_response", "replace")
+	return prediction, nil, lookup
 }
 
 // forecastRecord is one JSON line in the append-only forecast log (FORECAST_LOG).
 type forecastRecord struct {
+	OperatorRunID  string  `json:"operator_run_id,omitempty"`
+	LookupID       string  `json:"lookup_id,omitempty"`
+	AttemptID      string  `json:"attempt_id,omitempty"`
+	IssuanceID     string  `json:"issuance_id,omitempty"`
 	IssuedAt       string  `json:"issued_at"`
 	Application    string  `json:"application"`
 	Namespace      string  `json:"namespace"`
@@ -697,6 +731,8 @@ func (r *PredictiveAutoscalerReconciler) recordForecast(
 	}
 	stepMin := float64(horizon) / float64(len(prediction.Predictions))
 	rec := forecastRecord{
+		OperatorRunID: prediction.operatorRunID, LookupID: prediction.lookupID,
+		AttemptID: prediction.attemptID, IssuanceID: prediction.issuanceID,
 		IssuedAt: issuedAt.UTC().Format(time.RFC3339), Application: app, Namespace: ns,
 		HorizonMinutes: horizon, StepMinutes: stepMin, ModelName: prediction.ModelName,
 		ModelVersion: prediction.ModelVersion, ModelTrainedAt: prediction.ModelTrainedAt,
@@ -748,20 +784,9 @@ func (r *PredictiveAutoscalerReconciler) recordForecast(
 
 // appendForecastLog appends one JSON line to FORECAST_LOG (no-op when unset).
 func (r *PredictiveAutoscalerReconciler) appendForecastLog(v interface{}) {
-	path := os.Getenv("FORECAST_LOG")
-	if path == "" {
-		return
-	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		r.Log.Error(err, "forecast log not writable", "path", path)
-		return
-	}
-	defer f.Close()
-	line, _ := json.Marshal(v)
-	if _, err := f.Write(append(line, '\n')); err != nil {
-		r.Log.Error(err, "forecast log write failed", "path", path)
-	}
+	r.forecastLedger.mu.Lock()
+	defer r.forecastLedger.mu.Unlock()
+	r.appendForecastLogLocked(v)
 }
 
 // sanityRejectionEvent is the JSON line written when a recorded forecast is discarded by the
@@ -876,63 +901,79 @@ func (r *PredictiveAutoscalerReconciler) getPrediction(
 	ctx context.Context,
 	autoscaler *autoscalerv1alpha1.PredictiveAutoscaler,
 ) (*MLPredictionResponse, error) {
+	return r.getPredictionObserved(ctx, autoscaler, nil)
+}
+
+func (r *PredictiveAutoscalerReconciler) getPredictionObserved(
+	ctx context.Context, autoscaler *autoscalerv1alpha1.PredictiveAutoscaler, lookup *forecastLookup,
+) (*MLPredictionResponse, error) {
 	mlAPIURL := os.Getenv("ML_API_URL")
 	if mlAPIURL == "" {
 		mlAPIURL = "http://ml-api-service.ml-engine.svc.cluster.local:8000"
 	}
 
-	// Determine primary metric type
-	metricType := "cpu"
-	if autoscaler.Spec.Metrics.Requests != nil && autoscaler.Spec.Metrics.Requests.Enabled {
-		metricType = "requests"
-	}
-
-	// Use full horizon for ML API (it returns all steps, we select lead-time window later)
-	horizonMinutes := autoscaler.Spec.Prediction.HorizonMinutes
-	if horizonMinutes == 0 {
-		horizonMinutes = defaultHorizonMinutes
-	}
-
-	reqBody := MLPredictionRequest{
-		Application:    autoscaler.Spec.TargetDeployment.Name,
-		Namespace:      autoscaler.Spec.TargetDeployment.Namespace,
-		MetricType:     metricType,
-		HorizonMinutes: horizonMinutes,
-	}
+	// Identical wire defaults, shared with the observation identity.
+	reqBody := predictionRequest(autoscaler)
 
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
+		if lookup != nil {
+			lookup.Resolution = "local_error"
+		}
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
 	// Call ML API (120s timeout to allow for LSTM training on first call)
 	httpClient := &http.Client{Timeout: mlAPITimeout}
-	resp, err := httpClient.Post(
-		fmt.Sprintf("%s/predict", mlAPIURL),
-		"application/json",
-		bytes.NewBuffer(jsonData),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to call ML API: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-			return nil, &forecastRefusedError{status: resp.StatusCode, body: string(body)}
+	completion, started := r.beginForecastAttempt(lookup, jsonData)
+	// The closure's normal return is the one completion boundary. Panic/termination
+	// leaves only the start; no deferred success is fabricated.
+	prediction, callErr := func() (*MLPredictionResponse, error) {
+		resp, err := httpClient.Post(
+			fmt.Sprintf("%s/predict", mlAPIURL),
+			"application/json",
+			bytes.NewBuffer(jsonData),
+		)
+		if err != nil {
+			completion.failure("transport_error", "transport", "request", err)
+			return nil, fmt.Errorf("failed to call ML API: %w", err)
 		}
-		return nil, fmt.Errorf("ML API returned status %d: %s", resp.StatusCode, string(body))
-	}
+		if completion != nil {
+			completion.HTTPStatus = &resp.StatusCode
+		}
+		defer resp.Body.Close()
 
-	var prediction MLPredictionResponse
-	var captured bytes.Buffer
-	if err := json.NewDecoder(io.TeeReader(resp.Body, &captured)).Decode(&prediction); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-	prediction.components = decodeForecastComponents(captured.Bytes())
+		if resp.StatusCode != http.StatusOK {
+			body, bodyErr := io.ReadAll(resp.Body)
+			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+				completion.failure("http_refusal", "http_status", "response_body", bodyErr)
+				return nil, &forecastRefusedError{status: resp.StatusCode, body: string(body)}
+			}
+			completion.failure("http_error", "http_status", "response_body", bodyErr)
+			return nil, fmt.Errorf("ML API returned status %d: %s", resp.StatusCode, string(body))
+		}
 
-	return &prediction, nil
+		var prediction MLPredictionResponse
+		var captured bytes.Buffer
+		if err := json.NewDecoder(io.TeeReader(resp.Body, &captured)).Decode(&prediction); err != nil {
+			completion.classifyServed(captured.Bytes())
+			completion.failure("decode_error", "decode", "decode", err)
+			return nil, fmt.Errorf("failed to decode response: %w", err)
+		}
+		prediction.components = decodeForecastComponents(captured.Bytes())
+		if completion != nil {
+			completion.Outcome = "decoded_response"
+		}
+		completion.classifyServed(captured.Bytes())
+
+		return &prediction, nil
+	}()
+	if completion != nil {
+		completion.At = time.Now().UTC().Format(time.RFC3339Nano)
+		completion.ElapsedSeconds = time.Since(started).Seconds()
+		lookup.completion = completion
+	}
+	return prediction, callErr
 }
 
 // scaleDeployment scales the target deployment to the specified replica count.

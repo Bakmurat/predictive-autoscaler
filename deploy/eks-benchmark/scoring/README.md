@@ -1,5 +1,9 @@
 # Verified forecast-log inputs
 
+For the separate descriptive RPC/cache ledger reader, see
+[ATTEMPT-RECORDS.md](ATTEMPT-RECORDS.md). It uses the same verified bytes and reports
+formal forecast availability as `not_evaluated`.
+
 The scoring CLI requires the log **and its collector receipt**, including for
 `--participation-only`. Existing function-level fixture tests do not need one.
 
