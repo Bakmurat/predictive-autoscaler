@@ -88,6 +88,8 @@ func TestReplayHarness(t *testing.T) {
 
 		predicted := adjustForOverestimation(log, s.Predicted, s.Reactive, state,
 			s.CurrentRPM, s.Predictions, "replay", "replay")
+		// Reconcile records this after adjustment for the next ramp-up check.
+		state.lastRPM = s.CurrentRPM
 
 		desired := predicted
 		if s.Reactive > desired {
@@ -110,7 +112,7 @@ func TestReplayHarness(t *testing.T) {
 			applied = r.calculateScaleDownTarget(log, state, current, desired)
 			if applied < current {
 				state.lastScaleDown = time.Now()
-				state.belowCurrentSince = time.Time{}
+				state.overrideActive = false
 			}
 		default:
 			state.belowCurrentSince = time.Time{}
