@@ -56,11 +56,22 @@ this arm take that room would push the original arms' strict spread into Pending
 spread across them (at most six per node at its ceiling). Its generator runs on the node
 labelled `predictive-bench/ensemble-generator=true`, never with the API.
 
+## Evidence
+
+The arm's issuance record carries the generation fingerprint as `artifact_sha256` (there is no
+model file). The API logs one `ENSEMBLE_ISSUANCE` JSON line per served forecast with the same
+fingerprint; the in-cluster archiver preserves those lines (`logs/api-ensemble.jsonl`), and the
+archive reconciler verifies each issuance against a logged fingerprint within five minutes.
+Lines the archiver did not see are not evidence, so **run the archive job by hand and wait
+for it before replacing the API pod**; a Recreate rollout between two fifteen-minute runs
+loses the old pod's last lines.
+
 ## Deployment order
 
 1. Build the API as a thin image over the deployed digest, using the reviewed source only,
    and keep the build log as `images-<commit>.log`.
-2. Render the live API Deployment with only the image and `ENSEMBLE_EXPERIMENT` changed.
+2. Run the archive job (`kubectl create job --from=cronjob/evidence-archive …`) and wait for
+   it, then render the live API Deployment with only the image and `ENSEMBLE_EXPERIMENT` changed.
    Inspect `kubectl diff`, keep `strategy: Recreate`, and verify the existing arms'
    forecasts after the rollout.
 3. Label the generator node, then apply the service, app, generator (with `VM_WRITE_URL`
