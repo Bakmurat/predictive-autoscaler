@@ -1,10 +1,10 @@
 {
-  "version": 2,
-  "issued_at": "2026-09-20T18:20:00Z",
+  "version": 3,
+  "issued_at": "2026-09-27T14:20:00Z",
   "series": "sum(rate(istio_requests_total{reporter=\"destination\",destination_workload=\"nginx-test\",destination_workload_namespace=\"demo\"}[1m])) * 60",
   "grid_seconds": 600,
   "benchmark_history_start": "2026-09-20T18:20:00Z",
-  "note": "Predeclared before any benchmark training (Codex Task 03 round 4, C-14). Samples inside an interval are not telemetry gaps but changed workload behaviour: they are excluded from benchmark training and never interpolated. Raw data is untouched. Samples before benchmark_history_start may feed only a training whose role is 'diagnostic' (artifact written under models/diagnostic/, never loaded by the API). v2 (2026-09-20T18:20Z): history start moved to 18:20Z after the generator redesign; the hourly-Job generators biased every :00 sample low (restart gap), so no sample before the redesign is benchmark history.",
+  "note": "Predeclared before any benchmark training (Codex Task 03 round 4, C-14). Samples inside an interval are not telemetry gaps but changed workload behaviour: they are excluded from benchmark training and never interpolated. Raw data is untouched. Samples before benchmark_history_start may feed only a training whose role is 'diagnostic' (artifact written under models/diagnostic/, never loaded by the API). v2 (2026-09-20T18:20Z): history start moved to 18:20Z after the generator redesign; the hourly-Job generators biased every :00 sample low (restart gap), so no sample before the redesign is benchmark history. v3 (2026-09-27): adds `regimes`, the traffic profile each period ran under (eval/PROTOCOL-challenge-workload.md section 6). A regime is a label, not an exclusion: repeating-v2 history stays valid evidence about repeating-v2, and evaluations report each regime separately. The live forecasters train across the boundary on purpose. The 14:12Z interval records the generator restart that installed the challenge-v1 script; that script is identical to repeating-v2 before 2026-09-28T00:00Z, so the boundary itself involves no restart and no gap.",
   "intervals": [
     {
       "start": "2026-09-20T13:40:00Z",
@@ -25,6 +25,25 @@
       "start": "2026-09-20T18:10:00Z",
       "end": "2026-09-20T18:20:00Z",
       "reason": "generator design change: Prometheus restarted to enable the remote-write receiver (18:13-18:17Z); hourly k6 Jobs deleted 18:17:12Z and replaced by long-running k6 Deployments started 18:17:43-18:17:46Z; 34 s traffic gap at cutover"
+    },
+    {
+      "start": "2026-09-27T14:12:00Z",
+      "end": "2026-09-27T14:13:00Z",
+      "reason": "all five k6 generators restarted (Recreate) to load k6-load-script-challenge-v1, 14:12:18-14:12:41Z; no ten-minute grid sample lies inside, so the forecast series is unaffected; recorded for the hourly load gates"
+    }
+  ],
+  "regimes": [
+    {
+      "profile": "repeating-v2",
+      "start": "2026-09-20T18:20:00Z",
+      "end": "2026-09-28T00:00:00Z",
+      "generator": "k6-load-script (hourly UTC table); from 2026-09-27T14:12:41Z the challenge-v1 script, identical before its start"
+    },
+    {
+      "profile": "challenge-v1",
+      "start": "2026-09-28T00:00:00Z",
+      "end": null,
+      "generator": "k6-load-script-challenge-v1, deploy/eks-benchmark/workload/challenge-v1 (profile.json frozen at 9f38a1a)"
     }
   ]
 }
