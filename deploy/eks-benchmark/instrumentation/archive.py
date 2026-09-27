@@ -34,6 +34,11 @@ import uuid
 
 VERSION = "1"
 RELOAD_RE = re.compile(r"(Loaded|Reloaded) model")
+# The seasonal-ensemble arm has no model file: its issuance record's artifact_sha256 is the
+# generation fingerprint, and the API logs one ENSEMBLE_ISSUANCE JSON line per served forecast
+# carrying that fingerprint. Preserving those lines gives the reconciler the counterpart of an
+# archived artifact plus reload line for that arm (2026-09-27, Task 03).
+ENSEMBLE_RE = re.compile(r"ENSEMBLE_ISSUANCE (\{.*\})\s*$")
 
 
 class CollectionError(Exception):
@@ -365,8 +370,9 @@ def collect_api_reloads(api, arc, selector, container, ident, now):
         with open(state_p) as fh:
             state = json.load(fh)
     reload_p, cov_p = os.path.join(d, "api-reload.jsonl"), os.path.join(d, "api-coverage.jsonl")
+    ens_p = os.path.join(d, "api-ensemble.jsonl")
     collected_at = now()
-    errors, new_lines = [], 0
+    errors, new_lines, new_ens = [], 0, 0
     pods = api.list_pods(selector)
     seen = set()
     for pod in pods:
@@ -413,12 +419,28 @@ def collect_api_reloads(api, arc, selector, container, ident, now):
                                  "collector": ident})
             continue   # state unchanged: the next run retries the same window
         got.sort(key=lambda x: x[0])
-        rel = 0
+        rel = ens = 0
         for t, s, ln, inst in got:
             if RELOAD_RE.search(ln):
                 append_jsonl(reload_p, {"ts": s, "pod": name, "pod_uid": uid, "restart_count": rc,
                                         "instance": inst, "line": ln.strip(), "collected_at": collected_at})
                 rel += 1
+            m = ENSEMBLE_RE.search(ln)
+            if m:
+                rec = {"ts": s, "pod": name, "pod_uid": uid, "restart_count": rc, "instance": inst,
+                       "line_sha256": hashlib.sha256(ln.strip().encode()).hexdigest(), "collected_at": collected_at}
+                try:
+                    body = json.loads(m.group(1))
+                    gen = body.get("generation") or {}
+                    rec.update({"application": body.get("application"), "namespace": body.get("namespace"),
+                                "origin": body.get("origin"), "fingerprint": gen.get("fingerprint"),
+                                "boundary": gen.get("boundary"), "served": body.get("served"),
+                                "margin": body.get("margin"), "margin_samples": body.get("margin_samples"),
+                                "stale_generation": body.get("stale_generation")})
+                except (ValueError, AttributeError) as e:
+                    rec["parse_error"] = repr(e)   # the raw line hash still binds the evidence
+                append_jsonl(ens_p, rec)
+                ens += 1
         cur_lines = [g for g in got if g[3] == "current"]
         if cur_lines and window_start:
             try:
@@ -431,8 +453,9 @@ def collect_api_reloads(api, arc, selector, container, ident, now):
                              "container_started_at": started, "window_start": window_start,
                              "window_end": collected_at, "first_line_ts": got[0][1] if got else None,
                              "last_line_ts": got[-1][1] if got else None, "lines": len(got),
-                             "reload_lines": rel, "flags": flags, "collector": ident})
+                             "reload_lines": rel, "ensemble_lines": ens, "flags": flags, "collector": ident})
         new_lines += rel
+        new_ens += ens
         state[uid] = {"pod": name, "restart_count": rc, "window_end": collected_at,
                       "last_ts": got[-1][1] if got else (st or {}).get("last_ts"), "gone": False}
     for uid, st in state.items():
@@ -444,13 +467,14 @@ def collect_api_reloads(api, arc, selector, container, ident, now):
                                  "collector": ident})
             st["gone"] = True
     write_atomic(state_p, json.dumps(state, indent=1, sort_keys=True).encode())
-    return new_lines, errors
+    return new_lines, errors, new_ens
 
 
 def collect_logs(api, arc, namespace, trainer_selector, api_selector, api_container, ident, now=utcnow):
     new_tr, e1 = collect_trainer_logs(api, arc, trainer_selector, ident, now)
-    new_api, e2 = collect_api_reloads(api, arc, api_selector, api_container, ident, now)
-    return {"trainer_logs_new": new_tr, "api_reload_lines_new": new_api, "errors": e1 + e2}
+    new_api, e2, new_ens = collect_api_reloads(api, arc, api_selector, api_container, ident, now)
+    return {"trainer_logs_new": new_tr, "api_reload_lines_new": new_api, "api_ensemble_lines_new": new_ens,
+            "errors": e1 + e2}
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -507,7 +531,7 @@ def run(src, arc, art_name, side_name, api, namespace, trainer_selector, api_sel
         logs = {}
         errors.append(f"logs: {e!r}")
     rec = {"started_at": started, "finished_at": now(), **ident, "pair": pair,
-           "trainer_logs_new": logs.get("trainer_logs_new"), "api_reload_lines_new": logs.get("api_reload_lines_new"),
+           "trainer_logs_new": logs.get("trainer_logs_new"), "api_reload_lines_new": logs.get("api_reload_lines_new"), "api_ensemble_lines_new": logs.get("api_ensemble_lines_new"),
            "errors": errors, "archiver_version": VERSION}
     append_jsonl(os.path.join(arc, "RUNS.jsonl"), rec)
     print(json.dumps(rec, sort_keys=True))

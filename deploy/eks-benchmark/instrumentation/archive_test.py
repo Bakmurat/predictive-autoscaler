@@ -293,6 +293,46 @@ class LogTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.arc, "logs", "trainer")) and
                          os.listdir(os.path.join(self.arc, "logs", "trainer")))
 
+    def test_api_ensemble_issuance_lines_are_preserved_with_fingerprint(self):
+        fp = "0d80ab9bc8ee" + "f" * 52
+        body = json.dumps({"application": "nginx-ensemble", "namespace": "demo", "origin": "2026-09-23T06:00:00Z",
+                           "raw": [751.2] * 6, "margin": 0.0, "margin_samples": 142, "served": [751.2] * 6,
+                           "stale_generation": False,
+                           "generation": {"boundary": "2026-09-23T06:00:00Z", "fingerprint": fp,
+                                          "hw": {"alpha": 0.01}, "ar": {"coef": [0.6, 0, 0, 0], "rows": 787}}},
+                          sort_keys=True)
+        self.api.pods.append(api_pod("ml-api-1", "a1"))
+        self.api.logs[("ml-api-1", "api", False)] = (
+            "2026-09-23T06:02:32.46Z " + RELOAD.format("c5af91a788a9") + "\n"
+            "2026-09-23T06:06:47Z INFO:api.main:ENSEMBLE_ISSUANCE " + body + "\n"
+            "2026-09-23T06:06:48Z INFO: POST /predict 200\n")
+        out = self.collect()
+        self.assertEqual(out["api_ensemble_lines_new"], 1)
+        recs = lines(os.path.join(self.arc, "logs", "api-ensemble.jsonl"))
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["fingerprint"], fp)
+        self.assertEqual(recs[0]["boundary"], "2026-09-23T06:00:00Z")
+        self.assertEqual(recs[0]["application"], "nginx-ensemble")
+        self.assertEqual(recs[0]["pod_uid"], "a1")
+        self.assertEqual(len(recs[0]["line_sha256"]), 64)
+        cov = lines(os.path.join(self.arc, "logs", "api-coverage.jsonl"))
+        self.assertEqual(cov[-1]["ensemble_lines"], 1)
+        self.assertEqual(cov[-1]["reload_lines"], 1)
+        self.clock[0] = "2026-09-23T12:20:00Z"
+        out = self.collect()
+        self.assertEqual(out["api_ensemble_lines_new"], 0)
+        self.assertEqual(len(lines(os.path.join(self.arc, "logs", "api-ensemble.jsonl"))), 1)
+
+    def test_api_ensemble_line_with_bad_json_keeps_the_raw_hash(self):
+        self.api.pods.append(api_pod("ml-api-1", "a1"))
+        self.api.logs[("ml-api-1", "api", False)] = "2026-09-23T06:06:47Z INFO:api.main:ENSEMBLE_ISSUANCE {not json}\n"
+        self.collect()
+        recs = lines(os.path.join(self.arc, "logs", "api-ensemble.jsonl"))
+        self.assertEqual(len(recs), 1)
+        self.assertIn("parse_error", recs[0])
+        self.assertEqual(len(recs[0]["line_sha256"]), 64)
+        self.assertIsNone(recs[0].get("fingerprint"))
+
     def test_api_reload_lines_are_appended_without_duplicates(self):
         self.api.pods.append(api_pod("ml-api-1", "a1"))
         self.api.logs[("ml-api-1", "api", False)] = (
