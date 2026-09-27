@@ -29,7 +29,7 @@
       },
       "options": {
         "mode": "markdown",
-        "content": "**Blue: LSTM + daily pattern \u00b7 Green: seasonal pattern only \u00b7 Orange: reactive \u00b7 Purple: KEDA**\n\nSame daily simulated schedule, four separate apps. Compare predictions with actual traffic in the **target-matched** charts; later forecast charts show predictions at observation time. Development observation; formal scoring has not started."
+        "content": "**Blue: LSTM + daily pattern \u00b7 Green: seasonal pattern only \u00b7 Orange: reactive \u00b7 Purple: KEDA \u00b7 Red: seasonal ensemble + q90 margin**\n\nSame daily simulated schedule, five separate apps. Compare predictions with actual traffic in the **target-matched** charts; later forecast charts show predictions at observation time. Development observation; formal scoring has not started."
       }
     },
     {
@@ -44,7 +44,7 @@
       },
       "options": {
         "mode": "html",
-        "content": "<table style=\"width:100%;text-align:center;border-spacing:12px\"><tr><th>1 \u00b7 SIMULATE</th><th></th><th>2 \u00b7 OBSERVE</th><th></th><th>3 \u00b7 PREDICT</th><th></th><th>4 \u00b7 DECIDE</th><th></th><th>5 \u00b7 SERVE</th></tr><tr><td>k6 daily schedule<br/>Quiet \u2192 rise \u2192 peak \u2192 fall</td><td>\u2192</td><td>Measured requests/minute<br/>Prometheus traffic history</td><td>\u2192</td><td><b>LSTM + daily pattern</b><br/>or <b>seasonal pattern only</b><br/>Six steps: +10 to +60 min</td><td>\u2192</td><td>Peak forecast in lead window<br/>plus live-traffic safety floor<br/>600 RPM per replica</td><td>\u2192</td><td>Desired pods \u2192 Ready pods<br/>Limits, guards and scale-down<br/>timers also apply</td></tr></table><hr/><p><b>Blue \u00b7 Hybrid:</b> a trained LSTM neural network blended with the same clock-time pattern from previous days. At +10 min: 30% LSTM + 70% pattern. At +60 min: about 9% LSTM + 91% pattern. Training runs every 6 hours. <b>Green \u00b7 Seasonal:</b> uses only the daily pattern in its final prediction; the shared service still computes network diagnostics.</p><p><b>Orange \u00b7 Reactive:</b> scales from traffic already observed. <b>Prediction success:</b> forecast dots would overlap actual traffic at the target time if accurate, and Ready capacity should arrive before demand rises. A running model alone does not prove either.</p><p><b>Timing:</b> the 20-minute step is measured from the last input timestamp, so actual advance notice is shorter when that input is old. Unpredictable bursts still need the reactive safety floor.</p>"
+        "content": "<table style=\"width:100%;text-align:center;border-spacing:12px\"><tr><th>1 \u00b7 SIMULATE</th><th></th><th>2 \u00b7 OBSERVE</th><th></th><th>3 \u00b7 PREDICT</th><th></th><th>4 \u00b7 DECIDE</th><th></th><th>5 \u00b7 SERVE</th></tr><tr><td>k6 daily schedule<br/>Quiet \u2192 rise \u2192 peak \u2192 fall</td><td>\u2192</td><td>Measured requests/minute<br/>Prometheus traffic history</td><td>\u2192</td><td><b>LSTM + daily pattern</b>,<br/><b>seasonal pattern only</b> or<br/><b>seasonal ensemble + q90</b><br/>Six steps: +10 to +60 min</td><td>\u2192</td><td>Peak forecast in lead window<br/>plus live-traffic safety floor<br/>600 RPM per replica</td><td>\u2192</td><td>Desired pods \u2192 Ready pods<br/>Limits, guards and scale-down<br/>timers also apply</td></tr></table><hr/><p><b>Blue \u00b7 Hybrid:</b> a trained LSTM neural network blended with the same clock-time pattern from previous days. At +10 min: 30% LSTM + 70% pattern. At +60 min: about 9% LSTM + 91% pattern. Training runs every 6 hours. <b>Green \u00b7 Seasonal:</b> uses only the daily pattern in its final prediction; the shared service still computes network diagnostics.</p><p><b>Red \u00b7 Seasonal ensemble + q90:</b> half additive Holt-Winters, half the same slot on the previous seven days plus an AR(3) correction, both refitted on 00/06/12/18 UTC. The served value adds a margin: the 90th percentile of its own lead-window errors over the last 24 hours (never negative).</p><p><b>Orange \u00b7 Reactive:</b> scales from traffic already observed. <b>Prediction success:</b> forecast dots would overlap actual traffic at the target time if accurate, and Ready capacity should arrive before demand rises. A running model alone does not prove either.</p><p><b>Timing:</b> the 20-minute step is measured from the last input timestamp, so actual advance notice is shorter when that input is old. Unpredictable bursts still need the reactive safety floor.</p>"
       }
     },
     {
@@ -54,7 +54,7 @@
       "gridPos": {
         "x": 0,
         "y": 13,
-        "w": 12,
+        "w": 8,
         "h": 10
       },
       "datasource": {
@@ -167,9 +167,9 @@
       "title": "Seasonal pattern only \u00b7 predicted vs actual at target time",
       "type": "timeseries",
       "gridPos": {
-        "x": 12,
+        "x": 8,
         "y": 13,
-        "w": 12,
+        "w": 8,
         "h": 10
       },
       "datasource": {
@@ -278,13 +278,128 @@
       "interval": "1m"
     },
     {
+      "id": 16,
+      "title": "Seasonal ensemble + q90 \u00b7 predicted vs actual at target time",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 16,
+        "y": 13,
+        "w": 8,
+        "h": 10
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(istio_requests_total{reporter=\"destination\",destination_workload=\"nginx-ensemble\",destination_workload_namespace=\"demo\"}[1m])) * 60",
+          "legendFormat": "Actual traffic",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "range": true
+        },
+        {
+          "expr": "max(predictive_autoscaler_forecast_rpm{namespace=\"ml-engine\",exported_namespace=\"demo\",application=\"nginx-ensemble\",step=\"2\"} offset 15m and (abs(predictive_autoscaler_forecast_target_timestamp_seconds{namespace=\"ml-engine\",exported_namespace=\"demo\",application=\"nginx-ensemble\",step=\"2\"} offset 15m - time()) <= 30))",
+          "legendFormat": "Predicted \u00b7 20-minute step",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "range": true
+        }
+      ],
+      "description": "The served forecast of the seasonal-ensemble arm INCLUDES its q90 margin (zero while the forecaster's recent errors are within the margin rule). Forecast samples are read 15 minutes earlier and included ONLY when their recorded target timestamp matches chart time within 30 seconds. This shows a subset of 20-minute-step forecasts, not every issuance. Dots are not joined or filled. The step starts at the input anchor, not issuance time. Scrape delays/held gauges can leave gaps. Diagnostic timing tolerance is not formal scored accuracy; use the verified forecast log for exact target scoring. Best viewed at 6 hours or less; wider ranges show fewer matched points. Pairing uses matching source labels before aggregation, including across controller restarts.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqpm",
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "axisBorderShow": false
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Actual traffic"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#B0B0B0"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Predicted \u00b7 20-minute step"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#F2495C"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 0
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "always"
+              },
+              {
+                "id": "custom.pointSize",
+                "value": 7
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": []
+        }
+      },
+      "maxDataPoints": 360,
+      "interval": "1m"
+    },
+    {
       "id": 2,
       "title": "Observed traffic \u00b7 RPM",
       "type": "stat",
       "gridPos": {
         "x": 0,
         "y": 23,
-        "w": 6,
+        "w": 4,
         "h": 4
       },
       "datasource": {
@@ -404,9 +519,9 @@
       "title": "Predictive hybrid \u00b7 Ready replicas",
       "type": "stat",
       "gridPos": {
-        "x": 6,
+        "x": 4,
         "y": 23,
-        "w": 6,
+        "w": 5,
         "h": 4
       },
       "datasource": {
@@ -526,9 +641,9 @@
       "title": "Seasonal only \u00b7 Ready replicas",
       "type": "stat",
       "gridPos": {
-        "x": 12,
+        "x": 9,
         "y": 23,
-        "w": 6,
+        "w": 5,
         "h": 4
       },
       "datasource": {
@@ -648,9 +763,9 @@
       "title": "Reactive \u00b7 Ready replicas",
       "type": "stat",
       "gridPos": {
-        "x": 18,
+        "x": 14,
         "y": 23,
-        "w": 6,
+        "w": 5,
         "h": 4
       },
       "datasource": {
@@ -766,6 +881,143 @@
       "interval": "1m"
     },
     {
+      "id": 17,
+      "title": "Ensemble + q90 \u00b7 Ready replicas",
+      "type": "stat",
+      "gridPos": {
+        "x": 19,
+        "y": 23,
+        "w": 5,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "max(kube_deployment_status_replicas_ready{namespace=\"demo\",deployment=\"nginx-ensemble\"})",
+          "legendFormat": "Ensemble + q90",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "range": true
+        }
+      ],
+      "description": "",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "axisBorderShow": false
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Predictive hybrid"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#5794F2"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Seasonal only"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#73BF69"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Reactive"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#FF9830"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "KEDA"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#B877D9"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Ensemble + q90"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#F2495C"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      },
+      "maxDataPoints": 360,
+      "interval": "1m"
+    },
+    {
       "id": 6,
       "title": "Simulated traffic and traffic received",
       "type": "timeseries",
@@ -824,6 +1076,16 @@
           "expr": "sum(rate(istio_requests_total{reporter=\"destination\",destination_workload=\"myapptwo\",destination_workload_namespace=\"demo\"}[1m])) * 60",
           "legendFormat": "KEDA",
           "refId": "E",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "range": true
+        },
+        {
+          "expr": "sum(rate(istio_requests_total{reporter=\"destination\",destination_workload=\"nginx-ensemble\",destination_workload_namespace=\"demo\"}[1m])) * 60",
+          "legendFormat": "Ensemble + q90",
+          "refId": "F",
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
@@ -922,6 +1184,21 @@
                 }
               }
             ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Ensemble + q90"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#F2495C"
+                }
+              }
+            ]
           }
         ]
       },
@@ -990,6 +1267,26 @@
           "expr": "max(predictive_autoscaler_forecast_rpm{namespace=\"ml-engine\",exported_namespace=\"demo\",application=\"nginx-seasonal\",step=\"2\"})",
           "legendFormat": "Seasonal only \u00b7 20m step",
           "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "range": true
+        },
+        {
+          "expr": "max(predictive_autoscaler_forecast_rpm{namespace=\"ml-engine\",exported_namespace=\"demo\",application=\"nginx-ensemble\",step=\"1\"})",
+          "legendFormat": "Ensemble + q90 \u00b7 10m step",
+          "refId": "E",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "range": true
+        },
+        {
+          "expr": "max(predictive_autoscaler_forecast_rpm{namespace=\"ml-engine\",exported_namespace=\"demo\",application=\"nginx-ensemble\",step=\"2\"})",
+          "legendFormat": "Ensemble + q90 \u00b7 20m step",
+          "refId": "F",
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
@@ -1133,6 +1430,51 @@
                 }
               }
             ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Ensemble + q90"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#F2495C"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Ensemble + q90 \u00b7 10m step"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#F2495C"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Ensemble + q90 \u00b7 20m step"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#F2495C"
+                }
+              }
+            ]
           }
         ]
       },
@@ -1211,6 +1553,16 @@
           "expr": "ceil((sum(rate(istio_requests_total{reporter=\"destination\",destination_workload=\"nginx-test\",destination_workload_namespace=\"demo\"}[1m])) * 60) / 600)",
           "legendFormat": "Traffic / 600 RPM, rounded up",
           "refId": "E",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "range": true
+        },
+        {
+          "expr": "max(kube_deployment_status_replicas_ready{namespace=\"demo\",deployment=\"nginx-ensemble\"})",
+          "legendFormat": "Ensemble + q90",
+          "refId": "F",
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
@@ -1306,6 +1658,21 @@
                 "value": {
                   "mode": "fixed",
                   "fixedColor": "#B8B8B8"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Ensemble + q90"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#F2495C"
                 }
               }
             ]
@@ -1704,6 +2071,16 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "range": true
+        },
+        {
+          "expr": "time() - max(predictive_autoscaler_forecast_issued_timestamp_seconds{namespace=\"ml-engine\",exported_namespace=\"demo\",application=\"nginx-ensemble\"})",
+          "legendFormat": "Ensemble + q90",
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "range": true
         }
       ],
       "description": "Seconds since the latest forecast issuance, not time since a Prometheus scrape.",
@@ -1782,6 +2159,21 @@
                 }
               }
             ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Ensemble + q90"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#F2495C"
+                }
+              }
+            ]
           }
         ]
       },
@@ -1850,6 +2242,16 @@
           "expr": "max(kube_deployment_spec_replicas{namespace=\"demo\",deployment=\"myapptwo\"})",
           "legendFormat": "KEDA",
           "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "range": true
+        },
+        {
+          "expr": "max(kube_deployment_spec_replicas{namespace=\"demo\",deployment=\"nginx-ensemble\"})",
+          "legendFormat": "Ensemble + q90",
+          "refId": "E",
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
@@ -1933,9 +2335,199 @@
                 }
               }
             ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Ensemble + q90"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#F2495C"
+                }
+              }
+            ]
           }
         ]
       },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "maxDataPoints": 360,
+      "interval": "1m"
+    },
+    {
+      "id": 18,
+      "title": "Seasonal ensemble \u00b7 components (20-minute step) and q90 margin",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 60,
+        "w": 24,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "max(ml_api_prediction_rpm{application=\"nginx-ensemble\",component=\"ensemble_hw\",step=\"2\"})",
+          "legendFormat": "Holt-Winters",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "range": true
+        },
+        {
+          "expr": "max(ml_api_prediction_rpm{application=\"nginx-ensemble\",component=\"ensemble_profile_ar\",step=\"2\"})",
+          "legendFormat": "7-day profile + AR(3)",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "range": true
+        },
+        {
+          "expr": "max(ml_api_prediction_rpm{application=\"nginx-ensemble\",component=\"ensemble_raw\",step=\"2\"})",
+          "legendFormat": "Ensemble (no margin)",
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "range": true
+        },
+        {
+          "expr": "max(ml_api_prediction_rpm{application=\"nginx-ensemble\",component=\"final\",step=\"2\"})",
+          "legendFormat": "Served (ensemble + margin)",
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "range": true
+        },
+        {
+          "expr": "max(ml_api_ensemble_margin_rpm{application=\"nginx-ensemble\"})",
+          "legendFormat": "q90 margin (right axis)",
+          "refId": "E",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "range": true
+        },
+        {
+          "expr": "max(ml_api_ensemble_margin_samples{application=\"nginx-ensemble\"})",
+          "legendFormat": "Margin samples (right axis)",
+          "refId": "F",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqpm",
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "spanNulls": false,
+            "drawStyle": "line"
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Served (ensemble + margin)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#F2495C"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 3
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "q90 margin (right axis)"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.drawStyle",
+                "value": "bars"
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 40
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Margin samples (right axis)"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    4,
+                    4
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "description": "Values the forecasting service produced at its latest issuance for the 20-minute step. The q90 margin is the 90th percentile of this forecaster's own lead-window errors over the last 24 hours, clipped at zero; it is added to every served step. Development observation, not scored accuracy.",
       "options": {
         "tooltip": {
           "mode": "multi",
