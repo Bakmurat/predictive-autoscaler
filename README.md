@@ -19,6 +19,7 @@ Built by [Bakmurat Kubanaliev](#author). Apache-2.0.
 | **Demand forecasting** | A three-layer bidirectional LSTM (128/64/32 units) forecasts the next 60 minutes of request rate in six 10-minute steps from the last 24 hours of history. |
 | **Asymmetric training objective** | The loss penalizes under-prediction twice as heavily as over-prediction, because scaling too late costs more than scaling too early. |
 | **Hybrid forecast** | Model output is blended with the workload's own previous-day time-of-day pattern, looked up by timestamp over up to seven prior days (pattern weight 0.70 at the first step rising to 0.908 at the sixth), so forecasts keep the shape of the daily peak instead of regressing to the mean. When less than a day of history is available the pattern is unavailable and the network is served alone, which the response reports. |
+| **Seasonal-ensemble forecaster (opt-in)** | A second forecasting path that needs no neural network: the equal-weight average of an additive daily Holt-Winters model and a seven-day same-slot profile with an AR(3) residual correction, refitted on 00/06/12/18 UTC, plus a capacity margin equal to the 90th percentile of its own recent lead-window errors (never negative). It is selected per application through `ENSEMBLE_EXPERIMENT` (`ml-engine/models/seasonal_ensemble.py`), stateless per request, and refuses a partial forecast so the operator falls back to its reactive rule. |
 | **Continuous learning** | A scheduled job retrains every six hours on the previous seven days and publishes the model to the forecasting service without downtime. |
 | **Declarative operator** | A Go operator (controller-runtime) driven by a `PredictiveAutoscaler` custom resource: target Deployment, replica bounds, per-pod targets, horizon, lead time, and reconcile interval. |
 | **Additive safety model** | Replicas are set to the **highest** of the forecast baseline, the live reactive requirement, and the configured minimum. The forecast can only add capacity. |
@@ -158,10 +159,11 @@ Both suites pass. Last full run 2026-09-20: Go `go vet` + `go test -race` green;
    and a production-equivalent training configuration, judged against the strongest baseline.
    Reject invalid forecasts through a documented fallback and report raw and guarded outputs
    separately.
-2. Validation of the newest forecasting model (five input features, direct six-step output, robust scaling) against the benchmark.
-3. Adaptive blend weights in place of the fixed 0.70-to-0.908 schedule.
-4. A training-time validation gate so a new model can never replace a better one.
-5. Multi-tenant model management, CPU and memory forecasting paths, CRD validation and defaults via webhooks, Helm chart, end-to-end operator tests on kind.
+2. The live benchmark (`deploy/eks-benchmark/`) now runs five arms on identical traffic (the neural/seasonal hybrid, reactive-only, KEDA, seasonal-only and the seasonal ensemble with its margin), and from 2026-09-28 a declared challenge workload (`deploy/eks-benchmark/workload/challenge-v1/`: the same daily cycle with bounded correlated noise, drift and level shifts). Results will be published with their method after a human-declared start of scoring and complete scored days, whatever they show.
+3. Validation of the newest forecasting model (five input features, direct six-step output, robust scaling) against the benchmark.
+4. Adaptive blend weights in place of the fixed 0.70-to-0.908 schedule.
+5. A training-time validation gate so a new model can never replace a better one.
+6. Multi-tenant model management, CPU and memory forecasting paths, CRD validation and defaults via webhooks, Helm chart, end-to-end operator tests on kind.
 
 ## Status
 
@@ -198,6 +200,7 @@ entered the scored window, has been withdrawn.
 
 - Not deployed to production anywhere; evaluated so far only against synthetic traffic in the author's own environments. The first controlled evaluation is published in `eval/RESULTS-2026-09-22-corrected.md` (the 2026-09-21 run was withdrawn) and it does not support the neural component; a live benchmark is running (`deploy/eks-benchmark/`) and its results will be published the same way, whatever they show.
 - The LSTM's training is not numerically stable: on identical data, separate runs produced errors ten orders of magnitude apart. The cause is not established -- the `relu` activation in the LSTM layers is one hypothesis, and the unseeded initialisation is another. Until it is understood, an invalid forecast has no documented rejection path.
+- The seasonal ensemble implements Holt-Winters on NumPy/SciPy (the serving image has no statsmodels). Tests match its initial states and recursion to statsmodels and require an equal or lower fit error, but it is not the statsmodels code. Its margin is empirical, not a coverage guarantee, and a refit that lands inside a traffic burst can make it over-forecast for a while.
 - One target metric in practice (request rate per pod); CPU and memory paths exist in the schema but are not trained.
 - Model files live on a ReadWriteOnce volume, so a single forecasting replica is supported.
 - The API group `autoscaler.example.com` is a placeholder to rename before use.
