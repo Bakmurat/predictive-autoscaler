@@ -328,6 +328,60 @@ def test_api_serves_each_ensemble_app_with_its_own_quantile(api):
     assert b90["ensemble"]["raw"] == b95["ensemble"]["raw"]
     assert b95["ensemble"]["margin"] >= b90["ensemble"]["margin"]
     assert b95["ensemble"]["settings"]["margin_quantile"] == 0.95
-    assert b95["model_version"].startswith("ensemble-q95-v1:") and "seasonal-ensemble-1.1.0@" in b95["model_version"]
+    assert b95["model_version"].startswith("ensemble-q95-v1:") and "seasonal-ensemble-1.2.0@" in b95["model_version"]
     assert b95["model_name"] == "ensemble_nginx-ensemble-q95_requests"
     assert seen["application"] == "nginx-test"                # both read the shared source history
+
+
+def test_relative_margin_scales_with_the_lead_and_matches_the_absolute_rule_in_shape():
+    pts = staircase(days=7, extra=60, noise=0.02, seed=5)
+    now = pts[-1][0]
+    fa = se.forecast(pts, now, "rel")
+    fr = se.forecast(pts, now, "rel", margin_mode="relative")
+    assert fa["raw"] == fr["raw"] and fr["margin_mode"] == "relative" and fa["margin_mode"] == "absolute"
+    assert fr["margin"] >= 0 and fr["margin_samples"] == fa["margin_samples"] >= se.MARGIN_MIN_SAMPLES
+    lead = max(fr["raw"][0], fr["raw"][1])
+    assert fr["margin"] <= se.MARGIN_CLIP_FRACTION * lead
+    assert fr["settings"]["margin_mode"] == "relative" and fr["served"] == [v + fr["margin"] for v in fr["raw"]]
+    grid = se.Grid.from_points(pts)
+    origin = int(np.flatnonzero(np.isfinite(grid.y))[-1])
+    m_rel, n = se.margin_at(grid, origin, lead, "rel", 0.9, "relative")
+    m_rel2, _ = se.margin_at(grid, origin, 2 * lead, "rel", 0.9, "relative")
+    assert m_rel2 == pytest.approx(2 * m_rel)               # relative: proportional to the lead
+    with pytest.raises(ValueError):
+        se.margin_at(grid, origin, lead, "rel", 0.9, "percent")
+
+
+def test_partial_rule_finite_serves_the_remaining_component(monkeypatch):
+    pts = staircase(days=7, extra=60, seed=6)
+    now = pts[-1][0]
+    real = se.components_at
+
+    def hw_missing(grid, origin, cache_key=""):
+        c = real(grid, origin, cache_key)
+        c["hw"] = [float("nan")] * se.STEPS
+        c["raw"] = [float("nan")] * se.STEPS
+        c["raw_finite"] = [max(0.0, v) for v in c["profile_ar"]]
+        return c
+    monkeypatch.setattr(se, "components_at", hw_missing)
+    with pytest.raises(se.ForecastUnavailable):
+        se.forecast(pts, now, "fin")                                   # the 1.0.0 rule refuses
+    f = se.forecast(pts, now, "fin", partial_rule="finite")
+    assert all(np.isfinite(f["served"])) and f["partial_rule"] == "finite" and f["served_components"] == 0
+    assert f["raw"] == [max(0.0, v) for v in f["profile_ar"]]
+    with pytest.raises(ValueError):
+        se.forecast(pts, now, "fin", partial_rule="median")
+
+
+def test_experiment_config_accepts_margin_mode_and_partial_rule():
+    from api.ensemble_experiment import EnsembleExperiment
+    e = EnsembleExperiment.parse(json.dumps({"id": "x", "application": "a", "namespace": "d",
+                                             "source_application": "s", "source_namespace": "d",
+                                             "margin_mode": "relative", "partial_rule": "finite"}))
+    assert e.forecast_mode == "seasonal-ensemble-rq90-finite" and e.provenance()["margin_mode"] == "relative"
+    default = EnsembleExperiment.parse(json.dumps({"id": "x", "application": "a", "namespace": "d",
+                                                   "source_application": "s", "source_namespace": "d"}))
+    assert default.margin_mode == "absolute" and default.partial_rule == "refuse" and default.forecast_mode == "seasonal-ensemble-q90"
+    with pytest.raises(ValueError):
+        EnsembleExperiment.parse(json.dumps({"id": "x", "application": "a", "namespace": "d",
+                                             "source_application": "s", "source_namespace": "d", "margin_mode": "percent"}))

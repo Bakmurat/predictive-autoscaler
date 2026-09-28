@@ -54,7 +54,9 @@ MARGIN_CLIP_FRACTION = 0.8
 MAX_ORIGIN_AGE_SECONDS = 20 * 60
 STALE_GENERATIONS = 1          # an invalid refit may fall back to the previous boundary once
 HW_STARTS = ((0.3, 0.1, 0.1), (0.1, 0.01, 0.05), (0.6, 0.05, 0.3))
-VERSION = "seasonal-ensemble-1.1.0"   # 1.1.0: margin quantile is a per-experiment parameter (default unchanged)
+VERSION = "seasonal-ensemble-1.2.0"   # 1.2.0: per-experiment margin_mode (absolute|relative) and partial_rule (refuse|finite); defaults unchanged
+MARGIN_MODES = ("absolute", "relative")
+PARTIAL_RULES = ("refuse", "finite")
 
 SETTINGS = {
     "version": VERSION, "slot_seconds": SLOT_SECONDS, "season": SEASON, "steps": STEPS,
@@ -374,21 +376,34 @@ def components_at(grid: Grid, origin: int, cache_key: str = "") -> Dict:
         nxt = c[0] + c[1] * hist[0] + c[2] * hist[1] + c[3] * hist[2]
         prof_ar.append(profile_at(y, origin + s) + nxt)
         hist = [nxt, hist[0], hist[1]]
-    raw = []
+    raw, raw_finite = [], []
     for a, bb in zip(hw, prof_ar):
         if np.isfinite(a) and np.isfinite(bb):
             raw.append(max(0.0, HW_WEIGHT * a + (1.0 - HW_WEIGHT) * bb))
+            raw_finite.append(raw[-1])
         else:
             raw.append(float("nan"))
+            # partial_rule "finite": serve the finite component alone; NaN only when both are missing
+            finite = [v for v in (a, bb) if np.isfinite(v)]
+            raw_finite.append(max(0.0, float(np.mean(finite))) if finite else float("nan"))
     return {"hw": [float(v) for v in hw], "profile_ar": [float(v) for v in prof_ar],
-            "raw": raw, "generation": gen, "stale_generation": stale}
+            "raw": raw, "raw_finite": raw_finite, "generation": gen, "stale_generation": stale}
 
 
 def margin_at(grid: Grid, origin: int, lead: float, cache_key: str = "",
-              quantile: float = MARGIN_QUANTILE) -> Tuple[float, int]:
-    """`quantile` (default q90) of past lead-window errors over the trailing 24 h of matured ticks."""
+              quantile: float = MARGIN_QUANTILE, mode: str = "absolute",
+              raw_key: str = "raw") -> Tuple[float, int]:
+    """`quantile` (default q90) of past lead-window errors over the trailing 24 h of matured ticks.
+
+    mode "absolute" (the 1.0.0 rule): samples are max(a10, a20) - lead_j in rpm; the margin is the
+    quantile clipped to [0, 0.8 x lead]. mode "relative" (model lab, 2026-09-28): samples are
+    max(a10, a20) / lead_j - 1; the margin is lead x clip(quantile, 0, 0.8), so it scales with the
+    load instead of carrying daytime errors into the night. `raw_key` selects which served series the
+    errors are measured against ("raw" or "raw_finite", matching the experiment's partial rule)."""
     if not (0.0 < quantile < 1.0):
         raise ValueError(f"margin quantile must lie in (0, 1), got {quantile}")
+    if mode not in MARGIN_MODES:
+        raise ValueError(f"margin mode must be one of {MARGIN_MODES}, got {mode!r}")
     y = grid.y
     samples = []
     for j in range(max(0, origin - MARGIN_WINDOW_SLOTS + 1), origin - 1):
@@ -396,26 +411,39 @@ def margin_at(grid: Grid, origin: int, lead: float, cache_key: str = "",
         if not (np.isfinite(a10) and np.isfinite(a20)) or not np.isfinite(y[j]):
             continue
         try:
-            raw = components_at(grid, j, cache_key)["raw"]
+            raw = components_at(grid, j, cache_key)[raw_key]
         except ForecastUnavailable:
             continue
         if not (np.isfinite(raw[0]) and np.isfinite(raw[1])):
             continue
-        samples.append(max(a10, a20) - max(raw[0], raw[1]))
+        lead_j = max(raw[0], raw[1])
+        if mode == "relative":
+            if lead_j <= 0:
+                continue
+            samples.append(max(a10, a20) / lead_j - 1.0)
+        else:
+            samples.append(max(a10, a20) - lead_j)
     if len(samples) < MARGIN_MIN_SAMPLES:
         return 0.0, len(samples)
     q = float(np.quantile(samples, quantile))
+    if mode == "relative":
+        return float(lead * np.clip(q, 0.0, MARGIN_CLIP_FRACTION)), len(samples)
     return float(np.clip(q, 0.0, MARGIN_CLIP_FRACTION * lead)), len(samples)
 
 
 def forecast(points: Iterable[Tuple[int, float]], now_ts: int, cache_key: str = "",
-             margin_quantile: float = MARGIN_QUANTILE) -> Dict:
+             margin_quantile: float = MARGIN_QUANTILE, margin_mode: str = "absolute",
+             partial_rule: str = "refuse") -> Dict:
     """Serve one forecast from on-grid (epoch seconds, value) observations.
 
     `margin_quantile` selects the error quantile added as capacity margin (q90 by default; an
-    experiment may declare another). Raises ForecastUnavailable when the input is stale, a
-    generation cannot be fitted, or any of the six steps is not finite (a partial forecast is refused).
+    experiment may declare another); `margin_mode` "absolute" (rpm) or "relative" (fraction of the
+    lead); `partial_rule` "refuse" (a step with a missing component is refused, the 1.0.0 rule) or
+    "finite" (the finite component is served alone). Raises ForecastUnavailable when the input is
+    stale, a generation cannot be fitted, or any served step is not finite.
     """
+    if partial_rule not in PARTIAL_RULES:
+        raise ValueError(f"partial rule must be one of {PARTIAL_RULES}, got {partial_rule!r}")
     grid = Grid.from_points(points)
     observed = np.flatnonzero(np.isfinite(grid.y))
     origin = int(observed[-1])
@@ -424,20 +452,24 @@ def forecast(points: Iterable[Tuple[int, float]], now_ts: int, cache_key: str = 
         raise ForecastUnavailable(f"latest observation {_iso(origin_ts)} is older than "
                                   f"{MAX_ORIGIN_AGE_SECONDS // 60} minutes")
     comp = components_at(grid, origin, cache_key)
-    raw = comp["raw"]
+    raw_key = "raw_finite" if partial_rule == "finite" else "raw"
+    raw = comp[raw_key]
     if not all(np.isfinite(v) for v in raw):
         raise ForecastUnavailable("ensemble step(s) not finite: hw=%s profile_ar=%s"
                                   % (comp["hw"], comp["profile_ar"]))
     lead = max(raw[0], raw[1])
-    margin, n = margin_at(grid, origin, lead, cache_key, margin_quantile)
+    margin, n = margin_at(grid, origin, lead, cache_key, margin_quantile, margin_mode, raw_key)
     gen: Generation = comp["generation"]
     return {
         "origin": _iso(origin_ts),
         "target_timestamps": [_iso(origin_ts + s * SLOT_SECONDS) for s in range(1, STEPS + 1)],
         "hw": comp["hw"], "profile_ar": comp["profile_ar"], "raw": raw,
         "margin": margin, "margin_samples": n, "margin_quantile": margin_quantile,
+        "margin_mode": margin_mode, "partial_rule": partial_rule,
+        "served_components": sum(1 for a, bb in zip(comp["hw"], comp["profile_ar"]) if np.isfinite(a) and np.isfinite(bb)),
         "served": [v + margin for v in raw],
         "generation": gen.summary(), "stale_generation": comp["stale_generation"],
         "off_grid_dropped": grid.off_grid_dropped,
-        "settings": {**SETTINGS, "margin_quantile": margin_quantile},
+        "settings": {**SETTINGS, "margin_quantile": margin_quantile, "margin_mode": margin_mode,
+                     "partial_rule": partial_rule},
     }

@@ -46,3 +46,15 @@ sealed seed, the sixth generator offers the same traffic as the other five from 
 
 Patch `ENSEMBLE_EXPERIMENT` back to the single q90 object (the 1.1.0 image accepts both forms),
 delete the q95 PredictiveAutoscaler, generator, app and service. E1 is unaffected.
+
+## seasonal-ensemble-1.2.0 options (2026-09-28, from the model lab's results; not yet used by any live arm)
+
+Each experiment may also declare `"margin_mode": "relative"` (the margin is the lead times the quantile of past
+`max(a10, a20) / lead − 1`, so it scales with the load; default `"absolute"`, the 1.0.0 rule) and
+`"partial_rule": "finite"` (a step whose Holt-Winters or profile-AR component is missing is served from the finite
+component alone; default `"refuse"`). Offline on the challenge process (lab report
+`agent-coordination/07-jupyter-model-lab/LAB-RESULTS-20260928.md`) the relative q90 margin cut E1's shortage by 8–22
+replica-minutes per 14 days in 13 of 14 configurations with intervals excluding zero, for less surplus than q95, and
+the finite rule removed the 5–8× loss under component failure. `forecast_mode` becomes e.g.
+`seasonal-ensemble-rq90-finite`; every issuance logs `margin_mode`, `partial_rule` and `served_components`.
+Switching a live arm to these options is a configuration change plus an API image and a re-qualification.

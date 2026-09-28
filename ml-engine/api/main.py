@@ -1153,7 +1153,9 @@ async def predict_ensemble(experiment, application, namespace, metric_type, hori
             result = await loop.run_in_executor(
                 None, functools.partial(seasonal_ensemble.forecast, pts, now_ts,
                                         f"{experiment.source_namespace}/{experiment.source_application}",
-                                        margin_quantile=experiment.margin_quantile))
+                                        margin_quantile=experiment.margin_quantile,
+                                        margin_mode=experiment.margin_mode,
+                                        partial_rule=experiment.partial_rule))
     except (seasonal_ensemble.ForecastUnavailable, ValueError) as e:
         PREDICTION_ERRORS.labels(error_type="EnsembleUnavailable").inc()
         raise HTTPException(422, f"forecast refused: {e}")
@@ -1214,6 +1216,8 @@ async def predict_ensemble(experiment, application, namespace, metric_type, hori
     logger.info("ENSEMBLE_ISSUANCE " + json.dumps({
         "application": application, "namespace": namespace, "origin": result["origin"],
         "experiment": experiment.id, "margin_quantile": experiment.margin_quantile,
+        "margin_mode": experiment.margin_mode, "partial_rule": experiment.partial_rule,
+        "served_components": result.get("served_components"),
         "raw": [round(v, 2) for v in result["raw"]], "margin": round(result["margin"], 2),
         "margin_samples": result["margin_samples"], "served": served, "generation": gen,
         "stale_generation": result["stale_generation"]}, sort_keys=True))

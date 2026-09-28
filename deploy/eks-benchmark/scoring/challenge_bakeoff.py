@@ -324,7 +324,7 @@ def forecasts_at(grid, origin, cache_key, failures=None):
 # Margin, scoring, replay
 # ------------------------------------------------------------------------------------------
 
-def q90_margins(y, leads, origins, quantile=se.MARGIN_QUANTILE, window=se.MARGIN_WINDOW_SLOTS):
+def q90_margins(y, leads, origins, quantile=se.MARGIN_QUANTILE, window=se.MARGIN_WINDOW_SLOTS, mode="absolute"):
     """The live rule for every method: q90 of matured lead-window errors over the trailing 24 h,
     at least MARGIN_MIN_SAMPLES samples, clipped to [0, 0.8 x lead]. `leads[k]` = max(step+10, step+20)
     forecast issued at origin k (NaN when unavailable). Equals seasonal_ensemble.margin_at for e1 at the
@@ -336,12 +336,14 @@ def q90_margins(y, leads, origins, quantile=se.MARGIN_QUANTILE, window=se.MARGIN
             if j + 2 >= len(y) or not (np.isfinite(y[j]) and np.isfinite(y[j + 1]) and np.isfinite(y[j + 2])):
                 continue
             lj = leads.get(j)
-            if lj is None or not np.isfinite(lj):
+            if lj is None or not np.isfinite(lj) or (mode == "relative" and lj <= 0):
                 continue
-            samples.append(max(y[j + 1], y[j + 2]) - lj)
+            samples.append(max(y[j + 1], y[j + 2]) / lj - 1.0 if mode == "relative" else max(y[j + 1], y[j + 2]) - lj)
         lead = leads.get(k)
         if len(samples) < se.MARGIN_MIN_SAMPLES or lead is None or not np.isfinite(lead):
             margins[k] = 0.0
+        elif mode == "relative":
+            margins[k] = float(lead * np.clip(np.quantile(samples, quantile), 0.0, se.MARGIN_CLIP_FRACTION))
         else:
             q = float(np.quantile(samples, quantile))
             margins[k] = float(np.clip(q, 0.0, se.MARGIN_CLIP_FRACTION * lead))
@@ -437,6 +439,8 @@ def evaluate_series(points, first_origin_ts, cache_key, methods=None, per_pod=60
         m80 = q90_margins(y, leads, origins, quantile=0.80)
         m95 = q90_margins(y, leads, origins, quantile=0.95)
         m90_12h = q90_margins(y, leads, origins, window=se.MARGIN_WINDOW_SLOTS // 2)
+        r90 = q90_margins(y, leads, origins, mode="relative")
+        r80 = q90_margins(y, leads, origins, quantile=0.80, mode="relative")
         pol = OrderedDict()
         R = lambda f: replay(y, origins, f, per_pod, min_r, max_r, windows=windows)
         pol["none"] = R(lambda k: leads.get(k, float("nan")))
@@ -444,6 +448,8 @@ def evaluate_series(points, first_origin_ts, cache_key, methods=None, per_pod=60
         pol["q90"] = R(lambda k: leads.get(k, float("nan")) + margins.get(k, 0.0))
         pol["q95"] = R(lambda k: leads.get(k, float("nan")) + m95.get(k, 0.0))
         pol["q90_12h"] = R(lambda k: leads.get(k, float("nan")) + m90_12h.get(k, 0.0))
+        pol["rq80"] = R(lambda k: leads.get(k, float("nan")) + r80.get(k, 0.0))
+        pol["rq90"] = R(lambda k: leads.get(k, float("nan")) + r90.get(k, 0.0))
         pol["fixed10"] = R(lambda k: leads.get(k, float("nan")) * 1.10)
         wmae = {}
         for wname, ranges in (windows or {}).items():

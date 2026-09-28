@@ -198,3 +198,20 @@ def test_replay_window_sums_partition_the_totals():
     ws = r["windows"]
     assert ws["first"]["shortage_replica_min"] + ws["rest"]["shortage_replica_min"] == r["shortage_replica_min"]
     assert ws["first"]["surplus_replica_min"] + ws["rest"]["surplus_replica_min"] == r["surplus_replica_min"]
+
+
+def test_relative_margin_matches_the_serving_module_and_scales_with_the_lead():
+    rates, _ = bo.offered_rates(seed=6, warm_days=7, challenge_days=2)
+    grid = se.Grid.from_points(bo.sampled_series(rates, seed=6))
+    origins = list(range(7 * bo.SEASON - se.MARGIN_WINDOW_SLOTS, len(grid.y) - 2))
+    leads = {}
+    for k in origins:
+        raw = se.components_at(grid, k, "relpar")["raw"]
+        leads[k] = max(raw[0], raw[1])
+    mine = bo.q90_margins(grid.y, leads, origins, mode="relative")
+    for k in (origins[se.MARGIN_WINDOW_SLOTS + 60], origins[-1]):
+        theirs, _ = se.margin_at(grid, k, leads[k], "relpar", 0.9, "relative")
+        assert mine[k] == pytest.approx(theirs, abs=1e-9)
+    k = origins[-1]
+    doubled = bo.q90_margins(grid.y, {**leads, k: 2 * leads[k]}, [k], mode="relative")[k]
+    assert doubled == pytest.approx(2 * mine[k])

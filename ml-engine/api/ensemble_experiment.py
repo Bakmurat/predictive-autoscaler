@@ -15,7 +15,7 @@ import re
 from models import seasonal_ensemble
 
 REQUIRED = ("id", "application", "namespace", "source_application", "source_namespace")
-OPTIONAL = ("margin_quantile",)
+OPTIONAL = ("margin_quantile", "margin_mode", "partial_rule")
 QUANTILE_RANGE = (0.5, 0.99)
 
 
@@ -27,6 +27,8 @@ class EnsembleExperiment:
     source_application: str
     source_namespace: str
     margin_quantile: float = seasonal_ensemble.MARGIN_QUANTILE
+    margin_mode: str = "absolute"
+    partial_rule: str = "refuse"
 
     @classmethod
     def from_dict(cls, value):
@@ -45,7 +47,14 @@ class EnsembleExperiment:
         if isinstance(q, bool) or not isinstance(q, (int, float)) or not (QUANTILE_RANGE[0] <= q <= QUANTILE_RANGE[1]):
             raise ValueError(f"ENSEMBLE_EXPERIMENT margin_quantile must be a number in "
                              f"[{QUANTILE_RANGE[0]}, {QUANTILE_RANGE[1]}]")
-        return cls(**{**{k: value[k] for k in REQUIRED}, "margin_quantile": float(q)})
+        mode = value.get("margin_mode", "absolute")
+        rule = value.get("partial_rule", "refuse")
+        if mode not in seasonal_ensemble.MARGIN_MODES:
+            raise ValueError(f"ENSEMBLE_EXPERIMENT margin_mode must be one of {seasonal_ensemble.MARGIN_MODES}")
+        if rule not in seasonal_ensemble.PARTIAL_RULES:
+            raise ValueError(f"ENSEMBLE_EXPERIMENT partial_rule must be one of {seasonal_ensemble.PARTIAL_RULES}")
+        return cls(**{**{k: value[k] for k in REQUIRED}, "margin_quantile": float(q), "margin_mode": mode,
+                      "partial_rule": rule})
 
     @classmethod
     def parse(cls, raw: str):
@@ -81,7 +90,9 @@ class EnsembleExperiment:
 
     @property
     def forecast_mode(self):
-        return f"seasonal-ensemble-q{int(round(self.margin_quantile * 100))}"
+        q = int(round(self.margin_quantile * 100))
+        return f"seasonal-ensemble-{'r' if self.margin_mode == 'relative' else ''}q{q}" + \
+            ("-finite" if self.partial_rule == "finite" else "")
 
     def matches(self, application, namespace, metric_type):
         return (application, namespace, metric_type) == (self.application, self.namespace, "requests")
