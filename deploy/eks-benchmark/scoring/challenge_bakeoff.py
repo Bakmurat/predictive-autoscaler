@@ -96,8 +96,15 @@ def merged_profile(override=None):
     return p
 
 
-def offered_rates(seed, warm_days, challenge_days, t0=DEFAULT_T0, profile=None):
-    """Offered rpm per slot: repeating-v2 for warm_days, then the challenge process for challenge_days."""
+def offered_rates(seed, warm_days, challenge_days, t0=DEFAULT_T0, profile=None, events=None):
+    """Offered rpm per slot: repeating-v2 for warm_days, then the challenge process for challenge_days.
+
+    `events` overlays the lab's stress cases on the challenge process (slot indices count from t0):
+      {"bursts": [(day, minute_of_day, width_slots, factor), ...],   # e.g. (3, 11*60+40, 6, 2.5)
+       "shift": (day, minute_of_day, factor)}                          # e.g. (7, 12*60, 1.55)
+    `day` counts from the first challenge day. Returns (rates, windows) where windows holds the
+    scoring windows in slot indices: "burst_inside" (the burst itself), "burst_after" (2 h after each
+    burst ends), "shift_24h" (first 24 h after the shift)."""
     profile = profile or cp.PROFILE
     base = profile["base_pattern_utc_rpm"]
     n_warm, n_ch = warm_days * SEASON, challenge_days * SEASON
@@ -107,8 +114,22 @@ def offered_rates(seed, warm_days, challenge_days, t0=DEFAULT_T0, profile=None):
         t = t0 + k * SLOT
         hour = datetime.datetime.fromtimestamp(t, tz=datetime.timezone.utc).hour
         m = 1.0 if k < n_warm else mult[k - n_warm]
-        rates.append(math.floor(base[hour] * m + 0.5))
-    return rates
+        rates.append(base[hour] * m)
+    windows = {"burst_inside": [], "burst_after": [], "shift_24h": []}
+    for day, minute, width, factor in (events or {}).get("bursts", []):
+        at = n_warm + day * SEASON + minute // (SLOT // 60)
+        for k in range(at, min(len(rates), at + width)):
+            rates[k] *= factor
+        windows["burst_inside"].append((at, at + width))
+        windows["burst_after"].append((at + width, at + width + 12))
+    shift = (events or {}).get("shift")
+    if shift:
+        day, minute, factor = shift
+        at = n_warm + day * SEASON + minute // (SLOT // 60)
+        for k in range(at, len(rates)):
+            rates[k] *= factor
+        windows["shift_24h"].append((at, at + SEASON))
+    return [math.floor(r + 0.5) for r in rates], windows
 
 
 def sampled_series(rates, seed, t0=DEFAULT_T0, noise=MEASUREMENT_NOISE):
@@ -225,29 +246,77 @@ def bias_corrected(grid, origin, cache_key, raw, support=6, halflife_slots=3.0, 
     return [max(0.0, v * ratio) for v in raw]
 
 
-def forecasts_at(grid, origin, cache_key):
-    """All methods' six-step forecasts from one origin, as {name: [6 floats]} (NaN = unavailable)."""
+def failure_plan(grid, o0, n_origins, kind, windows, seed):
+    """Which component is unavailable at which origins (the lab's single-component failure test).
+    kind: "hw_burst_generation"  -> the Holt-Winters component of every generation whose refit boundary
+                                    lies inside or within 2 h after a burst is unavailable (a fit
+                                    contaminated by the burst is refused)
+          "theta_random_generation" -> Theta is unavailable for one random six-hour generation per day
+          "hw_random_generation"    -> Holt-Winters unavailable for one random generation per day
+    Returns {component: set(origin indices)}."""
+    plan = {"hw": set(), "theta": set(), "profile_ar": set()}
+    if not kind:
+        return plan
+    gen_slots = REFIT_SECONDS_SLOTS = se.REFIT_SECONDS // SLOT
+    origins = range(o0, o0 + n_origins)
+    def boundary_of(k):
+        return (grid.ts(k) // se.REFIT_SECONDS) * se.REFIT_SECONDS
+    if kind == "hw_burst_generation":
+        bad = set()
+        for (a, b) in windows.get("burst_inside", []) + windows.get("burst_after", []):
+            for k in range(a, b):
+                bad.add(boundary_of(k))
+        plan["hw"] = {k for k in origins if boundary_of(k) in bad}
+    elif kind in ("theta_random_generation", "hw_random_generation"):
+        rng = np.random.default_rng(seed + 7)
+        comp = "theta" if kind.startswith("theta") else "hw"
+        days = n_origins // SEASON + 1
+        bad = set()
+        for d in range(days):
+            k = o0 + d * SEASON + int(rng.integers(0, SEASON))
+            if k < o0 + n_origins:
+                bad.add(boundary_of(k))
+        plan[comp] = {k for k in origins if boundary_of(k) in bad}
+    else:
+        raise ValueError(f"unknown failure kind {kind}")
+    return plan
+
+
+def forecasts_at(grid, origin, cache_key, failures=None):
+    """All methods' six-step forecasts from one origin, as {name: [6 floats]} (NaN = unavailable).
+    `failures` = {component: set(origins)} marks a component unavailable at those origins; e1 then
+    refuses (its live rule: a partial forecast is refused), `median3` refuses unless all three members
+    are finite, and `median3_finite` serves the median of the finite members (the mean of two)."""
     y, yf = grid.y, grid.filled()
     nan6 = [float("nan")] * STEPS
     out = OrderedDict()
+    failures = failures or {}
     try:
         comp = se.components_at(grid, origin, cache_key)
         out["e1"], out["hw"], out["profile_ar"] = comp["raw"], comp["hw"], comp["profile_ar"]
     except (se.ForecastUnavailable, ValueError):
         out["e1"], out["hw"], out["profile_ar"] = nan6, nan6, nan6
+    if origin in failures.get("hw", ()):
+        out["hw"], out["e1"] = nan6, nan6
+    if origin in failures.get("profile_ar", ()):
+        out["profile_ar"], out["e1"] = nan6, nan6
     out["profile7"] = [se.profile_at(y, origin + s) for s in range(1, STEPS + 1)]
     out["yesterday"] = [yf[origin + s - SEASON] if origin + s - SEASON >= 0 else float("nan")
                         for s in range(1, STEPS + 1)]
     out["persistence"] = [float(yf[origin])] * STEPS
     out["profile_ratio"] = profile_ratio_forecast(y, yf, origin)
     out["e1_bc"] = bias_corrected(grid, origin, cache_key, out["e1"])
-    out["theta"] = theta_forecast(yf, origin)
+    out["theta"] = nan6 if origin in failures.get("theta", ()) else theta_forecast(yf, origin)
     trio = np.array([out["hw"], out["profile_ar"], out["theta"]], dtype=float)
-    if np.all(np.isfinite(trio)):
+    finite_rows = [r for r in trio if np.all(np.isfinite(r))]
+    if len(finite_rows) == 3:
         out["median3"] = [float(v) for v in np.median(trio, axis=0)]
         out["mean3"] = [float(v) for v in np.mean(trio, axis=0)]
+        out["median3_finite"] = out["median3"]
     else:
         out["median3"], out["mean3"] = nan6, nan6
+        out["median3_finite"] = ([float(v) for v in np.median(np.array(finite_rows), axis=0)]
+                                 if len(finite_rows) >= 2 else nan6)
     return out
 
 
@@ -283,13 +352,16 @@ def pods(rpm, per_pod):
     return max(1, math.ceil(rpm / per_pod - 1e-9)) if np.isfinite(rpm) and rpm > 0 else 1
 
 
-def replay(y, origins, lead_of, per_pod, min_r, max_r, reactive_lag_min=2.0, slot_min=SLOT / 60.0):
+def replay(y, origins, lead_of, per_pod, min_r, max_r, reactive_lag_min=2.0, slot_min=SLOT / 60.0,
+           windows=None):
     """Controller replay over consecutive origins. lead_of(k) -> lead rpm incl. margin, or NaN.
-    Returns shortage / surplus replica-minutes, short minutes, mean Ready, scale changes."""
+    Returns shortage / surplus replica-minutes, short minutes, mean Ready, scale changes, and the same
+    sums inside each named scoring window (slot index ranges on the requirement slot k + 1)."""
     ready = min(max_r, max(min_r, pods(y[origins[0]], per_pod)))
     prev_desired = ready
     short = surplus = short_min = 0.0
     total_ready, changes, n = 0.0, 0, 0
+    per_slot = {}
     for k in origins:
         if k + 1 >= len(y) or not np.isfinite(y[k + 1]):
             break
@@ -309,32 +381,45 @@ def replay(y, origins, lead_of, per_pod, min_r, max_r, reactive_lag_min=2.0, slo
         ready = nxt
         required = min(max_r, pods(y[k + 1], per_pod))
         if ready >= required:
-            surplus += (ready - required) * slot_min
+            s_add, sp_add = 0.0, (ready - required) * slot_min
         else:
             gap = required - ready
-            short += gap * reactive_lag_min
+            s_add, sp_add = gap * reactive_lag_min, 0.0
             short_min += reactive_lag_min
-            surplus += 0.0
             ready = required                 # the reactive path caught up for the rest of the slot
             changes += 1
+        short += s_add
+        surplus += sp_add
+        per_slot[k + 1] = (s_add, sp_add)
         total_ready += ready
         n += 1
-    return {"shortage_replica_min": round(short, 1), "surplus_replica_min": round(surplus, 1),
-            "short_min": round(short_min, 1), "mean_ready": round(total_ready / n, 3) if n else None,
-            "changes": changes, "slots": n}
+    out = {"shortage_replica_min": round(short, 1), "surplus_replica_min": round(surplus, 1),
+           "short_min": round(short_min, 1), "mean_ready": round(total_ready / n, 3) if n else None,
+           "changes": changes, "slots": n}
+    if windows:
+        out["windows"] = {}
+        for name, ranges in windows.items():
+            ws = sum(per_slot.get(j, (0.0, 0.0))[0] for a, b in ranges for j in range(a, b))
+            wp = sum(per_slot.get(j, (0.0, 0.0))[1] for a, b in ranges for j in range(a, b))
+            out["windows"][name] = {"shortage_replica_min": round(ws, 1), "surplus_replica_min": round(wp, 1),
+                                    "slots": sum(b - a for a, b in ranges)}
+    return out
 
 
-def evaluate_series(points, first_origin_ts, cache_key, methods=None, per_pod=600.0, min_r=1, max_r=12):
+def evaluate_series(points, first_origin_ts, cache_key, methods=None, per_pod=600.0, min_r=1, max_r=12,
+                    windows=None, failures=None, seed=0):
     grid = se.Grid.from_points(points)
     y = grid.y
     o0 = grid.index(first_origin_ts)
     origins = list(range(o0, len(y) - LEAD_STEPS))
+    windows = {k: v for k, v in (windows or {}).items() if v} or None
+    fplan = failure_plan(grid, o0, len(origins), failures, windows or {}, seed) if failures else None
     # Forecasts start one margin window earlier so every method's q90 window is as full at the first
     # scored origin as the live arm's was at the regime switch; only `origins` are scored and replayed.
     warm = list(range(max(0, o0 - se.MARGIN_WINDOW_SLOTS), o0))
     F = {}                                  # method -> {origin: [6]}
     for k in warm + origins:
-        for name, f in forecasts_at(grid, k, cache_key).items():
+        for name, f in forecasts_at(grid, k, cache_key, fplan).items():
             if methods and name not in methods:
                 continue
             F.setdefault(name, {})[k] = f
@@ -353,23 +438,30 @@ def evaluate_series(points, first_origin_ts, cache_key, methods=None, per_pod=60
         m95 = q90_margins(y, leads, origins, quantile=0.95)
         m90_12h = q90_margins(y, leads, origins, window=se.MARGIN_WINDOW_SLOTS // 2)
         pol = OrderedDict()
-        pol["none"] = replay(y, origins, lambda k: leads.get(k, float("nan")), per_pod, min_r, max_r)
-        pol["q80"] = replay(y, origins, lambda k: leads.get(k, float("nan")) + m80.get(k, 0.0), per_pod, min_r, max_r)
-        pol["q90"] = replay(y, origins, lambda k: leads.get(k, float("nan")) + margins.get(k, 0.0),
-                            per_pod, min_r, max_r)
-        pol["q95"] = replay(y, origins, lambda k: leads.get(k, float("nan")) + m95.get(k, 0.0), per_pod, min_r, max_r)
-        pol["q90_12h"] = replay(y, origins, lambda k: leads.get(k, float("nan")) + m90_12h.get(k, 0.0), per_pod, min_r, max_r)
-        pol["fixed10"] = replay(y, origins, lambda k: leads.get(k, float("nan")) * 1.10, per_pod, min_r, max_r)
+        R = lambda f: replay(y, origins, f, per_pod, min_r, max_r, windows=windows)
+        pol["none"] = R(lambda k: leads.get(k, float("nan")))
+        pol["q80"] = R(lambda k: leads.get(k, float("nan")) + m80.get(k, 0.0))
+        pol["q90"] = R(lambda k: leads.get(k, float("nan")) + margins.get(k, 0.0))
+        pol["q95"] = R(lambda k: leads.get(k, float("nan")) + m95.get(k, 0.0))
+        pol["q90_12h"] = R(lambda k: leads.get(k, float("nan")) + m90_12h.get(k, 0.0))
+        pol["fixed10"] = R(lambda k: leads.get(k, float("nan")) * 1.10)
+        wmae = {}
+        for wname, ranges in (windows or {}).items():
+            errs = [abs(fk[k][1] - y[k + 2]) for a, b in ranges for k in range(a - 2, b - 2)
+                    if k in fk and np.isfinite(fk[k][1]) and k + 2 < len(y)]
+            wmae[wname] = round(float(np.mean(errs)), 1) if errs else None
         results[name] = {"mae10": round(float(np.mean(e10)), 1) if e10 else None,
                          "mae20": round(float(np.mean(e20)), 1) if e20 else None,
                          "mape10_pct": round(100 * float(np.mean(p10)), 2) if p10 else None,
                          "under_forecast_rate": round(float(np.mean(under)), 3) if under else None,
                          "availability": round(avail, 3),
                          "median_q90_margin": round(float(np.median([margins[k] for k in origins])), 1),
-                         "policies": pol}
-    results["reactive_only"] = {"policies": {"none": replay(y, origins, lambda k: float("nan"), per_pod, min_r, max_r)}}
+                         "window_mae20": wmae, "policies": pol}
+    results["reactive_only"] = {"policies": {"none": replay(y, origins, lambda k: float("nan"), per_pod, min_r, max_r,
+                                                            windows=windows)}}
     results["oracle"] = {"policies": {"none": replay(
-        y, origins, lambda k: max(y[k + 1], y[k + 2]) if k + 2 < len(y) else float("nan"), per_pod, min_r, max_r)}}
+        y, origins, lambda k: max(y[k + 1], y[k + 2]) if k + 2 < len(y) else float("nan"), per_pod, min_r, max_r,
+        windows=windows)}}
     return results, origins
 
 
@@ -377,11 +469,13 @@ def evaluate_series(points, first_origin_ts, cache_key, methods=None, per_pod=60
 # Runner and report
 # ------------------------------------------------------------------------------------------
 
-def run_seed(seed, warm_days, challenge_days, methods, per_pod, max_r, profile=None):
-    rates = offered_rates(seed, warm_days, challenge_days, profile=profile)
+def run_seed(seed, warm_days, challenge_days, methods, per_pod, max_r, profile=None, events=None,
+             failures=None):
+    rates, windows = offered_rates(seed, warm_days, challenge_days, profile=profile, events=events)
     points = sampled_series(rates, seed)
     first_origin = DEFAULT_T0 + warm_days * SEASON * SLOT
-    return evaluate_series(points, first_origin, f"bakeoff-{seed}", methods, per_pod, 1, max_r)[0]
+    return evaluate_series(points, first_origin, f"bakeoff-{seed}", methods, per_pod, 1, max_r,
+                           windows=windows, failures=failures, seed=seed)[0]
 
 
 def aggregate(per_seed):
@@ -399,9 +493,35 @@ def aggregate(per_seed):
             keys = ("shortage_replica_min", "surplus_replica_min", "short_min", "mean_ready", "changes")
             m = {k: round(float(np.mean([r["policies"][pol][k] for r in rows])), 1) for k in keys}
             m["worst_shortage"] = round(max(r["policies"][pol]["shortage_replica_min"] for r in rows), 1)
+            if "windows" in rows[0]["policies"][pol]:
+                m["windows"] = {}
+                for w in rows[0]["policies"][pol]["windows"]:
+                    m["windows"][w] = {k: round(float(np.mean([r["policies"][pol]["windows"][w][k] for r in rows])), 1)
+                                       for k in ("shortage_replica_min", "surplus_replica_min")}
             entry["policies"][pol] = m
+        if rows[0].get("window_mae20"):
+            entry["window_mae20"] = {w: round(float(np.mean([r["window_mae20"][w] for r in rows if r["window_mae20"].get(w) is not None])), 1)
+                                     for w in rows[0]["window_mae20"] if any(r["window_mae20"].get(w) is not None for r in rows)}
         agg[name] = entry
     return agg
+
+
+def print_windows(agg):
+    """Event-window view: q90 shortage / surplus inside each window, and MAE at +20 there."""
+    wins = [w for r in agg.values() for p in r["policies"].values() for w in p.get("windows", {})]
+    wins = list(OrderedDict.fromkeys(wins))
+    if not wins:
+        return
+    print("event windows (q90 policy; shortage/surplus replica-minutes inside the window; MAE at +20 min inside it):")
+    print(f"{'method':14s} | " + " | ".join(f"{w:>26s}" for w in wins))
+    for name, r in agg.items():
+        p = r["policies"].get("q90") or r["policies"].get("none")
+        cells = []
+        for w in wins:
+            ww = p.get("windows", {}).get(w)
+            mae = (r.get("window_mae20") or {}).get(w)
+            cells.append(f"{ww['shortage_replica_min']:7.1f}/{ww['surplus_replica_min']:8.1f} {('mae ' + str(mae)) if mae is not None else '':>10s}" if ww else " " * 26)
+        print(f"{name:14s} | " + " | ".join(cells))
 
 
 def print_report(agg, seeds, days):
@@ -437,6 +557,10 @@ def main():
     ap.add_argument("--methods", default="")
     ap.add_argument("--override", default="", help="JSON merged over profile.json for a stress variant, e.g. "
                     "'{\"noise\": {\"sigma\": 0.08, \"clip\": 0.2}, \"shifts\": {\"max_abs_level\": 0.25}}'")
+    ap.add_argument("--events", default="", help="JSON stress events on the challenge process: "
+                    "'{\"bursts\": [[3, 700, 6, 2.5]], \"shift\": [7, 720, 1.55]}' (day, minute of day, width slots, factor)")
+    ap.add_argument("--failures", default="", help="single-component failure test: hw_burst_generation | "
+                    "theta_random_generation | hw_random_generation")
     ap.add_argument("--json")
     ap.add_argument("--real", help="JSON {app: [[ts, rpm], ...]} from Prometheus; replay the harness on it")
     ap.add_argument("--app", default="nginx-test")
@@ -459,18 +583,29 @@ def main():
     seeds = list(range(a.first_seed, a.first_seed + a.seeds))
     assert cp.PROFILE["seed"] not in seeds, "never evaluate on the sealed seed"
     profile = merged_profile(json.loads(a.override)) if a.override else None
+    events = json.loads(a.events) if a.events else None
+    if events:
+        events = {"bursts": [tuple(b) for b in events.get("bursts", [])],
+                  "shift": tuple(events["shift"]) if events.get("shift") else None}
     per_seed = OrderedDict()
     for s in seeds:
-        per_seed[s] = run_seed(s, a.warm_days, a.challenge_days, methods, a.per_pod_rpm, a.max_replicas, profile)
+        per_seed[s] = run_seed(s, a.warm_days, a.challenge_days, methods, a.per_pod_rpm, a.max_replicas, profile,
+                               events, a.failures or None)
         print(f"seed {s} done", file=sys.stderr)
     agg = aggregate(per_seed)
     if a.override:
         print(f"process override: {a.override}")
+    if a.events:
+        print(f"events: {a.events}")
+    if a.failures:
+        print(f"component failures: {a.failures}")
     print_report(agg, seeds, a.challenge_days)
+    print_windows(agg)
     if a.json:
         json.dump({"seeds": seeds, "warm_days": a.warm_days, "challenge_days": a.challenge_days,
                    "per_pod_rpm": a.per_pod_rpm, "max_replicas": a.max_replicas,
                    "sealed_seed_excluded": cp.PROFILE["seed"], "override": json.loads(a.override) if a.override else None,
+                   "events": events, "failures": a.failures or None,
                    "aggregate": agg, "per_seed": per_seed},
                   open(a.json, "w"), indent=1)
     return 0

@@ -30,7 +30,7 @@ def test_other_seeds_give_other_traffic_within_the_declared_bounds():
 
 
 def test_warm_days_are_exactly_repeating_v2_and_sampling_carries_the_previous_slot():
-    rates = bo.offered_rates(seed=3, warm_days=1, challenge_days=1)
+    rates, _ = bo.offered_rates(seed=3, warm_days=1, challenge_days=1)
     base = cp.PROFILE["base_pattern_utc_rpm"]
     assert rates[:bo.SEASON] == [base[k // 6] for k in range(bo.SEASON)]
     pts = bo.sampled_series(rates, seed=3, noise=0.0)
@@ -69,7 +69,7 @@ def test_replay_respects_the_replica_ceiling():
 
 
 def test_generic_q90_margin_matches_the_deployed_rule_for_e1():
-    rates = bo.offered_rates(seed=4, warm_days=7, challenge_days=2)
+    rates, _ = bo.offered_rates(seed=4, warm_days=7, challenge_days=2)
     pts = bo.sampled_series(rates, seed=4)
     grid = se.Grid.from_points(pts)
     origins = list(range(7 * bo.SEASON - se.MARGIN_WINDOW_SLOTS, len(grid.y) - 2))
@@ -94,11 +94,11 @@ def test_theta_reproduces_a_pure_daily_cycle():
 
 
 def test_forecasts_at_returns_every_method_with_six_finite_steps_on_the_process():
-    rates = bo.offered_rates(seed=5, warm_days=7, challenge_days=1)
+    rates, _ = bo.offered_rates(seed=5, warm_days=7, challenge_days=1)
     grid = se.Grid.from_points(bo.sampled_series(rates, seed=5))
     F = bo.forecasts_at(grid, 7 * bo.SEASON + 30, "all")
     assert set(F) == {"e1", "hw", "profile_ar", "profile7", "yesterday", "persistence",
-                      "profile_ratio", "e1_bc", "theta", "median3", "mean3"}
+                      "profile_ratio", "e1_bc", "theta", "median3", "mean3", "median3_finite"}
     for name, f in F.items():
         assert len(f) == 6 and all(np.isfinite(f)), name
 
@@ -113,7 +113,7 @@ def test_profile_override_merges_nested_keys_without_touching_the_sealed_profile
 
 
 def test_higher_quantile_and_shorter_window_margins_behave():
-    rates = bo.offered_rates(seed=6, warm_days=7, challenge_days=2)
+    rates, _ = bo.offered_rates(seed=6, warm_days=7, challenge_days=2)
     grid = se.Grid.from_points(bo.sampled_series(rates, seed=6))
     origins = list(range(7 * bo.SEASON - se.MARGIN_WINDOW_SLOTS, len(grid.y) - 2))
     leads = {}
@@ -131,7 +131,7 @@ def test_higher_quantile_and_shorter_window_margins_behave():
 
 
 def test_bias_correction_is_neutral_on_an_unbiased_series_and_clipped():
-    rates = bo.offered_rates(seed=6, warm_days=7, challenge_days=1)
+    rates, _ = bo.offered_rates(seed=6, warm_days=7, challenge_days=1)
     grid = se.Grid.from_points(bo.sampled_series(rates, seed=6))
     k = 7 * bo.SEASON + 20
     raw = se.components_at(grid, k, "bc")["raw"]
@@ -141,10 +141,60 @@ def test_bias_correction_is_neutral_on_an_unbiased_series_and_clipped():
 
 
 def test_report_prints_for_a_single_unaggregated_series(capsys):
-    rates = bo.offered_rates(seed=8, warm_days=7, challenge_days=1)
+    rates, _ = bo.offered_rates(seed=8, warm_days=7, challenge_days=1)
     pts = bo.sampled_series(rates, seed=8)
     res, origins = bo.evaluate_series(pts, bo.DEFAULT_T0 + 7 * bo.SEASON * bo.SLOT, "single",
                                       methods=["e1", "persistence"], per_pod=600.0, min_r=1, max_r=12)
     bo.print_report(res, ["real"], 1)             # the --real path: no worst_shortage key
     out = capsys.readouterr().out
     assert "e1" in out and "reactive_only" in out and len(origins) == bo.SEASON - bo.LEAD_STEPS
+
+
+def test_events_overlay_bursts_and_shift_with_scoring_windows():
+    base, _ = bo.offered_rates(seed=9, warm_days=1, challenge_days=2)
+    rates, w = bo.offered_rates(seed=9, warm_days=1, challenge_days=2,
+                                events={"bursts": [(0, 700, 6, 2.5)], "shift": (1, 720, 1.55)})
+    at = bo.SEASON + 70                                  # day 0 of the challenge, minute 700 = slot 70
+    assert w["burst_inside"] == [(at, at + 6)] and w["burst_after"] == [(at + 6, at + 18)]
+    assert all(abs(rates[k] - round(base[k] * 2.5)) <= 1 for k in range(at, at + 6))
+    assert rates[at - 1] == base[at - 1] and rates[at + 6] == base[at + 6]
+    sh = 2 * bo.SEASON + 72
+    assert w["shift_24h"] == [(sh, sh + bo.SEASON)]
+    assert all(abs(rates[k] - round(base[k] * 1.55)) <= 1 for k in range(sh, len(rates)))
+
+
+def test_failure_plan_marks_generations_touching_a_burst_and_random_generations():
+    rates, w = bo.offered_rates(seed=9, warm_days=7, challenge_days=2, events={"bursts": [(0, 11 * 60 + 40, 6, 2.5)]})
+    grid = se.Grid.from_points(bo.sampled_series(rates, seed=9))
+    o0 = 7 * bo.SEASON
+    plan = bo.failure_plan(grid, o0, 2 * bo.SEASON - 2, "hw_burst_generation", w, seed=9)
+    # the burst 11:40-12:40 straddles the 12:00Z boundary: the 06:00 and 12:00 generations are contaminated
+    bad_boundaries = {(grid.ts(k) // se.REFIT_SECONDS) * se.REFIT_SECONDS for k in plan["hw"]}
+    assert len(bad_boundaries) == 2 and plan["theta"] == set()
+    plan2 = bo.failure_plan(grid, o0, 2 * bo.SEASON - 2, "theta_random_generation", w, seed=9)
+    assert plan2["theta"] and not plan2["hw"]
+    assert len({(grid.ts(k) // se.REFIT_SECONDS) * se.REFIT_SECONDS for k in plan2["theta"]}) <= 3
+
+
+def test_component_failure_makes_e1_and_median3_refuse_but_median3_finite_serve():
+    rates, _ = bo.offered_rates(seed=9, warm_days=7, challenge_days=1)
+    grid = se.Grid.from_points(bo.sampled_series(rates, seed=9))
+    k = 7 * bo.SEASON + 30
+    ok = bo.forecasts_at(grid, k, "f")
+    assert all(np.isfinite(ok["median3_finite"])) and ok["median3_finite"] == ok["median3"]
+    hw_fail = bo.forecasts_at(grid, k, "f", failures={"hw": {k}})
+    assert not any(np.isfinite(hw_fail["e1"])) and not any(np.isfinite(hw_fail["median3"]))
+    assert all(np.isfinite(hw_fail["median3_finite"]))
+    assert np.allclose(hw_fail["median3_finite"], np.mean([ok["profile_ar"], ok["theta"]], axis=0))
+    th_fail = bo.forecasts_at(grid, k, "f", failures={"theta": {k}})
+    assert all(np.isfinite(th_fail["e1"])) and not any(np.isfinite(th_fail["median3"]))
+
+
+def test_replay_window_sums_partition_the_totals():
+    y = np.array([600.0] * 4 + [1800.0] * 4 + [600.0] * 4)
+    origins = list(range(0, 10))
+    w = {"first": [(1, 6)], "rest": [(6, 11)]}
+    r = bo.replay(y, origins, lambda k: float("nan"), 600.0, 1, 12, windows=w)
+    ws = r["windows"]
+    assert ws["first"]["shortage_replica_min"] + ws["rest"]["shortage_replica_min"] == r["shortage_replica_min"]
+    assert ws["first"]["surplus_replica_min"] + ws["rest"]["surplus_replica_min"] == r["surplus_replica_min"]
