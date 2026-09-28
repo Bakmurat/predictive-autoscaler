@@ -420,7 +420,9 @@ def print_report(agg, seeds, days):
             return f"{p[pol]['shortage_replica_min']:7.1f}/{p[pol]['surplus_replica_min']:8.1f}" if pol in p else " " * 16
         acc = (f"{r['mae10']:7.1f} {r['mae20']:7.1f} {r['mape10_pct']:6.2f}% {r['under_forecast_rate']:6.3f}"
                if r.get("mae10") is not None else " " * 29)
-        q = f"{p['q90']['worst_shortage']:7.1f} {r['median_q90_margin']:6.1f}" if "q90" in p else " " * 14
+        # a single series (the --real path) has no seed aggregate: its worst shortage is its shortage
+        q = (f"{p['q90'].get('worst_shortage', p['q90']['shortage_replica_min']):7.1f} {r['median_q90_margin']:6.1f}"
+             if "q90" in p else " " * 14)
         print(f"{name:14s} {acc} {q} | " + " | ".join(ss(pol) for pol in pols))
 
 

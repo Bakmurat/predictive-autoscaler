@@ -138,3 +138,13 @@ def test_bias_correction_is_neutral_on_an_unbiased_series_and_clipped():
     bc = bo.bias_corrected(grid, k, "bc", raw)
     ratios = [b / r for b, r in zip(bc, raw)]
     assert all(0.85 <= x <= 1.20 for x in ratios) and max(ratios) - min(ratios) < 1e-9
+
+
+def test_report_prints_for_a_single_unaggregated_series(capsys):
+    rates = bo.offered_rates(seed=8, warm_days=7, challenge_days=1)
+    pts = bo.sampled_series(rates, seed=8)
+    res, origins = bo.evaluate_series(pts, bo.DEFAULT_T0 + 7 * bo.SEASON * bo.SLOT, "single",
+                                      methods=["e1", "persistence"], per_pod=600.0, min_r=1, max_r=12)
+    bo.print_report(res, ["real"], 1)             # the --real path: no worst_shortage key
+    out = capsys.readouterr().out
+    assert "e1" in out and "reactive_only" in out and len(origins) == bo.SEASON - bo.LEAD_STEPS
