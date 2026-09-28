@@ -239,12 +239,22 @@ def train_lstm_for_metric(
         training_result = model.train(train_data, target_column='value', epochs=epochs, imputed=train_imputed)
         logger.info(f"Training completed successfully")
 
-        # Evaluate on test data (sequences with an imputed target label are excluded from the metrics)
+        # Evaluate on test data (sequences with an imputed target label are excluded from the metrics).
+        # The whole series is attached as the previous-day lookup's history (the lookup reads only days
+        # before each origin, so this is leak-free) so that evaluate() scores the SERVED blend, and the
+        # pattern weight is then selected on that held-out partition (training/blend_selection.py).
+        from training.blend_selection import attach_history, select_blend_weight
+        attach_history(model, df['value'])
+        network_eval = model.evaluate(test_data, target_column='value', imputed=test_imputed)
+        blend_selection = select_blend_weight(model, test_data, imputed=test_imputed)
         eval_result = model.evaluate(test_data, target_column='value', imputed=test_imputed)
         if eval_result.get('rmse') is None:
             logger.info(f"Evaluation - {eval_result.get('evaluation', 'unavailable')}")
         else:
-            logger.info(f"Evaluation - RMSE: {eval_result['rmse']:.4f}, MAE: {eval_result['mae']:.4f}")
+            logger.info(f"Evaluation ({eval_result.get('scored')}) - RMSE: {eval_result['rmse']:.4f}, "
+                        f"MAE: {eval_result['mae']:.4f}; network only MAE: "
+                        f"{(eval_result.get('network_only') or {}).get('mae')}")
+        logger.info("BLEND_SELECTION " + json.dumps(blend_selection, default=str, sort_keys=True))
 
         # Make sample prediction -- Phase 16: Dense(6) outputs exactly 6 steps
         prediction = model.predict(steps_ahead=6, confidence_level=0.95)  # 1 hour ahead (6 * 10min)
@@ -269,6 +279,8 @@ def train_lstm_for_metric(
             "test_points": len(test_data),
             "training_metrics": training_result.get('training_metrics', {}),
             "evaluation_metrics": eval_result,
+            "evaluation_before_selection": network_eval,
+            "blend_selection": blend_selection,
             "sample_prediction_confidence": prediction['confidence'],
             "model_path": str(model_path),
             "trained_at": datetime.utcnow().isoformat() + "Z",

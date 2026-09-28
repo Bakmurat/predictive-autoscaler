@@ -41,6 +41,20 @@ The demo manifests under `demo/` are the repository examples adapted to two smal
 ## Evaluation
 The operator records every forecast at issuance — Prometheus series `predictive_autoscaler_forecast_rpm{step}`, `..._forecast_target_timestamp_seconds{step}`, `..._forecast_issued_timestamp_seconds`, `..._model_trained_timestamp_seconds`, `..._model_info{model_name,model_version}` and a JSONL line on its own small volume (`FORECAST_LOG`) — so each horizon step can be scored against the observation at its own target time. The protocol, the scorer (`score.py` with known-answer tests), and the recorded runs live outside this repository until a run is complete.
 
+
+### Hybrid arm: validation-selected blend weight (2026-09-28)
+
+The hybrid forecaster serves a blend of its network and a previous-day pattern lookup. The trainer now
+attaches the series as the lookup's history, scores the *served* blend on the outer held-out partition
+for four candidate pattern weights (the deployed ramp 0.70→0.908, 0.85, 0.95, pattern-only) and
+persists the lowest-MAE weight on the artifact (`pattern_weight_override`, honoured by `predict()`).
+Ties keep the earlier candidate, so the deployed ramp is only replaced by a strict improvement. The
+provenance sidecar records every candidate (`blend_selection`) and the evaluation before selection;
+the status line reports `scored` (served_blend or raw_network), `network_only_mae` and `blend`.
+Motivation: on the benchmark series the network's held-out MAE swung between 232 and 2,318 rpm across
+trainings while the pattern alone scored tens of rpm, so at 9–30 % weight the network was adding error
+(`training/blend_selection.py`, tests `ml-engine/tests/test_blend_selection.py`).
+
 ## Versions
 Pinned and used for the recorded runs (2026-09-20): Terraform aws provider 5.100, kubernetes 2.38, helm 2.17; modules terraform-aws-vpc 5.21, terraform-aws-eks 20.37, iam-role-for-service-accounts-eks 5.60; charts istio 1.30.4, keda 2.20.2, kube-prometheus-stack 91.4.1. Latest available on that date, not adopted because they change module inputs or are not yet published as stable charts: terraform-aws-eks 21.25, terraform-aws-vpc 6.7, aws provider 6.65, Istio 1.31.0 (charts only at rc/beta in the Istio Helm index).
 
