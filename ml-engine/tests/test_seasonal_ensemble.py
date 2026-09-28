@@ -209,9 +209,11 @@ def api(monkeypatch):
     from fastapi.testclient import TestClient
     from api import main
     from api.ensemble_experiment import EnsembleExperiment
-    cfg = {"id": "ensemble-q90-v1", "application": "nginx-ensemble", "namespace": "demo",
-           "source_application": "nginx-test", "source_namespace": "demo"}
-    monkeypatch.setattr(main, "ensemble_experiment", EnsembleExperiment.parse(json.dumps(cfg)))
+    cfg = [{"id": "ensemble-q90-v1", "application": "nginx-ensemble", "namespace": "demo",
+            "source_application": "nginx-test", "source_namespace": "demo"},
+           {"id": "ensemble-q95-v1", "application": "nginx-ensemble-q95", "namespace": "demo",
+            "source_application": "nginx-test", "source_namespace": "demo", "margin_quantile": 0.95}]
+    monkeypatch.setattr(main, "ensemble_experiments", EnsembleExperiment.parse_all(json.dumps(cfg)))
     import time
     wall = int(time.time())
     last = wall - wall % se.SLOT_SECONDS
@@ -266,3 +268,66 @@ def test_ensemble_config_is_strict():
     with pytest.raises(ValueError):
         EnsembleExperiment.parse(json.dumps({"id": "x", "application": "a", "namespace": "d",
                                              "source_application": "a", "source_namespace": "d"}))
+
+    with pytest.raises(ValueError):
+        EnsembleExperiment.parse(json.dumps({"id": "x", "application": "a", "namespace": "d",
+                                             "source_application": "b", "source_namespace": "d",
+                                             "margin_quantile": 1.5}))
+    with pytest.raises(ValueError):
+        EnsembleExperiment.parse(json.dumps({"id": "x", "application": "a", "namespace": "d",
+                                             "source_application": "b", "source_namespace": "d",
+                                             "margin_quantile": "0.95"}))
+    with pytest.raises(ValueError):              # duplicate application across the list
+        EnsembleExperiment.parse_all(json.dumps([
+            {"id": "x", "application": "a", "namespace": "d", "source_application": "b", "source_namespace": "d"},
+            {"id": "y", "application": "a", "namespace": "d", "source_application": "b", "source_namespace": "d"}]))
+    with pytest.raises(ValueError):
+        EnsembleExperiment.parse_all("[]")
+
+
+def test_two_experiments_parse_with_their_own_quantiles_and_provenance():
+    from api.ensemble_experiment import EnsembleExperiment
+    exps = EnsembleExperiment.parse_all(json.dumps([
+        {"id": "e1", "application": "a", "namespace": "d", "source_application": "s", "source_namespace": "d"},
+        {"id": "e2", "application": "b", "namespace": "d", "source_application": "s", "source_namespace": "d",
+         "margin_quantile": 0.95}]))
+    assert [e.margin_quantile for e in exps] == [0.90, 0.95]
+    assert [e.forecast_mode for e in exps] == ["seasonal-ensemble-q90", "seasonal-ensemble-q95"]
+    assert exps[0].config_sha256 != exps[1].config_sha256
+    assert exps[0].provenance()["margin_quantile"] == 0.90 and exps[1].provenance()["margin_quantile"] == 0.95
+    one = EnsembleExperiment.parse_all(json.dumps({"id": "e1", "application": "a", "namespace": "d",
+                                                   "source_application": "s", "source_namespace": "d"}))
+    assert len(one) == 1 and one[0] == exps[0]
+
+
+def test_q95_margin_is_at_least_the_q90_margin_and_recorded():
+    pts = staircase(days=7, extra=60, noise=0.02, seed=3)
+    now = pts[-1][0]
+    f90 = se.forecast(pts, now, "q")
+    f95 = se.forecast(pts, now, "q", margin_quantile=0.95)
+    assert f90["raw"] == f95["raw"]                       # same forecaster, only the margin differs
+    assert f95["margin"] >= f90["margin"] > 0
+    assert f90["margin_quantile"] == 0.90 and f95["margin_quantile"] == 0.95
+    assert f90["settings"]["margin_quantile"] == 0.90 and f95["settings"]["margin_quantile"] == 0.95
+    assert f95["served"] == [v + f95["margin"] for v in f95["raw"]]
+    with pytest.raises(ValueError):
+        se.forecast(pts, now, "q", margin_quantile=1.0)
+
+
+def test_api_serves_each_ensemble_app_with_its_own_quantile(api):
+    client, seen, pts = api
+    r90 = client.post("/predict", json={"application": "nginx-ensemble", "namespace": "demo",
+                                        "metric_type": "requests", "horizon_minutes": 60})
+    r95 = client.post("/predict", json={"application": "nginx-ensemble-q95", "namespace": "demo",
+                                        "metric_type": "requests", "horizon_minutes": 60})
+    assert r90.status_code == 200 and r95.status_code == 200, (r90.text, r95.text)
+    b90, b95 = r90.json(), r95.json()
+    assert b90["experiment"]["forecast_mode"] == "seasonal-ensemble-q90"
+    assert b95["experiment"]["forecast_mode"] == "seasonal-ensemble-q95"
+    assert b95["experiment"]["margin_quantile"] == 0.95 and b95["experiment"]["id"] == "ensemble-q95-v1"
+    assert b90["ensemble"]["raw"] == b95["ensemble"]["raw"]
+    assert b95["ensemble"]["margin"] >= b90["ensemble"]["margin"]
+    assert b95["ensemble"]["settings"]["margin_quantile"] == 0.95
+    assert b95["model_version"].startswith("ensemble-q95-v1:") and "seasonal-ensemble-1.1.0@" in b95["model_version"]
+    assert b95["model_name"] == "ensemble_nginx-ensemble-q95_requests"
+    assert seen["application"] == "nginx-test"                # both read the shared source history

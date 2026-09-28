@@ -26,7 +26,8 @@ import sys
 import urllib.parse
 import urllib.request
 
-ARMS = {"nginx-ensemble": "E1 seasonal ensemble + q90", "nginx-seasonal": "S1 seasonal only",
+ARMS = {"nginx-ensemble": "E1 seasonal ensemble + q90", "nginx-ensemble-q95": "E2 seasonal ensemble + q95",
+        "nginx-seasonal": "S1 seasonal only",
         "nginx-test": "neural/seasonal hybrid", "nginx-reactive": "reactive only", "myapptwo": "KEDA"}
 RPM_Q = ('sum(rate(istio_requests_total{{reporter="destination",destination_workload="{app}",'
          'destination_workload_namespace="demo"}}[1m])) * 60')

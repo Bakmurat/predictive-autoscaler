@@ -1,0 +1,17 @@
+[
+  {
+    "id": "seasonal-ensemble-q90-v1",
+    "application": "nginx-ensemble",
+    "namespace": "demo",
+    "source_application": "nginx-test",
+    "source_namespace": "demo"
+  },
+  {
+    "id": "seasonal-ensemble-q95-v1",
+    "application": "nginx-ensemble-q95",
+    "namespace": "demo",
+    "source_application": "nginx-test",
+    "source_namespace": "demo",
+    "margin_quantile": 0.95
+  }
+]

@@ -54,7 +54,7 @@ MARGIN_CLIP_FRACTION = 0.8
 MAX_ORIGIN_AGE_SECONDS = 20 * 60
 STALE_GENERATIONS = 1          # an invalid refit may fall back to the previous boundary once
 HW_STARTS = ((0.3, 0.1, 0.1), (0.1, 0.01, 0.05), (0.6, 0.05, 0.3))
-VERSION = "seasonal-ensemble-1.0.0"
+VERSION = "seasonal-ensemble-1.1.0"   # 1.1.0: margin quantile is a per-experiment parameter (default unchanged)
 
 SETTINGS = {
     "version": VERSION, "slot_seconds": SLOT_SECONDS, "season": SEASON, "steps": STEPS,
@@ -384,8 +384,11 @@ def components_at(grid: Grid, origin: int, cache_key: str = "") -> Dict:
             "raw": raw, "generation": gen, "stale_generation": stale}
 
 
-def margin_at(grid: Grid, origin: int, lead: float, cache_key: str = "") -> Tuple[float, int]:
-    """q90 of past lead-window errors over the trailing 24 h of matured decision ticks."""
+def margin_at(grid: Grid, origin: int, lead: float, cache_key: str = "",
+              quantile: float = MARGIN_QUANTILE) -> Tuple[float, int]:
+    """`quantile` (default q90) of past lead-window errors over the trailing 24 h of matured ticks."""
+    if not (0.0 < quantile < 1.0):
+        raise ValueError(f"margin quantile must lie in (0, 1), got {quantile}")
     y = grid.y
     samples = []
     for j in range(max(0, origin - MARGIN_WINDOW_SLOTS + 1), origin - 1):
@@ -401,15 +404,17 @@ def margin_at(grid: Grid, origin: int, lead: float, cache_key: str = "") -> Tupl
         samples.append(max(a10, a20) - max(raw[0], raw[1]))
     if len(samples) < MARGIN_MIN_SAMPLES:
         return 0.0, len(samples)
-    q = float(np.quantile(samples, MARGIN_QUANTILE))
+    q = float(np.quantile(samples, quantile))
     return float(np.clip(q, 0.0, MARGIN_CLIP_FRACTION * lead)), len(samples)
 
 
-def forecast(points: Iterable[Tuple[int, float]], now_ts: int, cache_key: str = "") -> Dict:
+def forecast(points: Iterable[Tuple[int, float]], now_ts: int, cache_key: str = "",
+             margin_quantile: float = MARGIN_QUANTILE) -> Dict:
     """Serve one forecast from on-grid (epoch seconds, value) observations.
 
-    Raises ForecastUnavailable when the input is stale, a generation cannot be fitted, or any of
-    the six steps is not finite (the live rule: a partial forecast is refused).
+    `margin_quantile` selects the error quantile added as capacity margin (q90 by default; an
+    experiment may declare another). Raises ForecastUnavailable when the input is stale, a
+    generation cannot be fitted, or any of the six steps is not finite (a partial forecast is refused).
     """
     grid = Grid.from_points(points)
     observed = np.flatnonzero(np.isfinite(grid.y))
@@ -424,13 +429,15 @@ def forecast(points: Iterable[Tuple[int, float]], now_ts: int, cache_key: str = 
         raise ForecastUnavailable("ensemble step(s) not finite: hw=%s profile_ar=%s"
                                   % (comp["hw"], comp["profile_ar"]))
     lead = max(raw[0], raw[1])
-    margin, n = margin_at(grid, origin, lead, cache_key)
+    margin, n = margin_at(grid, origin, lead, cache_key, margin_quantile)
     gen: Generation = comp["generation"]
     return {
         "origin": _iso(origin_ts),
         "target_timestamps": [_iso(origin_ts + s * SLOT_SECONDS) for s in range(1, STEPS + 1)],
         "hw": comp["hw"], "profile_ar": comp["profile_ar"], "raw": raw,
-        "margin": margin, "margin_samples": n, "served": [v + margin for v in raw],
+        "margin": margin, "margin_samples": n, "margin_quantile": margin_quantile,
+        "served": [v + margin for v in raw],
         "generation": gen.summary(), "stale_generation": comp["stale_generation"],
-        "off_grid_dropped": grid.off_grid_dropped, "settings": SETTINGS,
+        "off_grid_dropped": grid.off_grid_dropped,
+        "settings": {**SETTINGS, "margin_quantile": margin_quantile},
     }

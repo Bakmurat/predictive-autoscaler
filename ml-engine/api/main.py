@@ -85,7 +85,7 @@ FLOOR_PCT_GAUGE = Gauge(
 
 ENSEMBLE_MARGIN_GAUGE = Gauge(
     'ml_api_ensemble_margin_rpm',
-    'q90 capacity margin added to every served step of the seasonal-ensemble arm',
+    'capacity margin (the experiment\'s error quantile, q90 or q95) added to every served step of a seasonal-ensemble arm',
     ['application', 'namespace']
 )
 
@@ -847,9 +847,9 @@ predictor = LSTMPredictor()
 # Initialize accuracy tracker
 accuracy_tracker = AccuracyTracker()
 
-# Seasonal-ensemble arm (Task 03 U-21): opt-in, malformed configuration fails at startup.
+# Seasonal-ensemble arms (Task 03 U-21, U-23): opt-in, malformed configuration fails at startup.
 _raw_ensemble = os.getenv("ENSEMBLE_EXPERIMENT")
-ensemble_experiment = EnsembleExperiment.parse(_raw_ensemble) if _raw_ensemble is not None else None
+ensemble_experiments = EnsembleExperiment.parse_all(_raw_ensemble) if _raw_ensemble is not None else []
 ENSEMBLE_HISTORY_HOURS = int(os.getenv("ENSEMBLE_HISTORY_HOURS", "360"))
 
 # Initialize VictoriaMetrics collector
@@ -933,7 +933,9 @@ async def predict(request: Dict):
         if metric_type != "requests":
             raise HTTPException(status_code=400, detail="metric_type must be 'requests'")
 
-        if ensemble_experiment and ensemble_experiment.matches(application, namespace, metric_type):
+        ensemble_experiment = next((e for e in ensemble_experiments
+                                    if e.matches(application, namespace, metric_type)), None)
+        if ensemble_experiment:
             if "metric_data" in request:
                 raise HTTPException(422, "ensemble forecast refused: history must be fetched from configured source")
             return await predict_ensemble(ensemble_experiment, application, namespace, metric_type, horizon_minutes)
@@ -1125,7 +1127,7 @@ def _naive_iso(value: str) -> str:
 
 
 async def predict_ensemble(experiment, application, namespace, metric_type, horizon_minutes):
-    """Serve the seasonal-ensemble forecast plus its q90 margin (Task 03 U-21).
+    """Serve the seasonal-ensemble forecast plus the experiment's margin (q90 U-21, q95 U-23).
 
     The served `predictions` already include the margin; `ensemble.raw` keeps the margin-free
     forecast for scoring. Any refusal is a 422, which the operator maps to reactive fallback.
@@ -1150,7 +1152,8 @@ async def predict_ensemble(experiment, application, namespace, metric_type, hori
         with PREDICTION_DURATION.time():
             result = await loop.run_in_executor(
                 None, functools.partial(seasonal_ensemble.forecast, pts, now_ts,
-                                        f"{experiment.source_namespace}/{experiment.source_application}"))
+                                        f"{experiment.source_namespace}/{experiment.source_application}",
+                                        margin_quantile=experiment.margin_quantile))
     except (seasonal_ensemble.ForecastUnavailable, ValueError) as e:
         PREDICTION_ERRORS.labels(error_type="EnsembleUnavailable").inc()
         raise HTTPException(422, f"forecast refused: {e}")
@@ -1210,6 +1213,7 @@ async def predict_ensemble(experiment, application, namespace, metric_type, hori
                  ).total_seconds() / 3600
     logger.info("ENSEMBLE_ISSUANCE " + json.dumps({
         "application": application, "namespace": namespace, "origin": result["origin"],
+        "experiment": experiment.id, "margin_quantile": experiment.margin_quantile,
         "raw": [round(v, 2) for v in result["raw"]], "margin": round(result["margin"], 2),
         "margin_samples": result["margin_samples"], "served": served, "generation": gen,
         "stale_generation": result["stale_generation"]}, sort_keys=True))

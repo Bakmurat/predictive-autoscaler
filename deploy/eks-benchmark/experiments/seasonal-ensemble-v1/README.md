@@ -85,3 +85,7 @@ fresh freeze.
 
 Delete the generator, PredictiveAutoscaler, app and service, remove the node label, and
 restore the previous API Deployment. Never delete the model or evidence volumes.
+
+## Since 2026-09-28 (U-23)
+
+`ENSEMBLE_EXPERIMENT` may hold a JSON list; the q95 sibling arm lives in `../seasonal-ensemble-q95-v1/` and shares this arm's source history and generation cache. This arm's configuration and behaviour are unchanged.
