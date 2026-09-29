@@ -55,6 +55,22 @@ Motivation: on the benchmark series the network's held-out MAE swung between 232
 trainings while the pattern alone scored tens of rpm, so at 9–30 % weight the network was adding error
 (`training/blend_selection.py`, tests `ml-engine/tests/test_blend_selection.py`).
 
+#### 2026-09-30: stable selection rule `margin-lb-pooled-hysteresis-1`
+
+The lowest-MAE rule above chose on one held-out partition of ~50 strongly autocorrelated origins and moved between
+pattern_only, 0.95 and the deployed ramp across the live trainings of 2026-09-28/29; the model lab's block bootstrap put
+the 12Z and 18Z choices near coin tosses, and the network's gains were level shrinkage and a chance bias cancellation,
+not forecasting. `training/blend_selection.py` now ports the lab's rule (13 vectors reproduced to 1e-9): pattern_only
+is the default; a network candidate is chosen only if it beats pattern_only by at least 5 % of the MAE pooled over the
+current and the previous two held-out partitions **and** the one-sided 90 % moving-block-bootstrap lower bound of that
+gain is above zero; an incumbent network blend is kept while its pooled gain stays non-negative unless a challenger
+beats it the same way. The per-origin evidence comes from `evaluate(..., return_origin_errors=True)` and is chained
+through the provenance sidecar (`blend_selection.stability.origin_errors` / `pooled_history`); a sidecar written
+under another rule contributes nothing. The same change fixes a latent `evaluate()` bug: after a sequence with an
+imputed target was dropped, later pattern lookups used an origin shifted back by the number of drops (no live
+partition had an imputed test slot). On the five live partitions of 09-28/29 the rule would have chosen pattern_only
+every time, so the hybrid arm is expected to serve its pattern until a network earns weight on pooled evidence.
+
 ### Arm R1: relative-residual profile-AR forecaster (declared 2026-09-29)
 
 A third declared forecaster for the ensemble route, `models/relative_profile_ar.py`

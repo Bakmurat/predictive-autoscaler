@@ -243,10 +243,18 @@ def train_lstm_for_metric(
         # The whole series is attached as the previous-day lookup's history (the lookup reads only days
         # before each origin, so this is leak-free) so that evaluate() scores the SERVED blend, and the
         # pattern weight is then selected on that held-out partition (training/blend_selection.py).
-        from training.blend_selection import attach_history, select_blend_weight
+        from training.blend_selection import attach_history, history_from_sidecar, select_blend_weight
         attach_history(model, df['value'])
         network_eval = model.evaluate(test_data, target_column='value', imputed=test_imputed)
-        blend_selection = select_blend_weight(model, test_data, imputed=test_imputed)
+        # The stable rule pools the previous trainings' held-out evidence and keeps an incumbent blend
+        # (hysteresis); both come from the previous sidecar next to the model, which the caller overwrites
+        # only after this function returns. A sidecar from another rule contributes nothing.
+        prev_sidecar = Path(model_dir) / f"lstm_{app_name}_{metric_type}.meta.json"
+        previous, history_parts = history_from_sidecar(prev_sidecar)
+        logger.info(f"Blend selection evidence: previous={previous}, pooled previous partitions={len(history_parts)} "
+                    f"(from {prev_sidecar.name if prev_sidecar.exists() else 'no sidecar'})")
+        blend_selection = select_blend_weight(model, test_data, imputed=test_imputed,
+                                              previous=previous, history_partitions=history_parts)
         eval_result = model.evaluate(test_data, target_column='value', imputed=test_imputed)
         if eval_result.get('rmse') is None:
             logger.info(f"Evaluation - {eval_result.get('evaluation', 'unavailable')}")

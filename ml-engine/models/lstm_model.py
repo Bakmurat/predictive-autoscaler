@@ -795,7 +795,7 @@ class LSTMForecastModel:
         return arr, source
 
     def evaluate(self, test_data: pd.DataFrame, target_column: str = 'value',
-                 imputed: Optional[np.ndarray] = None) -> Dict:
+                 imputed: Optional[np.ndarray] = None, return_origin_errors: bool = False) -> Dict:
         """
         Evaluate model performance on test data.
 
@@ -804,6 +804,10 @@ class LSTMForecastModel:
         Args:
             test_data: DataFrame with datetime index
             target_column: Name of target column
+            imputed: per-row flags; sequences whose target labels touch an imputed slot are dropped
+            return_origin_errors: also return, per scored sequence (origin), the mean absolute error of the
+                scored prediction over its steps (`origin_abs_errors`) and the origin timestamps
+                (`origins`) -- the evidence the stable blend selection pools (training/blend_selection.py)
 
         Returns:
             Dictionary with evaluation metrics
@@ -821,11 +825,18 @@ class LSTMForecastModel:
         # Create sequences with time features; drop sequences whose target labels include an imputed slot
         X_test, y_test = self._create_sequences(scaled_data.flatten(), time_features)
         n_eval_dropped = 0
+        # Row position of every kept sequence in the ORIGINAL sequence list: the pattern lookup below
+        # needs each kept sequence's own origin. (Before 2026-09-30 the lookup used the index among the
+        # KEPT sequences, so after a dropped imputed-target sequence every later pattern was looked up
+        # for an origin shifted back by the number of drops -- found by the model lab; no live
+        # partition had an imputed test slot.)
+        kept_idx = np.arange(len(X_test))
         if imputed is not None and len(imputed) == len(values) and len(X_test) and np.asarray(imputed, dtype=bool).any():
             imp = np.asarray(imputed, dtype=bool)
             keep = np.array([not imp[i + self.sequence_length:i + self.sequence_length + STEPS_AHEAD].any() for i in range(len(X_test))])
             n_eval_dropped = int((~keep).sum())
             X_test, y_test = X_test[keep], y_test[keep]
+            kept_idx = np.flatnonzero(keep)
 
         if len(X_test) == 0:
             logger.warning("Evaluation unavailable: test partition shorter than sequence_length + STEPS_AHEAD")
@@ -860,7 +871,7 @@ class LSTMForecastModel:
                 rows = test_data.index
                 served = np.empty_like(test_pred)
                 for k in range(len(X_test)):
-                    origin = pd.Timestamp(rows[k + self.sequence_length - 1]).to_pydatetime()
+                    origin = pd.Timestamp(rows[int(kept_idx[k]) + self.sequence_length - 1]).to_pydatetime()
                     pattern, source = self._pattern_forecast(
                         origin=origin, steps_ahead=test_pred.shape[1],
                         seasonal_history=seasonal, effective_pct=75)
@@ -910,6 +921,10 @@ class LSTMForecastModel:
             # alone. Total cells = sequences * horizon steps.
             'pattern_steps_genuine': int(genuine_pattern_steps),
             'pattern_steps_total': int(len(X_test) * test_pred.shape[1]),
+            **({'origin_abs_errors': np.mean(np.abs(y_test_rescaled - (served_pred if served_pred is not None
+                                                                          else test_pred)), axis=1).tolist(),
+                'origins': [pd.Timestamp(test_data.index[int(i) + self.sequence_length - 1]).isoformat()
+                            for i in kept_idx]} if return_origin_errors else {}),
         }
 
     def _create_sequences(self, scaled_values: np.ndarray,
