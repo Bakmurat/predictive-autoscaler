@@ -19,6 +19,7 @@ Methods (each returns six ten-minute steps from an origin; only the +10 and +20 
   profile_ratio profile7 scaled by an EWMA of the last hour's actual / profile ratio (level-adaptive)
   theta         standard Theta (SES with drift on the deseasonalised window, refit every origin)
   median3       per-step median of hw, profile_ar, theta   (the lab's best worst case)
+  r1            the relative-residual profile-AR forecaster (models/relative_profile_ar.py, arm R1)
   mean3         per-step mean of the same three
 Replay arms without a forecaster: reactive_only (desired = ceil(current / per-pod rpm)) and oracle
 (perfect knowledge of the next two slots).
@@ -53,6 +54,7 @@ ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 sys.path.insert(0, os.path.join(ROOT, "ml-engine"))
 sys.path.insert(0, os.path.join(ROOT, "deploy", "eks-benchmark", "workload", "challenge-v1"))
 from models import seasonal_ensemble as se  # noqa: E402
+from models import relative_profile_ar as rpa  # noqa: E402
 import challenge_profile as cp  # noqa: E402
 
 SLOT = se.SLOT_SECONDS
@@ -310,6 +312,10 @@ def forecasts_at(grid, origin, cache_key, failures=None):
     out["profile_ratio"] = profile_ratio_forecast(y, yf, origin)
     out["e1_bc"] = bias_corrected(grid, origin, cache_key, out["e1"])
     out["theta"] = nan6 if origin in failures.get("theta", ()) else theta_forecast(yf, origin)
+    try:                                    # the serving module itself, so the harness cannot drift from it
+        out["r1"] = rpa.raw_at(grid, origin, cache_key)["raw"]
+    except (se.ForecastUnavailable, ValueError):
+        out["r1"] = nan6
     trio = np.array([out["hw"], out["profile_ar"], out["theta"]], dtype=float)
     finite_rows = [r for r in trio if np.all(np.isfinite(r))]
     if len(finite_rows) == 3:

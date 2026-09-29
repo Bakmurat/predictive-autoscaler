@@ -98,7 +98,7 @@ def test_forecasts_at_returns_every_method_with_six_finite_steps_on_the_process(
     grid = se.Grid.from_points(bo.sampled_series(rates, seed=5))
     F = bo.forecasts_at(grid, 7 * bo.SEASON + 30, "all")
     assert set(F) == {"e1", "hw", "profile_ar", "profile7", "yesterday", "persistence",
-                      "profile_ratio", "e1_bc", "theta", "median3", "mean3", "median3_finite"}
+                      "profile_ratio", "e1_bc", "theta", "median3", "mean3", "median3_finite", "r1"}
     for name, f in F.items():
         assert len(f) == 6 and all(np.isfinite(f)), name
 
@@ -242,3 +242,25 @@ def test_relative_margin_matches_the_serving_module_and_scales_with_the_lead():
     k = origins[-1]
     doubled = bo.q90_margins(grid.y, {**leads, k: 2 * leads[k]}, [k], mode="relative")[k]
     assert doubled == pytest.approx(2 * mine[k])
+
+
+def test_r1_is_the_serving_module_and_its_relative_margin_matches_margin_at():
+    """The harness's r1 forecasts are relative_profile_ar.raw_at itself, and the harness's relative q90
+    margin on r1's own leads equals seasonal_ensemble.margin_at(raw_fn=relative_profile_ar._raw_fn), the
+    rule the live R1 arm would serve."""
+    from models import relative_profile_ar as rpa
+    rates, _ = bo.offered_rates(seed=11, warm_days=7, challenge_days=2)
+    grid = se.Grid.from_points(bo.sampled_series(rates, seed=11))
+    origins = list(range(7 * bo.SEASON - se.MARGIN_WINDOW_SLOTS, len(grid.y) - 2))
+    leads = {}
+    for k in origins:
+        f = bo.forecasts_at(grid, k, "r1par")["r1"]
+        rpa._CACHE.clear() if k == origins[0] else None
+        direct = rpa.raw_at(grid, k, "r1par-direct")["raw"]
+        assert f == direct
+        leads[k] = max(f[0], f[1])
+    mine = bo.q90_margins(grid.y, leads, origins, mode="relative")
+    for k in (origins[se.MARGIN_WINDOW_SLOTS + 60], origins[-1]):
+        theirs, n = se.margin_at(grid, k, leads[k], "r1par", 0.9, "relative", raw_fn=rpa._raw_fn)
+        assert n >= se.MARGIN_MIN_SAMPLES
+        assert mine[k] == pytest.approx(theirs, abs=1e-9)
