@@ -55,6 +55,21 @@ Motivation: on the benchmark series the network's held-out MAE swung between 232
 trainings while the pattern alone scored tens of rpm, so at 9–30 % weight the network was adding error
 (`training/blend_selection.py`, tests `ml-engine/tests/test_blend_selection.py`).
 
+### Arm R1: relative-residual profile-AR forecaster (declared 2026-09-29)
+
+A third declared forecaster for the ensemble route, `models/relative_profile_ar.py`
+(`relative-profile-ar-1.0.0`): relative residual `q = y / profile - 1` against the seven-day same-slot
+profile, one least-squares AR(3) per 6-hourly generation on the trailing seven days of `q` (training
+copy clipped to +/- 50 %, unclipped seed at the origin), `y_hat = max(0, profile x (1 + q_hat))`; no
+Holt-Winters, no optimiser, one component. It is the model lab's `pr_ar_rob`; the lab's test vectors
+(three eight-day series, five origins, AR coefficients per generation) are reproduced to 1e-6 by
+`ml-engine/tests/test_relative_profile_ar.py`. An `ENSEMBLE_EXPERIMENT` entry selects it with
+`"forecaster": "relative-profile-ar"`; its margin (`margin_mode`, `margin_quantile`) is computed from
+its own past leads (`seasonal_ensemble.margin_at(raw_fn=...)`), never from the ensemble's. The
+declared arm configuration is `experiments/relative-profile-ar-v1/` (R1 = relative q90, replacing S1
+on `nginx-seasonal` after one complete hybrid = S1 A/A day). The issuance log line carries
+`"forecaster"`, and the E1/E2 configuration hashes are unchanged by the new field (pinned in the tests).
+
 ## Versions
 Pinned and used for the recorded runs (2026-09-20): Terraform aws provider 5.100, kubernetes 2.38, helm 2.17; modules terraform-aws-vpc 5.21, terraform-aws-eks 20.37, iam-role-for-service-accounts-eks 5.60; charts istio 1.30.4, keda 2.20.2, kube-prometheus-stack 91.4.1. Latest available on that date, not adopted because they change module inputs or are not yet published as stable charts: terraform-aws-eks 21.25, terraform-aws-vpc 6.7, aws provider 6.65, Istio 1.31.0 (charts only at rc/beta in the Istio Helm index).
 

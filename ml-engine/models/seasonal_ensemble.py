@@ -392,14 +392,16 @@ def components_at(grid: Grid, origin: int, cache_key: str = "") -> Dict:
 
 def margin_at(grid: Grid, origin: int, lead: float, cache_key: str = "",
               quantile: float = MARGIN_QUANTILE, mode: str = "absolute",
-              raw_key: str = "raw") -> Tuple[float, int]:
+              raw_key: str = "raw", raw_fn=None) -> Tuple[float, int]:
     """`quantile` (default q90) of past lead-window errors over the trailing 24 h of matured ticks.
 
     mode "absolute" (the 1.0.0 rule): samples are max(a10, a20) - lead_j in rpm; the margin is the
     quantile clipped to [0, 0.8 x lead]. mode "relative" (model lab, 2026-09-28): samples are
     max(a10, a20) / lead_j - 1; the margin is lead x clip(quantile, 0, 0.8), so it scales with the
     load instead of carrying daytime errors into the night. `raw_key` selects which served series the
-    errors are measured against ("raw" or "raw_finite", matching the experiment's partial rule)."""
+    errors are measured against ("raw" or "raw_finite", matching the experiment's partial rule).
+    `raw_fn(grid, j, cache_key) -> six raw forecasts` replaces the ensemble's own forecasts so another
+    forecaster (models/relative_profile_ar.py) gets a margin from ITS past leads, never the ensemble's."""
     if not (0.0 < quantile < 1.0):
         raise ValueError(f"margin quantile must lie in (0, 1), got {quantile}")
     if mode not in MARGIN_MODES:
@@ -411,7 +413,7 @@ def margin_at(grid: Grid, origin: int, lead: float, cache_key: str = "",
         if not (np.isfinite(a10) and np.isfinite(a20)) or not np.isfinite(y[j]):
             continue
         try:
-            raw = components_at(grid, j, cache_key)[raw_key]
+            raw = raw_fn(grid, j, cache_key) if raw_fn else components_at(grid, j, cache_key)[raw_key]
         except ForecastUnavailable:
             continue
         if not (np.isfinite(raw[0]) and np.isfinite(raw[1])):
@@ -464,6 +466,7 @@ def forecast(points: Iterable[Tuple[int, float]], now_ts: int, cache_key: str = 
         "origin": _iso(origin_ts),
         "target_timestamps": [_iso(origin_ts + s * SLOT_SECONDS) for s in range(1, STEPS + 1)],
         "hw": comp["hw"], "profile_ar": comp["profile_ar"], "raw": raw,
+        "components": {"hw": comp["hw"], "profile_ar": comp["profile_ar"]},
         "margin": margin, "margin_samples": n, "margin_quantile": margin_quantile,
         "margin_mode": margin_mode, "partial_rule": partial_rule,
         "served_components": sum(1 for a, bb in zip(comp["hw"], comp["profile_ar"]) if np.isfinite(a) and np.isfinite(bb)),

@@ -1127,7 +1127,8 @@ def _naive_iso(value: str) -> str:
 
 
 async def predict_ensemble(experiment, application, namespace, metric_type, horizon_minutes):
-    """Serve the seasonal-ensemble forecast plus the experiment's margin (q90 U-21, q95 U-23).
+    """Serve the experiment's forecaster (seasonal ensemble U-21/U-23, or the relative profile-AR
+    forecaster R1) plus the experiment's margin.
 
     The served `predictions` already include the margin; `ensemble.raw` keeps the margin-free
     forecast for scoring. Any refusal is a 422, which the operator maps to reactive fallback.
@@ -1151,11 +1152,9 @@ async def predict_ensemble(experiment, application, namespace, metric_type, hori
     try:
         with PREDICTION_DURATION.time():
             result = await loop.run_in_executor(
-                None, functools.partial(seasonal_ensemble.forecast, pts, now_ts,
+                None, functools.partial(experiment.module.forecast, pts, now_ts,
                                         f"{experiment.source_namespace}/{experiment.source_application}",
-                                        margin_quantile=experiment.margin_quantile,
-                                        margin_mode=experiment.margin_mode,
-                                        partial_rule=experiment.partial_rule))
+                                        **experiment.forecast_kwargs()))
     except (seasonal_ensemble.ForecastUnavailable, ValueError) as e:
         PREDICTION_ERRORS.labels(error_type="EnsembleUnavailable").inc()
         raise HTTPException(422, f"forecast refused: {e}")
@@ -1199,8 +1198,8 @@ async def predict_ensemble(experiment, application, namespace, metric_type, hori
         logger.warning(f"Ensemble accuracy tracking error (non-fatal): {e}")
 
     try:
-        for name, values in (("ensemble_hw", result["hw"]), ("ensemble_profile_ar", result["profile_ar"]),
-                             ("ensemble_raw", result["raw"]), ("final", served)):
+        for name, values in ([(f"ensemble_{c}", v) for c, v in result["components"].items()]
+                             + [("ensemble_raw", result["raw"]), ("final", served)]):
             for i, v in enumerate(values):
                 PREDICTION_RPM_GAUGE.labels(application=application, namespace=namespace,
                                             component=name, step=str(i + 1)).set(float(v))
@@ -1215,7 +1214,8 @@ async def predict_ensemble(experiment, application, namespace, metric_type, hori
                  ).total_seconds() / 3600
     logger.info("ENSEMBLE_ISSUANCE " + json.dumps({
         "application": application, "namespace": namespace, "origin": result["origin"],
-        "experiment": experiment.id, "margin_quantile": experiment.margin_quantile,
+        "experiment": experiment.id, "forecaster": experiment.forecaster,
+        "margin_quantile": experiment.margin_quantile,
         "margin_mode": experiment.margin_mode, "partial_rule": experiment.partial_rule,
         "served_components": result.get("served_components"),
         "raw": [round(v, 2) for v in result["raw"]], "margin": round(result["margin"], 2),
@@ -1225,7 +1225,7 @@ async def predict_ensemble(experiment, application, namespace, metric_type, hori
         "experiment": experiment.provenance(),
         "application": application,
         "metric_type": metric_type,
-        "model_version": f"{experiment.id}:{experiment.config_sha256[:12]}:{seasonal_ensemble.VERSION}@{gen['fingerprint'][:12]}",
+        "model_version": f"{experiment.id}:{experiment.config_sha256[:12]}:{experiment.module.VERSION}@{gen['fingerprint'][:12]}",
         "model_trained_at": _naive_iso(boundary),
         "training_cutoff": boundary,
         "artifact_sha256": gen["fingerprint"],
@@ -1233,7 +1233,7 @@ async def predict_ensemble(experiment, application, namespace, metric_type, hori
         "inference_input_end": result["origin"],
         "inference_window": {"mask": {k: mask_info[k] for k in ("mask_version", "dropped_in_intervals")},
                              "latest_observed": result["origin"]},
-        "provenance": "seasonal-ensemble",
+        "provenance": experiment.forecaster,
         "predictions": served,
         "target_timestamps": targets,
         "confidence": 0.95,
@@ -1242,8 +1242,9 @@ async def predict_ensemble(experiment, application, namespace, metric_type, hori
         "horizon_minutes": horizon_minutes,
         "data_points_used": len(pts),
         "model_age_hours": round(age_hours, 2),
-        "ensemble": {k: result[k] for k in ("origin", "hw", "profile_ar", "raw", "margin", "margin_samples",
-                                              "generation", "stale_generation", "settings")},
+        "ensemble": {**{k: result[k] for k in ("origin", "components", "raw", "margin", "margin_samples",
+                                                 "generation", "stale_generation", "settings")},
+                     **{k: result[k] for k in ("hw", "profile_ar") if k in result}},
     }
     return JSONResponse(content=_json_safe(payload))
 
