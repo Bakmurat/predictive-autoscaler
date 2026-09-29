@@ -155,12 +155,39 @@ def test_events_overlay_bursts_and_shift_with_scoring_windows():
     rates, w = bo.offered_rates(seed=9, warm_days=1, challenge_days=2,
                                 events={"bursts": [(0, 700, 6, 2.5)], "shift": (1, 720, 1.55)})
     at = bo.SEASON + 70                                  # day 0 of the challenge, minute 700 = slot 70
-    assert w["burst_inside"] == [(at, at + 6)] and w["burst_after"] == [(at + 6, at + 18)]
+    # windows are on observation slots: the sampled value at slot j carries rates[j - 1] (Q-L5)
+    assert w["burst_inside"] == [(at + 1, at + 7)] and w["burst_after"] == [(at + 7, at + 19)]
     assert all(abs(rates[k] - round(base[k] * 2.5)) <= 1 for k in range(at, at + 6))
     assert rates[at - 1] == base[at - 1] and rates[at + 6] == base[at + 6]
     sh = 2 * bo.SEASON + 72
-    assert w["shift_24h"] == [(sh, sh + bo.SEASON)]
+    assert w["shift_24h"] == [(sh + 1, sh + bo.SEASON + 1)]
     assert all(abs(rates[k] - round(base[k] * 1.55)) <= 1 for k in range(sh, len(rates)))
+
+
+def test_scoring_windows_cover_exactly_the_observed_burst_and_shift():
+    """The lab's Q-L5 finding: the observed burst is one slot after the offered one; the windows must
+    contain every observed burst slot and no pre-burst slot, and the replay's per-slot sums must land
+    inside them."""
+    rates, w = bo.offered_rates(seed=3, warm_days=1, challenge_days=2,
+                                events={"bursts": [(0, 700, 6, 2.5)], "shift": (1, 720, 1.55)})
+    base, _ = bo.offered_rates(seed=3, warm_days=1, challenge_days=2)
+    y = np.array([v for _, v in bo.sampled_series(rates, seed=3, noise=0.0)])
+    yb = np.array([v for _, v in bo.sampled_series(base, seed=3, noise=0.0)])
+    (a, b), = w["burst_inside"]
+    assert b - a == 6
+    assert all(abs(y[j] - 2.5 * yb[j]) <= 1.5 for j in range(a, b))          # every window slot is burst
+    assert y[a - 1] == yb[a - 1] and y[b] == yb[b]                            # the slots around it are not
+    (c, d), = w["burst_after"]
+    assert c == b and d - c == 12 and all(y[j] == yb[j] for j in range(c, d))
+    (s0, s1), = w["shift_24h"]
+    assert s1 - s0 == bo.SEASON and y[s0 - 1] == yb[s0 - 1] and abs(y[s0] - 1.55 * yb[s0]) <= 1.5
+    # a perfect-foresight replay has zero shortage inside the burst; a reactive-only one does not
+    origins = list(range(a - 24, d))
+    oracle = bo.replay(y, origins, lambda k: max(y[k + 1], y[k + 2]), 600.0, 1, 12, windows=w)
+    reactive = bo.replay(y, origins, lambda k: float("nan"), 600.0, 1, 12, windows=w)
+    assert oracle["windows"]["burst_inside"]["shortage_replica_min"] == 0
+    assert reactive["windows"]["burst_inside"]["shortage_replica_min"] > 0
+    assert reactive["windows"]["burst_inside"]["slots"] == 6
 
 
 def test_failure_plan_marks_generations_touching_a_burst_and_random_generations():

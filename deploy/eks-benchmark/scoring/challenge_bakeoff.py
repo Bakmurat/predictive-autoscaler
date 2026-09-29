@@ -103,8 +103,11 @@ def offered_rates(seed, warm_days, challenge_days, t0=DEFAULT_T0, profile=None, 
       {"bursts": [(day, minute_of_day, width_slots, factor), ...],   # e.g. (3, 11*60+40, 6, 2.5)
        "shift": (day, minute_of_day, factor)}                          # e.g. (7, 12*60, 1.55)
     `day` counts from the first challenge day. Returns (rates, windows) where windows holds the
-    scoring windows in slot indices: "burst_inside" (the burst itself), "burst_after" (2 h after each
-    burst ends), "shift_24h" (first 24 h after the shift)."""
+    scoring windows as half-open ranges of OBSERVATION slots: the sampled series at slot j carries
+    rates[j - 1] (`sampled_series`), so an event on offered slots [at, at + width) is observed on
+    [at + 1, at + width + 1) and the windows are placed there ("burst_inside" = the observed burst,
+    "burst_after" = the 2 h after it, "shift_24h" = the first 24 h of the observed shift). `replay`
+    and the window MAE key their per-slot sums on the same observation index (k + 1, k + 2)."""
     profile = profile or cp.PROFILE
     base = profile["base_pattern_utc_rpm"]
     n_warm, n_ch = warm_days * SEASON, challenge_days * SEASON
@@ -120,15 +123,15 @@ def offered_rates(seed, warm_days, challenge_days, t0=DEFAULT_T0, profile=None, 
         at = n_warm + day * SEASON + minute // (SLOT // 60)
         for k in range(at, min(len(rates), at + width)):
             rates[k] *= factor
-        windows["burst_inside"].append((at, at + width))
-        windows["burst_after"].append((at + width, at + width + 12))
+        windows["burst_inside"].append((at + 1, at + width + 1))
+        windows["burst_after"].append((at + width + 1, at + width + 13))
     shift = (events or {}).get("shift")
     if shift:
         day, minute, factor = shift
         at = n_warm + day * SEASON + minute // (SLOT // 60)
         for k in range(at, len(rates)):
             rates[k] *= factor
-        windows["shift_24h"].append((at, at + SEASON))
+        windows["shift_24h"].append((at + 1, at + SEASON + 1))
     return [math.floor(r + 0.5) for r in rates], windows
 
 
