@@ -1,10 +1,10 @@
 {
-  "version": 3,
-  "issued_at": "2026-09-27T14:20:00Z",
+  "version": 4,
+  "issued_at": "2026-09-29T13:45:00Z",
   "series": "sum(rate(istio_requests_total{reporter=\"destination\",destination_workload=\"nginx-test\",destination_workload_namespace=\"demo\"}[1m])) * 60",
   "grid_seconds": 600,
   "benchmark_history_start": "2026-09-20T18:20:00Z",
-  "note": "Predeclared before any benchmark training (Codex Task 03 round 4, C-14). Samples inside an interval are not telemetry gaps but changed workload behaviour: they are excluded from benchmark training and never interpolated. Raw data is untouched. Samples before benchmark_history_start may feed only a training whose role is 'diagnostic' (artifact written under models/diagnostic/, never loaded by the API). v2 (2026-09-20T18:20Z): history start moved to 18:20Z after the generator redesign; the hourly-Job generators biased every :00 sample low (restart gap), so no sample before the redesign is benchmark history. v3 (2026-09-27): adds `regimes`, the traffic profile each period ran under (eval/PROTOCOL-challenge-workload.md section 6). A regime is a label, not an exclusion: repeating-v2 history stays valid evidence about repeating-v2, and evaluations report each regime separately. The live forecasters train across the boundary on purpose. The 14:12Z interval records the generator restart that installed the challenge-v1 script; that script is identical to repeating-v2 before 2026-09-28T00:00Z, so the boundary itself involves no restart and no gap.",
+  "note": "Predeclared before any benchmark training (Codex Task 03 round 4, C-14). Samples inside an interval are not telemetry gaps but changed workload behaviour: they are excluded from benchmark training and never interpolated. Raw data is untouched. Samples before benchmark_history_start may feed only a training whose role is 'diagnostic' (artifact written under models/diagnostic/, never loaded by the API). v2 (2026-09-20T18:20Z): history start moved to 18:20Z after the generator redesign; the hourly-Job generators biased every :00 sample low (restart gap), so no sample before the redesign is benchmark history. v3 (2026-09-27): adds `regimes`, the traffic profile each period ran under (eval/PROTOCOL-challenge-workload.md section 6). A regime is a label, not an exclusion: repeating-v2 history stays valid evidence about repeating-v2, and evaluations report each regime separately. The live forecasters train across the boundary on purpose. The 14:12Z interval records the generator restart that installed the challenge-v1 script; that script is identical to repeating-v2 before 2026-09-28T00:00Z, so the boundary itself involves no restart and no gap. v4 (2026-09-29): three intervals for the generator OOM kills at the 160Mi memory limit and the controlled limit rollout to 384Mi (D-1063); one-minute dips on single arms, none containing a ten-minute grid sample, declared for the hourly load gates; regimes unchanged.",
   "intervals": [
     {
       "start": "2026-09-20T13:40:00Z",
@@ -30,6 +30,21 @@
       "start": "2026-09-27T14:12:00Z",
       "end": "2026-09-27T14:13:00Z",
       "reason": "all five k6 generators restarted (Recreate) to load k6-load-script-challenge-v1, 14:12:18-14:12:41Z; no ten-minute grid sample lies inside, so the forecast series is unaffected; recorded for the hourly load gates"
+    },
+    {
+      "start": "2026-09-29T13:01:00Z",
+      "end": "2026-09-29T13:04:00Z",
+      "reason": "k6-nginx-test (13:01:19Z) and k6-nginx-seasonal (13:02:19Z) OOMKilled at the 160Mi limit after 47 h; each a ~1-minute dip on its own arm (13:02Z nginx-test 27 % of the reference rate, 13:03Z nginx-seasonal 6 %); the schedule is a pure function of wall-clock time, so both resumed in sync; no ten-minute grid sample lies inside; recorded for the hourly load gates (D-1063)"
+    },
+    {
+      "start": "2026-09-29T13:20:00Z",
+      "end": "2026-09-29T13:22:00Z",
+      "reason": "k6-nginx-seasonal OOMKilled a second time (13:20:46Z, 160Mi); ~1-minute dip on nginx-seasonal only; no grid sample inside; recorded for the hourly load gates (D-1063)"
+    },
+    {
+      "start": "2026-09-29T13:24:00Z",
+      "end": "2026-09-29T13:35:00Z",
+      "reason": "controlled rollout of the k6 memory limit 160Mi -> 384Mi (request unchanged), one generator at a time with Recreate in the order seasonal, test, ensemble-q95, ensemble, reactive, myapptwo; each arm one ~1-minute dip; script, VUs and arrival-rate schedule untouched; recorded for the hourly load gates (D-1063, public manifests updated)"
     }
   ],
   "regimes": [
