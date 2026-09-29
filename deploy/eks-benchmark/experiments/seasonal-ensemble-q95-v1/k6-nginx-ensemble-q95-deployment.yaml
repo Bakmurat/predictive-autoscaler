@@ -57,7 +57,11 @@ spec:
           resources:
             # memory request == limit (D-137); identical to the original three generators
             requests: { cpu: 100m, memory: 160Mi }
-            limits: { cpu: 500m, memory: 160Mi }
+            # 2026-09-29: k6 0.48 with 30 pre-allocated VUs and the 2,305-stage challenge schedule idles at
+            # ~155 MiB, so a 160Mi limit left no headroom: k6-nginx-test and k6-nginx-seasonal were OOMKilled
+            # (exit 137) at 13:01Z / 13:02Z and 13:20Z on the plateau, each a ~1-minute traffic dip. The
+            # request stays 160Mi (scheduling unchanged); the limit is the headroom.
+            limits: { cpu: 500m, memory: 384Mi }
           volumeMounts:
             - name: script
               mountPath: /scripts
