@@ -250,6 +250,9 @@ class LSTMForecastModel:
                 C-55: 'relu' permits unbounded activations and is ONE hypothesis for the
                 divergences seen in evaluation; 'tanh' is the Keras default and bounds them.
                 This is an experiment arm -- change it alone, never together with clipnorm.
+                D-1068 (2026-09-30): the benchmark trainer now passes 'tanh' explicitly
+                (training/train_lstm_from_vm.training_activation) after live divergences; this
+                default is unchanged for other callers.
             clipnorm: Optional gradient-norm clipping for Adam. The SECOND, separate arm.
                 Leave None when testing `activation`, so an improvement can be attributed.
 

@@ -38,6 +38,20 @@ CADENCE_TOLERANCE_S = 30      # a grid sample may deviate this much from its 10-
 DEFAULT_SEQUENCE_LENGTH = 144  # 24 h of ten-minute steps (LSTMForecastModel default)
 STEPS_AHEAD = 6                # one hour of ten-minute steps (LSTMForecastModel.STEPS_AHEAD)
 
+# D-1068 (2026-09-30): the hybrid's BiLSTM is trained with a bounded activation. With the shipped 'relu' (unbounded,
+# no gradient clipping) 7 of 26 live trainings ended with non-finite loss and 4 more collapsed; in the declared
+# experiment on three live windows x four seeds, 'relu' diverged once, clipnorm 1.0 did not prevent it, and 'tanh'
+# had zero failures and the lowest mean network MAE (claude-cycle-20260927/stabilization-live-20260930/).
+# TRAIN_ACTIVATION overrides it for experiments; the model class keeps its own default for other callers.
+TRAIN_ACTIVATIONS = ("tanh", "relu")
+
+
+def training_activation() -> str:
+    value = os.environ.get("TRAIN_ACTIVATION", "tanh").strip()
+    if value not in TRAIN_ACTIVATIONS:
+        raise ValueError(f"TRAIN_ACTIVATION must be one of {TRAIN_ACTIVATIONS}, got {value!r}")
+    return value
+
 
 def sequence_budget(n_points: int, sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
                     steps_ahead: int = STEPS_AHEAD, imputed=None) -> dict:
@@ -236,7 +250,10 @@ def train_lstm_for_metric(
     try:
         train_imputed = imputed[:train_size] if imputed is not None else None
         test_imputed = imputed[train_size:] if imputed is not None else None
-        training_result = model.train(train_data, target_column='value', epochs=epochs, imputed=train_imputed)
+        activation = training_activation()
+        logger.info(f"Network activation: {activation} (D-1068)")
+        training_result = model.train(train_data, target_column='value', epochs=epochs, imputed=train_imputed,
+                                      activation=activation)
         logger.info(f"Training completed successfully")
 
         # Evaluate on test data (sequences with an imputed target label are excluded from the metrics).

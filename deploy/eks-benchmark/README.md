@@ -71,6 +71,16 @@ imputed target was dropped, later pattern lookups used an origin shifted back by
 partition had an imputed test slot). On the five live partitions of 09-28/29 the rule would have chosen pattern_only
 every time, so the hybrid arm is expected to serve its pattern until a network earns weight on pooled evidence.
 
+#### 2026-09-30: the network trains with `tanh` (trainer setting, D-1068)
+
+Of 26 live trainings with the shipped ReLU BiLSTM (no gradient clipping, unseeded), 7 ended with non-finite loss and 4
+collapsed (final training loss 0.31-0.40, network MAE 1,470-2,318 rpm). A declared experiment on three live windows x
+four seeds reproduced a non-finite ReLU run; gradient clipping (clipnorm 1.0) did not prevent it; `tanh` had zero
+failures and the lowest mean network MAE (192.5 vs 279.3 rpm). The trainer now passes `activation="tanh"`
+(`training_activation()`, override `TRAIN_ACTIVATION`); the model class default is unchanged for other callers. Even
+healthy networks did not beat the plain pattern on these windows, so the stable blend rule keeps deciding whether the
+network gets any weight.
+
 ### Arm R1: relative-residual profile-AR forecaster (declared 2026-09-29)
 
 A third declared forecaster for the ensemble route, `models/relative_profile_ar.py`
