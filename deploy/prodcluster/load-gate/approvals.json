@@ -1,1 +1,9 @@
-{}
+{
+ "A1'": {
+  "at": "2026-10-05T21:05:11Z",
+  "by": "user",
+  "decision": "approved",
+  "ref": "U-30",
+  "text": "a k6 sample reaches the exporter within 600 s of its event time (G2/G3 rest on it)"
+ }
+}
