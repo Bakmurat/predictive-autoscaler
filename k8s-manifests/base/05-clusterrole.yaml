@@ -41,3 +41,9 @@ rules:
 - apiGroups: ["batch"]
   resources: ["jobs"]
   verbs: ["create"]
+
+# The API's cold start runs `kubectl create job --from=cronjob/ml-training`, which reads the CronJob first;
+# without get on cronjobs that call is denied (found by code review on 2026-10-05; not observed live).
+- apiGroups: ["batch"]
+  resources: ["cronjobs"]
+  verbs: ["get", "list"]

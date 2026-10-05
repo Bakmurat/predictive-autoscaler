@@ -1,0 +1,27 @@
+# Codex Task 03 round 27 (C-102, C-104).
+#
+# fsGroup: the operator image is distroless and runs as USER 65532:65532, but the forecast-log PVC is
+# an ext4 EBS volume whose root directory is owned by root:root 0755, so the operator could not create
+# or append forecasts.jsonl ("permission denied" on every issuance). A pod-level fsGroup makes the
+# kubelet chown the volume root to group 65532 with the setgid bit; OnRootMismatch skips the recursive
+# walk once the root already matches. Neither setting is proof of writability on its own: verify an
+# append by the operator process itself.
+#
+# strategy Recreate: leader election is OFF by default (k8s-operator/main.go, --leader-elect=false) and
+# no argument enables it, so a RollingUpdate with surge would run two active controllers against the
+# same PredictiveAutoscaler objects during the overlap. Recreate stops the old pod before the new one
+# starts; the cost is a short control interruption, which each rollout records.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: predictive-operator
+  namespace: ml-engine
+spec:
+  strategy:
+    type: Recreate
+    rollingUpdate: null
+  template:
+    spec:
+      securityContext:
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch

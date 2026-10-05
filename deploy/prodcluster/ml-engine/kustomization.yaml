@@ -1,0 +1,47 @@
+# prodcluster (self-hosted RKE2 + VictoriaMetrics) overlay for the ml-engine namespace.
+# Placeholders are substituted by ../deploy.sh after rendering (never commit real registry or cluster values):
+#   HARBOR_REGISTRY  image registry/project, e.g. registry.example.com/autoscaler
+#   ML_API_DIGEST, OPERATOR_DIGEST  sha256:<digest> of the images built from GIT_COMMIT_VALUE
+#   GIT_COMMIT_VALUE  full commit the images were built from
+#   VM_QUERY_URL      VictoriaMetrics/Prometheus-compatible query base URL (in cluster)
+# Differences from deploy/eks-benchmark/overlay: VictoriaMetrics is the metrics backend (the base VMServiceScrapes
+# are kept), storage class `harvester`, a pull secret, placement by node label instead of EBS zones, and the
+# ml-api experiment configuration declared here instead of live patches.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../../k8s-manifests/base
+  - ../../eks-benchmark/instrumentation
+images:
+  - name: registry.example.com/predictive-autoscaler/predictive-autoscaler-ml-api
+    newName: HARBOR_REGISTRY/predictive-autoscaler-ml-api
+    digest: ML_API_DIGEST
+  - name: registry.example.com/predictive-autoscaler/predictive-autoscaler-operator
+    newName: HARBOR_REGISTRY/predictive-autoscaler-operator
+    digest: OPERATOR_DIGEST
+patches:
+  - path: training-env.yaml
+  - path: resources-training.yaml
+  - path: resources-operator.yaml
+  - path: resources-ml-api.yaml
+  - path: operator-vm-url.yaml
+  - path: operator-security-handoff.yaml
+  - path: validity-mask.yaml
+  - path: placement.yaml
+  - path: pull-secret.yaml
+  - path: ml-api-experiments.yaml
+  - target: { kind: PersistentVolumeClaim, name: "ml-models-pvc|forecast-log-pvc" }
+    patch: |-
+      - op: add
+        path: /spec/storageClassName
+        value: harvester
+  - target: { kind: PersistentVolumeClaim, name: evidence-archive-pvc }
+    patch: |-
+      - op: replace
+        path: /spec/storageClassName
+        value: harvester
+  - target: { kind: ConfigMap, name: ".*victoria.*" }
+    patch: |-
+      - op: replace
+        path: /data/victoria_metrics_url
+        value: VM_QUERY_URL

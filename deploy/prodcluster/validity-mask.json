@@ -1,0 +1,17 @@
+{
+ "version": 1,
+ "issued_at": null,
+ "series": "sum(rate(istio_requests_total{reporter=\"destination\",destination_workload=\"nginx-test\",destination_workload_namespace=\"demo\"}[1m])) * 60",
+ "grid_seconds": 600,
+ "benchmark_history_start": null,
+ "note": "prodcluster campaign (2026-10-05, U-29): self-hosted RKE2 cluster, VictoriaMetrics backend, amd64 nodes, images built from 0472829. A new campaign: no EKS sample or interval applies. benchmark_history_start is set (v2) to the first ten-minute grid instant after all six generators run the challenge-v1 script without restarts; until then it is null and no training is a benchmark training. Same rules as the EKS mask: samples inside an interval are excluded and never interpolated; an interval kept only for the hourly load gates contains no grid sample (endpoints inclusive).",
+ "intervals": [],
+ "regimes": [
+  {
+   "profile": "challenge-v1",
+   "start": null,
+   "end": null,
+   "generator": "k6-load-script-challenge-v1 (deploy/eks-benchmark/workload/challenge-v1, profile.json frozen at 9f38a1a); rate is a pure function of wall-clock time"
+  }
+ ]
+}

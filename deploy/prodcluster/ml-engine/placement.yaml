@@ -1,0 +1,32 @@
+# Placement on prodcluster. ml-api, its RWO model volume, the training job and the evidence-archive job share one
+# node (podAffinity in the base and instrumentation manifests). That node is chosen by the label
+# `predictive-bench/ml-node=true` (set by deploy.sh on the worker with the most free root disk: the ml-api image is
+# about 2 GB). The operator never runs on the ml-api node; generators never do either (their own manifests).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ml-api
+  namespace: ml-engine
+spec:
+  strategy:
+    type: Recreate   # single writer of the RWO model volume
+    rollingUpdate: null
+  template:
+    spec:
+      nodeSelector:
+        predictive-bench/ml-node: "true"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: predictive-operator
+  namespace: ml-engine
+spec:
+  template:
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels: { app: ml-api }
+              topologyKey: kubernetes.io/hostname

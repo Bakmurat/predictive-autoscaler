@@ -1,0 +1,52 @@
+# prodcluster overlay for the `demo` namespace: the six benchmark arms, their Services, PredictiveAutoscalers and
+# KEDA ScaledObjects, and the six k6 generators, taken unchanged from deploy/eks-benchmark except:
+#   - every generator mounts the challenge-v1 script (on EKS five of the six were switched by hand; repo drift fixed);
+#   - nginx-ensemble loses its EKS zone pin (ap-southeast-1b);
+#   - VM_QUERY_URL / VM_WRITE_URL placeholders are substituted by ../deploy.sh.
+# The files live outside this directory, so render with: kustomize build --load-restrictor LoadRestrictionsNone
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../eks-benchmark/demo/00-namespace.yaml
+  - ../../eks-benchmark/workload/challenge-v1/k6-load-script-challenge-v1.yaml
+  # arm 1: hybrid (operator, forecasting on) + paused KEDA fallback
+  - ../../eks-benchmark/demo/nginx-test-deployment.yaml
+  - ../../eks-benchmark/demo/nginx-test-service.yaml
+  - ../../eks-benchmark/demo/nginx-test-predictive-autoscaler.yaml
+  - ../../eks-benchmark/demo/nginx-test-keda-fallback.yaml
+  - ../../eks-benchmark/demo/k6-nginx-test-deployment.yaml
+  # arm 2: reactive (operator, forecasting off)
+  - ../../eks-benchmark/demo/nginx-reactive-deployment.yaml
+  - ../../eks-benchmark/demo/nginx-reactive-service.yaml
+  - ../../eks-benchmark/demo/nginx-reactive-predictive-autoscaler.yaml
+  - ../../eks-benchmark/demo/k6-nginx-reactive-deployment.yaml
+  # arm 3: KEDA
+  - ../../eks-benchmark/demo/myapptwo-deployment.yaml
+  - ../../eks-benchmark/demo/myapptwo-service.yaml
+  - ../../eks-benchmark/demo/myapptwo-keda-fallback.yaml
+  - ../../eks-benchmark/demo/k6-myapptwo-deployment.yaml
+  # arm 4: S1 seasonal pattern only
+  - ../../eks-benchmark/experiments/seasonal-pattern-v1/nginx-seasonal-deployment.yaml
+  - ../../eks-benchmark/experiments/seasonal-pattern-v1/nginx-seasonal-service.yaml
+  - ../../eks-benchmark/experiments/seasonal-pattern-v1/nginx-seasonal-predictive-autoscaler.yaml
+  - ../../eks-benchmark/experiments/seasonal-pattern-v1/k6-nginx-seasonal-deployment.yaml
+  # arm 5: E1 seasonal ensemble, q90 margin
+  - ../../eks-benchmark/experiments/seasonal-ensemble-v1/nginx-ensemble-deployment.yaml
+  - ../../eks-benchmark/experiments/seasonal-ensemble-v1/nginx-ensemble-service.yaml
+  - ../../eks-benchmark/experiments/seasonal-ensemble-v1/nginx-ensemble-predictive-autoscaler.yaml
+  - ../../eks-benchmark/experiments/seasonal-ensemble-v1/k6-nginx-ensemble-deployment.yaml
+  # arm 6: E2 seasonal ensemble, q95 margin
+  - ../../eks-benchmark/experiments/seasonal-ensemble-q95-v1/nginx-ensemble-q95-deployment.yaml
+  - ../../eks-benchmark/experiments/seasonal-ensemble-q95-v1/nginx-ensemble-q95-service.yaml
+  - ../../eks-benchmark/experiments/seasonal-ensemble-q95-v1/nginx-ensemble-q95-predictive-autoscaler.yaml
+  - ../../eks-benchmark/experiments/seasonal-ensemble-q95-v1/k6-nginx-ensemble-q95-deployment.yaml
+patches:
+  - target: { kind: Deployment, labelSelector: "app=k6" }
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/volumes/0/configMap/name
+        value: k6-load-script-challenge-v1
+  - target: { kind: Deployment, name: nginx-ensemble }
+    patch: |-
+      - op: remove
+        path: /spec/template/spec/affinity

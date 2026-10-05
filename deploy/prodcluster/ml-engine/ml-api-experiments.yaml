@@ -1,0 +1,26 @@
+# ml-api experiment configuration, declared (on EKS these were live patches; Task 03 repo-drift fix).
+# SEASONAL_EXPERIMENT  = experiments/seasonal-pattern-v1/api-config.json (S1, nginx-seasonal)
+# ENSEMBLE_EXPERIMENT  = experiments/seasonal-ensemble-q95-v1/api-config.json (E1 q90 nginx-ensemble + E2 q95
+#                        nginx-ensemble-q95); the R1 config (relative-profile-ar-v1) is not enabled.
+# ENSEMBLE_HISTORY_HOURS = 360 needs at least 15 days of metric retention (prodcluster: 30 days).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ml-api
+  namespace: ml-engine
+spec:
+  template:
+    spec:
+      containers:
+        - name: api
+          env:
+            - name: SEASONAL_EXPERIMENT
+              value: '{"id":"seasonal-pattern-v1","application":"nginx-seasonal","namespace":"demo","source_application":"nginx-test","source_namespace":"demo"}'
+            - name: ENSEMBLE_EXPERIMENT
+              value: '[{"id":"seasonal-ensemble-q90-v1","application":"nginx-ensemble","namespace":"demo","source_application":"nginx-test","source_namespace":"demo"},{"id":"seasonal-ensemble-q95-v1","application":"nginx-ensemble-q95","namespace":"demo","source_application":"nginx-test","source_namespace":"demo","margin_quantile":0.95}]'
+            - name: ENSEMBLE_HISTORY_HOURS
+              value: "360"
+            - name: IMAGE_REF
+              value: "HARBOR_REGISTRY/predictive-autoscaler-ml-api@ML_API_DIGEST"
+            - name: GIT_COMMIT
+              value: "GIT_COMMIT_VALUE"
