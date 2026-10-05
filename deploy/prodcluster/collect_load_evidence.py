@@ -35,10 +35,9 @@ Inventory (v6): every arm pod with any record (pod info, Envoy target, istio ser
   (the moment the final hook ran on every arm pod; earlier pods are closed by a one-time record kept with the
   campaign). A pod without a successful scrape after t1 needs an accepted snapshot (re-verified every hour) or a
   validated manual termination record (--terminations); otherwise every later hour is INCOMPLETE. A pod created at or
-  after the hour end (kube_pod_created) did not serve in it (created_after_hour). A pod that was never scheduled is
-  closed only by a record (never_scheduled) whose evidence the collector re-checks: one creation time equal to the
-  record, an empty node label in every kube-state-metrics sample, scheduled condition never true, no start time, no
-  Envoy target, no istio series, nothing after the recorded deletion bound (Codex r24). An accepted snapshot: exactly one
+  after the hour end (kube_pod_created) did not serve in it (created_after_hour). A termination record closes one
+  incarnation (pod start or creation time, re-checked) for the hours after its termination bound only; it never
+  claims anything about earlier hours (Codex r25: a never-scheduled claim needs final UID-bound evidence). An accepted snapshot: exactly one
   receipt (snapshot_version 2), the same non-empty pod_uid on receipt and payload, the receipt's series count stored at
   the capture time, the canonical sha256 recomputed from the stored integer counter series, no duplicate series,
   hot-restart epoch 0, Envoy start (capture - proxy uptime) within -2..+30 s of kube-state-metrics' istio-proxy
@@ -299,7 +298,10 @@ def const_through(series, t0, t1, what):
     return next(iter(vals))
 
 
-def generator_lifecycle(vm, app, t0, t1, end):
+def generator_lifecycle(vm, app, t0, t1, end, hold):
+    """The one generator pod of the hour and its k6 container start; pod, container start and restart counter must be
+    observed unchanged from t0 through hold (the end of every k6 sample used, Codex r25)."""
+    end = max(end, hold) + KSM_GAP          # an observation at or after hold must be inside the query window
     win = end - (t0 - 600)
     rs = {m.get("replicaset") for m, s, _ in vm.raw(f'kube_replicaset_owner{{namespace="{NAMESPACE}",owner_kind="Deployment",owner_name="k6-{app}"}}', end, win) if s}
     if not rs:
@@ -312,9 +314,8 @@ def generator_lifecycle(vm, app, t0, t1, end):
     if len(live) != 1:
         raise Incomplete(f"generator pods in the hour: {sorted(live)}")
     pod, ts = next(iter(live.items()))
-    hold = t1 + LAG + PUSH
     if not covers(ts, t0, hold, KSM_GAP):
-        raise Incomplete(f"generator pod {pod} not observed through the hour and the k6 lag allowance")
+        raise Incomplete(f"generator pod {pod} not observed through the hour and every k6 sample used")
     pod_start = const_through(vm.raw(f'kube_pod_start_time{{namespace="{NAMESPACE}",pod="{pod}"}}', end, win), t0, hold, "pod start time")
     k6_start = const_through(vm.raw(f'kube_pod_container_state_started{{namespace="{NAMESPACE}",pod="{pod}",container="k6"}}', end, win), t0, hold, "k6 container start time")
     const_through(vm.raw(f'kube_pod_container_status_restarts_total{{namespace="{NAMESPACE}",pod="{pod}",container="k6"}}', end, win), t0, hold, "k6 restart counter")
@@ -354,10 +355,10 @@ def valid_approvals(raw):
 
 
 def valid_terminations(raw):
-    """{pod: record} -> {pod: (kind, bound, identity)} for well-formed records only:
-    terminated:      {"terminated_before": UTC, "pod_start": UTC (< bound), "pod_uid", "evidence", "recorded_by", "at"}
-    never_scheduled: {"never_scheduled": true, "created": UTC, "deleted_before": UTC (> created), "pod_uid", "evidence",
-                      "recorded_by", "at"} (the evidence must name the retained UID-bound object/event record)."""
+    """{pod: record} -> {pod: (terminated_before, identity kind, identity value)} for well-formed records only:
+    {"terminated_before": UTC, "pod_start" or "created": UTC (< bound), "pod_uid", "evidence", "recorded_by", "at"}.
+    A record closes one incarnation (name + pod start, or name + creation time for a pod that never started) for the
+    hours after its bound; it says nothing about earlier hours."""
     out = {}
     if not isinstance(raw, dict):
         return out
@@ -365,14 +366,13 @@ def valid_terminations(raw):
         if not isinstance(r, dict) or _utc(r.get("at")) is None or \
                 not all(isinstance(r.get(k), str) and r[k].strip() for k in ("pod_uid", "evidence", "recorded_by")):
             continue
-        if r.get("never_scheduled") is True:
-            cr, db = _utc(r.get("created")), _utc(r.get("deleted_before"))
-            if cr is not None and db is not None and cr < db:
-                out[pod] = ("never_scheduled", db, cr)
+        tb = _utc(r.get("terminated_before"))
+        kinds = [k for k in ("pod_start", "created") if k in r]
+        if tb is None or len(kinds) != 1:
             continue
-        tb, ps = _utc(r.get("terminated_before")), _utc(r.get("pod_start"))
-        if tb is not None and ps is not None and ps < tb:
-            out[pod] = ("terminated", tb, ps)
+        v = _utc(r.get(kinds[0]))
+        if v is not None and v < tb:
+            out[pod] = (tb, kinds[0], v)
     return out
 
 
@@ -383,41 +383,24 @@ def lifecycle_value(series, what, pod):
     return next(iter(vals))
 
 
-def verify_never_scheduled(vm, pod, rec, end, W):
-    """Re-check a never_scheduled record against kube-state-metrics; returns 0.0 (closed for every hour)."""
-    _, deleted_before, created = rec
-    cr = vm.raw(f'kube_pod_created{{namespace="{NAMESPACE}",pod="{pod}"}}', end, W)
-    if len(cr) != 1 or abs(lifecycle_value(cr[0][1], "pod creation time", pod) - created) > 1:
-        raise Incomplete(f"pod {pod}: never_scheduled record does not match the observed creation time")
-    info = vm.raw(f'kube_pod_info{{namespace="{NAMESPACE}",pod="{pod}"}}', end, W)
-    if not info or any(m.get("node", "") != "" for m, s, _ in info if s) or \
-            any(t > deleted_before + KSM_GAP for _, s, _ in info for t, _ in s):
-        raise Incomplete(f"pod {pod}: never_scheduled contradicted (assigned to a node, or alive after the bound)")
-    sched = vm.raw(f'kube_pod_status_scheduled{{namespace="{NAMESPACE}",pod="{pod}",condition="true"}}', end, W)
-    if not sched or any(v != 0 for _, s, _ in sched for _, v in s):
-        raise Incomplete(f"pod {pod}: scheduled condition missing or true")
-    for q in (f'kube_pod_start_time{{namespace="{NAMESPACE}",pod="{pod}"}}', f'up{{job="{ENVOY_JOB}",namespace="{NAMESPACE}",pod="{pod}"}}',
-              f'istio_requests_total{{namespace="{NAMESPACE}",pod="{pod}"}}'):
-        if any(s for _, s, _ in vm.raw(q, end, W)):
-            raise Incomplete(f"pod {pod}: never_scheduled contradicted by {q.split('{')[0]}")
-    return 0.0
-
-
 def verify_snapshot(vm, app, pod, t_inv, end, terminations):
     """(capture, uid) of a pod whose scrapes stopped: its final snapshot, re-verified from VictoriaMetrics (no cache), or
     (terminated_before, None) from a validated manual termination record."""
     W = int(end - t_inv)
     receipts = [(m, t) for m, s, _ in vm.raw(f'bench_final_snapshot_receipt{{namespace="{NAMESPACE}",pod="{pod}"}}', end, W) for t, _ in s]
     if not receipts:
-        if pod in terminations and terminations[pod][0] == "never_scheduled":
-            return verify_never_scheduled(vm, pod, terminations[pod], end, W), None
         if pod in terminations:
-            _, tb, rec_start = terminations[pod]
-            # the record closes ONE incarnation (name + pod start): the observed start must match it, and nothing of
-            # that name may be observed alive after the recorded termination bound
-            st = vm.raw(f'kube_pod_start_time{{namespace="{NAMESPACE}",pod="{pod}"}}', end, W)
-            if len(st) != 1 or abs(lifecycle_value(st[0][1], "pod start time", pod) - rec_start) > 1:
+            tb, kind, ident = terminations[pod]
+            # the record closes ONE incarnation (name + pod start or creation time): the observed value must match it
+            # (positive, finite evidence), and nothing of that name may be observed alive after the recorded bound
+            metric = "kube_pod_start_time" if kind == "pod_start" else "kube_pod_created"
+            st = [x for x in vm.raw(f'{metric}{{namespace="{NAMESPACE}",pod="{pod}"}}', end, W) if x[1]]
+            if len(st) != 1 or abs(lifecycle_value(st[0][1], metric, pod) - ident) > 1:
                 raise Incomplete(f"pod {pod}: manual termination record does not match the observed incarnation")
+            if kind == "created" and any(s for _, s, _ in vm.raw(f'kube_pod_start_time{{namespace="{NAMESPACE}",pod="{pod}"}}', end, W)):
+                raise Incomplete(f"pod {pod}: record identifies it by creation time but it has a start time")
+            if not any(s for _, s, _ in vm.raw(f'kube_pod_info{{namespace="{NAMESPACE}",pod="{pod}"}}', end, W)):
+                raise Incomplete(f"pod {pod}: no finite pod record to bind the termination record to")
             later = [t for q in (f'kube_pod_info{{namespace="{NAMESPACE}",pod="{pod}"}}', f'up{{job="{ENVOY_JOB}",namespace="{NAMESPACE}",pod="{pod}"}}')
                      for _, s, _ in vm.raw(q, end, W) for t, v in s if t > tb + KSM_GAP and (not q.startswith("up") or v == 1)]
             if later:
@@ -456,7 +439,7 @@ def arm_envoy(vm, app, t0, t1, end, t_inv, terminations):
         f'max by (pod) (max_over_time(up{{job="{ENVOY_JOB}",namespace="{NAMESPACE}",pod=~"{prx}"}}[{int(end - t1)}s]))', end) if v == 1}
     snaps, closed, created_after = {}, [], []
     for p in sorted(inv - serving_after):
-        cr = vm.raw(f'kube_pod_created{{namespace="{NAMESPACE}",pod="{p}"}}', end, W)
+        cr = [x for x in vm.raw(f'kube_pod_created{{namespace="{NAMESPACE}",pod="{p}"}}', end, W) if x[1]]   # finite only
         if len(cr) == 1 and ms(lifecycle_value(cr[0][1], "pod creation time", p)) >= ms(t1):
             # the pod object did not exist before the hour end: it served nothing in [t0, t1) (Codex r24)
             early = [t for q in (f'up{{job="{ENVOY_JOB}",namespace="{NAMESPACE}",pod="{p}"}}', f'istio_requests_total{{{sel},pod="{p}"}}')
@@ -559,6 +542,8 @@ def arm_envoy(vm, app, t0, t1, end, t_inv, terminations):
 def collect(vm, hour_start, t_inv, terminations=None, approvals=None, now=None):
     import challenge_profile  # noqa: E402
     t0 = hour_start.timestamp(); t1 = t0 + 3600; end = t1 + GRACE
+    inputs_sha256 = {k: _hashlib.sha256(json.dumps(v or {}, sort_keys=True).encode()).hexdigest()
+                     for k, v in (("terminations", terminations), ("approvals", approvals))}
     terminations = valid_terminations(terminations or {})
     approved = valid_approvals(approvals or {})
     now = time.time() if now is None else now
@@ -566,7 +551,7 @@ def collect(vm, hour_start, t_inv, terminations=None, approvals=None, now=None):
     for app in APPS:
         r = {"app": app, "hour_start": hour_start.strftime("%Y-%m-%dT%H:%M:%SZ"), "collector": "collect_load_evidence.py v7",
              "collector_sha256": COLLECTOR_SHA256, "inventory_start": utc(t_inv), "collection_cutoff": utc(end),
-             "terminations_used": sorted(terminations), "identity": IDENTITY_NOTE}
+             "terminations_used": sorted(terminations), "inputs_sha256": inputs_sha256, "identity": IDENTITY_NOTE}
         try:
             if now < end:
                 raise Incomplete(f"collected before the hour closed + {int(GRACE)} s")
@@ -578,13 +563,15 @@ def collect(vm, hour_start, t_inv, terminations=None, approvals=None, now=None):
             p95 = histogram_quantile(0.95, buckets)
             # p95 over the requests certainly inside the hour (lower-bound increments), not necessarily all of them
             r.update(observed=[round(x) for x in observed], p95_server_ms_interior=round(p95, 1) if p95 is not None else None, **inv)
-            pod, k6_start = generator_lifecycle(vm, app, t0, t1, end)
+            # sparse k6 series may need a sample well after the hour to bound their tail (A1'): search up to collection,
+            # with the generator's pod and k6 container proven unchanged through that search end
+            k6_end = max(end, now - 120)        # leaves KSM_GAP for the lifecycle observation after it
+            r["k6_query_end"] = utc(k6_end)
+            pod, k6_start = generator_lifecycle(vm, app, t0, t1, end, max(t1 + LAG + PUSH, k6_end))
             r["generator_pod"] = pod
             hbs = vm.raw(f'k6_vus{{testid="{app}"}}', end, end - (t0 - SHORT))
             if len(hbs) != 1 or not covers([t for t, _ in hbs[0][1]], t0, t1 + LAG + PUSH, HB_GAP):
                 raise Incomplete("k6 heartbeat shows a lost flush (or is missing) over the hour and the lag allowance")
-            # sparse k6 series may need a sample well after the hour to bound their tail (A1'): search up to collection
-            k6_end = max(end, now - 60)
             failed = k6_counter(vm, f'k6_http_reqs_total{{testid="{app}",expected_response="false"}}', t0, t1, k6_start, k6_end, LAG)
             dropped = k6_counter(vm, f'k6_dropped_iterations_total{{testid="{app}"}}', t0, t1, k6_start, k6_end, LAG)
             r.update(failed=[round(x) for x in failed], dropped=[round(x) for x in dropped])
@@ -609,16 +596,25 @@ def collect(vm, hour_start, t_inv, terminations=None, approvals=None, now=None):
 
 
 def write_rows(rows, directory, hour_start):
-    """Atomically write the hour's rows to <directory>/load-<YYYYmmddTHHMMZ>.json (temporary file, fsync, rename)."""
-    os.makedirs(directory, exist_ok=True)
-    path = os.path.join(directory, "load-" + hour_start.strftime("%Y%m%dT%H%MZ") + ".json")
-    tmp = path + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(rows, fh, indent=1)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
-    return path
+    """Keep every evaluation: an immutable attempt <directory>/attempts/load-<hour>-<collected>-<pid>.json, then the
+    latest projection <directory>/load-<hour>.json; both written to a unique temporary file, fsynced and renamed."""
+    import tempfile
+    tag = "load-" + hour_start.strftime("%Y%m%dT%H%MZ")
+    collected = (rows[0].get("collected_at", "") if rows else "").replace("-", "").replace(":", "")
+    attempt = os.path.join(directory, "attempts", f"{tag}-{collected}-{os.getpid()}.json")
+    latest = os.path.join(directory, tag + ".json")
+    for path in (attempt, latest):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
+        with os.fdopen(fd, "w") as fh:
+            json.dump(rows, fh, indent=1)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if path == attempt and os.path.exists(path):
+            os.unlink(tmp)
+            raise RuntimeError(f"attempt file exists: {path}")
+        os.replace(tmp, path)
+    return latest
 
 
 def main():

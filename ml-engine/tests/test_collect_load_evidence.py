@@ -144,7 +144,7 @@ class FakeVM:
         self.rate = challenge_profile.planned_requests(int(T0)) / 3600.0 * o.get("observed_share", 1.0)
         gap = o.get("hb_gap")
         self.hb = [t for t in grid(T0 - 180, END, 10, 0.475) if not (gap and gap[0] < t < gap[1])]
-        self.ksm = grid(T_INV, END, 20, 0.486)
+        self.ksm = grid(T_INV, END + 7200, 20, 0.486)      # kube-state-metrics keeps sampling after the cutoff
 
     def app_of(self, sel):
         for app in sorted(cle.APPS, key=len, reverse=True):
@@ -180,11 +180,11 @@ class FakeVM:
                                              created=T1 + 60, node="", scheduled=False, no_start=True)
             if o["created_after"] == "seen_early":
                 out[f"{app}-aaaa1111-pc"].update(frm=T1 - 300, to=T1 - 200)
-        if o.get("never_scheduled"):                  # Pending from T0-1000 until deleted at T0-200
+        if o.get("never_scheduled"):                  # Pending from T0-1000 until deleted at T0-200 (or into the hour)
             ns = o["never_scheduled"]
-            out[f"{app}-aaaa1111-pn"] = dict(start=T0 - 1000, ksm_end=T0 - 210, frm=None, to=None, share=0.0, snap=None,
-                                             created=T0 - 1000, node="w1" if ns == "assigned" else "",
-                                             scheduled=(ns == "scheduled"), no_start=True)
+            out[f"{app}-aaaa1111-pn"] = dict(start=T0 - 1000, ksm_end=T0 + 250 if ns == "pending_into_hour" else T0 - 210,
+                                             frm=None, to=None, share=0.0, snap=None, created=T0 - 1000, node="",
+                                             scheduled=False, no_start=(ns != "started"), stale_only=(ns == "stale_only"))
         return out
 
     def value(self, p, t):
@@ -226,7 +226,7 @@ class FakeVM:
             raise cle.Incomplete("query failed or partial")
         lo = t_end - window
         name = sel.split("{")[0]
-        ksm = [t for t in self.ksm if t > lo]
+        ksm = [t for t in self.ksm if lo < t <= t_end]
         k6pod = f"k6-{app}-abcd1234-xyz12"
         pod_q = sel.split('pod="')[1].split('"')[0] if 'pod="' in sel else None
         if name == "kube_replicaset_owner":
@@ -237,9 +237,12 @@ class FakeVM:
             return [({"pod": k6pod}, [(t, K6_START - 5) for t in ksm], [])]
         if name == "kube_pod_container_state_started" and 'container="k6"' in sel:
             st = T0 + 1800 if o.get("late_container") else K6_START
-            return [({"pod": k6pod, "container": "k6"}, [(t, st) for t in ksm], [])]
+            return [({"pod": k6pod, "container": "k6"}, [(t, (T1 + 2000 if (o.get("k6_restart_after") and t > T1 + 2000) else st))
+                                                         for t in ksm if t <= t_end], [])]
         if name == "kube_pod_container_status_restarts_total" and 'container="k6"' in sel:
-            return [({"pod": k6pod, "container": "k6"}, [(t, 1.0 if (o.get("restarted") and t > T0 + 900) else 0.0) for t in ksm], [])]
+            return [({"pod": k6pod, "container": "k6"}, [(t, 1.0 if ((o.get("restarted") and t > T0 + 900) or
+                                                                  (o.get("k6_restart_after") and t > T1 + 2000)) else 0.0)
+                                                         for t in ksm if t <= t_end], [])]
         arm_pods = self.pods(app)
         if pod_q:
             arm_pods = {pod_q: arm_pods[pod_q]}
@@ -247,6 +250,9 @@ class FakeVM:
             out = []
             for p, d in arm_pods.items():
                 pts = [t for t in ksm if d["start"] <= t <= d["ksm_end"]]
+                if pts and d.get("stale_only"):
+                    out.append(({"pod": p}, [], pts))
+                    continue
                 if pts:
                     v = d.get("created", d["start"] - 1) if name == "kube_pod_created" else (1.0 if d.get("scheduled", True) else 0.0)
                     out.append(({"pod": p}, [(t, v) for t in pts], []))
@@ -276,6 +282,9 @@ class FakeVM:
                     lab = {"pod": p, "container": "istio-proxy"}
                     if name == "kube_pod_info":
                         lab["node"] = d.get("node", "w1")
+                    if d.get("stale_only"):
+                        out.append((lab, [], [t for t, _ in pts]))
+                        continue
                     out.append((lab, pts, []))
                     if o.get("dup_start") and name == "kube_pod_start_time" and p.endswith("p1"):
                         out.append(({"pod": p, "container": "istio-proxy", "uid": "other"}, pts, []))
@@ -493,23 +502,44 @@ def test_r24_pod_created_after_the_hour_served_nothing_in_it():
     assert r["status"] == "INCOMPLETE" and "created after the hour but observed in it" in r["reason"], r
 
 
-NS_REC = {"never_scheduled": True, "created": iso(T0 - 1000), "deleted_before": iso(T0 - 150), "pod_uid": "uid-pn",
-          "evidence": "events capture with FailedScheduling only", "recorded_by": "claude", "at": iso(T0)}
+DEL_REC = {"terminated_before": iso(T0 - 150), "created": iso(T0 - 1000), "pod_uid": "uid-pn",
+           "evidence": "graceful deletion by a rollout; API absence recorded", "recorded_by": "claude", "at": iso(T0)}
 
 
-def test_r24_never_scheduled_pods_are_closed_only_by_a_verified_record():
+def test_r25_a_deleted_never_started_pod_is_closed_only_for_hours_after_its_deletion():
     r = run(FakeVM(never_scheduled="pending"))
     assert r["status"] == "INCOMPLETE" and "no final snapshot" in r["reason"], r
-    r = run(FakeVM(never_scheduled="pending"), terminations={"nginx-test-aaaa1111-pn": NS_REC})
+    r = run(FakeVM(never_scheduled="pending"), terminations={"nginx-test-aaaa1111-pn": DEL_REC})
     assert r["status"] == "PASS" and r["pods_closed_before_hour"] == 1, r
-    for over, rec, msg in (("assigned", NS_REC, "assigned to a node"), ("scheduled", NS_REC, "scheduled condition"),
-                           ("pending", dict(NS_REC, created=iso(T0 - 900)), "creation time"),
-                           ("pending", dict(NS_REC, deleted_before=iso(T0 - 600)), "alive after the bound")):
+    r = run(FakeVM(never_scheduled="pending_into_hour"), terminations={"nginx-test-aaaa1111-pn": dict(DEL_REC, terminated_before=iso(T0 + 300))})
+    assert r["status"] == "INCOMPLETE" and "manual termination record inside the hour" in r["reason"], r
+    for over, rec, msg in (("pending", dict(DEL_REC, created=iso(T0 - 900)), "does not match the observed incarnation"),
+                           ("pending", dict(DEL_REC, terminated_before=iso(T0 - 600)), "alive after"),
+                           ("stale_only", DEL_REC, "does not match the observed incarnation"),
+                           ("started", DEL_REC, "has a start time")):
         r = run(FakeVM(never_scheduled=over), terminations={"nginx-test-aaaa1111-pn": rec})
         assert r["status"] == "INCOMPLETE" and msg in r["reason"], (over, r)
-    bad = dict(NS_REC, deleted_before=iso(T0 - 2000))                      # deleted before created: malformed
-    r = run(FakeVM(never_scheduled="pending"), terminations={"nginx-test-aaaa1111-pn": bad})
+    both = dict(DEL_REC, pod_start=iso(T0 - 1000))                          # two identities: malformed
+    r = run(FakeVM(never_scheduled="pending"), terminations={"nginx-test-aaaa1111-pn": both})
     assert r["status"] == "INCOMPLETE" and "no final snapshot" in r["reason"], r
+
+
+def test_r25_a_bounding_k6_sample_from_a_later_generator_run_is_not_used():
+    r = run(FakeVM(failure_after_hour=True, k6_restart_after=True), now=T1 + 4000)
+    assert r["status"] == "INCOMPLETE" and "k6" in r["reason"], r
+
+
+def test_r25_every_evaluation_is_kept_and_the_latest_projected(tmp_path):
+    import json
+    d = str(tmp_path / "ev")
+    rows1 = [{"app": "x", "status": "INCOMPLETE", "collected_at": "2026-10-05T10:13:00Z"}]
+    rows2 = [{"app": "x", "status": "PASS", "collected_at": "2026-10-05T11:13:00Z"}]
+    cle.write_rows(rows1, d, HOUR)
+    latest = cle.write_rows(rows2, d, HOUR)
+    attempts = sorted(os.listdir(os.path.join(d, "attempts")))
+    assert len(attempts) == 2 and json.load(open(latest)) == rows2
+    assert sorted(json.load(open(os.path.join(d, "attempts", a)))[0]["status"] for a in attempts) == ["INCOMPLETE", "PASS"]
+    assert not [f for f in os.listdir(d) if f.startswith(".tmp-")]
 
 
 def test_r24_sparse_k6_tail_is_bounded_by_a_sample_found_at_a_later_collection():
