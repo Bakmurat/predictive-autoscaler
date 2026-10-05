@@ -69,6 +69,12 @@ patches:
   # not be mandatory); tainted nodes (the control plane) are not counted as domains.
   - target: { kind: Deployment, labelSelector: "app in (nginx-test,nginx-reactive,myapptwo,nginx-seasonal,nginx-ensemble,nginx-ensemble-q95)" }
     patch: |-
+      # The per-arm hard spread (constraint 0, maxSkew 1, DoNotSchedule) defaults to nodeTaintsPolicy Ignore, so the
+      # tainted control-plane node counts as a domain holding zero pods: with five workers no arm could exceed five
+      # replicas (the sixth pod stayed Pending on 2026-10-05 from 10:02Z). Honor excludes nodes the pod cannot use.
+      - op: add
+        path: /spec/template/spec/topologySpreadConstraints/0/nodeTaintsPolicy
+        value: Honor
       - op: add
         path: /spec/template/metadata/labels/predictive-bench~1role
         value: arm

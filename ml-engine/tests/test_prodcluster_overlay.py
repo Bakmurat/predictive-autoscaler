@@ -118,3 +118,17 @@ def test_load_evidence_cronjob_is_read_only_and_never_reports_success_for_a_fail
     assert "  - load-evidence.yaml" in k and "../collect_load_evidence.py" in k and "../load-gate/settings.env" in k
     settings = open(os.path.join(ROOT, "deploy", "prodcluster", "load-gate", "settings.env")).read()
     assert settings.strip() == "INVENTORY_START=2026-10-05T08:14:00Z"
+
+
+def test_per_arm_hard_spread_ignores_the_tainted_control_plane():
+    # without nodeTaintsPolicy Honor the control-plane node is a zero-pod domain and caps every arm at one pod per worker
+    text = open(OVERLAY).read()
+    assert re.search(r"- op: add\n\s+path: /spec/template/spec/topologySpreadConstraints/0/nodeTaintsPolicy\n\s+value: Honor", text)
+    for rel in ("deploy/eks-benchmark/demo/nginx-test-deployment.yaml", "deploy/eks-benchmark/demo/nginx-reactive-deployment.yaml",
+                "deploy/eks-benchmark/demo/myapptwo-deployment.yaml",
+                "deploy/eks-benchmark/experiments/seasonal-pattern-v1/nginx-seasonal-deployment.yaml",
+                "deploy/eks-benchmark/experiments/seasonal-ensemble-v1/nginx-ensemble-deployment.yaml",
+                "deploy/eks-benchmark/experiments/seasonal-ensemble-q95-v1/nginx-ensemble-q95-deployment.yaml"):
+        base = open(os.path.join(ROOT, rel)).read()
+        first = base.split("topologySpreadConstraints:", 1)[1].split("- maxSkew", 2)[1]
+        assert "topologyKey: kubernetes.io/hostname" in first and "DoNotSchedule" in first, rel   # constraint 0 = the hard one
