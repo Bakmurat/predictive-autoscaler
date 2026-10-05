@@ -29,6 +29,9 @@ k(){ "$KUBECTL" --context "$KUBE_CONTEXT" "$@"; }
 # Ownership conflicts are shown, not overridden: set FORCE_CONFLICTS=1 only for a deliberate takeover (e.g. the first
 # server-side apply over objects written by client-side applies, done once on 2026-10-05 04:57Z).
 sa(){ k apply --server-side ${FORCE_CONFLICTS:+--force-conflicts} --field-manager=predictive-bench-deploy "$@"; }
+# Validate a whole file with a server-side dry run before applying any of it: on 2026-10-05 12:20Z the API rejected the
+# six arm Deployments (duplicate topologySpreadConstraints key) while the other objects of the same apply went through.
+sa_checked(){ sa --dry-run=server -f "$1" > /dev/null || { echo "server-side dry run rejected $1; nothing applied" >&2; exit 3; }; sa -f "$1"; }
 need(){ for v in "$@"; do [ -n "${!v:-}" ] || { echo "missing environment variable $v" >&2; exit 2; }; done; }
 
 render() {
@@ -71,14 +74,14 @@ crd = [d for d in docs if "\nkind: CustomResourceDefinition" in "\n" + d]
 rest = [d for d in docs if d not in crd]
 open(sys.argv[2], "w").write("\n---\n".join(crd) + "\n"); open(sys.argv[3], "w").write("\n---\n".join(rest) + "\n")
 PY
-  sa -f "$OUT/ml-engine.crd.yaml"
+  sa_checked "$OUT/ml-engine.crd.yaml"
   k wait --for=condition=Established crd/predictiveautoscalers.autoscaler.example.com --timeout=60s
-  sa -f "$OUT/ml-engine.rest.yaml"
+  sa_checked "$OUT/ml-engine.rest.yaml"
 }
 
 demo() {
   need KUBE_CONTEXT; [ -s "$OUT/demo.yaml" ] || { echo "run render first" >&2; exit 2; }
-  sa -f "$OUT/demo.yaml"
+  sa_checked "$OUT/demo.yaml"
 }
 
 status() {
