@@ -33,7 +33,8 @@ Inventory (v6): every arm pod with any record (pod info, Envoy target, istio ser
   termination record in the ledger; otherwise every later hour is INCOMPLETE. An accepted snapshot: exactly one
   receipt (snapshot_version 2), the same non-empty pod_uid on receipt and payload, the receipt's series count stored at
   the capture time, the canonical sha256 recomputed from the stored integer counter series, no duplicate series,
-  hot-restart epoch 0, capture - proxy uptime within 3 s of kube-state-metrics' istio-proxy start, every later scrape
+  hot-restart epoch 0, Envoy start (capture - proxy uptime) within -2..+30 s of kube-state-metrics' istio-proxy
+  container start, every later scrape
   equal to the final value. Snapshot times are whole seconds: capture c means [c, c+1 s).
 Also: generator lifecycle every hour (a name/start-time identity: kube-state-metrics here has no UID label);
 deny_partial_response=1 on every query; any query/transport error or inconsistency -> INCOMPLETE, never PASS.
@@ -56,7 +57,8 @@ SHORT = 180.0
 SCRAPE_LABELS = {"__name__", "app", "container", "endpoint", "instance", "job", "prometheus", "namespace", "pod", "service"}
 SNAP_LABELS = {"__name__", "namespace", "pod", "pod_uid", "snapshot_version"}
 ASSUMPTIONS = {"A1'": "G2/G3 (k6 dropped/failed): a k6 sample reaches the exporter within 600 s of its event time"}
-EPOCH_TOL = 3.0          # receipt capture - proxy uptime vs kube-state-metrics istio-proxy start (s resolution both)
+EPOCH_WINDOW = (-2.0, 30.0)  # Envoy start (capture - uptime) minus KSM istio-proxy container start: Envoy starts after
+                             # pilot-agent (measured +2 s on prodcluster); whole seconds on both sides
 
 _WORKLOAD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "eks-benchmark", "workload", "challenge-v1")
 sys.path.insert(0, _WORKLOAD)
@@ -210,7 +212,7 @@ def check_snapshot(receipts, payload, proxy_started):
         raise Incomplete("final snapshot payload incomplete or bound to another pod UID")
     if canonical_digest(payload) != (nc, digest):
         raise Incomplete("final snapshot canonical digest mismatch")
-    if proxy_started is None or abs((c - up) - proxy_started) > EPOCH_TOL:
+    if proxy_started is None or not EPOCH_WINDOW[0] <= (c - up) - proxy_started <= EPOCH_WINDOW[1]:
         raise Incomplete("final snapshot not from the istio-proxy instance kube-state-metrics recorded")
     return c, uid
 

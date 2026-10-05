@@ -118,8 +118,10 @@ def test_check_snapshot_identity_digest_epoch_and_version():
     for receipts, payload in bad:
         with pytest.raises(cle.Incomplete):
             cle.check_snapshot(receipts, payload, T0 + 1815.0 - 900)
-    with pytest.raises(cle.Incomplete):
-        cle.check_snapshot(*snapshot("x"), T0 + 1815.0 - 900 - 10)        # proxy instance differs from KSM's
+    assert cle.check_snapshot(*snapshot("x"), T0 + 1815.0 - 900 - 12)[1] == "u-1"   # Envoy up 12 s after its container
+    for started in (T0 + 1815.0 - 900 + 5, T0 + 1815.0 - 900 - 40):         # Envoy older than its container / far later
+        with pytest.raises(cle.Incomplete):
+            cle.check_snapshot(*snapshot("x"), started)
     with pytest.raises(cle.Incomplete):
         cle.check_snapshot(*snapshot("x"), None)                           # no KSM proxy start
 
