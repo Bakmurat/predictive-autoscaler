@@ -15,7 +15,8 @@
 #   GIT_COMMIT_VALUE full commit the images were built from
 #   VM_QUERY_URL     in-cluster Prometheus-compatible query base, e.g. http://vmselect.<ns>.svc:8481/select/0/prometheus
 #   VM_WRITE_URL     in-cluster remote-write endpoint, e.g. http://vminsert.<ns>.svc:8480/insert/0/prometheus/api/v1/write
-# Optional: KUBECTL (default: kubectl), KUSTOMIZE (default: kustomize, v5.8+; the kubectl-embedded one is too old).
+# Optional: KUBECTL (default: kubectl), KUSTOMIZE (default: kustomize, v5.8+; the kubectl-embedded one is too old),
+#   FORCE_CONFLICTS=1 to take over fields owned by another field manager (otherwise conflicts fail the apply).
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"; OUT="$HERE/rendered"
 KUBECTL="${KUBECTL:-kubectl}"; KUSTOMIZE="${KUSTOMIZE:-kustomize}"
@@ -23,7 +24,9 @@ k(){ "$KUBECTL" --context "$KUBE_CONTEXT" "$@"; }
 # Server-side apply: client-side apply merges list entries by the strategic-merge key only (for
 # topologySpreadConstraints that is topologyKey), which folded the arms' two hostname constraints into one.
 # SSA keys them by (topologyKey, whenUnsatisfiable) and makes the applied manifests authoritative.
-sa(){ k apply --server-side --force-conflicts --field-manager=predictive-bench-deploy "$@"; }
+# Ownership conflicts are shown, not overridden: set FORCE_CONFLICTS=1 only for a deliberate takeover (e.g. the first
+# server-side apply over objects written by client-side applies, done once on 2026-10-05 04:57Z).
+sa(){ k apply --server-side ${FORCE_CONFLICTS:+--force-conflicts} --field-manager=predictive-bench-deploy "$@"; }
 need(){ for v in "$@"; do [ -n "${!v:-}" ] || { echo "missing environment variable $v" >&2; exit 2; }; done; }
 
 render() {
