@@ -161,7 +161,8 @@ class FakeVM:
         if o.get("scaled_down"):
             out[f"{app}-aaaa1111-p1"]["share"] = 0.7
             snap = None if o["scaled_down"] == "no_snapshot" else T0 + 1815.0
-            out[f"{app}-aaaa1111-p3"] = dict(start=T0 - 3600, ksm_end=T0 + 1840, frm=T0 - 3600, to=T0 + 1800, share=0.3, snap=snap)
+            ksm_end, to = (T0 + 1825, T0 + 1830.7) if o.get("ksm_ends_before_last_scrape") else (T0 + 1840, T0 + 1800)
+            out[f"{app}-aaaa1111-p3"] = dict(start=T0 - 3600, ksm_end=ksm_end, frm=T0 - 3600, to=to, share=0.3, snap=snap)
         if o.get("born"):
             out[f"{app}-aaaa1111-p1"]["share"] = 0.9
             out[f"{app}-aaaa1111-p2"] = dict(start=T0 + 1200, ksm_end=END, frm=T0 + 1210, to=END, share=0.1, snap=None)
@@ -560,3 +561,9 @@ def test_restart_counter_bracket_may_start_at_the_container_start_when_it_reads_
     vm = FakeVM(born=True, restart_first_late=True)
     assert run(vm)["status"] == "PASS"
     assert run(FakeVM(born=True, restart_first_late=True, restart_first_one=True))["status"] == "INCOMPLETE"
+
+
+def test_snapshot_pod_restart_bracket_ends_at_its_capture():
+    # live 11:00Z: the last scrape of a terminating pod followed kube-state-metrics' last sample by under a second
+    r = run(FakeVM(scaled_down="snapshot", ksm_ends_before_last_scrape=True))
+    assert r["status"] == "PASS" and r["final_snapshots_in_hour"] == ["nginx-test-aaaa1111-p3"], r

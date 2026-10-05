@@ -494,6 +494,11 @@ def arm_envoy(vm, app, t0, t1, end, t_inv, terminations):
         sc = sorted(targets[p])
         a = max((x for x in sc if x < t0), default=sc[0])
         b = min((x for x in sc if x >= t1), default=sc[-1])
+        if p in snaps:
+            # a snapshot pod is counted up to its capture (later scrapes only have to equal the final value, and the
+            # proxy instance at capture is checked against the container start); its last scrape can follow
+            # kube-state-metrics' last sample of the terminating pod by a fraction of a second
+            b = min(b, snaps[p])
         obs = [t for t, _ in restarts[p]]
         # a counter that reads 0 at its first sample has not restarted since the container started: the container start
         # (kube-state-metrics) is then a valid observation point (a pod's first scrape can precede the first KSM sample)

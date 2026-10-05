@@ -63,6 +63,14 @@
   "recorded_by": "claude (benchmark agent)",
   "terminated_before": "2026-10-05T10:32:02Z"
  },
+ "nginx-seasonal-64bb5f8bb4-qss5x": {
+  "at": "2026-10-05T12:30:00Z",
+  "evidence": "graceful deletion by the 10:30:05Z arm rollout (D-1080): deletionTimestamp 10:32:16Z (requested ~10:31:01Z, grace 75 s), request counter flat from 10:31:15Z (drain effective), last successful scrape 10:31:45Z, kube-state-metrics record gone by 10:32:19Z, the API listed no old pod at 10:32:02Z, no force deletion, all nodes Ready. Its final-snapshot hook did not publish a receipt (cause unknown: the pod's log is gone). Closes the pod for hours after 10:32:02Z only.",
+  "pod_start": "2026-10-05T08:10:15Z",
+  "pod_uid": "b6238deb-23dc-4509-98a3-54def5cca19f",
+  "recorded_by": "claude (benchmark agent)",
+  "terminated_before": "2026-10-05T10:32:02Z"
+ },
  "nginx-seasonal-64bb5f8bb4-qvtw9": {
   "at": "2026-10-05T11:10:00Z",
   "created": "2026-10-05T10:22:01Z",
