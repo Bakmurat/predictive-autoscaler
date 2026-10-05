@@ -75,6 +75,22 @@ patches:
       - op: add
         path: /spec/template/spec/topologySpreadConstraints/0/nodeTaintsPolicy
         value: Honor
+      # Shared cluster, nodes at 68-92 % of CPU requested (2026-10-05 12:08Z): a hard spread leaves an arm's pods
+      # Pending as soon as one node is full although others have room (the autoscalers' decisions would then not be
+      # carried out). The spread stays a preference; capacity decides placement.
+      - op: replace
+        path: /spec/template/spec/topologySpreadConstraints/0/whenUnsatisfiable
+        value: ScheduleAnyway
+      # Arm pods stay off the ML node: there they took the CPU the six-hourly trainer needs (it must run next to
+      # ml-api and its RWO model volume) and its 12:00Z pod stayed Pending ("Insufficient cpu").
+      - op: add
+        path: /spec/template/spec/affinity
+        value:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - {key: predictive-bench/ml-node, operator: DoesNotExist}
       - op: add
         path: /spec/template/metadata/labels/predictive-bench~1role
         value: arm

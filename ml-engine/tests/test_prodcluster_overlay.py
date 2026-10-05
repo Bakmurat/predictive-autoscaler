@@ -140,3 +140,14 @@ def test_cronjob_recheck_window_matches_the_collectors_finalization_rule():
     collector = open(os.path.join(ROOT, "deploy", "prodcluster", "collect_load_evidence.py")).read()
     assert re.search(rf"^RECHECK_HOURS = {n}\b", collector, re.M), "finalization window must match the CronJob's rechecks"
     assert 'schedule: "14 * * * *"' in text                          # evaluations at t1 + 14 min + k hours
+
+
+def test_arms_keep_off_the_ml_node_and_spread_is_a_preference():
+    # 2026-10-05 12:00Z: arm pods filled the ML node and the trainer (bound to ml-api's node and RWO volume) stayed
+    # Pending; on a shared cluster a hard spread also leaves pods Pending when one node is full
+    text = open(OVERLAY).read()
+    assert re.search(r"path: /spec/template/spec/topologySpreadConstraints/0/whenUnsatisfiable\n\s+value: ScheduleAnyway", text)
+    assert re.search(r"path: /spec/template/spec/affinity\n\s+value:\n\s+nodeAffinity:\n\s+requiredDuringSchedulingIgnoredDuringExecution:"
+                     r"\n\s+nodeSelectorTerms:\n\s+- matchExpressions:\n\s+- \{key: predictive-bench/ml-node, operator: DoesNotExist\}", text)
+    # the nginx-ensemble base affinity is removed BEFORE the arm patch adds the new one
+    assert text.index("path: /spec/template/spec/affinity\n") < text.index("path: /spec/template/spec/affinity\n        value:")
