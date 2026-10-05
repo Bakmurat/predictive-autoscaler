@@ -151,3 +151,15 @@ def test_arms_keep_off_the_ml_node_and_spread_is_a_preference():
                      r"\n\s+nodeSelectorTerms:\n\s+- matchExpressions:\n\s+- \{key: predictive-bench/ml-node, operator: DoesNotExist\}", text)
     # the nginx-ensemble base affinity is removed BEFORE the arm patch adds the new one
     assert text.index("path: /spec/template/spec/affinity\n") < text.index("path: /spec/template/spec/affinity\n        value:")
+
+
+def test_spread_constraints_stay_unique_under_server_side_apply():
+    # SSA keys topologySpreadConstraints by (topologyKey, whenUnsatisfiable): two soft hostname constraints were
+    # rejected for every arm on 2026-10-05 12:20Z. The overlay may change constraint 0 but must not append another.
+    text = open(OVERLAY).read()
+    assert "path: /spec/template/spec/topologySpreadConstraints/-" not in text
+    for rel in ("deploy/eks-benchmark/demo/nginx-test-deployment.yaml", "deploy/eks-benchmark/demo/myapptwo-deployment.yaml",
+                "deploy/eks-benchmark/experiments/seasonal-ensemble-v1/nginx-ensemble-deployment.yaml"):
+        base = open(os.path.join(ROOT, rel)).read()
+        assert base.split("topologySpreadConstraints:", 1)[1].count("- maxSkew") >= 1
+        assert base.count("topologySpreadConstraints:") == 1, rel

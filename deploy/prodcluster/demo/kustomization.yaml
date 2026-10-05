@@ -3,7 +3,7 @@
 #   - every generator mounts the challenge-v1 script (on EKS five of the six were switched by hand; repo drift fixed)
 #     and opens a new connection per request (K6_NO_VU_CONNECTION_REUSE, see the patch);
 #   - nginx-ensemble loses its EKS zone pin (ap-southeast-1b);
-#   - all six arms carry predictive-bench/role=arm and a soft collective hostname spread;
+#   - all six arms carry predictive-bench/role=arm, a soft per-arm hostname spread and stay off the ML node;
 #   - all six arms record their final request counters when a pod terminates (final-snapshot.sh, see the patch);
 #   - VM_QUERY_URL / VM_WRITE_URL placeholders are substituted by ../deploy.sh.
 # The files live outside this directory, so render with: kustomize build --load-restrictor LoadRestrictionsNone
@@ -64,9 +64,7 @@ patches:
     patch: |-
       - op: remove
         path: /spec/template/spec/affinity
-  # Collective spread (Codex Task 03 r13): per-arm constraints alone let all six singleton replicas land on one
-  # worker. A shared pod label plus a SOFT hostname spread across all arms (six arms exceed five workers, so it must
-  # not be mandatory); tainted nodes (the control plane) are not counted as domains.
+  # Arm placement on a shared cluster: per-arm hostname spread (soft, taints honoured), arms kept off the ML node.
   - target: { kind: Deployment, labelSelector: "app in (nginx-test,nginx-reactive,myapptwo,nginx-seasonal,nginx-ensemble,nginx-ensemble-q95)" }
     patch: |-
       # The per-arm hard spread (constraint 0, maxSkew 1, DoNotSchedule) defaults to nodeTaintsPolicy Ignore, so the
@@ -91,19 +89,12 @@ patches:
               nodeSelectorTerms:
                 - matchExpressions:
                     - {key: predictive-bench/ml-node, operator: DoesNotExist}
+      # The collective soft spread over all arms (role=arm) was dropped on 2026-10-05: with the per-arm spread soft too,
+      # the two constraints share server-side apply's list key (topologyKey, whenUnsatisfiable) and the API rejects
+      # the Deployment; the per-arm soft spread plus the scheduler's least-allocated scoring spread the arms.
       - op: add
         path: /spec/template/metadata/labels/predictive-bench~1role
         value: arm
-      - op: add
-        path: /spec/template/spec/topologySpreadConstraints/-
-        value:
-          maxSkew: 1
-          topologyKey: kubernetes.io/hostname
-          whenUnsatisfiable: ScheduleAnyway
-          nodeTaintsPolicy: Honor
-          labelSelector:
-            matchLabels:
-              predictive-bench/role: arm
   # Final snapshot (Codex Task 03 r18/r19): when an arm pod terminates, its nginx preStop hook (final-snapshot.sh)
   # stops Envoy's inbound listeners, waits until no inbound connection or request is left, and pushes the final
   # istio_* counters as bench_final_istio_* plus a receipt to VictoriaMetrics, so requests served after the pod's last
