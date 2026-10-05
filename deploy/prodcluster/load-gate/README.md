@@ -9,4 +9,8 @@ Inputs of the hourly load-evidence CronJob (`../ml-engine/load-evidence.yaml`), 
   reports `qualifies: false` with A1' pending. Only the user approves.
 - `terminations.json` — manual termination records for pods without an accepted final snapshot:
   `{"<pod>": {"terminated_before": UTC, "pod_start": UTC, "pod_uid": "...", "evidence": "...", "recorded_by": "...",
-  "at": UTC}}`. Each closes one incarnation (name + pod start) and must cite its evidence.
+  "at": UTC}}`. Each closes one incarnation (name + pod start) and must cite its evidence. A pod that never ran uses
+  `{"never_scheduled": true, "created": UTC, "deleted_before": UTC, "pod_uid", "evidence", "recorded_by", "at"}`; the
+  collector re-checks it against kube-state-metrics (one creation time, empty node label in every sample, scheduled
+  condition never true, no start time, no Envoy target, no istio series, nothing after deleted_before). Current
+  records: the eleven arm pods that stayed Pending on 2026-10-05 10:02–10:30Z (topology-spread cap, D-1080).

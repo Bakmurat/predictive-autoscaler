@@ -1,1 +1,101 @@
-{}
+{
+ "myapptwo-66b95cc456-zp2nb": {
+  "at": "2026-10-05T10:55:00Z",
+  "created": "2026-10-05T10:11:03Z",
+  "deleted_before": "2026-10-05T10:32:02Z",
+  "evidence": "events prodcluster-20261005/never-scheduled-20261005/demo-events-20261005T104531Z.json (EB2 coordination repo): only FailedScheduling for this UID until 10:30Z (topology-spread cap, D-1080); kube-state-metrics: empty node label in every sample, scheduled condition never true, no start time; deleted by the 10:30:05Z rollout, the API listed no old pod at 10:32:02Z",
+  "never_scheduled": true,
+  "pod_uid": "30d78631-bba9-4c3c-8e4d-7abc37e3ee3b",
+  "recorded_by": "claude (benchmark agent)"
+ },
+ "nginx-ensemble-79897f9d-cjxwr": {
+  "at": "2026-10-05T10:55:00Z",
+  "created": "2026-10-05T10:23:55Z",
+  "deleted_before": "2026-10-05T10:32:02Z",
+  "evidence": "events prodcluster-20261005/never-scheduled-20261005/demo-events-20261005T104531Z.json (EB2 coordination repo): only FailedScheduling for this UID until 10:30Z (topology-spread cap, D-1080); kube-state-metrics: empty node label in every sample, scheduled condition never true, no start time; deleted by the 10:30:05Z rollout, the API listed no old pod at 10:32:02Z",
+  "never_scheduled": true,
+  "pod_uid": "6c12ed55-54b2-4f6c-a0f5-353539972363",
+  "recorded_by": "claude (benchmark agent)"
+ },
+ "nginx-ensemble-79897f9d-ntmtc": {
+  "at": "2026-10-05T10:55:00Z",
+  "created": "2026-10-05T10:01:55Z",
+  "deleted_before": "2026-10-05T10:32:02Z",
+  "evidence": "events prodcluster-20261005/never-scheduled-20261005/demo-events-20261005T104531Z.json (EB2 coordination repo): only FailedScheduling for this UID until 10:30Z (topology-spread cap, D-1080); kube-state-metrics: empty node label in every sample, scheduled condition never true, no start time; deleted by the 10:30:05Z rollout, the API listed no old pod at 10:32:02Z",
+  "never_scheduled": true,
+  "pod_uid": "fea17b3d-5c6d-40c4-932f-df65b3d2ec8d",
+  "recorded_by": "claude (benchmark agent)"
+ },
+ "nginx-ensemble-q95-674c599b8b-v8ctc": {
+  "at": "2026-10-05T10:55:00Z",
+  "created": "2026-10-05T10:23:58Z",
+  "deleted_before": "2026-10-05T10:32:02Z",
+  "evidence": "events prodcluster-20261005/never-scheduled-20261005/demo-events-20261005T104531Z.json (EB2 coordination repo): only FailedScheduling for this UID until 10:30Z (topology-spread cap, D-1080); kube-state-metrics: empty node label in every sample, scheduled condition never true, no start time; deleted by the 10:30:05Z rollout, the API listed no old pod at 10:32:02Z",
+  "never_scheduled": true,
+  "pod_uid": "6ad6e702-ef72-415b-ab7c-274d0c811651",
+  "recorded_by": "claude (benchmark agent)"
+ },
+ "nginx-ensemble-q95-674c599b8b-w9sj4": {
+  "at": "2026-10-05T10:55:00Z",
+  "created": "2026-10-05T10:01:58Z",
+  "deleted_before": "2026-10-05T10:32:02Z",
+  "evidence": "events prodcluster-20261005/never-scheduled-20261005/demo-events-20261005T104531Z.json (EB2 coordination repo): only FailedScheduling for this UID until 10:30Z (topology-spread cap, D-1080); kube-state-metrics: empty node label in every sample, scheduled condition never true, no start time; deleted by the 10:30:05Z rollout, the API listed no old pod at 10:32:02Z",
+  "never_scheduled": true,
+  "pod_uid": "b99936e4-a77c-4b07-b119-99dcafbeffa3",
+  "recorded_by": "claude (benchmark agent)"
+ },
+ "nginx-reactive-7b6c858f4b-ft64g": {
+  "at": "2026-10-05T10:55:00Z",
+  "created": "2026-10-05T10:02:00Z",
+  "deleted_before": "2026-10-05T10:32:02Z",
+  "evidence": "events prodcluster-20261005/never-scheduled-20261005/demo-events-20261005T104531Z.json (EB2 coordination repo): only FailedScheduling for this UID until 10:30Z (topology-spread cap, D-1080); kube-state-metrics: empty node label in every sample, scheduled condition never true, no start time; deleted by the 10:30:05Z rollout, the API listed no old pod at 10:32:02Z",
+  "never_scheduled": true,
+  "pod_uid": "ece83113-734e-4b7e-bd74-d01c4eab5a26",
+  "recorded_by": "claude (benchmark agent)"
+ },
+ "nginx-reactive-7b6c858f4b-rsf9z": {
+  "at": "2026-10-05T10:55:00Z",
+  "created": "2026-10-05T10:23:00Z",
+  "deleted_before": "2026-10-05T10:32:02Z",
+  "evidence": "events prodcluster-20261005/never-scheduled-20261005/demo-events-20261005T104531Z.json (EB2 coordination repo): only FailedScheduling for this UID until 10:30Z (topology-spread cap, D-1080); kube-state-metrics: empty node label in every sample, scheduled condition never true, no start time; deleted by the 10:30:05Z rollout, the API listed no old pod at 10:32:02Z",
+  "never_scheduled": true,
+  "pod_uid": "e8fb613b-5e8f-4f0e-a94a-092d3b36f70b",
+  "recorded_by": "claude (benchmark agent)"
+ },
+ "nginx-seasonal-64bb5f8bb4-np4n9": {
+  "at": "2026-10-05T10:55:00Z",
+  "created": "2026-10-05T10:02:01Z",
+  "deleted_before": "2026-10-05T10:32:02Z",
+  "evidence": "events prodcluster-20261005/never-scheduled-20261005/demo-events-20261005T104531Z.json (EB2 coordination repo): only FailedScheduling for this UID until 10:30Z (topology-spread cap, D-1080); kube-state-metrics: empty node label in every sample, scheduled condition never true, no start time; deleted by the 10:30:05Z rollout, the API listed no old pod at 10:32:02Z",
+  "never_scheduled": true,
+  "pod_uid": "fc40a211-8fde-4e26-a8a3-8abce53a97e4",
+  "recorded_by": "claude (benchmark agent)"
+ },
+ "nginx-seasonal-64bb5f8bb4-qvtw9": {
+  "at": "2026-10-05T10:55:00Z",
+  "created": "2026-10-05T10:22:01Z",
+  "deleted_before": "2026-10-05T10:32:02Z",
+  "evidence": "events prodcluster-20261005/never-scheduled-20261005/demo-events-20261005T104531Z.json (EB2 coordination repo): only FailedScheduling for this UID until 10:30Z (topology-spread cap, D-1080); kube-state-metrics: empty node label in every sample, scheduled condition never true, no start time; deleted by the 10:30:05Z rollout, the API listed no old pod at 10:32:02Z",
+  "never_scheduled": true,
+  "pod_uid": "6398c69a-072e-47d6-a957-041042525cc6",
+  "recorded_by": "claude (benchmark agent)"
+ },
+ "nginx-test-7f9cd5dc64-fph2g": {
+  "at": "2026-10-05T10:55:00Z",
+  "created": "2026-10-05T10:02:01Z",
+  "deleted_before": "2026-10-05T10:32:02Z",
+  "evidence": "events prodcluster-20261005/never-scheduled-20261005/demo-events-20261005T104531Z.json (EB2 coordination repo): only FailedScheduling for this UID until 10:30Z (topology-spread cap, D-1080); kube-state-metrics: empty node label in every sample, scheduled condition never true, no start time; deleted by the 10:30:05Z rollout, the API listed no old pod at 10:32:02Z",
+  "never_scheduled": true,
+  "pod_uid": "68baf94e-8e8b-43db-a681-f2fbf5d8f47a",
+  "recorded_by": "claude (benchmark agent)"
+ },
+ "nginx-test-7f9cd5dc64-x58d2": {
+  "at": "2026-10-05T10:55:00Z",
+  "created": "2026-10-05T10:23:01Z",
+  "deleted_before": "2026-10-05T10:32:02Z",
+  "evidence": "events prodcluster-20261005/never-scheduled-20261005/demo-events-20261005T104531Z.json (EB2 coordination repo): only FailedScheduling for this UID until 10:30Z (topology-spread cap, D-1080); kube-state-metrics: empty node label in every sample, scheduled condition never true, no start time; deleted by the 10:30:05Z rollout, the API listed no old pod at 10:32:02Z",
+  "never_scheduled": true,
+  "pod_uid": "31a0bebb-da91-4d81-b278-d3ea0c5101fc",
+  "recorded_by": "claude (benchmark agent)"
+ }
+}

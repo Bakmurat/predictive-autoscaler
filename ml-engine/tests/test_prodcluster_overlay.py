@@ -110,7 +110,7 @@ def test_load_evidence_cronjob_is_read_only_and_never_reports_success_for_a_fail
     assert 'schedule: "14 * * * *"' in text and "timeZone: Etc/UTC" in text and "concurrencyPolicy: Forbid" in text
     assert "sidecar.istio.io/inject: \"false\"" in text and "automountServiceAccountToken: false" in text
     assert "readOnlyRootFilesystem: true" in text and "runAsNonRoot: true" in text
-    assert '"--json-dir", "/evidence", "--exit-zero"' in text and '"--prom", "VM_QUERY_URL"' in text
+    assert '"--json-dir", "/evidence", "--recheck-hours", "6", "--exit-zero"' in text and '"--prom", "VM_QUERY_URL"' in text
     archive = open(os.path.join(ROOT, "deploy", "eks-benchmark", "instrumentation", "archive.yaml")).read()
     digest = re.search(r"python@(sha256:[0-9a-f]{64})", text).group(1)
     assert digest in archive                     # the image already pulled and running for the evidence archive

@@ -34,7 +34,11 @@ Envoy: value at a successful scrape = the series' sample there, or 0 if absent (
 Inventory (v6): every arm pod with any record (pod info, Envoy target, istio series, receipt) since --inventory-start
   (the moment the final hook ran on every arm pod; earlier pods are closed by a one-time record kept with the
   campaign). A pod without a successful scrape after t1 needs an accepted snapshot (re-verified every hour) or a
-  validated manual termination record (--terminations); otherwise every later hour is INCOMPLETE. An accepted snapshot: exactly one
+  validated manual termination record (--terminations); otherwise every later hour is INCOMPLETE. A pod created at or
+  after the hour end (kube_pod_created) did not serve in it (created_after_hour). A pod that was never scheduled is
+  closed only by a record (never_scheduled) whose evidence the collector re-checks: one creation time equal to the
+  record, an empty node label in every kube-state-metrics sample, scheduled condition never true, no start time, no
+  Envoy target, no istio series, nothing after the recorded deletion bound (Codex r24). An accepted snapshot: exactly one
   receipt (snapshot_version 2), the same non-empty pod_uid on receipt and payload, the receipt's series count stored at
   the capture time, the canonical sha256 recomputed from the stored integer counter series, no duplicate series,
   hot-restart epoch 0, Envoy start (capture - proxy uptime) within -2..+30 s of kube-state-metrics' istio-proxy
@@ -350,19 +354,25 @@ def valid_approvals(raw):
 
 
 def valid_terminations(raw):
-    """{pod: record}: {"terminated_before": UTC, "pod_start": UTC, "pod_uid": "...", "evidence": "...", "recorded_by": "...",
-    "at": UTC}; returns {pod: (terminated_before, pod_start)} for well-formed records only (the record closes the
-    incarnation with that pod start; verify_snapshot checks it against kube-state-metrics)."""
+    """{pod: record} -> {pod: (kind, bound, identity)} for well-formed records only:
+    terminated:      {"terminated_before": UTC, "pod_start": UTC (< bound), "pod_uid", "evidence", "recorded_by", "at"}
+    never_scheduled: {"never_scheduled": true, "created": UTC, "deleted_before": UTC (> created), "pod_uid", "evidence",
+                      "recorded_by", "at"} (the evidence must name the retained UID-bound object/event record)."""
     out = {}
     if not isinstance(raw, dict):
         return out
     for pod, r in raw.items():
-        if not isinstance(r, dict):
+        if not isinstance(r, dict) or _utc(r.get("at")) is None or \
+                not all(isinstance(r.get(k), str) and r[k].strip() for k in ("pod_uid", "evidence", "recorded_by")):
             continue
-        tb, at, ps = _utc(r.get("terminated_before")), _utc(r.get("at")), _utc(r.get("pod_start"))
-        if tb is None or at is None or ps is None or ps >= tb or not all(isinstance(r.get(k), str) and r[k].strip() for k in ("pod_uid", "evidence", "recorded_by")):
+        if r.get("never_scheduled") is True:
+            cr, db = _utc(r.get("created")), _utc(r.get("deleted_before"))
+            if cr is not None and db is not None and cr < db:
+                out[pod] = ("never_scheduled", db, cr)
             continue
-        out[pod] = (tb, ps)
+        tb, ps = _utc(r.get("terminated_before")), _utc(r.get("pod_start"))
+        if tb is not None and ps is not None and ps < tb:
+            out[pod] = ("terminated", tb, ps)
     return out
 
 
@@ -373,14 +383,36 @@ def lifecycle_value(series, what, pod):
     return next(iter(vals))
 
 
+def verify_never_scheduled(vm, pod, rec, end, W):
+    """Re-check a never_scheduled record against kube-state-metrics; returns 0.0 (closed for every hour)."""
+    _, deleted_before, created = rec
+    cr = vm.raw(f'kube_pod_created{{namespace="{NAMESPACE}",pod="{pod}"}}', end, W)
+    if len(cr) != 1 or abs(lifecycle_value(cr[0][1], "pod creation time", pod) - created) > 1:
+        raise Incomplete(f"pod {pod}: never_scheduled record does not match the observed creation time")
+    info = vm.raw(f'kube_pod_info{{namespace="{NAMESPACE}",pod="{pod}"}}', end, W)
+    if not info or any(m.get("node", "") != "" for m, s, _ in info if s) or \
+            any(t > deleted_before + KSM_GAP for _, s, _ in info for t, _ in s):
+        raise Incomplete(f"pod {pod}: never_scheduled contradicted (assigned to a node, or alive after the bound)")
+    sched = vm.raw(f'kube_pod_status_scheduled{{namespace="{NAMESPACE}",pod="{pod}",condition="true"}}', end, W)
+    if not sched or any(v != 0 for _, s, _ in sched for _, v in s):
+        raise Incomplete(f"pod {pod}: scheduled condition missing or true")
+    for q in (f'kube_pod_start_time{{namespace="{NAMESPACE}",pod="{pod}"}}', f'up{{job="{ENVOY_JOB}",namespace="{NAMESPACE}",pod="{pod}"}}',
+              f'istio_requests_total{{namespace="{NAMESPACE}",pod="{pod}"}}'):
+        if any(s for _, s, _ in vm.raw(q, end, W)):
+            raise Incomplete(f"pod {pod}: never_scheduled contradicted by {q.split('{')[0]}")
+    return 0.0
+
+
 def verify_snapshot(vm, app, pod, t_inv, end, terminations):
     """(capture, uid) of a pod whose scrapes stopped: its final snapshot, re-verified from VictoriaMetrics (no cache), or
     (terminated_before, None) from a validated manual termination record."""
     W = int(end - t_inv)
     receipts = [(m, t) for m, s, _ in vm.raw(f'bench_final_snapshot_receipt{{namespace="{NAMESPACE}",pod="{pod}"}}', end, W) for t, _ in s]
     if not receipts:
+        if pod in terminations and terminations[pod][0] == "never_scheduled":
+            return verify_never_scheduled(vm, pod, terminations[pod], end, W), None
         if pod in terminations:
-            tb, rec_start = terminations[pod]
+            _, tb, rec_start = terminations[pod]
             # the record closes ONE incarnation (name + pod start): the observed start must match it, and nothing of
             # that name may be observed alive after the recorded termination bound
             st = vm.raw(f'kube_pod_start_time{{namespace="{NAMESPACE}",pod="{pod}"}}', end, W)
@@ -422,8 +454,17 @@ def arm_envoy(vm, app, t0, t1, end, t_inv, terminations):
     inv = {p for p in inv if p and rx.fullmatch(p)}
     serving_after = {m.get("pod") for m, v in vm.instant(
         f'max by (pod) (max_over_time(up{{job="{ENVOY_JOB}",namespace="{NAMESPACE}",pod=~"{prx}"}}[{int(end - t1)}s]))', end) if v == 1}
-    snaps, closed = {}, []
+    snaps, closed, created_after = {}, [], []
     for p in sorted(inv - serving_after):
+        cr = vm.raw(f'kube_pod_created{{namespace="{NAMESPACE}",pod="{p}"}}', end, W)
+        if len(cr) == 1 and ms(lifecycle_value(cr[0][1], "pod creation time", p)) >= ms(t1):
+            # the pod object did not exist before the hour end: it served nothing in [t0, t1) (Codex r24)
+            early = [t for q in (f'up{{job="{ENVOY_JOB}",namespace="{NAMESPACE}",pod="{p}"}}', f'istio_requests_total{{{sel},pod="{p}"}}')
+                     for _, s, _ in vm.raw(q, end, W) for t, _ in s if t < t1]
+            if early:
+                raise Incomplete(f"pod {p}: created after the hour but observed in it")
+            created_after.append(p)
+            continue
         c, uid = verify_snapshot(vm, app, p, t_inv, end, terminations)
         if ms(c) + 1000 <= ms(t0):
             closed.append(p)                          # finished before the hour: contributes nothing
@@ -431,7 +472,7 @@ def arm_envoy(vm, app, t0, t1, end, t_inv, terminations):
             raise Incomplete(f"pod {p} has only a manual termination record inside the hour")
         else:
             snaps[p] = c
-    relevant = sorted(inv - set(closed))
+    relevant = sorted(inv - set(closed) - set(created_after))
     win = end - (t0 - SHORT)
     info = {m.get("pod") for m, s, _ in vm.raw(f'kube_pod_info{{namespace="{NAMESPACE}",pod=~"{prx}"}}', end, win) if s}
     starts = {}
@@ -468,7 +509,12 @@ def arm_envoy(vm, app, t0, t1, end, t_inv, terminations):
         sc = sorted(targets[p])
         a = max((x for x in sc if x < t0), default=sc[0])
         b = min((x for x in sc if x >= t1), default=sc[-1])
-        if not covers([t for t, _ in restarts[p]], a, b, KSM_GAP):
+        obs = [t for t, _ in restarts[p]]
+        # a counter that reads 0 at its first sample has not restarted since the container started: the container start
+        # (kube-state-metrics) is then a valid observation point (a pod's first scrape can precede the first KSM sample)
+        if restarts[p] and restarts[p][0][1] == 0 and proxy_starts.get(p):
+            obs.append(lifecycle_value(proxy_starts[p], "istio-proxy container start", p))
+        if not covers(obs, a, b, KSM_GAP):
             raise Incomplete(f"pod {p}: istio-proxy restart counter not observed through its scrapes")
     out = {}
     for metric in ("istio_requests_total", "istio_request_duration_milliseconds_bucket"):
@@ -507,7 +553,7 @@ def arm_envoy(vm, app, t0, t1, end, t_inv, terminations):
         out[metric] = (lo, hi, buckets)
     return out["istio_requests_total"][:2], out["istio_request_duration_milliseconds_bucket"][2], {
         "pods_inventoried": len(inv), "pods_relevant": relevant, "final_snapshots_in_hour": sorted(snaps),
-        "pods_closed_before_hour": len(closed)}
+        "pods_closed_before_hour": len(closed), "pods_created_after_hour": created_after}
 
 
 def collect(vm, hour_start, t_inv, terminations=None, approvals=None, now=None):
@@ -537,8 +583,10 @@ def collect(vm, hour_start, t_inv, terminations=None, approvals=None, now=None):
             hbs = vm.raw(f'k6_vus{{testid="{app}"}}', end, end - (t0 - SHORT))
             if len(hbs) != 1 or not covers([t for t, _ in hbs[0][1]], t0, t1 + LAG + PUSH, HB_GAP):
                 raise Incomplete("k6 heartbeat shows a lost flush (or is missing) over the hour and the lag allowance")
-            failed = k6_counter(vm, f'k6_http_reqs_total{{testid="{app}",expected_response="false"}}', t0, t1, k6_start, end, LAG)
-            dropped = k6_counter(vm, f'k6_dropped_iterations_total{{testid="{app}"}}', t0, t1, k6_start, end, LAG)
+            # sparse k6 series may need a sample well after the hour to bound their tail (A1'): search up to collection
+            k6_end = max(end, now - 60)
+            failed = k6_counter(vm, f'k6_http_reqs_total{{testid="{app}",expected_response="false"}}', t0, t1, k6_start, k6_end, LAG)
+            dropped = k6_counter(vm, f'k6_dropped_iterations_total{{testid="{app}"}}', t0, t1, k6_start, k6_end, LAG)
             r.update(failed=[round(x) for x in failed], dropped=[round(x) for x in dropped])
             try:
                 d = k6_counter(vm, f'k6_http_reqs_total{{testid="{app}"}}', t0, t1, k6_start, end, DELTA, zero_allowed=False)
@@ -580,6 +628,9 @@ def main():
     ap.add_argument("--json")
     ap.add_argument("--json-dir", help="write load-<hour>.json atomically into this directory (in-cluster runner)")
     ap.add_argument("--exit-zero", action="store_true", help="exit 0 whatever the outcome (the JSON carries it)")
+    ap.add_argument("--recheck-hours", type=int, default=0,
+                    help="with --json-dir and no --hour: also re-evaluate the N hours before the latest (a sparse k6 tail can "
+                         "only be bounded by a later sample); each file is rewritten with its collection time")
     ap.add_argument("--inventory-start", required=True, help="UTC time from which every arm pod runs the final hook")
     ap.add_argument("--terminations", help='JSON {pod: {"terminated_before", "pod_uid", "evidence", "recorded_by", "at"}}')
     ap.add_argument("--approvals", help='JSON {assumption: {"decision": "approved", "by": "user", "at", "ref"}}')
@@ -588,22 +639,25 @@ def main():
     terminations = json.load(open(a.terminations)) if a.terminations else {}
     approvals = json.load(open(a.approvals)) if a.approvals else {}
     if a.hour:
-        h = datetime.datetime.strptime(a.hour, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+        hours = [datetime.datetime.strptime(a.hour, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)]
     else:
         n = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=GRACE)
-        h = n.replace(minute=0, second=0, microsecond=0) - datetime.timedelta(hours=1)
-    rows = collect(VM(a.prom), h, t_inv, terminations, approvals)
-    for r in rows:
-        print(f"{r['app']:20s} {r['hour_start']} {r['status']:10s} planned={r.get('planned')} observed={r.get('observed')} "
-              f"failed={r.get('failed')} dropped={r.get('dropped')} qualifies={r['qualification']['qualifies']}"
-              + (f" reason={r['reason']}" if "reason" in r else ""))
-    if a.json:
-        json.dump(rows, open(a.json, "w"), indent=1)
-    if a.json_dir:
-        print("wrote", write_rows(rows, a.json_dir, h))
-    if a.exit_zero:
-        return 0
-    return 0 if all(r["qualification"]["qualifies"] for r in rows) else 1
+        last = n.replace(minute=0, second=0, microsecond=0) - datetime.timedelta(hours=1)
+        hours = [last - datetime.timedelta(hours=k) for k in range(a.recheck_hours + 1)]
+    ok = True
+    for h in hours:
+        rows = collect(VM(a.prom), h, t_inv, terminations, approvals)
+        for r in rows:
+            r["collected_at"] = utc(time.time())
+            print(f"{r['app']:20s} {r['hour_start']} {r['status']:10s} planned={r.get('planned')} observed={r.get('observed')} "
+                  f"failed={r.get('failed')} dropped={r.get('dropped')} qualifies={r['qualification']['qualifies']}"
+                  + (f" reason={r['reason']}" if "reason" in r else ""))
+        if a.json and len(hours) == 1:
+            json.dump(rows, open(a.json, "w"), indent=1)
+        if a.json_dir:
+            print("wrote", write_rows(rows, a.json_dir, h))
+        ok = ok and all(r["qualification"]["qualifies"] for r in rows)
+    return 0 if (a.exit_zero or ok) else 1
 
 
 if __name__ == "__main__":

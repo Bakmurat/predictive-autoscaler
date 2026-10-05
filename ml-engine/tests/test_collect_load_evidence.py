@@ -3,7 +3,7 @@
 Fixture timing follows prodcluster measurements (2026-10-05): k6 pushes every 10 s (k6_vus at x.475 s, a changed
 counter stamped with its latest event); Envoy targets scraped every 30 s with `up` and every series sharing the scrape
 timestamp; kube-state-metrics every 20 s; a terminating arm pod pushes bench_final_istio_* and a receipt (snapshot v2)
-at its capture second. Cases from Codex Task 03 r15-r22.
+at its capture second. Cases from Codex Task 03 r15-r24.
 """
 import datetime
 import hashlib
@@ -175,6 +175,16 @@ class FakeVM:
                 out[f"{app}-aaaa1111-p0"] = dict(start=T0 - 7000, ksm_end=last + 30, frm=T0 - 7000, to=last, share=0.0, snap=snap)
         if o.get("alive_without_target"):
             out[f"{app}-aaaa1111-p9"] = dict(start=T0 - 3600, ksm_end=END, frm=None, to=None, share=0.0, snap=None)
+        if o.get("created_after"):                    # Pending pod created after the hour end
+            out[f"{app}-aaaa1111-pc"] = dict(start=T1 + 60, ksm_end=END, frm=None, to=None, share=0.0, snap=None,
+                                             created=T1 + 60, node="", scheduled=False, no_start=True)
+            if o["created_after"] == "seen_early":
+                out[f"{app}-aaaa1111-pc"].update(frm=T1 - 300, to=T1 - 200)
+        if o.get("never_scheduled"):                  # Pending from T0-1000 until deleted at T0-200
+            ns = o["never_scheduled"]
+            out[f"{app}-aaaa1111-pn"] = dict(start=T0 - 1000, ksm_end=T0 - 210, frm=None, to=None, share=0.0, snap=None,
+                                             created=T0 - 1000, node="w1" if ns == "assigned" else "",
+                                             scheduled=(ns == "scheduled"), no_start=True)
         return out
 
     def value(self, p, t):
@@ -233,25 +243,40 @@ class FakeVM:
         arm_pods = self.pods(app)
         if pod_q:
             arm_pods = {pod_q: arm_pods[pod_q]}
+        if name in ("kube_pod_created", "kube_pod_status_scheduled"):
+            out = []
+            for p, d in arm_pods.items():
+                pts = [t for t in ksm if d["start"] <= t <= d["ksm_end"]]
+                if pts:
+                    v = d.get("created", d["start"] - 1) if name == "kube_pod_created" else (1.0 if d.get("scheduled", True) else 0.0)
+                    out.append(({"pod": p}, [(t, v) for t in pts], []))
+            return out
         if name in ("kube_pod_container_status_restarts_total", "kube_pod_container_state_started", "kube_pod_start_time", "kube_pod_info"):
             if (o.get("no_ksm") and name in ("kube_pod_info", "kube_pod_start_time")) or (o.get("no_restart_series") and "restarts" in name):
                 return []
             gap = (T0 + 600, T0 + 900) if (o.get("restart_gap") and "restarts" in name) else None
             if o.get("restart_tail_missing") and "restarts" in name:
                 gap = (T1 - 60, END + 1)
+            late_first = o.get("restart_first_late") and "restarts" in name
             out = []
             for p, d in arm_pods.items():
+                if d.get("no_start") and name != "kube_pod_info":
+                    continue                              # never started: no start time, no container series
                 if name == "kube_pod_container_status_restarts_total":
-                    val = lambda t: 1.0 if (o.get("proxy_restart") and t > T0 + 900) else 0.0
+                    val = lambda t, p=p: 1.0 if ((o.get("proxy_restart") and t > T0 + 900) or (o.get("restart_first_one") and p.endswith("p2"))) else 0.0
                 elif name == "kube_pod_container_state_started":
                     val = lambda t, d=d, p=p: d["start"] + 2 + (30 if (o.get("proxy_start_changes") and p.endswith("p1") and t > T0 + 1000) else 0)
                 elif name == "kube_pod_start_time":
                     val = lambda t, d=d, p=p: d["start"] + (5 if (o.get("start_changes") and p.endswith("p1") and t > T0 + 1000) else 0)
                 else:
                     val = lambda t: 1.0
-                pts = [(t, val(t)) for t in ksm if d["start"] <= t <= d["ksm_end"] and not (gap and gap[0] < t < gap[1] and p.endswith("p1"))]
+                pts = [(t, val(t)) for t in ksm if d["start"] <= t <= d["ksm_end"] and not (gap and gap[0] < t < gap[1] and p.endswith("p1"))
+                       and not (late_first and p.endswith("p2") and t < d["frm"] + 40)]
                 if pts:
-                    out.append(({"pod": p, "container": "istio-proxy"}, pts, []))
+                    lab = {"pod": p, "container": "istio-proxy"}
+                    if name == "kube_pod_info":
+                        lab["node"] = d.get("node", "w1")
+                    out.append((lab, pts, []))
                     if o.get("dup_start") and name == "kube_pod_start_time" and p.endswith("p1"):
                         out.append(({"pod": p, "container": "istio-proxy", "uid": "other"}, pts, []))
             return out
@@ -295,10 +320,13 @@ class FakeVM:
                         out.append((dict(lab, job=job, instance=f"10.0.0.{i}:15090", prometheus="x"), pts, []))
             return out
         if name == "k6_vus":
-            return [({"testid": app}, [(t, 30.0) for t in self.hb if t > lo], [])]
+            return [({"testid": app}, [(t, 30.0) for t in self.hb if lo < t <= t_end], [])]
         if name == "k6_http_reqs_total" and 'expected_response="false"' in sel:
             if app == "nginx-test" and o.get("failure_in_hour"):
                 return [({"testid": app, "expected_response": "false"}, [(T0 + 1000.9, 3.0)] + ([(T1 + 700.9, 4.0)] if o["failure_in_hour"] == "bounded" else []), [])]
+            if app == "nginx-test" and o.get("failure_after_hour"):     # one failure at t1+61; the next only at t1+3000
+                pts = [(T1 + 61.0, 1.0), (T1 + 3000.0, 2.0)]
+                return [({"testid": app, "expected_response": "false"}, [(t, v) for t, v in pts if lo < t <= t_end], [])]
             return []
         if name == "k6_http_reqs_total":
             r = challenge_profile.planned_requests(int(T0)) / 3600.0
@@ -316,7 +344,7 @@ class FakeVM:
             name = inner.split("{")[0]
             pods = []
             for p, d in self.pods(app).items():
-                if name == "kube_pod_info" or (name == "up" and d["frm"] is not None) or \
+                if (name == "kube_pod_info" and d["start"] <= t) or (name == "up" and d["frm"] is not None) or \
                         (name == "bench_final_snapshot_receipt" and d["snap"] is not None) or \
                         (name == "istio_requests_total" and d["frm"] is not None and d["share"] > 0):
                     pods.append(({"pod": p}, 1.0))
@@ -456,3 +484,42 @@ def test_write_rows_is_atomic_and_named_by_hour(tmp_path):
     assert os.path.basename(path) == "load-" + HOUR.strftime("%Y%m%dT%H%MZ") + ".json"
     import json
     assert json.load(open(path)) == rows and not [p for p in os.listdir(tmp_path / "ev") if p.endswith(".tmp")]
+
+
+def test_r24_pod_created_after_the_hour_served_nothing_in_it():
+    r = run(FakeVM(created_after=True))
+    assert r["status"] == "PASS" and r["pods_created_after_hour"] == ["nginx-test-aaaa1111-pc"], r
+    r = run(FakeVM(created_after="seen_early"))
+    assert r["status"] == "INCOMPLETE" and "created after the hour but observed in it" in r["reason"], r
+
+
+NS_REC = {"never_scheduled": True, "created": iso(T0 - 1000), "deleted_before": iso(T0 - 150), "pod_uid": "uid-pn",
+          "evidence": "events capture with FailedScheduling only", "recorded_by": "claude", "at": iso(T0)}
+
+
+def test_r24_never_scheduled_pods_are_closed_only_by_a_verified_record():
+    r = run(FakeVM(never_scheduled="pending"))
+    assert r["status"] == "INCOMPLETE" and "no final snapshot" in r["reason"], r
+    r = run(FakeVM(never_scheduled="pending"), terminations={"nginx-test-aaaa1111-pn": NS_REC})
+    assert r["status"] == "PASS" and r["pods_closed_before_hour"] == 1, r
+    for over, rec, msg in (("assigned", NS_REC, "assigned to a node"), ("scheduled", NS_REC, "scheduled condition"),
+                           ("pending", dict(NS_REC, created=iso(T0 - 900)), "creation time"),
+                           ("pending", dict(NS_REC, deleted_before=iso(T0 - 600)), "alive after the bound")):
+        r = run(FakeVM(never_scheduled=over), terminations={"nginx-test-aaaa1111-pn": rec})
+        assert r["status"] == "INCOMPLETE" and msg in r["reason"], (over, r)
+    bad = dict(NS_REC, deleted_before=iso(T0 - 2000))                      # deleted before created: malformed
+    r = run(FakeVM(never_scheduled="pending"), terminations={"nginx-test-aaaa1111-pn": bad})
+    assert r["status"] == "INCOMPLETE" and "no final snapshot" in r["reason"], r
+
+
+def test_r24_sparse_k6_tail_is_bounded_by_a_sample_found_at_a_later_collection():
+    r = run(FakeVM(failure_after_hour=True))                                     # collected at t1+13 min: unbounded
+    assert r["status"] == "INCOMPLETE" and "tail yet" in r["reason"], r
+    r = run(FakeVM(failure_after_hour=True), now=T1 + 4000)                      # the next failure bounds it
+    assert r["status"] == "PASS" and r["failed"] == [0, 2], r
+
+
+def test_restart_counter_bracket_may_start_at_the_container_start_when_it_reads_zero():
+    vm = FakeVM(born=True, restart_first_late=True)
+    assert run(vm)["status"] == "PASS"
+    assert run(FakeVM(born=True, restart_first_late=True, restart_first_one=True))["status"] == "INCOMPLETE"

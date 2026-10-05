@@ -51,7 +51,7 @@ spec:
               command: ["python3", "-B", "/opt/lea/deploy/prodcluster/collect_load_evidence.py"]
               args: ["--prom", "VM_QUERY_URL", "--inventory-start", "$(INVENTORY_START)",
                      "--approvals", "/opt/gate/approvals.json", "--terminations", "/opt/gate/terminations.json",
-                     "--json-dir", "/evidence", "--exit-zero"]
+                     "--json-dir", "/evidence", "--recheck-hours", "6", "--exit-zero"]
               env:
                 - name: INVENTORY_START
                   valueFrom: {configMapKeyRef: {name: load-gate-settings, key: INVENTORY_START}}
