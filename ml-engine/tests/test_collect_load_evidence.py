@@ -144,7 +144,7 @@ class FakeVM:
         self.rate = challenge_profile.planned_requests(int(T0)) / 3600.0 * o.get("observed_share", 1.0)
         gap = o.get("hb_gap")
         self.hb = [t for t in grid(T0 - 180, END, 10, 0.475) if not (gap and gap[0] < t < gap[1])]
-        self.ksm = grid(T_INV, END + 7200, 20, 0.486)      # kube-state-metrics keeps sampling after the cutoff
+        self.ksm = grid(T_INV, END + 30000, 20, 0.486)     # kube-state-metrics keeps sampling after the cutoff
 
     def app_of(self, sel):
         for app in sorted(cle.APPS, key=len, reverse=True):
@@ -371,12 +371,19 @@ def run(vm, app="nginx-test", now=NOW, terminations=None, approvals=APPROVED):
     return [r for r in cle.collect(vm, HOUR, T_INV, terminations, approvals, now=now) if r["app"] == app][0]
 
 
+FINAL_NOW = T1 + cle.FINAL_AFTER + 60          # inside the sixth scheduled evaluation window
+
+
 def test_healthy_hour_passes_and_qualifies_only_with_the_recorded_approval():
-    r = run(FakeVM())
-    assert r["status"] == "PASS" and r["qualification"]["qualifies"], r
+    r = run(FakeVM(), now=FINAL_NOW)
+    assert r["status"] == "PASS" and r["qualification"]["qualifies"] and r["maturity"]["finalized"], r
+    early = run(FakeVM())                         # the first evaluation: a provisional PASS, never qualifying
+    assert early["status"] == "PASS" and not early["qualification"]["qualifies"] and not early["maturity"]["finalized"]
+    missed = run(FakeVM(), now=T1 + cle.FINAL_AFTER + 3600 + 60)   # after the sixth window: not finalized
+    assert not missed["qualification"]["qualifies"] and not missed["maturity"]["finalized"]
     assert r["failed"] == [0, 0] and r["dropped"] == [0, 0] and r["collector"].endswith("v7")
     assert r["observed"][0] <= r["planned"] <= r["observed"][1] and r["p95_server_ms_interior"] is not None
-    q = run(FakeVM(), approvals={})["qualification"]
+    q = run(FakeVM(), approvals={}, now=FINAL_NOW)["qualification"]
     assert not q["qualifies"] and q["pending_user_approval"] == ["A1'"]
     # reproducibility (Codex r23): exact collector code, boundary, cutoff, records used, identity limitation
     assert len(r["collector_sha256"]) == 64 and r["inventory_start"] and r["collection_cutoff"].endswith("Z")
@@ -399,7 +406,7 @@ def test_r21_no_cache_a_corrupted_snapshot_is_rejected_every_hour():
                                        {"A1'": {"decision": "approved", "by": "claude", "at": "2026-10-05T08:00:00Z", "ref": "U-1"}},
                                        {"A1'": {"decision": "approved", "by": "user", "at": "yesterday", "ref": "U-1"}}])
 def test_r21_malformed_or_negative_approvals_leave_a1_pending(approvals):
-    q = run(FakeVM(), approvals=approvals)["qualification"]
+    q = run(FakeVM(), approvals=approvals, now=FINAL_NOW)["qualification"]
     assert not q["qualifies"] and q["pending_user_approval"] == ["A1'"]
 
 

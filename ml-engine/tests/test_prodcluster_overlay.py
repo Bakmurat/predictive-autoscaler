@@ -132,3 +132,11 @@ def test_per_arm_hard_spread_ignores_the_tainted_control_plane():
         base = open(os.path.join(ROOT, rel)).read()
         first = base.split("topologySpreadConstraints:", 1)[1].split("- maxSkew", 2)[1]
         assert "topologyKey: kubernetes.io/hostname" in first and "DoNotSchedule" in first, rel   # constraint 0 = the hard one
+
+
+def test_cronjob_recheck_window_matches_the_collectors_finalization_rule():
+    text = open(LOAD_EVIDENCE).read()
+    n = int(re.search(r'"--recheck-hours", "(\d+)"', text).group(1))
+    collector = open(os.path.join(ROOT, "deploy", "prodcluster", "collect_load_evidence.py")).read()
+    assert re.search(rf"^RECHECK_HOURS = {n}\b", collector, re.M), "finalization window must match the CronJob's rechecks"
+    assert 'schedule: "14 * * * *"' in text                          # evaluations at t1 + 14 min + k hours

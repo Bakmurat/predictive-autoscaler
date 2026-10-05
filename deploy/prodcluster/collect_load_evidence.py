@@ -64,6 +64,8 @@ SHORT = 180.0
 SCRAPE_LABELS = {"__name__", "app", "container", "endpoint", "instance", "job", "prometheus", "namespace", "pod", "service"}
 SNAP_LABELS = {"__name__", "namespace", "pod", "pod_uid", "snapshot_version"}
 ASSUMPTIONS = {"A1'": "G2/G3 (k6 dropped/failed): a k6 sample reaches the exporter within 600 s of its event time"}
+RECHECK_HOURS = 6        # the in-cluster CronJob re-evaluates each hour at its next six hourly runs (protocol P4)
+FINAL_AFTER = RECHECK_HOURS * 3600 + GRACE   # an hour's verdict is final only in its sixth scheduled evaluation window
 EPOCH_WINDOW = (-2.0, 30.0)  # Envoy start (capture - uptime) minus KSM istio-proxy container start: Envoy starts after
                              # pilot-agent (measured +2 s on prodcluster); whole seconds on both sides
 
@@ -589,8 +591,13 @@ def collect(vm, hour_start, t_inv, terminations=None, approvals=None, now=None):
         except Exception as e:  # any query/transport error => INCOMPLETE, never PASS
             r.update(status="INCOMPLETE", reason=f"error: {str(e)[:250]}")
         pending = sorted(a for a in ASSUMPTIONS if a not in approved)
-        r["qualification"] = {"qualifies": r["status"] == "PASS" and not pending, "conditional_on": ASSUMPTIONS,
-                              "pending_user_approval": pending}
+        # maturity (Codex r26): only the evaluation made in the sixth scheduled window is final; an earlier PASS in the
+        # latest projection is provisional, and a missed sixth evaluation leaves the hour not finalized
+        w0, w1 = t1 + FINAL_AFTER, t1 + FINAL_AFTER + 3600
+        finalized = w0 <= now < w1
+        r["maturity"] = {"finalized": finalized, "final_evaluation_window": [utc(w0), utc(w1)]}
+        r["qualification"] = {"qualifies": r["status"] == "PASS" and not pending and finalized, "conditional_on": ASSUMPTIONS,
+                              "pending_user_approval": pending, "finalized": finalized}
         rows.append(r)
     return rows
 
