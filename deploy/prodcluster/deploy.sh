@@ -20,6 +20,10 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"; OUT="$HERE/rendered"
 KUBECTL="${KUBECTL:-kubectl}"; KUSTOMIZE="${KUSTOMIZE:-kustomize}"
 k(){ "$KUBECTL" --context "$KUBE_CONTEXT" "$@"; }
+# Server-side apply: client-side apply merges list entries by the strategic-merge key only (for
+# topologySpreadConstraints that is topologyKey), which folded the arms' two hostname constraints into one.
+# SSA keys them by (topologyKey, whenUnsatisfiable) and makes the applied manifests authoritative.
+sa(){ k apply --server-side --force-conflicts --field-manager=predictive-bench-deploy "$@"; }
 need(){ for v in "$@"; do [ -n "${!v:-}" ] || { echo "missing environment variable $v" >&2; exit 2; }; done; }
 
 render() {
@@ -50,7 +54,7 @@ mask() {
   need KUBE_CONTEXT
   python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$HERE/validity-mask.json"
   k -n ml-engine create configmap validity-mask --from-file=validity-mask.json="$HERE/validity-mask.json" \
-    --dry-run=client -o yaml | k apply -f -
+    --dry-run=client -o yaml | sa -f -
 }
 
 ml_engine() {
@@ -62,14 +66,14 @@ crd = [d for d in docs if "\nkind: CustomResourceDefinition" in "\n" + d]
 rest = [d for d in docs if d not in crd]
 open(sys.argv[2], "w").write("\n---\n".join(crd) + "\n"); open(sys.argv[3], "w").write("\n---\n".join(rest) + "\n")
 PY
-  k apply -f "$OUT/ml-engine.crd.yaml"
+  sa -f "$OUT/ml-engine.crd.yaml"
   k wait --for=condition=Established crd/predictiveautoscalers.autoscaler.example.com --timeout=60s
-  k apply -f "$OUT/ml-engine.rest.yaml"
+  sa -f "$OUT/ml-engine.rest.yaml"
 }
 
 demo() {
   need KUBE_CONTEXT; [ -s "$OUT/demo.yaml" ] || { echo "run render first" >&2; exit 2; }
-  k apply -f "$OUT/demo.yaml"
+  sa -f "$OUT/demo.yaml"
 }
 
 status() {
