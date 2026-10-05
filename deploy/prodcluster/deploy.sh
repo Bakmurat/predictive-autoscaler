@@ -15,6 +15,8 @@
 #   GIT_COMMIT_VALUE full commit the images were built from
 #   VM_QUERY_URL     in-cluster Prometheus-compatible query base, e.g. http://vmselect.<ns>.svc:8481/select/0/prometheus
 #   VM_WRITE_URL     in-cluster remote-write endpoint, e.g. http://vminsert.<ns>.svc:8480/insert/0/prometheus/api/v1/write
+#   VM_IMPORT_URL    in-cluster Prometheus-text import endpoint for the arms' final snapshots,
+#                    e.g. http://vminsert.<ns>.svc:8480/insert/0/prometheus/api/v1/import/prometheus
 # Optional: KUBECTL (default: kubectl), KUSTOMIZE (default: kustomize, v5.8+; the kubectl-embedded one is too old),
 #   FORCE_CONFLICTS=1 to take over fields owned by another field manager (otherwise conflicts fail the apply).
 set -euo pipefail
@@ -30,15 +32,15 @@ sa(){ k apply --server-side ${FORCE_CONFLICTS:+--force-conflicts} --field-manage
 need(){ for v in "$@"; do [ -n "${!v:-}" ] || { echo "missing environment variable $v" >&2; exit 2; }; done; }
 
 render() {
-  need HARBOR_REGISTRY ML_API_DIGEST OPERATOR_DIGEST GIT_COMMIT_VALUE VM_QUERY_URL VM_WRITE_URL
+  need HARBOR_REGISTRY ML_API_DIGEST OPERATOR_DIGEST GIT_COMMIT_VALUE VM_QUERY_URL VM_WRITE_URL VM_IMPORT_URL
   mkdir -p "$OUT"
   for part in ml-engine demo; do
     "$KUSTOMIZE" build --load-restrictor LoadRestrictionsNone "$HERE/$part" | python3 -c '
 import os, re, sys
 s = sys.stdin.read()
-for key in ("HARBOR_REGISTRY", "ML_API_DIGEST", "OPERATOR_DIGEST", "GIT_COMMIT_VALUE", "VM_QUERY_URL", "VM_WRITE_URL"):
+for key in ("HARBOR_REGISTRY", "ML_API_DIGEST", "OPERATOR_DIGEST", "GIT_COMMIT_VALUE", "VM_QUERY_URL", "VM_WRITE_URL", "VM_IMPORT_URL"):
     s = s.replace(key, os.environ[key])
-left = sorted(set(re.findall(r"\b(HARBOR_REGISTRY|ML_API_DIGEST|OPERATOR_DIGEST|GIT_COMMIT_VALUE|VM_QUERY_URL|VM_WRITE_URL|ECR_REGISTRY|IMAGE_TAG)\b", s)))
+left = sorted(set(re.findall(r"\b(HARBOR_REGISTRY|ML_API_DIGEST|OPERATOR_DIGEST|GIT_COMMIT_VALUE|VM_QUERY_URL|VM_WRITE_URL|VM_IMPORT_URL|ECR_REGISTRY|IMAGE_TAG)\b", s)))
 if left: sys.exit("placeholders left after substitution: %s" % left)
 sys.stdout.write(s)' > "$OUT/$part.yaml"
     echo "rendered $OUT/$part.yaml ($(grep -c '^kind:' "$OUT/$part.yaml") objects)"
@@ -89,5 +91,5 @@ status() {
 
 case "${1:-}" in
   render) render ;; label-nodes) label_nodes ;; mask) mask ;; ml-engine) ml_engine ;; demo) demo ;; status) status ;;
-  *) sed -n '2,20p' "$0"; exit 2 ;;
+  *) sed -n '2,22p' "$0"; exit 2 ;;
 esac

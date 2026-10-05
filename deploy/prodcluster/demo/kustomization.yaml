@@ -4,6 +4,7 @@
 #     and opens a new connection per request (K6_NO_VU_CONNECTION_REUSE, see the patch);
 #   - nginx-ensemble loses its EKS zone pin (ap-southeast-1b);
 #   - all six arms carry predictive-bench/role=arm and a soft collective hostname spread;
+#   - all six arms record their final request counters when a pod terminates (final-snapshot.sh, see the patch);
 #   - VM_QUERY_URL / VM_WRITE_URL placeholders are substituted by ../deploy.sh.
 # The files live outside this directory, so render with: kustomize build --load-restrictor LoadRestrictionsNone
 apiVersion: kustomize.config.k8s.io/v1beta1
@@ -42,6 +43,10 @@ resources:
   - ../../eks-benchmark/experiments/seasonal-ensemble-q95-v1/nginx-ensemble-q95-service.yaml
   - ../../eks-benchmark/experiments/seasonal-ensemble-q95-v1/nginx-ensemble-q95-predictive-autoscaler.yaml
   - ../../eks-benchmark/experiments/seasonal-ensemble-q95-v1/k6-nginx-ensemble-q95-deployment.yaml
+configMapGenerator:
+  - name: final-snapshot-script
+    namespace: demo
+    files: [ final-snapshot.sh ]
 patches:
   # K6_NO_VU_CONNECTION_REUSE (k6 env options override script options; the script is unchanged): the generators
   # have no sidecar and Cilium balances per connection, so with keep-alive every VU connection opened while an arm had
@@ -77,3 +82,41 @@ patches:
           labelSelector:
             matchLabels:
               predictive-bench/role: arm
+  # Final snapshot (Codex Task 03 r18/r19): when an arm pod terminates, its nginx preStop hook (final-snapshot.sh)
+  # stops Envoy's inbound listeners, waits until no inbound connection or request is left, and pushes the final
+  # istio_* counters as bench_final_istio_* plus a receipt to VictoriaMetrics, so requests served after the pod's last
+  # scrape are not lost to the hourly load evidence. Envoy must outlive the hook (terminationDrainDuration 60 s; the
+  # hook's worst case, every request timing out, is 51 s) and the pod must outlive Envoy (grace period 75 s). The inbound gauges the hook reads are not exported by
+  # Istio by default.
+  - target: { kind: Deployment, labelSelector: "app in (nginx-test,nginx-reactive,myapptwo,nginx-seasonal,nginx-ensemble,nginx-ensemble-q95)" }
+    patch: |-
+      - op: add
+        path: /spec/template/metadata/annotations/proxy.istio.io~1config
+        value: |
+          terminationDrainDuration: 60s
+          proxyStatsMatcher:
+            inclusionRegexps:
+              - "listener\\.0\\.0\\.0\\.0_15006\\.downstream_(pre_)?cx_active"
+              - "http\\.inbound_.*\\.downstream_rq_active"
+      - op: add
+        path: /spec/template/spec/terminationGracePeriodSeconds
+        value: 75
+      - op: add
+        path: /spec/template/spec/volumes
+        value:
+          - { name: final-snapshot, configMap: { name: final-snapshot-script, defaultMode: 365 } }
+      - op: add
+        path: /spec/template/spec/containers/0/volumeMounts
+        value:
+          - { name: final-snapshot, mountPath: /opt/final-snapshot, readOnly: true }
+      - op: add
+        path: /spec/template/spec/containers/0/env
+        value:
+          - { name: POD_NAME, valueFrom: { fieldRef: { fieldPath: metadata.name } } }
+          - { name: POD_UID, valueFrom: { fieldRef: { fieldPath: metadata.uid } } }
+          - { name: POD_NAMESPACE, valueFrom: { fieldRef: { fieldPath: metadata.namespace } } }
+          - { name: SNAPSHOT_URL, value: "VM_IMPORT_URL" }
+      - op: add
+        path: /spec/template/spec/containers/0/lifecycle
+        value:
+          preStop: { exec: { command: ["/bin/sh", "/opt/final-snapshot/final-snapshot.sh"] } }

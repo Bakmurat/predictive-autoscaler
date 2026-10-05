@@ -17,6 +17,8 @@ campaign**, so nothing measured on EKS is pooled with it. No result is claimed h
 | ml-api experiments | live `kubectl set env` patches | declared in `ml-engine/ml-api-experiments.yaml` (S1, E1 q90, E2 q95; R1 not enabled) |
 | Generators | five of six switched to challenge-v1 by hand | all six mount `k6-load-script-challenge-v1` |
 | `nginx-ensemble` | pinned to one EKS zone | spread by hostname like the other arms |
+| Generator connections | keep-alive per VU | one connection per request (`K6_NO_VU_CONNECTION_REUSE`): with keep-alive and no generator sidecar, pods added by a scale-up received no requests |
+| Pod termination | default | `final-snapshot.sh` preStop hook: drains Envoy's inbound listeners and pushes the pod's final request counters (`bench_final_istio_*` plus a receipt) to VictoriaMetrics, so requests served after the last scrape are not lost |
 
 The manifests themselves (arms, generators, autoscalers, CronJobs, archive) are reused unchanged from
 `k8s-manifests/base` and `deploy/eks-benchmark`.
@@ -34,6 +36,7 @@ export GIT_COMMIT_VALUE=<full commit the images were built from>
 export ML_API_DIGEST=sha256:<…> OPERATOR_DIGEST=sha256:<…>
 export VM_QUERY_URL=http://<vmselect>.<ns>.svc:8481/select/0/prometheus
 export VM_WRITE_URL=http://<vminsert>.<ns>.svc:8480/insert/0/prometheus/api/v1/write
+export VM_IMPORT_URL=http://<vminsert>.<ns>.svc:8480/insert/0/prometheus/api/v1/import/prometheus
 export ML_NODE=<worker with the most free root disk> SEASONAL_GEN_NODE=<worker> ENSEMBLE_GEN_NODE=<worker>
 
 ./deploy.sh render        # rendered/{ml-engine,demo}.yaml; fails if any placeholder is left

@@ -49,3 +49,43 @@ def test_base_generators_recreate_without_sidecar_and_with_an_env_list():
         assert re.search(r'sidecar\.istio\.io/inject: "false"', text), rel
         assert len(re.findall(r"^\s+containers:\n", text, re.M)) == 1, rel
         assert re.search(r"containers:\n\s+- name: k6\n(?:.*\n)*?\s+env:\n\s+- name: TARGET_URL", text), rel
+
+
+ARMS_SELECTOR = '{ kind: Deployment, labelSelector: "app in (nginx-test,nginx-reactive,myapptwo,nginx-seasonal,nginx-ensemble,nginx-ensemble-q95)" }'
+
+
+def final_snapshot_patch():
+    text = open(OVERLAY).read()
+    blocks = [b for b in re.split(r"\n  - target: ", text) if b.startswith(ARMS_SELECTOR) and "containers/0/lifecycle" in b]
+    assert len(blocks) == 1
+    return blocks[0]
+
+
+def test_arms_run_the_final_snapshot_hook_from_a_generated_config_map():
+    text = open(OVERLAY).read()
+    assert re.search(r"configMapGenerator:\n  - name: final-snapshot-script\n    namespace: demo\n    files: \[ final-snapshot.sh \]", text)
+    p = final_snapshot_patch()
+    assert 'command: ["/bin/sh", "/opt/final-snapshot/final-snapshot.sh"]' in p
+    assert "configMap: { name: final-snapshot-script, defaultMode: 365 }" in p
+    for env in ("POD_NAME", "POD_UID", "POD_NAMESPACE"):
+        assert f"name: {env}, valueFrom" in p
+    assert '{ name: SNAPSHOT_URL, value: "VM_IMPORT_URL" }' in p
+
+
+def test_envoy_outlives_the_hook_and_the_pod_outlives_envoy():
+    p = final_snapshot_patch()
+    drain = int(re.search(r"terminationDrainDuration: (\d+)s", p).group(1))
+    grace = int(re.search(r"terminationGracePeriodSeconds\n\s+value: (\d+)", p).group(1))
+    script = open(os.path.join(ROOT, "deploy", "prodcluster", "demo", "final-snapshot.sh")).read()
+    settle = int(re.search(r"SETTLE=\$\{FINAL_SNAPSHOT_SETTLE:-(\d+)\}", script).group(1))
+    wait = int(re.search(r"WAIT=\$\{FINAL_SNAPSHOT_WAIT:-(\d+)\}", script).group(1))
+    # every request at its timeout: listener_stopped read and drain (2 + 2), polling until the deadline plus one last
+    # poll (wait + 2), three read pairs 1 s apart (3 * (2 + 1 + 2)), uptime and epoch (2 + 2), two uploads (2 * 5)
+    worst = settle + 2 + 2 + wait + 2 + 3 * (2 + 1 + 2) + 2 + 2 + 2 * 5
+    assert worst < drain < grace, (worst, drain, grace)
+
+
+def test_the_hook_reads_gauges_istio_does_not_export_by_default():
+    p = final_snapshot_patch()
+    assert r'"listener\\.0\\.0\\.0\\.0_15006\\.downstream_(pre_)?cx_active"' in p
+    assert r'"http\\.inbound_.*\\.downstream_rq_active"' in p
