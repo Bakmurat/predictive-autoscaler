@@ -341,6 +341,9 @@ def test_healthy_hour_passes_and_qualifies_only_with_the_recorded_approval():
     assert r["observed"][0] <= r["planned"] <= r["observed"][1] and r["p95_server_ms_interior"] is not None
     q = run(FakeVM(), approvals={})["qualification"]
     assert not q["qualifies"] and q["pending_user_approval"] == ["A1'"]
+    # reproducibility (Codex r23): exact collector code, boundary, cutoff, records used, identity limitation
+    assert len(r["collector_sha256"]) == 64 and r["inventory_start"] and r["collection_cutoff"].endswith("Z")
+    assert r["terminations_used"] == [] and "no pod UID" in r["identity"]
 
 
 def test_scale_down_with_a_valid_snapshot_passes():
@@ -445,3 +448,11 @@ def test_observed_short_of_plan_fails_and_partial_or_early_is_incomplete():
 def test_e1_and_e2_are_not_confused():
     r = run(FakeVM(), app="nginx-ensemble")
     assert r["status"] == "PASS" and r["generator_pod"] == "k6-nginx-ensemble-abcd1234-xyz12" and r["pods_relevant"] == ["nginx-ensemble-aaaa1111-p1"]
+
+
+def test_write_rows_is_atomic_and_named_by_hour(tmp_path):
+    rows = [{"app": "nginx-test", "status": "PASS"}]
+    path = cle.write_rows(rows, str(tmp_path / "ev"), HOUR)
+    assert os.path.basename(path) == "load-" + HOUR.strftime("%Y%m%dT%H%MZ") + ".json"
+    import json
+    assert json.load(open(path)) == rows and not [p for p in os.listdir(tmp_path / "ev") if p.endswith(".tmp")]

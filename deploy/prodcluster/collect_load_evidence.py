@@ -72,6 +72,17 @@ class Incomplete(Exception):
     pass
 
 
+with open(os.path.abspath(__file__), "rb") as _fh:
+    import hashlib as _hashlib
+    COLLECTOR_SHA256 = _hashlib.sha256(_fh.read()).hexdigest()   # identifies the exact collector code in every row
+IDENTITY_NOTE = ("pods identified by name + kube-state-metrics start times (pod and istio-proxy container); this cluster's "
+                 "kube-state-metrics exports no pod UID, so snapshot pod_uid labels are only checked for consistency")
+
+
+def utc(t):
+    return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def ms(t):
     return int(round(float(t) * 1000))
 
@@ -508,7 +519,8 @@ def collect(vm, hour_start, t_inv, terminations=None, approvals=None, now=None):
     rows = []
     for app in APPS:
         r = {"app": app, "hour_start": hour_start.strftime("%Y-%m-%dT%H:%M:%SZ"), "collector": "collect_load_evidence.py v7",
-             "inventory_start": datetime.datetime.fromtimestamp(t_inv, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+             "collector_sha256": COLLECTOR_SHA256, "inventory_start": utc(t_inv), "collection_cutoff": utc(end),
+             "terminations_used": sorted(terminations), "identity": IDENTITY_NOTE}
         try:
             if now < end:
                 raise Incomplete(f"collected before the hour closed + {int(GRACE)} s")
@@ -548,11 +560,26 @@ def collect(vm, hour_start, t_inv, terminations=None, approvals=None, now=None):
     return rows
 
 
+def write_rows(rows, directory, hour_start):
+    """Atomically write the hour's rows to <directory>/load-<YYYYmmddTHHMMZ>.json (temporary file, fsync, rename)."""
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, "load-" + hour_start.strftime("%Y%m%dT%H%MZ") + ".json")
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(rows, fh, indent=1)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    return path
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prom", required=True)
     ap.add_argument("--hour")
     ap.add_argument("--json")
+    ap.add_argument("--json-dir", help="write load-<hour>.json atomically into this directory (in-cluster runner)")
+    ap.add_argument("--exit-zero", action="store_true", help="exit 0 whatever the outcome (the JSON carries it)")
     ap.add_argument("--inventory-start", required=True, help="UTC time from which every arm pod runs the final hook")
     ap.add_argument("--terminations", help='JSON {pod: {"terminated_before", "pod_uid", "evidence", "recorded_by", "at"}}')
     ap.add_argument("--approvals", help='JSON {assumption: {"decision": "approved", "by": "user", "at", "ref"}}')
@@ -572,6 +599,10 @@ def main():
               + (f" reason={r['reason']}" if "reason" in r else ""))
     if a.json:
         json.dump(rows, open(a.json, "w"), indent=1)
+    if a.json_dir:
+        print("wrote", write_rows(rows, a.json_dir, h))
+    if a.exit_zero:
+        return 0
     return 0 if all(r["qualification"]["qualifies"] for r in rows) else 1
 
 

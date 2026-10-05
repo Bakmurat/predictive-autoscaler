@@ -89,3 +89,32 @@ def test_the_hook_reads_gauges_istio_does_not_export_by_default():
     p = final_snapshot_patch()
     assert r'"listener\\.0\\.0\\.0\\.0_15006\\.downstream_(pre_)?cx_active"' in p
     assert r'"http\\.inbound_.*\\.downstream_rq_active"' in p
+
+
+LOAD_EVIDENCE = os.path.join(ROOT, "deploy", "prodcluster", "ml-engine", "load-evidence.yaml")
+PLACEHOLDERS = ("HARBOR_REGISTRY", "ML_API_DIGEST", "OPERATOR_DIGEST", "GIT_COMMIT_VALUE", "VM_QUERY_URL", "VM_WRITE_URL",
+                "VM_IMPORT_URL", "ECR_REGISTRY", "IMAGE_TAG")
+
+
+def test_files_embedded_in_config_maps_contain_no_render_placeholder():
+    # deploy.sh substitutes these tokens across the whole rendered YAML, including ConfigMap file contents
+    for rel in ("deploy/prodcluster/collect_load_evidence.py", "deploy/eks-benchmark/workload/challenge-v1/challenge_profile.py",
+                "deploy/eks-benchmark/workload/challenge-v1/profile.json", "deploy/prodcluster/demo/final-snapshot.sh",
+                "deploy/prodcluster/load-gate/approvals.json", "deploy/prodcluster/load-gate/terminations.json"):
+        text = open(os.path.join(ROOT, rel)).read()
+        assert not [p for p in PLACEHOLDERS if re.search(r"\b" + p + r"\b", text)], rel
+
+
+def test_load_evidence_cronjob_is_read_only_and_never_reports_success_for_a_failed_gate():
+    text = open(LOAD_EVIDENCE).read()
+    assert 'schedule: "14 * * * *"' in text and "timeZone: Etc/UTC" in text and "concurrencyPolicy: Forbid" in text
+    assert "sidecar.istio.io/inject: \"false\"" in text and "automountServiceAccountToken: false" in text
+    assert "readOnlyRootFilesystem: true" in text and "runAsNonRoot: true" in text
+    assert '"--json-dir", "/evidence", "--exit-zero"' in text and '"--prom", "VM_QUERY_URL"' in text
+    archive = open(os.path.join(ROOT, "deploy", "eks-benchmark", "instrumentation", "archive.yaml")).read()
+    digest = re.search(r"python@(sha256:[0-9a-f]{64})", text).group(1)
+    assert digest in archive                     # the image already pulled and running for the evidence archive
+    k = open(os.path.join(ROOT, "deploy", "prodcluster", "ml-engine", "kustomization.yaml")).read()
+    assert "  - load-evidence.yaml" in k and "../collect_load_evidence.py" in k and "../load-gate/settings.env" in k
+    settings = open(os.path.join(ROOT, "deploy", "prodcluster", "load-gate", "settings.env")).read()
+    assert settings.strip() == "INVENTORY_START=2026-10-05T08:14:00Z"

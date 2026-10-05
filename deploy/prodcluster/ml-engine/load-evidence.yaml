@@ -1,0 +1,80 @@
+# Hourly load evidence in the cluster (the Mac that ran it sleeps). At :14 UTC the collector
+# (deploy/prodcluster/collect_load_evidence.py, read from a generated ConfigMap) evaluates the previous full hour
+# (collectable from t1 + 12 min) and writes load-<hour>.json atomically to its own volume. It only reads
+# VictoriaMetrics: no Kubernetes API access, no service-account token, no sidecar.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: load-evidence-pvc
+  namespace: ml-engine
+  labels: {app: load-evidence}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: harvester
+  resources: {requests: {storage: 1Gi}}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: load-evidence
+  namespace: ml-engine
+  labels: {app: load-evidence}
+spec:
+  schedule: "14 * * * *"
+  timeZone: Etc/UTC
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 1800
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 1500
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels: {app: load-evidence}
+          annotations: {sidecar.istio.io/inject: "false"}
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            fsGroup: 65534
+            seccompProfile: {type: RuntimeDefault}
+          containers:
+            - name: collect
+              # python:3.12-alpine, multi-arch index pinned by digest (the evidence-archive image); stdlib only
+              image: public.ecr.aws/docker/library/python@sha256:4c47124a8391cb7a9f571164147d154777cf012a4ece5f86097130d7a4478111
+              command: ["python3", "-B", "/opt/lea/deploy/prodcluster/collect_load_evidence.py"]
+              args: ["--prom", "VM_QUERY_URL", "--inventory-start", "$(INVENTORY_START)",
+                     "--approvals", "/opt/gate/approvals.json", "--terminations", "/opt/gate/terminations.json",
+                     "--json-dir", "/evidence", "--exit-zero"]
+              env:
+                - name: INVENTORY_START
+                  valueFrom: {configMapKeyRef: {name: load-gate-settings, key: INVENTORY_START}}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: [ALL]}
+              resources:
+                requests: {cpu: 50m, memory: 64Mi}
+                limits: {cpu: 500m, memory: 256Mi}
+              volumeMounts:
+                - {name: code, mountPath: /opt/lea, readOnly: true}
+                - {name: gate, mountPath: /opt/gate, readOnly: true}
+                - {name: evidence, mountPath: /evidence}
+          volumes:
+            - name: code
+              configMap:
+                name: load-evidence-code
+                items:
+                  - {key: collect_load_evidence.py, path: deploy/prodcluster/collect_load_evidence.py}
+                  - {key: challenge_profile.py, path: deploy/eks-benchmark/workload/challenge-v1/challenge_profile.py}
+                  - {key: profile.json, path: deploy/eks-benchmark/workload/challenge-v1/profile.json}
+            - name: gate
+              configMap: {name: load-gate-records}
+            - name: evidence
+              persistentVolumeClaim: {claimName: load-evidence-pvc}

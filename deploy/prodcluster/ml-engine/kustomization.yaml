@@ -12,6 +12,22 @@ kind: Kustomization
 resources:
   - ../../../k8s-manifests/base
   - ../../eks-benchmark/instrumentation
+  - load-evidence.yaml
+configMapGenerator:
+  # the hourly load-evidence CronJob's code and records (load-evidence.yaml); hashed names roll the CronJob's
+  # template whenever the collector or a record changes
+  - name: load-evidence-code
+    namespace: ml-engine
+    files:
+      - ../collect_load_evidence.py
+      - ../../eks-benchmark/workload/challenge-v1/challenge_profile.py
+      - ../../eks-benchmark/workload/challenge-v1/profile.json
+  - name: load-gate-records
+    namespace: ml-engine
+    files: [../load-gate/approvals.json, ../load-gate/terminations.json]
+  - name: load-gate-settings
+    namespace: ml-engine
+    envs: [../load-gate/settings.env]
 images:
   - name: registry.example.com/predictive-autoscaler/predictive-autoscaler-ml-api
     newName: HARBOR_REGISTRY/predictive-autoscaler-ml-api
