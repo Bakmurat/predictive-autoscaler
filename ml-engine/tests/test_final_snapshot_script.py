@@ -14,8 +14,11 @@ import pytest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "..", "..", "deploy", "prodcluster", "demo", "final-snapshot.sh")
-LINES = ['istio_requests_total{reporter="destination",response_code="200"} 721',
-         'istio_request_duration_milliseconds_bucket{reporter="destination",le="5"} 700']
+LINES = ['istio_requests_total{reporter="destination",response_code="200",destination_version=""} 721',
+         'istio_request_duration_milliseconds_bucket{reporter="destination",le="5"} 700',
+         'istio_request_duration_milliseconds_sum{reporter="destination"} 1234.5']
+CANONICAL = sorted(['istio_requests_total{reporter="destination",response_code="200"} 721',
+                    'istio_request_duration_milliseconds_bucket{le="5",reporter="destination"} 700'])
 
 CURL = r'''#!PYTHON
 import json, os, re, sys, urllib.parse
@@ -25,7 +28,14 @@ a = sys.argv[1:]
 url = [x for x in a if x.startswith("http")][0]
 method = "POST" if ("-X" in a and a[a.index("-X") + 1] == "POST") or "--data-binary" in a else "GET"
 def save(): json.dump(st, open(st_path, "w"))
-def out(s): sys.stdout.write(s); save(); sys.exit(0)
+def out(s, code=0):
+    if "-o" in a:
+        dst = a[a.index("-o") + 1]
+        if dst != "/dev/null":
+            open(dst, "w").write(s)
+    else:
+        sys.stdout.write(s)
+    save(); sys.exit(code)
 def err(): save(); sys.exit(22)
 st["calls"].append(url.split("?")[0].rsplit("/", 1)[-1] + ":" + method)
 if url.startswith(os.environ["SNAPSHOT_URL"]):
@@ -43,6 +53,8 @@ if url.endswith("/stats/prometheus"):
     i = st["prom_reads"]
     text = st["prom"][min(i, len(st["prom"]) - 1)]
     st["prom_reads"] = i + 1
+    if st.get("truncate"):
+        out(text.splitlines(True)[0], 28)          # a valid prefix, then a timeout: curl exits 28
     out(text)
 if url.endswith("/stats"):
     filt = urllib.parse.unquote_plus([x for x in a if x.startswith("filter=")][0][len("filter="):])
@@ -94,13 +106,16 @@ def test_happy_path_pushes_settled_counters_then_the_receipt(tmp_path):
     ts = int(payload[0].rsplit(" ", 1)[1]) // 1000
     assert payload == [f"bench_final_{line} {ts}000" for line in LINES]             # renamed, capture-time stamped
     q = st["pushes"][0]["query"]
-    assert "extra_label=pod=nginx-test-abc-1" in q and "extra_label=pod_uid=uid-1" in q and "snapshot_version=1" in q
+    assert "extra_label=pod=nginx-test-abc-1" in q and "extra_label=pod_uid=uid-1" in q and "snapshot_version=2" in q
     receipt = st["pushes"][1]["body"]
-    assert 'series="2"' in receipt and 'proxy_uptime_s="900"' in receipt and receipt.endswith(f" {ts} {ts}000\n")
+    assert 'series="3"' in receipt and 'canonical_series="2"' in receipt and 'proxy_uptime_s="900"' in receipt
+    assert receipt.endswith(f" {ts} {ts}000\n")
     import hashlib
-    assert hashlib.sha256(st["pushes"][0]["body"].encode()).hexdigest() in receipt
+    assert f'sha256="{hashlib.sha256(st["pushes"][0]["body"].encode()).hexdigest()}"' in receipt
+    canon = "".join(line + "\n" for line in CANONICAL)          # what the collector recomputes from stored series
+    assert f'canonical_sha256="{hashlib.sha256(canon.encode()).hexdigest()}"' in receipt
     assert st["calls"].index("drain_listeners:POST") < st["calls"].index("prometheus:GET")
-    assert "ok series=2" in log
+    assert "ok series=3 canonical=2" in log
 
 
 @pytest.mark.parametrize("case,over,msg", [
@@ -115,6 +130,9 @@ def test_happy_path_pushes_settled_counters_then_the_receipt(tmp_path):
     ("stopped counter missing", {"drop_stats": ["listener_manager.listener_stopped"]}, "listener_stopped not readable"),
     ("counters keep changing", {"prom": [LINES[0] + "\n", LINES[0].replace("721", "722") + "\n"] * 4}, "still changing"),
     ("no istio counters", {"prom": ["# nothing\n"]}, "counter read failed"),
+    ("truncated read (curl exit 28)", {"truncate": True}, "counter read failed (curl)"),
+    ("unparsable counter line", {"prom": ['istio_requests_total{reporter="destination",bad} 7\n']}, "not canonicalizable"),
+    ("non-integer counter", {"prom": ['istio_requests_total{reporter="destination"} 7.5\n']}, "not canonicalizable"),
     ("payload upload fails", {"fail": {"payload": True}}, "payload upload failed"),
     ("receipt upload fails", {"fail": {"receipt": True}}, "receipt upload failed"),
     ("uptime missing", {"drop_stats": ["server.uptime"]}, "server.uptime not readable"),

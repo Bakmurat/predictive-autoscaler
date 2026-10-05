@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""Hourly load evidence for the six benchmark arms on a VictoriaMetrics cluster (prodcluster campaign), v5.
+"""Hourly load evidence for the six benchmark arms on a VictoriaMetrics cluster (prodcluster campaign), v6.
 
+v6 (2026-10-05, Codex Task 03 r20): inventory since a declared start, no A2, verified snapshot identity and canonical
+digest, lifecycle evidence required, capture second treated as [c, c+1 s), separate qualification outcome.
 v5 (2026-10-05, Codex Task 03 r17-r19). The hour is [t0, t1); every time comparison is in integer milliseconds.
 
 Gate (protocol P4 revision):
@@ -24,8 +26,15 @@ Envoy: value at a successful scrape = the series' sample there, or 0 if absent (
   makes the hour's increment 0. A snapshot is accepted only with exactly one receipt for the pod, the receipt's series
   count present at the capture time, F >= every earlier scrape, every later scrape == F, and Envoy started (capture -
   proxy uptime) no later than the target's first scrape. Every arm pod alive in the hour must have an Envoy target and,
-  if its scrapes stop before t1, a snapshot; its istio-proxy restart counter must not move. A2 (declared): a pod with
-  no snapshot, not alive in the hour and last scraped more than 3 min before it served nothing in the hour (listed).
+  if its scrapes stop before t1, a snapshot; its istio-proxy restart counter must not move.
+Inventory (v6): every arm pod with any record (pod info, Envoy target, istio series, receipt) since --inventory-start
+  (the moment the final hook ran on every arm pod; earlier pods are closed by a one-time record kept with the
+  campaign). A pod without a successful scrape after t1 needs an accepted snapshot (cached in --ledger) or a manual
+  termination record in the ledger; otherwise every later hour is INCOMPLETE. An accepted snapshot: exactly one
+  receipt (snapshot_version 2), the same non-empty pod_uid on receipt and payload, the receipt's series count stored at
+  the capture time, the canonical sha256 recomputed from the stored integer counter series, no duplicate series,
+  hot-restart epoch 0, capture - proxy uptime within 3 s of kube-state-metrics' istio-proxy start, every later scrape
+  equal to the final value. Snapshot times are whole seconds: capture c means [c, c+1 s).
 Also: generator lifecycle every hour (a name/start-time identity: kube-state-metrics here has no UID label);
 deny_partial_response=1 on every query; any query/transport error or inconsistency -> INCOMPLETE, never PASS.
 
@@ -46,8 +55,8 @@ KSM_GAP = 90.0
 SHORT = 180.0
 SCRAPE_LABELS = {"__name__", "app", "container", "endpoint", "instance", "job", "prometheus", "namespace", "pod", "service"}
 SNAP_LABELS = {"__name__", "namespace", "pod", "pod_uid", "snapshot_version"}
-CONDITIONS = ["G2/G3 (k6 dropped/failed) conditional on A1': a k6 sample reaches the exporter within 600 s (user approval pending)",
-              "G1 conditional on A2 for pods without a final snapshot that left Kubernetes and the scrapes > 3 min before the hour"]
+ASSUMPTIONS = {"A1'": "G2/G3 (k6 dropped/failed): a k6 sample reaches the exporter within 600 s of its event time"}
+EPOCH_TOL = 3.0          # receipt capture - proxy uptime vs kube-state-metrics istio-proxy start (s resolution both)
 
 _WORKLOAD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "eks-benchmark", "workload", "challenge-v1")
 sys.path.insert(0, _WORKLOAD)
@@ -131,7 +140,7 @@ def target_series_bounds(samples, scrapes, t0, t1, pod_start, snap):
     # N(< t0)
     if pod_start is not None and ms(pod_start) >= T0:
         v0 = (0.0, 0.0)
-    elif snap is not None and ms(snap[0]) < T0:
+    elif snap is not None and ms(snap[0]) + 1000 <= T0:          # capture second [c, c+1) entirely before t0
         v0 = (snap[1], snap[1])
     else:
         b, a = before(T0), after(T0)
@@ -141,13 +150,15 @@ def target_series_bounds(samples, scrapes, t0, t1, pod_start, snap):
         v0 = (pts[b] if b is not None else 0.0, hi)          # no scrape before t0: a birth interval
     # N(< t1)
     a1 = after(T1)
-    if a1 is not None:
+    if pod_start is not None and ms(pod_start) >= T1:
+        v1 = (0.0, 0.0)
+    elif a1 is not None:
         b1 = before(T1)
         v1 = (pts[b1] if b1 is not None else 0.0, pts[a1])
     elif snap is not None:
         c, F = ms(snap[0]), snap[1]
         b1 = before(T1)
-        v1 = (F, F) if c < T1 else (pts[b1] if b1 is not None else 0.0, F)
+        v1 = (F, F) if c + 1000 <= T1 else (pts[b1] if b1 is not None else 0.0, F)
     else:
         raise Incomplete("target ends before the hour end without a final snapshot")
     low, high = max(0.0, v1[0] - v0[1]), v1[1] - v0[0]
@@ -160,21 +171,48 @@ def native(labels, drop):
     return tuple(sorted((k, v) for k, v in labels.items() if k not in drop))
 
 
-def check_snapshot(receipts, payload_counts, first_scrape):
-    """receipts: [(labels, capture time)] for one pod; payload_counts: {capture ms: bench_final_* series stored there}.
-    Returns the accepted capture time or raises Incomplete."""
+def canonical_digest(series):
+    """series: [(labels, value)] of one snapshot (stored bench_final_* series). Recomputes final-snapshot.sh's canonical
+    form: integer counter families, native labels sorted, 'name{k="v",...} value' lines sorted, sha256."""
+    import hashlib
+    lines = []
+    for lab, v in series:
+        name = lab.get("__name__", "")
+        if not name.startswith("bench_final_"):
+            raise Incomplete("unexpected series in a final snapshot")
+        name = name[len("bench_final_"):]
+        if not re.search(r"(_total|_bucket|_count)$", name):
+            continue
+        if not (math.isfinite(v) and v >= 0 and float(v).is_integer()):
+            raise Incomplete("non-integer counter in a final snapshot")
+        kv = ",".join(f'{k}="{x}"' for k, x in sorted(lab.items()) if k not in SNAP_LABELS and x != "")
+        lines.append(f"{name}{{{kv}}} {int(v)}")
+    if len(lines) != len(set(lines)) or len({line.rsplit(" ", 1)[0] for line in lines}) != len(lines):
+        raise Incomplete("duplicate series in a final snapshot")
+    lines.sort()
+    return len(lines), hashlib.sha256("".join(line + "\n" for line in lines).encode()).hexdigest()
+
+
+def check_snapshot(receipts, payload, proxy_started):
+    """receipts: [(labels, capture time)] for one pod; payload: [(labels, value)] stored at that capture time;
+    proxy_started: kube-state-metrics' istio-proxy start time. Returns (capture time, pod_uid) or raises Incomplete."""
     if len(receipts) != 1:
         raise Incomplete(f"{len(receipts)} final-snapshot receipts for one pod")
     lab, c = receipts[0]
     try:
-        n, up = int(lab["series"]), float(lab["proxy_uptime_s"])
+        n, nc, up = int(lab["series"]), int(lab["canonical_series"]), float(lab["proxy_uptime_s"])
+        digest, uid = lab["canonical_sha256"], lab["pod_uid"]
     except (KeyError, ValueError):
-        raise Incomplete("malformed final-snapshot receipt")
-    if lab.get("hot_restart_epoch") != "0" or payload_counts.get(ms(c), 0) != n:
-        raise Incomplete("final snapshot incomplete (series count) or proxy restarted")
-    if first_scrape is not None and ms(c - up) > ms(first_scrape) + 1000:
-        raise Incomplete("final snapshot from a later proxy epoch than the target's first scrape")
-    return c
+        raise Incomplete("malformed final-snapshot receipt (or snapshot_version 1)")
+    if lab.get("snapshot_version") != "2" or not uid or lab.get("hot_restart_epoch") != "0":
+        raise Incomplete("final-snapshot receipt: wrong version, no pod UID or proxy hot-restarted")
+    if len(payload) != n or any(m.get("pod_uid") != uid or m.get("snapshot_version") != "2" for m, _ in payload):
+        raise Incomplete("final snapshot payload incomplete or bound to another pod UID")
+    if canonical_digest(payload) != (nc, digest):
+        raise Incomplete("final snapshot canonical digest mismatch")
+    if proxy_started is None or abs((c - up) - proxy_started) > EPOCH_TOL:
+        raise Incomplete("final snapshot not from the istio-proxy instance kube-state-metrics recorded")
+    return c, uid
 
 
 def histogram_quantile(q, buckets):
@@ -279,67 +317,114 @@ def k6_counter(vm, selector, t0, t1, k6_start, end, lag, zero_allowed=True):
     return lo, hi
 
 
-def arm_envoy(vm, app, t0, t1, end):
-    """Observed bounds, latency buckets (lower increments) and the inventory, over all potentially serving arm pods."""
+def load_ledger(path):
+    if path and os.path.exists(path):
+        with open(path) as fh:
+            return json.load(fh)
+    return {"accepted": {}, "terminated": {}}
+
+
+def lifecycle_value(series, what, pod):
+    vals = {v for _, v in series}
+    if not series or len(vals) != 1:
+        raise Incomplete(f"{what} of pod {pod} missing or changing")
+    return next(iter(vals))
+
+
+def verify_snapshot(vm, app, pod, t_inv, end, ledger):
+    """Accepted snapshot (capture, uid) for a pod whose scrapes stopped; cached in the ledger once the pod is surely
+    gone (end >= capture + 120 s); manual termination records are honoured as (time, None)."""
+    if pod in ledger["accepted"]:
+        e = ledger["accepted"][pod]
+        return e["capture"], e["pod_uid"]
+    if pod in ledger.get("terminated", {}):
+        return ledger["terminated"][pod]["terminated_before"], None
+    W = int(end - t_inv)
+    receipts = [(m, t) for m, s, _ in vm.raw(f'bench_final_snapshot_receipt{{namespace="{NAMESPACE}",pod="{pod}"}}', end, W) for t, _ in s]
+    if not receipts:
+        raise Incomplete(f"pod {pod} stopped being scraped and has no final snapshot")
+    c = receipts[0][1]
+    payload = [(m, v) for m, s, _ in vm.raw(f'{{__name__=~"bench_final_istio_.*",namespace="{NAMESPACE}",pod="{pod}"}}', end, W)
+               for t, v in s if ms(t) == ms(c)]
+    started = vm.raw(f'kube_pod_container_state_started{{namespace="{NAMESPACE}",pod="{pod}",container="istio-proxy"}}', end, W)
+    proxy_started = lifecycle_value(started[0][1], "istio-proxy start time", pod) if len(started) == 1 else None
+    c, uid = check_snapshot(receipts, payload, proxy_started)
+    if end >= c + 120:
+        ledger["accepted"][pod] = {"capture": c, "pod_uid": uid, "app": app}
+    return c, uid
+
+
+def arm_envoy(vm, app, t0, t1, end, t_inv, ledger):
+    """Observed bounds, latency buckets (lower increments) and the inventory over every arm pod since t_inv."""
     rx = re.compile(re.escape(app) + r"-[a-z0-9]+-[a-z0-9]+")
     prx = f'{app}-[a-z0-9]+-[a-z0-9]+'
-    win = end - (t0 - 3600)
-    info = {m.get("pod"): (s, st) for m, s, st in vm.raw(f'kube_pod_info{{namespace="{NAMESPACE}",pod=~"{prx}"}}', end, win)}
-    alive = {p for p, (s, st) in info.items() if s and min(t for t, _ in s) <= t1 and
-             (max(t for t, _ in s) >= t0 - KSM_GAP or any(x >= t0 for x in st))}
+    sel = f'reporter="destination",destination_workload="{app}",destination_workload_namespace="{NAMESPACE}"'
+    W = int(end - t_inv)
+    inv = set()
+    for q in (f'kube_pod_info{{namespace="{NAMESPACE}",pod=~"{prx}"}}', f'up{{job="{ENVOY_JOB}",namespace="{NAMESPACE}",pod=~"{prx}"}}',
+              f'bench_final_snapshot_receipt{{namespace="{NAMESPACE}",pod=~"{prx}"}}', f'istio_requests_total{{{sel},pod=~"{prx}"}}'):
+        inv |= {m.get("pod") for m, _ in vm.instant(f'count by (pod) (count_over_time({q}[{W}s]))', end)}
+    inv = {p for p in inv if p and rx.fullmatch(p)}
+    serving_after = {m.get("pod") for m, v in vm.instant(
+        f'max by (pod) (max_over_time(up{{job="{ENVOY_JOB}",namespace="{NAMESPACE}",pod=~"{prx}"}}[{int(end - t1)}s]))', end) if v == 1}
+    snaps, closed = {}, []
+    for p in sorted(inv - serving_after):
+        c, uid = verify_snapshot(vm, app, p, t_inv, end, ledger)
+        if ms(c) + 1000 <= ms(t0):
+            closed.append(p)                          # finished before the hour: contributes nothing
+        elif uid is None:
+            raise Incomplete(f"pod {p} has only a manual termination record inside the hour")
+        else:
+            snaps[p] = c
+    relevant = sorted(inv - set(closed))
+    win = end - (t0 - SHORT)
+    info = {m.get("pod") for m, s, _ in vm.raw(f'kube_pod_info{{namespace="{NAMESPACE}",pod=~"{prx}"}}', end, win) if s}
     starts = {m.get("pod"): s[-1][1] for m, s, _ in vm.raw(f'kube_pod_start_time{{namespace="{NAMESPACE}",pod=~"{prx}"}}', end, win) if s}
-    for m, s, _ in vm.raw(f'kube_pod_container_status_restarts_total{{namespace="{NAMESPACE}",pod=~"{prx}",container="istio-proxy"}}', end, win):
-        if s and max(v for _, v in s) != min(v for _, v in s):
-            raise Incomplete(f"istio-proxy restarted in pod {m.get('pod')}")
+    restarts = {m.get("pod"): s for m, s, _ in vm.raw(
+        f'kube_pod_container_status_restarts_total{{namespace="{NAMESPACE}",pod=~"{prx}",container="istio-proxy"}}', end, win)}
     targets = {}
     for m, s, _ in vm.raw(f'up{{job="{ENVOY_JOB}",namespace="{NAMESPACE}",pod=~"{prx}"}}', end, win):
-        if rx.fullmatch(m.get("pod", "")):
-            if m.get("pod") in targets:
-                raise Incomplete(f"two Envoy targets for pod {m.get('pod')}")
-            targets[m.get("pod")] = [t for t, v in s if v == 1]
-    missing = sorted(p for p in alive if p not in targets)
-    if missing:
-        raise Incomplete(f"arm pods alive in the hour without an Envoy target: {missing}")
-    receipts = {}
-    for m, s, _ in vm.raw(f'bench_final_snapshot_receipt{{namespace="{NAMESPACE}",pod=~"{prx}"}}', end, win):
-        for t, _ in s:
-            receipts.setdefault(m.get("pod"), []).append((m, t))
-    snaps = {}
-    for p, sc in targets.items():
-        if not sc or max(sc) >= t1:
-            continue
-        if p not in receipts:
-            continue                                   # target_series_bounds raises for series that need it
-        counts = {}
-        for m, s, _ in vm.raw(f'{{__name__=~"bench_final_istio_.*",namespace="{NAMESPACE}",pod="{p}"}}', end, win):
-            for t, _ in s:
-                counts[ms(t)] = counts.get(ms(t), 0) + 1
-        snaps[p] = check_snapshot(receipts[p], counts, min(sc))
-    sel = f'reporter="destination",destination_workload="{app}",destination_workload_namespace="{NAMESPACE}"'
-    # A2: a target without a final snapshot whose pod is not alive in the hour and whose last successful scrape is more
-    # than SHORT before t0 served nothing in the hour (object deleted -> no Service endpoint; requests are per connection)
-    relevant = {p for p, sc in targets.items() if p in alive or p in snaps or (sc and max(sc) >= t0 - SHORT)}
-    excluded = sorted(set(targets) - relevant)
-    for p in sorted(relevant):
+        if m.get("pod") in targets:
+            raise Incomplete(f"two Envoy targets for pod {m.get('pod')}")
+        targets[m.get("pod")] = [t for t, v in s if v == 1]
+    for p in relevant:
+        if p not in info or p not in starts:
+            raise Incomplete(f"pod {p}: no kube-state-metrics pod record in the hour")
+        if p not in targets or not targets[p]:
+            raise Incomplete(f"pod {p}: no successful Envoy scrape in the hour window")
+        lifecycle_value(restarts.get(p, []), "istio-proxy restart counter", p)
+        # the counter must be sampled across every scrape used (an unobserved proxy restart could otherwise be hidden
+        # by a counter that grows past its old value); the pod's last scrape closes the final bracket
         sc = targets[p]
-        if (not sc or max(sc) < t1) and p not in snaps:
-            raise Incomplete(f"pod {p} stops being scraped before the hour end and has no accepted final snapshot")
+        if not covers([t for t, _ in restarts[p]] + [max(sc)], min(sc), max(sc), KSM_GAP):
+            raise Incomplete(f"pod {p}: istio-proxy restart counter not observed through its scrapes")
     out = {}
     for metric in ("istio_requests_total", "istio_request_duration_milliseconds_bucket"):
         scraped = {}
         for m, s, _ in vm.raw(f'{metric}{{{sel},pod=~"{prx}"}}', end, win):
-            if m.get("job") != ENVOY_JOB or m.get("pod") not in targets:
-                raise Incomplete(f"{metric} series without its own Envoy target: {m.get('pod')}")
-            scraped.setdefault(m.get("pod"), {})[native(m, SCRAPE_LABELS)] = s
+            p = m.get("pod")
+            if p not in relevant:
+                if any(t >= t0 for t, _ in s):
+                    raise Incomplete(f"{metric} samples in the hour from a pod closed before it: {p}")
+                continue
+            if m.get("job") != ENVOY_JOB or p not in targets:
+                raise Incomplete(f"{metric} series without its own Envoy target: {p}")
+            key = native(m, SCRAPE_LABELS)
+            if key in scraped.setdefault(p, {}):
+                raise Incomplete(f"duplicate {metric} series for pod {p}")
+            scraped[p][key] = s
         finals = {}
         for p, c in snaps.items():
-            for m, s, _ in vm.raw(f'bench_final_{metric}{{{sel},namespace="{NAMESPACE}",pod="{p}"}}', end, win):
+            for m, s, _ in vm.raw(f'bench_final_{metric}{{{sel},namespace="{NAMESPACE}",pod="{p}"}}', end, W):
                 v = [x for t, x in s if ms(t) == ms(c)]
                 if len(v) != 1:
                     raise Incomplete(f"final snapshot of {p} lacks {metric} at its capture time")
-                finals.setdefault(p, {})[native(m, SNAP_LABELS)] = v[0]
+                key = native(m, SNAP_LABELS)
+                if key in finals.setdefault(p, {}):
+                    raise Incomplete(f"duplicate final {metric} series for pod {p}")
+                finals[p][key] = v[0]
         lo, hi, buckets = 0.0, 0.0, {}
-        for p in sorted(relevant):
+        for p in relevant:
             for key in set(scraped.get(p, {})) | set(finals.get(p, {})):
                 snap = (snaps[p], finals.get(p, {}).get(key, 0.0)) if p in snaps else None
                 a, b = target_series_bounds(scraped.get(p, {}).get(key, []), targets[p], t0, t1, starts.get(p), snap)
@@ -349,26 +434,29 @@ def arm_envoy(vm, app, t0, t1, end):
                     buckets[le] = buckets.get(le, 0.0) + a
         out[metric] = (lo, hi, buckets)
     return out["istio_requests_total"][:2], out["istio_request_duration_milliseconds_bucket"][2], {
-        "pods_alive": sorted(alive), "envoy_targets_relevant": len(relevant), "final_snapshots": sorted(snaps),
-        "excluded_under_A2": excluded}
+        "pods_inventoried": len(inv), "pods_relevant": relevant, "final_snapshots_in_hour": sorted(snaps),
+        "pods_closed_before_hour": len(closed)}
 
 
-def collect(vm, hour_start, now=None):
+def collect(vm, hour_start, t_inv, ledger, approvals=(), now=None):
     import challenge_profile  # noqa: E402
     t0 = hour_start.timestamp(); t1 = t0 + 3600; end = t1 + GRACE
     now = time.time() if now is None else now
     rows = []
     for app in APPS:
-        r = {"app": app, "hour_start": hour_start.strftime("%Y-%m-%dT%H:%M:%SZ"), "collector": "collect_load_evidence.py v5",
-             "conditions": CONDITIONS}
+        r = {"app": app, "hour_start": hour_start.strftime("%Y-%m-%dT%H:%M:%SZ"), "collector": "collect_load_evidence.py v6",
+             "inventory_start": datetime.datetime.fromtimestamp(t_inv, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
         try:
             if now < end:
                 raise Incomplete(f"collected before the hour closed + {int(GRACE)} s")
+            if t0 < t_inv:
+                raise Incomplete("hour starts before the inventory start")
             planned = challenge_profile.planned_requests(int(t0))
             r["planned"] = round(planned)
-            observed, buckets, inv = arm_envoy(vm, app, t0, t1, end)
+            observed, buckets, inv = arm_envoy(vm, app, t0, t1, end, t_inv, ledger)
             p95 = histogram_quantile(0.95, buckets)
-            r.update(observed=[round(x) for x in observed], p95_server_ms=round(p95, 1) if p95 is not None else None, **inv)
+            # p95 over the requests certainly inside the hour (lower-bound increments), not necessarily all of them
+            r.update(observed=[round(x) for x in observed], p95_server_ms_interior=round(p95, 1) if p95 is not None else None, **inv)
             pod, k6_start = generator_lifecycle(vm, app, t0, t1, end)
             r["generator_pod"] = pod
             hbs = vm.raw(f'k6_vus{{testid="{app}"}}', end, end - (t0 - SHORT))
@@ -390,6 +478,9 @@ def collect(vm, hour_start, now=None):
             r.update(status="INCOMPLETE", reason=str(e))
         except Exception as e:  # any query/transport error => INCOMPLETE, never PASS
             r.update(status="INCOMPLETE", reason=f"error: {str(e)[:250]}")
+        pending = sorted(a for a in ASSUMPTIONS if a not in approvals)
+        r["qualification"] = {"qualifies": r["status"] == "PASS" and not pending, "conditional_on": ASSUMPTIONS,
+                              "pending_user_approval": pending}
         rows.append(r)
     return rows
 
@@ -399,20 +490,28 @@ def main():
     ap.add_argument("--prom", required=True)
     ap.add_argument("--hour")
     ap.add_argument("--json")
+    ap.add_argument("--inventory-start", required=True, help="UTC time from which every arm pod runs the final hook")
+    ap.add_argument("--ledger", required=True, help="JSON cache of accepted snapshots and manual termination records")
+    ap.add_argument("--approvals", help="JSON {assumption: record} of the user's recorded approvals")
     a = ap.parse_args()
+    t_inv = datetime.datetime.strptime(a.inventory_start, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc).timestamp()
+    ledger = load_ledger(a.ledger)
+    approvals = json.load(open(a.approvals)) if a.approvals else {}
     if a.hour:
         h = datetime.datetime.strptime(a.hour, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
     else:
         n = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=GRACE)
         h = n.replace(minute=0, second=0, microsecond=0) - datetime.timedelta(hours=1)
-    rows = collect(VM(a.prom), h)
+    rows = collect(VM(a.prom), h, t_inv, ledger, approvals)
+    with open(a.ledger, "w") as fh:
+        json.dump(ledger, fh, indent=1, sort_keys=True)
     for r in rows:
         print(f"{r['app']:20s} {r['hour_start']} {r['status']:10s} planned={r.get('planned')} observed={r.get('observed')} "
-              f"failed={r.get('failed')} dropped={r.get('dropped')} p95_server_ms={r.get('p95_server_ms')}"
+              f"failed={r.get('failed')} dropped={r.get('dropped')} qualifies={r['qualification']['qualifies']}"
               + (f" reason={r['reason']}" if "reason" in r else ""))
     if a.json:
         json.dump(rows, open(a.json, "w"), indent=1)
-    return 0 if all(r["status"] == "PASS" for r in rows) else 1
+    return 0 if all(r["qualification"]["qualifies"] for r in rows) else 1
 
 
 if __name__ == "__main__":
