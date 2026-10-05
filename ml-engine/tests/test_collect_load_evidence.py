@@ -3,7 +3,7 @@
 Fixture timing follows prodcluster measurements (2026-10-05): k6 pushes every 10 s (k6_vus at x.475 s, a changed
 counter stamped with its latest event); Envoy targets scraped every 30 s with `up` and every series sharing the scrape
 timestamp; kube-state-metrics every 20 s; a terminating arm pod pushes bench_final_istio_* and a receipt (snapshot v2)
-at its capture second. Cases from Codex Task 03 r15-r21.
+at its capture second. Cases from Codex Task 03 r15-r22.
 """
 import datetime
 import hashlib
@@ -166,9 +166,13 @@ class FakeVM:
             out[f"{app}-aaaa1111-p1"]["share"] = 0.9
             out[f"{app}-aaaa1111-p2"] = dict(start=T0 + 1200, ksm_end=END, frm=T0 + 1210, to=END, share=0.1, snap=None)
         if o.get("pre_hour"):
-            snap = T0 - 5.0 if o["pre_hour"] == "snapshot" else None
-            last = {"old": T0 - 600}.get(o["pre_hour"], T0 - 20)
-            out[f"{app}-aaaa1111-p0"] = dict(start=T0 - 7000, ksm_end=last + 30, frm=T0 - 7000, to=last, share=0.0, snap=snap)
+            ph = o["pre_hour"]
+            snap = {"snapshot": T0 - 5.0, "snapshot_late": T0 - 900.0}.get(ph)
+            last = {"old": T0 - 600, "snapshot_late": T0 - 900 + 400, "alive_after": T0 - 600}.get(ph, T0 - 20)
+            if ph == "reincarnated":                      # a NEW pod with the old name, started inside the hour
+                out[f"{app}-aaaa1111-p0"] = dict(start=T0 + 100, ksm_end=END, frm=None, to=None, share=0.0, snap=None)
+            else:
+                out[f"{app}-aaaa1111-p0"] = dict(start=T0 - 7000, ksm_end=last + 30, frm=T0 - 7000, to=last, share=0.0, snap=snap)
         if o.get("alive_without_target"):
             out[f"{app}-aaaa1111-p9"] = dict(start=T0 - 3600, ksm_end=END, frm=None, to=None, share=0.0, snap=None)
         return out
@@ -178,7 +182,7 @@ class FakeVM:
         if p.endswith("p2"):
             return d["share"] * self.rate * (t - d["start"])
         if d["share"] == 0.0:
-            return 5.0
+            return 6.0 if (self.o.get("pre_hour") == "snapshot_late" and t > T0 - 900 + 380) else 5.0
         if p.endswith("p3"):
             if self.o.get("scrape_after_capture") and t > T0 + 1815:
                 return d["share"] * self.rate * (t - (T0 - 3600))      # still counting after the capture
@@ -240,7 +244,7 @@ class FakeVM:
                 if name == "kube_pod_container_status_restarts_total":
                     val = lambda t: 1.0 if (o.get("proxy_restart") and t > T0 + 900) else 0.0
                 elif name == "kube_pod_container_state_started":
-                    val = lambda t, d=d: d["start"] + 2
+                    val = lambda t, d=d, p=p: d["start"] + 2 + (30 if (o.get("proxy_start_changes") and p.endswith("p1") and t > T0 + 1000) else 0)
                 elif name == "kube_pod_start_time":
                     val = lambda t, d=d, p=p: d["start"] + (5 if (o.get("start_changes") and p.endswith("p1") and t > T0 + 1000) else 0)
                 else:
@@ -254,7 +258,7 @@ class FakeVM:
         if name == "up":
             out = []
             for i, (p, d) in enumerate(arm_pods.items()):
-                sc = [t for t in self.scrapes(d) if t > lo]
+                sc = [t for t in self.scrapes(d) if lo < t <= t_end]
                 if sc:
                     out.append(({"job": cle.ENVOY_JOB, "instance": f"10.0.0.{i}:15090", "pod": p}, [(t, 1.0) for t in sc], []))
             return out
@@ -276,7 +280,7 @@ class FakeVM:
             les = ["5", "+Inf"] if name.endswith("bucket") else [None]
             out = []
             for i, (p, d) in enumerate(arm_pods.items()):
-                if d["frm"] is None or d["share"] == 0.0:
+                if d["frm"] is None or (d["share"] == 0.0 and not str(o.get("pre_hour", "")).startswith("snapshot")):
                     continue
                 for le in les:
                     lab = {"reporter": "destination", "response_code": "200", "pod": p, "namespace": "demo", "container": "istio-proxy"}
@@ -284,7 +288,7 @@ class FakeVM:
                         lab = {"reporter": "destination", "le": le, "pod": p, "namespace": "demo", "container": "istio-proxy"}
                     frac = 0.9 if le == "5" else 1.0
                     job = "other/job" if (o.get("foreign") and p.endswith("p1") and app == "nginx-test") else cle.ENVOY_JOB
-                    sc = [t for t in self.scrapes(d) if t > lo]
+                    sc = [t for t in self.scrapes(d) if lo < t <= t_end]
                     pts = [(t, float(int(frac * self.value(p, t)))) for t in sc]
                     out.append((dict(lab, job=job, instance=f"10.0.0.{i}:15090"), pts, []))
                     if o.get("dup_series") and p.endswith("p1") and app == "nginx-test":
@@ -376,6 +380,7 @@ def test_r21_malformed_or_negative_approvals_leave_a1_pending(approvals):
     ({"restart_tail_missing": True}, "restart counter not observed"),
     ({"start_changes": True}, "pod start time"),
     ({"dup_start": True}, "more than one pod-start series"),
+    ({"proxy_start_changes": True}, "istio-proxy container start"),
     ({"scaled_down": "snapshot", "scrape_after_capture": True}, "disagree with its final snapshot"),
     ({"restart_gap": True}, "restart counter not observed"),
     ({"foreign": True}, "without its own Envoy target"),
@@ -397,15 +402,30 @@ def iso(t):
 
 def test_pods_closed_before_the_hour_and_validated_termination_records():
     assert run(FakeVM(pre_hour="snapshot"))["status"] == "PASS"
-    rec = {"terminated_before": iso(T0 - 500), "pod_uid": "uid-p0", "evidence": "kubectl events + kubelet log",
-           "recorded_by": "user", "at": iso(T0)}
+    rec = {"terminated_before": iso(T0 - 500), "pod_start": iso(T0 - 7000), "pod_uid": "uid-p0",
+           "evidence": "kubectl events + kubelet log", "recorded_by": "user", "at": iso(T0)}
     r = run(FakeVM(pre_hour="old"), terminations={"nginx-test-aaaa1111-p0": rec})
     assert r["status"] == "PASS" and r["pods_closed_before_hour"] == 1, r
     r = run(FakeVM(pre_hour="old"), terminations={"nginx-test-aaaa1111-p0": dict(rec, terminated_before=iso(T0 + 100))})
     assert r["status"] == "INCOMPLETE" and "manual termination record inside the hour" in r["reason"], r
-    for bad in (dict(rec, evidence=""), dict(rec, terminated_before="soon"), {k: v for k, v in rec.items() if k != "pod_uid"}, "yes"):
+    for bad in (dict(rec, evidence=""), dict(rec, terminated_before="soon"), {k: v for k, v in rec.items() if k != "pod_uid"}, "yes",
+                {k: v for k, v in rec.items() if k != "pod_start"}):
         r = run(FakeVM(pre_hour="old"), terminations={"nginx-test-aaaa1111-p0": bad})
         assert r["status"] == "INCOMPLETE" and "no final snapshot" in r["reason"], (bad, r)
+
+
+def test_r22_manual_records_close_one_incarnation_only():
+    rec = {"terminated_before": iso(T0 - 500), "pod_start": iso(T0 - 7000), "pod_uid": "uid-p0",
+           "evidence": "kubectl events + kubelet log", "recorded_by": "user", "at": iso(T0)}
+    r = run(FakeVM(pre_hour="reincarnated"), terminations={"nginx-test-aaaa1111-p0": rec})
+    assert r["status"] == "INCOMPLETE" and "does not match the observed incarnation" in r["reason"], r
+    r = run(FakeVM(pre_hour="alive_after"), terminations={"nginx-test-aaaa1111-p0": dict(rec, terminated_before=iso(T0 - 700))})
+    assert r["status"] == "INCOMPLETE" and "observed alive after" in r["reason"], r
+
+
+def test_r22_a_closed_pods_counter_may_not_move_any_time_after_its_capture():
+    r = run(FakeVM(pre_hour="snapshot_late"))
+    assert r["status"] == "INCOMPLETE" and "disagree with its final snapshot" in r["reason"], r
 
 
 def test_born_pod_k6_counters_and_inventory_start():

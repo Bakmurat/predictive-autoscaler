@@ -339,18 +339,19 @@ def valid_approvals(raw):
 
 
 def valid_terminations(raw):
-    """{pod: record}: {"terminated_before": UTC, "pod_uid": "...", "evidence": "...", "recorded_by": "...", "at": UTC};
-    returns {pod: (terminated_before, uid)} for well-formed records only."""
+    """{pod: record}: {"terminated_before": UTC, "pod_start": UTC, "pod_uid": "...", "evidence": "...", "recorded_by": "...",
+    "at": UTC}; returns {pod: (terminated_before, pod_start)} for well-formed records only (the record closes the
+    incarnation with that pod start; verify_snapshot checks it against kube-state-metrics)."""
     out = {}
     if not isinstance(raw, dict):
         return out
     for pod, r in raw.items():
         if not isinstance(r, dict):
             continue
-        tb, at = _utc(r.get("terminated_before")), _utc(r.get("at"))
-        if tb is None or at is None or not all(isinstance(r.get(k), str) and r[k].strip() for k in ("pod_uid", "evidence", "recorded_by")):
+        tb, at, ps = _utc(r.get("terminated_before")), _utc(r.get("at")), _utc(r.get("pod_start"))
+        if tb is None or at is None or ps is None or ps >= tb or not all(isinstance(r.get(k), str) and r[k].strip() for k in ("pod_uid", "evidence", "recorded_by")):
             continue
-        out[pod] = (tb, r["pod_uid"])
+        out[pod] = (tb, ps)
     return out
 
 
@@ -368,7 +369,17 @@ def verify_snapshot(vm, app, pod, t_inv, end, terminations):
     receipts = [(m, t) for m, s, _ in vm.raw(f'bench_final_snapshot_receipt{{namespace="{NAMESPACE}",pod="{pod}"}}', end, W) for t, _ in s]
     if not receipts:
         if pod in terminations:
-            return terminations[pod][0], None
+            tb, rec_start = terminations[pod]
+            # the record closes ONE incarnation (name + pod start): the observed start must match it, and nothing of
+            # that name may be observed alive after the recorded termination bound
+            st = vm.raw(f'kube_pod_start_time{{namespace="{NAMESPACE}",pod="{pod}"}}', end, W)
+            if len(st) != 1 or abs(lifecycle_value(st[0][1], "pod start time", pod) - rec_start) > 1:
+                raise Incomplete(f"pod {pod}: manual termination record does not match the observed incarnation")
+            later = [t for q in (f'kube_pod_info{{namespace="{NAMESPACE}",pod="{pod}"}}', f'up{{job="{ENVOY_JOB}",namespace="{NAMESPACE}",pod="{pod}"}}')
+                     for _, s, _ in vm.raw(q, end, W) for t, v in s if t > tb + KSM_GAP and (not q.startswith("up") or v == 1)]
+            if later:
+                raise Incomplete(f"pod {pod}: observed alive after its recorded termination")
+            return tb, None
         raise Incomplete(f"pod {pod} stopped being scraped and has no final snapshot")
     c = receipts[0][1]
     payload = [(m, v) for m, s, _ in vm.raw(f'{{__name__=~"bench_final_istio_.*",namespace="{NAMESPACE}",pod="{pod}"}}', end, W)
@@ -380,7 +391,7 @@ def verify_snapshot(vm, app, pod, t_inv, end, terminations):
     # nothing may change after the capture: every scrape after it equals the final value, none before it exceeds it
     finals = {native(m, SNAP_LABELS): v for m, v in payload if m.get("__name__") == "bench_final_istio_requests_total"}
     sel = f'reporter="destination",destination_workload="{app}",destination_workload_namespace="{NAMESPACE}"'
-    for m, s, _ in vm.raw(f'istio_requests_total{{{sel},pod="{pod}"}}', min(end, c + 300), 600):
+    for m, s, _ in vm.raw(f'istio_requests_total{{{sel},pod="{pod}"}}', end, end - (c - 300)):   # through the cutoff
         F = finals.get(native(m, SCRAPE_LABELS))
         if F is None or any(v > F for t, v in s if t <= c) or any(v != F for t, v in s if t > c):
             raise Incomplete(f"pod {pod}: scrapes around the capture disagree with its final snapshot")
@@ -423,6 +434,11 @@ def arm_envoy(vm, app, t0, t1, end, t_inv, terminations):
         if m.get("pod") in restarts:
             raise Incomplete(f"pod {m.get('pod')}: more than one istio-proxy restart series")
         restarts[m.get("pod")] = s
+    proxy_starts = {}
+    for m, s, _ in vm.raw(f'kube_pod_container_state_started{{namespace="{NAMESPACE}",pod=~"{prx}",container="istio-proxy"}}', end, win):
+        if m.get("pod") in proxy_starts:
+            raise Incomplete(f"pod {m.get('pod')}: more than one istio-proxy start series")
+        proxy_starts[m.get("pod")] = s
     targets = {}
     for m, s, _ in vm.raw(f'up{{job="{ENVOY_JOB}",namespace="{NAMESPACE}",pod=~"{prx}"}}', end, win):
         if m.get("pod") in targets:
@@ -434,6 +450,7 @@ def arm_envoy(vm, app, t0, t1, end, t_inv, terminations):
         if p not in targets or not targets[p]:
             raise Incomplete(f"pod {p}: no successful Envoy scrape in the hour window")
         lifecycle_value(restarts.get(p, []), "istio-proxy restart counter", p)
+        lifecycle_value(proxy_starts.get(p, []), "istio-proxy container start", p)
         # the counter must really be observed across the scrapes the bounds use (an unobserved proxy restart could be
         # hidden by a counter that grows past its old value): from the last scrape before t0 (else the first) to the
         # first scrape at or after t1 (else the last)
