@@ -1,6 +1,7 @@
 # prodcluster overlay for the `demo` namespace: the six benchmark arms, their Services, PredictiveAutoscalers and
 # KEDA ScaledObjects, and the six k6 generators, taken unchanged from deploy/eks-benchmark except:
-#   - every generator mounts the challenge-v1 script (on EKS five of the six were switched by hand; repo drift fixed);
+#   - every generator mounts the challenge-v1 script (on EKS five of the six were switched by hand; repo drift fixed)
+#     and opens a new connection per request (K6_NO_VU_CONNECTION_REUSE, see the patch);
 #   - nginx-ensemble loses its EKS zone pin (ap-southeast-1b);
 #   - all six arms carry predictive-bench/role=arm and a soft collective hostname spread;
 #   - VM_QUERY_URL / VM_WRITE_URL placeholders are substituted by ../deploy.sh.
@@ -42,11 +43,18 @@ resources:
   - ../../eks-benchmark/experiments/seasonal-ensemble-q95-v1/nginx-ensemble-q95-predictive-autoscaler.yaml
   - ../../eks-benchmark/experiments/seasonal-ensemble-q95-v1/k6-nginx-ensemble-q95-deployment.yaml
 patches:
+  # K6_NO_VU_CONNECTION_REUSE (k6 env options override script options; the script is unchanged): the generators
+  # have no sidecar and Cilium balances per connection, so with keep-alive every VU connection opened while an arm had
+  # one pod stayed on that pod and replicas added later received no requests (measured 2026-10-05 06:01-06:27Z: zero
+  # on every new pod). One GET per iteration, so this opens a connection per request and spreads it over Ready pods.
   - target: { kind: Deployment, labelSelector: "app=k6" }
     patch: |-
       - op: replace
         path: /spec/template/spec/volumes/0/configMap/name
         value: k6-load-script-challenge-v1
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value: { name: K6_NO_VU_CONNECTION_REUSE, value: "true" }
   - target: { kind: Deployment, name: nginx-ensemble }
     patch: |-
       - op: remove
