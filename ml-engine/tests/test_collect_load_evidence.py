@@ -1,9 +1,11 @@
-"""deploy/prodcluster/collect_load_evidence.py: counter increments, coverage, server-side p95 and the gate.
-
-The fixtures follow the 2026-10-05 positive control on prodcluster: k6 emits k6_dropped_iterations_total only after
-the first drop, and its first sample was 190 (no zero sample precedes it); the last push before k6 exits is lost.
+"""deploy/prodcluster/collect_load_evidence.py v2: bounds, lifecycle, coverage and the cases Codex Task 03 r15 found
+that made v1 PASS on incomplete evidence. Facts behind the fixtures (prodcluster, 2026-10-05): k6 pushes a counter
+only in intervals in which it changed; k6_dropped_iterations_total's first sample is the count so far (190); k6_vus is
+pushed every 10 s; Envoy exposes every series on each 20-s scrape; vmagent writes NaN staleness markers.
 """
+import datetime
 import importlib.util
+import math
 import os
 
 import pytest
@@ -13,112 +15,209 @@ SPEC = importlib.util.spec_from_file_location(
     "collect_load_evidence", os.path.join(HERE, "..", "..", "deploy", "prodcluster", "collect_load_evidence.py"))
 cle = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(cle)
+import challenge_profile  # noqa: E402  (path inserted by the module)
 
-T0, T1 = 1_000_000.0, 1_003_600.0
-
-
-def test_series_starting_inside_the_hour_counts_its_first_sample():
-    inc, resets = cle.series_increment([(T0 + 100, 190.0), (T0 + 110, 400.0)], T0, T1)
-    assert (inc, resets) == (400.0, 0)        # increase() could miss the first 190; this rule does not
-
-
-def test_base_is_last_value_before_the_hour_and_later_samples_are_ignored():
-    s = [(T0 - 10, 100.0), (T0 + 10, 150.0), (T1, 200.0), (T1 + 10, 999.0)]
-    assert cle.series_increment(s, T0, T1) == (100.0, 0)
+T0 = 1_790_600_400.0          # a whole UTC hour
+T1 = T0 + 3600
+HOUR = datetime.datetime.fromtimestamp(T0, datetime.timezone.utc)
+NOW = T1 + 600
+POD_START = T0 - 7200
 
 
-def test_a_decrease_is_a_restart_and_adds_the_post_reset_value():
-    s = [(T0 - 10, 100.0), (T0 + 10, 150.0), (T0 + 20, 20.0), (T0 + 30, 50.0)]
-    assert cle.series_increment(s, T0, T1) == (100.0, 1)   # +50, reset +20, +30
+def grid(a, b, step):
+    t, out = a, []
+    while t <= b:
+        out.append(t); t += step
+    return out
 
 
-def test_coverage_requires_pushes_at_every_interval_and_both_edges():
-    full = [(T0 - 5 + 10 * i, float(i)) for i in range(362)]
-    assert cle.coverage(full, T0, T1)[0]
-    gap = [p for p in full if not (T0 + 1000 <= p[0] <= T0 + 1100)]
-    assert not cle.coverage(gap, T0, T1)[0]
-    late = [p for p in full if p[0] >= T0 + 60]
-    assert not cle.coverage(late, T0, T1)[0]
-    assert not cle.coverage([], T0, T1)[0]
+# ---------- pure functions ----------
+
+def test_finite_drops_staleness_markers_and_counts_them():
+    assert cle.finite([(1.0, 2.0), (2.0, float("nan"))]) == ([(1.0, 2.0)], 1)
 
 
-def test_histogram_quantile_matches_the_prometheus_interpolation():
+def test_edge_bounds_and_counter_bounds():
+    s = [(T0 - 5, 100.0), (T0 + 5, 110.0), (T1 - 5, 500.0), (T1 + 5, 510.0)]
+    assert cle.edge_bounds(s, T0, 15, None) == (100.0, 110.0)
+    assert cle.counter_bounds(s, T0, T1, 15) == (390.0, 410.0)
+    with pytest.raises(cle.Incomplete):
+        cle.counter_bounds([(T0 + 100, 190.0)], T0, T1, 15)                    # no base, absence not proven
+    assert cle.counter_bounds([(T0 + 100, 190.0)], T0, T1, 15, base0=0.0) == (190.0, 190.0)
+    with pytest.raises(cle.Incomplete):
+        cle.counter_bounds([(T0 - 5, 100.0), (T0 + 50, 20.0)], T0, T1, 15)     # reset
+
+
+def test_histogram_quantile():
     b = {"10": 50.0, "20": 90.0, "+Inf": 100.0}
     assert cle.histogram_quantile(0.5, b) == pytest.approx(10.0)
     assert cle.histogram_quantile(0.7, b) == pytest.approx(15.0)
-    assert cle.histogram_quantile(0.95, b) == pytest.approx(20.0)    # inside +Inf: the highest finite bound
-    assert cle.histogram_quantile(0.95, {"10": 5.0}) is None          # no +Inf bucket
-    assert cle.histogram_quantile(0.95, {"+Inf": 0.0}) is None        # no traffic
+    assert cle.histogram_quantile(0.95, b) == pytest.approx(20.0)
+    assert cle.histogram_quantile(0.95, {"10": 5.0}) is None
 
 
-def test_gate_and_incomplete():
-    assert cle.evaluate(1000, 1000, 0, None, 1000)["status"] == "INCOMPLETE"
-    assert cle.evaluate(1000, 1000, 0, 0, 1000)["status"] == "PASS"
-    assert cle.evaluate(1000, 1000, 2, 0, 1000)["status"] == "FAIL"     # failed 0.2 % of delivered
-    assert cle.evaluate(1000, 940, 0, 0, 940)["status"] == "FAIL"       # delivered 6 % short of plan
-    assert cle.evaluate(1000, 1000, 0, 1, 1000)["status"] == "FAIL"     # dropped 0.1 % of plan
+def test_gate_on_bounds_pass_fail_incomplete():
+    P = 10000.0
+    assert cle.gate_on_bounds(P, (P, P), (0, 0), (0, 0), (P, P))[0] == "PASS"
+    assert cle.gate_on_bounds(P, (P, P), (0, 0), (0, 190), (P, P))[0] == "INCOMPLETE"   # ambiguous drop near an edge
+    assert cle.gate_on_bounds(P, (P, P), (0, 0), (190, 190), (P, P))[0] == "FAIL"
+    assert cle.gate_on_bounds(P, (8000, 8000), (0, 0), (0, 0), (8000, 8000))[0] == "FAIL"
 
 
-def _fake(reqs_samples, restarts=0.0, pods=("k6-nginx-test-a",), dropped=None):
-    def raw(prom, selector, t1, window):
-        if selector.startswith("k6_http_reqs_total"):
-            return [({"expected_response": "true"}, reqs_samples)]
-        if selector.startswith("kube_pod_container_status_restarts_total"):
-            return [({}, [(T0 - 10, 0.0), (T1, restarts)])]
-        if selector.startswith("kube_pod_info"):
-            return [({"pod": p}, [(T1, 1.0)]) for p in pods]
-        if selector.startswith("k6_dropped_iterations_total"):
-            return [] if dropped is None else [({}, dropped)]
-        if selector.startswith("istio_requests_total"):
-            return [({}, [(T0 - 10, 0.0), (T1, reqs_samples[-1][1] - reqs_samples[0][1])])]
-        if selector.startswith("istio_request_duration_milliseconds_bucket"):
-            return [({"le": "5"}, [(T0 - 10, 0.0), (T1, 900.0)]), ({"le": "+Inf"}, [(T0 - 10, 0.0), (T1, 1000.0)])]
-        raise AssertionError(selector)
-    return raw
+# ---------- fake VictoriaMetrics ----------
+
+class FakeVM:
+    """A healthy hour for every arm; tests switch individual pieces off."""
+
+    def __init__(self, **o):
+        self.o = o
+
+    def app_of(self, sel):
+        for app in sorted(cle.APPS, key=len, reverse=True):
+            if f'"{app}"' in sel or f'"k6-{app}"' in sel or f'"{app}-[' in sel or f'"k6-{app}-' in sel:
+                return app
+        return None
+
+    def gen_pod(self, app):
+        return f"k6-{app}-abcd1234-xyz12"
+
+    def raw(self, sel, t_end, window):
+        o, app = self.o, self.app_of(sel)
+        if o.get("error"):
+            raise OSError("connection refused")
+        name = sel.split("{")[0]
+        ksm = grid(T0 - 600, T1 + 120, 20)
+        if name == "kube_replicaset_owner":
+            return [({"replicaset": f"k6-{app}-abcd1234"}, [(t, 1.0) for t in ksm], 0)]
+        if name == "kube_pod_owner":
+            out = []
+            for a in cle.APPS:
+                pts = [(t, 1.0) for t in ksm]
+                if a == o.get("late_pod_app") and a == "nginx-test":
+                    pts = [(t, 1.0) for t in ksm if t > T0 + 1800]
+                out.append(({"pod": self.gen_pod(a), "owner_name": f"k6-{a}-abcd1234"}, pts, 0))
+            return out
+        if name == "kube_pod_start_time" and "k6-" in sel:
+            start = T0 + 1800 if o.get("late_pod_app") == app else POD_START
+            return [({"pod": self.gen_pod(app)}, [(t, start) for t in ksm], 0)]
+        if name == "kube_pod_start_time":
+            return [({"pod": f"{app}-p1"}, [(t, T0 - 3600) for t in grid(T0 - 120, T1 + 120, 20)], 0)]
+        if name == "kube_pod_container_status_restarts_total":
+            if o.get("no_restart_counter"):
+                return []
+            return [({"pod": self.gen_pod(app), "container": "k6"}, [(t, 1.0 if (o.get("restarted") and t > T0 + 900) else 0.0) for t in ksm], 0)]
+        if name == "k6_vus":
+            ts = grid(T0 - 120, T1 + 120, 10)
+            if o.get("heartbeat_gap"):
+                ts = [t for t in ts if not (T0 + 1000 <= t <= T0 + 1100)]
+            return [({}, [(t, 30.0) for t in ts], 0)]
+        planned = challenge_profile.planned_requests(int(T0))
+        per_s = planned / 3600.0
+        if name == "k6_http_reqs_total" and 'expected_response="false"' in sel:
+            if app == "nginx-test" and o.get("stalled_failure"):
+                return [({"testid": app, "expected_response": "false", "status": "503"}, [(T0 + 600, 32.0)], 0)]
+            return []
+        if name == "k6_http_reqs_total":
+            pts = [(t, per_s * (t - POD_START)) for t in grid(T0 - 120, T1 + 120, 10)]
+            if o.get("reset") and app == "nginx-test":
+                pts = [(t, v if t < T0 + 1200 else v - per_s * 4000) for t, v in pts]
+            return [({"testid": app, "expected_response": "true", "status": "200"}, pts, 0)]
+        if name == "k6_dropped_iterations_total":
+            if app == "nginx-test" and o.get("drop_inside"):
+                return [({"testid": app}, [(T0 + 100, 190.0), (T0 + 110, 190.0)], 0)]
+            if app == "nginx-test" and o.get("drop_after_edge"):
+                return [({"testid": app}, [(T1 + 5, 190.0)], 0)]
+            return []
+        if name == "up":
+            ok = not o.get("not_scraped")
+            return [({"pod": f"{app}-p1"}, [(t, 1.0) for t in grid(T0 - 120, T1 + 120, 20)] if ok else [], 0)]
+        if name == "istio_requests_total":
+            pts = [(t, per_s * (t - (T0 - 3600))) for t in grid(T0 - 120, T1 + 120, 20)]
+            if o.get("envoy_no_base") and app == "nginx-test":
+                pts = [(t, v) for t, v in pts if t > T0]
+            return [({"pod": f"{app}-p1", "response_code": "200"}, pts, 0)]
+        if name == "istio_request_duration_milliseconds_bucket":
+            if o.get("no_buckets"):
+                return []
+            ts = grid(T0 - 120, T1 + 120, 20)
+            return [({"pod": f"{app}-p1", "le": "5"}, [(t, 0.9 * per_s * (t - (T0 - 3600))) for t in ts], 0),
+                    ({"pod": f"{app}-p1", "le": "+Inf"}, [(t, per_s * (t - (T0 - 3600))) for t in ts], 1)]
+        raise AssertionError(sel)
+
+    def instant(self, query, t):
+        if self.o.get("stalled_failure") and 'expected_response="false"' in query and '"nginx-test"' in query:
+            return [({"testid": "nginx-test", "expected_response": "false", "status": "503"}, 31.0)]
+        return []
+
+    def per_minute_counts(self, sel, a, b):
+        return [6.0] * max(0, int((b - a) // 60))
 
 
-def _steady(per_push):
-    return [(T0 - 5 + 10 * i, per_push * i) for i in range(362)]
+def row(vm, app="nginx-test", now=NOW):
+    return [r for r in cle.collect(vm, HOUR, now=now) if r["app"] == app][0]
 
 
-def test_absent_dropped_series_is_zero_only_with_full_coverage(monkeypatch):
-    import challenge_profile
-    planned = challenge_profile.planned_requests(int(T0))
-    per_push = planned / 360.0
-    monkeypatch.setattr(cle, "raw", _fake(_steady(per_push)))
-    rows = cle.collect("x", __import__("datetime").datetime.fromtimestamp(T0, __import__("datetime").timezone.utc))
-    r = rows[0]
-    assert r["dropped"] == 0 and "sparse-emission" in r["dropped_basis"] and r["status"] == "PASS"
-    assert r["p95_server_ms"] is not None
-    # a push gap makes absence unprovable -> INCOMPLETE, never PASS
-    gappy = [p for p in _steady(per_push) if not (T0 + 1000 <= p[0] <= T0 + 1100)]
-    monkeypatch.setattr(cle, "raw", _fake(gappy))
-    r = cle.collect("x", __import__("datetime").datetime.fromtimestamp(T0, __import__("datetime").timezone.utc))[0]
-    assert r["dropped"] is None and r["status"] == "INCOMPLETE"
-    # a generator restart in the hour also blocks the inference
-    monkeypatch.setattr(cle, "raw", _fake(_steady(per_push), restarts=1.0))
-    assert cle.collect("x", __import__("datetime").datetime.fromtimestamp(T0, __import__("datetime").timezone.utc))[0]["status"] == "INCOMPLETE"
+def test_healthy_hour_passes_with_tight_bounds():
+    r = row(FakeVM())
+    assert r["status"] == "PASS", r
+    assert r["dropped"] == [0, 0] and r["failed"] == [0, 0]
+    assert r["delivered"][1] - r["delivered"][0] < 0.01 * r["delivered"][0]
+    assert r["p95_server_ms"] is not None and r["staleness_markers_in_latency_series"] == 1
 
 
-def test_present_dropped_series_is_counted_from_its_first_sample(monkeypatch):
-    import challenge_profile
-    per_push = challenge_profile.planned_requests(int(T0)) / 360.0
-    monkeypatch.setattr(cle, "raw", _fake(_steady(per_push), dropped=[(T0 + 100, 190.0), (T0 + 110, 380.0)]))
-    r = cle.collect("x", __import__("datetime").datetime.fromtimestamp(T0, __import__("datetime").timezone.utc))[0]
-    assert r["dropped"] == 380 and r["dropped_basis"] == "series present" and r["status"] == "FAIL"
+def test_coverage_is_enforced_even_when_a_dropped_series_exists():
+    assert row(FakeVM(drop_inside=True, heartbeat_gap=True))["status"] == "INCOMPLETE"
 
 
-def test_query_error_is_incomplete(monkeypatch):
-    def boom(*a, **k):
-        raise OSError("connection refused")
-    monkeypatch.setattr(cle, "raw", boom)
-    r = cle.collect("x", __import__("datetime").datetime.fromtimestamp(T0, __import__("datetime").timezone.utc))[0]
-    assert r["status"] == "INCOMPLETE" and "connection refused" in r["error"]
+def test_missing_restart_evidence_is_incomplete():
+    assert row(FakeVM(no_restart_counter=True))["status"] == "INCOMPLETE"
 
 
-def test_staleness_markers_are_not_values():
-    # vmagent writes NaN staleness markers when a scraped pod disappears (the arms re-rolled 2026-10-05 04:58Z);
-    # they end a series, they are not counter values
-    s = [(T0 - 10, 100.0), (T0 + 10, 150.0), (T0 + 20, float("nan")), (T0 + 30, float("nan"))]
-    assert cle.finite(s) == [(T0 - 10, 100.0), (T0 + 10, 150.0)]
-    assert cle.series_increment(cle.finite(s), T0, T1) == (50.0, 0)
+def test_missing_latency_buckets_are_incomplete():
+    assert row(FakeVM(no_buckets=True))["status"] == "INCOMPLETE"
+
+
+def test_stalled_sparse_series_uses_its_last_value_not_zero():
+    r = row(FakeVM(stalled_failure=True))
+    assert r["failed"] == [1, 1]          # 32 - 31, not 32
+
+
+def test_series_born_inside_the_hour_counts_from_zero():
+    r = row(FakeVM(drop_inside=True))
+    assert r["dropped"] == [190, 190] and r["status"] == "FAIL"
+
+
+def test_a_drop_pushed_just_after_the_hour_makes_it_ambiguous():
+    r = row(FakeVM(drop_after_edge=True))
+    assert r["dropped"] == [0, 190] and r["status"] == "INCOMPLETE"
+
+
+def test_e1_and_e2_generators_are_not_confused():
+    assert row(FakeVM(), app="nginx-ensemble")["status"] == "PASS"
+    assert row(FakeVM(), app="nginx-ensemble")["generator_pod"] == "k6-nginx-ensemble-abcd1234-xyz12"
+
+
+def test_collection_before_the_grace_period_is_incomplete():
+    assert row(FakeVM(), now=T1 + 30)["status"] == "INCOMPLETE"
+
+
+def test_generator_started_inside_the_hour_is_incomplete():
+    assert row(FakeVM(late_pod_app="nginx-test"))["status"] == "INCOMPLETE"
+
+
+def test_generator_restart_is_incomplete():
+    assert row(FakeVM(restarted=True))["status"] == "INCOMPLETE"
+
+
+def test_counter_reset_is_incomplete():
+    assert row(FakeVM(reset=True))["status"] == "INCOMPLETE"
+
+
+def test_envoy_series_without_base_and_unproven_absence_is_incomplete():
+    assert row(FakeVM(envoy_no_base=True, not_scraped=True))["status"] == "INCOMPLETE"
+    assert row(FakeVM(envoy_no_base=True))["status"] in ("PASS", "INCOMPLETE")    # scraped before: base 0 is proven
+
+
+def test_query_error_is_incomplete():
+    r = row(FakeVM(error=True))
+    assert r["status"] == "INCOMPLETE" and "connection refused" in r["reason"]
