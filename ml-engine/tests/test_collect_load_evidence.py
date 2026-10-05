@@ -1,9 +1,9 @@
-"""deploy/prodcluster/collect_load_evidence.py v6: server-side gate, inventory since a declared start, verified snapshots.
+"""deploy/prodcluster/collect_load_evidence.py v7: server-side gate, inventory since a declared start, verified snapshots.
 
 Fixture timing follows prodcluster measurements (2026-10-05): k6 pushes every 10 s (k6_vus at x.475 s, a changed
 counter stamped with its latest event); Envoy targets scraped every 30 s with `up` and every series sharing the scrape
 timestamp; kube-state-metrics every 20 s; a terminating arm pod pushes bench_final_istio_* and a receipt (snapshot v2)
-at its capture second. Cases from Codex Task 03 r15-r20.
+at its capture second. Cases from Codex Task 03 r15-r21.
 """
 import datetime
 import hashlib
@@ -26,7 +26,7 @@ HOUR = datetime.datetime.fromtimestamp(T0, datetime.timezone.utc)
 NOW = END + 60
 T_INV = T0 - 7200
 K6_START = T0 - 7200 + 0.3
-APPROVED = {"A1'": {"approved_by": "user", "at": "test"}}
+APPROVED = {"A1'": {"decision": "approved", "by": "user", "at": "2026-10-05T08:00:00Z", "ref": "U-test"}}
 
 
 def grid(start, stop, step, offset):
@@ -180,13 +180,16 @@ class FakeVM:
         if d["share"] == 0.0:
             return 5.0
         if p.endswith("p3"):
+            if self.o.get("scrape_after_capture") and t > T0 + 1815:
+                return d["share"] * self.rate * (t - (T0 - 3600))      # still counting after the capture
             return d["share"] * self.rate * (min(t, T0 + 1805) - (T0 - 3600))
         if self.o.get("scaled_down") and t >= T0 + 1805:
             return 0.7 * self.rate * (T0 + 1805 - (T0 - 3600)) + self.rate * (t - (T0 + 1805))
         return d["share"] * self.rate * (t - (T0 - 3600))
 
     def scrapes(self, d):
-        return [] if d["frm"] is None else [t for t in grid(T_INV, END, 30, 0.659) if d["frm"] <= t <= d["to"]]
+        to = d["to"] + 40 if (self.o.get("scrape_after_capture") and d["snap"] is not None) else d["to"]
+        return [] if d["frm"] is None else [t for t in grid(T_INV, END, 30, 0.659) if d["frm"] <= t <= to]
 
     def snap_parts(self, app, p):
         d = self.pods(app)[p]
@@ -230,6 +233,8 @@ class FakeVM:
             if (o.get("no_ksm") and name in ("kube_pod_info", "kube_pod_start_time")) or (o.get("no_restart_series") and "restarts" in name):
                 return []
             gap = (T0 + 600, T0 + 900) if (o.get("restart_gap") and "restarts" in name) else None
+            if o.get("restart_tail_missing") and "restarts" in name:
+                gap = (T1 - 60, END + 1)
             out = []
             for p, d in arm_pods.items():
                 if name == "kube_pod_container_status_restarts_total":
@@ -237,12 +242,14 @@ class FakeVM:
                 elif name == "kube_pod_container_state_started":
                     val = lambda t, d=d: d["start"] + 2
                 elif name == "kube_pod_start_time":
-                    val = lambda t, d=d: d["start"]
+                    val = lambda t, d=d, p=p: d["start"] + (5 if (o.get("start_changes") and p.endswith("p1") and t > T0 + 1000) else 0)
                 else:
                     val = lambda t: 1.0
-                pts = [(t, val(t)) for t in ksm if d["start"] <= t <= d["ksm_end"] and not (gap and gap[0] < t < gap[1])]
+                pts = [(t, val(t)) for t in ksm if d["start"] <= t <= d["ksm_end"] and not (gap and gap[0] < t < gap[1] and p.endswith("p1"))]
                 if pts:
                     out.append(({"pod": p, "container": "istio-proxy"}, pts, []))
+                    if o.get("dup_start") and name == "kube_pod_start_time" and p.endswith("p1"):
+                        out.append(({"pod": p, "container": "istio-proxy", "uid": "other"}, pts, []))
             return out
         if name == "up":
             out = []
@@ -319,25 +326,37 @@ class FakeVM:
         return []
 
 
-def run(vm, app="nginx-test", now=NOW, ledger=None, approvals=APPROVED):
-    ledger = ledger if ledger is not None else {"accepted": {}, "terminated": {}}
-    return [r for r in cle.collect(vm, HOUR, T_INV, ledger, approvals, now=now) if r["app"] == app][0]
+def run(vm, app="nginx-test", now=NOW, terminations=None, approvals=APPROVED):
+    return [r for r in cle.collect(vm, HOUR, T_INV, terminations, approvals, now=now) if r["app"] == app][0]
 
 
 def test_healthy_hour_passes_and_qualifies_only_with_the_recorded_approval():
     r = run(FakeVM())
     assert r["status"] == "PASS" and r["qualification"]["qualifies"], r
-    assert r["failed"] == [0, 0] and r["dropped"] == [0, 0] and r["collector"].endswith("v6")
+    assert r["failed"] == [0, 0] and r["dropped"] == [0, 0] and r["collector"].endswith("v7")
     assert r["observed"][0] <= r["planned"] <= r["observed"][1] and r["p95_server_ms_interior"] is not None
     q = run(FakeVM(), approvals={})["qualification"]
     assert not q["qualifies"] and q["pending_user_approval"] == ["A1'"]
 
 
-def test_scale_down_with_a_valid_snapshot_passes_and_is_cached():
-    ledger = {"accepted": {}, "terminated": {}}
-    r = run(FakeVM(scaled_down="snapshot"), ledger=ledger)
+def test_scale_down_with_a_valid_snapshot_passes():
+    r = run(FakeVM(scaled_down="snapshot"))
     assert r["status"] == "PASS" and r["final_snapshots_in_hour"] == ["nginx-test-aaaa1111-p3"], r
-    assert ledger["accepted"]["nginx-test-aaaa1111-p3"]["pod_uid"] == "u-nginx-test-aaaa1111-p3"
+
+
+def test_r21_no_cache_a_corrupted_snapshot_is_rejected_every_hour():
+    assert "ledger" not in cle.collect.__code__.co_varnames
+    for over in ({"snap_digest": True}, {"snap_uid": True}):
+        assert run(FakeVM(scaled_down="snapshot", **over))["status"] == "INCOMPLETE"
+
+
+@pytest.mark.parametrize("approvals", [{"A1'": False}, {"A1'": None}, ["A1'"], {"A1'": {"decision": "approved", "by": "user"}},
+                                       {"A1'": {"decision": "rejected", "by": "user", "at": "2026-10-05T08:00:00Z", "ref": "U-1"}},
+                                       {"A1'": {"decision": "approved", "by": "claude", "at": "2026-10-05T08:00:00Z", "ref": "U-1"}},
+                                       {"A1'": {"decision": "approved", "by": "user", "at": "yesterday", "ref": "U-1"}}])
+def test_r21_malformed_or_negative_approvals_leave_a1_pending(approvals):
+    q = run(FakeVM(), approvals=approvals)["qualification"]
+    assert not q["qualifies"] and q["pending_user_approval"] == ["A1'"]
 
 
 @pytest.mark.parametrize("over,msg", [
@@ -347,13 +366,17 @@ def test_scale_down_with_a_valid_snapshot_passes_and_is_cached():
     ({"scaled_down": "snapshot", "snap_uid": True}, "another pod UID"),
     ({"scaled_down": "snapshot", "snap_digest": True}, "digest mismatch"),
     ({"scaled_down": "snapshot", "snap_v1": True}, "wrong version"),
-    ({"scaled_down": "snapshot", "snap_low": True}, "inconsistent"),
+    ({"scaled_down": "snapshot", "snap_low": True}, "disagree with its final snapshot"),
     ({"pre_hour": "none"}, "has no final snapshot"),
     ({"pre_hour": "old"}, "has no final snapshot"),
     ({"alive_without_target": True}, "has no final snapshot"),
     ({"no_ksm": True}, "no kube-state-metrics pod record"),
     ({"no_restart_series": True}, "restart counter"),
     ({"proxy_restart": True}, "restart counter"),
+    ({"restart_tail_missing": True}, "restart counter not observed"),
+    ({"start_changes": True}, "pod start time"),
+    ({"dup_start": True}, "more than one pod-start series"),
+    ({"scaled_down": "snapshot", "scrape_after_capture": True}, "disagree with its final snapshot"),
     ({"restart_gap": True}, "restart counter not observed"),
     ({"foreign": True}, "without its own Envoy target"),
     ({"dup_series": True}, "duplicate"),
@@ -368,21 +391,28 @@ def test_incomplete_paths(over, msg):
     assert r["status"] == "INCOMPLETE" and msg in r["reason"] and not r["qualification"]["qualifies"], (over, r)
 
 
-def test_pods_closed_before_the_hour():
+def iso(t):
+    return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_pods_closed_before_the_hour_and_validated_termination_records():
     assert run(FakeVM(pre_hour="snapshot"))["status"] == "PASS"
-    ledger = {"accepted": {}, "terminated": {"nginx-test-aaaa1111-p0": {"terminated_before": T0 - 500, "record": "manual"}}}
-    r = run(FakeVM(pre_hour="old"), ledger=ledger)
+    rec = {"terminated_before": iso(T0 - 500), "pod_uid": "uid-p0", "evidence": "kubectl events + kubelet log",
+           "recorded_by": "user", "at": iso(T0)}
+    r = run(FakeVM(pre_hour="old"), terminations={"nginx-test-aaaa1111-p0": rec})
     assert r["status"] == "PASS" and r["pods_closed_before_hour"] == 1, r
-    ledger["terminated"]["nginx-test-aaaa1111-p0"]["terminated_before"] = T0 + 100      # inside the hour: unknown tail
-    r = run(FakeVM(pre_hour="old"), ledger=ledger)
+    r = run(FakeVM(pre_hour="old"), terminations={"nginx-test-aaaa1111-p0": dict(rec, terminated_before=iso(T0 + 100))})
     assert r["status"] == "INCOMPLETE" and "manual termination record inside the hour" in r["reason"], r
+    for bad in (dict(rec, evidence=""), dict(rec, terminated_before="soon"), {k: v for k, v in rec.items() if k != "pod_uid"}, "yes"):
+        r = run(FakeVM(pre_hour="old"), terminations={"nginx-test-aaaa1111-p0": bad})
+        assert r["status"] == "INCOMPLETE" and "no final snapshot" in r["reason"], (bad, r)
 
 
 def test_born_pod_k6_counters_and_inventory_start():
     assert run(FakeVM(born=True))["status"] == "PASS"
     r = run(FakeVM(failure_in_hour="bounded"))
     assert r["failed"] == [0, 4] and r["status"] == "PASS", r
-    late = [x for x in cle.collect(FakeVM(), HOUR, T0 + 1, {"accepted": {}, "terminated": {}}, APPROVED, now=NOW) if x["app"] == "nginx-test"][0]
+    late = [x for x in cle.collect(FakeVM(), HOUR, T0 + 1, {}, APPROVED, now=NOW) if x["app"] == "nginx-test"][0]
     assert late["status"] == "INCOMPLETE" and "inventory start" in late["reason"]
 
 
