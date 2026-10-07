@@ -1,0 +1,17 @@
+{
+ "note": "Frozen identities for the P8 detector (infra_events.py v2): the five workers and the benchmark pods by name pattern; unrelated pods in these namespaces are ignored.",
+ "workers": ["prodcluster-prodworker-kg699-2nsgd", "prodcluster-prodworker-kg699-crwnv", "prodcluster-prodworker-kg699-gdjn7",
+             "prodcluster-prodworker-kg699-hbm2d", "prodcluster-prodworker-kg699-qcxlw"],
+ "pod_patterns": {
+  "demo": "^(nginx-test|nginx-reactive|myapptwo|nginx-seasonal|nginx-ensemble|nginx-ensemble-q95|k6-nginx-test|k6-nginx-reactive|k6-myapptwo|k6-nginx-seasonal|k6-nginx-ensemble|k6-nginx-ensemble-q95)-[a-z0-9]{8,10}-[a-z0-9]{5}$",
+  "ml-engine": "^(ml-api-[a-z0-9]{8,10}-[a-z0-9]{5}|predictive-operator-[a-z0-9]{8,10}-[a-z0-9]{5}|(ml-training|evidence-archive|load-evidence)-[0-9]+-[a-z0-9]{5})$"
+ },
+ "generators": {
+  "nginx-test": "^k6-nginx-test-[a-z0-9]{8,10}-[a-z0-9]{5}$",
+  "nginx-reactive": "^k6-nginx-reactive-[a-z0-9]{8,10}-[a-z0-9]{5}$",
+  "myapptwo": "^k6-myapptwo-[a-z0-9]{8,10}-[a-z0-9]{5}$",
+  "nginx-seasonal": "^k6-nginx-seasonal-[a-z0-9]{8,10}-[a-z0-9]{5}$",
+  "nginx-ensemble": "^k6-nginx-ensemble-[a-z0-9]{8,10}-[a-z0-9]{5}$",
+  "nginx-ensemble-q95": "^k6-nginx-ensemble-q95-[a-z0-9]{8,10}-[a-z0-9]{5}$"
+ }
+}
