@@ -1,7 +1,10 @@
 # ml-api experiment configuration, declared (on EKS these were live patches; Task 03 repo-drift fix).
 # SEASONAL_EXPERIMENT  = experiments/seasonal-pattern-v1/api-config.json (S1, nginx-seasonal)
-# ENSEMBLE_EXPERIMENT  = experiments/seasonal-ensemble-q95-v1/api-config.json (E1 q90 nginx-ensemble + E2 q95
-#                        nginx-ensemble-q95); the R1 config (relative-profile-ar-v1) is not enabled.
+# ENSEMBLE_EXPERIMENT  = E1 q90 (nginx-ensemble, absolute margin) + E2 relative q90 (nginx-ensemble-q95; the
+#                        Deployment keeps its name). E2 was absolute q95 (experiments/seasonal-ensemble-q95-v1) until
+#                        Task 03 U-31 (2026-10-07): the model lab's D-1062 candidate, never decided live on EKS, is
+#                        served from T0 (seasonal-ensemble 1.2.0 margin_mode "relative"; same forecasts as E1).
+#                        The R1 config (relative-profile-ar-v1) is not enabled.
 # ENSEMBLE_HISTORY_HOURS = 360 needs at least 15 days of metric retention (prodcluster: 30 days).
 apiVersion: apps/v1
 kind: Deployment
@@ -17,7 +20,7 @@ spec:
             - name: SEASONAL_EXPERIMENT
               value: '{"id":"seasonal-pattern-v1","application":"nginx-seasonal","namespace":"demo","source_application":"nginx-test","source_namespace":"demo"}'
             - name: ENSEMBLE_EXPERIMENT
-              value: '[{"id":"seasonal-ensemble-q90-v1","application":"nginx-ensemble","namespace":"demo","source_application":"nginx-test","source_namespace":"demo"},{"id":"seasonal-ensemble-q95-v1","application":"nginx-ensemble-q95","namespace":"demo","source_application":"nginx-test","source_namespace":"demo","margin_quantile":0.95}]'
+              value: '[{"id":"seasonal-ensemble-q90-v1","application":"nginx-ensemble","namespace":"demo","source_application":"nginx-test","source_namespace":"demo"},{"id":"seasonal-ensemble-rq90-v1","application":"nginx-ensemble-q95","namespace":"demo","source_application":"nginx-test","source_namespace":"demo","margin_quantile":0.90,"margin_mode":"relative"}]'
             - name: ENSEMBLE_HISTORY_HOURS
               value: "360"
             - name: IMAGE_REF

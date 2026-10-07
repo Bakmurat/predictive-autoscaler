@@ -66,6 +66,15 @@ patches:
       - op: add
         path: /spec/template/metadata/annotations/predictive-bench~1k6-script
         value: challenge-v1+bench_req_failed+days30
+  # U-31: E2 serves the relative q90 margin (ml-api ENSEMBLE_EXPERIMENT); the autoscaler's label and description say so.
+  - target: { kind: PredictiveAutoscaler, name: nginx-ensemble-q95-autoscaler }
+    patch: |-
+      - op: replace
+        path: /metadata/labels/experiment
+        value: seasonal-ensemble-rq90-v1
+      - op: replace
+        path: /metadata/annotations/description
+        value: "Seasonal ensemble (Holt-Winters + 7-day profile/AR) with relative q90 margin (U-31), forecast from demo/nginx-test; own reactive demand"
   - target: { kind: Deployment, name: nginx-ensemble }
     patch: |-
       - op: remove

@@ -14,7 +14,7 @@ campaign**, so nothing measured on EKS is pooled with it. No result is claimed h
 | Storage | `gp3` (EBS CSI) | `harvester` |
 | Images | ECR, arm64, tag `bench-<sha>` | any registry (`HARBOR_REGISTRY` placeholder), linux/amd64, pinned by digest; pull Secret `harbor-creds` |
 | Placement | EBS zones + Prometheus anti-affinity | node labels: `predictive-bench/ml-node` (ml-api, its RWO model volume, the trainer and the evidence archive), `predictive-bench/{seasonal,ensemble}-generator` (three generators) |
-| ml-api experiments | live `kubectl set env` patches | declared in `ml-engine/ml-api-experiments.yaml` (S1, E1 q90, E2 q95; R1 not enabled) |
+| ml-api experiments | live `kubectl set env` patches | declared in `ml-engine/ml-api-experiments.yaml` (S1, E1 q90, E2′ relative q90 — the workload keeps the name `nginx-ensemble-q95`, absolute q95 until Task 03 U-31; R1 not enabled) |
 | Generators | five of six switched to challenge-v1 by hand | all six mount `k6-load-script-challenge-v1` |
 | `nginx-ensemble` | pinned to one EKS zone | spread by hostname like the other arms |
 | Generator connections | keep-alive per VU | one connection per request (`K6_NO_VU_CONNECTION_REUSE`): with keep-alive and no generator sidecar, pods added by a scale-up received no requests |

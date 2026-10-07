@@ -1093,7 +1093,7 @@
     },
     {
      "expr": "sum(rate(istio_requests_total{reporter=\"destination\",destination_workload=\"nginx-ensemble-q95\",destination_workload_namespace=\"demo\"}[1m])) * 60",
-     "legendFormat": "Ensemble + q95",
+     "legendFormat": "Ensemble + rel. q90",
      "refId": "FQ",
      "datasource": {
       "type": "prometheus",
@@ -1304,7 +1304,7 @@
     },
     {
      "expr": "max(predictive_autoscaler_forecast_rpm{kubernetes_namespace=\"ml-engine\",namespace=\"demo\",application=\"nginx-ensemble-q95\",step=\"1\"})",
-     "legendFormat": "Ensemble + q95 · 10m step",
+     "legendFormat": "Ensemble + rel. q90 · 10m step",
      "refId": "EQ",
      "datasource": {
       "type": "prometheus",
@@ -1314,7 +1314,7 @@
     },
     {
      "expr": "max(predictive_autoscaler_forecast_rpm{kubernetes_namespace=\"ml-engine\",namespace=\"demo\",application=\"nginx-ensemble-q95\",step=\"2\"})",
-     "legendFormat": "Ensemble + q95 · 20m step",
+     "legendFormat": "Ensemble + rel. q90 · 20m step",
      "refId": "FQ",
      "datasource": {
       "type": "prometheus",
@@ -1600,7 +1600,7 @@
     },
     {
      "expr": "max(kube_deployment_status_replicas_ready{namespace=\"demo\",deployment=\"nginx-ensemble-q95\"})",
-     "legendFormat": "Ensemble + q95",
+     "legendFormat": "Ensemble + rel. q90",
      "refId": "FQ",
      "datasource": {
       "type": "prometheus",
@@ -2123,7 +2123,7 @@
     },
     {
      "expr": "time() - max(predictive_autoscaler_forecast_issued_timestamp_seconds{kubernetes_namespace=\"ml-engine\",namespace=\"demo\",application=\"nginx-ensemble-q95\"})",
-     "legendFormat": "Ensemble + q95",
+     "legendFormat": "Ensemble + rel. q90",
      "refId": "CQ",
      "datasource": {
       "type": "prometheus",
@@ -2309,7 +2309,7 @@
     },
     {
      "expr": "max(kube_deployment_spec_replicas{namespace=\"demo\",deployment=\"nginx-ensemble-q95\"})",
-     "legendFormat": "Ensemble + q95",
+     "legendFormat": "Ensemble + rel. q90",
      "refId": "EQ",
      "datasource": {
       "type": "prometheus",
@@ -2605,7 +2605,7 @@
   },
   {
    "id": 19,
-   "title": "Ensemble + q95 · Ready replicas",
+   "title": "Ensemble + rel. q90 (nginx-ensemble-q95) · Ready replicas",
    "type": "stat",
    "gridPos": {
     "x": 19,
@@ -2742,7 +2742,7 @@
   },
   {
    "id": 20,
-   "title": "Seasonal ensemble + q95 · predicted vs actual at target time",
+   "title": "Seasonal ensemble + relative q90 (nginx-ensemble-q95) · predicted vs actual at target time",
    "type": "timeseries",
    "gridPos": {
     "x": 16,
@@ -2776,7 +2776,7 @@
      "range": true
     }
    ],
-   "description": "The served forecast of the seasonal-ensemble arm INCLUDES its q95 margin (zero while the forecaster's recent errors are within the margin rule). Forecast samples are read 15 minutes earlier and included ONLY when their recorded target timestamp matches chart time within 30 seconds. This shows a subset of 20-minute-step forecasts, not every issuance. Dots are not joined or filled. The step starts at the input anchor, not issuance time. Scrape delays/held gauges can leave gaps. Diagnostic timing tolerance is not formal scored accuracy; use the verified forecast log for exact target scoring. Best viewed at 6 hours or less; wider ranges show fewer matched points. Pairing uses matching source labels before aggregation, including across controller restarts.",
+   "description": "The served forecast of the seasonal-ensemble arm INCLUDES its relative q90 margin (absolute q95 until the U-31 switch, 2026-10-07/08; the workload keeps the name nginx-ensemble-q95) (zero while the forecaster's recent errors are within the margin rule). Forecast samples are read 15 minutes earlier and included ONLY when their recorded target timestamp matches chart time within 30 seconds. This shows a subset of 20-minute-step forecasts, not every issuance. Dots are not joined or filled. The step starts at the input anchor, not issuance time. Scrape delays/held gauges can leave gaps. Diagnostic timing tolerance is not formal scored accuracy; use the verified forecast log for exact target scoring. Best viewed at 6 hours or less; wider ranges show fewer matched points. Pairing uses matching source labels before aggregation, including across controller restarts.",
    "fieldConfig": {
     "defaults": {
      "unit": "reqpm",
