@@ -639,3 +639,16 @@ def test_r36_a_watchdog_ends_a_read_that_keeps_trickling_past_the_deadline(tmp_p
     with pytest.raises(TimeoutError):
         arch.fetch("k6_vus", 0, 1000)
     assert time.time() - t0 < 5
+
+
+def test_r38_dropped_counter_domain_and_start_time_coverage():
+    lab = healthy()
+    lab.add({"__name__": "k6_dropped_iterations_total", "testid": "nginx-test"}, [(S + MIN, 1.5)])
+    with pytest.raises(ValueError):
+        run(lab)
+    lab = healthy()
+    for m, smp in lab.records:
+        if m.get("pod") == "k6-nginx-test-5645f9f848-fh4wl" and m["__name__"] == "kube_pod_start_time":
+            smp[:] = [(t, v) for t, v in smp if not S + 10 * MIN < t < S + 15 * MIN]
+    ev, unk, *_ = run(lab)
+    assert "k6 container start time demo/k6-nginx-test-5645f9f848-fh4wl" in sources(unk)

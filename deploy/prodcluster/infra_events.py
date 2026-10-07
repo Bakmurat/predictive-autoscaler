@@ -438,12 +438,15 @@ def detect(src, start, stop, ident, mask=None, attributions=None):
                 restarts, running = k6("kube_pod_container_status_restarts_total"), k6("kube_pod_container_status_running")
                 check_domain({"k6": restarts}, f"restarts {subject}", counter=True)
                 check_domain({"k6": running}, f"running {subject}")
-                st = [v for _, x in pick("kube_pod_start_time") for _, v in x if v is not None]
-                st = int(round(st[0] * MS)) if st else None
+                sts = merge([q for _, x in pick("kube_pod_start_time") for q in x], f"start time {subject}")
+                vals = sorted({v for _, v in sts if v is not None})
+                st = int(round(vals[0] * MS)) if vals else None
                 if st is None:
                     ev.gap(f"kube_pod_start_time {subject}", *life)
+                elif len(vals) > 1:                          # a pod's start time is a constant
+                    ev.gap(f"kube_pod_start_time changes {subject}", *life)
                 cfrom = (max(lo, st), life[1]) if st is not None else life
-                for name, s in (("restarts", restarts), ("running", running)):
+                for name, s in (("start time", sts), ("restarts", restarts), ("running", running)):
                     for a, b, _, _ in gaps(seen(s), *cfrom, KSM_GAP):
                         ev.gap(f"k6 container {name} {subject}", a, b)
                 run_obs = [(t, v == 1) for t, v in running if v is not None]
@@ -517,6 +520,7 @@ def detect(src, start, stop, ident, mask=None, attributions=None):
         starts += [f for p in pods for f, _, _, _ in p["runs"]]
         starts.sort()
         for m, s in normalize(src.fetch(f'k6_dropped_iterations_total{{testid="{app}"}}', lo, hi)):
+            check_domain({"k6": s}, f"dropped iterations {app}", counter=True)
             prev = None
             for t, v in s:
                 if v is None:
