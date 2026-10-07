@@ -163,3 +163,14 @@ def test_spread_constraints_stay_unique_under_server_side_apply():
         base = open(os.path.join(ROOT, rel)).read()
         assert base.split("topologySpreadConstraints:", 1)[1].count("- maxSkew") >= 1
         assert base.count("topologySpreadConstraints:") == 1, rel
+
+
+def test_d1083_script_revision_is_part_of_the_generator_template_and_the_script_counts_failures_densely():
+    """A ConfigMap change alone does not restart k6; the revision annotation makes the restart declarative."""
+    p = k6_patch()
+    assert re.search(r"path: /spec/template/metadata/annotations/predictive-bench~1k6-script\n\s+value: \S+", p), p
+    script = open(os.path.join(ROOT, "deploy", "eks-benchmark", "workload", "challenge-v1",
+                               "k6-load-script-challenge-v1.yaml")).read()
+    assert "new Counter('bench_req_failed')" in script
+    assert "benchReqFailed.add(res.status >= 200 && res.status < 400 ? 0 : 1);" in script
+    assert re.search(r"const DAYS = (\d+);", script).group(1) == "30"

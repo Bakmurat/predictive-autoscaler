@@ -1,4 +1,4 @@
-"""deploy/prodcluster/collect_load_evidence.py v7: server-side gate, inventory since a declared start, verified snapshots.
+"""deploy/prodcluster/collect_load_evidence.py v8: server-side gate, inventory since a declared start, verified snapshots.
 
 Fixture timing follows prodcluster measurements (2026-10-05): k6 pushes every 10 s (k6_vus at x.475 s, a changed
 counter stamped with its latest event); Envoy targets scraped every 30 s with `up` and every series sharing the scrape
@@ -172,6 +172,10 @@ class FakeVM:
             last = {"old": T0 - 600, "snapshot_late": T0 - 900 + 400, "alive_after": T0 - 600}.get(ph, T0 - 20)
             if ph == "reincarnated":                      # a NEW pod with the old name, started inside the hour
                 out[f"{app}-aaaa1111-p0"] = dict(start=T0 + 100, ksm_end=END, frm=None, to=None, share=0.0, snap=None)
+            elif ph == "deleted_at_window_edge":          # live 2026-10-06/07: deleted ~3 min before the hour, so only its
+                # kube-state-metrics staleness marker falls inside the collector's (t0 - SHORT, end] window
+                out[f"{app}-aaaa1111-p0"] = dict(start=T0 - 7000, ksm_end=T0 - 190, frm=T0 - 7000, to=T0 - 210, share=0.0,
+                                                 snap=T0 - 200.0, stale_at=T0 - 170)
             else:
                 out[f"{app}-aaaa1111-p0"] = dict(start=T0 - 7000, ksm_end=last + 30, frm=T0 - 7000, to=last, share=0.0, snap=snap)
         if o.get("alive_without_target"):
@@ -187,6 +191,21 @@ class FakeVM:
                                              frm=None, to=None, share=0.0, snap=None, created=T0 - 1000, node="",
                                              scheduled=False, no_start=(ns != "started"), stale_only=(ns == "stale_only"))
         return out
+
+    def sparse_failed(self, app):
+        o = self.o
+        if app == "nginx-test" and o.get("builtin_decrease"):          # a counter reset the dense series cannot excuse
+            return [(T0 - 100.9, 10.0), (T0 + 500.9, 5.0), (T0 + 900.9, 6.0)]
+        if app == "nginx-test" and o.get("failure_in_hour"):
+            return [(T0 + 1000.9, 3.0)] + ([(T1 + 700.9, 4.0)] if o["failure_in_hour"] == "bounded" else [])
+        if app == "nginx-test" and o.get("failure_after_hour"):     # one failure at t1+61; the next only at t1+3000
+            return [(T1 + 61.0, 1.0), (T1 + 3000.0, 2.0)]
+        return []
+
+    def dense_failed(self, app, t):
+        if self.o.get("dense_failed") == "disagree" and app == "nginx-test":
+            return 0.0 if t < T0 + 1000 else 5.0
+        return max([0.0] + [v for L, v in self.sparse_failed(app) if L <= t])
 
     def value(self, p, t):
         d = self.pods(p.rsplit("-", 2)[0])[p]
@@ -223,7 +242,7 @@ class FakeVM:
 
     def raw(self, sel, t_end, window):
         o, app = self.o, self.app_of(sel)
-        if o.get("partial"):
+        if o.get("partial") or (o.get("builtin_partial") and 'expected_response="false"' in sel):
             raise cle.Incomplete("query failed or partial")
         lo = t_end - window
         name = sel.split("{")[0]
@@ -279,14 +298,16 @@ class FakeVM:
                     val = lambda t: 1.0
                 pts = [(t, val(t)) for t in ksm if d["start"] <= t <= d["ksm_end"] and not (gap and gap[0] < t < gap[1] and p.endswith("p1"))
                        and not (late_first and p.endswith("p2") and t < d["frm"] + 40)]
-                if pts:
+                pts = [x for x in pts if lo < x[0] <= t_end]
+                stale = [d["stale_at"]] if d.get("stale_at") and lo < d["stale_at"] <= t_end else []
+                if pts or stale:
                     lab = {"pod": p, "container": "istio-proxy"}
                     if name == "kube_pod_info":
                         lab["node"] = d.get("node", "w1")
                     if d.get("stale_only"):
                         out.append((lab, [], [t for t, _ in pts]))
                         continue
-                    out.append((lab, pts, []))
+                    out.append((lab, pts, stale))
                     if o.get("dup_start") and name == "kube_pod_start_time" and p.endswith("p1"):
                         out.append(({"pod": p, "container": "istio-proxy", "uid": "other"}, pts, []))
             return out
@@ -332,12 +353,16 @@ class FakeVM:
         if name == "k6_vus":
             return [({"testid": app}, [(t, 30.0) for t in self.hb if lo < t <= t_end], [])]
         if name == "k6_http_reqs_total" and 'expected_response="false"' in sel:
+            pts = self.sparse_failed(app)
             if app == "nginx-test" and o.get("failure_in_hour"):
-                return [({"testid": app, "expected_response": "false"}, [(T0 + 1000.9, 3.0)] + ([(T1 + 700.9, 4.0)] if o["failure_in_hour"] == "bounded" else []), [])]
-            if app == "nginx-test" and o.get("failure_after_hour"):     # one failure at t1+61; the next only at t1+3000
-                pts = [(T1 + 61.0, 1.0), (T1 + 3000.0, 2.0)]
+                return [({"testid": app, "expected_response": "false"}, pts, [])]
+            if pts:
                 return [({"testid": app, "expected_response": "false"}, [(t, v) for t, v in pts if lo < t <= t_end], [])]
             return []
+        if name == "k6_bench_req_failed_total":       # dense (D-1083): a sample every flush, same events as the built-in
+            if not o.get("dense_failed"):
+                return []
+            return [({"testid": app}, [(h + 0.9, self.dense_failed(app, h + 0.9)) for h in self.hb if lo < h + 0.9 <= t_end], [])]
         if name == "k6_http_reqs_total":
             r = challenge_profile.planned_requests(int(T0)) / 3600.0
             return [({"testid": app, "expected_response": "true"}, [(h + 0.9, r * (h - K6_START)) for h in self.hb if h + 0.9 > lo], [])]
@@ -362,6 +387,8 @@ class FakeVM:
         if query.startswith("max by (pod) (max_over_time(up"):
             return [({"pod": p}, 1.0 if d["to"] is not None and d["to"] > T1 else 0.0)
                     for p, d in self.pods(app).items() if d["frm"] is not None and d["to"] >= T0 - 3600]
+        if "k6_bench_req_failed_total" in query:
+            return [({"testid": app}, self.dense_failed(app, t))] if self.o.get("dense_failed") else []
         if "k6_http_reqs_total" in query and "expected_response" not in query:
             r = challenge_profile.planned_requests(int(T0)) / 3600.0
             return [({"testid": app, "expected_response": "true"}, r * (t - 10 - K6_START))]
@@ -382,7 +409,7 @@ def test_healthy_hour_passes_and_qualifies_only_with_the_recorded_approval():
     assert early["status"] == "PASS" and not early["qualification"]["qualifies"] and not early["maturity"]["finalized"]
     missed = run(FakeVM(), now=T1 + cle.FINAL_AFTER + 3600 + 60)   # after the sixth window: not finalized
     assert not missed["qualification"]["qualifies"] and not missed["maturity"]["finalized"]
-    assert r["failed"] == [0, 0] and r["dropped"] == [0, 0] and r["collector"].endswith("v7")
+    assert r["failed"] == [0, 0] and r["dropped"] == [0, 0] and r["collector"].endswith("v8")
     assert r["observed"][0] <= r["planned"] <= r["observed"][1] and r["p95_server_ms_interior"] is not None
     q = run(FakeVM(), approvals={}, now=FINAL_NOW)["qualification"]
     assert not q["qualifies"] and q["pending_user_approval"] == ["A1'"]
@@ -460,6 +487,16 @@ def test_pods_closed_before_the_hour_and_validated_termination_records():
                 {k: v for k, v in rec.items() if k != "pod_start"}):
         r = run(FakeVM(pre_hour="old"), terminations={"nginx-test-aaaa1111-p0": bad})
         assert r["status"] == "INCOMPLETE" and "no final snapshot" in r["reason"], (bad, r)
+
+
+def test_a_pod_deleted_just_before_the_window_with_only_its_staleness_marker_inside_passes():
+    """Live false INCOMPLETE (2026-10-06 11Z/16Z/19Z): a pod deleted 3 minutes before the hour leaves only a
+    kube-state-metrics staleness marker inside the start-time window; it is closed before the hour, not relevant."""
+    r = run(FakeVM(pre_hour="deleted_at_window_edge"))
+    assert r["status"] == "PASS" and r["pods_closed_before_hour"] == 1, r
+    # a RELEVANT pod with no finite start-time sample still fails closed
+    r = run(FakeVM(no_ksm=True))
+    assert r["status"] == "INCOMPLETE" and "no kube-state-metrics pod record" in r["reason"], r
 
 
 def test_r22_manual_records_close_one_incarnation_only():
@@ -555,6 +592,34 @@ def test_r24_sparse_k6_tail_is_bounded_by_a_sample_found_at_a_later_collection()
     assert r["status"] == "INCOMPLETE" and "tail yet" in r["reason"], r
     r = run(FakeVM(failure_after_hour=True), now=T1 + 4000)                      # the next failure bounds it
     assert r["status"] == "PASS" and r["failed"] == [0, 2], r
+
+
+def test_d1083_dense_failure_counter_bounds_the_hour_the_sparse_series_cannot():
+    """Live: 7 of ~270 arm-hours stayed INCOMPLETE because a rare failure left the sparse built-in series without a later
+    sample. The dense bench_req_failed counter (add(0|1) every request) has a sample every flush."""
+    r = run(FakeVM(failure_in_hour="unbounded"))
+    assert r["status"] == "INCOMPLETE" and "tail yet" in r["reason"], r              # without the dense counter: as before
+    r = run(FakeVM(failure_in_hour="unbounded", dense_failed="match"))
+    assert r["status"] == "PASS" and r["failed"] == [3, 3] and r["failed_source"].startswith("bench_req_failed"), r
+    assert "tail yet" in r["failed_builtin"], r                                     # the built-in result is kept
+    r = run(FakeVM(dense_failed="match"), now=FINAL_NOW)
+    assert r["status"] == "PASS" and r["failed"] == [0, 0] and r["qualification"]["qualifies"], r
+    r = run(FakeVM(failure_after_hour=True, dense_failed="match"), now=T1 + 4000)
+    # the dense bound is conservative in the same way (its first sample after t1 + LAG may include later failures)
+    assert r["status"] == "PASS" and r["failed"] == [0, 1] and r["failed_builtin"] == [0, 2], r
+
+
+@pytest.mark.parametrize("over, msg", [({"builtin_partial": True}, "partial"), ({"builtin_decrease": True}, "")])
+def test_r29_dense_counter_tolerates_only_the_missing_tail_witness(over, msg):
+    """Codex r29 BLOCKER: a partial built-in query or a built-in counter reset must not become PASS behind a healthy
+    dense series; only the unbounded sparse tail is tolerated."""
+    r = run(FakeVM(dense_failed="match", **over))
+    assert r["status"] == "INCOMPLETE" and msg in r["reason"], r
+
+
+def test_d1083_disjoint_dense_and_builtin_bounds_are_incomplete():
+    r = run(FakeVM(failure_after_hour=True, dense_failed="disagree"), now=T1 + 4000)
+    assert r["status"] == "INCOMPLETE" and "disagree" in r["reason"], r
 
 
 def test_restart_counter_bracket_may_start_at_the_container_start_when_it_reads_zero():

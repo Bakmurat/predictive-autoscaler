@@ -1,7 +1,8 @@
 # prodcluster overlay for the `demo` namespace: the six benchmark arms, their Services, PredictiveAutoscalers and
 # KEDA ScaledObjects, and the six k6 generators, taken unchanged from deploy/eks-benchmark except:
 #   - every generator mounts the challenge-v1 script (on EKS five of the six were switched by hand; repo drift fixed)
-#     and opens a new connection per request (K6_NO_VU_CONNECTION_REUSE, see the patch);
+#     and opens a new connection per request (K6_NO_VU_CONNECTION_REUSE, see the patch); the script also counts failed
+#     requests in a dense counter (D-1083), recorded as a pod-template annotation;
 #   - nginx-ensemble loses its EKS zone pin (ap-southeast-1b);
 #   - all six arms carry predictive-bench/role=arm, a soft per-arm hostname spread and stay off the ML node;
 #   - all six arms record their final request counters when a pod terminates (final-snapshot.sh, see the patch);
@@ -60,6 +61,11 @@ patches:
       - op: add
         path: /spec/template/spec/containers/0/env/-
         value: { name: K6_NO_VU_CONNECTION_REUSE, value: "true" }
+      # D-1083: the script gained a dense failure counter and a 30-day schedule; a ConfigMap change alone does not
+      # restart k6, so the script revision is part of the pod template and every generator restarts with it (Recreate).
+      - op: add
+        path: /spec/template/metadata/annotations/predictive-bench~1k6-script
+        value: challenge-v1+bench_req_failed+days30
   - target: { kind: Deployment, name: nginx-ensemble }
     patch: |-
       - op: remove

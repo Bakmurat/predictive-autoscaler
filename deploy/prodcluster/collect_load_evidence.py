@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
-"""Hourly load evidence for the six benchmark arms on a VictoriaMetrics cluster (prodcluster campaign), v7.
+"""Hourly load evidence for the six benchmark arms on a VictoriaMetrics cluster (prodcluster campaign), v8.
 
+v8 (2026-10-07, D-1083): G3 reads the generator's dense failure counter (bench_req_failed) when the run has it; the
+built-in sparse series is kept and must intersect it. A pod deleted just before the start-time window, whose
+kube-state-metrics series shows only a staleness marker inside it, no longer makes the hour INCOMPLETE.
 v7 (2026-10-05, Codex Task 03 r21): no acceptance cache (every snapshot re-verified from VictoriaMetrics each hour,
 including that no scrape after its capture changed); one constant pod-start and container-start identity per pod;
 restart-counter observations must really bracket the scrapes used; approvals and manual termination records are
@@ -61,6 +64,7 @@ GRACE = LAG + 120.0      # collect at t1 + 12 min
 ENVOY_GAP = 70.0         # scrape every 30 s: allow one missed scrape
 KSM_GAP = 90.0
 SHORT = 180.0
+DENSE_FAILED = "k6_bench_req_failed_total"   # D-1083: dense failure counter of the generator script
 SCRAPE_LABELS = {"__name__", "app", "container", "endpoint", "instance", "job", "prometheus", "namespace", "pod", "service"}
 SNAP_LABELS = {"__name__", "namespace", "pod", "pod_uid", "snapshot_version"}
 ASSUMPTIONS = {"A1'": "G2/G3 (k6 dropped/failed): a k6 sample reaches the exporter within 600 s of its event time"}
@@ -75,6 +79,10 @@ sys.path.insert(0, _WORKLOAD)
 
 class Incomplete(Exception):
     pass
+
+
+class UnboundedTail(Incomplete):
+    """The one outcome a dense counter may resolve: a sparse k6 series has no sample at or after t1 + LAG yet."""
 
 
 with open(os.path.abspath(__file__), "rb") as _fh:
@@ -129,7 +137,7 @@ def k6_bounds(samples, base, t0, t1, lag, zero_allowed=True):
     if hi1 is None:
         if zero_allowed and not any(L >= T0 for L, _ in s):
             return 0.0, 0.0
-        raise Incomplete("k6 series changed in or after the hour and no later sample bounds its tail yet")
+        raise UnboundedTail("k6 series changed in or after the hour and no later sample bounds its tail yet")
     low = max(0.0, lo1 - hi0) if hi0 is not None else 0.0
     high = hi1 - lo0
     if low > high:
@@ -341,6 +349,38 @@ def k6_counter(vm, selector, t0, t1, k6_start, end, lag, zero_allowed=True):
     return lo, hi
 
 
+def k6_failed(vm, app, t0, t1, k6_start, end, r):
+    """G3's failed requests. Since D-1083 the generator script also counts failures in a DENSE counter
+    (bench_req_failed, add(0|1) on every request, k6's default expected statuses 200-399), which has a sample in every
+    flush; the built-in expected_response="false" series has one only in flushes with a failure, so a rare failure can
+    leave its tail unbounded for hours. With the dense series present for this generator run it bounds the hour; the
+    built-in bounds are kept and, when computable, must intersect the dense ones (both bound the same count). Only the
+    built-in's missing tail witness is tolerated (Codex r29). The dense sample is stamped at Counter.add, right after
+    the HTTP response completes; A1' covers that whole path (response completion -> add -> exporter within LAG)."""
+    builtin_sel = f'k6_http_reqs_total{{testid="{app}",expected_response="false"}}'
+    dense_sel = f'{DENSE_FAILED}{{testid="{app}"}}'
+    try:
+        builtin = k6_counter(vm, builtin_sel, t0, t1, k6_start, end, LAG)
+        r["failed_builtin"] = [round(x) for x in builtin]
+    except UnboundedTail as e:      # only the missing tail witness; partial queries, resets, invalid bounds propagate
+        builtin = None
+        r["failed_builtin"] = f"unbounded: {e}"
+    ws = max(t0 - SHORT, k6_start)
+    dense = [x for x in vm.raw(dense_sel, end, end - ws) if x[1]]
+    if not dense:
+        r["failed_source"] = "http_reqs expected_response=false (sparse, built-in)"
+        if builtin is None:
+            raise UnboundedTail(r["failed_builtin"][len("unbounded: "):])
+        return builtin
+    if len(dense) != 1:
+        raise Incomplete(f"{len(dense)} dense failure-counter series for one generator")
+    failed = k6_counter(vm, dense_sel, t0, t1, k6_start, end, LAG, zero_allowed=False)
+    if builtin is not None and (failed[0] > builtin[1] or builtin[0] > failed[1]):
+        raise Incomplete(f"k6 failure counters disagree: dense {list(failed)} vs built-in {list(builtin)}")
+    r["failed_source"] = "bench_req_failed (dense)"
+    return failed
+
+
 def _utc(x):
     try:
         return datetime.datetime.strptime(x, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc).timestamp()
@@ -463,6 +503,10 @@ def arm_envoy(vm, app, t0, t1, end, t_inv, terminations):
     starts = {}
     for m, s, _ in vm.raw(f'kube_pod_start_time{{namespace="{NAMESPACE}",pod=~"{prx}"}}', end, win):
         p = m.get("pod")
+        if not s:
+            # only a staleness marker in the window: the pod's record ended before it (deleted just before t0 - SHORT);
+            # a relevant pod without a finite start sample still fails closed below ("no kube-state-metrics pod record")
+            continue
         if p in starts:
             raise Incomplete(f"pod {p}: more than one pod-start series (name reuse?)")
         starts[p] = lifecycle_value(s, "pod start time", p)
@@ -556,7 +600,7 @@ def collect(vm, hour_start, t_inv, terminations=None, approvals=None, now=None):
     now = time.time() if now is None else now
     rows = []
     for app in APPS:
-        r = {"app": app, "hour_start": hour_start.strftime("%Y-%m-%dT%H:%M:%SZ"), "collector": "collect_load_evidence.py v7",
+        r = {"app": app, "hour_start": hour_start.strftime("%Y-%m-%dT%H:%M:%SZ"), "collector": "collect_load_evidence.py v8",
              "collector_sha256": COLLECTOR_SHA256, "inventory_start": utc(t_inv), "collection_cutoff": utc(end),
              "terminations_used": sorted(terminations), "inputs_sha256": inputs_sha256, "identity": IDENTITY_NOTE}
         try:
@@ -579,7 +623,7 @@ def collect(vm, hour_start, t_inv, terminations=None, approvals=None, now=None):
             hbs = vm.raw(f'k6_vus{{testid="{app}"}}', end, end - (t0 - SHORT))
             if len(hbs) != 1 or not covers([t for t, _ in hbs[0][1]], t0, t1 + LAG + PUSH, HB_GAP):
                 raise Incomplete("k6 heartbeat shows a lost flush (or is missing) over the hour and the lag allowance")
-            failed = k6_counter(vm, f'k6_http_reqs_total{{testid="{app}",expected_response="false"}}', t0, t1, k6_start, k6_end, LAG)
+            failed = k6_failed(vm, app, t0, t1, k6_start, k6_end, r)
             dropped = k6_counter(vm, f'k6_dropped_iterations_total{{testid="{app}"}}', t0, t1, k6_start, k6_end, LAG)
             r.update(failed=[round(x) for x in failed], dropped=[round(x) for x in dropped])
             try:

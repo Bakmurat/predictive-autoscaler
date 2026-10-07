@@ -17,6 +17,13 @@ metadata:
 data:
   load.js: |
     import http from 'k6/http';
+    import { Counter } from 'k6/metrics';
+
+    // Dense failure counter (prodcluster D-1083): k6 exports a counter only in flushes where it received a sample, so
+    // the built-in failed-request series (expected_response="false") is sparse and an hour with a rare failure stays
+    // unbounded until the next failure. add(0) on every request makes this series report every flush. Same
+    // definition as k6's default expected statuses (200-399); offered load is unchanged.
+    const benchReqFailed = new Counter('bench_req_failed');
 
     // BEGIN SCHEDULE
     const PROFILE = {
@@ -83,8 +90,10 @@ data:
     }
     // END SCHEDULE
 
-    const DAYS = 8;                       // schedule length; k6 exits afterwards and the Deployment
-                                          // restarts it, re-aligned to the wall clock
+    const DAYS = 30;                      // schedule length; k6 exits afterwards and the Deployment
+                                          // restarts it, re-aligned to the wall clock. 30 (was 8; prodcluster
+                                          // D-1083, Codex r29) so one run spans qualification, warm-up and scoring;
+                                          // k6 memory stayed flat at ~172 MiB over 2.5 days of an 8-day run
     const nowS = Date.now() / 1000;
     const rateAt = makeRateAt(nowS + DAYS * 86400 + PROFILE.slot);
     const slotStart = Math.floor(nowS / PROFILE.slot) * PROFILE.slot;
@@ -118,5 +127,6 @@ data:
     }
 
     export default function () {
-      http.get(__ENV.TARGET_URL);
+      const res = http.get(__ENV.TARGET_URL);
+      benchReqFailed.add(res.status >= 200 && res.status < 400 ? 0 : 1);
     }
