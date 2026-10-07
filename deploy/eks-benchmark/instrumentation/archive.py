@@ -32,7 +32,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = "1"
+VERSION = "2"   # 2: ensemble issuance records keep the margin policy, raw forecasts and the complete body
 RELOAD_RE = re.compile(r"(Loaded|Reloaded) model")
 # The seasonal-ensemble arm has no model file: its issuance record's artifact_sha256 is the
 # generation fingerprint, and the API logs one ENSEMBLE_ISSUANCE JSON line per served forecast
@@ -436,7 +436,12 @@ def collect_api_reloads(api, arc, selector, container, ident, now):
                                 "origin": body.get("origin"), "fingerprint": gen.get("fingerprint"),
                                 "boundary": gen.get("boundary"), "served": body.get("served"),
                                 "margin": body.get("margin"), "margin_samples": body.get("margin_samples"),
-                                "stale_generation": body.get("stale_generation")})
+                                "stale_generation": body.get("stale_generation"),
+                                # which margin policy served it (E1 and E2' share forecasts; Codex Task 03 r34)
+                                "experiment": body.get("experiment"), "margin_mode": body.get("margin_mode"),
+                                "margin_quantile": body.get("margin_quantile"),
+                                "partial_rule": body.get("partial_rule"), "raw": body.get("raw"),
+                                "body": body})
                 except (ValueError, AttributeError) as e:
                     rec["parse_error"] = repr(e)   # the raw line hash still binds the evidence
                 append_jsonl(ens_p, rec)

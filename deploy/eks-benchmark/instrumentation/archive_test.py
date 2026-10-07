@@ -323,6 +323,24 @@ class LogTests(unittest.TestCase):
         self.assertEqual(out["api_ensemble_lines_new"], 0)
         self.assertEqual(len(lines(os.path.join(self.arc, "logs", "api-ensemble.jsonl"))), 1)
 
+    def test_api_ensemble_issuance_keeps_its_policy_and_complete_body(self):
+        # Codex Task 03 r34: E2' (relative q90) and E1 (absolute q90) share forecasts; the archived record must say
+        # which margin policy served each issuance and keep the raw forecasts, not only the line hash.
+        body = {"application": "nginx-ensemble-q95", "namespace": "demo", "origin": "2026-10-07T23:10:00Z",
+                "experiment": "seasonal-ensemble-rq90-v1", "forecaster": "seasonal-ensemble",
+                "margin_mode": "relative", "margin_quantile": 0.9, "partial_rule": "refuse",
+                "raw": [358.1] * 6, "margin": 16.91, "margin_samples": 66, "served": [375.0] * 6,
+                "stale_generation": False, "generation": {"boundary": "2026-10-07T18:00:00Z", "fingerprint": "e57b" * 16}}
+        self.api.pods.append(api_pod("ml-api-1", "a1"))
+        self.api.logs[("ml-api-1", "api", False)] = (
+            "2026-10-07T23:12:01Z INFO:api.main:ENSEMBLE_ISSUANCE " + json.dumps(body) + "\n")
+        self.collect()
+        (rec,) = lines(os.path.join(self.arc, "logs", "api-ensemble.jsonl"))
+        self.assertEqual((rec["experiment"], rec["margin_mode"], rec["margin_quantile"], rec["partial_rule"]),
+                         ("seasonal-ensemble-rq90-v1", "relative", 0.9, "refuse"))
+        self.assertEqual(rec["raw"], [358.1] * 6)
+        self.assertEqual(rec["body"], body)
+
     def test_api_ensemble_line_with_bad_json_keeps_the_raw_hash(self):
         self.api.pods.append(api_pod("ml-api-1", "a1"))
         self.api.logs[("ml-api-1", "api", False)] = "2026-09-23T06:06:47Z INFO:api.main:ENSEMBLE_ISSUANCE {not json}\n"
