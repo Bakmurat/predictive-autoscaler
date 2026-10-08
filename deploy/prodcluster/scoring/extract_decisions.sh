@@ -17,7 +17,8 @@ while [ $# -gt 0 ]; do
 done
 : "${KUBE_CONTEXT:?set KUBE_CONTEXT}"; [ -n "$SINCE" ] && [ -n "$OUT" ] || { echo "--since and --out are required" >&2; exit 2; }
 [ -e "$OUT" ] && { echo "$OUT exists" >&2; exit 2; }
-k() { kubectl --context "$KUBE_CONTEXT" -n ml-engine "$@"; }
+KUBECTL="${KUBECTL:-kubectl}"   # deploy.env pins a kubectl within one minor version of the server
+k() { "$KUBECTL" --context "$KUBE_CONTEXT" -n ml-engine "$@"; }
 NODE=$(k get pod -l app=predictive-operator -o jsonpath='{.items[0].spec.nodeName}')
 POD="decisions-extract-$(date -u +%H%M%S)"
 IMAGE="public.ecr.aws/docker/library/python@sha256:4c47124a8391cb7a9f571164147d154777cf012a4ece5f86097130d7a4478111"
