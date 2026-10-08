@@ -333,6 +333,15 @@ def contamination(windows, segments, covered):
     return "contaminated" if "invalid" in hit else "unknown" if "unknown" in hit else "clean"
 
 
+def check_pre(res, ie):
+    """The P8 result's history pre-window (ms); both recorded copies must equal the pinned detector constant."""
+    pre = (res.get("run_identity") or {}).get("pre_ms")
+    const = (res.get("constants_ms") or {}).get("pre")
+    if type(pre) is not int or pre != ie.PRE or type(const) is not int or const != ie.PRE:
+        raise ValueError(f"P8 result's pre-window (run_identity {pre!r}, constants {const!r}) is not the detector's {ie.PRE}")
+    return pre
+
+
 def frozen_envelope_config():
     """The envelope inputs as deployed (frozen manifests): ENSEMBLE_HISTORY_HOURS and the trainer's TRAINING_HOURS."""
     exp = open(os.path.join(cap.PROD, "ml-engine", "ml-api-experiments.yaml")).read()
@@ -384,10 +393,7 @@ def main(argv=None):
         res = json.loads(p8_bytes)
         chk = cap.p8_check(res, start, stop, frozen, ie)
         target_class, segments, p8_summary = chk["classifier"].target, chk["classifier"].segs, chk["summary"]
-        pre = res["run_identity"]["pre_ms"]
-        if pre != ie.PRE or (res.get("constants_ms") or {}).get("pre") != ie.PRE:
-            raise ValueError(f"P8 result's pre_ms {pre} differs from the frozen detector constant {ie.PRE}")
-        covered = (ie.parse(res["start"]) - pre, ie.parse(res["stop"]))
+        covered = (ie.parse(res["start"]) - check_pre(res, ie), ie.parse(res["stop"]))
     mask = json.load(open(os.path.join(cap.PROD, "validity-mask.json")))
     history_start = ie.parse(mask["benchmark_history_start"])
     ens_by = {}

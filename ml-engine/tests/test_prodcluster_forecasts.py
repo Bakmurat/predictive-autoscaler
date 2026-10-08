@@ -217,3 +217,17 @@ def test_r50_c4_raw_identity_is_two_decimal_equality_and_generation_fields_join_
     conflicting = dict(good, generation={"fingerprint": "b"})
     assert fc.attach_raw(r, [good, conflicting]) == (None, "ambiguous")
     assert fc.attach_raw(r, [good, dict(good, stale_generation=True)]) == (None, "ambiguous")
+
+
+def test_r51_p8_pre_window_must_match_the_detector_in_both_places():
+    ie = fc.cap.load("infra_events", fc.os.path.join(fc.cap.PROD, "infra_events.py"))
+    ok = {"run_identity": {"pre_ms": ie.PRE}, "constants_ms": {"pre": ie.PRE}}
+    assert fc.check_pre(ok, ie) == ie.PRE
+    for bad in ({"run_identity": {"pre_ms": ie.PRE - 1}, "constants_ms": {"pre": ie.PRE}},
+                {"run_identity": {"pre_ms": ie.PRE}, "constants_ms": {"pre": ie.PRE + 1}},
+                {"run_identity": {}, "constants_ms": {"pre": ie.PRE}},
+                {"run_identity": {"pre_ms": ie.PRE}},
+                {"constants_ms": {"pre": ie.PRE}},
+                {"run_identity": {"pre_ms": float(ie.PRE)}, "constants_ms": {"pre": ie.PRE}}):
+        with pytest.raises(ValueError):
+            fc.check_pre(bad, ie)
