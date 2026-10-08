@@ -38,14 +38,15 @@ Gates (all PASS = a usable freeze; the capture is written either way):
   telemetry           kubectl top rows and physically valid (0 ≤ avail ≤ size, size > 0), unambiguous, fresh (both
                       series, no future timestamps) root-disk samples for every frozen worker; the required benchmark
                       series (VictoriaMetrics with deny_partial_response=1). Collection only: no disk threshold
-  qualification       the given load-gate log shows each given hour (consecutive) PASS and qualifies=True for all six arms
+  qualification       the immutable load-gate attempts of the given consecutive hours (fetch_load_attempts.sh): every final
+                      row PASS and qualifies=True for all six arms, conflicting final rows fail closed
   matches_previous    (with --compare-with) the configuration identity equals the earlier capture's
   no_secret_values    nothing credential-like found (found values are redacted before writing, never stored)
 Other evidence kept outside the code repo (the protocol, training verification records) is bound by --evidence.
 
   source env.sh; set -a; . deploy.env; set +a
   KUBE_CONTEXT=prodcluster VM_URL=http://127.0.0.1:18481/select/0/prometheus freeze_capture.py --out <new dir> \\
-    --evidence <protocol> --qualification <load-evidence log> --qualification-hours 2026-10-07T21:00:00Z,… \\
+    --evidence <protocol> --qualification-attempts <fetch output> --qualification-hours 2026-10-07T21:00:00Z,… \\
     [--compare-with <earlier capture>]
 """
 import argparse, calendar, copy, hashlib, importlib.util, json, math, os, re, shutil, subprocess, sys, tempfile, time
@@ -70,6 +71,7 @@ STATIC_KINDS = ("deployments.apps", "cronjobs.batch", "configmaps", "persistentv
 P8_FILES = ("infra_events.py", "infra-identities.json", "validity-mask.json", "p8_launcher.py")   # p8-job.sh FILES
 FROZEN_FILES = tuple("deploy/prodcluster/" + f for f in P8_FILES) + (
     "deploy/prodcluster/p8-job.sh", "deploy/prodcluster/deploy.sh", "deploy/prodcluster/freeze_capture.py",
+    "deploy/prodcluster/fetch_load_attempts.sh",
     "deploy/prodcluster/collect_load_evidence.py", "deploy/prodcluster/load-gate/approvals.json",
     "deploy/prodcluster/load-gate/terminations.json", "deploy/prodcluster/load-gate/settings.env",
     "deploy/prodcluster/scoring/capacity.py", "deploy/prodcluster/scoring/forecasts.py",
@@ -742,24 +744,119 @@ def gate_processes(jobs, pods, env, archive_log, api_log, trainer_template, now,
     return problems, summary
 
 
-def gate_qualification(log_text, hours):
-    """Each hour PASS and qualifies=True for all six arms in a load-evidence log; the hours consecutive."""
-    if not log_text or not hours:
-        return ["no qualification log or hours given"], {}
-    problems, seen = [], {}
-    for line in log_text.splitlines():
-        m = re.match(r"(\S+)\s+(\d{4}-\d\d-\d\dT\d\d:00:00Z)\s+(\S+)\s.*\bqualifies=(True|False)\b", line)
-        if m and m.group(1) in ARMS:
-            seen.setdefault(m.group(2), {})[m.group(1)] = (m.group(3), m.group(4))
+def hour_tag(h):
+    return "load-" + h[:4] + h[5:7] + h[8:13] + h[14:16] + "Z"
+
+
+FETCHER = "fetch_load_attempts.sh v1"
+COLLECTOR = "collect_load_evidence.py v8"
+FILE_NAME = re.compile(r"^(attempts/)?load-(\d{8}T\d{4}Z)(-\d{8}T\d{6}Z-\d+)?\.json$")
+
+
+def qualification_expectations(ctx):
+    """What a valid fetch and its final rows must name: the frozen fetcher and collector of this checkout, the context,
+    and the approvals/terminations the collector hashed (json.dumps(obj or {}, sort_keys=True), as the collector does)."""
+    gate_dir = os.path.join(HERE, "load-gate")
+    inputs = {k: sha_bytes(json.dumps(json.load(open(os.path.join(gate_dir, f"{k}.json"))) or {}, sort_keys=True).encode())
+              for k in ("terminations", "approvals")}
+    return {"context": ctx, "fetcher_sha256": sha(os.path.join(HERE, "fetch_load_attempts.sh")),
+            "collector_sha256": sha(os.path.join(HERE, "collect_load_evidence.py")), "inputs_sha256": inputs}
+
+
+def gate_qualification(fetched, hours, expect):
+    """(problems, summary): the qualification hours from the immutable load-gate attempts fetched by
+    fetch_load_attempts.sh v1 (D-1093, Codex r59/r60). The fetch: trailer over the exact bytes; the receipt names exactly
+    this fetcher version and its frozen sha256, the expected context and load-evidence-pvc, a reader pod and node;
+    receipt entries unique, well-formed and consistent (file name ↔ hour ↔ requested hours), each text matching its
+    entry. An hour qualifies when every attempt of it lists exactly the six arms for that hour, every arm has at least
+    one final row, and every final row is PASS with qualifies=True and was written by the frozen collector with the
+    frozen approvals/terminations: provisional rows are ignored, conflicting final rows fail closed in any order. The
+    hours must be two or more consecutive hours."""
+    if not fetched or not hours:
+        return ["no qualification attempts or hours given"], {}
+    try:
+        lines = fetched.rstrip(b"\n").split(b"\n")
+        trailer = json.loads(lines[-1])["trailer"]
+        body = b"\n".join(lines[:-1]) + b"\n"
+        if len(body) != trailer["bytes"] or sha_bytes(body) != trailer["sha256"]:
+            return ["the qualification fetch does not match its trailer"], {}
+        rec = json.loads(lines[0])["receipt"]
+        texts, problems = {}, []
+        for line in lines[1:-1]:
+            d = json.loads(line)
+            if d["file"] in texts:
+                problems.append(f"{d['file']} fetched twice")
+            texts[d["file"]] = d["text"]
+    except (ValueError, KeyError, IndexError, TypeError) as e:
+        return [f"the qualification fetch is unreadable ({e})"], {}
+    if rec.get("extractor") != FETCHER or rec.get("extractor_sha256") != expect["fetcher_sha256"]:
+        problems.append(f"fetched by {rec.get('extractor')!r} {str(rec.get('extractor_sha256'))[:12]}, not the frozen "
+                        f"{FETCHER} {expect['fetcher_sha256'][:12]}")
+    src = rec.get("source") if isinstance(rec.get("source"), dict) else {}
+    if src.get("context") != expect["context"] or src.get("pvc") != "load-evidence-pvc" \
+            or not str(src.get("pod") or "").startswith("load-attempts-fetch-") or not src.get("node"):
+        problems.append(f"the fetch's source {src} is not {expect['context']}/load-evidence-pvc with a reader pod and node")
+    listed = {}
+    for f in rec.get("files") if isinstance(rec.get("files"), list) else []:
+        m = FILE_NAME.match(str(f.get("path"))) if isinstance(f, dict) else None
+        if not m or bool(m.group(1)) != bool(m.group(3)) or not isinstance(f.get("bytes"), int) \
+                or not re.fullmatch(r"[0-9a-f]{64}", str(f.get("sha256"))):
+            problems.append(f"malformed receipt entry {f}")
+            continue
+        if f["path"] in listed:
+            problems.append(f"receipt lists {f['path']} twice")
+        if f.get("hour") not in hours or hour_tag(f["hour"]) != "load-" + m.group(2):
+            problems.append(f"receipt entry {f['path']} is for hour {f.get('hour')}")
+        listed[f["path"]] = f
+    if set(listed) != set(texts):
+        problems.append("the fetched files differ from the receipt")
+    problems += [f"{p} does not match its receipt" for p, f in sorted(listed.items())
+                 if p in texts and (sha_bytes(texts[p].encode()) != f.get("sha256") or len(texts[p].encode()) != f.get("bytes"))]
+    if not set(hours) <= set(rec.get("hours") or []):
+        problems.append(f"the fetch covers {rec.get('hours')}, not {hours}")
     ts = sorted(epoch(h) for h in hours)
     if len(ts) < 2 or any(b - a != 3600 for a, b in zip(ts, ts[1:])):
         problems.append(f"qualification hours {hours} are not two or more consecutive hours")
+    summary = {}
     for h in hours:
-        rows = seen.get(h, {})
-        bad = {a: rows.get(a) for a in ARMS if rows.get(a) != ("PASS", "True")}
-        if bad:
-            problems.append(f"{h}: not PASS/qualifies=True for {bad}")
-    return problems, {h: seen.get(h, {}) for h in hours}
+        attempts = sorted(p for p in texts if p.startswith(f"attempts/{hour_tag(h)}-"))
+        finals = {}
+        if not attempts:
+            problems.append(f"{h}: no attempts fetched")
+        for p in attempts:
+            try:
+                rows = json.loads(texts[p])
+            except ValueError:
+                problems.append(f"{p}: not JSON")
+                continue
+            apps = [r.get("app") for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+            if sorted(apps) != sorted(ARMS) or len(apps) != len(rows):
+                problems.append(f"{p}: arms {sorted(map(str, apps))}")
+                continue
+            for r in rows:
+                try:
+                    same_hour = epoch(r.get("hour_start", "")) == epoch(h)
+                except (ValueError, TypeError):
+                    same_hour = False
+                if not same_hour:
+                    problems.append(f"{p}: row for {r.get('hour_start')}")
+                fin = r.get("maturity").get("finalized") if isinstance(r.get("maturity"), dict) else None
+                if not isinstance(fin, bool):
+                    problems.append(f"{p}: {r.get('app')} has no boolean maturity.finalized")   # malformed evidence
+                if fin is True:
+                    provenance = r.get("collector") == COLLECTOR and r.get("collector_sha256") == expect[
+                        "collector_sha256"] and r.get("inputs_sha256") == expect["inputs_sha256"]
+                    finals.setdefault(r["app"], []).append((r.get("status"),
+                                                            (r.get("qualification") or {}).get("qualifies"),
+                                                            "frozen collector" if provenance else "other collector"))
+        for a in ARMS:
+            f = finals.get(a, [])
+            if attempts and not f:
+                problems.append(f"{h} {a}: no final evaluation")
+            elif any(st != "PASS" or q is not True or pv != "frozen collector" for st, q, pv in f):
+                problems.append(f"{h} {a}: final rows {f}")
+        summary[h] = {"attempts": attempts, "final_rows": {a: finals.get(a, []) for a in ARMS}}
+    return problems, summary
 
 
 def gate_arms(deploys, pas, scaled):
@@ -1005,7 +1102,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True, help="new directory for the capture")
     ap.add_argument("--evidence", action="append", default=[], help="a file to bind by path, size and sha256")
-    ap.add_argument("--qualification", help="load-evidence Job log showing the qualification hours final")
+    ap.add_argument("--qualification-attempts", help="fetch_load_attempts.sh output for the qualification hours")
     ap.add_argument("--qualification-hours", default="", help="comma-separated hour starts, e.g. 2026-10-07T21:00:00Z")
     ap.add_argument("--compare-with", help="an earlier PASS capture whose configuration identity must match")
     ap.add_argument("--training-check", help="training-check.sh v3.5 result.json for the expected training slot")
@@ -1023,7 +1120,7 @@ def main(argv=None):
     kube = Kube(shutil.which(os.environ.get("KUBECTL", "kubectl")) or sys.exit("kubectl not found"), ctx)
     kustomize = shutil.which(os.environ.get("KUSTOMIZE", "kustomize")) or sys.exit("kustomize not found")
     blobs = {}                                                # every evidence file read once: hashed and parsed
-    for role, p in [("evidence", p) for p in a.evidence] + [("qualification", a.qualification),
+    for role, p in [("evidence", p) for p in a.evidence] + [("qualification", a.qualification_attempts),
                                                             ("training_check", a.training_check)]:
         if p:
             blobs.setdefault(role, []).append((os.path.abspath(p), open(p, "rb").read()))
@@ -1115,9 +1212,9 @@ def main(argv=None):
                 tc = "unparsable"
         gates["declared_processes"], processes = gate_processes(live[("ml-engine", "jobs.batch")], bench_pods, env,
                                                                 archive_log, api_log, trainer_template, now, tc)
-        qual_text = blobs["qualification"][0][1].decode() if "qualification" in blobs else ""
+        qual_bytes = blobs["qualification"][0][1] if "qualification" in blobs else b""
         gates["qualification"], qualification = gate_qualification(
-            qual_text, [h for h in a.qualification_hours.split(",") if h])
+            qual_bytes, [h for h in a.qualification_hours.split(",") if h], qualification_expectations(ctx))
         gates["arms"] = gate_arms(live[("demo", "deployments.apps")],
                                   live[("demo", "predictiveautoscalers.autoscaler.example.com")],
                                   live[("demo", "scaledobjects.keda.sh")])
@@ -1136,8 +1233,8 @@ def main(argv=None):
         for when, ds in (("start", diffs0), ("end", diffs1)):
             for part, d in ds.items():
                 stage.text(f"rendered/{part}.{when}.diff", d["text"])
-        if qual_text:
-            stage.text("evidence/qualification.log", qual_text)        # the bytes the gate parsed (sha in evidence)
+        if qual_bytes:                                            # the bytes the gate parsed (sha in evidence)
+            stage.text("evidence/qualification-attempts.jsonl", qual_bytes.decode(errors="replace"))
         if isinstance(tc, dict):
             stage.json("evidence/training-check.json", tc)
         capture = {

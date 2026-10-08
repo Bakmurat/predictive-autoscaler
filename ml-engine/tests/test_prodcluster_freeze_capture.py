@@ -269,15 +269,83 @@ def test_r55_processes_need_the_four_leg_training_check_for_the_slot():
         assert run(tc), tc
 
 
-def test_qualification_needs_consecutive_final_pass_hours_for_all_arms():
-    rows = lambda h, status="PASS", q="True": "".join(
-        f"{a:<20} {h} {status}       planned=1 observed=[1, 1] failed=[0, 0] dropped=[0, 0] qualifies={q}\n"
-        for a in fz.ARMS)
-    h1, h2 = "2026-10-07T21:00:00Z", "2026-10-07T22:00:00Z"
-    assert fz.gate_qualification(rows(h1) + rows(h2), [h1, h2])[0] == []
-    assert len(fz.gate_qualification(rows(h1) + rows(h2, q="False"), [h1, h2])[0]) == 1
-    assert len(fz.gate_qualification(rows(h1) + rows("2026-10-07T23:00:00Z"), [h1, "2026-10-07T23:00:00Z"])[0]) == 1
-    assert fz.gate_qualification("", [])[0] == ["no qualification log or hours given"]
+EXPECT = {"context": "prodcluster", "fetcher_sha256": "f" * 64, "collector_sha256": "c" * 64,
+          "inputs_sha256": {"terminations": "t" * 64, "approvals": "a" * 64}}
+SOURCE = {"context": "prodcluster", "pvc": "load-evidence-pvc", "pod": "load-attempts-fetch-052504-ab", "node": "w1"}
+
+
+def hour_of(path):
+    m = fz.FILE_NAME.match(path)
+    t = m.group(2)
+    return f"{t[:4]}-{t[4:6]}-{t[6:8]}T{t[9:11]}:{t[11:13]}:00Z"
+
+
+def fetch_output(files, hours, extractor="fetch_load_attempts.sh v1", tamper=False, rec_over=None, entries=None):
+    """A fetch_load_attempts.sh output: receipt, one line per file text, trailer."""
+    rec = {"receipt": dict({"extractor": extractor, "extractor_sha256": "f" * 64, "hours": hours, "source": SOURCE,
+                            "files": entries if entries is not None else [
+                                {"hour": hour_of(p), "path": p, "bytes": len(t.encode()),
+                                 "sha256": fz.sha_bytes(t.encode())} for p, t in files]}, **(rec_over or {}))}
+    body = "\n".join([json.dumps(rec)] + [json.dumps({"file": p, "text": t}) for p, t in files]) + "\n"
+    trailer = {"trailer": {"bytes": len(body.encode()), "sha256": fz.sha_bytes(body.encode())}}
+    if tamper:
+        body = body.replace("PASS", "PASs", 1)
+    return (body + json.dumps(trailer) + "\n").encode()
+
+
+def attempt(h, final=True, status="PASS", q=None, arms=fz.ARMS, collector_sha="c" * 64):
+    q = (status == "PASS" and final) if q is None else q
+    return json.dumps([{"app": a, "hour_start": h, "status": status, "maturity": {"finalized": final},
+                        "qualification": {"qualifies": q}, "collector": "collect_load_evidence.py v8",
+                        "collector_sha256": collector_sha, "inputs_sha256": EXPECT["inputs_sha256"]} for a in arms])
+
+
+H1, H2 = "2026-10-07T21:00:00Z", "2026-10-07T22:00:00Z"
+
+
+def test_r59_qualification_reads_final_attempts_and_fails_closed_on_conflicts():
+    t1, t2 = fz.hour_tag(H1), fz.hour_tag(H2)
+    a1, b1, a2, b2 = (f"attempts/{t}-20261008T0{i}1500Z-1.json" for t, i in ((t1, 0), (t1, 1), (t2, 0), (t2, 1)))
+    good = [(a1, attempt(H1, final=False, q=False)),                           # provisional False, then final True
+            (b1, attempt(H1)), (a2, attempt(H2)), (f"{t2}.json", attempt(H2))]
+    gq = lambda files, hours=(H1, H2), **kw: fz.gate_qualification(fetch_output(files, list(hours), **kw), list(hours),
+                                                                    EXPECT)
+    problems, summary = gq(good)
+    assert problems == [] and len(summary[H1]["attempts"]) == 2
+    for bad_final in (attempt(H2, status="FAIL"), attempt(H2, status="INCOMPLETE"), attempt(H2, q=False),
+                      attempt(H2, collector_sha="0" * 64)):                    # r60: rows from another collector
+        for order in ((a2, b2), (b2, a2)):
+            files = [good[1], (order[0], attempt(H2)), (order[1], bad_final)]
+            assert any(f"{H2} " in p for p in gq(files)[0])
+    assert any("no final evaluation" in p for p in gq([good[1], (a2, attempt(H2, final=False, q=False))])[0])
+    assert any("arms" in p for p in gq([good[1], (a2, attempt(H2, arms=fz.ARMS[:5]))])[0])
+    assert any("row for" in p for p in gq([good[1], (a2, attempt(H1))])[0])
+    for broken in (lambda r: r.pop("maturity"), lambda r: r.update(maturity="final"),        # r61: malformed maturity
+                   lambda r: r.update(maturity={"finalized": "yes"}), lambda r: r["maturity"].pop("finalized")):
+        rows = json.loads(attempt(H2))
+        broken(rows[0])
+        assert any("no boolean maturity.finalized" in p for p in gq([good[1], (a2, json.dumps(rows))])[0])
+    assert gq(good, tamper=True)[0] == ["the qualification fetch does not match its trailer"]
+    assert any("not two or more consecutive" in p for p in gq(good, hours=(H1,))[0])
+    assert fz.gate_qualification(b"", [], EXPECT)[0] == ["no qualification attempts or hours given"]
+
+
+def test_r60_the_fetch_receipt_must_name_the_frozen_fetcher_and_source():
+    t1, t2 = fz.hour_tag(H1), fz.hour_tag(H2)
+    good = [(f"attempts/{t1}-20261008T001500Z-1.json", attempt(H1)), (f"attempts/{t2}-20261008T011500Z-1.json", attempt(H2))]
+    gq = lambda **kw: fz.gate_qualification(fetch_output(good, [H1, H2], **kw), [H1, H2], EXPECT)[0]
+    assert gq() == []
+    for over in ({"extractor": "fetch_load_attempts.sh v1OTHER"}, {"extractor_sha256": "0" * 64},   # r60 probe
+                 {"source": dict(SOURCE, context="other")}, {"source": dict(SOURCE, pvc="other-pvc")},
+                 {"source": dict(SOURCE, pod="")}, {"source": dict(SOURCE, node="")}, {"source": "x"}):
+        assert gq(rec_over=over), over
+    entry = lambda p, t, **o: dict({"hour": hour_of(p), "path": p, "bytes": len(t.encode()),
+                                    "sha256": fz.sha_bytes(t.encode())}, **o)
+    dup = [entry(*good[0]), entry(*good[0]), entry(*good[1])]
+    assert any("twice" in p for p in gq(entries=dup))
+    assert any("is for hour" in p for p in gq(entries=[entry(*good[0], hour=H2), entry(*good[1])]))
+    assert any("malformed receipt entry" in p for p in gq(entries=[entry(*good[0], path="../x.json"), entry(*good[1])]))
+    assert any("malformed receipt entry" in p for p in gq(entries=[entry(*good[0], sha256="short"), entry(*good[1])]))
 
 
 # ------------------------------------------------------------------ redaction and audit (r53 B3, r54 B2)
