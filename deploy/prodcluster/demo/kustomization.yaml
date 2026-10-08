@@ -66,6 +66,15 @@ patches:
       - op: add
         path: /spec/template/metadata/annotations/predictive-bench~1k6-script
         value: challenge-v1+bench_req_failed+days30
+      # D-1096 (2026-10-08): with the 30-day schedule (8,641 stages) k6 idles at ~350 MiB and grows with the request rate;
+      # from ~08:00Z on 10-08 every generator was OOMKilled at the 384Mi limit as the morning rate rose (crash loop).
+      # Request 512Mi, limit 1Gi (the daily peak is ~6,900 rpm).
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/memory
+        value: 512Mi
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: 1Gi
   # U-31: E2 serves the relative q90 margin (ml-api ENSEMBLE_EXPERIMENT); the autoscaler's label and description say so.
   - target: { kind: PredictiveAutoscaler, name: nginx-ensemble-q95-autoscaler }
     patch: |-
