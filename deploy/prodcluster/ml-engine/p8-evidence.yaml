@@ -1,6 +1,7 @@
 # Evidence volume of the P8 infrastructure-event detector (evaluation protocol P8; deploy/prodcluster/p8-job.sh runs it).
 # Raw VictoriaMetrics exports, manifests, results and their revisions live here, one directory per run; nothing is ever
-# overwritten. Read back with a short read-only pod (the claim is RWO on Longhorn).
+# overwritten. Read back with a short read-only pod (the claim is RWO on Longhorn). 8 Gi (D-1092, Codex r58): the campaign
+# export (history start 10-05 to the stop 11-02, ~28 days at ~95 MB/day raw) plus the rehearsal run and revisions.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -10,4 +11,4 @@ metadata:
 spec:
   accessModes: [ReadWriteOnce]
   storageClassName: harvester
-  resources: {requests: {storage: 4Gi}}
+  resources: {requests: {storage: 8Gi}}
