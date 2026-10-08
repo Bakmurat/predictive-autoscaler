@@ -226,23 +226,30 @@ def test_declared_processes_bind_slot_archive_pair_and_reload():
     log = 'x\n{"errors": [], "pair": {"key": "20261008T180000Z-6eb29669e30e", "result": "archived"}}\n'
     api = "INFO:api.main:Reloaded model nginx-test_requests from disk (file updated); artifact sha256=6eb29669e30e\n"
     now = SLOT0 + 4 * 3600
-    tc = tcheck(SLOT0, tr["metadata"]["name"])
+    prev = tcheck(SLOT0 - 6 * 3600, f"ml-training-{(SLOT0 - 6 * 3600) // 60}", art="1" * 64,
+                  first_issuance={"artifact_sha256": "1" * 64})
+    tc = [prev, tcheck(SLOT0, tr["metadata"]["name"])]
     gp = lambda jobs=jobs, pods=None, log=log, api=api, tmpl=tmpl, now=now, tc=tc: fz.gate_processes(
         jobs, [tpod(tr)] if pods is None else pods, ENV, log, api, tmpl, now, tc)
     problems, summary = gp()
     assert problems == [] and summary["ml-training"]["expected_slot"] == SLOT0
     assert summary["artifact"]["training_check_sha256"] == ART
     assert any("slot" in p for p in gp(now=now + 3 * 3600)[0])                         # the 00Z training missing
-    # r54 probe: older completed training plus a newer one still running -> pending, verified slot is the older one
+    # r66: a newer training still running is pending and fails — an older slot never substitutes
     running = job("ml-training", SLOT0 + 6 * 3600, finished=False)
     p2, s2 = gp(jobs=jobs + [running], now=SLOT0 + 6 * 3600 + 120)
-    assert p2 == [] and s2["ml-training"]["pending"] == [running["metadata"]["name"]]
-    assert any("running for" in p for p in gp(jobs=jobs + [running], now=SLOT0 + 6 * 3600 + 3600)[0])  # pending bound
+    assert any("still pending" in p for p in p2) and s2["ml-training"]["pending"] == [running["metadata"]["name"]]
+    assert any("previous slot" in p for p in gp(tc=[tc[1]])[0])                 # D-1097: two preceding slots
+    assert any("previous slot" in p for p in gp(tc=[dict(prev, status="incomplete_historical", ok=False), tc[1]])[0])
+    assert any("exactly two" in p for p in gp(tc=[prev, tc[1], tc[1]])[0])
     other = api.replace("6eb29669e30e", "0123456789ab")
     assert any("last reload" in p for p in gp(api=other)[0])
     # r55 probe: another application's reload line with the matching prefix does not count
     unrelated = other + "INFO:api.main:Reloaded model myapptwo_requests from disk; artifact sha256=6eb29669e30e\n"
     assert any("last reload" in p for p in gp(api=unrelated)[0])
+    restarted = "INFO:api.main:Loaded model for nginx-test_requests (age: 1.8h, sha256=6eb29669e30e, training_cutoff=x)\n"
+    assert gp(api=other + restarted)[0] == []                    # a pod restart loads the artifact at start-up
+    assert any("last reload" in p for p in gp(api=restarted + other)[0])         # the later line wins
     stale = log.replace("20261008T180000Z", "20261008T120000Z")
     assert any("expected slot" in p for p in gp(log=stale)[0])
     assert any("evidence-archive" in p for p in gp(log='{"errors": ["boom"], "pair": {}}')[0])
@@ -256,7 +263,10 @@ def test_r55_processes_need_the_four_leg_training_check_for_the_slot():
     tmpl = tr["spec"]["template"]["spec"]["containers"][0]
     log = '{"errors": [], "pair": {"key": "20261008T180000Z-6eb29669e30e", "result": "archived"}}\n'
     api = "Reloaded model nginx-test_requests from disk (file updated); artifact sha256=6eb29669e30e\n"
-    run = lambda tc: fz.gate_processes(jobs, [tpod(tr)], ENV, log, api, tmpl, SLOT0 + 4 * 3600, tc)[0]
+    prev = tcheck(SLOT0 - 6 * 3600, f"ml-training-{(SLOT0 - 6 * 3600) // 60}")
+    run = lambda tc: [p for p in fz.gate_processes(jobs, [tpod(tr)], ENV, log, api, tmpl, SLOT0 + 4 * 3600,
+                                                   [prev] + ([tc] if tc is not None else []))[0]
+                      if not p.startswith("expected exactly two")]
     name = tr["metadata"]["name"]
     assert run(tcheck(SLOT0, name)) == []
     assert run(None) == ["no training-check result for the expected slot"]
@@ -293,11 +303,12 @@ def fetch_output(files, hours, extractor="fetch_load_attempts.sh v1", tamper=Fal
     return (body + json.dumps(trailer) + "\n").encode()
 
 
-def attempt(h, final=True, status="PASS", q=None, arms=fz.ARMS, collector_sha="c" * 64):
+def attempt(h, final=True, status="PASS", q=None, arms=fz.ARMS, collector_sha="c" * 64, gen=None):
     q = (status == "PASS" and final) if q is None else q
     return json.dumps([{"app": a, "hour_start": h, "status": status, "maturity": {"finalized": final},
                         "qualification": {"qualifies": q}, "collector": "collect_load_evidence.py v8",
-                        "collector_sha256": collector_sha, "inputs_sha256": EXPECT["inputs_sha256"]} for a in arms])
+                        "collector_sha256": collector_sha, "inputs_sha256": EXPECT["inputs_sha256"],
+                        "generator_pod": (gen or {}).get(a, f"k6-{a}-abcdef1234-xyz12")} for a in arms])
 
 
 H1, H2 = "2026-10-07T21:00:00Z", "2026-10-07T22:00:00Z"
@@ -598,3 +609,93 @@ def test_p8_code_configmap_must_hold_the_current_code(tmp_path):
     assert fz.gate_p8_code({("ml-engine", name): good}, str(tmp_path))[0] == []
     bad = {"data": dict(good["data"], **{"p8_launcher.py": "other"}), "immutable": False}
     assert len(fz.gate_p8_code({("ml-engine", name): bad}, str(tmp_path))[0]) == 2
+
+
+def k6_pod(arm, name=None, restarts=0, started="2026-10-07T20:30:40Z", phase="Running"):
+    return {"metadata": {"name": name or f"k6-{arm}-abcdef1234-xyz12", "namespace": "demo"},
+            "status": {"phase": phase, "containerStatuses": [{"name": "k6", "restartCount": restarts,
+                                                              "state": {"running": {"startedAt": started}}}]}}
+
+
+def test_d1097_qualification_generators_must_be_the_live_ones():
+    t1, t2 = fz.hour_tag(H1), fz.hour_tag(H2)
+    files = [(f"attempts/{t1}-20261008T041500Z-1.json", attempt(H1)), (f"attempts/{t2}-20261008T051500Z-1.json", attempt(H2))]
+    _, qual = fz.gate_qualification(fetch_output(files, [H1, H2]), [H1, H2], EXPECT)
+    pods = [k6_pod(a) for a in fz.ARMS]
+    assert fz.gate_generators(qual, [H1, H2], pods) == ([], {a: [f"k6-{a}-abcdef1234-xyz12"] for a in fz.ARMS})
+    replaced = [k6_pod(a, name=f"k6-{a}-newrs00000-new12") if a == "nginx-test" else k6_pod(a) for a in fz.ARMS]
+    assert any("not running now" in p for p in fz.gate_generators(qual, [H1, H2], replaced)[0])
+    restarted = [k6_pod(a, restarts=1) if a == "myapptwo" else k6_pod(a) for a in fz.ARMS]
+    assert any("restarts 1" in p for p in fz.gate_generators(qual, [H1, H2], restarted)[0])
+    late = [k6_pod(a, started="2026-10-07T21:30:00Z") if a == "nginx-seasonal" else k6_pod(a) for a in fz.ARMS]
+    assert any("started 2026-10-07T21:30:00Z" in p for p in fz.gate_generators(qual, [H1, H2], late)[0])
+    two = [(f"attempts/{t1}-20261008T041500Z-1.json", attempt(H1)),
+           (f"attempts/{t2}-20261008T051500Z-1.json", attempt(H2, gen={"nginx-ensemble": "k6-nginx-ensemble-other00-abc12"}))]
+    _, qual2 = fz.gate_qualification(fetch_output(two, [H1, H2]), [H1, H2], EXPECT)
+    assert any("nginx-ensemble: qualification rows name generator pods" in p for p in fz.gate_generators(qual2, [H1, H2], pods)[0])
+    assert fz.gate_generators({}, [], pods)[0] == ["no qualification evidence to bind the generators to"]
+
+
+NOW_CAP = calendar.timegm((2026, 10, 12, 22, 0, 0))
+FC = fz.load_forecasts()
+
+
+def iso_t(t):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+
+def issuance(n, app, art, cut, issued="2026-10-12T21:55:05Z", ns="demo", steps=6, **over):
+    origin = calendar.timegm((2026, 10, 12, 21, 50, 0))
+    trained = "2026-10-12T18:00:00" if app in ("nginx-ensemble", "nginx-ensemble-q95") else "2026-10-12T18:02:32Z"
+    r = {"issuance_id": f"i{n}", "issued_at": issued, "application": app, "namespace": ns,
+         "inference_input_end": iso_t(origin), "target_anchor": "inference_input_end", "model_version": f"{app}@m",
+         "model_trained_at": trained, "training_cutoff": cut, "artifact_sha256": art, "step_minutes": 10,
+         "forecasts": [[k, iso_t(origin + 600 * k), 100.0] for k in range(1, steps + 1)]}
+    r.update(over)
+    return r
+
+
+def issuance_extract(records, receipt_over=None, tamper=False):
+    rec = {"receipt": dict({"extractor": "extract_decisions.sh v3", "extractor_sha256": "e" * 64, "sha256": "f" * 64,
+                            "lines": 100, "malformed_lines": 0, "issuance_fields": FC.ISSUANCE_FIELDS,
+                            "issuances": len(records),
+                            "source": {"context": "prodcluster", "pvc": "forecast-log-pvc", "pod": "decisions-extract-x"}},
+                           **(receipt_over or {}))}
+    rows = [json.dumps(["I"] + [r.get(f) for f in FC.ISSUANCE_FIELDS]) for r in records]
+    body = "\n".join([json.dumps(rec)] + rows) + "\n"
+    trailer = {"trailer": {"bytes": len(body.encode()), "sha256": fz.sha_bytes(body.encode())}}
+    if tamper:
+        body = body.replace("nginx-test", "nginx-tesT", 1)
+    return (body + json.dumps(trailer) + "\n").encode()
+
+
+def test_r67_fresh_issuances_must_be_accepted_demo_records_with_the_current_artifact():
+    art, cut = "a" * 64, "2026-10-12T18:00:00Z"
+    good = [issuance(n, a, art if a in ("nginx-test", "nginx-seasonal") else "g" * 64, cut)
+            for n, a in enumerate(fz.FORECASTING_ARMS)]
+    gate = lambda recs, log="", **kw: fz.gate_fresh_issuances(issuance_extract(recs, **kw), log, art, cut, NOW_CAP,
+                                                             "prodcluster", "e" * 64, FC)[0]
+    assert gate(good) == []
+    assert fz.gate_fresh_issuances(b"", "", art, cut, NOW_CAP, "prodcluster", "e" * 64, FC)[0] == \
+        ["no issuance extract given (--issuances)"]
+    assert any("invalid" in p for p in gate(good, tamper=True))
+    assert any("frozen extractor" in p for p in gate(good, receipt_over={"extractor_sha256": "0" * 64}))
+    assert any("invalid" in p for p in gate(good, receipt_over={"issuances": 99}))          # r67: count must match
+    assert any("invalid" in p for p in gate(good, receipt_over={"source": {"context": "prodcluster"}}))
+    # r67 probes: null provenance / no forecasts, and complete forecasts from another namespace
+    nulls = [dict(r, model_version=None, forecasts=None) if r["application"] == "nginx-test" else r for r in good]
+    out = gate(nulls)
+    assert any("nginx-test" in p and "P9 acceptance" in p for p in out) and any("nginx-test: no accepted" in p for p in out)
+    foreign = [dict(r, namespace="other") if r["application"] == "nginx-seasonal" else r for r in good]
+    assert any("nginx-seasonal: issuances outside namespace demo" in p for p in gate(foreign))
+    short = [issuance(9, "nginx-ensemble", "g" * 64, cut, steps=5) if r["application"] == "nginx-ensemble" else r
+             for r in good]
+    assert any("nginx-ensemble" in p and "steps" in p for p in gate(short))
+    stale = [issuance(9, "nginx-ensemble", "g" * 64, cut, issued="2026-10-12T21:30:00Z") if r["application"] ==
+             "nginx-ensemble" else r for r in good]
+    assert any("nginx-ensemble: no accepted issuance" in p for p in gate(stale))
+    old_art = [dict(r, artifact_sha256="b" * 64) if r["application"] == "nginx-seasonal" else r for r in good]
+    assert any("nginx-seasonal: newest issuance carries bbbbbbbbbbbb" in p for p in gate(old_art))
+    log = ('2026-10-12T21:59:04Z\tINFO\tcontrollers.PredictiveAutoscaler\tPrediction unavailable, using reactive only\t'
+           '{"predictiveautoscaler": {"name":"nginx-test-autoscaler","namespace":"demo"}}\n')
+    assert any("nginx-test: 1 'Prediction unavailable'" in p for p in gate(good, log))

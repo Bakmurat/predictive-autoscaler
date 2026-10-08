@@ -23,11 +23,12 @@ Gates (all PASS = a usable freeze; the capture is written either way):
                       added), the template's volumes unchanged; complete container status with the template digest;
                       ml-api and the operator fully Ready, ConfigMap-sourced env unchanged since their containers
                       started; their templates carry the deploy.env digests and GIT_COMMIT
-  declared_processes  the newest training slot is verified (latest finished ml-training Job Complete for it — or for the
-                      slot before while the newest is still running, labelled pending — with the deploy.env digest, the
-                      current CronJob container configuration and GIT_COMMIT); the archive pair and ml-api's latest
-                      reload name the same slot and artifact; the latest evidence-archive Job reported no errors; the
-                      latest load-evidence Job completed
+  declared_processes  the two newest scheduled slots by capture time are four-leg verified (D-1097: two --training-check
+                      results; never substituted by older slots — a newest training still running fails as pending);
+                      the newest slot's latest finished ml-training Job Complete with the deploy.env digest, the current
+                      CronJob container configuration and GIT_COMMIT; the archive pair and ml-api's latest load name
+                      that slot and artifact; the latest evidence-archive Job reported no errors; the latest
+                      load-evidence Job completed
   envelope_config     effective ml-api ENSEMBLE_HISTORY_HOURS (env, envFrom and ConfigMap refs resolved with Kubernetes
                       precedence, from the template and from every running ml-api pod) equals
                       forecasts.frozen_envelope_config(); no TRAINING_HOURS in the trainer; no unresolved or opaque
@@ -40,6 +41,12 @@ Gates (all PASS = a usable freeze; the capture is written either way):
                       series (VictoriaMetrics with deny_partial_response=1). Collection only: no disk threshold
   qualification       the immutable load-gate attempts of the given consecutive hours (fetch_load_attempts.sh): every final
                       row PASS and qualifies=True for all six arms, conflicting final rows fail closed
+  generator_continuity  (D-1097) each arm's qualification rows name one generator pod, running now, its k6 container
+                      never restarted and started before the first qualification hour (stricter than "no restart since
+                      qualification": a qualified generator that restarts must be replaced and re-qualified)
+  fresh_issuances     (D-1097, r66) issuance records (--issuances: an extract_decisions.sh v3 read just before the capture):
+                      every forecasting arm issued within 20 min, the hybrid's and S1's newest with the newest verified
+                      artifact and cutoff; no "Prediction unavailable" in the operator's last 20 min (stored)
   matches_previous    (with --compare-with) the configuration identity equals the earlier capture's
   no_secret_values    nothing credential-like found (found values are redacted before writing, never stored)
 Other evidence kept outside the code repo (the protocol, training verification records) is bound by --evidence.
@@ -49,7 +56,7 @@ Other evidence kept outside the code repo (the protocol, training verification r
     --evidence <protocol> --qualification-attempts <fetch output> --qualification-hours 2026-10-07T21:00:00Z,… \\
     [--compare-with <earlier capture>]
 """
-import argparse, calendar, copy, hashlib, importlib.util, json, math, os, re, shutil, subprocess, sys, tempfile, time
+import argparse, calendar, collections, copy, hashlib, importlib.util, json, math, os, re, shutil, subprocess, sys, tempfile, time
 import urllib.parse, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -88,13 +95,13 @@ DEPLOY_ENV = ("HARBOR_REGISTRY", "ML_API_DIGEST", "OPERATOR_DIGEST", "GIT_COMMIT
 TIMEOUT = 180            # seconds per subprocess
 FRESH = 180              # seconds: the newest root-disk samples of every worker must be at most this old
 SKEW = 60                # seconds: tolerated sample timestamps ahead of the local clock
-PENDING_MAX = 1800       # seconds: the newest slot's training may be running (pending) at most this long
 LEGS = ("job", "api_reload", "archive_pair", "first_issuance")    # training-check.sh v3.5 legs
-VERSION = "freeze_capture.py v5"
-SUPPORTED_BASELINES = ("freeze_capture.py v5",)
+VERSION = "freeze_capture.py v6"
+SUPPORTED_BASELINES = ("freeze_capture.py v6",)
 MANDATORY_GATES = ("tooling", "clean_checkout", "live_equals_render", "stable_during", "mask", "p8_code", "runtime",
-                   "declared_processes", "envelope_config", "qualification", "arms", "nodes", "telemetry",
-                   "no_secret_values")
+                   "declared_processes", "envelope_config", "qualification", "generator_continuity",
+                   "fresh_issuances", "arms", "nodes", "telemetry", "no_secret_values")
+FORECASTING_ARMS = ("nginx-test", "nginx-seasonal", "nginx-ensemble", "nginx-ensemble-q95")
 
 # ---- redaction (rewrites) and audit (independent check of the bytes written)
 CRED = r"(?:passw|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential)"
@@ -649,8 +656,11 @@ def latest_finished(jobs, cronjob):
 
 
 def last_reload(api_log):
-    """The last artifact sha prefix of ml-api's `Reloaded model nginx-test_requests … artifact sha256=<hex>` lines."""
-    hits = re.findall(r"Reloaded model nginx-test_requests .*?artifact sha256=([0-9a-f]{12,64})", api_log or "")
+    """The last artifact sha prefix of ml-api's `Reloaded model nginx-test_requests … artifact sha256=<hex>` or
+    startup `Loaded model for nginx-test_requests (… sha256=<hex> …)` lines."""
+    # a reload in a running pod, or the load at a pod's start (after an ml-api restart), whichever is later in the log
+    hits = re.findall(r"(?:Reloaded model nginx-test_requests .*?artifact sha256=|"
+                      r"Loaded model for nginx-test_requests \(.*?sha256=)([0-9a-f]{12,64})", api_log or "")
     return hits[-1] if hits else None
 
 
@@ -676,17 +686,19 @@ def check_training_result(tc, expected, job_name):
     return problems, art if re.fullmatch(r"[0-9a-f]{64}", art) else None
 
 
-def gate_processes(jobs, pods, env, archive_log, api_log, trainer_template, now, training_check=None):
-    """The declared processes are working: the newest training slot verified (or the one before it, labelled pending,
-    while the newest runs, at most PENDING_MAX), bound by slot and full artifact to its four-leg training check, the
-    archive pair and ml-api's latest reload of the hybrid's model; the latest archive and load-gate Jobs completed."""
+def gate_processes(jobs, pods, env, archive_log, api_log, trainer_template, now, training_checks=()):
+    """The declared processes are working: the two newest scheduled slots by capture time (D-1097, Codex r66: never
+    substituted by older ones) four-leg verified; the newest bound by Job, full artifact, the archive pair and ml-api's
+    latest load of the hybrid's model; the latest archive and load-gate Jobs completed. A training still running for the
+    newest slot is reported as pending and fails the gate — capture after its verification."""
     problems, summary = [], {}
     tr, active = latest_finished(jobs, "ml-training")
     newest = int(now) // SLOT * SLOT
     running = [j for j in active if scheduled(j) == newest]
-    expected = newest - SLOT if running or now - newest < 300 else newest
-    if running and now - newest > PENDING_MAX:
-        problems.append(f"the training for the newest slot has been running for {int(now - newest)} s")
+    expected = newest
+    if running or now - newest < 300:
+        problems.append(f"the training for the newest slot {time.strftime('%H:%MZ', time.gmtime(newest))} is still "
+                        f"pending; capture after its four-leg verification")
     summary["ml-training"] = {"job": tr and tr["metadata"]["name"], "result": tr and job_finished(tr),
                               "slot": tr and scheduled(tr), "expected_slot": expected,
                               "pending": [j["metadata"]["name"] for j in running],
@@ -732,7 +744,18 @@ def gate_processes(jobs, pods, env, archive_log, api_log, trainer_template, now,
         problems.append(f"archive pair {pair.get('key')} is not for the expected slot {expected}")
     elif not reload_sha or not (m.group(2).startswith(reload_sha) or reload_sha.startswith(m.group(2))):
         problems.append(f"ml-api's last reload {reload_sha} is not the archived artifact {m.group(2)}")
-    tc_problems, art = check_training_result(training_check, expected, tr and tr["metadata"]["name"])
+    by_slot = {}
+    for t in training_checks:
+        by_slot.setdefault(t.get("slot") if isinstance(t, dict) else None, []).append(t)
+    iso_slot = lambda x: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(x))
+    if len(training_checks) != 2 or any(len(v) != 1 for v in by_slot.values()):
+        problems.append(f"expected exactly two training-check results (slots {iso_slot(expected - SLOT)} and "
+                        f"{iso_slot(expected)}), got slots {sorted(map(str, by_slot))}")
+    prev_problems, _ = check_training_result((by_slot.get(iso_slot(expected - SLOT)) or [None])[0], expected - SLOT,
+                                             f"ml-training-{(expected - SLOT) // 60}")
+    problems += [f"previous slot: {x}" for x in prev_problems]                      # D-1097: two preceding slots
+    tc_problems, art = check_training_result((by_slot.get(iso_slot(expected)) or [None])[0], expected,
+                                             tr and tr["metadata"]["name"])
     problems += tc_problems
     summary["artifact"]["training_check_sha256"] = art
     if art and not (m and art.startswith(m.group(2)) and reload_sha and art.startswith(reload_sha)):
@@ -848,15 +871,105 @@ def gate_qualification(fetched, hours, expect):
                         "collector_sha256"] and r.get("inputs_sha256") == expect["inputs_sha256"]
                     finals.setdefault(r["app"], []).append((r.get("status"),
                                                             (r.get("qualification") or {}).get("qualifies"),
-                                                            "frozen collector" if provenance else "other collector"))
+                                                            "frozen collector" if provenance else "other collector",
+                                                            r.get("generator_pod")))
         for a in ARMS:
             f = finals.get(a, [])
             if attempts and not f:
                 problems.append(f"{h} {a}: no final evaluation")
-            elif any(st != "PASS" or q is not True or pv != "frozen collector" for st, q, pv in f):
+            elif any(st != "PASS" or q is not True or pv != "frozen collector" for st, q, pv, _ in f):
                 problems.append(f"{h} {a}: final rows {f}")
         summary[h] = {"attempts": attempts, "final_rows": {a: finals.get(a, []) for a in ARMS}}
     return problems, summary
+
+
+def gate_generators(qualification, hours, pods):
+    """D-1097: the qualification hours ran on the generators that run now — per arm exactly one generator pod in the
+    final rows of all qualification hours, alive under that name, its k6 container never restarted and started before
+    the first qualification hour."""
+    problems, out = [], {}
+    if not hours or not qualification:
+        return ["no qualification evidence to bind the generators to"], out
+    first = min(epoch(h) for h in hours)
+    live = {p["metadata"]["name"]: p for p in pods if p["metadata"].get("namespace") == "demo"
+            and p["metadata"]["name"].startswith("k6-")}
+    for a in ARMS:
+        names = sorted({str(g) for h in hours for (_, _, _, g) in (qualification.get(h) or {}).get("final_rows", {})
+                        .get(a, [])})
+        out[a] = names
+        if len(names) != 1:
+            problems.append(f"{a}: qualification rows name generator pods {names}")
+            continue
+        p = live.get(names[0])
+        if p is None:
+            problems.append(f"{a}: qualification generator {names[0]} is not running now")
+            continue
+        cs = next((c for c in p.get("status", {}).get("containerStatuses", []) if c.get("name") == "k6"), {})
+        started = ((cs.get("state") or {}).get("running") or {}).get("startedAt")
+        if p.get("status", {}).get("phase") != "Running" or cs.get("restartCount") != 0 or not started \
+                or epoch(started) > first:
+            problems.append(f"{a}: generator {names[0]} phase {p.get('status', {}).get('phase')}, restarts "
+                            f"{cs.get('restartCount')}, k6 started {started} (must be running since before {hours[0]})")
+    return problems, out
+
+
+UNAVAILABLE = re.compile(r"Prediction unavailable, using reactive only.*?\b((?:nginx|myapptwo)[a-z0-9-]*?)-autoscaler\b")
+ISSUANCE_WINDOW = 20 * 60          # seconds: every forecasting arm issued fresh within this window before the capture
+
+
+def gate_fresh_issuances(extract, operator_log, expect_artifact, expect_cutoff, now, ctx, extractor_sha, fc=None):
+    """D-1097 (Codex r66/r67): fresh, valid issuance records, not decision lines. `extract` is an extract_decisions.sh
+    v3 output taken just before the capture, read with the P9 scorer's own reader (trailer over the exact bytes; receipt
+    with hashes, line count, source context/pvc/pod, the exact issuance field list and the issuance count; no malformed
+    lines) and judged with its §4 acceptance per arm in log order (complete provenance, anchors, six finite steps,
+    targets strictly after issuance and cutoff). The receipt must name the frozen extractor, `ctx` and forecast-log-pvc.
+    Per forecasting arm every record issued in the last ISSUANCE_WINDOW must be in namespace demo and accepted, and at
+    least one must exist; the newest accepted hybrid and S1 issuance must carry the newest verified training's full
+    artifact and its cutoff. Any "Prediction unavailable" fallback of a forecasting arm in the operator's last 20 min
+    (stored) fails too."""
+    problems, newest = [], {}
+    if not extract:
+        return ["no issuance extract given (--issuances)"], newest
+    fc = fc or load_forecasts()
+    with tempfile.NamedTemporaryFile(suffix=".jsonl") as fh:
+        fh.write(extract)
+        fh.flush()
+        try:
+            receipt, rows, _ = fc.read_trailed(fh.name, "extract_decisions.sh v3", "I", "issuance_fields",
+                                               fc.ISSUANCE_FIELDS)
+        except (ValueError, KeyError, IndexError, TypeError, UnicodeDecodeError) as e:
+            return [f"the issuance extract is invalid ({str(e).replace(fh.name, '<extract>')})"], newest
+    src = receipt["source"]
+    if receipt.get("extractor_sha256") != extractor_sha or src.get("context") != ctx or src.get("pvc") != "forecast-log-pvc":
+        problems.append(f"the issuance extract was not read from {ctx}/forecast-log-pvc by the frozen extractor")
+    lo, hi = (now - ISSUANCE_WINDOW) * 1000, (now + 120) * 1000
+    cut_ms = fc.ts(expect_cutoff) if expect_cutoff else None
+    for a in FORECASTING_ARMS:
+        recs = [r for r in rows if r.get("application") == a]
+        acc, rej = fc.accept(recs)
+        in_window = lambda r: (fc.ts(r.get("issued_at")) or 0) >= lo and (fc.ts(r.get("issued_at")) or 0) <= hi
+        foreign = [r.get("issuance_id") for r in recs if in_window(r) and r.get("namespace") != "demo"]
+        bad = [x for x in rej if lo <= (fc.ts(x.get("issued_at")) or lo) <= hi]
+        fresh = [r for r in acc if lo <= r["_issued"] <= hi and r.get("namespace") == "demo"]
+        if foreign:
+            problems.append(f"{a}: issuances outside namespace demo in the window: {foreign[:3]}")
+        if bad:
+            problems.append(f"{a}: {len(bad)} issuances in the window fail the P9 acceptance: "
+                            f"{sorted({x['reason'] for x in bad})}")
+        if not fresh:
+            problems.append(f"{a}: no accepted issuance in the {ISSUANCE_WINDOW // 60} min before the capture")
+            continue
+        n = max(fresh, key=lambda r: r["_issued"])
+        newest[a] = {k: n.get(k) for k in ("issuance_id", "issued_at", "artifact_sha256", "training_cutoff",
+                                           "model_version", "namespace")}
+        if a in ("nginx-test", "nginx-seasonal") and (n.get("artifact_sha256") != expect_artifact
+                                                      or cut_ms is None or n["_cutoff"] != cut_ms):
+            problems.append(f"{a}: newest issuance carries {str(n.get('artifact_sha256'))[:12]} / "
+                            f"{n.get('training_cutoff')}, not the verified {str(expect_artifact)[:12]} / {expect_cutoff}")
+    fell_back = collections.Counter(m.group(1) for m in UNAVAILABLE.finditer(operator_log or ""))
+    problems += [f"{a}: {fell_back[a]} 'Prediction unavailable' fallbacks in the operator's last 20 min"
+                 for a in FORECASTING_ARMS if fell_back[a]]
+    return problems, {"newest_issuance": newest, "operator_fallbacks": dict(fell_back)}
 
 
 def gate_arms(deploys, pas, scaled):
@@ -1105,7 +1218,9 @@ def main(argv=None):
     ap.add_argument("--qualification-attempts", help="fetch_load_attempts.sh output for the qualification hours")
     ap.add_argument("--qualification-hours", default="", help="comma-separated hour starts, e.g. 2026-10-07T21:00:00Z")
     ap.add_argument("--compare-with", help="an earlier PASS capture whose configuration identity must match")
-    ap.add_argument("--training-check", help="training-check.sh v3.5 result.json for the expected training slot")
+    ap.add_argument("--issuances", help="extract_decisions.sh v3 output taken just before the capture (D-1097)")
+    ap.add_argument("--training-check", action="append", default=[],
+                    help="training-check.sh v3.5 result.json; give the expected slot and the slot before it (D-1097)")
     a = ap.parse_args(argv)
     ctx = os.environ.get("KUBE_CONTEXT") or sys.exit("set KUBE_CONTEXT")
     vm_url = os.environ.get("VM_URL") or sys.exit("set VM_URL (a reachable vmselect Prometheus API base)")
@@ -1120,8 +1235,8 @@ def main(argv=None):
     kube = Kube(shutil.which(os.environ.get("KUBECTL", "kubectl")) or sys.exit("kubectl not found"), ctx)
     kustomize = shutil.which(os.environ.get("KUSTOMIZE", "kustomize")) or sys.exit("kustomize not found")
     blobs = {}                                                # every evidence file read once: hashed and parsed
-    for role, p in [("evidence", p) for p in a.evidence] + [("qualification", a.qualification_attempts),
-                                                            ("training_check", a.training_check)]:
+    for role, p in [("evidence", p) for p in a.evidence] + [("qualification", a.qualification_attempts)] + \
+            [("training_check", p) for p in a.training_check] + [("issuances", a.issuances)]:
         if p:
             blobs.setdefault(role, []).append((os.path.abspath(p), open(p, "rb").read()))
     evidence = [{"role": role, "path": p, "bytes": len(b), "sha256": sha_bytes(b)}
@@ -1172,6 +1287,7 @@ def main(argv=None):
             ar, _ = latest_finished(live[("ml-engine", "jobs.batch")], "evidence-archive")
             archive_log = kube("-n", "ml-engine", "logs", f"job/{ar['metadata']['name']}", "--tail=20").stdout if ar else ""
             api_log = kube("-n", "ml-engine", "logs", "deploy/ml-api", "--since=14h").stdout
+            operator_log = kube("-n", "ml-engine", "logs", "deploy/predictive-operator", "--since=20m").stdout
             live1, _ = collect(kube)                              # end of collection: the same checks again
             diffs1 = server_diffs(kube, rendered)
         ident1 = checkout_identity()
@@ -1204,17 +1320,24 @@ def main(argv=None):
         gates["runtime"] = tmpl + runtime
         trainer_template = next(c for c in live[("ml-engine", "cronjobs.batch")] if c["metadata"]["name"] == "ml-training")[
             "spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]
-        tc = None
-        if "training_check" in blobs:
+        tcs = []
+        for _, b in blobs.get("training_check", []):
             try:
-                tc = json.loads(blobs["training_check"][0][1])
+                tcs.append(json.loads(b))
             except ValueError:
-                tc = "unparsable"
+                tcs.append("unparsable")
         gates["declared_processes"], processes = gate_processes(live[("ml-engine", "jobs.batch")], bench_pods, env,
-                                                                archive_log, api_log, trainer_template, now, tc)
+                                                                archive_log, api_log, trainer_template, now, tcs)
         qual_bytes = blobs["qualification"][0][1] if "qualification" in blobs else b""
-        gates["qualification"], qualification = gate_qualification(
-            qual_bytes, [h for h in a.qualification_hours.split(",") if h], qualification_expectations(ctx))
+        qual_hours = [h for h in a.qualification_hours.split(",") if h]
+        gates["qualification"], qualification = gate_qualification(qual_bytes, qual_hours,
+                                                                   qualification_expectations(ctx))
+        gates["generator_continuity"], generators = gate_generators(qualification, qual_hours, bench_pods)
+        gates["fresh_issuances"], issuances = gate_fresh_issuances(
+            blobs["issuances"][0][1] if "issuances" in blobs else b"", operator_log,
+            (processes.get("artifact") or {}).get("training_check_sha256"),
+            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime((processes.get("ml-training") or {}).get("expected_slot") or 0)),
+            now, ctx, sha(os.path.join(HERE, "scoring", "extract_decisions.sh")))
         gates["arms"] = gate_arms(live[("demo", "deployments.apps")],
                                   live[("demo", "predictiveautoscalers.autoscaler.example.com")],
                                   live[("demo", "scaledobjects.keda.sh")])
@@ -1235,8 +1358,12 @@ def main(argv=None):
                 stage.text(f"rendered/{part}.{when}.diff", d["text"])
         if qual_bytes:                                            # the bytes the gate parsed (sha in evidence)
             stage.text("evidence/qualification-attempts.jsonl", qual_bytes.decode(errors="replace"))
-        if isinstance(tc, dict):
-            stage.json("evidence/training-check.json", tc)
+        for i, t in enumerate(tcs, 1):
+            if isinstance(t, dict):
+                stage.json(f"evidence/training-check-{i}.json", t)
+        stage.text("evidence/operator-last-20min.log", operator_log)  # the bytes the fallback check read
+        if "issuances" in blobs:                                  # the issuance records the gate read (sha in evidence)
+            stage.text("evidence/issuances.jsonl", blobs["issuances"][0][1].decode(errors="replace"))
         capture = {
             "freeze_capture": VERSION, "started": started, "finished": now_iso(), "context": ctx,
             "tools": tools, "checkout": {"start": ident0, "end_matches": ident0 == ident1},
@@ -1244,6 +1371,7 @@ def main(argv=None):
                 "path": os.path.abspath(a.compare_with), "verified": not previous_problems,
                 "identity": ((previous or {}).get("configuration_identity") or {}).get("sha256")},
             "deploy_env": env, "rendered": rendered_meta, "evidence": evidence, "qualification": qualification,
+            "generator_continuity": generators, "fresh_issuances": issuances,
             "render_diffs": {when: {part: {k: d[k] for k in ("exit", "lines")} for part, d in ds.items()}
                              for when, ds in (("start", diffs0), ("end", diffs1))},
             "envelope_config": cfg, "effective_env": effective, "runtime_pods": pod_rows,
