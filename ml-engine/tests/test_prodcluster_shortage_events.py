@@ -144,3 +144,25 @@ def test_r43_r44_extraction_rows_are_validated_against_trailer_and_receipt(tmp_p
         p.write_text(bad)
         with pytest.raises(ValueError):
             se.read_rows(str(p))
+
+
+def test_r48_v2_and_v3_rows_are_both_read_and_a_v3_receipt_must_declare_its_issuance_fields(tmp_path):
+    base = {"decisions": 0, "issuances": 1, "decision_fields": ["at"], "lookup_fields": [], "malformed_lines": 0,
+            "extractor_sha256": "x" * 64, "sha256": "y" * 64, "lines": 1, "source": {}}
+    v2 = [json.dumps({"receipt": dict(base, extractor="extract_decisions.sh v2")}),
+          json.dumps(["I", "u1", "2026-10-07T00:00:00Z", "nginx-test", "2026-10-07T00:00:00Z", "v", []])]
+    fields = se.V3_ISSUANCE_FIELDS
+    row = {f: None for f in fields}
+    row.update(issuance_id="u1", application="nginx-test", inference_input_end="2026-10-07T00:00:00Z", forecasts=[])
+    v3 = [json.dumps({"receipt": dict(base, extractor="extract_decisions.sh v3", issuance_fields=fields)}),
+          json.dumps(["I"] + [row[f] for f in fields])]
+    p = tmp_path / "r.jsonl"
+    for rows in (v2, v3):
+        p.write_text(with_trailer(rows))
+        _, _, iss, _ = se.read_rows(str(p))
+        assert iss["u1"]["origin"] == "2026-10-07T00:00:00Z"
+    for bad_fields in (None, fields[:4], fields[::-1]):                 # absent, a subset or reordered: refused
+        p.write_text(with_trailer([json.dumps({"receipt": dict(base, extractor="extract_decisions.sh v3",
+                                                               issuance_fields=bad_fields)})] + v3[1:]))
+        with pytest.raises(ValueError):
+            se.read_rows(str(p))

@@ -34,6 +34,8 @@ import argparse, bisect, datetime, hashlib, importlib.util, json, os, statistics
 HERE = os.path.dirname(os.path.abspath(__file__))
 MS, STEP, FRESH = 1000, 30_000, 120_000
 KEDA_HPA = "keda-hpa-myapptwo-keda-fallback"
+V3_ISSUANCE_FIELDS = ["issuance_id", "issued_at", "application", "namespace", "inference_input_end", "target_anchor",
+                      "model_version", "model_trained_at", "training_cutoff", "artifact_sha256", "step_minutes", "forecasts"]
 HPA_Q = ('max(kube_horizontalpodautoscaler_status_desired_replicas{{namespace="demo",'
          'horizontalpodautoscaler="{hpa}"}})')
 
@@ -188,7 +190,7 @@ def read_rows(path):
     need = ("extractor", "extractor_sha256", "source", "sha256", "lines", "malformed_lines", "decisions", "issuances",
             "decision_fields", "lookup_fields")
     missing = [k for k in need if k not in receipt]
-    if missing or receipt["extractor"] != "extract_decisions.sh v2":
+    if missing or receipt["extractor"] not in ("extract_decisions.sh v2", "extract_decisions.sh v3"):
         raise ValueError(f"unexpected receipt (missing {missing}, extractor {receipt.get('extractor')!r})")
     bad = receipt["malformed_lines"]
     if type(bad) is not int or bad < 0:
@@ -196,6 +198,12 @@ def read_rows(path):
     if bad:
         raise ValueError(f"the source log had {bad} malformed lines; evidence incomplete")
     kf, lf = receipt["decision_fields"], receipt["lookup_fields"]
+    if receipt["extractor"] == "extract_decisions.sh v3":
+        if list(receipt.get("issuance_fields") or []) != V3_ISSUANCE_FIELDS:
+            raise ValueError("a v3 receipt must declare exactly the v3 issuance fields")
+        ifields = V3_ISSUANCE_FIELDS
+    else:                                                                       # v2 rows
+        ifields = ["issuance_id", "issued_at", "application", "inference_input_end", "model_version", "forecasts"]
     decs, iss = [], {}
     for n, line in enumerate(lines[1:], 2):
         r = json.loads(line)
@@ -203,9 +211,9 @@ def read_rows(path):
             d = dict(zip(kf, r[1:1 + len(kf)]))
             d.update(zip(lf, r[1 + len(kf):]))
             decs.append(d)
-        elif r[0] == "I" and len(r) == 7:
-            rec = {"issuance_id": r[1], "issued_at": r[2], "application": r[3], "origin": r[4], "model_version": r[5],
-                   "forecasts": r[6]}
+        elif r[0] == "I" and len(r) == 1 + len(ifields):
+            rec = dict(zip(ifields, r[1:]))
+            rec["origin"] = rec.get("inference_input_end")
             if r[1] in iss and iss[r[1]] != rec:
                 raise ValueError(f"line {n}: conflicting rows for issuance {r[1]}")
             iss[r[1]] = rec

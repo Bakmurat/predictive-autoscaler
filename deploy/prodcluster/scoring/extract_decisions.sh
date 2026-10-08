@@ -3,7 +3,9 @@
 # stream through a port-forward). A short read-only pod on the operator's node mounts forecast-log-pvc read-only, hashes
 # the WHOLE file (receipt: lines, bytes, sha256, malformed-line count) and prints compact rows since --since:
 #   ["D", <decision fields…>, <forecast_lookup fields…>]   one per reconcile ("event":"decision")
-#   ["I", issuance_id, issued_at, application, inference_input_end, model_version, [[step, target_at, rpm]…]]
+#   ["I", <issuance fields…>]   issuance_id, issued_at, application, namespace, inference_input_end, target_anchor,
+#                              model_version, model_trained_at, training_cutoff, artifact_sha256, step_minutes,
+#                              [[step, target_at, rpm]…] (the receipt lists them; the readers validate the widths)
 #   {"trailer": {"bytes": N, "sha256": H}}   the byte count and hash of every line printed before it
 # The local copy is verified against the trailer before it is published (atomically); a failed transfer is kept as
 # <out>.failed-<UTC>. Used by shortage_events.py (which validates the rows against the receipt and the trailer).
@@ -27,6 +29,8 @@ K = ("at", "application", "forecast_status", "lead_window_peak_rpm", "raw_predic
      "desired_source", "current_replicas", "applied_replicas", "action", "confidence", "forecast_issued_at", "min_replicas",
      "max_replicas")
 L = ("resolution", "cache_action", "cache_age_seconds", "returned_issuance_id", "returned_link_status")
+I = ("issuance_id", "issued_at", "application", "namespace", "inference_input_end", "target_anchor", "model_version",
+     "model_trained_at", "training_cutoff", "artifact_sha256", "step_minutes")
 with open(p, "rb") as f:
     for line in f:
         h.update(line); n += 1; b += len(line)
@@ -39,11 +43,12 @@ with open(p, "rb") as f:
             fl = r.get("forecast_lookup") or {}
             dec.append(["D"] + [r.get(k) for k in K] + [fl.get(k) for k in L])
         elif "forecasts" in r and "issued_at" in r and r.get("issued_at", "") >= since:
-            iss.append(["I", r.get("issuance_id"), r.get("issued_at"), r.get("application"), r.get("inference_input_end"),
-                        r.get("model_version"), [[x.get("step"), x.get("target_at"), x.get("rpm")] for x in r.get("forecasts") or []]])
+            iss.append(["I"] + [r.get(k) for k in I] + [[[x.get("step"), x.get("target_at"), x.get("rpm")]
+                                                          for x in r.get("forecasts") or []]])
 out = [json.dumps({"receipt": {"path": p, "lines": n, "bytes": b, "sha256": h.hexdigest(), "malformed_lines": bad,
                                "since": since, "decisions": len(dec), "issuances": len(iss), "decision_fields": K,
-                               "lookup_fields": L, "extractor": "extract_decisions.sh v2",
+                               "lookup_fields": L, "issuance_fields": I + ("forecasts",),
+                               "extractor": "extract_decisions.sh v3",
                                "extractor_sha256": os.environ["EXTRACTOR_SHA256"],
                                "source": {"context": os.environ["SRC_CONTEXT"], "pvc": "forecast-log-pvc",
                                           "pod": os.environ["SRC_POD"], "node": os.environ["SRC_NODE"]}}})]
