@@ -13,6 +13,7 @@ resources:
   - ../../../k8s-manifests/base
   - ../../eks-benchmark/instrumentation
   - load-evidence.yaml
+  - p8-evidence.yaml
 configMapGenerator:
   # the hourly load-evidence CronJob's code and records (load-evidence.yaml); hashed names roll the CronJob's
   # template whenever the collector or a record changes

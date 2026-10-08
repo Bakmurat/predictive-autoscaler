@@ -1,0 +1,13 @@
+# Evidence volume of the P8 infrastructure-event detector (evaluation protocol P8; deploy/prodcluster/p8-job.sh runs it).
+# Raw VictoriaMetrics exports, manifests, results and their revisions live here, one directory per run; nothing is ever
+# overwritten. Read back with a short read-only pod (the claim is RWO on Longhorn).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: p8-evidence-pvc
+  namespace: ml-engine
+  labels: {app: p8-detector}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: harvester
+  resources: {requests: {storage: 4Gi}}
