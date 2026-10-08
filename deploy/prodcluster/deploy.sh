@@ -18,9 +18,10 @@
 #   VM_IMPORT_URL    in-cluster Prometheus-text import endpoint for the arms' final snapshots,
 #                    e.g. http://vminsert.<ns>.svc:8480/insert/0/prometheus/api/v1/import/prometheus
 # Optional: KUBECTL (default: kubectl), KUSTOMIZE (default: kustomize, v5.8+; the kubectl-embedded one is too old),
+#   RENDER_OUT (default: ./rendered; freeze_capture.py renders into its own private directory),
 #   FORCE_CONFLICTS=1 to take over fields owned by another field manager (otherwise conflicts fail the apply).
 set -euo pipefail
-HERE="$(cd "$(dirname "$0")" && pwd)"; OUT="$HERE/rendered"
+HERE="$(cd "$(dirname "$0")" && pwd)"; OUT="${RENDER_OUT:-$HERE/rendered}"
 KUBECTL="${KUBECTL:-kubectl}"; KUSTOMIZE="${KUSTOMIZE:-kustomize}"
 k(){ "$KUBECTL" --context "$KUBE_CONTEXT" "$@"; }
 # Server-side apply: client-side apply merges list entries by the strategic-merge key only (for
