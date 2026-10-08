@@ -7,7 +7,8 @@
 #   p8-job.sh gates  --run <name> --start <ISO> --stop <ISO>   copy + hash the finalized gate rows (bounded, 5 min)
 #   p8-job.sh final  --run <name> --start <ISO> --stop <ISO> [--attributions FILE]   offline final detection
 #   p8-job.sh status --run <name>
-# Options: --dry-run (print, apply nothing). Needs KUBE_CONTEXT and VM_QUERY_URL (in-cluster vmselect base).
+# Options: --dry-run (print, apply nothing). Needs KUBE_CONTEXT and VM_QUERY_URL (in-cluster vmselect base); KUBECTL
+# (default kubectl) should name a client within one minor version of the server, as deploy.env does.
 #
 # Code identity: the detector, identity file, mask and launcher go into an immutable ConfigMap named after the sha256 of
 # all four; an existing ConfigMap of that name is reused only when its contents match. Attributions (final) go into
@@ -32,7 +33,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 : "${KUBE_CONTEXT:?set KUBE_CONTEXT}"
-k() { kubectl --request-timeout=30s --context "$KUBE_CONTEXT" -n "$NS" "$@"; }
+KUBECTL="${KUBECTL:-kubectl}"   # deploy.env pins a kubectl within one minor version of the server (Codex r58)
+k() { "$KUBECTL" --request-timeout=30s --context "$KUBE_CONTEXT" -n "$NS" "$@"; }
 [[ "$RUN" =~ ^[a-z0-9][a-z0-9-]{2,40}$ ]] || { echo "--run must be a short lowercase name" >&2; exit 2; }
 if [ "$MODE" = status ]; then
   k get jobs -l "app=p8-detector,p8-run=$RUN" -o wide; k logs -l "app=p8-detector,p8-run=$RUN" --tail=20 --prefix || true; exit 0
@@ -45,7 +47,7 @@ ID=$(for f in "${FILES[@]}"; do printf '%s  %s\n' "$(shasum -a 256 "$HERE/$f" | 
 CM="p8-code-$ID"
 cm_json() {   # name, then file=path pairs
   local name="$1"; shift; local args=(); for kv in "$@"; do args+=(--from-file="$kv"); done
-  kubectl create configmap "$name" -n "$NS" "${args[@]}" --dry-run=client -o json |
+  "$KUBECTL" create configmap "$name" -n "$NS" "${args[@]}" --dry-run=client -o json |
     python3 -c 'import json,sys; d=json.load(sys.stdin); d["metadata"]["labels"]={"app":"p8-detector"}; d["immutable"]=True; print(json.dumps(d))'
 }
 ensure_cm() {   # create, or verify that the existing one is immutable and holds exactly these bytes
@@ -66,7 +68,7 @@ fi
 JOB="p8-$MODE-$RUN-$(date -u +%m%d%H%M%S)"
 pv_of() { k get pvc "$1" -o jsonpath='{.spec.volumeName}'; }
 VA_JSON=""
-attachments() { VA_JSON=$(kubectl --request-timeout=30s --context "$KUBE_CONTEXT" get volumeattachments -o json) || { echo "volumeattachment query failed" >&2; exit 4; }; }
+attachments() { VA_JSON=$("$KUBECTL" --request-timeout=30s --context "$KUBE_CONTEXT" get volumeattachments -o json) || { echo "volumeattachment query failed" >&2; exit 4; }; }
 attached_node() {   # from the last successful attachments() snapshot
   echo "$VA_JSON" | python3 -c 'import json,sys; pv=sys.argv[1]; n=[a["spec"]["nodeName"] for a in json.load(sys.stdin)["items"] if a["spec"]["source"].get("persistentVolumeName")==pv and (a.get("status") or {}).get("attached")]; print(n[0] if n else "")' "$1" ||
     { echo "volumeattachment parse failed" >&2; exit 4; }; }
