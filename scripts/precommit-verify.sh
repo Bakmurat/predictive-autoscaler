@@ -95,8 +95,8 @@ say "verifying the staged tree in $WORK"
 ( cd "$WORK" && bash scripts/verify.sh ) 2>&1 | sed 's/^/  | /'
 rc=${PIPESTATUS[0]}
 if [ "$rc" -ne 0 ]; then
-  cp -f "$WORK/verify.log" "$ROOT/precommit-verify-failed.log" 2>/dev/null || true
-  die "verify failed on the staged tree (exit $rc); log: precommit-verify-failed.log"
+  mkdir -p "$ROOT/logs" && cp -f "$WORK/verify.log" "$ROOT/logs/precommit-verify-failed.log" 2>/dev/null || true
+  die "verify failed on the staged tree (exit $rc); log: logs/precommit-verify-failed.log"
 fi
 
 # --- 5. Re-check that the tree we verified is still the tree being committed -----------------
