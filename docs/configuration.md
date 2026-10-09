@@ -48,10 +48,16 @@ need.
 Scale-up is applied at once. Scale-down needs desired below current **continuously for 5 minutes** and no scale-up in the
 last 5 minutes (stabilization), at least 2 minutes since the previous scale-down (cooldown), and then removes at most
 `max(ceil(10 % × current), 2)` pods per step. When the overestimate cap is active, the stabilization checks are skipped but
-the cooldown still applies. This state is kept in memory, so an operator restart resets it. If both the forecast and the metrics query **fail with an error**,
-the current replica count is kept. **Known issue:** a metrics query that returns an empty or unsuccessful result is read
-as 0 req/min rather than as a failure, so without a forecast the desired count falls to `minReplicas`
-(fix planned first, item #0 of the product plan).
+the cooldown still applies. This state is kept in memory, so an operator restart resets it.
+
+**When the current request rate cannot be measured, the replica count is held.** Only a complete, successful answer with
+exactly one finite, non-negative sample counts as a measurement; a failed or partial query, an empty result (no series),
+several series or a non-finite value is "unavailable" — never zero traffic. Without a measurement the operator holds the
+current replica count (within `[minReplicas, maxReplicas]`), whether or not a forecast exists: it neither scales down on
+missing data nor scales on a forecast alone. The decision ledger records `telemetry_status: unavailable` with the reason and
+the safeguard `telemetry_unavailable_hold`, and the measurement gauges (current RPM, actual need, prediction error) are
+removed instead of showing stale or invented values. A workload whose request counter exists but sees no traffic is
+measured as a real zero and scales normally.
 
 ## Operator environment
 | Variable | Default | Purpose |

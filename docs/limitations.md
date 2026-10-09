@@ -3,8 +3,8 @@
 This is a research prototype that has run only in test environments with synthetic, generated load. It is not
 production-ready. Known limits, most important first:
 
-1. **Missing metrics can scale down.** A metrics query that returns an empty or unsuccessful result is read as zero
-   traffic; without a forecast the desired count then falls to `minReplicas` (see configuration.md, Decision rule).
+1. **Holds during metrics outages.** Without a measured request rate the operator holds the current replica count (see
+   configuration.md, Decision rule), so a real load change during a monitoring outage is not followed until metrics return.
 2. **No protection against a second autoscaler** on the same Deployment (see coexistence.md).
 3. **Istio is required** for the request-rate signal (`istio_requests_total{reporter="destination"}`), and the queries
    are not configurable.

@@ -16,8 +16,8 @@
 3. **Combine:** `max(forecast, reactive)`, clamped to `[minReplicas, maxReplicas]`.
 4. **Apply:** scale up at once; scale down gradually (5 minutes continuously lower, 2-minute cooldown, at most
    `max(ceil(10 %), 2)` pods per step).
-5. **Fallbacks:** no usable forecast → reactive only; forecast and metrics both failing with errors → keep current replicas
-   (see the known issue with empty metric results in `configuration.md`).
+5. **Fallbacks:** no usable forecast → reactive only; no measured request rate (failed, partial or empty metrics answer)
+   → hold the current replica count, forecast or not (`configuration.md`, Decision rule).
 
 ## Signals and units
 - The request rate is in **requests per minute** internally; `targetRPS` in the CRD is per second (×60).
