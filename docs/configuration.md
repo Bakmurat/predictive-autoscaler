@@ -11,6 +11,7 @@ brackets (20 and 60). The same applies to `metrics.requests`. Set these fields e
 ## spec
 | Field | Type | Required | Effective default | Read by the operator | Notes |
 |---|---|---|---|---|---|
+| `mode` | `Recommend` \| `Active` | no | **Recommend** (also when absent) | yes | `Recommend` computes and publishes the decision (status, metrics, ledger) and writes nothing; only `Active` scales the target. Existing objects without `mode` stop scaling after an upgrade until they set `Active`. |
 | `targetDeployment.name` | string | yes | — | yes | The Deployment to scale. |
 | `targetDeployment.namespace` | string | yes | — | yes | Any namespace is accepted in this version; keep it equal to the CR's namespace. |
 | `targetDeployment.container` | string | no | — | **no** | Accepted, ignored. |
@@ -26,14 +27,22 @@ brackets (20 and 60). The same applies to `metrics.requests`. Set these fields e
 | `resources.*` | — | no | 100 m / 128 MB / 10,000 rpm | **no** | Accepted, ignored. |
 
 ## status
-| Field | Meaning in this version |
+| Field | Meaning |
 |---|---|
-| `currentReplicas` | Replicas observed on the Deployment. |
-| `predictedReplicas` | Actually the **desired** replica count of the last decision (forecast and reactive combined), not the forecast alone. |
-| `lastPrediction` | Time of the last decision. |
-| `conditions` | A single `Ready` condition (`ScalingSuccessful`, `DeploymentNotFound`, `ScalingError`). Forecast refusals, a missing model or metrics failures are not shown here; see the operator log and metrics. |
-`lastScaleTime` and `observedGeneration` are not set. Planned: separate calculated / stabilized / applied / ready replicas,
-and conditions `ForecastAvailable`, `ConflictDetected`, `ModelStale`.
+| `mode` | The mode applied in the last reconcile. |
+| `observedGeneration` | The spec generation the status describes. |
+| `currentReplicas` / `readyReplicas` | The Deployment's replicas and ready replicas (a zero is reported). |
+| `forecastReplicas` | Replicas from the forecast alone; absent when no forecast was used. |
+| `calculatedReplicas` | The decision rule's result, or the held count when the request rate is unavailable. |
+| `stabilizedReplicas` | Active only: what is applied after scale-down stabilization and cooldown. Absent in Recommend mode, which keeps no hypothetical scale history. |
+| `appliedReplicas`, `lastScaleTime` | Active only: the last successful write. Cleared when the target Deployment is replaced (`targetUID` changes). |
+| `targetUID` | UID of the target Deployment the status describes. |
+| `predictedReplicas` | Deprecated: the calculated count (historical meaning). Use `calculatedReplicas` and `forecastReplicas`. |
+| `lastPrediction` | Issue time of the last forecast used. |
+| `conditions` | `Ready` (the reconcile completed), `TelemetryAvailable` (`Measured` / `MetricsUnavailable`), `ForecastAvailable` (`Used`, `Disabled`, `Unavailable`, `HorizonElapsed`, `SanityRejected`), `ScalingActive` (`Active`, `RecommendMode`, `TelemetryHold`, or the failure reason). |
+
+Events are emitted when a condition changes (and on `ScaledUp` / `ScaledDown`), never on every reconcile; `kubectl
+describe pa <name>` shows them. `kubectl get pa` shows Target, Mode, Min, Max, Current, Calculated, Applied, Ready, Age.
 
 ## Decision rule
 ```

@@ -21,8 +21,9 @@ sync and the workload flaps between their answers.
 - A VerticalPodAutoscaler in `Auto`/`Recreate` mode changes resource requests and recreates pods rather than owning the
   replica count; it is reported as a warning, not a conflict.
 - Replicas are written only through the `/scale` subresource, and leader election is on by default.
-- A `Recommend` mode (the planned install default) computes and publishes the desired replicas without writing to the
-  target or any scaler, so it can run next to an existing HPA or KEDA object.
+- `Recommend` mode (implemented, the default): the operator computes and publishes the replica count it would set
+  without writing to the target or any scaler, so it can run next to an existing HPA or KEDA object. Use it to compare
+  before handing a workload over (`mode: Active`).
 
 ## The paused-KEDA fallback pattern
 Keep a KEDA ScaledObject for the same Deployment, **paused**, as a ready-made reactive fallback:
