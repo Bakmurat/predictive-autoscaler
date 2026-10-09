@@ -449,6 +449,15 @@ def test_v6_a_joined_worker_must_be_the_declared_node_object():
     assert len(bad) == 1 and "differ from the declared" in bad[0]
 
 
+def test_d1105_qualification_hours_must_follow_the_latest_worker_join():
+    ident = {"workers": ["w1", {"name": "w3", "joined": "2026-10-09T19:03:20Z", "uid": "u-3"}]}
+    assert fz.qualification_after_joins(["2026-10-09T20:00:00Z", "2026-10-09T21:00:00Z"], ident) == []
+    bad = fz.qualification_after_joins(["2026-10-08T14:00:00Z", "2026-10-09T19:00:00Z", "2026-10-09T20:00:00Z"], ident)
+    assert len(bad) == 2 and all("before the latest worker join" in b for b in bad)
+    assert fz.qualification_after_joins(["2026-10-08T14:00:00Z"], {"workers": ["w1", "w2"]}) == []   # no joins declared
+    assert "not a timestamp" in fz.qualification_after_joins(["14Z"], ident)[0]
+
+
 def test_v6_the_frozen_identities_parse_and_name_six_workers():
     ident = json.load(open(os.path.join(fz.HERE, "infra-identities.json")))
     entries = fz.load_ie().worker_entries(ident)

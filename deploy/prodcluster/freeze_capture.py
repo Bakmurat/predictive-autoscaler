@@ -787,6 +787,24 @@ def qualification_expectations(ctx):
             "collector_sha256": sha(os.path.join(HERE, "collect_load_evidence.py")), "inputs_sha256": inputs}
 
 
+def qualification_after_joins(hours, ident):
+    """P6 gate 4 (D-1105): a worker that joined during the history is a relevant placement change, so every
+    qualification hour must start at or after the latest declared join (k5nbm: 2026-10-09T19:03:20Z → first eligible hour
+    20:00Z). Unparsable hours are reported, never skipped."""
+    ie = load_ie()
+    joins = [ie.parse(w["joined"]) for w in ident["workers"] if isinstance(w, dict)]
+    if not joins:
+        return []
+    latest, out = max(joins), []
+    for h in hours:
+        try:
+            if ie.parse(h) < latest:
+                out.append(f"qualification hour {h} starts before the latest worker join {ie.iso(latest)} (P6 gate 4, D-1105)")
+        except ValueError:
+            out.append(f"qualification hour {h!r} is not a timestamp")
+    return out
+
+
 def gate_qualification(fetched, hours, expect):
     """(problems, summary): the qualification hours from the immutable load-gate attempts fetched by
     fetch_load_attempts.sh v1 (D-1093, Codex r59/r60). The fetch: trailer over the exact bytes; the receipt names exactly
@@ -1350,6 +1368,7 @@ def main(argv=None):
         qual_hours = [h for h in a.qualification_hours.split(",") if h]
         gates["qualification"], qualification = gate_qualification(qual_bytes, qual_hours,
                                                                    qualification_expectations(ctx))
+        gates["qualification"] += qualification_after_joins(qual_hours, ident_raw)
         gates["generator_continuity"], generators = gate_generators(qualification, qual_hours, bench_pods)
         gates["fresh_issuances"], issuances = gate_fresh_issuances(
             blobs["issuances"][0][1] if "issuances" in blobs else b"", operator_log,
