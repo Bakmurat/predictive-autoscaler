@@ -35,7 +35,8 @@ Gates (all PASS = a usable freeze; the capture is written either way):
                       source (Secret, field reference, missing ConfigMap, $(VAR)) in either
   arms                the six arms and six generators; exactly one PredictiveAutoscaler per operator arm, bounded 1..12;
                       the KEDA arm's ScaledObject 1..12 and active; the hybrid's KEDA fallback paused
-  nodes               the five frozen workers present, Ready, without Disk/Memory/PID pressure
+  nodes               the frozen workers (infra-identities.json; six since 2026-10-09, U-32) present, Ready, without
+                      Disk/Memory/PID pressure
   telemetry           kubectl top rows and physically valid (0 ≤ avail ≤ size, size > 0), unambiguous, fresh (both
                       series, no future timestamps) root-disk samples for every frozen worker; the required benchmark
                       series (VictoriaMetrics with deny_partial_response=1). Collection only: no disk threshold
@@ -995,10 +996,17 @@ def gate_arms(deploys, pas, scaled):
     return problems
 
 
-def gate_nodes(nodes, workers):
+def gate_nodes(nodes, workers, joined=None):
+    """joined: {name: (creationTimestamp, uid)} for workers declared as joined during the history (detector v6): the live
+    Node must be that object (same UID and creationTimestamp)."""
     problems, out = [], []
     names = {n["metadata"]["name"] for n in nodes}
     problems += [f"frozen worker {w} missing" for w in workers if w not in names]
+    for n in nodes:
+        decl = (joined or {}).get(n["metadata"]["name"])
+        if decl and (n["metadata"].get("creationTimestamp"), n["metadata"].get("uid")) != decl:
+            problems.append(f"{n['metadata']['name']}: live creationTimestamp/uid "
+                            f"{(n['metadata'].get('creationTimestamp'), n['metadata'].get('uid'))} differ from the declared {decl}")
     for n in nodes:
         cond = {c["type"]: c["status"] for c in n.get("status", {}).get("conditions", [])}
         out.append({"name": n["metadata"]["name"], "frozen_worker": n["metadata"]["name"] in workers,
@@ -1098,6 +1106,13 @@ def tool_versions(kube):
          f"{v['serverVersion']['gitVersion']}"]
     return problems, {"kubectl": kube.bin, "client": v["clientVersion"]["gitVersion"],
                       "server": v["serverVersion"]["gitVersion"]}
+
+
+def load_ie():
+    spec = importlib.util.spec_from_file_location("infra_events", os.path.join(HERE, "infra_events.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
 
 
 def load_forecasts():
@@ -1292,7 +1307,10 @@ def main(argv=None):
             diffs1 = server_diffs(kube, rendered)
         ident1 = checkout_identity()
 
-        workers = json.load(open(os.path.join(HERE, "infra-identities.json")))["workers"]
+        ident_raw = json.load(open(os.path.join(HERE, "infra-identities.json")))
+        load_ie().worker_entries(ident_raw)                    # the detector's own validation (v6)
+        workers = [w if isinstance(w, str) else w["name"] for w in ident_raw["workers"]]
+        joined = {w["name"]: (w["joined"], w["uid"]) for w in ident_raw["workers"] if isinstance(w, dict)}
         bench_pods = [p for p in pods_all if p["metadata"]["namespace"] in NAMESPACES]
         fingerprint = config_fingerprint(live)
         gates["clean_checkout"] += [f"checkout changed during the capture: {k}" for k in ("head", "dirty", "files_sha256")
@@ -1341,7 +1359,7 @@ def main(argv=None):
         gates["arms"] = gate_arms(live[("demo", "deployments.apps")],
                                   live[("demo", "predictiveautoscalers.autoscaler.example.com")],
                                   live[("demo", "scaledobjects.keda.sh")])
-        gates["nodes"], nodes = gate_nodes(nodes_raw, workers)
+        gates["nodes"], nodes = gate_nodes(nodes_raw, workers, joined)
         disk_by_node = root_disk(disk, nodes)
         gates["telemetry"] = gate_telemetry(top.returncode, top.stdout, disk_by_node, workers, series, now, conflicts)
         identity = configuration_identity(ident0, rendered_meta, fingerprint, env, vm_static_identity(monitoring, vm_crs),

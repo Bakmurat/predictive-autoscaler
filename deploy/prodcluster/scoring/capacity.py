@@ -231,8 +231,8 @@ def p8_check(res, start, stop, frozen, ie):
     """Validate a detector result for this scoring window. frozen: sha256 of the frozen detector, identity file and mask.
     Every capacity slot of the window is recomputed from the result's segments and gate hours and must equal the saved
     classification; the budget is counted from that map. Returns the classifier and the window summary."""
-    if not str(res.get("detector", "")).startswith("infra_events.py v5"):
-        raise ValueError(f"P8 result from {res.get('detector')!r}, not detector v5")
+    if str(res.get("detector", "")) not in ("infra_events.py v5", "infra_events.py v6"):   # the frozen sha binds which
+        raise ValueError(f"P8 result from {res.get('detector')!r}, not detector v5/v6")
     ri = res.get("run_identity") or {}
     for name, key in (("detector", "detector_sha256"), ("identities", "identities_sha256"), ("mask", "mask_sha256")):
         if ri.get(key) != frozen[name]:

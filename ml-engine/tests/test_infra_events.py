@@ -1,4 +1,4 @@
-"""deploy/prodcluster/infra_events.py v5: P8 detector on raw samples (Codex r30–r35 cases)."""
+"""deploy/prodcluster/infra_events.py v6: P8 detector on raw samples (Codex r30–r35 cases; v6 joined workers)."""
 import fcntl
 import hashlib
 import importlib.util
@@ -17,7 +17,7 @@ ie = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ie)
 IDENT = json.load(open(os.path.join(PROD, "infra-identities.json")))
 APPS = list(IDENT["generators"])
-NODES = IDENT["workers"]
+NODES = [w if isinstance(w, str) else w["name"] for w in IDENT["workers"]]   # v6: {"name", "joined"} entries
 
 MIN, HOUR, DAY = 60_000, ie.HOUR, 24 * ie.HOUR
 S = 1_791_331_200_000        # 2026-10-07T00:00:00.000Z
@@ -99,12 +99,16 @@ def heartbeats(lab, app, a=LO, b=E, holes=()):
              if a <= t + 400 <= b and not any(x < t + 400 < y for x, y in holes)])
 
 
+JOINED = dict(ie.worker_entries(IDENT))     # v6: a worker's samples exist only from its join (k5nbm: 2026-10-09)
+
+
 def healthy(nodes=NODES, skip_gen=()):
     lab = Lab()
     for node in nodes:
+        since = JOINED.get(node)
         for c in ie.CONDITIONS:
             lab.add(dict(EXPORTER, __name__="kube_node_status_condition", node=node, condition=c, status="true"),
-                    [(t, 1.0 if c == "Ready" else 0.0) for t in KSM])
+                    [(t, 1.0 if c == "Ready" else 0.0) for t in KSM if since is None or t >= since])
     for app in APPS:
         pod(lab, "demo", f"{app}-77d6cb8d96-9sb2p", created=LO - DAY)
         if app not in skip_gen:
@@ -652,3 +656,114 @@ def test_r38_dropped_counter_domain_and_start_time_coverage():
             smp[:] = [(t, v) for t, v in smp if not S + 10 * MIN < t < S + 15 * MIN]
     ev, unk, *_ = run(lab)
     assert "k6 container start time demo/k6-nginx-test-5645f9f848-fh4wl" in sources(unk)
+
+
+# ---- v6: a worker that joined during the history (2026-10-09, U-32) -------------------------------------------
+BASE = [w for w in IDENT["workers"] if isinstance(w, str)]
+NEW = "prodcluster-prodworker-kg699-newnd"
+
+
+def node_samples(lab, node, a, ready_from=None):
+    for c in ie.CONDITIONS:
+        lab.add(dict(EXPORTER, __name__="kube_node_status_condition", node=node, condition=c, status="true"),
+                [(t, (1.0 if (ready_from is None or t >= ready_from) else 0.0) if c == "Ready" else 0.0)
+                 for t in KSM if t >= a])
+
+
+def run_ident(lab, ident):
+    ev, unk = ie.detect(lab, S, E, ident, None, None)
+    slots, targets, summary, _ = ie.classify(ev, unk, S, E, APPS, GOOD)
+    return ev, unk, summary
+
+
+def with_new(joined):
+    return dict(IDENT, workers=BASE + [{"name": NEW, "joined": ie.iso(joined), "uid": "u-newnd"}])
+
+
+def test_v6_joined_worker_needs_coverage_only_from_its_join():
+    lab = healthy(nodes=BASE)
+    join = S + HOUR
+    node_samples(lab, NEW, join)
+    ev, unk, s = run_ident(lab, with_new(join))
+    assert ev == [] and unk == [] and s["verified_clean"] == s["total"]
+
+
+def test_v6_a_coverage_gap_after_the_join_is_unknown():
+    lab = healthy(nodes=BASE)
+    join = S + HOUR
+    node_samples(lab, NEW, join + 5 * MIN)                       # first scrape 5 min after the declared join
+    ev, unk, s = run_ident(lab, with_new(join))
+    assert any(NEW in u["source"] for u in unk) and s["compromised"]
+
+
+def test_v6_not_ready_at_join_is_a_candidate():
+    lab = healthy(nodes=BASE)
+    join = S + HOUR
+    node_samples(lab, NEW, join, ready_from=join + 2 * MIN)
+    ev, unk, s = run_ident(lab, with_new(join))
+    # a candidate stays unknown until an attribution record resolves it
+    assert any(e["kind"] == "node not ready or under pressure" and e["status"] == "unknown" and NEW in e["subject"]
+               for e in ev)
+
+
+def test_v6_samples_before_the_declared_join_fail_the_run():
+    lab = healthy(nodes=BASE)
+    join = S + HOUR
+    node_samples(lab, NEW, join - 10 * MIN)
+    with pytest.raises(ValueError, match="before its declared join"):
+        run_ident(lab, with_new(join))
+
+
+def test_v6_a_worker_joining_after_the_window_is_not_required():
+    lab = healthy(nodes=BASE)
+    ev, unk, s = run_ident(lab, with_new(E + HOUR))
+    assert ev == [] and unk == []
+
+
+def test_v6_without_the_join_declaration_the_new_worker_is_unknown_before_it_existed():
+    lab = healthy(nodes=BASE)
+    node_samples(lab, NEW, S + HOUR)
+    ev, unk, s = run_ident(lab, dict(IDENT, workers=BASE + [NEW]))
+    assert any(NEW in u["source"] for u in unk)
+
+
+@pytest.mark.parametrize("bad", [[{"name": NEW}], [{"name": NEW, "joined": "2026-10-09T00:00:00Z"}],
+                                 [{"name": NEW, "joined": "2026-10-09T00:00:00Z", "uid": "u", "x": 1}], [""], [3],
+                                 [NEW, NEW], [{"name": NEW, "joined": "not-a-time", "uid": "u"}],
+                                 [{"name": NEW, "joined": "2026-10-09T00:00:00Z", "uid": ""}]])
+def test_v6_malformed_or_duplicate_worker_identities_are_rejected(bad):
+    with pytest.raises(ValueError):
+        ie.worker_entries({"workers": BASE + bad})
+
+
+@pytest.mark.parametrize("workers", [[], "prodcluster-prodworker-kg699-2nsgd", {"name": NEW}, None])
+def test_v6_workers_must_be_a_non_empty_list(workers):
+    with pytest.raises(ValueError, match="non-empty list"):
+        ie.worker_entries({"workers": workers})
+
+
+def test_v6_r80_not_ready_at_a_mid_window_join_leaves_the_pre_join_slots_clean():
+    # Codex r80 probe: a worker joining halfway, NotReady for 2 min, must not make the slots before its join unknown
+    lab = healthy(nodes=BASE)
+    join = S + HOUR
+    node_samples(lab, NEW, join, ready_from=join + 2 * MIN)
+    ev, unk, s = run_ident(lab, with_new(join))
+    e = next(x for x in ev if NEW in x["subject"])
+    assert all(seg[0] >= join for seg in e["segments"]) and e["start"] >= join
+    assert s["verified_clean"] == 6 and s["compromised"]              # the six 10-min slots before the join stay clean
+
+
+def test_v6_r80_a_future_join_contradicted_by_samples_in_the_window_fails():
+    # Codex r80 probe: declared after the window but observed (NotReady) throughout it
+    lab = healthy(nodes=BASE)
+    node_samples(lab, NEW, LO, ready_from=E + DAY)
+    with pytest.raises(ValueError, match="before its declared join"):
+        run_ident(lab, with_new(E + HOUR))
+
+
+def test_v6_the_frozen_identities_declare_k5nbm_from_its_creation():
+    assert {"name": "prodcluster-prodworker-kg699-k5nbm", "joined": "2026-10-09T19:03:20Z",
+            "uid": "02006ad2-573b-44c7-8691-1acb67363c4a"} in IDENT["workers"]
+    entries = dict(ie.worker_entries(IDENT))
+    assert entries["prodcluster-prodworker-kg699-k5nbm"] == ie.parse("2026-10-09T19:03:20Z")
+    assert sum(1 for v in entries.values() if v is None) == 5

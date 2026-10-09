@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Infrastructure-event detector for the prodcluster campaign (evaluation protocol P8), v5 (Codex r30–r35).
+"""Infrastructure-event detector for the prodcluster campaign (evaluation protocol P8), v6 (Codex r30–r35; v6: workers
+that joined during the history, 2026-10-09 U-32).
 
 Run after the stop and before any score is looked at. Declared sources only, read as RAW samples through the
 VictoriaMetrics export API in bounded time chunks; every chunk is streamed into an attempt directory, hashed and
@@ -10,7 +11,11 @@ deduplicated, and rejected when malformed or conflicting; `null` is a staleness 
 Sources and coverage (a gap in any required series is unknown, never clean):
 - workers (frozen identities): kube_node_status_condition{status="true"} for Ready, DiskPressure, MemoryPressure and
   PIDPressure; every condition must be covered (gap > 60 s = 3 scrapes), and states are read only at instants where all
-  four were scraped together (one kube-state-metrics scrape carries one timestamp; no value is carried forward).
+  four were scraped together (one kube-state-metrics scrape carries one timestamp; no value is carried forward). A
+  worker that joined during the history is declared as {"name", "joined", "uid"} (joined = its Node object's
+  creationTimestamp; uid = the Node UID, checked live by the freeze capture): its
+  coverage is required from `joined` on (a gap from `joined` to its first joint scrape is unknown, and a not-Ready start
+  is a candidate like any other); any sample of it before `joined` contradicts the declaration and fails the run.
 - benchmark pods (frozen name patterns, filtered server-side). Every series of the namespace's benchmark pods is
   streamed chunk by chunk into per-pod summaries. A pod's lifetime runs from its creation time (kube_pod_created; when
   missing, the start is unresolved back to the window start) to its END, which is established only by a staleness
@@ -95,6 +100,27 @@ def parse(s):
 
 def now_ms():
     return int(time.time() * MS)
+
+
+def worker_entries(ident):
+    """[(node, joined_ms or None)]: a worker is a name (present over the whole history) or {"name", "joined", "uid"} (it
+    joined at `joined`, its Node object's creationTimestamp; `uid` is the Node UID the freeze capture checks live). An
+    empty or non-list `workers`, any other shape, or a duplicate name is a configuration error."""
+    ws = ident.get("workers") if isinstance(ident, dict) else None
+    if not isinstance(ws, list) or not ws:
+        raise ValueError("identities: workers must be a non-empty list")
+    out = []
+    for w in ws:
+        if isinstance(w, str) and w:
+            out.append((w, None))
+        elif (isinstance(w, dict) and set(w) == {"name", "joined", "uid"} and isinstance(w["name"], str) and w["name"]
+              and isinstance(w["uid"], str) and w["uid"] and isinstance(w["joined"], str)):
+            out.append((w["name"], parse(w["joined"])))
+        else:
+            raise ValueError(f"bad worker identity {w!r}")
+    if len({n for n, _ in out}) != len(out):
+        raise ValueError("duplicate worker identity")
+    return out
 
 
 # ---------------------------------------------------------------------------------------------------- raw samples
@@ -232,7 +258,7 @@ class Events:
         if b >= a:
             self.unknown.append({"source": source, "start": a, "end": b})
 
-    def add(self, cls, kind, subject, first, last, before, after, evidence, candidate, definite=True):
+    def add(self, cls, kind, subject, first, last, before, after, evidence, candidate, definite=True, floor=None):
         """first/last: the observations showing the event; before/after: the observations bracketing it (None = open:
         its extent to the window edge is unknown)."""
         cid = f"{cls}:{kind}:{subject}:{iso(first)}"
@@ -245,8 +271,9 @@ class Events:
         a = before if before is not None else first
         b = after if after is not None else last
         segs = [] if status == "system_outcome" else [[a, b, status]]
-        if before is None and self.lo < first:
-            segs.append([self.lo, first, "unknown"])
+        lo_open = self.lo if floor is None else max(self.lo, floor)    # v6: nothing existed before a worker's join
+        if before is None and lo_open < first:
+            segs.append([lo_open, first, "unknown"])
         if after is None and last < self.hi:
             segs.append([last, self.hi, "unknown"])
         self.events.append({"id": cid, "class": cls, "kind": kind, "subject": subject, "start": a, "end": b,
@@ -361,20 +388,26 @@ def detect(src, start, stop, ident, mask=None, attributions=None):
     ev = Events(lo, hi, validate_attributions(attributions))
 
     # (a) workers: every condition covered; states only at joint scrapes; unhealthy runs are candidates
-    for node in ident["workers"]:
+    for node, since in worker_entries(ident):
+        wlo = lo if since is None else max(lo, since)          # coverage is required from the worker's join on
         sel = f'kube_node_status_condition{{node="{node}",status="true",condition=~"{"|".join(CONDITIONS)}"}}'
         conds = by_label(normalize(src.fetch(sel, lo, hi)), "condition")
         conds = {c: conds.get(c, []) for c in CONDITIONS}
         check_domain(conds, f"node {node}")
+        if since is not None and any(t < since for s in conds.values() for t, _ in s):
+            raise ValueError(f"node {node} has samples before its declared join {iso(since)}")
+        if wlo > hi:
+            continue                                           # joins after this window (and no sample contradicts it)
         for c, s in conds.items():
-            for a, b, _, _ in gaps(seen(s), lo, hi, KSM_GAP):
+            for a, b, _, _ in gaps(seen(s), wlo, hi, KSM_GAP):
                 ev.gap(f"kube-state-metrics node {node} condition {c}", a, b)
         joined = exact_join(conds)
-        for a, b, _, _ in gaps([t for t, _ in joined], lo, hi, KSM_GAP):
+        for a, b, _, _ in gaps([t for t, _ in joined], wlo, hi, KSM_GAP):
             ev.gap(f"kube-state-metrics node {node} joint scrape", a, b)
         obs = [(t, v["Ready"] == 1 and not any(v[c] for c in CONDITIONS[1:])) for t, v in joined]
         for first, last, before, after in bad_runs(obs):
-            ev.add("a", "node not ready or under pressure", node, first, last, before, after, sel, candidate=True)
+            ev.add("a", "node not ready or under pressure", node, first, last, before, after, sel, candidate=True,
+                   floor=since)
 
     gen_re = {app: re.compile(p) for app, p in ident["generators"].items()}
     gens = {app: [] for app in gen_re}
@@ -839,7 +872,7 @@ def main(argv=None, opener=None):
         raise
     ser = lambda x: dict(x, start=iso(x["start"]), end=iso(x["end"]), start_ms=x["start"], end_ms=x["end"])
     revision = 0 if mode != "offline" else 1 + len(glob.glob(os.path.join(attempt, "result-r*.json")))
-    out = {"detector": "infra_events.py v5", "detector_sha256": identity["detector_sha256"],
+    out = {"detector": "infra_events.py v6", "detector_sha256": identity["detector_sha256"],
            "python": platform.python_version(), "attempt": os.path.basename(os.path.normpath(attempt)),
            "revision": revision, "run_identity": identity,
            "inputs_sha256": {k: sha_file(v) for k, v in (("identities", a.identities), ("mask", a.mask),

@@ -14,8 +14,9 @@ package controllers
 //
 // Input JSON:  {"min":1,"max":12,"steps":[{"t":"RFC3339","reactive":3,"predicted":5,
 //               "current_rpm":1234.5,"predictions":[...]}, ...]}
-// A keep_current step represents BOTH an unavailable forecast and a telemetry query
-// error (not an empty successful metrics response); counts/RPM/vector must be empty.
+// A keep_current step represents a missing current request rate (a failed, partial, empty or non-finite metrics
+// answer): its reactive count and RPM must be empty; a forecast may be present but cannot move the decision, because
+// without a measurement the controller holds the current replica count (unifiedDesired).
 // API/cache/deployment failures and the live reconciliation cadence are not simulated.
 // Output JSON: {"decisions":[{"t":...,"current":N,"desired":N,"applied":N,
 //               "override_active":bool,"streak":N}, ...]}
@@ -82,8 +83,8 @@ func TestReplayHarness(t *testing.T) {
 	out := replayOutput{}
 
 	for _, s := range in.Steps {
-		if s.KeepCurrent && (s.Reactive != 0 || s.Predicted != 0 || s.CurrentRPM != 0 || len(s.Predictions) != 0) {
-			t.Fatal("keep_current requires unavailable forecast and telemetry")
+		if s.KeepCurrent && (s.Reactive != 0 || s.CurrentRPM != 0) {
+			t.Fatal("keep_current requires missing telemetry (reactive and current_rpm empty)")
 		}
 		ts, err := time.Parse(time.RFC3339, s.T)
 		if err != nil {
@@ -98,20 +99,8 @@ func TestReplayHarness(t *testing.T) {
 		// Reconcile records this after adjustment for the next ramp-up check.
 		state.lastRPM = s.CurrentRPM
 
-		desired := predicted
-		if s.Reactive > desired {
-			desired = s.Reactive
-		}
-		if in.Min > desired {
-			desired = in.Min
-		}
-		if desired > in.Max {
-			desired = in.Max
-		}
-		// Live reconciliation applies the both-input-error hold after clamping.
-		if s.KeepCurrent {
-			desired = current
-		}
+		// The live rule itself: a recorded predicted count of 0 means no forecast participated.
+		desired, _ := unifiedDesired(predicted, s.Reactive, in.Min, in.Max, current, true, !s.KeepCurrent)
 
 		applied := current
 		switch {
