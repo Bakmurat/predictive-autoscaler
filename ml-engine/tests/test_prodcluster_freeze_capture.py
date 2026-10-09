@@ -437,6 +437,24 @@ def node(name, ip, **cond):
                        "addresses": [{"type": "InternalIP", "address": ip}]}}
 
 
+def test_v6_a_joined_worker_must_be_the_declared_node_object():
+    n = node("w3", "10.0.0.3")
+    n["metadata"].update(creationTimestamp="2026-10-09T19:03:20Z", uid="u-3")
+    ok = fz.gate_nodes([node("w1", "10.0.0.1"), node("w2", "10.0.0.2"), n], WORKERS + ["w3"],
+                       {"w3": ("2026-10-09T19:03:20Z", "u-3")})[0]
+    assert ok == []
+    replaced = dict(n, metadata=dict(n["metadata"], uid="u-other"))   # same name, a different (re-created) Node
+    bad = fz.gate_nodes([node("w1", "10.0.0.1"), node("w2", "10.0.0.2"), replaced], WORKERS + ["w3"],
+                        {"w3": ("2026-10-09T19:03:20Z", "u-3")})[0]
+    assert len(bad) == 1 and "differ from the declared" in bad[0]
+
+
+def test_v6_the_frozen_identities_parse_and_name_six_workers():
+    ident = json.load(open(os.path.join(fz.HERE, "infra-identities.json")))
+    entries = fz.load_ie().worker_entries(ident)
+    assert len(entries) == 6 and dict(entries)["prodcluster-prodworker-kg699-k5nbm"] is not None
+
+
 def test_nodes_need_every_frozen_worker():
     problems, out = fz.gate_nodes([node("w1", "10.0.0.1"), node("w2", "10.0.0.2"), node("cp", "10.0.0.9", Ready="False")],
                                   WORKERS)

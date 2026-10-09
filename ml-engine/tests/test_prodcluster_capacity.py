@@ -136,7 +136,10 @@ def test_r40_p8_result_is_validated_before_it_is_applied():
     s, e = D0, D0 + cap.DAY
     ok = cap.p8_check(p8_result(s, e), s, e, FROZEN, IE)
     assert ok["summary"]["verified_clean"] == 144 and not ok["summary"]["compromised"]
-    for bad in (p8_result(s, e, detector="infra_events.py v4"),
+    v6 = cap.p8_check(p8_result(s, e, detector="infra_events.py v6"), s, e, FROZEN, IE)   # D-1105: joined workers
+    assert v6["summary"]["verified_clean"] == 144
+    for bad in (p8_result(s, e, detector="infra_events.py v4"), p8_result(s, e, detector="infra_events.py v7"),
+                p8_result(s, e, detector="infra_events.py v6-dev"),
                 p8_result(s, e, run_identity=dict(p8_result(s, e)["run_identity"], mask_sha256="x")),
                 p8_result(s, e - cap.SLOT),                                      # does not cover the window
                 p8_result(s, e, segments=[(s, e, "clean-ish")]),
