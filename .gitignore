@@ -20,6 +20,6 @@ k8s-operator/manager
 *.log
 logs/
 
-# scripts/verify.sh run logs
+# scripts/verify.sh run logs (now written under logs/; the root patterns cover older checkouts)
 verify-*.log
 precommit-verify-failed.log
