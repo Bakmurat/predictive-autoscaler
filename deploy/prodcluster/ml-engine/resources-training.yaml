@@ -16,5 +16,8 @@ spec:
           containers:
             - name: trainer
               resources:
-                requests: { cpu: 500m, memory: 768Mi }   # provisional until measured on the final nodes (see evaluation-protocol.md)
+                # D-1100 (2026-10-09): 300m (was 500m) — the ML node's CPU requests leave no room for 500m since other
+                # workloads grew there (the 2026-10-09 00Z training stayed Pending until its deadline); the 2-CPU limit
+                # is unchanged, but under contention a smaller request also means a smaller CPU share (Codex r70).
+                requests: { cpu: 300m, memory: 768Mi }
                 limits: { cpu: "2", memory: 2Gi }
