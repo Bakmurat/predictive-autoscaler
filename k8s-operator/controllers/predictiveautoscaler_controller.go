@@ -23,7 +23,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -87,7 +87,7 @@ type PredictiveAutoscalerReconciler struct {
 	forecastLedger   forecastLedgerState
 	scaleStates      map[string]*scaleState
 	// Recorder emits Kubernetes events on condition transitions and scaling actions (nil-safe).
-	Recorder record.EventRecorder
+	Recorder events.EventRecorder
 	// APIReader reads straight from the API server (no cache) for the coexistence check and the write guard;
 	// nil falls back to the client (tests).
 	APIReader client.Reader
@@ -1338,7 +1338,11 @@ func (r *PredictiveAutoscalerReconciler) transitionEvents(a *autoscalerv1alpha1.
 
 func (r *PredictiveAutoscalerReconciler) event(a *autoscalerv1alpha1.PredictiveAutoscaler, typ, reason, msg string) {
 	if r.Recorder != nil {
-		r.Recorder.Event(a, typ, reason, msg)
+		action := "Reconcile"
+		if reason == "ScaledUp" || reason == "ScaledDown" {
+			action = "Scale"
+		}
+		r.Recorder.Eventf(a, nil, typ, reason, action, "%s", msg)
 	}
 }
 

@@ -15,6 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	autoscalerv1alpha1 "predictive-autoscaler/api/v1alpha1"
 	"predictive-autoscaler/controllers"
@@ -59,20 +60,21 @@ func main() {
 	// isolated namespace without both instances reconciling the same objects.
 	mgrOpts := ctrl.Options{
 		Scheme:                 scheme,
-		MetricsBindAddress:     metricsAddr,
-		Port:                   9443,
+		Metrics:                metricsserver.Options{BindAddress: metricsAddr}, // plain HTTP, as before
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "predictive-autoscaler-leader",
 	}
 	if raw := strings.TrimSpace(os.Getenv("WATCH_NAMESPACES")); raw != "" {
 		var namespaces []string
+		watched := map[string]cache.Config{}
 		for _, ns := range strings.Split(raw, ",") {
 			if ns = strings.TrimSpace(ns); ns != "" {
 				namespaces = append(namespaces, ns)
+				watched[ns] = cache.Config{}
 			}
 		}
-		mgrOpts.Cache = cache.Options{Namespaces: namespaces}
+		mgrOpts.Cache = cache.Options{DefaultNamespaces: watched}
 		setupLog.Info("Restricting watches to namespaces", "namespaces", namespaces)
 	}
 	restConfig := ctrl.GetConfigOrDie()
@@ -96,7 +98,7 @@ func main() {
 		Client:    mgr.GetClient(),
 		Scheme:    mgr.GetScheme(),
 		Log:       ctrl.Log.WithName("controllers").WithName("PredictiveAutoscaler"),
-		Recorder:  mgr.GetEventRecorderFor("predictive-autoscaler"),
+		Recorder:  mgr.GetEventRecorder("predictive-autoscaler"),
 		APIReader: mgr.GetAPIReader(),
 		Discovery: controllers.RESTDiscovery{Client: discoveryClient.RESTClient()},
 	}).SetupWithManager(mgr); err != nil {

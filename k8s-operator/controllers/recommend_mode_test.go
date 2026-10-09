@@ -11,7 +11,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	autoscalerv1alpha1 "predictive-autoscaler/api/v1alpha1"
@@ -19,7 +19,7 @@ import (
 
 // Recommend mode (the default, also when spec.mode is absent), status, conditions and events (plan items #2/#3, B1).
 
-func recommendHarness(t *testing.T, mode string, rpm string) (*PredictiveAutoscalerReconciler, ctrl.Request, string, *record.FakeRecorder) {
+func recommendHarness(t *testing.T, mode string, rpm string) (*PredictiveAutoscalerReconciler, ctrl.Request, string, *events.FakeRecorder) {
 	t.Helper()
 	r, a, req, path := rpmGaugeReconciler(t)
 	a.Spec.Mode = mode
@@ -34,7 +34,7 @@ func recommendHarness(t *testing.T, mode string, rpm string) (*PredictiveAutosca
 	ml := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(503) }))
 	t.Cleanup(ml.Close)
 	t.Setenv("ML_API_URL", ml.URL)
-	rec := record.NewFakeRecorder(100)
+	rec := events.NewFakeRecorder(100)
 	r.Recorder = rec
 	t.Cleanup(func() {
 		currentRpmGauge.DeleteLabelValues(req.Name, req.Namespace)
@@ -53,7 +53,7 @@ func getPA(t *testing.T, r *PredictiveAutoscalerReconciler, req ctrl.Request) *a
 	return &a
 }
 
-func drain(rec *record.FakeRecorder) []string {
+func drain(rec *events.FakeRecorder) []string {
 	var out []string
 	for {
 		select {
