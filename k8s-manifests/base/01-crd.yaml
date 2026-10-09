@@ -138,6 +138,12 @@ spec:
                     type: integer
                     minimum: 1
                     default: 10000
+
+              mode:
+                type: string
+                enum: ["Recommend", "Active"]
+                default: Recommend
+                description: "Recommend (the default, also when absent) computes and publishes decisions and writes nothing; Active scales the target. Only an explicit Active authorizes writes."
           
           status:
             type: object
@@ -147,6 +153,37 @@ spec:
               
               predictedReplicas:
                 type: integer
+                description: "Deprecated: the calculated count (historical meaning); use calculatedReplicas and forecastReplicas."
+
+              observedGeneration:
+                type: integer
+                format: int64
+
+              mode:
+                type: string
+
+              forecastReplicas:
+                type: integer
+                description: "Replicas from the forecast alone (absent when no forecast was used)."
+
+              calculatedReplicas:
+                type: integer
+                description: "The decision rule's result, or the held count when the request rate is unavailable."
+
+              stabilizedReplicas:
+                type: integer
+                description: "Active only: after scale-down stabilization and cooldown."
+
+              appliedReplicas:
+                type: integer
+                description: "Active only: the replica count of the last successful write."
+
+              readyReplicas:
+                type: integer
+
+              targetUID:
+                type: string
+                description: "UID of the target Deployment the status describes; a change clears appliedReplicas and lastScaleTime."
               
               lastPrediction:
                 type: string
@@ -172,6 +209,9 @@ spec:
                       type: string
                     message:
                       type: string
+                    observedGeneration:
+                      type: integer
+                      format: int64
     
     subresources:
       status: {}
@@ -186,12 +226,21 @@ spec:
     - name: Max
       type: integer
       jsonPath: .spec.maxReplicas
+    - name: Mode
+      type: string
+      jsonPath: .status.mode
     - name: Current
       type: integer
       jsonPath: .status.currentReplicas
-    - name: Predicted
+    - name: Calculated
       type: integer
-      jsonPath: .status.predictedReplicas
+      jsonPath: .status.calculatedReplicas
+    - name: Applied
+      type: integer
+      jsonPath: .status.appliedReplicas
+    - name: Ready
+      type: integer
+      jsonPath: .status.readyReplicas
     - name: Age
       type: date
       jsonPath: .metadata.creationTimestamp

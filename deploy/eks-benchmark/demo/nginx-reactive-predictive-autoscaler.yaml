@@ -22,6 +22,8 @@ metadata:
   annotations:
     description: "Matched control: same operator, same reactive rule, forecasting disabled"
 spec:
+  # Active: this autoscaler scales its Deployment (Recommend, observe-only, is the default when mode is absent).
+  mode: Active
   targetDeployment:
     name: nginx-reactive
     namespace: demo

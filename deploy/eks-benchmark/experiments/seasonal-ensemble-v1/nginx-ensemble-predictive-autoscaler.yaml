@@ -10,6 +10,8 @@ metadata:
   annotations:
     description: "Seasonal ensemble (Holt-Winters + 7-day profile/AR) with q90 margin, forecast from demo/nginx-test; own reactive demand"
 spec:
+  # Active: this autoscaler scales its Deployment (Recommend, observe-only, is the default when mode is absent).
+  mode: Active
   targetDeployment:
     name: nginx-ensemble
     namespace: demo

@@ -18,9 +18,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -59,6 +61,10 @@ type scaleState struct {
 	lastRPM            float64   // Previous reconcile's current RPM (for ramp-up detection)
 	reEvalCounter      int       // Counts reconciles since last periodic re-evaluation (OPER-01)
 	overrideActive     bool      // True when overestimate cap fired; bypasses stabilization (OPER-03)
+	// The state belongs to one mode and one target object: it is reset when either changes, so hypothetical
+	// (Recommend-mode) history never carries into Active mode and a re-created target starts clean.
+	mode      string
+	targetUID types.UID
 	// Replay-only (Codex C-52): the differential harness rebases wall-clock timestamps so a
 	// recorded sequence can be replayed at its own cadence through the real decision
 	// functions. Unused in production -- nothing outside replay_harness_test.go sets these.
@@ -79,6 +85,8 @@ type PredictiveAutoscalerReconciler struct {
 	predictionCache  map[string]*cachedPrediction
 	forecastLedger   forecastLedgerState
 	scaleStates      map[string]*scaleState
+	// Recorder emits Kubernetes events on condition transitions and scaling actions (nil-safe).
+	Recorder record.EventRecorder
 }
 
 // MLPredictionRequest represents the request to ML API
@@ -204,6 +212,10 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		return r.updateStatusWithError(ctx, &autoscaler, "DeploymentNotFound", err.Error())
 	}
 	currentReplicas := *deployment.Spec.Replicas
+	mode := autoscaler.Spec.EffectiveMode()
+	if st := r.getOrCreateScaleState(key); st.mode != mode || st.targetUID != deployment.UID {
+		*st = scaleState{mode: mode, targetUID: deployment.UID}
+	}
 
 	// --- PREDICTIVE COMPONENT ---
 	// Get ML prediction (cached, refresh every 5 min)
@@ -372,8 +384,12 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		"currentRPM", fmt.Sprintf("%.0f", currentRPM))
 
 	// --- APPLY SCALING ---
-
-	if desiredReplicas > currentReplicas {
+	// Recommend mode: the decision is complete and recorded, nothing is written and no scale history is advanced.
+	stabilized, applied := int32(0), int32(0)
+	if mode != autoscalerv1alpha1.ModeActive {
+		log.Info("Recommend mode: not scaling", "calculated", desiredReplicas, "current", currentReplicas)
+		r.recordDecision(dec, "recommend", currentReplicas)
+	} else if desiredReplicas > currentReplicas {
 		// SCALE UP: immediate — no delay for predicted or reactive
 		log.Info("Scaling UP",
 			"from", currentReplicas, "to", desiredReplicas,
@@ -385,6 +401,8 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 			return r.updateStatusWithError(ctx, &autoscaler, "ScalingError", err.Error())
 		}
 		r.recordDecision(dec, "scale_up", desiredReplicas)
+		stabilized, applied = desiredReplicas, desiredReplicas
+		r.event(&autoscaler, "Normal", "ScaledUp", fmt.Sprintf("Scaled %s from %d to %d", deployment.Name, currentReplicas, desiredReplicas))
 		state.lastScaleUp = time.Now()
 		state.belowCurrentSince = time.Time{} // reset scale-down timer
 		log.Info("Scaled deployment", "from", currentReplicas, "to", desiredReplicas)
@@ -401,6 +419,8 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 				return r.updateStatusWithError(ctx, &autoscaler, "ScalingError", err.Error())
 			}
 			r.recordDecision(dec, "scale_down", target)
+			stabilized, applied = target, target
+			r.event(&autoscaler, "Normal", "ScaledDown", fmt.Sprintf("Scaled %s from %d to %d (calculated %d)", deployment.Name, currentReplicas, target, desiredReplicas))
 			state.lastScaleDown = time.Now()
 			state.overrideActive = false // clear override after scale-down completes (per D-12)
 			log.Info("Scaled deployment", "from", currentReplicas, "to", target)
@@ -416,6 +436,7 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 			log.Info("Scale-down pending ("+reason+")",
 				"desired", desiredReplicas, "current", currentReplicas)
 			r.recordDecision(dec, "hold_"+reason, currentReplicas)
+			stabilized = currentReplicas
 		}
 
 	} else {
@@ -427,10 +448,20 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 			action = "keep_current"
 		}
 		r.recordDecision(dec, action, currentReplicas)
+		stabilized = currentReplicas
 	}
 
 	// Update status
-	if err := r.updateStatus(ctx, &autoscaler, desiredReplicas, currentReplicas); err != nil {
+	forecastReplicas := int32(0)
+	if dec.ForecastStatus == "used" {
+		forecastReplicas = predictedReplicas
+	}
+	if err := r.updateStatus(ctx, &autoscaler, statusInputs{
+		mode: mode, calculated: desiredReplicas, forecast: forecastReplicas, stabilized: stabilized, applied: applied,
+		current: currentReplicas, ready: deployment.Status.ReadyReplicas, keepCurrent: keepCurrent,
+		telemetry: dec.TelemetryStatus, telemetryError: dec.TelemetryError, forecastStatus: dec.ForecastStatus,
+		forecastIssuedAt: dec.ForecastIssuedAt, targetUID: string(deployment.UID),
+	}); err != nil {
 		log.Error(err, "Failed to update status")
 	}
 
@@ -1052,73 +1083,156 @@ func (r *PredictiveAutoscalerReconciler) scaleDeployment(
 	return nil
 }
 
-// updateStatus updates the PredictiveAutoscaler status
-func (r *PredictiveAutoscalerReconciler) updateStatus(
-	ctx context.Context,
-	autoscaler *autoscalerv1alpha1.PredictiveAutoscaler,
-	predictedReplicas int32,
-	currentReplicas int32,
-) error {
-	now := metav1.Now()
-	autoscaler.Status.PredictedReplicas = predictedReplicas
-	autoscaler.Status.CurrentReplicas = currentReplicas
-	autoscaler.Status.LastPrediction = &now
-
-	condition := metav1.Condition{
-		Type:               "Ready",
-		Status:             metav1.ConditionTrue,
-		LastTransitionTime: now,
-		Reason:             "ScalingSuccessful",
-		Message:            fmt.Sprintf("Unified: predicted=%d, desired=%d, current=%d", predictedReplicas, predictedReplicas, currentReplicas),
-	}
-
-	found := false
-	for i, cond := range autoscaler.Status.Conditions {
-		if cond.Type == "Ready" {
-			autoscaler.Status.Conditions[i] = condition
-			found = true
-			break
-		}
-	}
-	if !found {
-		autoscaler.Status.Conditions = append(autoscaler.Status.Conditions, condition)
-	}
-
-	return r.Status().Update(ctx, autoscaler)
+// statusInputs carries one reconcile's results into the status.
+type statusInputs struct {
+	mode                                                      string
+	calculated, forecast, stabilized, applied, current, ready int32
+	keepCurrent                                               bool
+	telemetry, forecastStatus                                 string
+	telemetryError, forecastIssuedAt                          *string
+	targetUID                                                 string
 }
 
-// updateStatusWithError updates status with error condition
+var forecastReasons = map[string]string{"disabled": "Disabled", "unavailable": "Unavailable",
+	"horizon_elapsed": "HorizonElapsed", "sanity_rejected": "SanityRejected"}
+
+// updateStatus writes the status when it changed: replica counts, mode, observedGeneration and the conditions Ready,
+// TelemetryAvailable, ForecastAvailable and ScalingActive (transition times preserved). Events are emitted on
+// condition transitions only.
+func (r *PredictiveAutoscalerReconciler) updateStatus(ctx context.Context, autoscaler *autoscalerv1alpha1.PredictiveAutoscaler, in statusInputs) error {
+	before := autoscaler.Status.DeepCopy()
+	st := &autoscaler.Status
+	st.ObservedGeneration = autoscaler.Generation
+	st.Mode = in.mode
+	if st.TargetUID != in.targetUID { // a replaced or retargeted Deployment: its predecessor's history does not apply
+		st.TargetUID, st.AppliedReplicas, st.LastScaleTime = in.targetUID, 0, nil
+	}
+	st.PredictedReplicas = in.calculated // deprecated field, historical meaning (the calculated count)
+	st.CalculatedReplicas, st.ForecastReplicas, st.StabilizedReplicas = in.calculated, in.forecast, in.stabilized
+	st.CurrentReplicas, st.ReadyReplicas = in.current, in.ready
+	if in.mode != autoscalerv1alpha1.ModeActive {
+		st.StabilizedReplicas = 0
+	}
+	if in.applied > 0 {
+		st.AppliedReplicas = in.applied
+		now := metav1.Now()
+		st.LastScaleTime = &now
+	}
+	if in.forecastIssuedAt != nil {
+		if t, err := time.Parse(time.RFC3339, normalizeRFC3339(*in.forecastIssuedAt)); err == nil {
+			mt := metav1.NewTime(t)
+			st.LastPrediction = &mt
+		}
+	}
+	gen := autoscaler.Generation
+	set := func(t string, ok bool, reason, msg string) {
+		status := metav1.ConditionFalse
+		if ok {
+			status = metav1.ConditionTrue
+		}
+		meta.SetStatusCondition(&st.Conditions, metav1.Condition{Type: t, Status: status, Reason: reason, Message: msg, ObservedGeneration: gen})
+	}
+	set("Ready", true, "ReconcileCompleted", fmt.Sprintf("calculated=%d current=%d mode=%s", in.calculated, in.current, in.mode))
+	if in.telemetry == "measured" {
+		set("TelemetryAvailable", true, "Measured", "the current request rate was measured")
+	} else {
+		msg := "the current request rate is unavailable"
+		if in.telemetryError != nil {
+			msg = *in.telemetryError
+		}
+		set("TelemetryAvailable", false, "MetricsUnavailable", msg)
+	}
+	if in.forecastStatus == "used" {
+		set("ForecastAvailable", true, "Used", "a forecast was used in the decision")
+	} else {
+		reason := forecastReasons[in.forecastStatus]
+		if reason == "" {
+			reason = "Unavailable"
+		}
+		set("ForecastAvailable", false, reason, "forecast status: "+in.forecastStatus)
+	}
+	switch {
+	case in.mode != autoscalerv1alpha1.ModeActive:
+		set("ScalingActive", false, "RecommendMode", "Recommend mode: the operator computes and publishes decisions and writes nothing")
+	case in.keepCurrent:
+		set("ScalingActive", false, "TelemetryHold", "holding the current replica count: the current request rate is unavailable")
+	default:
+		set("ScalingActive", true, "Active", "the operator scales the target")
+	}
+	if statusEqual(before, st) {
+		return nil
+	}
+	if err := r.Status().Update(ctx, autoscaler); err != nil {
+		return err
+	}
+	r.transitionEvents(autoscaler, before.Conditions, st.Conditions) // only after the status is persisted
+	return nil
+}
+
+// statusEqual compares two statuses including condition contents (transition times are preserved by SetStatusCondition).
+func statusEqual(a, b *autoscalerv1alpha1.PredictiveAutoscalerStatus) bool {
+	ja, _ := json.Marshal(a)
+	jb, _ := json.Marshal(b)
+	return bytes.Equal(ja, jb)
+}
+
+// transitionEvents emits one event per condition whose status changed (or that first appears unhealthy).
+func (r *PredictiveAutoscalerReconciler) transitionEvents(a *autoscalerv1alpha1.PredictiveAutoscaler, old, cur []metav1.Condition) {
+	names := map[string][2]string{ // type → {event when it turns False, event when it turns True}
+		"TelemetryAvailable": {"TelemetryUnavailable", "TelemetryRestored"},
+		"ForecastAvailable":  {"ForecastUnavailable", "ForecastRestored"},
+		"ScalingActive":      {"ScalingInactive", "ScalingActive"},
+		"Ready":              {"ReconcileFailed", "ReconcileRecovered"},
+	}
+	for _, c := range cur {
+		n, ok := names[c.Type]
+		if !ok {
+			continue
+		}
+		prev := meta.FindStatusCondition(old, c.Type)
+		if prev != nil && prev.Status == c.Status && prev.Reason == c.Reason {
+			continue
+		}
+		if prev == nil && c.Status == metav1.ConditionTrue {
+			continue // a healthy first observation is not news
+		}
+		switch {
+		case c.Status == metav1.ConditionTrue:
+			r.event(a, "Normal", n[1], c.Message)
+		case c.Reason == "RecommendMode" || c.Reason == "Disabled": // configured states, not faults
+			r.event(a, "Normal", c.Reason, c.Message)
+		default:
+			r.event(a, "Warning", n[0], c.Reason+": "+c.Message)
+		}
+	}
+}
+
+func (r *PredictiveAutoscalerReconciler) event(a *autoscalerv1alpha1.PredictiveAutoscaler, typ, reason, msg string) {
+	if r.Recorder != nil {
+		r.Recorder.Event(a, typ, reason, msg)
+	}
+}
+
+// updateStatusWithError records a failed reconcile (Ready=False, transition time preserved).
 func (r *PredictiveAutoscalerReconciler) updateStatusWithError(
 	ctx context.Context,
 	autoscaler *autoscalerv1alpha1.PredictiveAutoscaler,
 	reason string,
 	message string,
 ) (ctrl.Result, error) {
-	now := metav1.Now()
-	condition := metav1.Condition{
-		Type:               "Ready",
-		Status:             metav1.ConditionFalse,
-		LastTransitionTime: now,
-		Reason:             reason,
-		Message:            message,
+	before := autoscaler.Status.DeepCopy()
+	autoscaler.Status.ObservedGeneration = autoscaler.Generation
+	autoscaler.Status.Mode = autoscaler.Spec.EffectiveMode()
+	for _, c := range []string{"Ready", "ScalingActive"} {
+		meta.SetStatusCondition(&autoscaler.Status.Conditions, metav1.Condition{Type: c, Status: metav1.ConditionFalse,
+			Reason: reason, Message: message, ObservedGeneration: autoscaler.Generation})
 	}
-
-	found := false
-	for i, cond := range autoscaler.Status.Conditions {
-		if cond.Type == "Ready" {
-			autoscaler.Status.Conditions[i] = condition
-			found = true
-			break
+	if !statusEqual(before, &autoscaler.Status) {
+		if err := r.Status().Update(ctx, autoscaler); err != nil {
+			return ctrl.Result{}, err
 		}
+		r.transitionEvents(autoscaler, before.Conditions, autoscaler.Status.Conditions)
 	}
-	if !found {
-		autoscaler.Status.Conditions = append(autoscaler.Status.Conditions, condition)
-	}
-
-	if err := r.Status().Update(ctx, autoscaler); err != nil {
-		return ctrl.Result{}, err
-	}
-
 	return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
 }
 
