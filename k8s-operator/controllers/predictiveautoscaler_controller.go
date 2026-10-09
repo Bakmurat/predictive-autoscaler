@@ -128,8 +128,9 @@ func predictionEnabled(a *autoscalerv1alpha1.PredictiveAutoscaler) bool {
 
 // VMInstantQueryResponse represents the VictoriaMetrics instant query response
 type VMInstantQueryResponse struct {
-	Status string `json:"status"`
-	Data   struct {
+	Status    string `json:"status"`
+	IsPartial bool   `json:"isPartial"` // VictoriaMetrics: some storage nodes did not answer
+	Data      struct {
 		ResultType string `json:"resultType"`
 		Result     []struct {
 			Value [2]interface{} `json:"value"` // [timestamp, "value_string"]
@@ -241,7 +242,7 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	currentRPM, vmErr := r.queryCurrentRPM(autoscaler.Spec.TargetDeployment.Name, autoscaler.Spec.TargetDeployment.Namespace)
 	reactiveReplicas := int32(0)
 	if vmErr != nil {
-		log.Info("VM query failed, using prediction only", "error", vmErr.Error())
+		log.Info("Current request rate unavailable; the decision will hold the current replica count", "error", vmErr.Error())
 	} else {
 		targetRPM := int32(20000)
 		if autoscaler.Spec.Metrics.Requests != nil && autoscaler.Spec.Metrics.Requests.TargetRPS > 0 {
@@ -252,6 +253,11 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		}
 	}
 	dec.ReactiveReplicas, dec.CurrentRPM = reactiveReplicas, currentRPM
+	dec.TelemetryStatus = "measured"
+	if vmErr != nil {
+		msg := vmErr.Error()
+		dec.TelemetryStatus, dec.TelemetryError = "unavailable", &msg
+	}
 
 	// --- PREDICTION SANITY CHECK ---
 	// Guard against diverging LSTM predictions (exponential blowup).
@@ -307,29 +313,20 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	state.lastRPM = currentRPM
 
 	// --- UNIFIED DECISION ---
-	// desired = max(predicted_baseline, reactive_needed, minReplicas)
-	desiredReplicas := predictedReplicas
-	if reactiveReplicas > desiredReplicas {
-		desiredReplicas = reactiveReplicas
-	}
-	if desiredReplicas < autoscaler.Spec.MinReplicas {
-		desiredReplicas = autoscaler.Spec.MinReplicas
-	}
-	if desiredReplicas > autoscaler.Spec.MaxReplicas {
-		desiredReplicas = autoscaler.Spec.MaxReplicas
-	}
-
-	// No usable input (forecast off or failed, and the metrics query failed) — keep current replicas
-	keepCurrent := false
-	if (predErr != nil || !forecasting) && vmErr != nil {
-		log.Info("Both prediction and VM query failed, keeping current replicas",
-			"current", currentReplicas)
-		desiredReplicas = currentReplicas
-		keepCurrent = true
+	desiredReplicas, keepCurrent := unifiedDesired(predictedReplicas, reactiveReplicas,
+		autoscaler.Spec.MinReplicas, autoscaler.Spec.MaxReplicas, currentReplicas,
+		dec.ForecastStatus == "used", vmErr == nil)
+	if keepCurrent {
+		log.Info("Current request rate unavailable: holding the current replica count",
+			"current", currentReplicas, "desired", desiredReplicas, "error", vmErr.Error())
+		// A forecast may be available but does not take part in a hold.
+		dec.Safeguards = append(dec.Safeguards, "telemetry_unavailable_hold")
 	}
 	dec.setDecision(predictedReplicas, desiredReplicas, keepCurrent)
 
 	// --- ACCURACY METRICS ---
+	// The actual need and the prediction error come from a measured rate only: without one they would be invented
+	// (minReplicas, 100 % error), so their series are removed instead.
 	actualNeeded := reactiveReplicas
 	if actualNeeded < autoscaler.Spec.MinReplicas {
 		actualNeeded = autoscaler.Spec.MinReplicas
@@ -342,8 +339,13 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 
 	predictedReplicasGauge.WithLabelValues(appName, appNS).Set(float64(predictedReplicas))
 	desiredReplicasGauge.WithLabelValues(appName, appNS).Set(float64(desiredReplicas))
-	actualNeededReplicasGauge.WithLabelValues(appName, appNS).Set(float64(actualNeeded))
-	predictionErrorPercentGauge.WithLabelValues(appName, appNS).Set(errorPct)
+	if vmErr == nil {
+		actualNeededReplicasGauge.WithLabelValues(appName, appNS).Set(float64(actualNeeded))
+		predictionErrorPercentGauge.WithLabelValues(appName, appNS).Set(errorPct)
+	} else {
+		actualNeededReplicasGauge.DeleteLabelValues(appName, appNS)
+		predictionErrorPercentGauge.DeleteLabelValues(appName, appNS)
+	}
 
 	// RPM gauges (D-08, D-09) — update every reconcile cycle
 	if dec.ForecastStatus == "used" && dec.LeadWindowPeak != nil && prediction != nil && len(prediction.Predictions) > 0 {
@@ -354,8 +356,10 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		// Absence distinguishes an unused/empty forecast from a usable forecast of zero RPM.
 		predictedRpmGauge.DeleteLabelValues(appName, appNS)
 	}
-	if currentRPM > 0 {
-		currentRpmGauge.WithLabelValues(appName, appNS).Set(currentRPM)
+	if vmErr == nil {
+		currentRpmGauge.WithLabelValues(appName, appNS).Set(currentRPM) // a measured zero is published as zero
+	} else {
+		currentRpmGauge.DeleteLabelValues(appName, appNS) // never leave the previous measurement standing
 	}
 
 	log.Info("Unified scaling decision",
@@ -560,6 +564,7 @@ func (r *PredictiveAutoscalerReconciler) queryCurrentRPM(deploymentName, namespa
 	endpoint := fmt.Sprintf("%s/api/v1/query", vmURL)
 	params := url.Values{}
 	params.Set("query", query)
+	params.Set("deny_partial_response", "1") // VictoriaMetrics cluster: fail rather than answer partially (also checked below)
 
 	httpClient := &http.Client{Timeout: vmQueryTimeout}
 	resp, err := httpClient.Get(fmt.Sprintf("%s?%s", endpoint, params.Encode()))
@@ -578,21 +583,71 @@ func (r *PredictiveAutoscalerReconciler) queryCurrentRPM(deploymentName, namespa
 		return 0, fmt.Errorf("failed to decode VM response: %w", err)
 	}
 
-	if vmResp.Status != "success" || len(vmResp.Data.Result) == 0 {
-		return 0, nil // No data = 0 RPM (no traffic or metric not available yet)
+	// Only a complete, successful answer with exactly one finite, non-negative sample is a measurement. Anything else
+	// is "unavailable", never zero traffic: reading it as 0 req/min used to scale a workload down to minReplicas during a
+	// metrics outage. A workload whose request counter exists but sees no traffic returns one series with value 0 (a real
+	// zero); when scraping stops, rate(...[1m]) returns no series, which is unavailable.
+	if vmResp.Status != "success" {
+		return 0, fmt.Errorf("%w: status %q", errMetricsUnavailable, vmResp.Status)
+	}
+	if vmResp.IsPartial {
+		return 0, fmt.Errorf("%w: partial response", errMetricsUnavailable)
+	}
+	if vmResp.Data.ResultType != "vector" {
+		return 0, fmt.Errorf("%w: resultType %q, want vector", errMetricsUnavailable, vmResp.Data.ResultType)
+	}
+	if n := len(vmResp.Data.Result); n != 1 {
+		return 0, fmt.Errorf("%w: %d series, want exactly one", errMetricsUnavailable, n)
+	}
+	if _, ok := vmResp.Data.Result[0].Value[0].(float64); !ok {
+		return 0, fmt.Errorf("%w: malformed sample timestamp", errMetricsUnavailable)
 	}
 
 	valueStr, ok := vmResp.Data.Result[0].Value[1].(string)
 	if !ok {
-		return 0, fmt.Errorf("unexpected value type in VM response")
+		return 0, fmt.Errorf("%w: unexpected value type in VM response", errMetricsUnavailable)
 	}
 
 	rpm, err := strconv.ParseFloat(valueStr, 64)
 	if err != nil {
-		return 0, fmt.Errorf("failed to parse RPM value '%s': %w", valueStr, err)
+		return 0, fmt.Errorf("%w: failed to parse RPM value '%s': %v", errMetricsUnavailable, valueStr, err)
+	}
+	if math.IsNaN(rpm) || math.IsInf(rpm, 0) || rpm < 0 {
+		return 0, fmt.Errorf("%w: value %q is not a finite, non-negative rate", errMetricsUnavailable, valueStr)
 	}
 
 	return rpm, nil
+}
+
+// errMetricsUnavailable marks every metrics answer that is not a usable measurement of the current request rate.
+var errMetricsUnavailable = stderrors.New("current request rate unavailable")
+
+// unifiedDesired is the one decision rule, shared by Reconcile and the replay harness.
+//
+//	telemetry measured: desired = clamp(max(forecast replicas if a forecast is used, reactive replicas), min, max)
+//	telemetry missing:  hold the current count (clamped to the bounds) — never scale on a forecast alone, never
+//	                    read "no data" as zero traffic (user decision 2026-10-09: missing metrics → HOLD).
+func unifiedDesired(predicted, reactive, minReplicas, maxReplicas, current int32, forecastUsed, telemetryOK bool) (int32, bool) {
+	clamp := func(v int32) int32 {
+		if v < minReplicas {
+			v = minReplicas
+		}
+		if v > maxReplicas {
+			v = maxReplicas
+		}
+		return v
+	}
+	if !telemetryOK {
+		return clamp(current), true
+	}
+	desired := int32(0)
+	if forecastUsed {
+		desired = predicted
+	}
+	if reactive > desired {
+		desired = reactive
+	}
+	return clamp(desired), false
 }
 
 // getCachedPrediction returns ML predictions, using a 5-min cache to avoid

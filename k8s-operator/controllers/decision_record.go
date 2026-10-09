@@ -34,13 +34,17 @@ type decisionRecord struct {
 	Safeguards        []string `json:"safeguards"`
 	ReactiveReplicas  int32    `json:"reactive_replicas"`
 	CurrentRPM        float64  `json:"current_rpm"`
-	MinReplicas       int32    `json:"min_replicas"`
-	MaxReplicas       int32    `json:"max_replicas"`
-	DesiredReplicas   int32    `json:"desired_replicas"`
-	DesiredSource     string   `json:"desired_source"` // prediction|reactive|tie|min_replicas|max_replicas|keep_current
-	CurrentReplicas   int32    `json:"current_replicas"`
-	AppliedReplicas   int32    `json:"applied_replicas"`
-	Action            string   `json:"action"` // scale_up|scale_down|hold_stabilizing|hold_cooldown|at_target|keep_current|scale_error
+	// TelemetryStatus says whether current_rpm/reactive_replicas are a measurement ("measured") or not
+	// ("unavailable": both are then 0 placeholders, never zero traffic; TelemetryError says why).
+	TelemetryStatus string  `json:"telemetry_status"`
+	TelemetryError  *string `json:"telemetry_error,omitempty"`
+	MinReplicas     int32   `json:"min_replicas"`
+	MaxReplicas     int32   `json:"max_replicas"`
+	DesiredReplicas int32   `json:"desired_replicas"`
+	DesiredSource   string  `json:"desired_source"` // prediction|reactive|tie|min_replicas|max_replicas|keep_current
+	CurrentReplicas int32   `json:"current_replicas"`
+	AppliedReplicas int32   `json:"applied_replicas"`
+	Action          string  `json:"action"` // scale_up|scale_down|hold_stabilizing|hold_cooldown|at_target|keep_current|scale_error
 }
 
 func newDecisionRecord(a *autoscalerv1alpha1.PredictiveAutoscaler, forecasting bool, current int32) *decisionRecord {
