@@ -7,8 +7,8 @@ production-ready. Known limits, most important first:
    configuration.md, Decision rule), so a real load change during a monitoring outage is not followed until metrics return.
 2. **Only known scalers are detected.** In `Active` mode the operator refuses to scale while one of these targets the
    Deployment: an HPA, an unpaused KEDA ScaledObject, or another Active PredictiveAutoscaler. It does not detect other
-   writers (CI jobs, `kubectl scale`, GitOps applying `replicas`). The check is not atomic, and the replica count is
-   still written with a full Deployment update (see coexistence.md).
+   writers (CI jobs, `kubectl scale`, GitOps applying `replicas`), and the check is not atomic. A write is refused if
+   the replica count changed after the decision (see coexistence.md).
 3. **Istio is required** for the request-rate signal (`istio_requests_total{reporter="destination"}`), and the queries
    are not configurable.
 4. **One workload per trainer.** The training CronJob trains one workload (`TRAINING_WORKLOAD`/`TRAINING_NAMESPACE`), and
@@ -16,8 +16,8 @@ production-ready. Known limits, most important first:
    runs reactive-only, silently.
 5. **Single forecasting replica on a ReadWriteOnce volume:** the API and the trainer must run on the same node; the API is
    a single point of failure (the operator falls back to the reactive rule when it is down).
-6. **Operator state in memory:** cooldowns, stabilization windows and forecast caches are lost on restart; leader
-   election is off by default.
+6. **Operator state in memory:** cooldowns, stabilization windows and forecast caches are lost on restart, and when
+   leadership moves to another instance.
 7. **Broad permissions:** one cluster-wide role is shared by the operator and the forecasting API, and the API's
    `/predict` and `/train` endpoints are unauthenticated.
 8. **Silent configuration mistakes:** ignored CRD fields (CPU, memory, resources, container), defaults that differ from

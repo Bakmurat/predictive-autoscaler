@@ -47,21 +47,28 @@ sync and the workload flaps between their answers.
 - **Same namespace only:** `targetDeployment.namespace` must equal the PredictiveAutoscaler's namespace. Otherwise the
   status shows `Ready=False` with reason `CrossNamespaceTarget`, and nothing is written.
 - **Limits:**
-  - The check is not atomic across objects. A scaler created between the check and the write (milliseconds) is caught at
-    the next reconcile, not before that write.
+  - The check is not atomic across objects. A scaler created between the check and the write is caught at the next
+    reconcile, not before that write; if it has already changed the replica count, the write itself is refused (see
+    "Writing" below).
   - HPAs and ScaledObjects are not watched yet, so a new conflict shows in the status at the next reconcile (one
     `updateIntervalSeconds`).
   - Writers of other kinds are not detected: a CI job, someone running `kubectl scale`, or a GitOps tool applying
     `replicas`.
-- **GitOps:** the operator writes the replica count by updating the whole Deployment object. GitOps tools that own the
-  Deployment manifest (Argo CD, Flux) will see drift on `spec.replicas`. Exclude that field from their comparison: for
-  example, use Argo CD `ignoreDifferences` on `/spec/replicas`, or omit `replicas` from the managed manifest.
-- **Leader election** exists but is off by default, so during a rolling update of the operator two instances can act at
-  the same time. Run one replica with the `Recreate` strategy.
+- **Writing:** the replica count is written only through the Deployment's `/scale` subresource; no other field is
+  touched. The operator reads a fresh Scale and writes only if its replica count is still the one the decision was
+  computed from. The update carries the Scale's resourceVersion, so a change in between is rejected. In both cases
+  nothing is written (`action: guard_abort`, `ScalingActive=False` with reason `GuardAborted`), the old decision is
+  never retried, and a fresh reconcile, with all checks, follows within about 5 s.
+- **GitOps:** tools that own the Deployment manifest (Argo CD, Flux) will see drift on `spec.replicas`. Exclude that
+  field from their comparison: for example, use Argo CD `ignoreDifferences` on `/spec/replicas`, or omit `replicas`
+  from the managed manifest.
+- **Leader election** is on by default (`--leader-elect`, Lease `predictive-autoscaler-leader` in the operator's
+  namespace), so only one pod of an installation reconciles at a time, even during a rolling update. Installations
+  whose watched namespaces overlap coordinate only if they share the Lease namespace
+  (`--leader-election-namespace`); separate default namespaces do not coordinate them. Outside a cluster, pass
+  `--leader-election-namespace`, or `--leader-elect=false` for a single local run.
 
 ## Planned
-- Replicas written only through the `/scale` subresource, re-authorized on a write conflict, and leader election on by
-  default.
 - Watching HPAs and ScaledObjects, so that a new conflict is reported at once.
 
 ## The paused-KEDA fallback pattern

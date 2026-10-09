@@ -1,0 +1,25 @@
+# Leader election (on by default, --leader-elect): the operator holds the Lease "predictive-autoscaler-leader" in its
+# own namespace, so only one instance reconciles at a time.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: predictive-operator-leader-election
+  namespace: ml-engine
+rules:
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: predictive-operator-leader-election
+  namespace: ml-engine
+subjects:
+- kind: ServiceAccount
+  name: predictive-operator-sa
+  namespace: ml-engine
+roleRef:
+  kind: Role
+  name: predictive-operator-leader-election
+  apiGroup: rbac.authorization.k8s.io

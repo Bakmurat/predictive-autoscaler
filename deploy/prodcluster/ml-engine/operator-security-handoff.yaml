@@ -7,10 +7,11 @@
 # walk once the root already matches. Neither setting is proof of writability on its own: verify an
 # append by the operator process itself.
 #
-# strategy Recreate: leader election is OFF by default (k8s-operator/main.go, --leader-elect=false) and
-# no argument enables it, so a RollingUpdate with surge would run two active controllers against the
-# same PredictiveAutoscaler objects during the overlap. Recreate stops the old pod before the new one
-# starts; the cost is a short control interruption, which each rollout records.
+# strategy Recreate: the operator appends to the ReadWriteOnce forecast-log volume, so only one pod may run.
+# (Images built before leader election became the default, as in the benchmark campaign, also need it so that
+# two active controllers never overlap; with leader election on, a surge pod would wait for the Lease.)
+# Recreate stops the old pod before the new one starts; the cost is a short control interruption, which each
+# rollout records.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
