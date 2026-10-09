@@ -9,8 +9,9 @@
 # istio_requests_total{reporter="destination"} in a Prometheus-compatible store, and a model must have been trained
 # for the workload (see the README). Without a model the operator runs reactive-only.
 #
-# Only one controller may own a Deployment's replica count: do not also run an active HPA or KEDA ScaledObject on the
-# same Deployment (a paused KEDA ScaledObject kept for a manual hand-over is fine; see docs/coexistence.md).
+# Only one controller may own a Deployment's replica count. In Active mode the operator refuses to scale while an HPA,
+# an unpaused KEDA ScaledObject or another Active PredictiveAutoscaler targets the same Deployment (a paused KEDA
+# ScaledObject kept for a manual hand-over is fine; see docs/coexistence.md).
 apiVersion: autoscaler.example.com/v1alpha1
 kind: PredictiveAutoscaler
 metadata:
@@ -21,7 +22,7 @@ spec:
   mode: Recommend
   targetDeployment:
     name: web-frontend
-    namespace: shop          # this version allows any namespace; keep it equal to the CR's namespace
+    namespace: shop          # must equal the CR's namespace
   minReplicas: 2
   maxReplicas: 20
   metrics:

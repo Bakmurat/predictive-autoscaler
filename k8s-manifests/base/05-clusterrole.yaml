@@ -13,14 +13,19 @@ rules:
   resources: ["pods"]
   verbs: ["get", "list", "watch"]
 
-# Read/Write HPA (to coordinate with KEDA)
+# Read the other replica writers on a target (coexistence check before every write; the operator never changes them)
 - apiGroups: ["autoscaling"]
   resources: ["horizontalpodautoscalers"]
-  verbs: ["get", "list", "watch", "patch", "update"]
+  verbs: ["get", "list", "watch"]
 
-# Read KEDA ScaledObjects (optional)
+# KEDA ScaledObjects (optional API: absent is not a conflict)
 - apiGroups: ["keda.sh"]
   resources: ["scaledobjects"]
+  verbs: ["get", "list", "watch"]
+
+# VerticalPodAutoscalers (optional API; reported as the VPAInterference warning)
+- apiGroups: ["autoscaling.k8s.io"]
+  resources: ["verticalpodautoscalers"]
   verbs: ["get", "list", "watch"]
 
 # Read ConfigMaps (for application config)

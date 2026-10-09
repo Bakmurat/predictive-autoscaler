@@ -44,7 +44,7 @@ spec:
                     description: "Name of the deployment to scale"
                   namespace:
                     type: string
-                    description: "Namespace of the deployment"
+                    description: "Namespace of the deployment; must equal the PredictiveAutoscaler's namespace"
                   container:
                     type: string
                     description: "Container name (default: first container)"

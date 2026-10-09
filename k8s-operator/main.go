@@ -4,10 +4,13 @@ import (
 	"flag"
 	"os"
 	"strings"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/discovery"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
@@ -72,17 +75,30 @@ func main() {
 		mgrOpts.Cache = cache.Options{Namespaces: namespaces}
 		setupLog.Info("Restricting watches to namespaces", "namespaces", namespaces)
 	}
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), mgrOpts)
+	restConfig := ctrl.GetConfigOrDie()
+	mgr, err := ctrl.NewManager(restConfig, mgrOpts)
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
 	}
 
+	// Uncached discovery for the coexistence check (optional KEDA/VPA APIs); the check's context bounds each request,
+	// and the request timeout is a backstop.
+	discoveryConfig := rest.CopyConfig(restConfig)
+	discoveryConfig.Timeout = 10 * time.Second
+	discoveryClient, err := discovery.NewDiscoveryClientForConfig(discoveryConfig)
+	if err != nil {
+		setupLog.Error(err, "unable to create the discovery client")
+		os.Exit(1)
+	}
+
 	if err = (&controllers.PredictiveAutoscalerReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Log:      ctrl.Log.WithName("controllers").WithName("PredictiveAutoscaler"),
-		Recorder: mgr.GetEventRecorderFor("predictive-autoscaler"),
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Log:       ctrl.Log.WithName("controllers").WithName("PredictiveAutoscaler"),
+		Recorder:  mgr.GetEventRecorderFor("predictive-autoscaler"),
+		APIReader: mgr.GetAPIReader(),
+		Discovery: controllers.RESTDiscovery{Client: discoveryClient.RESTClient()},
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "PredictiveAutoscaler")
 		os.Exit(1)

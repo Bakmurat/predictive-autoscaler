@@ -1,8 +1,8 @@
 # Getting started (current version: build and install from source)
 
 There are no published images, Helm chart or releases yet; a chart and a kind quickstart are planned. This guide installs
-the current version from source. Read `limitations.md` first: in particular, do not run it next to another autoscaler on
-the same Deployment (`coexistence.md`).
+the current version from source. Read `limitations.md` first. In `Active` mode the operator refuses to scale while another autoscaler targets the same
+Deployment (`coexistence.md`).
 
 ## 1. Prerequisites
 - A Kubernetes cluster and `kubectl` pointed at it explicitly (`kubectl config current-context`); try it on a disposable
