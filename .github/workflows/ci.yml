@@ -1,0 +1,53 @@
+# CI: the same checks as `make verify` (scripts/verify.sh), on GitHub-hosted runners only.
+# Security (public repository): read-only token, no secrets, no deployment credentials, actions pinned to commit SHAs,
+# never `pull_request_target` (pull-request code never runs with write permissions). Releases get their own workflow.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main, "product/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: operator (go vet, go test -race)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e   # v7.0.0
+        with:
+          go-version: "1.21.x"            # the operator image's builder (k8s-operator/Dockerfile)
+          cache-dependency-path: k8s-operator/go.sum
+      - name: verify (Go)
+        run: LOG=/dev/null scripts/verify.sh --go-only
+
+  python:
+    name: forecaster + evaluation tooling (pytest, scorer, archive)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97   # v7.0.0
+        with:
+          python-version: "3.12"            # the forecasting image's base (ml-engine/Dockerfile)
+          cache: pip
+          cache-dependency-path: |
+            ml-engine/requirements.txt
+            ml-engine/requirements-dev.txt
+      - name: install
+        run: python -m pip install -r ml-engine/requirements.txt -r ml-engine/requirements-dev.txt
+      - name: verify (Python)
+        run: LOG=/dev/null PYTHON=python scripts/verify.sh --python-only

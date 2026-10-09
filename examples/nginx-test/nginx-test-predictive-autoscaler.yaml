@@ -9,7 +9,10 @@
 # - Reactive floor: current RPM from VictoriaMetrics (catches under-prediction)
 # - Scale-up: immediate
 # - Scale-down: stabilized (5 min wait, then gradual reduction)
-# - KEDA is paused — this operator is the sole replica controller
+# - The KEDA ScaledObject next to it (nginx-test-keda-fallback.yaml) is PAUSED: this operator is the sole replica
+#   controller. Never run both active (see docs/coexistence.md).
+# - The operator reads only targetDeployment.{name,namespace}, min/maxReplicas, metrics.requests and prediction.
+#   The CRD also accepts container, metrics.cpu/memory and resources, but this version ignores them, so they are omitted.
 #
 apiVersion: autoscaler.example.com/v1alpha1
 kind: PredictiveAutoscaler
@@ -28,35 +31,18 @@ spec:
   targetDeployment:
     name: nginx-test
     namespace: default
-    container: nginx
 
   minReplicas: 1
   maxReplicas: 40
 
   metrics:
-    # Request rate is PRIMARY metric (leading indicator)
-    # Matches Grafana: sum(rate(istio_requests_total{...}[1m]))
-    # Matches KEDA Prometheus threshold: 300 RPS/pod
+    # Request rate is the scaling signal: sum(rate(istio_requests_total{reporter="destination",...}[1m])).
+    # enabled must be true: with it unset or false the operator cannot forecast and runs reactive-only.
     requests:
       enabled: true
-      targetRPS: 300      # 300 RPS/pod — aligns with KEDA threshold and Grafana dashboard
-
-    # CPU as supplementary signal
-    cpu:
-      enabled: true
-      targetPercent: 70
-
-    # Memory as supplementary signal
-    memory:
-      enabled: true
-      targetPercent: 70
+      targetRPS: 300      # capacity of one pod in requests per second (same threshold as the KEDA fallback)
 
   prediction:
     horizonMinutes: 60          # ML API predicts 1 hour ahead (full context)
     leadTimeMinutes: 20         # Use predictions within 20-min window for scaling
     updateIntervalSeconds: 60   # Reconcile every 60s (reactive needs fast cycles)
-
-  resources:
-    cpuRequestMillicores: 50    # From nginx-deployment.yaml: cpu: 50m
-    memoryRequestMB: 32         # From nginx-deployment.yaml: memory: 32Mi
-    baselineRPM: 60000          # Baseline RPM at 2 replicas (night minimum ~3k, peak ~120k)
