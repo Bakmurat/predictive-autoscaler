@@ -62,6 +62,7 @@ func rpmGaugeReconciler(t *testing.T) (*PredictiveAutoscalerReconciler, *autosca
 		Spec: autoscalerv1alpha1.PredictiveAutoscalerSpec{
 			TargetDeployment: autoscalerv1alpha1.TargetDeployment{Name: name, Namespace: "gauge-test"},
 			MinReplicas:      1, MaxReplicas: 12,
+			Mode:       autoscalerv1alpha1.ModeActive, // these tests exercise scaling (Recommend is the default)
 			Metrics:    autoscalerv1alpha1.MetricsConfig{Requests: &autoscalerv1alpha1.RequestsMetric{TargetRPS: 10}},
 			Prediction: autoscalerv1alpha1.PredictionConfig{HorizonMinutes: 60, LeadTimeMinutes: 20},
 		},

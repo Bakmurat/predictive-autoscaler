@@ -17,6 +17,8 @@ metadata:
   name: web-frontend
   namespace: shop
 spec:
+  # Recommend (the default) computes and publishes the decision without scaling; set Active to scale.
+  mode: Recommend
   targetDeployment:
     name: web-frontend
     namespace: shop          # this version allows any namespace; keep it equal to the CR's namespace

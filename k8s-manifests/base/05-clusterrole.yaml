@@ -28,6 +28,14 @@ rules:
   resources: ["configmaps"]
   verbs: ["get", "list", "watch"]
 
+# Emit Kubernetes events (condition transitions, scaling actions)
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create", "patch"]
+- apiGroups: ["events.k8s.io"]
+  resources: ["events"]
+  verbs: ["create", "patch"]
+
 # Access PredictiveAutoscaler CRD
 - apiGroups: ["autoscaler.example.com"]
   resources: ["predictiveautoscalers"]

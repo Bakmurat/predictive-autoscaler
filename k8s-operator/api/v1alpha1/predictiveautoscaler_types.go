@@ -23,6 +23,29 @@ type PredictiveAutoscalerSpec struct {
 
 	// Resources configuration for replica calculation
 	Resources ResourcesConfig `json:"resources,omitempty"`
+
+	// Mode selects what the operator does with its decision. Recommend (the default, also when the field is absent)
+	// computes and publishes the recommended replica count in status, metrics and the decision ledger and writes nothing
+	// to the target. Active scales the target. Only an explicit Active authorizes writes.
+	// +kubebuilder:validation:Enum=Recommend;Active
+	// +kubebuilder:default=Recommend
+	// +optional
+	Mode string `json:"mode,omitempty"`
+}
+
+const (
+	// ModeRecommend computes and publishes decisions without writing to the target.
+	ModeRecommend = "Recommend"
+	// ModeActive scales the target.
+	ModeActive = "Active"
+)
+
+// EffectiveMode is the mode the operator applies: Active only when explicitly set, Recommend otherwise.
+func (s PredictiveAutoscalerSpec) EffectiveMode() string {
+	if s.Mode == ModeActive {
+		return ModeActive
+	}
+	return ModeRecommend
 }
 
 // TargetDeployment specifies the target deployment
@@ -112,8 +135,36 @@ type PredictiveAutoscalerStatus struct {
 	// CurrentReplicas is the current number of replicas
 	CurrentReplicas int32 `json:"currentReplicas,omitempty"`
 
-	// PredictedReplicas is the predicted number of replicas needed
+	// PredictedReplicas is the last calculated (desired) replica count. Deprecated: kept with its historical meaning
+	// for compatibility until the API-group migration; use calculatedReplicas and forecastReplicas.
 	PredictedReplicas int32 `json:"predictedReplicas,omitempty"`
+
+	// ObservedGeneration is the spec generation the status describes.
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// Mode is the mode applied in the last reconcile (Recommend or Active).
+	Mode string `json:"mode,omitempty"`
+
+	// ForecastReplicas is the replica count derived from the forecast alone (absent when no forecast was used).
+	ForecastReplicas int32 `json:"forecastReplicas,omitempty"`
+
+	// CalculatedReplicas is the decision rule's result: clamp(max(forecast, reactive), min, max), or the held count
+	// when the current request rate is unavailable.
+	CalculatedReplicas int32 `json:"calculatedReplicas,omitempty"`
+
+	// StabilizedReplicas is what Active mode applies after the scale-down stabilization and cooldown (Active only:
+	// Recommend mode keeps no hypothetical scale history, so it is absent there).
+	StabilizedReplicas int32 `json:"stabilizedReplicas,omitempty"`
+
+	// AppliedReplicas is the replica count of the last successful write to the target (Active only).
+	AppliedReplicas int32 `json:"appliedReplicas,omitempty"`
+
+	// ReadyReplicas is the target's ready replica count observed in the last reconcile (a zero is reported).
+	ReadyReplicas int32 `json:"readyReplicas"`
+
+	// TargetUID is the UID of the target Deployment the status describes. When the target is replaced or retargeted,
+	// the target-specific history (appliedReplicas, lastScaleTime) is cleared.
+	TargetUID string `json:"targetUID,omitempty"`
 
 	// LastPrediction is the timestamp of the last prediction
 	LastPrediction *metav1.Time `json:"lastPrediction,omitempty"`
@@ -131,8 +182,11 @@ type PredictiveAutoscalerStatus struct {
 //+kubebuilder:printcolumn:name="Target",type="string",JSONPath=".spec.targetDeployment.name"
 //+kubebuilder:printcolumn:name="Min",type="integer",JSONPath=".spec.minReplicas"
 //+kubebuilder:printcolumn:name="Max",type="integer",JSONPath=".spec.maxReplicas"
+//+kubebuilder:printcolumn:name="Mode",type="string",JSONPath=".status.mode"
 //+kubebuilder:printcolumn:name="Current",type="integer",JSONPath=".status.currentReplicas"
-//+kubebuilder:printcolumn:name="Predicted",type="integer",JSONPath=".status.predictedReplicas"
+//+kubebuilder:printcolumn:name="Calculated",type="integer",JSONPath=".status.calculatedReplicas"
+//+kubebuilder:printcolumn:name="Applied",type="integer",JSONPath=".status.appliedReplicas"
+//+kubebuilder:printcolumn:name="Ready",type="integer",JSONPath=".status.readyReplicas"
 //+kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // PredictiveAutoscaler is the Schema for the predictiveautoscalers API

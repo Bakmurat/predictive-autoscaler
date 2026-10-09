@@ -63,7 +63,9 @@ ten-minute points` and publishes nothing; that is expected on a new cluster. Unt
 reactively from the current request rate only.
 
 ## 5. Create a PredictiveAutoscaler
-Start from `k8s-operator/config/samples/autoscaler_v1alpha1_predictiveautoscaler.yaml`. Set
+Start from `k8s-operator/config/samples/autoscaler_v1alpha1_predictiveautoscaler.yaml`. A new autoscaler runs in
+**Recommend** mode: it computes and shows the replica count it would set (`kubectl get pa`: Calculated) without changing
+the Deployment. Watch it for a while, then set `mode: Active` to let it scale. Set
 `metrics.requests.enabled: true` and `targetRPS` (requests per second one pod should handle), and set
 `leadTimeMinutes` and `updateIntervalSeconds` explicitly (the CRD defaults are 15 and 300; see `configuration.md`).
 ```sh

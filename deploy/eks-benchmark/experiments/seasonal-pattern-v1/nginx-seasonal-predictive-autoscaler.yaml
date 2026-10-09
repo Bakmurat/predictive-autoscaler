@@ -10,6 +10,8 @@ metadata:
   annotations:
     description: "S1 seasonal component from demo/nginx-test; own reactive demand"
 spec:
+  # Active: this autoscaler scales its Deployment (Recommend, observe-only, is the default when mode is absent).
+  mode: Active
   targetDeployment:
     name: nginx-seasonal
     namespace: demo

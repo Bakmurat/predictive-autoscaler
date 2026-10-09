@@ -26,6 +26,8 @@ metadata:
     description: "LSTM-based predictive scaling for nginx-test"
     keda-fallback: "nginx-test-keda-fallback"
 spec:
+  # Active: this autoscaler scales its Deployment (Recommend, observe-only, is the default when mode is absent).
+  mode: Active
   targetDeployment:
     name: nginx-test
     namespace: default
