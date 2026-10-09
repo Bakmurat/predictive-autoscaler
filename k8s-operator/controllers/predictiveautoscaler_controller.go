@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -87,6 +88,41 @@ type PredictiveAutoscalerReconciler struct {
 	scaleStates      map[string]*scaleState
 	// Recorder emits Kubernetes events on condition transitions and scaling actions (nil-safe).
 	Recorder record.EventRecorder
+	// APIReader reads straight from the API server (no cache) for the coexistence check and the write guard;
+	// nil falls back to the client (tests).
+	APIReader client.Reader
+	// Discovery is an uncached discovery client: optional APIs (KEDA, VPA) count as absent only when a fresh discovery
+	// shows they are not served. nil (tests) treats them as served.
+	Discovery APIDiscovery
+}
+
+func (r *PredictiveAutoscalerReconciler) reader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
+}
+
+// identityGuard re-reads, uncached, the autoscaler and its target immediately before a write: the write is refused
+// when the autoscaler was deleted or changed (UID, generation, mode no longer Active) or the target was replaced.
+func (r *PredictiveAutoscalerReconciler) identityGuard(ctx context.Context, pa *autoscalerv1alpha1.PredictiveAutoscaler, dep *appsv1.Deployment) string {
+	ctx, cancel := context.WithTimeout(ctx, identityGuardTimeout)
+	defer cancel()
+	var fresh autoscalerv1alpha1.PredictiveAutoscaler
+	if err := r.reader().Get(ctx, types.NamespacedName{Namespace: pa.Namespace, Name: pa.Name}, &fresh); err != nil {
+		return "autoscaler re-read failed: " + err.Error()
+	}
+	if fresh.UID != pa.UID || fresh.Generation != pa.Generation || fresh.Spec.EffectiveMode() != autoscalerv1alpha1.ModeActive {
+		return "the autoscaler changed during the reconcile"
+	}
+	var target appsv1.Deployment
+	if err := r.reader().Get(ctx, types.NamespacedName{Namespace: dep.Namespace, Name: dep.Name}, &target); err != nil {
+		return "target re-read failed: " + err.Error()
+	}
+	if target.UID != dep.UID {
+		return "the target Deployment was replaced during the reconcile"
+	}
+	return ""
 }
 
 // MLPredictionRequest represents the request to ML API
@@ -153,6 +189,9 @@ type VMInstantQueryResponse struct {
 //+kubebuilder:rbac:groups=apps,resources=deployments/scale,verbs=get;update;patch
 //+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 //+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+//+kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch
+//+kubebuilder:rbac:groups=keda.sh,resources=scaledobjects,verbs=get;list;watch
+//+kubebuilder:rbac:groups=autoscaling.k8s.io,resources=verticalpodautoscalers,verbs=get;list;watch
 
 // Reconcile is the unified scaling loop. On every cycle (default 60s):
 // 1. Get ML predictions (cached 5 min) → predicted replicas within lead-time window
@@ -203,6 +242,13 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	log.Info("Reconciling PredictiveAutoscaler",
 		"target", autoscaler.Spec.TargetDeployment.Name,
 		"namespace", autoscaler.Spec.TargetDeployment.Namespace)
+
+	// The target must be in the autoscaler's own namespace: a namespace-scoped cache could otherwise hide another
+	// autoscaler of the same target from the coexistence check.
+	if tns := autoscaler.Spec.TargetDeployment.Namespace; tns != "" && tns != autoscaler.Namespace {
+		return r.updateStatusWithError(ctx, &autoscaler, "CrossNamespaceTarget",
+			fmt.Sprintf("targetDeployment.namespace %q differs from the autoscaler's namespace %q", tns, autoscaler.Namespace))
+	}
 
 	// Get target deployment
 	deployment, err := r.getTargetDeployment(ctx, &autoscaler)
@@ -383,29 +429,61 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		"currentReplicas", currentReplicas,
 		"currentRPM", fmt.Sprintf("%.0f", currentRPM))
 
+	// --- COEXISTENCE CHECK AND WRITE GUARD (uncached, after the slow forecast work, immediately before any write) ---
+	checkCtx, cancelCheck := context.WithTimeout(ctx, coexistenceTimeout)
+	check, checkErr := checkReplicaWriters(checkCtx, r.reader(), r.Discovery, &autoscaler, deployment)
+	cancelCheck()
+	dec.Conflicts = check.Conflicts
+	checkMsg := ""
+	if checkErr != nil {
+		checkMsg = checkErr.Error()
+		dec.ConflictCheckError = &checkMsg
+	}
+	blocked := mode == autoscalerv1alpha1.ModeActive && (checkErr != nil || len(check.Conflicts) > 0)
+	// write re-reads the autoscaler and the target immediately before the write; guard holds the reason when it
+	// aborted the write (the object changed during the reconcile).
+	guard := ""
+	write := func(to int32) (bool, error) {
+		if guard = r.identityGuard(ctx, &autoscaler, deployment); guard != "" {
+			log.Info("Not scaling: the autoscaler or its target changed during the reconcile", "guard", guard)
+			r.recordDecision(dec, "guard_abort", currentReplicas)
+			return false, nil
+		}
+		return true, r.scaleDeployment(ctx, deployment, to)
+	}
+
 	// --- APPLY SCALING ---
 	// Recommend mode: the decision is complete and recorded, nothing is written and no scale history is advanced.
 	stabilized, applied := int32(0), int32(0)
 	if mode != autoscalerv1alpha1.ModeActive {
 		log.Info("Recommend mode: not scaling", "calculated", desiredReplicas, "current", currentReplicas)
 		r.recordDecision(dec, "recommend", currentReplicas)
+	} else if blocked {
+		// Another writer owns the count (or ownership is unknown): no write, and no scale-down timer keeps running.
+		log.Info("Not scaling: another replica writer or a failed coexistence check",
+			"conflicts", check.Conflicts, "checkError", checkMsg)
+		r.recordDecision(dec, "conflict_hold", currentReplicas)
+		state.belowCurrentSince = time.Time{}
 	} else if desiredReplicas > currentReplicas {
 		// SCALE UP: immediate — no delay for predicted or reactive
 		log.Info("Scaling UP",
 			"from", currentReplicas, "to", desiredReplicas,
 			"predictedComponent", predictedReplicas,
 			"reactiveComponent", reactiveReplicas)
-		if err := r.scaleDeployment(ctx, deployment, desiredReplicas); err != nil {
+		wrote, err := write(desiredReplicas)
+		if err != nil {
 			log.Error(err, "Failed to scale up")
 			r.recordDecision(dec, "scale_error", currentReplicas)
 			return r.updateStatusWithError(ctx, &autoscaler, "ScalingError", err.Error())
 		}
-		r.recordDecision(dec, "scale_up", desiredReplicas)
-		stabilized, applied = desiredReplicas, desiredReplicas
-		r.event(&autoscaler, "Normal", "ScaledUp", fmt.Sprintf("Scaled %s from %d to %d", deployment.Name, currentReplicas, desiredReplicas))
-		state.lastScaleUp = time.Now()
-		state.belowCurrentSince = time.Time{} // reset scale-down timer
-		log.Info("Scaled deployment", "from", currentReplicas, "to", desiredReplicas)
+		if wrote {
+			r.recordDecision(dec, "scale_up", desiredReplicas)
+			stabilized, applied = desiredReplicas, desiredReplicas
+			r.event(&autoscaler, "Normal", "ScaledUp", fmt.Sprintf("Scaled %s from %d to %d", deployment.Name, currentReplicas, desiredReplicas))
+			state.lastScaleUp = time.Now()
+			state.belowCurrentSince = time.Time{} // reset scale-down timer
+			log.Info("Scaled deployment", "from", currentReplicas, "to", desiredReplicas)
+		}
 
 	} else if desiredReplicas < currentReplicas {
 		// SCALE DOWN: with stabilization window and gradual reduction
@@ -413,17 +491,20 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		if target < currentReplicas {
 			log.Info("Scaling DOWN",
 				"from", currentReplicas, "to", target, "eventualTarget", desiredReplicas)
-			if err := r.scaleDeployment(ctx, deployment, target); err != nil {
+			wrote, err := write(target)
+			if err != nil {
 				log.Error(err, "Failed to scale down")
 				r.recordDecision(dec, "scale_error", currentReplicas)
 				return r.updateStatusWithError(ctx, &autoscaler, "ScalingError", err.Error())
 			}
-			r.recordDecision(dec, "scale_down", target)
-			stabilized, applied = target, target
-			r.event(&autoscaler, "Normal", "ScaledDown", fmt.Sprintf("Scaled %s from %d to %d (calculated %d)", deployment.Name, currentReplicas, target, desiredReplicas))
-			state.lastScaleDown = time.Now()
-			state.overrideActive = false // clear override after scale-down completes (per D-12)
-			log.Info("Scaled deployment", "from", currentReplicas, "to", target)
+			if wrote {
+				r.recordDecision(dec, "scale_down", target)
+				stabilized, applied = target, target
+				r.event(&autoscaler, "Normal", "ScaledDown", fmt.Sprintf("Scaled %s from %d to %d (calculated %d)", deployment.Name, currentReplicas, target, desiredReplicas))
+				state.lastScaleDown = time.Now()
+				state.overrideActive = false // clear override after scale-down completes (per D-12)
+				log.Info("Scaled deployment", "from", currentReplicas, "to", target)
+			}
 		} else {
 			// Still in stabilization or cooldown
 			reason := "stabilizing"
@@ -461,6 +542,7 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		current: currentReplicas, ready: deployment.Status.ReadyReplicas, keepCurrent: keepCurrent,
 		telemetry: dec.TelemetryStatus, telemetryError: dec.TelemetryError, forecastStatus: dec.ForecastStatus,
 		forecastIssuedAt: dec.ForecastIssuedAt, targetUID: string(deployment.UID),
+		conflicts: check.Conflicts, warnings: check.Warnings, vpaChecked: check.VPAChecked, checkError: checkMsg, guard: guard,
 	}); err != nil {
 		log.Error(err, "Failed to update status")
 	}
@@ -1091,6 +1173,9 @@ type statusInputs struct {
 	telemetry, forecastStatus                                 string
 	telemetryError, forecastIssuedAt                          *string
 	targetUID                                                 string
+	conflicts, warnings                                       []string
+	vpaChecked                                                bool
+	checkError, guard                                         string
 }
 
 var forecastReasons = map[string]string{"disabled": "Disabled", "unavailable": "Unavailable",
@@ -1132,6 +1217,9 @@ func (r *PredictiveAutoscalerReconciler) updateStatus(ctx context.Context, autos
 		}
 		meta.SetStatusCondition(&st.Conditions, metav1.Condition{Type: t, Status: status, Reason: reason, Message: msg, ObservedGeneration: gen})
 	}
+	setStatus := func(t string, status metav1.ConditionStatus, reason, msg string) {
+		meta.SetStatusCondition(&st.Conditions, metav1.Condition{Type: t, Status: status, Reason: reason, Message: msg, ObservedGeneration: gen})
+	}
 	set("Ready", true, "ReconcileCompleted", fmt.Sprintf("calculated=%d current=%d mode=%s", in.calculated, in.current, in.mode))
 	if in.telemetry == "measured" {
 		set("TelemetryAvailable", true, "Measured", "the current request rate was measured")
@@ -1152,8 +1240,30 @@ func (r *PredictiveAutoscalerReconciler) updateStatus(ctx context.Context, autos
 		set("ForecastAvailable", false, reason, "forecast status: "+in.forecastStatus)
 	}
 	switch {
+	case in.checkError != "":
+		setStatus("ConflictDetected", metav1.ConditionUnknown, "CheckFailed", in.checkError)
+	case len(in.conflicts) > 0:
+		setStatus("ConflictDetected", metav1.ConditionTrue, "ReplicaWriter", "other replica writers on the target: "+strings.Join(in.conflicts, ", "))
+	default:
+		setStatus("ConflictDetected", metav1.ConditionFalse, "NoConflict", "no other replica writer targets the Deployment")
+	}
+	switch {
+	case !in.vpaChecked:
+		setStatus("VPAInterference", metav1.ConditionUnknown, "CheckFailed", "the VerticalPodAutoscaler check did not complete")
+	case len(in.warnings) > 0:
+		setStatus("VPAInterference", metav1.ConditionTrue, "VPAUpdatesPods", "changes the pods' resource requests: "+strings.Join(in.warnings, ", "))
+	default:
+		setStatus("VPAInterference", metav1.ConditionFalse, "None", "no VerticalPodAutoscaler (other than Off) targets the Deployment")
+	}
+	switch {
 	case in.mode != autoscalerv1alpha1.ModeActive:
 		set("ScalingActive", false, "RecommendMode", "Recommend mode: the operator computes and publishes decisions and writes nothing")
+	case in.checkError != "":
+		set("ScalingActive", false, "CheckFailed", "the coexistence check failed, so nothing is written: "+in.checkError)
+	case len(in.conflicts) > 0:
+		set("ScalingActive", false, "Conflict", "another replica writer targets the Deployment: "+strings.Join(in.conflicts, ", "))
+	case in.guard != "":
+		set("ScalingActive", false, "GuardAborted", in.guard)
 	case in.keepCurrent:
 		set("ScalingActive", false, "TelemetryHold", "holding the current replica count: the current request rate is unavailable")
 	default:
@@ -1185,6 +1295,25 @@ func (r *PredictiveAutoscalerReconciler) transitionEvents(a *autoscalerv1alpha1.
 		"Ready":              {"ReconcileFailed", "ReconcileRecovered"},
 	}
 	for _, c := range cur {
+		if c.Type == "ConflictDetected" || c.Type == "VPAInterference" { // True is the problem for these two
+			prev := meta.FindStatusCondition(old, c.Type)
+			if prev != nil && prev.Status == c.Status && prev.Reason == c.Reason {
+				continue
+			}
+			switch {
+			case c.Status == metav1.ConditionTrue:
+				r.event(a, "Warning", c.Type, c.Message)
+			case c.Status == metav1.ConditionUnknown:
+				if c.Type == "ConflictDetected" { // an incomplete VPA check is covered by this event
+					r.event(a, "Warning", "ConflictCheckFailed", c.Message)
+				}
+			case c.Type == "ConflictDetected" && prev != nil && prev.Status != metav1.ConditionFalse:
+				r.event(a, "Normal", "ConflictResolved", c.Message)
+			case c.Type == "VPAInterference" && prev != nil && prev.Status == metav1.ConditionTrue:
+				r.event(a, "Normal", "VPAInterferenceCleared", c.Message) // only a completed check clears it
+			}
+			continue
+		}
 		n, ok := names[c.Type]
 		if !ok {
 			continue

@@ -38,13 +38,16 @@ type decisionRecord struct {
 	// ("unavailable": both are then 0 placeholders, never zero traffic; TelemetryError says why).
 	TelemetryStatus string  `json:"telemetry_status"`
 	TelemetryError  *string `json:"telemetry_error,omitempty"`
-	MinReplicas     int32   `json:"min_replicas"`
-	MaxReplicas     int32   `json:"max_replicas"`
-	DesiredReplicas int32   `json:"desired_replicas"`
-	DesiredSource   string  `json:"desired_source"` // prediction|reactive|tie|min_replicas|max_replicas|keep_current
-	CurrentReplicas int32   `json:"current_replicas"`
-	AppliedReplicas int32   `json:"applied_replicas"`
-	Action          string  `json:"action"` // scale_up|scale_down|hold_stabilizing|hold_cooldown|at_target|keep_current|scale_error
+	// Other replica writers on the target (coexistence check, run before every write) and its failure, if any.
+	Conflicts          []string `json:"conflicts,omitempty"`
+	ConflictCheckError *string  `json:"conflict_check_error,omitempty"`
+	MinReplicas        int32    `json:"min_replicas"`
+	MaxReplicas        int32    `json:"max_replicas"`
+	DesiredReplicas    int32    `json:"desired_replicas"`
+	DesiredSource      string   `json:"desired_source"` // prediction|reactive|tie|min_replicas|max_replicas|keep_current
+	CurrentReplicas    int32    `json:"current_replicas"`
+	AppliedReplicas    int32    `json:"applied_replicas"`
+	Action             string   `json:"action"` // scale_up|scale_down|hold_stabilizing|hold_cooldown|at_target|keep_current|scale_error|recommend|conflict_hold|guard_abort
 }
 
 func newDecisionRecord(a *autoscalerv1alpha1.PredictiveAutoscaler, forecasting bool, current int32) *decisionRecord {

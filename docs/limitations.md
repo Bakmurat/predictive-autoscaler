@@ -5,7 +5,10 @@ production-ready. Known limits, most important first:
 
 1. **Holds during metrics outages.** Without a measured request rate the operator holds the current replica count (see
    configuration.md, Decision rule), so a real load change during a monitoring outage is not followed until metrics return.
-2. **No protection against a second autoscaler** on the same Deployment (see coexistence.md).
+2. **Only known scalers are detected.** In `Active` mode the operator refuses to scale while one of these targets the
+   Deployment: an HPA, an unpaused KEDA ScaledObject, or another Active PredictiveAutoscaler. It does not detect other
+   writers (CI jobs, `kubectl scale`, GitOps applying `replicas`). The check is not atomic, and the replica count is
+   still written with a full Deployment update (see coexistence.md).
 3. **Istio is required** for the request-rate signal (`istio_requests_total{reporter="destination"}`), and the queries
    are not configurable.
 4. **One workload per trainer.** The training CronJob trains one workload (`TRAINING_WORKLOAD`/`TRAINING_NAMESPACE`), and

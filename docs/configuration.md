@@ -13,7 +13,7 @@ brackets (20 and 60). The same applies to `metrics.requests`. Set these fields e
 |---|---|---|---|---|---|
 | `mode` | `Recommend` \| `Active` | no | **Recommend** (also when absent) | yes | `Recommend` computes and publishes the decision (status, metrics, ledger) and writes nothing; only `Active` scales the target. Existing objects without `mode` stop scaling after an upgrade until they set `Active`. |
 | `targetDeployment.name` | string | yes | — | yes | The Deployment to scale. |
-| `targetDeployment.namespace` | string | yes | — | yes | Any namespace is accepted in this version; keep it equal to the CR's namespace. |
+| `targetDeployment.namespace` | string | yes | — | yes | Must equal the CR's namespace; any other value is rejected (`Ready=False`, reason `CrossNamespaceTarget`) and nothing is written. |
 | `targetDeployment.container` | string | no | — | **no** | Accepted, ignored. |
 | `minReplicas` | int ≥ 1 | yes | — | yes | `minReplicas ≤ maxReplicas` is not validated yet. |
 | `maxReplicas` | int ≥ 1 | yes | — | yes | |
@@ -39,9 +39,11 @@ brackets (20 and 60). The same applies to `metrics.requests`. Set these fields e
 | `targetUID` | UID of the target Deployment the status describes. |
 | `predictedReplicas` | Deprecated: the calculated count (historical meaning). Use `calculatedReplicas` and `forecastReplicas`. |
 | `lastPrediction` | Issue time of the last forecast used. |
-| `conditions` | `Ready` (the reconcile completed), `TelemetryAvailable` (`Measured` / `MetricsUnavailable`), `ForecastAvailable` (`Used`, `Disabled`, `Unavailable`, `HorizonElapsed`, `SanityRejected`), `ScalingActive` (`Active`, `RecommendMode`, `TelemetryHold`, or the failure reason). |
+| `conditions` | `Ready` (the reconcile completed), `TelemetryAvailable` (`Measured` / `MetricsUnavailable`), `ForecastAvailable` (`Used`, `Disabled`, `Unavailable`, `HorizonElapsed`, `SanityRejected`), `ScalingActive` (`Active`, `RecommendMode`, `TelemetryHold`, `Conflict`, `CheckFailed`, `GuardAborted`, or the failure reason), `ConflictDetected` (`NoConflict`; `ReplicaWriter` when an HPA, an unpaused KEDA ScaledObject or another Active PredictiveAutoscaler targets the Deployment; `Unknown`/`CheckFailed` when the check failed), `VPAInterference` (`None`; `VPAUpdatesPods` for a VPA in any mode except `Off`; `Unknown`/`CheckFailed` when the check did not complete). See coexistence.md. |
 
-Events are emitted when a condition changes (and on `ScaledUp` / `ScaledDown`), never on every reconcile; `kubectl
+Events are emitted when a condition changes (and on `ScaledUp` / `ScaledDown`), never on every reconcile; the
+coexistence events are `ConflictDetected`, `ConflictResolved`, `ConflictCheckFailed`, `VPAInterference` and
+`VPAInterferenceCleared`; `kubectl
 describe pa <name>` shows them. `kubectl get pa` shows Target, Mode, Min, Max, Current, Calculated, Applied, Ready, Age.
 
 ## Decision rule

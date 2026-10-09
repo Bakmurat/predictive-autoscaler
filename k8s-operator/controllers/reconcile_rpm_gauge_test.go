@@ -15,6 +15,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -54,6 +55,9 @@ func rpmGaugeReconciler(t *testing.T) (*PredictiveAutoscalerReconciler, *autosca
 		t.Fatal(err)
 	}
 	if err := autoscalerv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := autoscalingv2.AddToScheme(scheme); err != nil { // the coexistence check lists HPAs
 		t.Fatal(err)
 	}
 	name := "rpm-" + strings.ReplaceAll(strings.ToLower(t.Name()), "/", "-")

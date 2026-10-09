@@ -53,7 +53,7 @@ type TargetDeployment struct {
 	// Name of the deployment
 	Name string `json:"name"`
 
-	// Namespace of the deployment
+	// Namespace of the deployment; must equal the PredictiveAutoscaler's namespace
 	Namespace string `json:"namespace"`
 
 	// Container name (optional, defaults to first container)
