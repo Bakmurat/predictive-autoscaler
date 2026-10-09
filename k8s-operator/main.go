@@ -36,13 +36,17 @@ func init() {
 func main() {
 	var metricsAddr string
 	var enableLeaderElection bool
+	var leaderElectionNamespace string
 	var probeAddr string
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
-	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
-		"Enable leader election for controller manager. "+
-			"Enabling this will ensure there is only one active controller manager.")
+	flag.BoolVar(&enableLeaderElection, "leader-elect", true,
+		"Leader election: only the instance holding the Lease reconciles, so the pods of one installation (a rolling "+
+			"update, two replicas) never both write. Installations whose watched namespaces overlap must share the same "+
+			"Lease namespace. Set false only for a single local run.")
+	flag.StringVar(&leaderElectionNamespace, "leader-election-namespace", "",
+		"Namespace of the leader-election Lease (default: the pod's own namespace; required outside a cluster).")
 
 	opts := zap.Options{
 		Development: true,
@@ -59,11 +63,14 @@ func main() {
 	// Used by the benchmark so that a second operator instance can be exercised in an
 	// isolated namespace without both instances reconciling the same objects.
 	mgrOpts := ctrl.Options{
-		Scheme:                 scheme,
-		Metrics:                metricsserver.Options{BindAddress: metricsAddr}, // plain HTTP, as before
-		HealthProbeBindAddress: probeAddr,
-		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "predictive-autoscaler-leader",
+		Scheme:                  scheme,
+		Metrics:                 metricsserver.Options{BindAddress: metricsAddr}, // plain HTTP, as before
+		HealthProbeBindAddress:  probeAddr,
+		LeaderElection:          enableLeaderElection,
+		LeaderElectionID:        "predictive-autoscaler-leader",
+		LeaderElectionNamespace: leaderElectionNamespace,
+		// The manager exits right after it stops, so releasing the Lease on shutdown is safe and hands over at once.
+		LeaderElectionReleaseOnCancel: true,
 	}
 	if raw := strings.TrimSpace(os.Getenv("WATCH_NAMESPACES")); raw != "" {
 		var namespaces []string

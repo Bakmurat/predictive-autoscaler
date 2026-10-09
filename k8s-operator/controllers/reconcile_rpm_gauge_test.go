@@ -72,7 +72,9 @@ func rpmGaugeReconciler(t *testing.T) (*PredictiveAutoscalerReconciler, *autosca
 		},
 	}
 	replicas := int32(1)
-	d := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: a.Namespace}, Spec: appsv1.DeploymentSpec{Replicas: &replicas}}
+	// Real objects always carry a UID; the /scale write checks it (the fake client assigns none).
+	d := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: a.Namespace, UID: types.UID("uid-" + name)},
+		Spec: appsv1.DeploymentSpec{Replicas: &replicas}}
 	client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(a).WithObjects(a, d).Build()
 	r := &PredictiveAutoscalerReconciler{Client: client, Scheme: scheme, Log: logr.Discard(), predictionCache: map[string]*cachedPrediction{}}
 	vm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

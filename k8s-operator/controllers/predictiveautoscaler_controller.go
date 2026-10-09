@@ -18,6 +18,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -185,8 +186,9 @@ type VMInstantQueryResponse struct {
 //+kubebuilder:rbac:groups=autoscaler.example.com,resources=predictiveautoscalers,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=autoscaler.example.com,resources=predictiveautoscalers/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=autoscaler.example.com,resources=predictiveautoscalers/finalizers,verbs=update
-//+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;update;patch
-//+kubebuilder:rbac:groups=apps,resources=deployments/scale,verbs=get;update;patch
+//+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch
+//+kubebuilder:rbac:groups=apps,resources=deployments/scale,verbs=get;update
+//+kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 //+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 //+kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch
@@ -442,14 +444,40 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	blocked := mode == autoscalerv1alpha1.ModeActive && (checkErr != nil || len(check.Conflicts) > 0)
 	// write re-reads the autoscaler and the target immediately before the write; guard holds the reason when it
 	// aborted the write (the object changed during the reconcile).
-	guard := ""
+	// The write itself goes through /scale and applies only if the replica count is still the one decided from; a
+	// change or a write conflict aborts it (never retried with the old decision) and the next reconcile, with fresh
+	// checks, follows soon.
+	guard, retrySoon := "", false
+	// Order (Codex r07): read the fresh Scale first, then the final authorization (identity guard), then the update, all
+	// within scaleWriteTimeout, so a slow read cannot leave the authorization old when the write begins.
 	write := func(to int32) (bool, error) {
-		if guard = r.identityGuard(ctx, &autoscaler, deployment); guard != "" {
+		wctx, cancel := context.WithTimeout(ctx, scaleWriteTimeout)
+		defer cancel()
+		stale := func(err error) (bool, error) {
+			guard, retrySoon = "the target changed since the decision: "+err.Error(), true
+			log.Info("Not scaling: the decision is stale", "guard", guard)
+			r.recordDecision(dec, "guard_abort", currentReplicas)
+			return false, nil
+		}
+		scale, err := r.freshScale(wctx, deployment, currentReplicas)
+		if stderrors.Is(err, errStaleDecision) {
+			return stale(err)
+		}
+		if err != nil {
+			return true, err
+		}
+		if guard = r.identityGuard(wctx, &autoscaler, deployment); guard != "" {
 			log.Info("Not scaling: the autoscaler or its target changed during the reconcile", "guard", guard)
 			r.recordDecision(dec, "guard_abort", currentReplicas)
 			return false, nil
 		}
-		return true, r.scaleDeployment(ctx, deployment, to)
+		if err := r.writeScale(wctx, deployment, scale, to); err != nil {
+			if errors.IsConflict(err) {
+				return stale(err)
+			}
+			return true, err
+		}
+		return true, nil
 	}
 
 	// --- APPLY SCALING ---
@@ -547,6 +575,10 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		log.Error(err, "Failed to update status")
 	}
 
+	if retrySoon {
+		delete(r.lastReconcileMap, key)
+		return ctrl.Result{RequeueAfter: staleDecisionRetry}, nil
+	}
 	return ctrl.Result{RequeueAfter: reconcileInterval}, nil
 }
 
@@ -1144,21 +1176,49 @@ func (r *PredictiveAutoscalerReconciler) getPredictionObserved(
 	return prediction, callErr
 }
 
-// scaleDeployment scales the target deployment to the specified replica count.
-func (r *PredictiveAutoscalerReconciler) scaleDeployment(
-	ctx context.Context,
-	deployment *appsv1.Deployment,
-	replicas int32,
-) error {
-	if deployment.Spec.Replicas != nil && *deployment.Spec.Replicas == replicas {
-		return nil // Already at target
+// errStaleDecision: the target is no longer the object, or no longer at the replica count, the decision was computed
+// from.
+var errStaleDecision = stderrors.New("stale decision")
+
+// staleDecisionRetry is how soon a reconcile follows a write aborted by a stale decision.
+const staleDecisionRetry = 5 * time.Second
+
+// scaleWriteTimeout bounds the fresh Scale read, the final authorization and the /scale update together.
+var scaleWriteTimeout = 10 * time.Second
+
+// freshScale reads the Deployment's /scale subresource and accepts it only for the same object (UID) at the replica
+// count the decision was computed from (from), with a resourceVersion to make the update conditional.
+func (r *PredictiveAutoscalerReconciler) freshScale(ctx context.Context, deployment *appsv1.Deployment, from int32) (*autoscalingv1.Scale, error) {
+	decidedUID := deployment.UID // captured first: a client may refresh the object it is given
+	scale := &autoscalingv1.Scale{}
+	if err := r.SubResource("scale").Get(ctx, deployment.DeepCopy(), scale); err != nil {
+		return nil, fmt.Errorf("read the scale subresource: %w", err)
+	}
+	switch {
+	case scale.UID == "" || decidedUID == "" || scale.UID != decidedUID:
+		return nil, fmt.Errorf("%w: the target Deployment was replaced (UID %q, decided for %q)", errStaleDecision, scale.UID, decidedUID)
+	case scale.ResourceVersion == "":
+		return nil, fmt.Errorf("%w: the Scale has no resourceVersion", errStaleDecision)
+	case scale.Spec.Replicas != from:
+		return nil, fmt.Errorf("%w: replica count decided from %d, now %d", errStaleDecision, from, scale.Spec.Replicas)
+	}
+	return scale, nil
+}
+
+// writeScale writes the replica count through /scale (never a full-object update, so no other field is touched). The
+// body keeps the Scale's UID and resourceVersion: the API server rejects it (Conflict) if the Deployment was replaced
+// or changed after the read. It is not retried here.
+func (r *PredictiveAutoscalerReconciler) writeScale(ctx context.Context, deployment *appsv1.Deployment, scale *autoscalingv1.Scale, replicas int32) error {
+	from := scale.Spec.Replicas
+	if replicas == from {
+		return nil // already at target
 	}
 	direction := "up"
-	if deployment.Spec.Replicas != nil && replicas < *deployment.Spec.Replicas {
+	if replicas < from {
 		direction = "down"
 	}
-	deployment.Spec.Replicas = &replicas
-	if err := r.Update(ctx, deployment); err != nil {
+	scale.Spec.Replicas = replicas
+	if err := r.SubResource("scale").Update(ctx, deployment.DeepCopy(), client.WithSubResourceBody(scale)); err != nil {
 		return err
 	}
 	scaleEventsTotal.WithLabelValues(deployment.Name, deployment.Namespace, direction).Inc()

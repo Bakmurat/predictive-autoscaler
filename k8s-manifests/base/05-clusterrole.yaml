@@ -3,10 +3,13 @@ kind: ClusterRole
 metadata:
   name: predictive-operator-role
 rules:
-# Read/Write Deployments (for scaling)
+# Read Deployments; replicas are written only through the scale subresource (never the whole object)
 - apiGroups: ["apps"]
-  resources: ["deployments", "deployments/scale"]
-  verbs: ["get", "list", "watch", "patch", "update"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments/scale"]
+  verbs: ["get", "update"]
 
 # Read Pods (for current metrics)
 - apiGroups: [""]

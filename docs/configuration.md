@@ -78,3 +78,11 @@ measured as a real zero and scales normally.
 | `FORECAST_LOG` | unset | Path of the append-only forecast/decision ledger (JSONL). |
 | `WATCH_NAMESPACES` | all | Comma-separated namespaces to watch. |
 The forecasting service reads the endpoint from a differently named variable, `VICTORIA_METRICS_URL`; set both.
+
+## Operator flags
+| Flag | Default | Purpose |
+|---|---|---|
+| `--leader-elect` | `true` | Only the instance holding the Lease `predictive-autoscaler-leader` reconciles. Installations whose watched namespaces overlap must share the Lease namespace. Set `false` only for a single local run. |
+| `--leader-election-namespace` | the pod's namespace | Namespace of the Lease; required when running outside a cluster with leader election on. |
+| `--metrics-bind-address` | `:8080` | Prometheus metrics (plain HTTP). |
+| `--health-probe-bind-address` | `:8081` | `/healthz` and `/readyz`. |
