@@ -13,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -52,6 +53,17 @@ const (
 type cachedPrediction struct {
 	response  *MLPredictionResponse
 	fetchedAt time.Time
+	binding   string // the PA, target and compiled query the forecast belongs to (forecastBinding)
+}
+
+// forecastBinding identifies what a cached forecast is valid for: the PA object, the target object and the compiled
+// query with its contract. A change of any of them invalidates the cache.
+func forecastBinding(a *autoscalerv1alpha1.PredictiveAutoscaler) string {
+	ms := a.Status.MetricSource
+	if ms == nil {
+		return string(a.UID) + "|-"
+	}
+	return string(a.UID) + "|" + ms.TargetUID + "|" + ms.SHA256 + "|" + ms.Contract
 }
 
 // scaleState tracks scaling history per deployment for stabilization.
@@ -64,8 +76,10 @@ type scaleState struct {
 	reEvalCounter      int       // Counts reconciles since last periodic re-evaluation (OPER-01)
 	overrideActive     bool      // True when overestimate cap fired; bypasses stabilization (OPER-03)
 	// The state belongs to one mode and one target object: it is reset when either changes, so hypothetical
-	// (Recommend-mode) history never carries into Active mode and a re-created target starts clean.
+	// (Recommend-mode) history never carries into Active mode and a re-created target starts clean. Its
+	// signal-dependent part also belongs to one compiled query (signal = its hash) and restarts when that changes.
 	mode      string
+	signal    string
 	targetUID types.UID
 	// Replay-only (Codex C-52): the differential harness rebases wall-clock timestamps so a
 	// recorded sequence can be replayed at its own cadence through the real decision
@@ -132,6 +146,15 @@ type MLPredictionRequest struct {
 	Namespace      string `json:"namespace"`
 	MetricType     string `json:"metric_type"`
 	HorizonMinutes int32  `json:"horizon_minutes"`
+	// The PredictiveAutoscaler whose compiled query (status.metricSource) the service resolves and checks; the query
+	// itself is never sent.
+	AutoscalerName       string `json:"autoscaler_name,omitempty"`
+	AutoscalerNamespace  string `json:"autoscaler_namespace,omitempty"`
+	AutoscalerUID        string `json:"autoscaler_uid,omitempty"`
+	AutoscalerGeneration int64  `json:"autoscaler_generation,omitempty"`
+	TargetUID            string `json:"target_uid,omitempty"`
+	MetricQuerySHA256    string `json:"metric_query_sha256,omitempty"`
+	Contract             string `json:"contract,omitempty"`
 }
 
 // MLPredictionResponse represents the response from ML API
@@ -141,6 +164,9 @@ type MLPredictionResponse struct {
 	ModelName      string    `json:"model_name"`
 	ModelVersion   string    `json:"model_version"`
 	ModelTrainedAt string    `json:"model_trained_at"`
+	// The signal the forecast was computed on; a forecast is used only when both equal the compiled query's.
+	MetricQuerySHA256 string `json:"metric_query_sha256"`
+	Contract          string `json:"contract"`
 	// Provenance from the trainer's sidecar, passed through by the API (empty when unknown).
 	TrainingCutoff    string `json:"training_cutoff"`
 	ArtifactSHA256    string `json:"artifact_sha256"`
@@ -265,6 +291,33 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		*st = scaleState{mode: mode, targetUID: deployment.UID}
 	}
 
+	// --- METRIC SOURCE ---
+	// Compiled every reconcile and published in status before any consumer (the forecasting service, the trainer)
+	// resolves it; an invalid configuration withdraws the previous compiled query and the cached forecast.
+	compiled, err := compileMetricQuery(requestsSource(&autoscaler), deployment.Namespace, deployment.Name)
+	if err != nil {
+		autoscaler.Status.MetricSource = nil
+		delete(r.predictionCache, key)
+		return r.updateStatusWithError(ctx, &autoscaler, "InvalidMetricQuery", err.Error())
+	}
+	if st := r.getOrCreateScaleState(key); st.signal != compiled.SHA256 {
+		// Overestimate tracking, the override, the ramp reference and the scale-down timer describe the previous
+		// signal; the real write timestamps (lastScaleUp/lastScaleDown) stay, so cooldowns still apply.
+		st.overestimateStreak, st.overrideActive, st.lastRPM, st.reEvalCounter = 0, false, 0, 0
+		st.belowCurrentSince = time.Time{}
+		st.signal = compiled.SHA256
+	}
+	wantSource := &autoscalerv1alpha1.MetricSourceStatus{Query: compiled.Query, SHA256: compiled.SHA256,
+		ObservedGeneration: autoscaler.Generation, TargetUID: string(deployment.UID), Contract: metricContract}
+	if autoscaler.Status.MetricSource == nil || *autoscaler.Status.MetricSource != *wantSource {
+		autoscaler.Status.MetricSource = wantSource
+		if err := r.Status().Update(ctx, &autoscaler); err != nil {
+			log.Error(err, "Failed to publish the compiled metric query; not forecasting before it is published")
+			delete(r.lastReconcileMap, key)
+			return ctrl.Result{}, err
+		}
+	}
+
 	// --- PREDICTIVE COMPONENT ---
 	// Get ML prediction (cached, refresh every 5 min)
 	var prediction *MLPredictionResponse
@@ -299,18 +352,16 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 
 	// --- REACTIVE COMPONENT ---
 	// Query VictoriaMetrics for current RPM
-	currentRPM, vmErr := r.queryCurrentRPM(autoscaler.Spec.TargetDeployment.Name, autoscaler.Spec.TargetDeployment.Namespace)
+	currentRPM, vmErr := r.queryCurrentRPM(ctx, compiled.Query)
 	reactiveReplicas := int32(0)
 	if vmErr != nil {
 		log.Info("Current request rate unavailable; the decision will hold the current replica count", "error", vmErr.Error())
 	} else {
-		targetRPM := int32(20000)
+		targetRPM := 20000.0
 		if autoscaler.Spec.Metrics.Requests != nil && autoscaler.Spec.Metrics.Requests.TargetRPS > 0 {
-			targetRPM = autoscaler.Spec.Metrics.Requests.TargetRPS * 60
+			targetRPM = float64(autoscaler.Spec.Metrics.Requests.TargetRPS) * 60
 		}
-		if currentRPM > 0 {
-			reactiveReplicas = int32(math.Ceil(currentRPM / float64(targetRPM)))
-		}
+		reactiveReplicas = boundedReplicas(math.Ceil(currentRPM / targetRPM))
 	}
 	dec.ReactiveReplicas, dec.CurrentRPM = reactiveReplicas, currentRPM
 	dec.TelemetryStatus = "measured"
@@ -651,12 +702,12 @@ func (r *PredictiveAutoscalerReconciler) calculatePredictedReplicasDetail(
 	}
 
 	// Calculate replicas from RPM (CR specifies targetRPS, convert to RPM internally)
-	targetRPM := int32(30000)
+	targetRPM := 30000.0
 	if autoscaler.Spec.Metrics.Requests != nil && autoscaler.Spec.Metrics.Requests.TargetRPS > 0 {
-		targetRPM = autoscaler.Spec.Metrics.Requests.TargetRPS * 60
+		targetRPM = float64(autoscaler.Spec.Metrics.Requests.TargetRPS) * 60
 	}
 
-	desiredReplicas := int32(math.Ceil(peakRPM / float64(targetRPM)))
+	desiredReplicas := boundedReplicas(math.Ceil(peakRPM / targetRPM))
 	det.PeakRPM, det.Raw = peakRPM, desiredReplicas
 
 	log.Info("Predicted replicas (lead-time window)",
@@ -671,7 +722,7 @@ func (r *PredictiveAutoscalerReconciler) calculatePredictedReplicasDetail(
 	if prediction.Confidence < 0.7 && prediction.Confidence > 0 {
 		dampened := float64(autoscaler.Spec.MinReplicas) +
 			prediction.Confidence*float64(desiredReplicas-autoscaler.Spec.MinReplicas)
-		desiredReplicas = int32(math.Ceil(dampened))
+		desiredReplicas = boundedReplicas(math.Ceil(dampened))
 		log.Info("Low confidence dampening",
 			"confidence", prediction.Confidence, "dampened", desiredReplicas)
 		if desiredReplicas != det.Raw {
@@ -694,25 +745,21 @@ func (r *PredictiveAutoscalerReconciler) calculatePredictedReplicasDetail(
 	return desiredReplicas, true, det
 }
 
-// queryCurrentRPM queries VictoriaMetrics for the current requests per minute
-// of the target deployment. This is the REACTIVE signal.
-func (r *PredictiveAutoscalerReconciler) queryCurrentRPM(deploymentName, namespace string) (float64, error) {
-	vmURL := os.Getenv("VICTORIAMETRICS_URL")
-	if vmURL == "" {
-		vmURL = "http://vmselect-vmst.monitoring.svc.cluster.local:8481/select/0/prometheus"
-	}
-
-	// Canonical request-count definition (shared with the forecasting service, the KEDA comparison,
-	// and the scorer): destination-reported requests only, one workload, one namespace.
-	query := fmt.Sprintf(`sum(rate(istio_requests_total{reporter="destination",destination_workload="%s",destination_workload_namespace="%s"}[1m])) * 60`, deploymentName, namespace)
-
+// queryCurrentRPM runs the compiled request-rate query (requests per second, contract requests-per-second/v1) as an
+// instant query and returns requests per minute. This is the REACTIVE signal.
+func (r *PredictiveAutoscalerReconciler) queryCurrentRPM(ctx context.Context, query string) (float64, error) {
+	vmURL := prometheusURL()
 	endpoint := fmt.Sprintf("%s/api/v1/query", vmURL)
 	params := url.Values{}
 	params.Set("query", query)
 	params.Set("deny_partial_response", "1") // VictoriaMetrics cluster: fail rather than answer partially (also checked below)
 
 	httpClient := &http.Client{Timeout: vmQueryTimeout}
-	resp, err := httpClient.Get(fmt.Sprintf("%s?%s", endpoint, params.Encode()))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s?%s", endpoint, params.Encode()), nil)
+	if err != nil {
+		return 0, fmt.Errorf("VM query failed: %w", err)
+	}
+	resp, err := httpClient.Do(httpReq)
 	if err != nil {
 		return 0, fmt.Errorf("VM query failed: %w", err)
 	}
@@ -753,15 +800,54 @@ func (r *PredictiveAutoscalerReconciler) queryCurrentRPM(deploymentName, namespa
 		return 0, fmt.Errorf("%w: unexpected value type in VM response", errMetricsUnavailable)
 	}
 
-	rpm, err := strconv.ParseFloat(valueStr, 64)
+	rps, err := strconv.ParseFloat(valueStr, 64)
 	if err != nil {
-		return 0, fmt.Errorf("%w: failed to parse RPM value '%s': %v", errMetricsUnavailable, valueStr, err)
+		return 0, fmt.Errorf("%w: failed to parse the rate value '%s': %v", errMetricsUnavailable, valueStr, err)
 	}
-	if math.IsNaN(rpm) || math.IsInf(rpm, 0) || rpm < 0 {
+	if math.IsNaN(rps) || math.IsInf(rps, 0) || rps < 0 {
 		return 0, fmt.Errorf("%w: value %q is not a finite, non-negative rate", errMetricsUnavailable, valueStr)
 	}
 
+	rpm := rps * 60 // the one RPS → RPM conversion in the operator (contract requests-per-second/v1)
+	if math.IsInf(rpm, 0) {
+		return 0, fmt.Errorf("%w: value %q overflows when converted to requests per minute", errMetricsUnavailable, valueStr)
+	}
 	return rpm, nil
+}
+
+// boundedReplicas converts a computed replica count to int32 without wrapping: NaN and non-positive values are 0, values
+// beyond int32 saturate (the caller clamps to maxReplicas).
+func boundedReplicas(x float64) int32 {
+	switch {
+	case math.IsNaN(x) || x <= 0:
+		return 0
+	case x >= math.MaxInt32:
+		return math.MaxInt32
+	}
+	return int32(x)
+}
+
+// prometheusURL is the Prometheus-compatible query endpoint: PROMETHEUS_URL, or the deprecated VICTORIAMETRICS_URL.
+func prometheusURL() string {
+	if u := os.Getenv("PROMETHEUS_URL"); u != "" {
+		return u
+	}
+	if u := os.Getenv("VICTORIAMETRICS_URL"); u != "" {
+		warnDeprecatedMetricsURL.Do(func() {
+			ctrl.Log.WithName("setup").Info("VICTORIAMETRICS_URL is deprecated; set PROMETHEUS_URL")
+		})
+		return u
+	}
+	return "http://vmselect-vmst.monitoring.svc.cluster.local:8481/select/0/prometheus"
+}
+
+var warnDeprecatedMetricsURL sync.Once
+
+func requestsSource(a *autoscalerv1alpha1.PredictiveAutoscaler) *autoscalerv1alpha1.MetricSource {
+	if a.Spec.Metrics.Requests == nil {
+		return nil
+	}
+	return a.Spec.Metrics.Requests.Source
 }
 
 // errMetricsUnavailable marks every metrics answer that is not a usable measurement of the current request rate.
@@ -811,6 +897,10 @@ func (r *PredictiveAutoscalerReconciler) getCachedPredictionObserved(
 ) (*MLPredictionResponse, error, *forecastLookup) {
 	lookup := r.newForecastLookup(autoscaler)
 	defer r.recordForecastCompletion(lookup)
+	binding := forecastBinding(autoscaler)
+	if cached, ok := r.predictionCache[key]; ok && cached.binding != binding {
+		delete(r.predictionCache, key) // built for another object, target or signal
+	}
 	// Check cache
 	if cached, ok := r.predictionCache[key]; ok {
 		age := time.Since(cached.fetchedAt)
@@ -875,6 +965,7 @@ func (r *PredictiveAutoscalerReconciler) getCachedPredictionObserved(
 	r.predictionCache[key] = &cachedPrediction{
 		response:  prediction,
 		fetchedAt: now,
+		binding:   binding,
 	}
 	r.recordForecast(autoscaler, prediction, now)
 	lookup.returned(prediction, "fresh_response", "replace")
@@ -1165,6 +1256,14 @@ func (r *PredictiveAutoscalerReconciler) getPredictionObserved(
 			completion.Outcome = "decoded_response"
 		}
 		completion.classifyServed(captured.Bytes())
+		// Only a forecast computed on the compiled query (same hash and contract) may be used or cached; an older
+		// service that does not report them is refused too (the reactive rule applies).
+		if ms := autoscaler.Status.MetricSource; ms == nil || ms.SHA256 == "" ||
+			prediction.MetricQuerySHA256 != ms.SHA256 || prediction.Contract != ms.Contract {
+			completion.failure("query_mismatch", "provenance", "response_body", nil)
+			return nil, &forecastRefusedError{status: resp.StatusCode, body: fmt.Sprintf(
+				"forecast for metric query %q (contract %q) does not match the compiled query", prediction.MetricQuerySHA256, prediction.Contract)}
+		}
 
 		return &prediction, nil
 	}()

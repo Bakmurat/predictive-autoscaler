@@ -1,16 +1,22 @@
 package controllers
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	appsv1 "k8s.io/api/apps/v1"
+
+	autoscalerv1alpha1 "predictive-autoscaler/api/v1alpha1"
 )
 
 func hasString(xs []string, x string) bool {
@@ -48,6 +54,57 @@ func gaugeValue(t *testing.T, g *prometheus.GaugeVec, app, namespace string) (fl
 // Missing metrics must hold the current replica count, never read as zero traffic (plan item #0; user decision
 // 2026-10-09: missing or failed metrics → HOLD).
 
+// rateBody is the metrics answer for a measured rate given in requests per minute; the query contract is per second.
+func rateBody(t *testing.T, rpm string) string {
+	t.Helper()
+	v, err := strconv.ParseFloat(rpm, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return `{"status":"success","data":{"resultType":"vector","result":[{"value":[1,"` + strconv.FormatFloat(v/60, 'f', -1, 64) + `"]}]}}`
+}
+
+// echoProvenance wraps a stub forecasting service: like the real service, it reports the request's compiled-query hash
+// and contract in a successful JSON answer (spliced in, so the rest of the stub's bytes are unchanged).
+func echoProvenance(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		raw, _ := io.ReadAll(req.Body)
+		req.Body = io.NopCloser(bytes.NewReader(raw))
+		var in MLPredictionRequest
+		_ = json.Unmarshal(raw, &in)
+		rec := httptest.NewRecorder()
+		next(rec, req)
+		out := rec.Body.Bytes()
+		if rec.Code == http.StatusOK && bytes.HasPrefix(bytes.TrimSpace(out), []byte("{")) &&
+			!bytes.Contains(out, []byte(`"metric_query_sha256"`)) {
+			trimmed := bytes.TrimSpace(out)
+			fields := fmt.Sprintf(`{"metric_query_sha256":%q,"contract":%q`, in.MetricQuerySHA256, in.Contract)
+			if !bytes.HasPrefix(bytes.TrimSpace(trimmed[1:]), []byte("}")) {
+				fields += ","
+			}
+			out = append([]byte(fields), trimmed[1:]...)
+		}
+		for k, v := range rec.Header() {
+			w.Header()[k] = v
+		}
+		w.WriteHeader(rec.Code)
+		_, _ = w.Write(out)
+	}
+}
+
+// withSource gives a test autoscaler the compiled metric source a reconcile would have published (once).
+func withSource(t *testing.T, a *autoscalerv1alpha1.PredictiveAutoscaler) *autoscalerv1alpha1.PredictiveAutoscaler {
+	t.Helper()
+	if a.Status.MetricSource == nil {
+		c, err := compileMetricQuery(requestsSource(a), a.Spec.TargetDeployment.Namespace, a.Spec.TargetDeployment.Name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		a.Status.MetricSource = &autoscalerv1alpha1.MetricSourceStatus{Query: c.Query, SHA256: c.SHA256, Contract: metricContract}
+	}
+	return a
+}
+
 func vmServer(t *testing.T, body string, code int) {
 	t.Helper()
 	vm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -74,6 +131,7 @@ func TestQueryCurrentRPMOnlyAcceptsOneFiniteMeasurement(t *testing.T) {
 		{"two_series", `{"status":"success","data":{"resultType":"vector","result":[{"value":[1,"5"]},{"value":[1,"6"]}]}}`, 200, 0, false},
 		{"nan", `{"status":"success","data":{"resultType":"vector","result":[{"value":[1,"NaN"]}]}}`, 200, 0, false},
 		{"inf", `{"status":"success","data":{"resultType":"vector","result":[{"value":[1,"+Inf"]}]}}`, 200, 0, false},
+		{"overflow_after_conversion", `{"status":"success","data":{"resultType":"vector","result":[{"value":[1,"1e308"]}]}}`, 200, 0, false},
 		{"negative", `{"status":"success","data":{"resultType":"vector","result":[{"value":[1,"-3"]}]}}`, 200, 0, false},
 		{"not_a_number", `{"status":"success","data":{"resultType":"vector","result":[{"value":[1,"x"]}]}}`, 200, 0, false},
 		{"http_error", `oops`, 503, 0, false},
@@ -82,9 +140,9 @@ func TestQueryCurrentRPMOnlyAcceptsOneFiniteMeasurement(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			vmServer(t, tc.body, tc.code)
-			got, err := r.queryCurrentRPM("app", "ns")
+			got, err := r.queryCurrentRPM(context.Background(), `sum(rate(requests_total[1m]))`)
 			if tc.ok {
-				if err != nil || got != tc.want {
+				if err != nil || got != tc.want*60 { // the query answers per second; the operator works per minute
 					t.Fatalf("got %v, %v; want %v", got, err, tc.want)
 				}
 				return
@@ -156,7 +214,7 @@ func TestReconcileHoldsWhenTheCurrentRateIsUnavailable(t *testing.T) {
 			t.Setenv("ML_API_URL", ml.URL)
 			if tc.forecast != nil {
 				now := time.Now()
-				r.predictionCache[req.NamespacedName.String()] = &cachedPrediction{fetchedAt: now, response: &MLPredictionResponse{
+				r.predictionCache[req.NamespacedName.String()] = &cachedPrediction{binding: reconcileBinding(t, r, req), fetchedAt: now, response: &MLPredictionResponse{
 					Predictions: tc.forecast, Confidence: 0.9, anchorAt: now.Add(-time.Minute), issuedAt: now,
 				}}
 			}
@@ -183,7 +241,7 @@ func TestReconcileHoldsWhenTheCurrentRateIsUnavailable(t *testing.T) {
 // With the rate measured, the reconcile still follows the normal rule (a measured zero is a real zero).
 func TestReconcileStillScalesOnAMeasuredRate(t *testing.T) {
 	r, _, req, path := rpmGaugeReconciler(t)
-	vmServer(t, `{"status":"success","data":{"resultType":"vector","result":[{"value":[1,"3000"]}]}}`, 200)
+	vmServer(t, rateBody(t, "3000"), 200)
 	ml := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(503) }))
 	t.Cleanup(ml.Close)
 	t.Setenv("ML_API_URL", ml.URL)

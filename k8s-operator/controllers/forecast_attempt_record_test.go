@@ -65,13 +65,19 @@ func attemptFixture(t *testing.T) (*PredictiveAutoscalerReconciler, *autoscalerv
 	a.Name, a.Namespace = "predictive", "control"
 	a.Spec.TargetDeployment.Name, a.Spec.TargetDeployment.Namespace = "app", "demo"
 	a.Spec.Prediction.HorizonMinutes = 60
+	compiled, err := compileMetricQuery(nil, "demo", "app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Status.MetricSource = &autoscalerv1alpha1.MetricSourceStatus{Query: compiled.Query, SHA256: compiled.SHA256,
+		Contract: metricContract}
 	return &PredictiveAutoscalerReconciler{Log: logr.Discard(), predictionCache: map[string]*cachedPrediction{}}, a, path
 }
 
 func TestForecastAttemptLedgerFreshCacheAndStale(t *testing.T) {
 	r, a, path := attemptFixture(t)
 	var calls, status int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+	srv := httptest.NewServer(echoProvenance(func(w http.ResponseWriter, req *http.Request) {
 		atomic.AddInt32(&calls, 1)
 		if atomic.LoadInt32(&status) != 0 {
 			w.WriteHeader(502)
@@ -129,7 +135,7 @@ func TestForecastAttemptLedgerRawServedStatusesAndEmpty(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r, a, path := attemptFixture(t)
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) { fmt.Fprint(w, tc.body) }))
+			srv := httptest.NewServer(echoProvenance(func(w http.ResponseWriter, req *http.Request) { fmt.Fprint(w, tc.body) }))
 			defer srv.Close()
 			t.Setenv("ML_API_URL", srv.URL)
 			p, err := r.getCachedPrediction(context.Background(), a, "k")
@@ -169,7 +175,7 @@ func TestForecastAttemptLedgerRawServedStatusesAndEmpty(t *testing.T) {
 
 func TestForecastAttemptLedgerDecisionLinks(t *testing.T) {
 	r, _, req, path := rpmGaugeReconciler(t)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+	srv := httptest.NewServer(echoProvenance(func(w http.ResponseWriter, req *http.Request) {
 		fmt.Fprint(w, `{"predictions":[600,600,600,600,600,600],"confidence":0.9}`)
 	}))
 	defer srv.Close()
@@ -230,7 +236,7 @@ func TestForecastAttemptLedgerTimeoutStagesPreserveCacheClass(t *testing.T) {
 			})
 			defer func() { http.DefaultTransport = oldTransport }()
 			cached := &MLPredictionResponse{Predictions: []float64{1, 2}}
-			r.predictionCache["k"] = &cachedPrediction{response: cached, fetchedAt: time.Now().Add(-6 * time.Minute)}
+			r.predictionCache["k"] = &cachedPrediction{response: cached, fetchedAt: time.Now().Add(-6 * time.Minute), binding: forecastBinding(a)}
 			p, err, lookup := r.getCachedPredictionObserved(context.Background(), a, "k")
 			if status == 422 {
 				if p != nil || !isForecastRefusal(err) || lookup.Resolution != "unavailable" {
@@ -303,7 +309,7 @@ func TestForecastAttemptLedgerWriterFailuresAreObservedOnly(t *testing.T) {
 				}
 				return file, nil
 			}
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, `{"predictions":[1,2],"confidence":0.9}`) }))
+			srv := httptest.NewServer(echoProvenance(func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, `{"predictions":[1,2],"confidence":0.9}`) }))
 			defer srv.Close()
 			t.Setenv("ML_API_URL", srv.URL)
 			p, err := r.getCachedPrediction(context.Background(), a, "k")
@@ -328,7 +334,7 @@ func TestForecastAttemptLedgerDisabledAndIdentityFailure(t *testing.T) {
 			if disabled {
 				t.Setenv("FORECAST_LOG", "")
 			}
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, `{"predictions":[1,2],"confidence":0.9}`) }))
+			srv := httptest.NewServer(echoProvenance(func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, `{"predictions":[1,2],"confidence":0.9}`) }))
 			defer srv.Close()
 			t.Setenv("ML_API_URL", srv.URL)
 			p, err, lookup := r.getCachedPredictionObserved(context.Background(), a, "k")
@@ -380,7 +386,7 @@ func TestForecastAttemptLedgerRequestIdentityAndSyntheticFixture(t *testing.T) {
 	r, a, req, path := rpmGaugeReconciler(t)
 	var body atomic.Value
 	var status int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+	srv := httptest.NewServer(echoProvenance(func(w http.ResponseWriter, request *http.Request) {
 		rawBody, _ := io.ReadAll(request.Body)
 		body.Store(rawBody)
 		if s := atomic.LoadInt32(&status); s != 0 {
@@ -438,7 +444,7 @@ func TestForecastAttemptLedgerRequestIdentityAndSyntheticFixture(t *testing.T) {
 func TestForecastAttemptLedgerEmptyWireNamespacePreservesLegacyIssuance(t *testing.T) {
 	r, a, path := attemptFixture(t)
 	a.Spec.TargetDeployment.Namespace = ""
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+	srv := httptest.NewServer(echoProvenance(func(w http.ResponseWriter, req *http.Request) {
 		var request MLPredictionRequest
 		if err := json.NewDecoder(req.Body).Decode(&request); err != nil {
 			t.Error(err)

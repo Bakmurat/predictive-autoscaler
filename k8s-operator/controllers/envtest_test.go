@@ -131,7 +131,7 @@ func envHarness(t *testing.T, mode string) *envFixture {
 		t.Fatal(err)
 	}
 	vm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprint(w, `{"status":"success","data":{"resultType":"vector","result":[{"value":[1,"3000"]}]}}`)
+		fmt.Fprint(w, `{"status":"success","data":{"resultType":"vector","result":[{"value":[1,"50"]}]}}`) // 3000 req/min
 	}))
 	t.Cleanup(vm.Close)
 	t.Setenv("VICTORIAMETRICS_URL", vm.URL)
@@ -405,5 +405,44 @@ func TestEnvtestAnHPACreatedAfterAnAbortedWriteBlocksTheRetry(t *testing.T) {
 	reconcileOnce(t, f.r, f.req)
 	if d := lastDecision(t, f.path); d.Action != "conflict_hold" || *f.deployment(t).Spec.Replicas != 1 {
 		t.Fatalf("the retry must see the new HPA and hold: %+v", d)
+	}
+}
+
+// The CRD's validation of spec.metrics.requests.source on the real API server (CEL rule and default).
+func TestEnvtestTheMetricSourceRulesAreEnforcedByTheAPIServer(t *testing.T) {
+	f := envHarness(t, autoscalerv1alpha1.ModeRecommend)
+	ctx := context.Background()
+	try := func(name string, src *autoscalerv1alpha1.MetricSource) error {
+		pa := &autoscalerv1alpha1.PredictiveAutoscaler{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: f.req.Namespace},
+			Spec: autoscalerv1alpha1.PredictiveAutoscalerSpec{
+				TargetDeployment: autoscalerv1alpha1.TargetDeployment{Name: "web", Namespace: f.req.Namespace},
+				MinReplicas:      1, MaxReplicas: 3,
+				Metrics: autoscalerv1alpha1.MetricsConfig{Requests: &autoscalerv1alpha1.RequestsMetric{TargetRPS: 10, Source: src}},
+			},
+		}
+		return f.c.Create(ctx, pa)
+	}
+	if err := try("istio-with-query", &autoscalerv1alpha1.MetricSource{Preset: "istio", Query: "sum(x)"}); err == nil {
+		t.Fatal("a query with the istio preset must be rejected")
+	}
+	if err := try("prometheus-without-query", &autoscalerv1alpha1.MetricSource{Preset: "prometheus"}); err == nil {
+		t.Fatal("preset prometheus without a query must be rejected")
+	}
+	if err := try("unknown-preset", &autoscalerv1alpha1.MetricSource{Preset: "nginx-ingress"}); err == nil {
+		t.Fatal("an unknown preset must be rejected")
+	}
+	if err := try("prometheus-ok", &autoscalerv1alpha1.MetricSource{Preset: "prometheus", Query: `sum(rate(x{d="{{ .Name }}"}[1m]))`}); err != nil {
+		t.Fatalf("a prometheus query must be accepted: %v", err)
+	}
+	if err := try("defaulted", &autoscalerv1alpha1.MetricSource{}); err != nil {
+		t.Fatal(err)
+	}
+	var pa autoscalerv1alpha1.PredictiveAutoscaler
+	if err := f.c.Get(ctx, types.NamespacedName{Namespace: f.req.Namespace, Name: "defaulted"}, &pa); err != nil {
+		t.Fatal(err)
+	}
+	if pa.Spec.Metrics.Requests.Source == nil || pa.Spec.Metrics.Requests.Source.Preset != "istio" {
+		t.Fatalf("the preset must default to istio: %+v", pa.Spec.Metrics.Requests.Source)
 	}
 }
