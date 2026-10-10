@@ -28,4 +28,4 @@ ENVTEST_BIN_DIR ?= $(HOME)/.local/share/kubebuilder-envtest
 
 envtest:
 	@assets=$$(go run sigs.k8s.io/controller-runtime/tools/setup-envtest@$(SETUP_ENVTEST_VERSION) use $(ENVTEST_K8S_VERSION) --bin-dir "$(ENVTEST_BIN_DIR)" -p path) && \
-	cd k8s-operator && KUBEBUILDER_ASSETS="$$assets" ENVTEST_REQUIRED=1 go test -race -count=1 -run Envtest -v ./controllers/
+	cd k8s-operator && env -u KUBERNETES_SERVICE_HOST -u KUBERNETES_SERVICE_PORT KUBECONFIG=/dev/null KUBEBUILDER_ASSETS="$$assets" ENVTEST_REQUIRED=1 go test -race -count=1 -run Envtest -v ./controllers/
