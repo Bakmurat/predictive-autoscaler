@@ -222,6 +222,7 @@ type VMInstantQueryResponse struct {
 //+kubebuilder:rbac:groups=keda.sh,resources=scaledobjects,verbs=get;list;watch
 //+kubebuilder:rbac:groups=autoscaling.k8s.io,resources=verticalpodautoscalers,verbs=get;list;watch
 //+kubebuilder:rbac:groups=autoscaler.example.com,resources=predictiveautoscalers,verbs=get;list;watch
+//+kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,resourceNames=predictiveautoscalers.autoscaling.devkuban.com,verbs=get
 
 // Reconcile is the unified scaling loop. On every cycle (default 60s):
 // 1. Get ML predictions (cached 5 min) → predicted replicas within lead-time window

@@ -664,3 +664,19 @@ func TestEnvtestARawDeleteWithPreconditionsIsEnforcedByTheServer(t *testing.T) {
 		t.Fatal("the object must be gone")
 	}
 }
+
+// The CRD revision gate against the real API server and the generated CRD: a metadata-only read of the CRD, which the
+// operator's RBAC allows by name only.
+func TestEnvtestTheCRDRevisionGateReadsTheInstalledCRD(t *testing.T) {
+	cfg := startEnv(t)
+	c, err := client.New(cfg, client.Options{Scheme: envScheme()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckCRDRevision(context.Background(), c, RequiredCRDRevision); err != nil {
+		t.Fatalf("the generated CRD must satisfy this operator: %v", err)
+	}
+	if err := CheckCRDRevision(context.Background(), c, RequiredCRDRevision+1); err == nil || !strings.Contains(err.Error(), "needs") {
+		t.Fatalf("a newer operator must refuse this CRD: %v", err)
+	}
+}

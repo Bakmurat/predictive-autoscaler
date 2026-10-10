@@ -1,0 +1,98 @@
+{{- $ledger := .Values.operator.forecastLedger }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pa.fullname" . }}-operator
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "pa.labels" . | nindent 4 }}
+    app.kubernetes.io/component: operator
+{{- $ledgerClaim := and $ledger.enabled $ledger.persistence.existingClaim }}
+{{- if and $ledgerClaim (gt (int .Values.operator.replicas) 1) }}
+{{- fail "operator.forecastLedger.persistence.existingClaim needs operator.replicas: 1 (one pod holds the ledger claim)" }}
+{{- end }}
+spec:
+  replicas: {{ .Values.operator.replicas }}
+  {{- if $ledgerClaim }}
+  strategy:
+    type: Recreate             # the ledger claim may be ReadWriteOnce: the old pod releases it before the new one starts
+  {{- end }}
+  selector:
+    matchLabels: {{- include "pa.selector" (list . "operator") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "pa.selector" (list . "operator") | nindent 8 }}
+      {{- with .Values.operator.podAnnotations }}
+      annotations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "pa.fullname" . }}-operator
+      securityContext: {{- include "pa.podSecurity" 65532 | nindent 8 }}
+      {{- with .Values.images.pullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: operator
+          image: {{ include "pa.image" (list . .Values.images.operator) }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          args:
+            - --leader-elect=true
+            - --health-probe-bind-address=:8081
+            - --metrics-bind-address=:8080
+          env:
+            - name: ML_API_URL
+              value: {{ include "pa.forecasterURL" . | quote }}
+            - name: PROMETHEUS_URL
+              value: {{ required "prometheus.url is required" .Values.prometheus.url | quote }}
+            {{- with .Values.operator.watchNamespaces }}
+            - name: WATCH_NAMESPACES
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- if $ledger.enabled }}
+            - name: FORECAST_LOG
+              value: /var/lib/predictive-autoscaler/forecasts.jsonl
+            {{- end }}
+          ports:
+            - {name: metrics, containerPort: 8080}
+            - {name: probes, containerPort: 8081}
+          livenessProbe:
+            httpGet: {path: /healthz, port: probes}
+            periodSeconds: 20
+          readinessProbe:
+            httpGet: {path: /readyz, port: probes}
+            periodSeconds: 10
+          securityContext: {{- include "pa.containerSecurity" . | nindent 12 }}
+          resources: {{- toYaml .Values.operator.resources | nindent 12 }}
+          {{- if $ledger.enabled }}
+          volumeMounts:
+            - {name: ledger, mountPath: /var/lib/predictive-autoscaler}
+          {{- end }}
+      {{- if $ledger.enabled }}
+      volumes:
+        - name: ledger
+          {{- if $ledger.persistence.existingClaim }}
+          persistentVolumeClaim: {claimName: {{ $ledger.persistence.existingClaim | quote }}}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+      {{- end }}
+      {{- with .Values.operator.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.operator.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.operator.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pa.fullname" . }}-operator-metrics
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "pa.labels" . | nindent 4 }}
+    app.kubernetes.io/component: operator
+spec:
+  selector: {{- include "pa.selector" (list . "operator") | nindent 4 }}
+  ports:
+    - {name: metrics, port: 8080, targetPort: metrics}

@@ -37,6 +37,12 @@ rules:
   resources: ["predictiveautoscalers"]
   verbs: ["get", "list", "watch"]
 
+# Read this operator's own CRD (the revision gate before startup), nothing else
+- apiGroups: ["apiextensions.k8s.io"]
+  resources: ["customresourcedefinitions"]
+  resourceNames: ["predictiveautoscalers.autoscaling.devkuban.com"]
+  verbs: ["get"]
+
 # Read ConfigMaps (for application config)
 - apiGroups: [""]
   resources: ["configmaps"]

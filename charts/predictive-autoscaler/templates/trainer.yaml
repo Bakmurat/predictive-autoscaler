@@ -1,0 +1,79 @@
+{{- $seen := dict }}
+{{- range $t := .Values.training.targets }}
+{{- $target := printf "%s/%s" $t.namespace $t.name }}
+{{- if hasKey $seen $target }}
+{{- fail (printf "training.targets lists %s twice" $target) }}
+{{- end }}
+{{- $_ := set $seen $target true }}
+{{- /* <= 28 + 7 + 8 = 43 characters: a CronJob's name must leave room for its Jobs' suffix (52 at most). */}}
+{{- $name := printf "%s-train-%s" (include "pa.fullname" $ | trunc 28 | trimSuffix "-") (sha256sum $target | trunc 8) }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $name }}
+  namespace: {{ $.Release.Namespace }}
+  labels: {{- include "pa.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: trainer
+  annotations:
+    autoscaling.devkuban.com/training-target: {{ $target | quote }}
+spec:
+  schedule: {{ $t.schedule | quote }}
+  concurrencyPolicy: Forbid         # one training per target at a time (the publication lock also serializes them)
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    metadata:
+      labels: {{- include "pa.selector" (list $ "trainer") | nindent 8 }}
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: {{ $.Values.training.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels: {{- include "pa.selector" (list $ "trainer") | nindent 12 }}
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ include "pa.fullname" $ }}-trainer
+          securityContext: {{- include "pa.podSecurity" 10001 | nindent 12 }}
+          {{- with $.Values.images.pullSecrets }}
+          imagePullSecrets: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: trainer
+              image: {{ include "pa.image" (list $ $.Values.images.forecaster) }}
+              imagePullPolicy: {{ $.Values.images.pullPolicy }}
+              command: ["python3", "training/train_nginx_test.py"]
+              env:
+                {{- include "pa.pythonEnv" $ | nindent 16 }}
+                - name: TRAINING_TARGET
+                  value: {{ $target | quote }}
+                - name: TRAINING_HOURS
+                  value: {{ $.Values.training.hours | quote }}
+                - name: PROMETHEUS_URL
+                  value: {{ required "prometheus.url is required" $.Values.prometheus.url | quote }}
+              securityContext: {{- include "pa.containerSecurity" $ | nindent 16 }}
+              resources: {{- toYaml $.Values.training.resources | nindent 16 }}
+              volumeMounts:
+                - {name: models, mountPath: /models}
+                - {name: tmp, mountPath: /tmp}
+          volumes:
+            - name: models
+              persistentVolumeClaim: {claimName: {{ include "pa.modelsClaim" $ | quote }}}
+            - name: tmp
+              emptyDir: {sizeLimit: {{ $.Values.forecaster.tmpSizeLimit }}}
+          {{- if ne $.Values.forecaster.persistence.accessMode "ReadWriteMany" }}
+          affinity:
+            podAffinity:            # a ReadWriteOnce volume: run on the forecaster's node
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - topologyKey: kubernetes.io/hostname
+                  labelSelector:
+                    matchLabels: {{- include "pa.selector" (list $ "forecaster") | nindent 22 }}
+          {{- end }}
+          {{- with $.Values.training.nodeSelector }}
+          nodeSelector: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $.Values.training.tolerations }}
+          tolerations: {{- toYaml . | nindent 12 }}
+          {{- end }}
+---
+{{- end }}

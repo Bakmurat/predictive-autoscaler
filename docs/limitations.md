@@ -19,12 +19,14 @@ production-ready. Known limits, most important first:
    a single point of failure (the operator falls back to the reactive rule when it is down).
 6. **Operator state in memory:** cooldowns, stabilization windows and forecast caches are lost on restart, and when
    leadership moves to another instance.
-7. **Broad permissions:** one cluster-wide role is shared by the operator and the forecasting API, and the API's
-   `/predict` and `/train` endpoints are unauthenticated.
+7. **Unauthenticated forecasting API:** the Helm chart gives each component its own least-privilege service account,
+   and its NetworkPolicies admit only the operator to the forecasting service. The API itself does not authenticate
+   callers yet (`/train` is disabled). The manifests in `k8s-manifests/` still share one broad role (see helm.md).
 8. **Silent configuration mistakes:** ignored CRD fields (CPU, memory, resources, container), defaults that differ from
    the README, and `metrics.requests.enabled` defaulting to `false` (see configuration.md).
 9. **Heavy footprint:** the forecasting image includes TensorFlow (about 1 CPU / 1 GiB requested); the neural component
    has not shown a consistent advantage over the seasonal pattern in the evaluations so far.
-10. **No published images, chart or releases yet;** see getting-started.md for building and installing from source.
+10. **No published images, chart or releases yet:** the chart is installed from the source tree (helm.md); images are
+    built from source (getting-started.md).
 
 The plan to address these is tracked by the maintainers; items 1–2 come first.

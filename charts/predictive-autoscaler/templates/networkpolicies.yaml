@@ -1,0 +1,62 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $np := .Values.networkPolicy }}
+# Forecaster: reached only by the operator (and the configured scrapers); talks only to DNS, the API server, Prometheus.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "pa.fullname" . }}-forecaster
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "pa.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "pa.selector" (list . "forecaster") | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {{- include "pa.selector" (list . "operator") | nindent 14 }}
+        {{- with $np.metricsFrom }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      ports:
+        - {protocol: TCP, port: 8000}
+  egress: {{- include "pa.commonEgress" . | nindent 4 }}
+---
+# Operator: scraped on its metrics port only; talks to DNS, the API server, Prometheus and the forecaster.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "pa.fullname" . }}-operator
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "pa.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "pa.selector" (list . "operator") | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    {{- if $np.metricsFrom }}
+    - from: {{- toYaml $np.metricsFrom | nindent 8 }}
+      ports:
+        - {protocol: TCP, port: 8080}
+    {{- end }}
+  egress:
+    {{- include "pa.commonEgress" . | nindent 4 }}
+    - to:
+        - podSelector:
+            matchLabels: {{- include "pa.selector" (list . "forecaster") | nindent 14 }}
+      ports:
+        - {protocol: TCP, port: 8000}
+---
+# Trainer: no ingress; talks to DNS, the API server and Prometheus.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "pa.fullname" . }}-trainer
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "pa.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "pa.selector" (list . "trainer") | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  egress: {{- include "pa.commonEgress" . | nindent 4 }}
+{{- end }}

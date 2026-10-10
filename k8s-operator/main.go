@@ -126,8 +126,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	// The CRD revision gate: nothing starts (no leadership campaign, no controller) until the installed CRD is one this
+	// operator works with; meanwhile the probes report alive and not ready.
+	ctx := ctrl.SetupSignalHandler()
+	if err := controllers.WaitForCRDRevision(ctx, mgr.GetAPIReader(), controllers.RequiredCRDRevision, probeAddr, setupLog); err != nil {
+		setupLog.Error(err, "stopped while waiting for a compatible CRD")
+		os.Exit(1)
+	}
+
 	setupLog.Info("starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(ctx); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}

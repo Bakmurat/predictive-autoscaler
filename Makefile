@@ -1,5 +1,5 @@
 # Publication is gated on `make verify` returning 0. See scripts/verify.sh and README "Testing".
-.PHONY: setup verify verify-selftest verify-python verify-go precommit-selftest envtest manifests manifests-check
+.PHONY: setup verify verify-selftest verify-python verify-go precommit-selftest envtest manifests manifests-check chart-check
 
 setup:
 	@git config core.hooksPath .githooks
@@ -23,6 +23,10 @@ manifests:
 
 manifests-check:
 	@scripts/gen-manifests.sh check
+
+# The chart's static checks (helm lint/template, kubeconform for Kubernetes 1.33-1.35); needs helm and kubeconform.
+chart-check:
+	@scripts/chart-check.sh
 
 precommit-selftest:
 	@scripts/precommit-selftest.sh

@@ -1,0 +1,87 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "pa.fullname" . }}-operator
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "pa.labels" . | nindent 4 }}
+---
+# The operator: reads autoscalers and their targets, writes replicas only through deployments/scale, reads every other
+# replica writer (coexistence), reads its own CRD (the revision gate), emits events.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "pa.fullname" . }}-operator
+  labels: {{- include "pa.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["autoscaling.devkuban.com"]
+    resources: ["predictiveautoscalers"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["autoscaling.devkuban.com"]
+    resources: ["predictiveautoscalers/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    verbs: ["get", "update"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["keda.sh"]
+    resources: ["scaledobjects"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["autoscaling.k8s.io"]
+    resources: ["verticalpodautoscalers"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["autoscaler.example.com"]
+    resources: ["predictiveautoscalers"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    resourceNames: ["predictiveautoscalers.autoscaling.devkuban.com"]
+    verbs: ["get"]
+  - apiGroups: ["", "events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "pa.fullname" . }}-operator
+  labels: {{- include "pa.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "pa.fullname" . }}-operator
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "pa.fullname" . }}-operator
+    namespace: {{ .Release.Namespace }}
+---
+# Leader election: the Lease in the release namespace only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "pa.fullname" . }}-operator-lease
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "pa.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "pa.fullname" . }}-operator-lease
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "pa.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "pa.fullname" . }}-operator-lease
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "pa.fullname" . }}-operator
+    namespace: {{ .Release.Namespace }}

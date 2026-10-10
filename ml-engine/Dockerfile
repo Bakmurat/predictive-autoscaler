@@ -38,16 +38,23 @@ COPY . .
 # was not executable on arm64 nodes (found by the in-cluster test run, 2026-09-20).
 ARG TARGETARCH
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
-    && curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/${TARGETARCH}/kubectl" \
+    && curl -fLO "https://dl.k8s.io/release/v1.35.9/bin/linux/${TARGETARCH}/kubectl" \
+    && case "${TARGETARCH}" in \
+         amd64) sum=3cfeaf80be482b435b0aa214aff6e0b2c312ee23c0ff20810c75517b6004c6eb ;; \
+         arm64) sum=39c98bca82875d9a9ddfb6f3c5ab17c3f78ea0801230683e538a67d5c053308d ;; \
+         *) echo "no pinned kubectl checksum for ${TARGETARCH}" >&2; exit 1 ;; \
+       esac \
+    && echo "${sum}  kubectl" | sha256sum -c - \
     && chmod +x kubectl \
     && mv kubectl /usr/local/bin/kubectl \
     && apt-get purge -y curl \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
-# Add non-root user and set ownership (required because we use readOnlyRootFilesystem)
-RUN useradd --create-home --shell /bin/bash app && chown -R app:app /app
-USER app
+# A fixed numeric non-root user: Kubernetes' runAsNonRoot can only verify a numeric USER, and the chart runs the
+# forecaster and the trainer as 10001 with a read-only root filesystem (writable: /models and /tmp).
+RUN useradd --uid 10001 --user-group --create-home --shell /usr/sbin/nologin app && chown -R 10001:10001 /app
+USER 10001:10001
 
 ENV PYTHONUNBUFFERED=1 \
         PYTHONPATH=/app

@@ -1,0 +1,22 @@
+{{- range $kind, $cfg := dict "ServiceMonitor" .Values.metrics.serviceMonitor "VMServiceScrape" .Values.metrics.vmServiceScrape }}
+{{- if $cfg.enabled }}
+{{- range $component := list "operator" "forecaster" }}
+apiVersion: {{ ternary "monitoring.coreos.com/v1" "operator.victoriametrics.com/v1beta1" (eq $kind "ServiceMonitor") }}
+kind: {{ $kind }}
+metadata:
+  name: {{ include "pa.fullname" $ }}-{{ $component }}
+  namespace: {{ $.Release.Namespace }}
+  labels: {{- include "pa.labels" $ | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+      app.kubernetes.io/component: {{ $component }}
+  endpoints:
+    - port: {{ ternary "metrics" "http" (eq $component "operator") }}
+      path: /metrics
+      interval: {{ $cfg.interval }}
+---
+{{- end }}
+{{- end }}
+{{- end }}

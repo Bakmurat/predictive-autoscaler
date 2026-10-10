@@ -43,7 +43,14 @@ images:
     newName: <registry>/predictive-autoscaler-operator
     newTag: dev
 ```
-Apply and check that everything came up:
+Install with the Helm chart (recommended: least-privilege service accounts, non-root read-only containers,
+network policies; see [helm.md](helm.md)), with your images:
+```sh
+helm install pa charts/predictive-autoscaler -n predictive-autoscaler --create-namespace -f my-values.yaml \
+  --set images.operator.repository=<registry>/predictive-autoscaler-operator --set images.operator.tag=dev \
+  --set images.forecaster.repository=<registry>/predictive-autoscaler-ml-api --set images.forecaster.tag=dev
+```
+Or apply the plain manifests (one shared role, no network policies) and check that everything came up:
 ```sh
 kubectl apply -k k8s-manifests/base
 kubectl wait --for=condition=Established crd/predictiveautoscalers.autoscaling.devkuban.com --timeout=60s

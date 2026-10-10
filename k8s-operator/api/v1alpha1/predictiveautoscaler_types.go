@@ -283,6 +283,8 @@ type PredictiveAutoscalerStatus struct {
 //+kubebuilder:subresource:status
 //+kubebuilder:resource:shortName=pa
 //+kubebuilder:metadata:labels="autoscaling.devkuban.com/crd-revision=1"
+//+kubebuilder:metadata:annotations="argocd.argoproj.io/sync-options=Prune=false,Delete=false,ServerSideApply=true"
+//+kubebuilder:metadata:annotations="argocd.argoproj.io/sync-wave=-1"
 //+kubebuilder:printcolumn:name="Target",type="string",JSONPath=".spec.targetDeployment.name"
 //+kubebuilder:printcolumn:name="Min",type="integer",JSONPath=".spec.minReplicas"
 //+kubebuilder:printcolumn:name="Max",type="integer",JSONPath=".spec.maxReplicas"
