@@ -1,5 +1,5 @@
 # Publication is gated on `make verify` returning 0. See scripts/verify.sh and README "Testing".
-.PHONY: setup verify verify-selftest verify-python verify-go precommit-selftest envtest manifests manifests-check chart-check smoke
+.PHONY: setup verify verify-selftest verify-python verify-go precommit-selftest envtest manifests manifests-check chart-check smoke quickstart
 
 setup:
 	@git config core.hooksPath .githooks
@@ -32,6 +32,10 @@ chart-check:
 # kubectl, helm. KEEP=1 keeps the cluster; OPERATOR_IMAGE/FORECASTER_IMAGE skip the image builds.
 smoke:
 	@hack/smoke-kind.sh
+
+# The newcomer path: Recommend mode with actual HTTP request telemetry on its own kind cluster.
+quickstart:
+	@quickstart/kind.sh up
 
 precommit-selftest:
 	@scripts/precommit-selftest.sh

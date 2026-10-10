@@ -25,7 +25,7 @@ brackets (20 and 60). The same applies to `metrics.requests`. Set these fields e
 | `metrics.cpu.*`, `metrics.memory.*` | — | no | enabled, 70 / 60 % | **no** | Accepted, ignored: only the request rate is used. |
 | `prediction.enabled` | bool | no | true | yes | `false` = reactive-only. |
 | `prediction.horizonMinutes` | int ≥ 5 | no | 60 [60] | yes | How far ahead the forecaster predicts. |
-| `prediction.leadTimeMinutes` | int ≥ 1 | no | **15** [20] | yes | The operator sizes for the highest forecast in the next `leadTimeMinutes` (see the decision rule). The README and examples use 20; set it explicitly. |
+| `prediction.leadTimeMinutes` | int ≥ 1 | no | **15** [20] | yes | The operator sizes for the highest forecast in the next `leadTimeMinutes` (see the decision rule). Set it explicitly; the quickstart uses 15. |
 | `prediction.updateIntervalSeconds` | int ≥ 60 | no | **300** [60] | yes | Reconcile period. Examples set 60. |
 | `resources.*` | — | no | 100 m / 128 MB / 10,000 rpm | **no** | Accepted, ignored. |
 
@@ -84,7 +84,7 @@ measured as a real zero and scales normally.
 | `WATCH_NAMESPACES` | all | Comma-separated namespaces to watch. |
 | `ML_API_TOKEN_FILE` | unset | A projected service account token for the forecasting service's audience, read on every request and sent as `Authorization: Bearer`. With it set, `ML_API_URL` must be https, and a missing or empty file sends nothing (forecast status `auth_misconfigured`, reactive rule). |
 | `ML_API_CA_FILE` | unset | The forecasting service's CA bundle. It is reloaded when it changes (checked at most every 60 s); a configured file that is missing or invalid sends nothing. Redirects are never followed. |
-The forecasting service reads the endpoint from a differently named variable, `VICTORIA_METRICS_URL`; set both.
+The chart sets `PROMETHEUS_URL` consistently for the operator, forecasting service and trainer.
 
 ## Forecasting service
 | Variable | Default | Purpose |
