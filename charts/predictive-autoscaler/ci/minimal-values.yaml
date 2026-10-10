@@ -3,3 +3,5 @@ prometheus:
   url: http://prometheus:9090
 networkPolicy:
   enabled: false
+forecaster:
+  auth: {enabled: false}

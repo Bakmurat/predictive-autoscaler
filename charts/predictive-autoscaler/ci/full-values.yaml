@@ -13,6 +13,7 @@ operator:
   podAnnotations: {example.com/team: platform}
   nodeSelector: {kubernetes.io/os: linux}
 forecaster:
+  tls: {source: certManager, certManager: {issuerRef: {name: cluster-ca, kind: ClusterIssuer}}}
   persistence: {storageClass: fast, size: 20Gi, accessMode: ReadWriteMany, retain: false}
   tmpSizeLimit: 4Gi
 training:

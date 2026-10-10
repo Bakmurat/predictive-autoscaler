@@ -86,11 +86,12 @@ def test_rbac_matches_the_documented_least_privilege_table(render):
         (("apiextensions.k8s.io",), ("customresourcedefinitions",), (NEW_CRD,), ("get",)),
         (("", "events.k8s.io"), ("events",), (), ("create", "patch")),
     }
-    for component in ("forecaster", "trainer"):
-        assert rules_of(docs, f"pa-predictive-autoscaler-{component}") == {
-            (("autoscaling.devkuban.com",), ("predictiveautoscalers",), (), ("get",)),
-            (("apps",), ("deployments",), (), ("get",)),
-        }
+    read_only = {(("autoscaling.devkuban.com",), ("predictiveautoscalers",), (), ("get",)),
+                 (("apps",), ("deployments",), (), ("get",))}
+    assert rules_of(docs, "pa-predictive-autoscaler-trainer") == read_only
+    # With authentication (the default) the forecasting service also checks callers' tokens.
+    assert rules_of(docs, "pa-predictive-autoscaler-forecaster") == read_only | {
+        (("authentication.k8s.io",), ("tokenreviews",), (), ("create",))}
     lease = by_kind(docs, "Role")
     assert len(lease) == 1 and lease[0]["metadata"]["namespace"] == NS
     assert {tuple(r["resources"]) for r in lease[0]["rules"]} == {("leases",)}
@@ -134,12 +135,16 @@ def test_every_container_is_non_root_read_only_and_drops_all_capabilities(render
 
 def test_writable_paths_are_exactly_the_documented_ones(render):
     docs = render({"operator": {"forecastLedger": {"enabled": True}}})
-    mounts = {}
+    writable, read_only = {}, {}
     for d, pod in pod_specs(docs):
         for c in pod["containers"]:
-            mounts.setdefault(c["name"], set()).update(m["mountPath"] for m in c.get("volumeMounts", []))
-    assert mounts == {"operator": {"/var/lib/predictive-autoscaler"}, "forecaster": {"/models", "/tmp"},
-                      "trainer": {"/models", "/tmp"}}
+            for m in c.get("volumeMounts", []):
+                (read_only if m.get("readOnly") else writable).setdefault(c["name"], set()).add(m["mountPath"])
+    assert writable == {"operator": {"/var/lib/predictive-autoscaler"}, "forecaster": {"/models", "/tmp"},
+                        "trainer": {"/models", "/tmp"}}
+    assert read_only == {"operator": {"/var/run/secrets/predictive-autoscaler/forecaster-token",
+                                      "/etc/predictive-autoscaler/forecaster-ca"},
+                         "forecaster": {"/etc/predictive-autoscaler/tls"}}
     for d, pod in pod_specs(docs):
         if d["metadata"]["labels"]["app.kubernetes.io/component"] != "operator":
             env = {e["name"]: e.get("value") for e in pod["containers"][0]["env"]}
@@ -162,7 +167,8 @@ def test_a_ledger_claim_runs_one_operator_replaced_not_rolled(render):
 def test_the_ledger_is_off_by_default(render):
     op = next(d for d in by_kind(render(), "Deployment") if d["metadata"]["name"].endswith("-operator"))
     c = op["spec"]["template"]["spec"]["containers"][0]
-    assert "FORECAST_LOG" not in {e["name"] for e in c["env"]} and "volumeMounts" not in c
+    assert "FORECAST_LOG" not in {e["name"] for e in c["env"]}
+    assert "/var/lib/predictive-autoscaler" not in {m["mountPath"] for m in c.get("volumeMounts", [])}
 
 
 def test_no_cold_start_and_no_benchmark_experiments(render):
@@ -178,7 +184,7 @@ def test_references_point_at_the_releases_own_objects(render):
     ident = {(d["kind"], d["metadata"].get("namespace", ""), d["metadata"]["name"]) for d in docs}
     op = next(d for d in by_kind(docs, "Deployment") if d["metadata"]["name"] == "pa-predictive-autoscaler-operator")
     env = {e["name"]: e.get("value") for e in op["spec"]["template"]["spec"]["containers"][0]["env"]}
-    assert env["ML_API_URL"] == f"http://pa-predictive-autoscaler-forecaster.{NS}.svc:8000"
+    assert env["ML_API_URL"] == f"https://pa-predictive-autoscaler-forecaster.{NS}.svc:8443"
     assert ("Service", NS, "pa-predictive-autoscaler-forecaster") in ident
     assert env["PROMETHEUS_URL"] == BASE["prometheus"]["url"]
     for d, pod in pod_specs(docs):
@@ -278,7 +284,7 @@ def test_network_policies_isolate_each_component(render):
         assert prom["to"] == [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "monitoring"}}}]
     forecaster_from = nps["forecaster"]["ingress"][0]["from"]
     assert forecaster_from[0]["podSelector"]["matchLabels"]["app.kubernetes.io/component"] == "operator"
-    assert nps["forecaster"]["ingress"][0]["ports"] == [{"protocol": "TCP", "port": 8000}]
+    assert nps["forecaster"]["ingress"][0]["ports"] == [{"protocol": "TCP", "port": 8443}]
     assert "ingress" not in nps["trainer"]                                   # no ingress at all
     assert nps["operator"]["egress"][3]["to"][0]["podSelector"]["matchLabels"]["app.kubernetes.io/component"] == "forecaster"
 
@@ -324,3 +330,75 @@ def test_images_prefer_the_digest(render):
 def test_the_values_schema_rejects(render, bad):
     p = render(bad, check=False)
     assert p.returncode != 0, bad
+
+
+# --- authentication between the operator and the forecasting service (B5e) ---------------------------------------------
+
+def deployment(docs, component):
+    return next(d for d in by_kind(docs, "Deployment") if d["metadata"]["name"].endswith(f"-{component}"))
+
+
+def test_authentication_is_on_by_default_with_tls(render):
+    docs = render()
+    fc = deployment(docs, "forecaster")["spec"]["template"]["spec"]
+    env = {e["name"]: e.get("value") for e in fc["containers"][0]["env"]}
+    assert env["FORECASTER_AUTH"] == "tokenreview"
+    assert env["FORECASTER_AUTH_SUBJECTS"] == f"system:serviceaccount:{NS}:pa-predictive-autoscaler-operator"
+    assert env["FORECASTER_AUTH_AUDIENCE"] == "predictive-autoscaler-forecaster"
+    assert env["FORECASTER_TLS_CERT"].endswith("tls.crt") and "FORECASTER_AUTH_ALLOW_PLAINTEXT" not in env
+    assert fc["containers"][0]["ports"] == [{"name": "http", "containerPort": 8443}]
+    for probe in ("startupProbe", "livenessProbe", "readinessProbe"):
+        assert fc["containers"][0][probe]["httpGet"]["scheme"] == "HTTPS"
+    tls_vol = next(v for v in fc["volumes"] if v["name"] == "tls")
+    assert tls_vol["secret"]["items"] == [{"key": "tls.crt", "path": "tls.crt"}, {"key": "tls.key", "path": "tls.key"}]
+    svc = next(d for d in by_kind(docs, "Service") if d["metadata"]["name"].endswith("-forecaster"))
+    assert svc["spec"]["ports"][0]["port"] == 8443
+
+    op = deployment(docs, "operator")["spec"]["template"]["spec"]
+    env = {e["name"]: e.get("value") for e in op["containers"][0]["env"]}
+    assert env["ML_API_URL"].startswith("https://") and env["ML_API_TOKEN_FILE"].endswith("/token")
+    vols = {v["name"]: v for v in op["volumes"]}
+    token = vols["forecaster-token"]["projected"]["sources"][0]["serviceAccountToken"]
+    assert token == {"audience": "predictive-autoscaler-forecaster", "expirationSeconds": 3600, "path": "token"}
+    assert vols["forecaster-ca"]["secret"]["items"] == [{"key": "ca.crt", "path": "ca.crt"}]   # never the private key
+
+
+def test_the_self_signed_certificate_covers_the_service_names(render):
+    secret = next(d for d in by_kind(render(), "Secret") if d["metadata"]["name"] == "pa-predictive-autoscaler-forecaster-tls")
+    assert secret["type"] == "kubernetes.io/tls" and set(secret["data"]) == {"tls.crt", "tls.key", "ca.crt"}
+    import base64
+    cert = base64.b64decode(secret["data"]["tls.crt"]).decode()
+    assert cert.startswith("-----BEGIN CERTIFICATE-----")
+    check = subprocess.run(["openssl", "x509", "-noout", "-ext", "subjectAltName"], input=cert, capture_output=True, text=True)
+    if check.returncode == 0:
+        assert f"pa-predictive-autoscaler-forecaster.{NS}.svc" in check.stdout
+
+
+def test_cert_manager_and_existing_secret_sources(render):
+    docs = render({"forecaster": {"tls": {"source": "certManager", "certManager": {"issuerRef": {"name": "ca", "kind": "ClusterIssuer"}}}}})
+    cert = next(d for d in docs if d["kind"] == "Certificate")
+    assert cert["spec"]["secretName"] == "pa-predictive-autoscaler-forecaster-tls"
+    assert cert["spec"]["issuerRef"] == {"name": "ca", "kind": "ClusterIssuer", "group": "cert-manager.io"}
+    assert f"pa-predictive-autoscaler-forecaster.{NS}.svc" in cert["spec"]["dnsNames"] and not by_kind(docs, "Secret")
+    assert render({"forecaster": {"tls": {"source": "certManager"}}}, check=False).returncode != 0   # issuer required
+    docs = render({"forecaster": {"tls": {"source": "existingSecret", "existingSecret": "my-tls"}}})
+    assert not by_kind(docs, "Secret") and not [d for d in docs if d["kind"] == "Certificate"]
+    op = deployment(docs, "operator")["spec"]["template"]["spec"]
+    assert next(v for v in op["volumes"] if v["name"] == "forecaster-ca")["secret"]["secretName"] == "my-tls"
+    assert render({"forecaster": {"tls": {"source": "existingSecret"}}}, check=False).returncode != 0   # name required
+
+
+def test_authentication_can_be_turned_off(render):
+    docs = render({"forecaster": {"auth": {"enabled": False}}})
+    fc = deployment(docs, "forecaster")["spec"]["template"]["spec"]["containers"][0]
+    assert "FORECASTER_AUTH" not in {e["name"] for e in fc["env"]} and fc["ports"][0]["containerPort"] == 8000
+    op = deployment(docs, "operator")["spec"]["template"]["spec"]
+    assert "volumes" not in op and not by_kind(docs, "Secret")
+    assert rules_of(docs, "pa-predictive-autoscaler-forecaster") == {
+        (("autoscaling.devkuban.com",), ("predictiveautoscalers",), (), ("get",)), (("apps",), ("deployments",), (), ("get",))}
+
+
+def test_the_forecaster_is_scraped_over_tls(render):
+    docs = render({"metrics": {"serviceMonitor": {"enabled": True}}})
+    sm = next(d for d in docs if d["kind"] == "ServiceMonitor" and d["metadata"]["name"].endswith("-forecaster"))
+    assert sm["spec"]["endpoints"][0]["scheme"] == "https"

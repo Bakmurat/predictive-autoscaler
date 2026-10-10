@@ -71,6 +71,16 @@ def _try_timeout(sock, seconds: float) -> None:
 def bounded_get(url: str, *, headers: Optional[Dict[str, str]] = None, deadline_s: float, max_bytes: int,
                 connect_timeout_s: float = 3.0, ssl_context: Optional[ssl.SSLContext] = None) -> Tuple[int, bytes]:
     """GET url; return (status, complete body). Raises DeadlineExceeded, TransportFailure or BodyTooLarge."""
+    return bounded_request("GET", url, headers=headers, deadline_s=deadline_s, max_bytes=max_bytes,
+                           connect_timeout_s=connect_timeout_s, ssl_context=ssl_context)
+
+
+def bounded_request(method: str, url: str, *, body: Optional[bytes] = None, headers: Optional[Dict[str, str]] = None,
+                    deadline_s: float, max_bytes: int, connect_timeout_s: float = 3.0,
+                    ssl_context: Optional[ssl.SSLContext] = None) -> Tuple[int, bytes]:
+    """method (GET or POST) url with an optional body; the same deadline, framing and size guarantees as bounded_get."""
+    if method not in ("GET", "POST"):
+        raise TransportFailure(f"unsupported method {method!r}")
     if deadline_s <= 0:
         raise DeadlineExceeded("deadline already passed")
     u = urllib.parse.urlsplit(url)
@@ -144,7 +154,7 @@ def bounded_get(url: str, *, headers: Optional[Dict[str, str]] = None, deadline_
             conn = (http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection)(host, port)
             conn.sock = sock   # use our connected, watched socket; http.client never opens another
             path = (u.path or "/") + (f"?{u.query}" if u.query else "")
-            conn.request("GET", path, headers=headers or {})
+            conn.request(method, path, body=body, headers=headers or {})
             _try_timeout(sock, remaining())
             resp = conn.getresponse()
             chunks, size = [], 0

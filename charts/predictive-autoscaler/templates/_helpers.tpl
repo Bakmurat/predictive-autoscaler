@@ -43,8 +43,24 @@ app.kubernetes.io/component: {{ index . 1 }}
 {{- end -}}
 {{- end -}}
 
+{{- define "pa.forecasterPort" -}}
+{{- ternary 8443 8000 .Values.forecaster.auth.enabled -}}
+{{- end -}}
+
 {{- define "pa.forecasterURL" -}}
-{{- printf "http://%s-forecaster.%s.svc:8000" (include "pa.fullname" .) .Release.Namespace -}}
+{{- printf "%s://%s-forecaster.%s.svc:%s" (ternary "https" "http" .Values.forecaster.auth.enabled) (include "pa.fullname" .) .Release.Namespace (include "pa.forecasterPort" .) -}}
+{{- end -}}
+
+{{- define "pa.forecasterTLSSecret" -}}
+{{- if eq .Values.forecaster.tls.source "existingSecret" -}}
+{{- required "forecaster.tls.existingSecret is required with tls.source existingSecret" .Values.forecaster.tls.existingSecret -}}
+{{- else -}}
+{{- printf "%s-forecaster-tls" (include "pa.fullname" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "pa.operatorSubject" -}}
+{{- printf "system:serviceaccount:%s:%s-operator" .Release.Namespace (include "pa.fullname" .) -}}
 {{- end -}}
 
 {{- define "pa.modelsClaim" -}}

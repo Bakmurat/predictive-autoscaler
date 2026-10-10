@@ -63,7 +63,7 @@ EXPOSE 8000
 
 # Health check (kept lightweight)
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD python -c "import requests; import sys; sys.exit(0 if requests.get('http://localhost:8000/health').status_code==200 else 1)" || exit 1
+    CMD python -c "import os,ssl,urllib.request; tls=bool(os.getenv('FORECASTER_TLS_CERT')); port=os.getenv('FORECASTER_PORT', '8443' if tls else '8000'); urllib.request.urlopen(('https' if tls else 'http')+'://localhost:'+port+'/health', timeout=4, context=ssl._create_unverified_context() if tls else None)" || exit 1
 
-# Use uvicorn executable directly (installed system-wide)
-CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# api/serve.py: plain HTTP on 8000, or HTTPS on 8443 when FORECASTER_TLS_CERT/KEY are set (restarts on rotation)
+CMD ["python", "-m", "api.serve"]

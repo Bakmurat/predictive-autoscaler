@@ -56,20 +56,32 @@ spec:
               value: {{ required "prometheus.url is required" .Values.prometheus.url | quote }}
             - name: POD_NAMESPACE
               valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            {{- if .Values.forecaster.auth.enabled }}
+            - name: FORECASTER_AUTH
+              value: tokenreview
+            - name: FORECASTER_AUTH_AUDIENCE
+              value: {{ .Values.forecaster.auth.audience | quote }}
+            - name: FORECASTER_AUTH_SUBJECTS
+              value: {{ include "pa.operatorSubject" . | quote }}
+            - name: FORECASTER_TLS_CERT
+              value: /etc/predictive-autoscaler/tls/tls.crt
+            - name: FORECASTER_TLS_KEY
+              value: /etc/predictive-autoscaler/tls/tls.key
+            {{- end }}
           ports:
-            - {name: http, containerPort: 8000}
+            - {name: http, containerPort: {{ include "pa.forecasterPort" . }}}
           startupProbe:
-            httpGet: {path: /health, port: http}
+            httpGet: {path: /health, port: http{{ if .Values.forecaster.auth.enabled }}, scheme: HTTPS{{ end }}}
             periodSeconds: 10
             timeoutSeconds: 10
             failureThreshold: 30
           livenessProbe:
-            httpGet: {path: /health, port: http}
+            httpGet: {path: /health, port: http{{ if .Values.forecaster.auth.enabled }}, scheme: HTTPS{{ end }}}
             periodSeconds: 60
             timeoutSeconds: 30
             failureThreshold: 8
           readinessProbe:
-            httpGet: {path: /ready, port: http}
+            httpGet: {path: /ready, port: http{{ if .Values.forecaster.auth.enabled }}, scheme: HTTPS{{ end }}}
             periodSeconds: 10
             timeoutSeconds: 10
           securityContext: {{- include "pa.containerSecurity" . | nindent 12 }}
@@ -77,11 +89,20 @@ spec:
           volumeMounts:
             - {name: models, mountPath: /models}
             - {name: tmp, mountPath: /tmp}
+            {{- if .Values.forecaster.auth.enabled }}
+            - {name: tls, mountPath: /etc/predictive-autoscaler/tls, readOnly: true}
+            {{- end }}
       volumes:
         - name: models
           persistentVolumeClaim: {claimName: {{ include "pa.modelsClaim" . | quote }}}
         - name: tmp
           emptyDir: {sizeLimit: {{ .Values.forecaster.tmpSizeLimit }}}
+        {{- if .Values.forecaster.auth.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ include "pa.forecasterTLSSecret" . }}
+            items: [{key: tls.crt, path: tls.crt}, {key: tls.key, path: tls.key}]
+        {{- end }}
       {{- with .Values.forecaster.nodeSelector }}
       nodeSelector: {{- toYaml . | nindent 8 }}
       {{- end }}
@@ -102,4 +123,4 @@ metadata:
 spec:
   selector: {{- include "pa.selector" (list . "forecaster") | nindent 4 }}
   ports:
-    - {name: http, port: 8000, targetPort: http}
+    - {name: http, port: {{ include "pa.forecasterPort" . }}, targetPort: http}

@@ -33,6 +33,20 @@ operator:
   affinity: {}
 
 forecaster:
+  # Only the operator may call the forecasting service: its projected service account token, checked with TokenReview,
+  # over TLS. Off: plain HTTP, and the NetworkPolicies are the only boundary.
+  auth:
+    enabled: true
+    audience: predictive-autoscaler-forecaster
+  tls:
+    source: selfSigned       # selfSigned (plain Helm; kept with lookup) | certManager | existingSecret (Argo CD: not selfSigned)
+    existingSecret: ""       # a Secret with tls.crt, tls.key and ca.crt
+    certManager:
+      issuerRef: {name: "", kind: Issuer}   # the Issuer's CA must end up in the Secret's ca.crt
+      duration: 2160h
+      renewBefore: 360h
+    selfSigned:
+      validityDays: 365      # renewal: delete the Secret, then helm upgrade
   resources:
     requests: {cpu: 500m, memory: 1Gi}
     limits: {memory: 4Gi}

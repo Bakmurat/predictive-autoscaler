@@ -16,6 +16,10 @@ spec:
     - port: {{ ternary "metrics" "http" (eq $component "operator") }}
       path: /metrics
       interval: {{ $cfg.interval }}
+      {{- if and (eq $component "forecaster") $.Values.forecaster.auth.enabled }}
+      scheme: https
+      tlsConfig: {insecureSkipVerify: true}    # an in-cluster scrape of an open /metrics, limited by metricsFrom
+      {{- end }}
 ---
 {{- end }}
 {{- end }}
