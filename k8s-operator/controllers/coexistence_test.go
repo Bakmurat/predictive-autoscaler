@@ -12,6 +12,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
@@ -86,6 +87,22 @@ func paObj(name, ns, target, mode string) *autoscalerv1alpha1.PredictiveAutoscal
 	}
 }
 
+// legacyPA is a PredictiveAutoscaler of the legacy API group (autoscaler.example.com), as the campaign's operator reads it.
+func legacyPA(name, ns, targetNS, target, mode string) *unstructured.Unstructured {
+	td := map[string]interface{}{"name": target}
+	if targetNS != "" {
+		td["namespace"] = targetNS
+	}
+	spec := map[string]interface{}{"targetDeployment": td, "minReplicas": int64(1), "maxReplicas": int64(5)}
+	if mode != "" {
+		spec["mode"] = mode
+	}
+	return &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": autoscalerv1alpha1.LegacyGroup + "/v1alpha1", "kind": "PredictiveAutoscaler",
+		"metadata": map[string]interface{}{"name": name, "namespace": ns}, "spec": spec,
+	}}
+}
+
 func TestCheckReplicaWritersFindsEveryOtherWriter(t *testing.T) {
 	const ns = "shop"
 	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: ns, UID: "dep-uid"}}
@@ -114,6 +131,14 @@ func TestCheckReplicaWritersFindsEveryOtherWriter(t *testing.T) {
 		{"other_recommend_pa", []client.Object{paObj("other", ns, "web", autoscalerv1alpha1.ModeRecommend)}, nil, nil},
 		{"other_pa_without_mode_is_recommend", []client.Object{paObj("other", ns, "web", "")}, nil, nil},
 		{"other_active_pa_other_target", []client.Object{paObj("other", ns, "api", autoscalerv1alpha1.ModeActive)}, nil, nil},
+		// Legacy-group PAs (r23/r24): no released legacy operator has a Recommend mode, and it may target another namespace.
+		{"legacy_pa_same_namespace", []client.Object{legacyPA("old", ns, ns, "web", "")}, []string{"PredictiveAutoscaler.autoscaler.example.com/shop/old"}, nil},
+		{"legacy_pa_elsewhere_targeting_here", []client.Object{legacyPA("old", "ml-engine", ns, "web", "")}, []string{"PredictiveAutoscaler.autoscaler.example.com/ml-engine/old"}, nil},
+		{"legacy_pa_without_target_namespace", []client.Object{legacyPA("old", ns, "", "web", "")}, []string{"PredictiveAutoscaler.autoscaler.example.com/shop/old"}, nil},
+		{"legacy_pa_recommend_is_still_a_writer", []client.Object{legacyPA("old", ns, ns, "web", "Recommend")}, []string{"PredictiveAutoscaler.autoscaler.example.com/shop/old"}, nil},
+		{"legacy_pa_other_target", []client.Object{legacyPA("old", ns, ns, "api", "")}, nil, nil},
+		{"legacy_pa_same_name_other_namespace", []client.Object{legacyPA("old", "other", "other", "web", "")}, nil, nil},
+		{"legacy_pa_without_target_namespace_elsewhere", []client.Object{legacyPA("old", "other", "", "web", "")}, nil, nil},
 		{"vpa_auto", []client.Object{vpaObj("v", ns, "web", "Auto")}, nil, []string{"VerticalPodAutoscaler/v (Auto)"}},
 		{"vpa_mode_unset_is_auto", []client.Object{vpaObj("v", ns, "web", "")}, nil, []string{"VerticalPodAutoscaler/v (Auto)"}},
 		{"vpa_recreate", []client.Object{vpaObj("v", ns, "web", "Recreate")}, nil, []string{"VerticalPodAutoscaler/v (Recreate)"}},
@@ -178,7 +203,7 @@ func apiGroup(name string, versions ...string) metav1.APIGroup {
 // coreOnly is a cluster without KEDA and without the VPA.
 func coreOnly() *stubDiscovery {
 	return &stubDiscovery{groups: []metav1.APIGroup{apiGroup("apps", "v1"), apiGroup("autoscaling", "v2", "v1"),
-		apiGroup("autoscaler.example.com", "v1alpha1")}, resources: map[string][]string{}}
+		apiGroup("autoscaling.devkuban.com", "v1alpha1")}, resources: map[string][]string{}}
 }
 
 func withKEDA(d *stubDiscovery, version string, resources ...string) *stubDiscovery {
@@ -191,6 +216,9 @@ func withKEDA(d *stubDiscovery, version string, resources ...string) *stubDiscov
 
 func listKind(list client.ObjectList) string {
 	if u, ok := list.(*unstructured.UnstructuredList); ok {
+		if u.GroupVersionKind().Group == autoscalerv1alpha1.LegacyGroup {
+			return "legacy:" + u.GroupVersionKind().Kind
+		}
 		return u.GroupVersionKind().Kind
 	}
 	switch list.(type) {
@@ -223,7 +251,15 @@ func TestCheckReplicaWritersAcceptsAbsenceOnlyFromDiscovery(t *testing.T) {
 	forbidden := apierrors.NewForbidden(schema.GroupResource{Resource: "horizontalpodautoscalers"}, "", errors.New("RBAC"))
 	noMatch := &meta.NoKindMatchError{GroupKind: schema.GroupKind{Group: "keda.sh", Kind: "ScaledObject"}, SearchedVersions: []string{"v1alpha1"}}
 	mustNotList := errors.New("an absent API must not be listed")
-	optionalLists := map[string]error{"ScaledObjectList": mustNotList, "VerticalPodAutoscalerList": mustNotList}
+	optionalLists := map[string]error{"ScaledObjectList": mustNotList, "VerticalPodAutoscalerList": mustNotList,
+		"legacy:PredictiveAutoscalerList": mustNotList}
+	withLegacy := func(d *stubDiscovery, version string, resources ...string) *stubDiscovery {
+		d.groups = append(d.groups, apiGroup(autoscalerv1alpha1.LegacyGroup, version))
+		if resources != nil {
+			d.resources[autoscalerv1alpha1.LegacyGroup+"/"+version] = resources
+		}
+		return d
+	}
 	for _, tc := range []struct {
 		name    string
 		disc    *stubDiscovery
@@ -252,6 +288,11 @@ func TestCheckReplicaWritersAcceptsAbsenceOnlyFromDiscovery(t *testing.T) {
 		}(), map[string]error{"VerticalPodAutoscalerList": apierrors.NewTimeoutError("slow", 1)}, true},
 		{"hpa_forbidden", coreOnly(), map[string]error{"HorizontalPodAutoscalerList": forbidden}, true},
 		{"pa_list_fails", coreOnly(), map[string]error{"PredictiveAutoscalerList": errors.New("boom")}, true},
+		{"legacy_not_served", coreOnly(), optionalLists, false},
+		{"legacy_served_and_readable", withLegacy(coreOnly(), "v1alpha1", "predictiveautoscalers"), nil, false},
+		{"legacy_served_list_forbidden", withLegacy(coreOnly(), "v1alpha1", "predictiveautoscalers"), map[string]error{"legacy:PredictiveAutoscalerList": forbidden}, true},
+		{"legacy_group_without_v1alpha1", withLegacy(coreOnly(), "v1beta1", "predictiveautoscalers"), nil, true},
+		{"legacy_version_discovery_404", withLegacy(coreOnly(), "v1alpha1"), nil, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			base := fake.NewClientBuilder().WithScheme(coexScheme(t)).WithObjects(self, dep).Build()
@@ -275,10 +316,13 @@ func TestCheckReplicaWritersWithTheRealClient(t *testing.T) {
 			APIResources: []metav1.APIResource{{Name: name, Namespaced: true, Kind: kind, Verbs: metav1.Verbs{"get", "list", "watch"}}}})
 		return string(b)
 	}
-	groups := func(withKEDA bool, kedaVersion string) string {
-		gs := []metav1.APIGroup{apiGroup("apps", "v1"), apiGroup("autoscaling", "v2"), apiGroup("autoscaler.example.com", "v1alpha1")}
+	groups := func(withKEDA bool, kedaVersion string, withLegacy bool) string {
+		gs := []metav1.APIGroup{apiGroup("apps", "v1"), apiGroup("autoscaling", "v2"), apiGroup("autoscaling.devkuban.com", "v1alpha1")}
 		if withKEDA {
 			gs = append(gs, apiGroup("keda.sh", kedaVersion))
+		}
+		if withLegacy {
+			gs = append(gs, apiGroup(autoscalerv1alpha1.LegacyGroup, "v1alpha1"))
 		}
 		for i := range gs {
 			gs[i].PreferredVersion = gs[i].Versions[0]
@@ -305,20 +349,32 @@ func TestCheckReplicaWritersWithTheRealClient(t *testing.T) {
 			case "discovery_down":
 				reply(503, unavailable)
 			case "absent":
-				reply(200, groups(false, ""))
+				reply(200, groups(false, "", false))
 			case "other_version":
-				reply(200, groups(true, "v1alpha2"))
+				reply(200, groups(true, "v1alpha2", false))
+			case "legacy_installed", "legacy_list_forbidden":
+				reply(200, groups(true, "v1alpha1", true))
 			default:
-				reply(200, groups(true, "v1alpha1"))
+				reply(200, groups(true, "v1alpha1", false))
 			}
 		case "/apis/autoscaling/v2":
 			reply(200, resources("autoscaling/v2", "horizontalpodautoscalers", "HorizontalPodAutoscaler"))
 		case "/apis/autoscaling/v2/namespaces/shop/horizontalpodautoscalers":
 			reply(200, `{"apiVersion":"autoscaling/v2","kind":"HorizontalPodAutoscalerList","metadata":{},"items":[]}`)
+		case "/apis/autoscaling.devkuban.com/v1alpha1":
+			reply(200, resources("autoscaling.devkuban.com/v1alpha1", "predictiveautoscalers", "PredictiveAutoscaler"))
+		case "/apis/autoscaling.devkuban.com/v1alpha1/namespaces/shop/predictiveautoscalers":
+			reply(200, `{"apiVersion":"autoscaling.devkuban.com/v1alpha1","kind":"PredictiveAutoscalerList","metadata":{},"items":[]}`)
 		case "/apis/autoscaler.example.com/v1alpha1":
 			reply(200, resources("autoscaler.example.com/v1alpha1", "predictiveautoscalers", "PredictiveAutoscaler"))
-		case "/apis/autoscaler.example.com/v1alpha1/namespaces/shop/predictiveautoscalers":
-			reply(200, `{"apiVersion":"autoscaler.example.com/v1alpha1","kind":"PredictiveAutoscalerList","metadata":{},"items":[]}`)
+		case "/apis/autoscaler.example.com/v1alpha1/predictiveautoscalers": // all namespaces: a legacy PA may target another
+			if state == "legacy_list_forbidden" {
+				reply(403, `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Forbidden","code":403}`)
+				return
+			}
+			reply(200, `{"apiVersion":"autoscaler.example.com/v1alpha1","kind":"PredictiveAutoscalerList","metadata":{},"items":[`+
+				`{"apiVersion":"autoscaler.example.com/v1alpha1","kind":"PredictiveAutoscaler","metadata":{"name":"old","namespace":"ml-engine"},"spec":{"targetDeployment":{"name":"web","namespace":"shop"}}},`+
+				`{"apiVersion":"autoscaler.example.com/v1alpha1","kind":"PredictiveAutoscaler","metadata":{"name":"api","namespace":"shop"},"spec":{"targetDeployment":{"name":"api","namespace":"shop"}}}]}`)
 		case "/apis/keda.sh/v1alpha1":
 			if state == "version_404" {
 				reply(404, notFound)
@@ -361,6 +417,9 @@ func TestCheckReplicaWritersWithTheRealClient(t *testing.T) {
 		{"discovery_down", true, nil},                     // /apis unavailable
 		{"discovery_stalls", true, nil},                   // bounded by the check's context, not by the request timeout
 		{"installed", false, []string{"ScaledObject/so"}}, // installed after the operator started: noticed, no restart
+		{"legacy_installed", false, []string{"PredictiveAutoscaler.autoscaler.example.com/ml-engine/old", "ScaledObject/so"}},
+		// Served but unreadable: the check fails (no writes); the writers found before the failure are still reported.
+		{"legacy_list_forbidden", true, []string{"ScaledObject/so"}},
 	} {
 		mu.Lock()
 		keda = step.state
@@ -434,6 +493,10 @@ func TestActiveRefusesWhileAnHPATargetsTheDeploymentAndResumesAfter(t *testing.T
 	if s := getPA(t, r, req).Status; s.AppliedReplicas != 0 || s.LastScaleTime != nil || s.CalculatedReplicas != 5 {
 		t.Fatalf("status must show the calculated count and no write: %+v", s)
 	}
+	if got := getPA(t, r, req).Status.Conflicts; !reflect.DeepEqual(got, []autoscalerv1alpha1.ReplicaWriter{
+		{Group: "autoscaling", Kind: "HorizontalPodAutoscaler", Namespace: req.Namespace, Name: "web-hpa"}}) {
+		t.Fatalf("status.conflicts = %v", got)
+	}
 	if ev := drain(rec); !hasEvent(ev, "Warning ConflictDetected") {
 		t.Fatalf("missing ConflictDetected warning: %v", ev)
 	}
@@ -451,6 +514,9 @@ func TestActiveRefusesWhileAnHPATargetsTheDeploymentAndResumesAfter(t *testing.T
 	}
 	if c := condition(t, r, nn, "ConflictDetected"); c.Status != metav1.ConditionFalse {
 		t.Fatalf("ConflictDetected after resolution: %+v", c)
+	}
+	if got := getPA(t, r, req).Status.Conflicts; len(got) != 0 {
+		t.Fatalf("status.conflicts must clear: %v", got)
 	}
 	if ev := drain(rec); !hasEvent(ev, "Normal ConflictResolved") {
 		t.Fatalf("missing ConflictResolved: %v", ev)
@@ -755,5 +821,50 @@ func TestAConflictHoldStopsTheScaleDownTimer(t *testing.T) {
 	}
 	if !r.scaleStates[req.NamespacedName.String()].belowCurrentSince.IsZero() {
 		t.Fatal("a conflict hold must stop the scale-down timer")
+	}
+}
+
+func TestConditionMessagesStayWithinTheSchemaLimit(t *testing.T) {
+	if got := conditionMessage("short"); got != "short" {
+		t.Fatal(got)
+	}
+	exact := strings.Repeat("a", maxConditionMessage)
+	if got := conditionMessage(exact); got != exact {
+		t.Fatal("a message at the limit must not change")
+	}
+	long := strings.Repeat("é", maxConditionMessage) // 2 bytes per rune: the cut falls inside a rune half the time
+	got := conditionMessage(long)
+	if len(got) > maxConditionMessage || !utf8.ValidString(got) || !strings.HasSuffix(got, "(truncated)") {
+		t.Fatalf("len %d, valid %v", len(got), utf8.ValidString(got))
+	}
+}
+
+// The structured writers (status.conflicts) carry group, kind, namespace and name, and a reason only where the kind
+// alone does not explain it; their String() forms are what conditions and the ledger show (Codex task-08 r26).
+func TestReplicaWritersAreStructured(t *testing.T) {
+	const ns = "shop"
+	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: ns}}
+	self := paObj("self", ns, "web", autoscalerv1alpha1.ModeActive)
+	c := fake.NewClientBuilder().WithScheme(coexScheme(t)).WithObjects(self, dep,
+		hpaObj("h", ns, "Deployment", "apps/v1", "web"),
+		scaledObj("so", ns, "web", map[string]string{"autoscaling.keda.sh/paused-replicas": "3"}),
+		paObj("other", ns, "web", autoscalerv1alpha1.ModeActive),
+		legacyPA("old", "ml-engine", ns, "web", "")).Build()
+	got, err := checkReplicaWriters(context.Background(), c, nil, self, dep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []autoscalerv1alpha1.ReplicaWriter{
+		{Group: "autoscaling", Kind: "HorizontalPodAutoscaler", Namespace: ns, Name: "h"},
+		{Group: autoscalerv1alpha1.LegacyGroup, Kind: "PredictiveAutoscaler", Namespace: "ml-engine", Name: "old", Reason: autoscalerv1alpha1.WriterReasonLegacyAPIGroup},
+		{Group: autoscalerv1alpha1.GroupVersion.Group, Kind: "PredictiveAutoscaler", Namespace: ns, Name: "other"},
+		{Group: "keda.sh", Kind: "ScaledObject", Namespace: ns, Name: "so", Reason: autoscalerv1alpha1.WriterReasonPausedReplicas},
+	}
+	if !reflect.DeepEqual(got.Writers, want) {
+		t.Fatalf("writers %+v", got.Writers)
+	}
+	if !reflect.DeepEqual(got.Conflicts, []string{"HorizontalPodAutoscaler/h", "PredictiveAutoscaler.autoscaler.example.com/ml-engine/old",
+		"PredictiveAutoscaler/other", "ScaledObject/so (paused-replicas)"}) {
+		t.Fatalf("conflicts %v", got.Conflicts)
 	}
 }

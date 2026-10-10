@@ -1,4 +1,4 @@
-# Leader election (on by default, --leader-elect): the operator holds the Lease "predictive-autoscaler-leader" in its
+# Leader election (on by default, --leader-elect): the operator holds the Lease "predictive-autoscaler.autoscaling.devkuban.com" in its
 # own namespace, so only one instance reconciles at a time.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role

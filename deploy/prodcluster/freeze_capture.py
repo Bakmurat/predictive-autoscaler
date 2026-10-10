@@ -72,10 +72,10 @@ CONTROLLED = ("image", "command", "args", "env", "envFrom", "workingDir")
 SLOT = 6 * 3600                                      # ml-training schedule 0 */6 * * *
 KINDS = ("deployments.apps", "replicasets.apps", "cronjobs.batch", "jobs.batch", "configmaps", "persistentvolumeclaims",
          "services", "horizontalpodautoscalers.autoscaling", "scaledobjects.keda.sh",
-         "predictiveautoscalers.autoscaler.example.com")
+         "predictiveautoscalers.autoscaling.devkuban.com")
 STATIC_KINDS = ("deployments.apps", "cronjobs.batch", "configmaps", "persistentvolumeclaims", "services",
                 "horizontalpodautoscalers.autoscaling", "scaledobjects.keda.sh",
-                "predictiveautoscalers.autoscaler.example.com")
+                "predictiveautoscalers.autoscaling.devkuban.com")
 P8_FILES = ("infra_events.py", "infra-identities.json", "validity-mask.json", "p8_launcher.py")   # p8-job.sh FILES
 FROZEN_FILES = tuple("deploy/prodcluster/" + f for f in P8_FILES) + (
     "deploy/prodcluster/p8-job.sh", "deploy/prodcluster/deploy.sh", "deploy/prodcluster/freeze_capture.py",
@@ -1357,7 +1357,7 @@ def main(argv=None):
             time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime((processes.get("ml-training") or {}).get("expected_slot") or 0)),
             now, ctx, sha(os.path.join(HERE, "scoring", "extract_decisions.sh")))
         gates["arms"] = gate_arms(live[("demo", "deployments.apps")],
-                                  live[("demo", "predictiveautoscalers.autoscaler.example.com")],
+                                  live[("demo", "predictiveautoscalers.autoscaling.devkuban.com")],
                                   live[("demo", "scaledobjects.keda.sh")])
         gates["nodes"], nodes = gate_nodes(nodes_raw, workers, joined)
         disk_by_node = root_disk(disk, nodes)

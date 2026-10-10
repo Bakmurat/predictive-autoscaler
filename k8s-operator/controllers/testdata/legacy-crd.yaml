@@ -1,0 +1,25 @@
+# The legacy API group's CRD (autoscaler.example.com, before v0.1.0), reduced to what the coexistence check reads: a
+# test fixture for envtest, not a supported install.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: predictiveautoscalers.autoscaler.example.com
+spec:
+  group: autoscaler.example.com
+  names:
+    kind: PredictiveAutoscaler
+    listKind: PredictiveAutoscalerList
+    plural: predictiveautoscalers
+    singular: predictiveautoscaler
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    served: true
+    storage: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            x-kubernetes-preserve-unknown-fields: true

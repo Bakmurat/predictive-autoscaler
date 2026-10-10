@@ -76,7 +76,7 @@ rest = [d for d in docs if d not in crd]
 open(sys.argv[2], "w").write("\n---\n".join(crd) + "\n"); open(sys.argv[3], "w").write("\n---\n".join(rest) + "\n")
 PY
   sa_checked "$OUT/ml-engine.crd.yaml"
-  k wait --for=condition=Established crd/predictiveautoscalers.autoscaler.example.com --timeout=60s
+  k wait --for=condition=Established crd/predictiveautoscalers.autoscaling.devkuban.com --timeout=60s
   sa_checked "$OUT/ml-engine.rest.yaml"
 }
 
@@ -89,7 +89,7 @@ status() {
   need KUBE_CONTEXT
   k -n ml-engine get pods -o wide
   k -n demo get pods -o wide
-  k -n demo get predictiveautoscalers.autoscaler.example.com,scaledobjects.keda.sh
+  k -n demo get predictiveautoscalers.autoscaling.devkuban.com,scaledobjects.keda.sh
   k -n ml-engine get pods -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .status.containerStatuses[*]}{.imageID}{" "}{end}{"\n"}{end}'
 }
 

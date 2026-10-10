@@ -1,7 +1,8 @@
 # Configuration reference
 
-`PredictiveAutoscaler` (`autoscaler.example.com/v1alpha1`, short name `pa`, namespaced). The API group is a placeholder
-and will be renamed to `autoscaling.devkuban.com` before v0.1.0 (a breaking change, decided 2026-10-09).
+`PredictiveAutoscaler` (`autoscaling.devkuban.com/v1alpha1`, short name `pa`, namespaced). The group replaced the
+placeholder `autoscaler.example.com` before v0.1.0 (a breaking change, decided 2026-10-09); objects of the old group are
+moved with the procedure in [upgrading.md](upgrading.md). The CRD is generated from the API types (`make manifests`).
 
 **Defaults depend on whether the parent object is present.** The API server fills in a field's CRD default only inside
 an object that exists: with `prediction: {}` an omitted `leadTimeMinutes` becomes 15 and `updateIntervalSeconds` 300 (the
@@ -12,10 +13,10 @@ brackets (20 and 60). The same applies to `metrics.requests`. Set these fields e
 | Field | Type | Required | Effective default | Read by the operator | Notes |
 |---|---|---|---|---|---|
 | `mode` | `Recommend` \| `Active` | no | **Recommend** (also when absent) | yes | `Recommend` computes and publishes the decision (status, metrics, ledger) and writes nothing; only `Active` scales the target. Existing objects without `mode` stop scaling after an upgrade until they set `Active`. |
-| `targetDeployment.name` | string | yes | — | yes | The Deployment to scale. |
+| `targetDeployment.name` | string (non-empty) | yes | — | yes | The Deployment to scale. |
 | `targetDeployment.namespace` | string | yes | — | yes | Must equal the CR's namespace; any other value is rejected (`Ready=False`, reason `CrossNamespaceTarget`) and nothing is written. |
 | `targetDeployment.container` | string | no | — | **no** | Accepted, ignored. |
-| `minReplicas` | int ≥ 1 | yes | — | yes | `minReplicas ≤ maxReplicas` is not validated yet. |
+| `minReplicas` | int ≥ 1 | yes | — | yes | The API server rejects `minReplicas > maxReplicas`. |
 | `maxReplicas` | int ≥ 1 | yes | — | yes | |
 | `metrics.requests.enabled` | bool | no | **false** (when `requests` is present) | yes | Must be `true` for forecasting: with `false` the operator asks the forecaster for a CPU forecast, which it rejects, so every decision falls back to the reactive rule. |
 | `metrics.requests.targetRPS` | int ≥ 1 | no | — | yes | Requests per second one pod should handle. If unset the operator uses 20,000 req/min per pod for the reactive part and 30,000 for the forecast part (an inconsistency to be fixed). |
@@ -39,6 +40,7 @@ brackets (20 and 60). The same applies to `metrics.requests`. Set these fields e
 | `stabilizedReplicas` | Active only: what is applied after scale-down stabilization and cooldown. Absent in Recommend mode, which keeps no hypothetical scale history. |
 | `appliedReplicas`, `lastScaleTime` | Active only: the last successful write. Cleared when the target Deployment is replaced (`targetUID` changes). |
 | `targetUID` | UID of the target Deployment the status describes. |
+| `conflicts` | The other replica writers the last coexistence check found on the target, each as `{group, kind, namespace, name, reason}`. `reason` is set only where the kind alone does not explain it: `PausedReplicas` (a paused KEDA ScaledObject holding a fixed count) or `LegacyAPIGroup` (an autoscaler of the legacy group). Empty when there are none. After a failed check (`ConflictDetected=Unknown`) it lists those found before the failure. Conditions, events and the decision ledger show the same writers as text (`Kind/name`). |
 | `metricSource` | The compiled request-rate query: `query`, `sha256` (of the exact query text), `observedGeneration`, `targetUID`, `contract` (`requests-per-second/v1`). It is published before the forecasting service is asked. The service uses a forecast only when it was computed for this query, generation and target; any other forecast is refused, and the reactive rule applies. It is absent while the configuration is invalid. |
 | `predictedReplicas` | Deprecated: the calculated count (historical meaning). Use `calculatedReplicas` and `forecastReplicas`. |
 | `lastPrediction` | Issue time of the last forecast used. |
@@ -107,7 +109,7 @@ the API's node; check `flock` on your storage class before relying on it (same-n
 ## Operator flags
 | Flag | Default | Purpose |
 |---|---|---|
-| `--leader-elect` | `true` | Only the instance holding the Lease `predictive-autoscaler-leader` reconciles. Installations whose watched namespaces overlap must share the Lease namespace. Set `false` only for a single local run. |
+| `--leader-elect` | `true` | Only the instance holding the Lease `predictive-autoscaler.autoscaling.devkuban.com` reconciles (the legacy operator's Lease was `predictive-autoscaler-leader`, so the two do not block each other during a migration). Installations whose watched namespaces overlap must share the Lease namespace. Set `false` only for a single local run. |
 | `--leader-election-namespace` | the pod's namespace | Namespace of the Lease; required when running outside a cluster with leader election on. |
 | `--metrics-bind-address` | `:8080` | Prometheus metrics (plain HTTP). |
 | `--health-probe-bind-address` | `:8081` | `/healthz` and `/readyz`. |

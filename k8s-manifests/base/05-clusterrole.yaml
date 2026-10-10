@@ -31,6 +31,12 @@ rules:
   resources: ["verticalpodautoscalers"]
   verbs: ["get", "list", "watch"]
 
+# Legacy-group PredictiveAutoscalers (autoscaler.example.com, before v0.1.0; optional API): each one on a target is
+# another replica writer, in any namespace (docs/upgrading.md)
+- apiGroups: ["autoscaler.example.com"]
+  resources: ["predictiveautoscalers"]
+  verbs: ["get", "list", "watch"]
+
 # Read ConfigMaps (for application config)
 - apiGroups: [""]
   resources: ["configmaps"]
@@ -45,11 +51,11 @@ rules:
   verbs: ["create", "patch"]
 
 # Access PredictiveAutoscaler CRD
-- apiGroups: ["autoscaler.example.com"]
+- apiGroups: ["autoscaling.devkuban.com"]
   resources: ["predictiveautoscalers"]
   verbs: ["get", "list", "watch", "patch", "update"]
 
-- apiGroups: ["autoscaler.example.com"]
+- apiGroups: ["autoscaling.devkuban.com"]
   resources: ["predictiveautoscalers/status"]
   verbs: ["get", "patch", "update"]
 

@@ -67,12 +67,12 @@ Set the image names in `k8s-manifests/base/kustomization.yaml` and the Deploymen
 kubectl apply -k k8s-manifests/base
 ```
 
-Prerequisites: VictoriaMetrics with Istio request metrics, and KEDA for the reactive backstop. The API group `autoscaler.example.com` is a placeholder; rename it (CRD, RBAC, Go types, samples) to a domain you control.
+Prerequisites: VictoriaMetrics with Istio request metrics, and KEDA for the reactive backstop. The API group is `autoscaling.devkuban.com` (renamed from the placeholder `autoscaler.example.com` before v0.1.0; see [docs/upgrading.md](docs/upgrading.md)).
 
 ### Declare an autoscaler
 
 ```yaml
-apiVersion: autoscaler.example.com/v1alpha1
+apiVersion: autoscaling.devkuban.com/v1alpha1
 kind: PredictiveAutoscaler
 metadata:
   name: web-autoscaler
@@ -203,7 +203,6 @@ entered the scored window, has been withdrawn.
 - The seasonal ensemble implements Holt-Winters on NumPy/SciPy (the serving image has no statsmodels). Tests match its initial states and recursion to statsmodels and require an equal or lower fit error, but it is not the statsmodels code. Its margin is empirical, not a coverage guarantee, and a refit that lands inside a traffic burst can make it over-forecast for a while.
 - One target metric in practice (request rate per pod); CPU and memory paths exist in the schema but are not trained.
 - Model files live on a ReadWriteOnce volume, so a single forecasting replica is supported.
-- The API group `autoscaler.example.com` is a placeholder to rename before use.
 - Integration with a node-level autoscaler has not been tested; the operator manages replicas only.
 
 ## License

@@ -14,7 +14,7 @@
 # - The operator reads only targetDeployment.{name,namespace}, min/maxReplicas, metrics.requests and prediction.
 #   The CRD also accepts container, metrics.cpu/memory and resources, but this version ignores them, so they are omitted.
 #
-apiVersion: autoscaler.example.com/v1alpha1
+apiVersion: autoscaling.devkuban.com/v1alpha1
 kind: PredictiveAutoscaler
 metadata:
   name: nginx-test-autoscaler

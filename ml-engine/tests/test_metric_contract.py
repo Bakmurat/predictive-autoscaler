@@ -233,7 +233,7 @@ def test_identity_resolves_the_compiled_query():
     sig = resolve_signal(request(), reader)
     assert sig == ResolvedSignal(namespace="shop", name="web", metric="requests", query=QUERY, sha256=SHA,
                                  contract=CONTRACT, autoscaler_uid="pa-uid", target_uid="dep-uid", generation=3)
-    assert reader.paths == ["/apis/autoscaler.example.com/v1alpha1/namespaces/shop/predictiveautoscalers/web-pa",
+    assert reader.paths == ["/apis/autoscaling.devkuban.com/v1alpha1/namespaces/shop/predictiveautoscalers/web-pa",
                             "/apis/apps/v1/namespaces/shop/deployments/web"]
 
 

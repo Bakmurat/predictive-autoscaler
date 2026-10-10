@@ -11,7 +11,7 @@
 # - Scale-down: stabilized (5 min wait, then gradual reduction)
 # - KEDA is paused — this operator is the sole replica controller
 #
-apiVersion: autoscaler.example.com/v1alpha1
+apiVersion: autoscaling.devkuban.com/v1alpha1
 kind: PredictiveAutoscaler
 metadata:
   name: nginx-reactive-autoscaler

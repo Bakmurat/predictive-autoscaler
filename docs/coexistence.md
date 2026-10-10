@@ -12,7 +12,11 @@ sync and the workload flaps between their answers.
   - a KEDA ScaledObject on the Deployment, unless it is paused with `autoscaling.keda.sh/paused: "true"`.
     `autoscaling.keda.sh/paused-replicas` makes KEDA hold that count, so it is a writer; the directional pauses
     (`paused-scale-in`, `paused-scale-out`) are not a pause;
-  - another PredictiveAutoscaler in `Active` mode on the same Deployment (both refuse; neither wins).
+  - another PredictiveAutoscaler in `Active` mode on the same Deployment (both refuse; neither wins);
+  - any PredictiveAutoscaler of the legacy API group `autoscaler.example.com` (before v0.1.0) that targets the
+    Deployment, in any namespace and whatever its spec says: the legacy operator has no Recommend mode and writes on
+    every reconcile. The check runs only while the legacy CRD is installed, and is how the
+    [API-group migration](upgrading.md) avoids two operators on one Deployment.
 
   In `Active` mode, while any of them exists the operator writes nothing. The decision is still computed and published;
   the status shows `ConflictDetected=True` (reason `ReplicaWriter`, the message names the objects) and
@@ -62,7 +66,7 @@ sync and the workload flaps between their answers.
 - **GitOps:** tools that own the Deployment manifest (Argo CD, Flux) will see drift on `spec.replicas`. Exclude that
   field from their comparison: for example, use Argo CD `ignoreDifferences` on `/spec/replicas`, or omit `replicas`
   from the managed manifest.
-- **Leader election** is on by default (`--leader-elect`, Lease `predictive-autoscaler-leader` in the operator's
+- **Leader election** is on by default (`--leader-elect`, Lease `predictive-autoscaler.autoscaling.devkuban.com` in the operator's
   namespace), so only one pod of an installation reconciles at a time, even during a rolling update. Installations
   whose watched namespaces overlap coordinate only if they share the Lease namespace
   (`--leader-election-namespace`); separate default namespaces do not coordinate them. Outside a cluster, pass

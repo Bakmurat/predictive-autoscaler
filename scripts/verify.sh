@@ -71,6 +71,9 @@ if [ "$run_go" = 1 ]; then
     status_line "go vet" "$rc" | tee -a "$LOG"; [ "$rc" -eq 0 ] || overall=1
     ( cd k8s-operator && "$GO" test -race -count=1 ./... ) 2>&1 | tee -a "$LOG"; rc=${PIPESTATUS[0]}
     status_line "go test -race" "$rc" | tee -a "$LOG"; [ "$rc" -eq 0 ] || overall=1
+    # The CRD and deepcopy code must be exactly what the API types' markers generate.
+    scripts/gen-manifests.sh check 2>&1 | tee -a "$LOG"; rc=${PIPESTATUS[0]}
+    status_line "generated code" "$rc" | tee -a "$LOG"; [ "$rc" -eq 0 ] || overall=1
   fi
 fi
 
