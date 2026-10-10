@@ -19,6 +19,8 @@ brackets (20 and 60). The same applies to `metrics.requests`. Set these fields e
 | `maxReplicas` | int ≥ 1 | yes | — | yes | |
 | `metrics.requests.enabled` | bool | no | **false** (when `requests` is present) | yes | Must be `true` for forecasting: with `false` the operator asks the forecaster for a CPU forecast, which it rejects, so every decision falls back to the reactive rule. |
 | `metrics.requests.targetRPS` | int ≥ 1 | no | — | yes | Requests per second one pod should handle. If unset the operator uses 20,000 req/min per pod for the reactive part and 30,000 for the forecast part (an inconsistency to be fixed). |
+| `metrics.requests.source.preset` | `istio` \| `prometheus` | no | `istio` | yes | Where the request rate comes from. `istio` uses `sum(rate(istio_requests_total{reporter="destination",destination_workload="<name>",destination_workload_namespace="<namespace>"}[1m]))`; `prometheus` uses `source.query`. |
+| `metrics.requests.source.query` | string ≤ 2 KiB | with `prometheus` only | — | yes | An instant PromQL expression returning **exactly one series, in requests per second**, for the target. It may use only `{{ .Namespace }}` and `{{ .Name }}` (the target Deployment), escaped as PromQL string content. No other template features are allowed: no functions, conditions or variables. An invalid query sets `Ready=False` (reason `InvalidMetricQuery`), and nothing is written. Example for ingress-nginx: `sum(rate(nginx_ingress_controller_requests{namespace="{{ .Namespace }}",service="{{ .Name }}"}[1m]))`. `{{ .Name }}` is the Deployment's name: if the Service is named differently, write the Service's name into the query. Check which namespace label your scrape keeps (`namespace` or `exported_namespace`), and that the series counts this Deployment's traffic only. |
 | `metrics.cpu.*`, `metrics.memory.*` | — | no | enabled, 70 / 60 % | **no** | Accepted, ignored: only the request rate is used. |
 | `prediction.enabled` | bool | no | true | yes | `false` = reactive-only. |
 | `prediction.horizonMinutes` | int ≥ 5 | no | 60 [60] | yes | How far ahead the forecaster predicts. |
@@ -37,6 +39,7 @@ brackets (20 and 60). The same applies to `metrics.requests`. Set these fields e
 | `stabilizedReplicas` | Active only: what is applied after scale-down stabilization and cooldown. Absent in Recommend mode, which keeps no hypothetical scale history. |
 | `appliedReplicas`, `lastScaleTime` | Active only: the last successful write. Cleared when the target Deployment is replaced (`targetUID` changes). |
 | `targetUID` | UID of the target Deployment the status describes. |
+| `metricSource` | The compiled request-rate query: `query`, `sha256` (of the exact query text), `observedGeneration`, `targetUID`, `contract` (`requests-per-second/v1`). It is published before the forecasting service is asked. The service uses a forecast only when it was computed for this query, generation and target; any other forecast is refused, and the reactive rule applies. It is absent while the configuration is invalid. |
 | `predictedReplicas` | Deprecated: the calculated count (historical meaning). Use `calculatedReplicas` and `forecastReplicas`. |
 | `lastPrediction` | Issue time of the last forecast used. |
 | `conditions` | `Ready` (the reconcile completed), `TelemetryAvailable` (`Measured` / `MetricsUnavailable`), `ForecastAvailable` (`Used`, `Disabled`, `Unavailable`, `HorizonElapsed`, `SanityRejected`), `ScalingActive` (`Active`, `RecommendMode`, `TelemetryHold`, `Conflict`, `CheckFailed`, `GuardAborted`, or the failure reason), `ConflictDetected` (`NoConflict`; `ReplicaWriter` when an HPA, an unpaused KEDA ScaledObject or another Active PredictiveAutoscaler targets the Deployment; `Unknown`/`CheckFailed` when the check failed), `VPAInterference` (`None`; `VPAUpdatesPods` for a VPA in any mode except `Off`; `Unknown`/`CheckFailed` when the check did not complete). See coexistence.md. |
@@ -74,10 +77,32 @@ measured as a real zero and scales normally.
 | Variable | Default | Purpose |
 |---|---|---|
 | `ML_API_URL` | `http://ml-api-service.ml-engine.svc.cluster.local:8000` | Forecasting service. |
-| `VICTORIAMETRICS_URL` | `http://vmselect-vmst.monitoring.svc.cluster.local:8481/select/0/prometheus` | Prometheus-compatible query endpoint (any Prometheus API works). |
+| `PROMETHEUS_URL` | `http://vmselect-vmst.monitoring.svc.cluster.local:8481/select/0/prometheus` | Prometheus-compatible query endpoint (any Prometheus API works). `VICTORIAMETRICS_URL` is still read as a deprecated fallback. |
 | `FORECAST_LOG` | unset | Path of the append-only forecast/decision ledger (JSONL). |
 | `WATCH_NAMESPACES` | all | Comma-separated namespaces to watch. |
 The forecasting service reads the endpoint from a differently named variable, `VICTORIA_METRICS_URL`; set both.
+
+## Forecasting service
+| Variable | Default | Purpose |
+|---|---|---|
+| `PROMETHEUS_URL` | the in-cluster VictoriaMetrics address | Prometheus-compatible query endpoint for the history. `VICTORIA_METRICS_URL` is still read as a deprecated fallback. |
+| `MODEL_DIR` | `/app/models/trained` | Model store (artifacts `lstm_<key>.pkl` + `.meta.json`). |
+| `COLD_START_CRONJOB` | unset | Without any compatible model at startup, create one Job from this CronJob. Unset = never (a local run or a test cannot create Jobs). |
+| `FORECAST_ADMISSION` / `FORECAST_INFERENCE_SLOTS` | `4` / `2` | Concurrent forecast jobs / concurrent inferences; beyond that the service answers 503. |
+| `ALLOW_BENCHMARK_EXPERIMENTS` | unset | Benchmark experiment arms (`SEASONAL_EXPERIMENT`, `ENSEMBLE_EXPERIMENT`) refuse to start without it; their answers never carry the product attestation. |
+
+The service never accepts a query or a history from a request. It reads the PredictiveAutoscaler named in the request
+and its target Deployment from the Kubernetes API, checks the generation, the UIDs, the query hash and the contract,
+and only then reads the history (168 h, 10-minute grid) with the compiled query. A refusal is 422 (provenance, no
+compatible model, an answer that is not one valid series, an incomplete input window); an outage is 503 (Kubernetes or
+metrics unreachable, at capacity). Models are keyed by namespace and name and carry their query hash, contract and
+autoscaler/target UIDs. **Models trained before this version are not loaded: retrain** (the training job must run
+once with the current version). `POST /train` is disabled (410): models come only from the training job.
+
+Trainings of one autoscaler are serialized with an exclusive `flock` on `lstm_<key>.lock` in the model store, held from
+the candidate's creation to the sidecar's publication (`TRAINING_LOCK_WAIT_S`, default 1800 s). The model filesystem
+must therefore support cross-process `flock`. The base manifests use a ReadWriteOnce volume with the trainer placed on
+the API's node; check `flock` on your storage class before relying on it (same-node placement alone is not that check).
 
 ## Operator flags
 | Flag | Default | Purpose |

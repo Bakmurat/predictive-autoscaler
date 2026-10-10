@@ -67,12 +67,12 @@ func componentRows(t *testing.T, path string) []map[string]interface{} {
 
 func recordedComponent(t *testing.T, body string, horizon int32) (map[string]interface{}, map[string]interface{}) {
 	t.Helper()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, body) }))
+	server := httptest.NewServer(echoProvenance(func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, body) }))
 	defer server.Close()
 	t.Setenv("ML_API_URL", server.URL)
 	r := &PredictiveAutoscalerReconciler{Log: logr.Discard()}
 	a := &autoscalerv1alpha1.PredictiveAutoscaler{ObjectMeta: metav1.ObjectMeta{Name: "hybrid", Namespace: "demo"}, Spec: autoscalerv1alpha1.PredictiveAutoscalerSpec{TargetDeployment: autoscalerv1alpha1.TargetDeployment{Name: "hybrid", Namespace: "demo"}, Prediction: autoscalerv1alpha1.PredictionConfig{HorizonMinutes: horizon}}}
-	prediction, err := r.getPrediction(context.Background(), a)
+	prediction, err := r.getPrediction(context.Background(), withSource(t, a))
 	if err != nil {
 		t.Fatalf("optional diagnostic changed core decode: %v", err)
 	}
@@ -233,7 +233,7 @@ func TestForecastComponentCacheAndIdentity(t *testing.T) {
 	var response atomic.Value
 	response.Store(componentBody(t, b))
 	var calls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { calls.Add(1); fmt.Fprint(w, response.Load().(string)) }))
+	server := httptest.NewServer(echoProvenance(func(w http.ResponseWriter, _ *http.Request) { calls.Add(1); fmt.Fprint(w, response.Load().(string)) }))
 	defer server.Close()
 	t.Setenv("ML_API_URL", server.URL)
 	r := &PredictiveAutoscalerReconciler{Log: logr.Discard(), predictionCache: map[string]*cachedPrediction{}}
@@ -241,7 +241,7 @@ func TestForecastComponentCacheAndIdentity(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "forecasts.jsonl")
 	t.Setenv("FORECAST_LOG", path)
 	for i := 0; i < 2; i++ {
-		if _, err := r.getCachedPrediction(context.Background(), a, "demo/hybrid"); err != nil {
+		if _, err := r.getCachedPrediction(context.Background(), withSource(t, a), "demo/hybrid"); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -252,14 +252,14 @@ func TestForecastComponentCacheAndIdentity(t *testing.T) {
 	b["model_version"] = "hybrid@new"
 	b["artifact_sha256"] = strings.Repeat("b", 64)
 	response.Store(componentBody(t, b))
-	if _, err := r.getCachedPrediction(context.Background(), a, "demo/hybrid"); err != nil {
+	if _, err := r.getCachedPrediction(context.Background(), withSource(t, a), "demo/hybrid"); err != nil {
 		t.Fatal(err)
 	}
 	a.Spec.TargetDeployment.Name = "seasonal"
 	b["model_version"] = "seasonal-pattern@new"
 	b["components"].(map[string]interface{})["pattern"].([]interface{})[0] = 800
 	response.Store(componentBody(t, b))
-	if _, err := r.getCachedPrediction(context.Background(), a, "demo/seasonal"); err != nil {
+	if _, err := r.getCachedPrediction(context.Background(), withSource(t, a), "demo/seasonal"); err != nil {
 		t.Fatal(err)
 	}
 	rows := componentRows(t, path)
@@ -280,7 +280,7 @@ func TestForecastComponentCacheAndIdentity(t *testing.T) {
 func TestForecastComponentCoreFailuresUnchanged(t *testing.T) {
 	for _, body := range []string{`{"predictions":"bad","components":{}}`, `{"predictions":[1],"components":NaN}`} {
 		t.Run(body, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, body) }))
+			server := httptest.NewServer(echoProvenance(func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, body) }))
 			defer server.Close()
 			t.Setenv("ML_API_URL", server.URL)
 			r := &PredictiveAutoscalerReconciler{Log: logr.Discard()}
@@ -299,7 +299,7 @@ func TestForecastComponentReconcileDecisionUnchanged(t *testing.T) {
 			if bad {
 				body["components"] = "malformed"
 			}
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, componentBody(t, body)) }))
+			server := httptest.NewServer(echoProvenance(func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, componentBody(t, body)) }))
 			defer server.Close()
 			t.Setenv("ML_API_URL", server.URL)
 			d := runRPMReconcile(t, r, req, path)

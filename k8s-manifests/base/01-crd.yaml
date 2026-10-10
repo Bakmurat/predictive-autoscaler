@@ -95,6 +95,21 @@ spec:
                       targetRPS:
                         type: integer
                         minimum: 1
+                      source:
+                        type: object
+                        description: "The request-rate signal of the target: an instant PromQL expression returning exactly one series, in requests per second. Default: the istio preset."
+                        properties:
+                          preset:
+                            type: string
+                            enum: ["istio", "prometheus"]
+                            default: istio
+                          query:
+                            type: string
+                            maxLength: 2048
+                            description: "preset prometheus only: a PromQL template that may use only {{ .Namespace }} and {{ .Name }} (the target), escaped as PromQL string content."
+                        x-kubernetes-validations:
+                        - rule: "self.preset == 'prometheus' ? (has(self.query) && size(self.query) > 0) : !has(self.query)"
+                          message: "query is required with preset prometheus and not allowed otherwise"
               
               prediction:
                 type: object
@@ -184,6 +199,22 @@ spec:
               targetUID:
                 type: string
                 description: "UID of the target Deployment the status describes; a change clears appliedReplicas and lastScaleTime."
+
+              metricSource:
+                type: object
+                description: "The compiled request-rate query; consumers accept it only for the current generation, target UID and hash."
+                properties:
+                  query:
+                    type: string
+                  sha256:
+                    type: string
+                  observedGeneration:
+                    type: integer
+                    format: int64
+                  targetUID:
+                    type: string
+                  contract:
+                    type: string
               
               lastPrediction:
                 type: string

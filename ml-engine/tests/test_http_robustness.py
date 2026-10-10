@@ -65,34 +65,40 @@ def _model_with_network(idx, vals, network_scaled=None, raises=None):
     return m
 
 
+from tests.b4_helpers import install_model, make_signal, product_body, route_product_path  # noqa: E402
+
+
 @pytest.fixture
 def api(monkeypatch):
     from fastapi.testclient import TestClient
     from api import main as api_main
 
-    monkeypatch.setattr(api_main.predictor, "_check_and_reload_model", lambda *a, **k: None)
-    monkeypatch.setitem(api_main.predictor.model_train_times, KEY, datetime.utcnow())
-    monkeypatch.setitem(api_main.predictor.model_meta, KEY, {"artifact_sha256": "a" * 64})
     api_main.accuracy_tracker.pending.clear()
     api_main.accuracy_tracker.history.clear()
     return TestClient(api_main.app), api_main
 
 
-def _post(client, idx, vals):
-    body = {"application": "nginx-test", "namespace": "demo", "metric_type": "requests",
-            "horizon_minutes": 60,
-            "metric_data": [{"timestamp": t.isoformat() + "Z", "value": v}
-                            for t, v in zip(idx, vals)]}
-    return client.post("/predict", json=body)
+SIGNAL = make_signal(namespace="demo", name="nginx-test")
+
+
+def _serve(api_main, monkeypatch, model, idx, vals):
+    """The model is the served record for SIGNAL, and the service reads (idx, vals) as its history."""
+    install_model(api_main.predictor, model, SIGNAL)
+    route_product_path(monkeypatch, api_main, SIGNAL,
+                       [{"timestamp": t.isoformat() + "Z", "value": v} for t, v in zip(idx, vals)])
+
+
+def _post(client):
+    return client.post("/predict", json=product_body(SIGNAL))
 
 
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")], ids=["nan", "inf", "-inf"])
 def test_non_finite_network_at_weight_one_returns_200_with_finite_pattern_forecasts(api, monkeypatch, bad):
     client, api_main = api
     idx, vals = _fresh_two_days()
-    monkeypatch.setitem(api_main.predictor.trained_models, KEY, _model_with_network(idx, vals, bad))
+    _serve(api_main, monkeypatch, _model_with_network(idx, vals, bad), idx, vals)
 
-    r = _post(client, idx, vals)
+    r = _post(client)
     # Pre-fix: 400 "Out of range float values are not JSON compliant: nan".
     assert r.status_code == 200, r.text
     body = r.json()
@@ -114,10 +120,9 @@ def test_non_finite_network_at_weight_one_returns_200_with_finite_pattern_foreca
 def test_network_exception_at_weight_one_returns_200_with_finite_pattern_forecasts(api, monkeypatch):
     client, api_main = api
     idx, vals = _fresh_two_days()
-    monkeypatch.setitem(api_main.predictor.trained_models, KEY,
-                        _model_with_network(idx, vals, raises=RuntimeError("keras exploded")))
+    _serve(api_main, monkeypatch, _model_with_network(idx, vals, raises=RuntimeError("keras exploded")), idx, vals)
 
-    r = _post(client, idx, vals)
+    r = _post(client)
     assert r.status_code == 200, r.text
     body = r.json()
     assert all(np.isfinite(body["predictions"]))
@@ -134,8 +139,9 @@ def test_response_never_contains_a_non_finite_number(api, monkeypatch):
 
     client, api_main = api
     idx, vals = _fresh_two_days()
-    monkeypatch.setitem(api_main.predictor.trained_models, KEY, _model_with_network(idx, vals, float("nan")))
-    r = _post(client, idx, vals)
+    _serve(api_main, monkeypatch, _model_with_network(idx, vals, float("nan")), idx, vals)
+
+    r = _post(client)
     assert r.status_code == 200
     # json.loads with a constant-rejecting hook: NaN/Infinity literals would raise.
     json.loads(r.text, parse_constant=lambda c: (_ for _ in ()).throw(ValueError(c)))

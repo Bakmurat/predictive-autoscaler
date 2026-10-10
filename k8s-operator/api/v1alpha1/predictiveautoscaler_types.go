@@ -38,6 +38,11 @@ const (
 	ModeRecommend = "Recommend"
 	// ModeActive scales the target.
 	ModeActive = "Active"
+
+	// PresetIstio measures the target's requests with Istio's destination-reported istio_requests_total (the default).
+	PresetIstio = "istio"
+	// PresetPrometheus measures the target's requests with the user's PromQL template (source.query).
+	PresetPrometheus = "prometheus"
 )
 
 // EffectiveMode is the mode the operator applies: Active only when explicitly set, Recommend otherwise.
@@ -96,8 +101,34 @@ type RequestsMetric struct {
 	Enabled bool `json:"enabled"`
 
 	// TargetRPS is the target requests per second per pod
-	// Matches Grafana/KEDA: sum(rate(istio_requests_total{...}[1m]))
 	TargetRPS int32 `json:"targetRPS,omitempty"`
+
+	// Source names the request-rate signal of the target (default: the istio preset).
+	// +optional
+	Source *MetricSource `json:"source,omitempty"`
+}
+
+// MetricSource is the PromQL that measures the target's requests per second: an instant expression returning exactly
+// one series. A template may use only {{ .Namespace }} and {{ .Name }} (the target), which are escaped as PromQL string
+// content.
+// +kubebuilder:validation:XValidation:rule="self.preset == 'prometheus' ? (has(self.query) && size(self.query) > 0) : !has(self.query)",message="query is required with preset prometheus and not allowed otherwise"
+type MetricSource struct {
+	// +kubebuilder:validation:Enum=istio;prometheus
+	// +kubebuilder:default=istio
+	Preset string `json:"preset,omitempty"`
+	// +kubebuilder:validation:MaxLength=2048
+	// +optional
+	Query string `json:"query,omitempty"`
+}
+
+// MetricSourceStatus is the compiled request-rate query the forecasting service and the trainer use: they accept it
+// only when ObservedGeneration equals the object's generation, TargetUID the target's UID and SHA256 the query's hash.
+type MetricSourceStatus struct {
+	Query              string `json:"query,omitempty"`
+	SHA256             string `json:"sha256,omitempty"`
+	ObservedGeneration int64  `json:"observedGeneration,omitempty"`
+	TargetUID          string `json:"targetUID,omitempty"`
+	Contract           string `json:"contract,omitempty"`
 }
 
 // PredictionConfig defines prediction settings
@@ -165,6 +196,9 @@ type PredictiveAutoscalerStatus struct {
 	// TargetUID is the UID of the target Deployment the status describes. When the target is replaced or retargeted,
 	// the target-specific history (appliedReplicas, lastScaleTime) is cleared.
 	TargetUID string `json:"targetUID,omitempty"`
+
+	// MetricSource is the compiled request-rate query (absent while the configuration is invalid).
+	MetricSource *MetricSourceStatus `json:"metricSource,omitempty"`
 
 	// LastPrediction is the timestamp of the last prediction
 	LastPrediction *metav1.Time `json:"lastPrediction,omitempty"`

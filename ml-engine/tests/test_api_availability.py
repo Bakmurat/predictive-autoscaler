@@ -92,6 +92,12 @@ def _partial_prediction(steps=STEPS_AHEAD):
     }
 
 
+from tests.b4_helpers import install_model, make_signal, product_body, route_product_path  # noqa: E402
+
+SIGNAL = make_signal(namespace="demo", name="nginx-test")
+HISTORY = [{"timestamp": (END - GRID * (PER_DAY - 1 - i)).isoformat() + "Z", "value": 600.0} for i in range(PER_DAY)]
+
+
 @pytest.fixture
 def api(monkeypatch):
     from fastapi.testclient import TestClient
@@ -99,6 +105,7 @@ def api(monkeypatch):
 
     monkeypatch.setattr(api_main.predictor, "predict",
                         lambda *a, **k: _partial_prediction(), raising=True)
+    route_product_path(monkeypatch, api_main, SIGNAL, HISTORY)
     # Fresh queue and fresh gauge state for this test.
     api_main.accuracy_tracker.pending.clear()
     for labels in list(api_main.PREDICTION_RPM_GAUGE._metrics.keys()):
@@ -110,11 +117,7 @@ def api(monkeypatch):
 
 
 def _post(client):
-    body = {"application": "nginx-test", "namespace": "demo", "metric_type": "requests",
-            "horizon_minutes": 60,
-            "metric_data": [{"timestamp": (END - GRID * (PER_DAY - 1 - i)).isoformat() + "Z",
-                             "value": 600.0} for i in range(PER_DAY)]}
-    return client.post("/predict", json=body)
+    return client.post("/predict", json=product_body(SIGNAL))
 
 
 def _gauge_present(api_main, component, step):
@@ -128,8 +131,9 @@ def test_every_valid_step_is_queued_and_unavailable_steps_are_skipped(api):
     assert r.status_code == 200, r.text
 
     pend = api_main.accuracy_tracker.pending
+    scope = api_main.accuracy_scope(SIGNAL)   # accuracy state is bound to the signal, not the workload name
     by_comp = {k[3]: len(v) for k, v in pend.items()
-               if k[0] == "nginx-test" and k[1] == "demo" and k[2] == "requests"}
+               if k[0] == scope and k[1] == "demo" and k[2] == "requests"}
     # Pre-fix: float(None) raised at step 1's pattern, after only step 1's final and lstm
     # were queued -- so final == 1, pattern == 0, and steps 2-6 never arrived.
     assert by_comp.get(None) == STEPS_AHEAD, by_comp          # every final step
@@ -189,11 +193,7 @@ def test_predictor_return_dict_carries_target_timestamps(monkeypatch):
     from api import main as api_main
     from datetime import timezone
 
-    key = "nginx-test_requests"
-    monkeypatch.setitem(api_main.predictor.trained_models, key, _FakeTrainedModel())
-    monkeypatch.setitem(api_main.predictor.model_train_times, key, datetime.utcnow())
-    monkeypatch.setitem(api_main.predictor.model_meta, key, {"artifact_sha256": "a" * 64})
-    monkeypatch.setattr(api_main.predictor, "_check_and_reload_model", lambda *a, **k: None)
+    install_model(api_main.predictor, _FakeTrainedModel(), SIGNAL)
 
     # The inference-window check refuses a latest sample older than two grid steps, measured
     # against the wall clock -- so the data must end at (roughly) now, on the ten-minute grid.
@@ -202,7 +202,7 @@ def test_predictor_return_dict_carries_target_timestamps(monkeypatch):
     metric_data = [{"timestamp": (last - GRID * (PER_DAY - 1 - i)).isoformat() + "Z",
                     "value": 600.0} for i in range(PER_DAY)]
 
-    out = api_main.predictor.predict("nginx-test", metric_data, 60, "requests", "demo")
+    out = api_main.predictor.predict("nginx-test", metric_data, 60, "requests", "demo", signal=SIGNAL)
     assert isinstance(out, dict)
     assert len(out.get("target_timestamps", [])) == STEPS_AHEAD, out.keys()
     # And they are the model's, keyed off the forecast origin, one grid step apart.

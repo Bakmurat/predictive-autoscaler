@@ -85,7 +85,12 @@ func TestNoEventsWhenTheStatusWriteFails(t *testing.T) {
 			return c.SubResource(sub).Update(ctx, obj, opts...)
 		},
 	})
-	runRPMReconcile(t, r, req, path)
+	// The compiled metric source is published before anything else; when that status write fails the reconcile stops
+	// (an error, retried) before forecasting, scaling or emitting anything.
+	delete(r.lastReconcileMap, req.NamespacedName.String())
+	if _, err := r.Reconcile(context.Background(), req); err == nil {
+		t.Fatal("a failed status write must fail the reconcile")
+	}
 	if ev := drain(rec); len(ev) != 0 {
 		t.Fatalf("events emitted although the status was not persisted: %v", ev)
 	}

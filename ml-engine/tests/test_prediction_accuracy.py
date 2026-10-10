@@ -203,6 +203,9 @@ def _fresh_grid(n):
              'value': float(i)} for i in range(n)]
 
 
+from tests.b4_helpers import install_model, make_signal  # noqa: E402
+
+
 class TestMAPEInjection:
     """Test that MAPE flows from accuracy_tracker through predict() to model.mape_for_floor.
 
@@ -232,13 +235,12 @@ class TestMAPEInjection:
         fake_model = self._make_fake_model()
         metric_data = _fresh_grid(200)
 
-        with patch('api.main.accuracy_tracker') as mock_tracker, \
-             patch.dict('api.main.predictor.trained_models', {'myapp_requests': fake_model}), \
-             patch.dict('api.main.predictor.model_train_times', {'myapp_requests': __import__('datetime').datetime.utcnow()}):
+        with patch('api.main.accuracy_tracker') as mock_tracker:
             mock_tracker.get_component_mape.return_value = 12.5
 
             from api.main import predictor
-            predictor.predict('myapp', metric_data, 60, 'requests', namespace='mynamespace')
+            install_model(predictor, fake_model, make_signal(namespace='mynamespace', name='myapp'))
+            predictor.predict('myapp', metric_data, 60, 'requests', namespace='mynamespace', signal=make_signal(namespace='mynamespace', name='myapp'))
 
             mock_tracker.get_component_mape.assert_called_with('myapp', 'mynamespace', 'requests', 'blended')
 
@@ -249,13 +251,12 @@ class TestMAPEInjection:
         fake_model = self._make_fake_model()
         metric_data = _fresh_grid(200)
 
-        with patch('api.main.accuracy_tracker') as mock_tracker, \
-             patch.dict('api.main.predictor.trained_models', {'myapp_requests': fake_model}), \
-             patch.dict('api.main.predictor.model_train_times', {'myapp_requests': __import__('datetime').datetime.utcnow()}):
+        with patch('api.main.accuracy_tracker') as mock_tracker:
             mock_tracker.get_component_mape.return_value = 15.0
 
             from api.main import predictor
-            predictor.predict('myapp', metric_data, 60, 'requests', namespace='default')
+            install_model(predictor, fake_model, make_signal(namespace='default', name='myapp'))
+            predictor.predict('myapp', metric_data, 60, 'requests', namespace='default', signal=make_signal(namespace='default', name='myapp'))
 
             assert fake_model.mape_for_floor == 15.0, (
                 f"Expected model.mape_for_floor=15.0, got {fake_model.mape_for_floor}"
@@ -268,13 +269,12 @@ class TestMAPEInjection:
         fake_model = self._make_fake_model()
         metric_data = _fresh_grid(200)
 
-        with patch('api.main.accuracy_tracker') as mock_tracker, \
-             patch.dict('api.main.predictor.trained_models', {'myapp_requests': fake_model}), \
-             patch.dict('api.main.predictor.model_train_times', {'myapp_requests': __import__('datetime').datetime.utcnow()}):
+        with patch('api.main.accuracy_tracker') as mock_tracker:
             mock_tracker.get_component_mape.side_effect = RuntimeError("no data")
 
             from api.main import predictor
-            predictor.predict('myapp', metric_data, 60, 'requests', namespace='default')
+            install_model(predictor, fake_model, make_signal(namespace='default', name='myapp'))
+            predictor.predict('myapp', metric_data, 60, 'requests', namespace='default', signal=make_signal(namespace='default', name='myapp'))
 
             assert fake_model.mape_for_floor == 0.0, (
                 f"Expected model.mape_for_floor=0.0 on exception, got {fake_model.mape_for_floor}"

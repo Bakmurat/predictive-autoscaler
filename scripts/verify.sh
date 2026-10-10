@@ -27,6 +27,12 @@ set -o pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# No test may reach a real cluster, whatever kubeconfig or in-cluster environment the caller has (a local run once
+# reached a production context through the forecasting service's cold-start kubectl). Every runner started below
+# (go test, pytest, the scorer and archive suites, their kubectl stubs) inherits an empty kubeconfig.
+export KUBECONFIG=/dev/null
+unset KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT
+
 PYTHON="${PYTHON:-}"
 if [ -z "$PYTHON" ]; then
   if [ -x "$ROOT/eval/.venv/bin/python" ]; then PYTHON="$ROOT/eval/.venv/bin/python"; else PYTHON="python3"; fi

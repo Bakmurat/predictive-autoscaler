@@ -499,40 +499,24 @@ class TestModelsEndpoint:
     """Test that /models returns enriched per-model info."""
 
     def test_models_returns_validation_info(self):
-        """Response includes per-model validation_status, mape, scaler_range, age, staleness."""
+        """/models describes the served models: identity, provenance, scaler range, age and staleness.
+
+        (B4b: the validation-gate results of train_on_data belong to the sandbox and are not part of it.)"""
         from fastapi.testclient import TestClient
         from api.main import app, predictor
+        from tests.b4_helpers import install_model, make_signal
 
-        # Set up a fake trained model in the predictor
-        model_key = "testapp_requests"
-        fake_model = FakeLSTMModel(mape=8.0)
-        predictor.trained_models[model_key] = fake_model
-        predictor.model_train_times[model_key] = datetime.utcnow() - timedelta(hours=2)
-        predictor.validation_metadata[model_key] = {
-            "status": "accepted",
-            "mape": 8.0,
-            "old_mape": None,
-            "timestamp": datetime.utcnow().isoformat(),
-        }
+        signal = make_signal(namespace="testns", name="testapp")
+        rec = install_model(predictor, FakeLSTMModel(mape=8.0), signal,
+                            trained_at=(datetime.utcnow() - timedelta(hours=2)).isoformat())
 
-        client = TestClient(app)
-        response = client.get("/models")
+        response = TestClient(app).get("/models")
         assert response.status_code == 200
-
         data = response.json()
-        assert "models" in data
-        assert model_key in data["models"]
-
-        model_info = data["models"][model_key]
-        assert "validation_status" in model_info
-        assert model_info["validation_status"] == "accepted"
-        assert "validation_mape" in model_info
+        assert data["trained_models"] == ["testns/testapp"]
+        model_info = data["models"][rec.key]
+        assert model_info["metric_query_sha256"] == signal.sha256
         assert "scaler_range" in model_info
-        assert "age_hours" in model_info
-        assert "is_stale" in model_info
+        assert model_info["age_hours"] == pytest.approx(2.0, abs=0.1)
         assert model_info["is_stale"] is False  # 2 hours < 6 hours
-
-        # Cleanup
-        del predictor.trained_models[model_key]
-        del predictor.model_train_times[model_key]
-        del predictor.validation_metadata[model_key]
+        assert "validation_status" not in model_info

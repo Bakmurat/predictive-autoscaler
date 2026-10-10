@@ -78,7 +78,7 @@ func rpmGaugeReconciler(t *testing.T) (*PredictiveAutoscalerReconciler, *autosca
 	client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(a).WithObjects(a, d).Build()
 	r := &PredictiveAutoscalerReconciler{Client: client, Scheme: scheme, Log: logr.Discard(), predictionCache: map[string]*cachedPrediction{}}
 	vm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprint(w, `{"status":"success","data":{"resultType":"vector","result":[{"value":[1,"300"]}]}}`)
+		fmt.Fprint(w, `{"status":"success","data":{"resultType":"vector","result":[{"value":[1,"5"]}]}}`) // 5 req/s = 300 req/min
 	}))
 	t.Cleanup(vm.Close)
 	t.Setenv("VICTORIAMETRICS_URL", vm.URL)
@@ -141,7 +141,7 @@ func TestReconcileRPMGaugeUsesSelectedWindow(t *testing.T) {
 				t.Fatal(err)
 			}
 			now := time.Now()
-			r.predictionCache[req.NamespacedName.String()] = &cachedPrediction{fetchedAt: now, response: &MLPredictionResponse{
+			r.predictionCache[req.NamespacedName.String()] = &cachedPrediction{binding: reconcileBinding(t, r, req), fetchedAt: now, response: &MLPredictionResponse{
 				Predictions: tc.pred, Confidence: 0.9, anchorAt: now.Add(-tc.age), issuedAt: now,
 			}}
 			d := runRPMReconcile(t, r, req, path)
@@ -163,7 +163,7 @@ func TestReconcileRPMGaugeRemovesUnusedForecast(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			r, a, req, path := rpmGaugeReconciler(t)
 			now := time.Now()
-			cached := &cachedPrediction{fetchedAt: now, response: &MLPredictionResponse{
+			cached := &cachedPrediction{binding: reconcileBinding(t, r, req), fetchedAt: now, response: &MLPredictionResponse{
 				Predictions: []float64{600, 600, 600, 600, 600, 600}, Confidence: 0.9, anchorAt: now.Add(-time.Minute), issuedAt: now,
 			}}
 			r.predictionCache[req.NamespacedName.String()] = cached
@@ -207,4 +207,22 @@ func TestReconcileRPMGaugeRemovesUnusedForecast(t *testing.T) {
 			}
 		})
 	}
+}
+
+// reconcileBinding is the forecast-cache binding the reconcile computes for req (its PA, target and compiled query).
+func reconcileBinding(t *testing.T, r *PredictiveAutoscalerReconciler, req ctrl.Request) string {
+	t.Helper()
+	var a autoscalerv1alpha1.PredictiveAutoscaler
+	if err := r.Get(context.Background(), req.NamespacedName, &a); err != nil {
+		t.Fatal(err)
+	}
+	var d appsv1.Deployment
+	if err := r.Get(context.Background(), types.NamespacedName{Namespace: a.Spec.TargetDeployment.Namespace, Name: a.Spec.TargetDeployment.Name}, &d); err != nil {
+		t.Fatal(err)
+	}
+	c, err := compileMetricQuery(requestsSource(&a), d.Namespace, d.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(a.UID) + "|" + string(d.UID) + "|" + c.SHA256 + "|" + metricContract
 }

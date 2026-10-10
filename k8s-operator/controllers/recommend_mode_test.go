@@ -29,7 +29,7 @@ func recommendHarness(t *testing.T, mode string, rpm string) (*PredictiveAutosca
 	if rpm == "" {
 		vmServer(t, `{"status":"success","data":{"resultType":"vector","result":[]}}`, 200)
 	} else {
-		vmServer(t, `{"status":"success","data":{"resultType":"vector","result":[{"value":[1,"`+rpm+`"]}]}}`, 200)
+		vmServer(t, rateBody(t, rpm), 200)
 	}
 	ml := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(503) }))
 	t.Cleanup(ml.Close)
@@ -165,7 +165,7 @@ func TestConditionsPreserveTransitionsAndUnchangedStatusIsNotWritten(t *testing.
 	if again := drain(rec); len(again) != 0 {
 		t.Fatalf("events repeated without a transition: %v", again)
 	}
-	vmServer(t, `{"status":"success","data":{"resultType":"vector","result":[{"value":[1,"300"]}]}}`, 200)
+	vmServer(t, rateBody(t, "300"), 200)
 	runRPMReconcile(t, r, req, path)
 	a3 := getPA(t, r, req)
 	tel3 := meta.FindStatusCondition(a3.Status.Conditions, "TelemetryAvailable")

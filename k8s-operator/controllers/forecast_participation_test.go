@@ -120,7 +120,7 @@ func TestGetCachedPrediction_RefusalDropsCache(t *testing.T) {
 	a := &autoscalerv1alpha1.PredictiveAutoscaler{}
 	a.Spec.TargetDeployment.Name, a.Spec.TargetDeployment.Namespace = "app", "ns"
 	resp := &MLPredictionResponse{Predictions: []float64{100, 100}}
-	r.predictionCache["k"] = &cachedPrediction{response: resp, fetchedAt: time.Now().Add(-predictionCacheTTL - time.Minute)}
+	r.predictionCache["k"] = &cachedPrediction{response: resp, fetchedAt: time.Now().Add(-predictionCacheTTL - time.Minute), binding: forecastBinding(a)}
 	_, err := r.getCachedPrediction(context.Background(), a, "k")
 	if err == nil || !isForecastRefusal(err) {
 		t.Fatalf("expected a refusal error, got %v", err)
@@ -135,7 +135,7 @@ func TestGetCachedPrediction_RefusalDropsCache(t *testing.T) {
 	}))
 	defer srv5.Close()
 	t.Setenv("ML_API_URL", srv5.URL)
-	r.predictionCache["k"] = &cachedPrediction{response: resp, fetchedAt: time.Now().Add(-predictionCacheTTL - time.Minute)}
+	r.predictionCache["k"] = &cachedPrediction{response: resp, fetchedAt: time.Now().Add(-predictionCacheTTL - time.Minute), binding: forecastBinding(a)}
 	got, err := r.getCachedPrediction(context.Background(), a, "k")
 	if err != nil || got != resp {
 		t.Fatalf("5xx should reuse the young cache: got=%v err=%v", got, err)
@@ -160,7 +160,7 @@ func TestGetCachedPrediction_StaleBoundaries(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			r.predictionCache["k"] = &cachedPrediction{response: resp, fetchedAt: time.Now().Add(-c.age)}
+			r.predictionCache["k"] = &cachedPrediction{response: resp, fetchedAt: time.Now().Add(-c.age), binding: forecastBinding(a)}
 			got, err := r.getCachedPrediction(context.Background(), a, "k")
 			if c.reuse && (err != nil || got != resp) {
 				t.Fatalf("expected reuse, got %v %v", got, err)
@@ -179,7 +179,7 @@ func TestGetCachedPrediction_FreshCacheServedWithoutFetch(t *testing.T) {
 	r := &PredictiveAutoscalerReconciler{Log: logr.Discard(), predictionCache: map[string]*cachedPrediction{}}
 	a := &autoscalerv1alpha1.PredictiveAutoscaler{}
 	resp := &MLPredictionResponse{Predictions: []float64{100, 100}}
-	r.predictionCache["k"] = &cachedPrediction{response: resp, fetchedAt: time.Now().Add(-predictionCacheTTL + time.Minute)}
+	r.predictionCache["k"] = &cachedPrediction{response: resp, fetchedAt: time.Now().Add(-predictionCacheTTL + time.Minute), binding: forecastBinding(a)}
 	if got, err := r.getCachedPrediction(context.Background(), a, "k"); err != nil || got != resp {
 		t.Fatalf("fresh cache must be served: %v %v", got, err)
 	}

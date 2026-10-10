@@ -30,7 +30,10 @@ spec:
                   matchLabels:
                     app: ml-api
                 topologyKey: kubernetes.io/hostname
-          
+
+          # Reads its PredictiveAutoscaler and target Deployment (the compiled query and identities)
+          serviceAccountName: predictive-operator-sa
+
           containers:
           - name: trainer
             # Use the same image as ML API - it contains training code
@@ -55,10 +58,10 @@ spec:
             
             - name: MODEL_DIR
               value: "/models"
-            - name: TRAINING_WORKLOAD
-              value: "nginx-test"
-            - name: TRAINING_NAMESPACE
-              value: "default"
+            # The PredictiveAutoscaler this job trains for (<namespace>/<name>): the model is trained on exactly
+            # its compiled request-rate query and carries that provenance (the forecasting service serves nothing else)
+            - name: TRAINING_TARGET
+              value: "default/nginx-test-autoscaler"
             
             - name: PYTHONUNBUFFERED
               value: "1"

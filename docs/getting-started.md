@@ -30,7 +30,7 @@ docker push <registry>/predictive-autoscaler-operator:dev
 | `kustomization.yaml` | `images:` → your two images (example below). The ml-api entry covers the API and the trainer. |
 | `02-configmap-victoriametrics.yaml` | `victoria_metrics_url` → your query endpoint (read by the forecasting API and the trainer). |
 | `09-operator-deployment.yaml` | `VICTORIAMETRICS_URL` → the same endpoint (the operator does not read the ConfigMap). |
-| `10-training-cronjob.yaml` | `TRAINING_WORKLOAD` / `TRAINING_NAMESPACE` → the Deployment to forecast (one workload per CronJob). |
+| `10-training-cronjob.yaml` | `TRAINING_TARGET` → `<namespace>/<PredictiveAutoscaler>` to train for (one per CronJob). The model is trained on exactly that autoscaler's compiled request-rate query, so create the PredictiveAutoscaler first and let the operator publish its `status.metricSource`. |
 | `03-pvc.yaml`, `12-forecast-log-pvc.yaml` | `storageClassName` for your cluster. |
 
 Image overrides keep the original `name` as the key and set `newName`/`newTag`:
@@ -51,28 +51,36 @@ kubectl -n ml-engine rollout status deploy/ml-api --timeout=300s
 kubectl -n ml-engine rollout status deploy/predictive-operator --timeout=120s
 ```
 
-## 4. Train a first model
-Training needs history in the metrics store (the scheduled CronJob uses the last 7 days). To train now:
+## 4. Create a PredictiveAutoscaler
+Start from `k8s-operator/config/samples/autoscaler_v1alpha1_predictiveautoscaler.yaml`.
+- A new autoscaler runs in **Recommend** mode: it computes and shows the replica count it would set
+  (`kubectl get pa`: Calculated) without changing the Deployment. Watch it for a while, then set `mode: Active` to let it
+  scale.
+- Set `metrics.requests.enabled: true` and `targetRPS` (requests per second one pod should handle).
+- Choose the request-rate source: the default `istio` preset, or a `prometheus` query (`configuration.md`).
+- Set `leadTimeMinutes` and `updateIntervalSeconds` explicitly: the CRD defaults are 15 and 300.
+```sh
+kubectl apply -f my-autoscaler.yaml
+kubectl get pa -A
+# The operator compiles the query and publishes it; training and forecasts use exactly this one.
+kubectl -n <namespace> get pa <name> -o jsonpath='{.status.metricSource}{"\n"}'
+```
+Wait until `status.metricSource` is present, with `observedGeneration` equal to the object's `metadata.generation`.
+Until a model exists, the forecasting service answers 422 (`ModelUnavailable`). Meanwhile the operator computes a
+reactive recommendation from the current request rate; in Active mode it scales on that recommendation.
+
+## 5. Train a first model
+Point the training CronJob at the autoscaler (`TRAINING_TARGET=<namespace>/<name>` in `10-training-cronjob.yaml`).
+Training needs history in the metrics store; the scheduled CronJob uses the last 7 days. To train now:
 ```sh
 kubectl -n ml-engine create job first-training --from=cronjob/ml-training
 kubectl -n ml-engine logs -f job/first-training
 ```
-A successful run ends with a JSON line containing `"status": "success"` and the published `artifact_sha256`, and the API
-logs `Reloaded model …` shortly after. With too little history it stops with `insufficient history: have N of M
-ten-minute points` and publishes nothing; that is expected on a new cluster. Until a model exists, the operator scales
-reactively from the current request rate only.
-
-## 5. Create a PredictiveAutoscaler
-Start from `k8s-operator/config/samples/autoscaler_v1alpha1_predictiveautoscaler.yaml`. A new autoscaler runs in
-**Recommend** mode: it computes and shows the replica count it would set (`kubectl get pa`: Calculated) without changing
-the Deployment. Watch it for a while, then set `mode: Active` to let it scale. Set
-`metrics.requests.enabled: true` and `targetRPS` (requests per second one pod should handle), and set
-`leadTimeMinutes` and `updateIntervalSeconds` explicitly (the CRD defaults are 15 and 300; see `configuration.md`).
-```sh
-kubectl apply -f my-autoscaler.yaml
-kubectl get pa -A
-kubectl -n ml-engine logs deploy/predictive-operator | grep -i "decision\|prediction"
-```
+- A successful run ends with a JSON line containing `"status": "success"` and the published `artifact_sha256`, and the
+  API logs `Loaded model <namespace>/<name>` shortly after.
+- With too little history, the run stops with `insufficient history: have N of M ten-minute points` and publishes
+  nothing; that is expected on a new cluster.
+- After you change the autoscaler's metric source, train again: a model trained on another query is never served.
 
 ## 6. Stop or remove
 **Stop scaling one workload** (its replica count stays where it is):
