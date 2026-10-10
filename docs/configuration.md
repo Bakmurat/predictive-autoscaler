@@ -99,6 +99,11 @@ metrics unreachable, at capacity). Models are keyed by namespace and name and ca
 autoscaler/target UIDs. **Models trained before this version are not loaded: retrain** (the training job must run
 once with the current version). `POST /train` is disabled (410): models come only from the training job.
 
+Trainings of one autoscaler are serialized with an exclusive `flock` on `lstm_<key>.lock` in the model store, held from
+the candidate's creation to the sidecar's publication (`TRAINING_LOCK_WAIT_S`, default 1800 s). The model filesystem
+must therefore support cross-process `flock`. The base manifests use a ReadWriteOnce volume with the trainer placed on
+the API's node; check `flock` on your storage class before relying on it (same-node placement alone is not that check).
+
 ## Operator flags
 | Flag | Default | Purpose |
 |---|---|---|

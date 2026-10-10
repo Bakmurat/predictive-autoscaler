@@ -17,12 +17,82 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from training.train_lstm_from_vm import train_requests_only
 from config import VICTORIA_METRICS_CONFIG
+from api.identity import KubeReader, LookupFailed, ProvenanceRefused, resolve_autoscaler
+from api.registry import artifact_paths, model_key
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+def provenance_fields(signal, pa_ns: str, pa_name: str) -> dict:
+    """The sidecar's identity and query provenance (api/registry.py REQUIRED_META), plus the query text."""
+    return {"namespace": signal.namespace, "name": signal.name, "metric": signal.metric,
+            "metric_query": signal.query, "metric_query_sha256": signal.sha256, "contract": signal.contract,
+            "pa_uid": signal.autoscaler_uid, "target_uid": signal.target_uid,
+            "autoscaler": {"namespace": pa_ns, "name": pa_name, "generation": signal.generation}}
+
+
+LOCK_WAIT_S = float(os.environ.get("TRAINING_LOCK_WAIT_S", "1800"))
+
+
+def acquire_publication_lock(model_dir: Path, key: str, wait_s: float = LOCK_WAIT_S):
+    """Serialize trainings of one artifact key across processes (CronJob runs, a cold-start Job, a manual Job) from
+    candidate creation to sidecar publication. Returns the open lock file; the lock lasts until it is closed or the
+    process exits. Raises TimeoutError when another training holds it for longer than wait_s."""
+    import fcntl
+    fh = open(Path(model_dir) / f"lstm_{key}.lock", "a+")
+    deadline = time.monotonic() + wait_s
+    while True:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fh
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                fh.close()
+                raise TimeoutError(f"another training of {key} has held the publication lock for over {wait_s:.0f} s")
+            time.sleep(min(5.0, max(0.05, wait_s / 20)))
+
+
+def _sha256_file(path: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def publish_candidate(tmp_path: Path, final_path: Path) -> str:
+    """Publish this attempt's validated candidate: its digest is taken from its own bytes BEFORE the rename (never from
+    a final path another writer could replace), and the published file must still have that digest."""
+    candidate_sha = _sha256_file(tmp_path)
+    os.rename(str(tmp_path), str(final_path))
+    published_sha = _sha256_file(final_path)
+    if published_sha != candidate_sha:
+        raise RuntimeError(f"{final_path.name} changed during publication (candidate {candidate_sha[:12]}, "
+                           f"published {published_sha[:12]}): another writer bypassed the publication lock")
+    return candidate_sha
+
+
+def previous_evidence(meta_path: Path, signal) -> dict:
+    """The previous sidecar if it belongs to exactly this signal, else {} (its blend evidence must not carry over)."""
+    try:
+        meta = json.loads(Path(meta_path).read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(meta, dict):
+        return {}
+    same = (meta.get("metric") == signal.metric
+            and meta.get("metric_query_sha256") == signal.sha256 and meta.get("contract") == signal.contract
+            and meta.get("pa_uid") == signal.autoscaler_uid and meta.get("target_uid") == signal.target_uid
+            and meta.get("namespace") == signal.namespace and meta.get("name") == signal.name)
+    if not same:
+        logger.info(f"Previous sidecar {Path(meta_path).name} is from another signal: its blend evidence is not used")
+        return {}
+    return meta
 
 
 def main():
@@ -34,15 +104,31 @@ def main():
     logger.info("=" * 80)
 
     # Configuration
-    vm_url = VICTORIA_METRICS_CONFIG["url"]
-    logger.info(f"VictoriaMetrics URL: {vm_url}")
+    vm_url = os.environ.get("PROMETHEUS_URL") or VICTORIA_METRICS_CONFIG["url"]
+    logger.info(f"Metrics endpoint: {vm_url}")
 
-    # Workload identity comes from the environment so the same image trains any target
-    # (defaults keep the original example). TRAINING_HOURS and TRAINING_EPOCHS are optional overrides.
+    # Metric contract (B4c): the model is trained for one PredictiveAutoscaler, on exactly its compiled query, and
+    # carries that provenance; the forecasting service serves nothing else. TRAINING_TARGET=<namespace>/<autoscaler>.
+    target = os.environ.get("TRAINING_TARGET", "")
+    if target.count("/") != 1:
+        logger.error("TRAINING_TARGET=<namespace>/<predictive-autoscaler> is required (models without the "
+                     "autoscaler's query provenance are never served)")
+        sys.exit(2)
+    pa_ns, pa_name = target.split("/")
+    try:
+        signal = resolve_autoscaler(KubeReader(), pa_ns, pa_name)
+    except ProvenanceRefused as e:
+        logger.error(f"Not training for {target}: {e}")
+        sys.exit(1)
+    except LookupFailed as e:
+        logger.error(f"Could not read {target} from the Kubernetes API: {e}")
+        sys.exit(1)
+    logger.info(f"Target {target}: {signal.namespace}/{signal.name}, query sha256 {signal.sha256[:12]}, "
+                f"generation {signal.generation}")
     app_config = {
-        "name": os.environ.get("TRAINING_WORKLOAD", "nginx-test"),
-        "namespace": os.environ.get("TRAINING_NAMESPACE", "default"),
-        "workload_name": os.environ.get("TRAINING_WORKLOAD", "nginx-test"),
+        "name": signal.name,
+        "namespace": signal.namespace,
+        "workload_name": signal.name,
         "baseline_rpm": int(os.environ.get("TRAINING_BASELINE_RPM", "60000")),
     }
 
@@ -96,6 +182,17 @@ def main():
             logger.info(f"Removing unused model: {f}")
             f.unlink()
 
+    # The previous training's blend-selection evidence counts only if it was produced for the same autoscaler,
+    # target, query and contract.
+    key = model_key(signal.namespace, signal.name, signal.metric)
+    try:
+        # Held until this process exits: covers the candidate's creation, validation, publication and sidecar.
+        publication_lock = acquire_publication_lock(model_dir, key)  # noqa: F841 (kept open on purpose)
+    except TimeoutError as e:
+        logger.error(str(e))
+        sys.exit(1)
+    previous_meta = previous_evidence(artifact_paths(model_dir, key)[1], signal)
+
     # Train requests model with atomic write
     try:
         result = train_requests_only(
@@ -110,7 +207,10 @@ def main():
             sequence_length=sequence_length,
             mask=mask,
             role=role,
-            fill=fill
+            fill=fill,
+            query=signal.query,
+            artifact_key=key,
+            previous_meta=previous_meta,
         )
 
         if result.get("skipped"):
@@ -153,25 +253,21 @@ def main():
                 tmp_path.unlink(missing_ok=True)
                 sys.exit(1)
 
-            # Atomic rename: .tmp -> final path
+            # Atomic rename of this attempt's private candidate; the digest is the candidate's own.
             final_path = Path(model_path)
-            os.rename(str(tmp_path), str(final_path))
-            logger.info(f"Atomic rename: {tmp_path} -> {final_path}")
+            artifact_sha256 = publish_candidate(tmp_path, final_path)
+            logger.info(f"Published {tmp_path.name} -> {final_path.name} (sha256 {artifact_sha256[:12]})")
         else:
             logger.warning("No tmp_model_path in result, model was saved directly")
             final_path = Path(model_path)
+            artifact_sha256 = _sha256_file(final_path)
 
-        # Provenance sidecar (read by the API and reported to the operator): what the artifact was
-        # trained on, where the splits fall, and the artifact's own hash. Written after the rename so the
-        # hash is of the published file; the API treats a model without a sidecar as "provenance unknown".
-        import hashlib
-        h = hashlib.sha256()
-        with open(final_path, "rb") as fh:
-            for chunk in iter(lambda: fh.read(1 << 20), b""):
-                h.update(chunk)
+        # Provenance sidecar (read by the API and reported to the operator): what the artifact was trained on, where
+        # the splits fall, the query it was trained for and the artifact's own digest. The API loads the pair only
+        # when the sidecar's digest matches the artifact's bytes.
         meta = {
             "artifact": final_path.name,
-            "artifact_sha256": h.hexdigest(),
+            "artifact_sha256": artifact_sha256,
             "artifact_bytes": final_path.stat().st_size,
             "trained_at": result.get("trained_at"),
             "training_cutoff": result.get("training_cutoff"),
@@ -190,7 +286,7 @@ def main():
             "blend_selection": result.get("blend_selection"),
             "preflight": result.get("preflight"),
             "workload": app_config["workload_name"],
-            "namespace": app_config["namespace"],
+            **provenance_fields(signal, pa_ns, pa_name),
             "training_hours_requested": hours,
             "image": os.environ.get("IMAGE_REF", ""),
             "git_commit": os.environ.get("GIT_COMMIT", ""),
@@ -200,7 +296,7 @@ def main():
             "gap_fill": (result.get("preflight") or {}).get("gap_fill"),
             "imputed_slots": {"total": result.get("imputed_slots_total"), "train": result.get("imputed_slots_train"), "test": result.get("imputed_slots_test")},
         }
-        meta_tmp = final_path.with_suffix(".meta.json.tmp")
+        meta_tmp = final_path.with_name(f"{final_path.stem}.meta.json.{os.getpid()}.tmp")   # private to this attempt
         with open(meta_tmp, "w") as fh:
             json.dump(meta, fh, indent=2, default=str)
         os.rename(str(meta_tmp), str(final_path.with_suffix(".meta.json")))

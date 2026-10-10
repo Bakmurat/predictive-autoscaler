@@ -118,8 +118,53 @@ def _require(request: dict, field: str, check: Callable[[object], bool], what: s
     return v
 
 
+def resolve_autoscaler(reader: KubeReader, pa_ns: str, pa_name: str) -> ResolvedSignal:
+    """The compiled query of a PredictiveAutoscaler and its live target, when the object is self-consistent:
+    status.metricSource compiled for the current generation, its hash = sha256(query), the supported contract, the
+    target in the autoscaler's namespace and the live Deployment's UID = the compiled targetUID. Used by the forecasting
+    service (with a request to compare) and by the trainer (TRAINING_TARGET)."""
+    if not (valid_namespace(pa_ns) and valid_name(pa_name)):
+        raise ProvenanceRefused(f"malformed autoscaler reference {pa_ns!r}/{pa_name!r}")
+    pa = reader.get(f"/apis/{API_GROUP}/{API_VERSION}/namespaces/{pa_ns}/predictiveautoscalers/{pa_name}")
+    if pa is None:
+        raise ProvenanceRefused(f"PredictiveAutoscaler {pa_ns}/{pa_name} not found")
+    meta, spec, status = _obj(pa, "metadata"), _obj(pa, "spec"), _obj(pa, "status")
+    uid, generation = meta.get("uid"), meta.get("generation")
+    if not isinstance(uid, str) or not uid or not isinstance(generation, int) or isinstance(generation, bool):
+        raise ProvenanceRefused("the autoscaler has no UID or generation")
+    ms = status.get("metricSource")
+    if not isinstance(ms, dict):
+        raise ProvenanceRefused("the autoscaler has no compiled metric source")
+    if ms.get("observedGeneration") != generation:
+        raise ProvenanceRefused(f"the compiled metric source is from generation {ms.get('observedGeneration')}, "
+                                f"the object is at {generation}")
+    query, sha = ms.get("query"), ms.get("sha256")
+    if not isinstance(query, str) or not query or not isinstance(sha, str):
+        raise ProvenanceRefused("the compiled metric source is incomplete")
+    if hashlib.sha256(query.encode("utf-8")).hexdigest() != sha:
+        raise ProvenanceRefused("the compiled query does not match its hash")
+    if ms.get("contract") != CONTRACT:
+        raise ProvenanceRefused(f"compiled contract {ms.get('contract')!r} is not {CONTRACT!r}")
+    target = _obj(spec, "targetDeployment")
+    t_name, t_ns = target.get("name"), target.get("namespace") or pa_ns
+    if t_ns != pa_ns:
+        raise ProvenanceRefused("the target must be in the autoscaler's namespace")
+    if not valid_name(t_name):
+        raise ProvenanceRefused("the autoscaler's target name is malformed")
+    dep = reader.get(f"/apis/apps/v1/namespaces/{t_ns}/deployments/{t_name}")
+    if dep is None:
+        raise ProvenanceRefused(f"target Deployment {t_ns}/{t_name} not found")
+    live_uid = _obj(dep, "metadata").get("uid")
+    if not isinstance(live_uid, str) or not live_uid:
+        raise ProvenanceRefused("the target Deployment has no UID")
+    if ms.get("targetUID") != live_uid:
+        raise ProvenanceRefused("the target Deployment was replaced (UID differs from the compiled one)")
+    return ResolvedSignal(namespace=t_ns, name=t_name, metric="requests", query=query, sha256=sha, contract=CONTRACT,
+                          autoscaler_uid=uid, target_uid=live_uid, generation=generation)
+
+
 def resolve_signal(request: dict, reader: KubeReader) -> ResolvedSignal:
-    """Validate the request's reference against the live objects and return the compiled query to use."""
+    """Validate a forecast request's reference against the live objects and return the compiled query to use."""
     if not isinstance(request, dict):
         raise ProvenanceRefused("the request is not an object")
     pa_ns = _require(request, "autoscaler_namespace", valid_namespace, "a namespace")
@@ -132,45 +177,17 @@ def resolve_signal(request: dict, reader: KubeReader) -> ResolvedSignal:
                        "a sha256")
     if request.get("contract") != CONTRACT:
         raise ProvenanceRefused(f"contract {request.get('contract')!r} is not {CONTRACT!r}")
-    metric = request.get("metric_type", "requests")
-    if metric != "requests":
+    if request.get("metric_type", "requests") != "requests":
         raise ProvenanceRefused("metric_type must be 'requests'")
-
-    pa = reader.get(f"/apis/{API_GROUP}/{API_VERSION}/namespaces/{pa_ns}/predictiveautoscalers/{pa_name}")
-    if pa is None:
-        raise ProvenanceRefused(f"PredictiveAutoscaler {pa_ns}/{pa_name} not found")
-    meta, spec, status = _obj(pa, "metadata"), _obj(pa, "spec"), _obj(pa, "status")
-    if meta.get("uid") != req_uid:
+    sig = resolve_autoscaler(reader, pa_ns, pa_name)
+    if sig.autoscaler_uid != req_uid:
         raise ProvenanceRefused("the autoscaler was replaced (UID differs)")
-    ms = status.get("metricSource")
-    if not isinstance(ms, dict):
-        raise ProvenanceRefused("the autoscaler has no compiled metric source")
-    gens = (req_gen, meta.get("generation"), ms.get("observedGeneration"))
-    if not (gens[0] == gens[1] == gens[2]):
-        raise ProvenanceRefused(f"generation mismatch (request, object, compiled) = {gens}")
-    query, sha = ms.get("query"), ms.get("sha256")
-    if not isinstance(query, str) or not query or not isinstance(sha, str):
-        raise ProvenanceRefused("the compiled metric source is incomplete")
-    if hashlib.sha256(query.encode("utf-8")).hexdigest() != sha or sha != req_sha:
+    if sig.generation != req_gen:
+        raise ProvenanceRefused(f"generation mismatch (request {req_gen}, object and compiled {sig.generation})")
+    if sig.sha256 != req_sha:
         raise ProvenanceRefused("query hash mismatch")
-    if ms.get("contract") != CONTRACT:
-        raise ProvenanceRefused(f"compiled contract {ms.get('contract')!r} is not {CONTRACT!r}")
-
-    target = _obj(spec, "targetDeployment")
-    t_name, t_ns = target.get("name"), target.get("namespace") or pa_ns
-    if t_ns != pa_ns:
-        raise ProvenanceRefused("the target must be in the autoscaler's namespace")
-    if not valid_name(t_name):
-        raise ProvenanceRefused("the autoscaler's target name is malformed")
-    if request.get("application") != t_name or request.get("namespace", t_ns) != t_ns:
+    if sig.target_uid != req_target_uid:
+        raise ProvenanceRefused("the target Deployment was replaced (UID differs from the request)")
+    if request.get("application") != sig.name or request.get("namespace", sig.namespace) != sig.namespace:
         raise ProvenanceRefused("application/namespace do not name the autoscaler's target")
-    dep = reader.get(f"/apis/apps/v1/namespaces/{t_ns}/deployments/{t_name}")
-    if dep is None:
-        raise ProvenanceRefused(f"target Deployment {t_ns}/{t_name} not found")
-    live_uid = _obj(dep, "metadata").get("uid")
-    if not isinstance(live_uid, str) or not live_uid:
-        raise ProvenanceRefused("the target Deployment has no UID")
-    if not (req_target_uid == ms.get("targetUID") == live_uid):
-        raise ProvenanceRefused("the target Deployment was replaced (UID differs)")
-    return ResolvedSignal(namespace=t_ns, name=t_name, metric=metric, query=query, sha256=sha, contract=CONTRACT,
-                          autoscaler_uid=req_uid, target_uid=live_uid, generation=req_gen)
+    return sig

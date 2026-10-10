@@ -9,11 +9,12 @@ production-ready. Known limits, most important first:
    Deployment: an HPA, an unpaused KEDA ScaledObject, or another Active PredictiveAutoscaler. It does not detect other
    writers (CI jobs, `kubectl scale`, GitOps applying `replicas`), and the check is not atomic. A write is refused if
    the replica count changed after the decision (see coexistence.md).
-3. **Istio is required** for the request-rate signal (`istio_requests_total{reporter="destination"}`), and the queries
-   are not configurable.
-4. **One workload per trainer.** The training CronJob trains one workload (`TRAINING_WORKLOAD`/`TRAINING_NAMESPACE`), and
-   models are keyed by application name only, so the same name in two namespaces collides. A workload without a model
-   runs reactive-only, silently.
+3. **One request-rate series per workload.** The `istio` preset needs Istio sidecars. Other sources need a `prometheus`
+   query, restricted to `{{ .Namespace }}` and `{{ .Name }}` substitutions, that returns exactly one series in requests
+   per second. Only request rate is supported; CPU and memory are not.
+4. **One workload per trainer.** The training CronJob trains for one PredictiveAutoscaler (`TRAINING_TARGET`), on its
+   compiled query. A workload without a model gets no forecast (422) and runs reactive-only. Models are keyed by
+   namespace and name. Models from earlier versions carry no query provenance and must be retrained after an upgrade.
 5. **Single forecasting replica on a ReadWriteOnce volume:** the API and the trainer must run on the same node; the API is
    a single point of failure (the operator falls back to the reactive rule when it is down).
 6. **Operator state in memory:** cooldowns, stabilization windows and forecast caches are lost on restart, and when
