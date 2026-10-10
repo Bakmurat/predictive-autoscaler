@@ -3,10 +3,12 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -14,8 +16,11 @@ import (
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -66,7 +71,9 @@ func startEnv(t *testing.T) *rest.Config {
 	}
 	envOnce.Do(func() {
 		env = &envtest.Environment{
-			CRDDirectoryPaths:     []string{filepath.Join("..", "..", "k8s-manifests", "base", "01-crd.yaml")},
+			// The generated CRD, and the legacy group's CRD as a fixture (legacy objects are other replica writers).
+			CRDDirectoryPaths: []string{filepath.Join("..", "..", "k8s-manifests", "base", "01-crd.yaml"),
+				filepath.Join("testdata", "legacy-crd.yaml")},
 			ErrorIfCRDPathMissing: true,
 		}
 		envCfg, envErr = env.Start()
@@ -444,5 +451,216 @@ func TestEnvtestTheMetricSourceRulesAreEnforcedByTheAPIServer(t *testing.T) {
 	}
 	if pa.Spec.Metrics.Requests.Source == nil || pa.Spec.Metrics.Requests.Source.Preset != "istio" {
 		t.Fatalf("the preset must default to istio: %+v", pa.Spec.Metrics.Requests.Source)
+	}
+}
+
+// The generated CRD (B5a) on the real API server: the bounds and defaults kept from the hand-written CRD, and the new
+// minReplicas <= maxReplicas rule.
+func TestEnvtestTheGeneratedSchemaValidatesAndDefaults(t *testing.T) {
+	f := envHarness(t, autoscalerv1alpha1.ModeRecommend)
+	ctx := context.Background()
+	create := func(name string, spec map[string]interface{}) (*unstructured.Unstructured, error) {
+		base := map[string]interface{}{"targetDeployment": map[string]interface{}{"name": "web", "namespace": f.req.Namespace},
+			"minReplicas": int64(1), "maxReplicas": int64(3)}
+		for k, v := range spec {
+			base[k] = v
+		}
+		u := &unstructured.Unstructured{Object: map[string]interface{}{
+			"apiVersion": autoscalerv1alpha1.GroupVersion.String(), "kind": "PredictiveAutoscaler",
+			"metadata": map[string]interface{}{"name": name, "namespace": f.req.Namespace}, "spec": base,
+		}}
+		return u, f.c.Create(ctx, u)
+	}
+	for name, spec := range map[string]map[string]interface{}{
+		"min-above-max":   {"minReplicas": int64(5), "maxReplicas": int64(3)},
+		"zero-min":        {"minReplicas": int64(0)},
+		"cpu-over-100":    {"metrics": map[string]interface{}{"cpu": map[string]interface{}{"targetPercent": int64(101)}}},
+		"zero-target-rps": {"metrics": map[string]interface{}{"requests": map[string]interface{}{"targetRPS": int64(0)}}},
+		"short-horizon":   {"prediction": map[string]interface{}{"horizonMinutes": int64(4)}},
+		"fast-update":     {"prediction": map[string]interface{}{"updateIntervalSeconds": int64(59)}},
+		"zero-baseline":   {"resources": map[string]interface{}{"baselineRPM": int64(0)}},
+		"unknown-mode":    {"mode": "Auto"},
+		"empty-target":    {"targetDeployment": map[string]interface{}{"name": "", "namespace": f.req.Namespace}},
+	} {
+		if _, err := create(name, spec); err == nil {
+			t.Errorf("%s: must be rejected", name)
+		}
+	}
+	noSpec := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": autoscalerv1alpha1.GroupVersion.String(), "kind": "PredictiveAutoscaler",
+		"metadata": map[string]interface{}{"name": "no-spec", "namespace": f.req.Namespace},
+	}}
+	if err := f.c.Create(ctx, noSpec); err == nil {
+		t.Error("an object without spec must be rejected")
+	}
+	off, err := create("explicit-off", map[string]interface{}{"metrics": map[string]interface{}{
+		"cpu": map[string]interface{}{"enabled": false}, "requests": map[string]interface{}{"enabled": false}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"spec.metrics.cpu.enabled", "spec.metrics.requests.enabled"} {
+		if got, _, _ := unstructured.NestedFieldNoCopy(off.Object, strings.Split(path, ".")...); got != false {
+			t.Errorf("%s = %v: an explicit false must not be defaulted", path, got)
+		}
+	}
+	u, err := create("defaults", map[string]interface{}{"metrics": map[string]interface{}{"cpu": map[string]interface{}{}},
+		"prediction": map[string]interface{}{}, "resources": map[string]interface{}{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for path, want := range map[string]interface{}{
+		"spec.mode": "Recommend", "spec.metrics.cpu.enabled": true, "spec.metrics.cpu.targetPercent": int64(70),
+		"spec.prediction.enabled": true, "spec.prediction.horizonMinutes": int64(60), "spec.prediction.leadTimeMinutes": int64(15),
+		"spec.prediction.updateIntervalSeconds": int64(300), "spec.resources.baselineRPM": int64(10000),
+		"spec.resources.cpuRequestMillicores": int64(100), "spec.resources.memoryRequestMB": int64(128),
+	} {
+		got, found, _ := unstructured.NestedFieldNoCopy(u.Object, strings.Split(path, ".")...)
+		if !found || got != want {
+			t.Errorf("%s = %v (found %v), want %v", path, got, found, want)
+		}
+	}
+	var crd unstructured.Unstructured
+	crd.SetGroupVersionKind(schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"})
+	if err := f.c.Get(ctx, types.NamespacedName{Name: "predictiveautoscalers." + autoscalerv1alpha1.GroupVersion.Group}, &crd); err != nil {
+		t.Fatal(err)
+	}
+	if crd.GetLabels()["autoscaling.devkuban.com/crd-revision"] != "1" {
+		t.Fatalf("the CRD revision label is missing: %v", crd.GetLabels())
+	}
+}
+
+// A legacy-group PredictiveAutoscaler in another namespace that targets the Deployment blocks Active writes through the
+// real API server's discovery and an all-namespaces list, and the block lifts once it is deleted (r23/r24).
+func TestEnvtestALegacyAutoscalerElsewhereBlocksActiveWrites(t *testing.T) {
+	f := envHarness(t, autoscalerv1alpha1.ModeActive)
+	ctx := context.Background()
+	legacyNS := f.req.Namespace + "-legacy"
+	if err := f.c.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: legacyNS}}); err != nil {
+		t.Fatal(err)
+	}
+	old := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": autoscalerv1alpha1.LegacyGroup + "/v1alpha1", "kind": "PredictiveAutoscaler",
+		"metadata": map[string]interface{}{"name": "old", "namespace": legacyNS},
+		"spec":     map[string]interface{}{"targetDeployment": map[string]interface{}{"name": "web", "namespace": f.req.Namespace}},
+	}}
+	if err := f.c.Create(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.c.Delete(context.Background(), old) })
+	reconcileOnce(t, f.r, f.req)
+	if d := lastDecision(t, f.path); d.Action != "conflict_hold" || *f.deployment(t).Spec.Replicas != 1 {
+		t.Fatalf("a legacy autoscaler on the target must block the write: %+v", d)
+	}
+	if c := condition(t, f.r, f.req.NamespacedName, "ConflictDetected"); c.Status != metav1.ConditionTrue ||
+		!strings.Contains(c.Message, "PredictiveAutoscaler."+autoscalerv1alpha1.LegacyGroup+"/"+legacyNS+"/old") {
+		t.Fatalf("ConflictDetected must name the legacy object: %+v", c)
+	}
+	var withConflict autoscalerv1alpha1.PredictiveAutoscaler
+	if err := f.c.Get(ctx, f.req.NamespacedName, &withConflict); err != nil {
+		t.Fatal(err)
+	}
+	if want := []autoscalerv1alpha1.ReplicaWriter{{Group: autoscalerv1alpha1.LegacyGroup, Kind: "PredictiveAutoscaler", Namespace: legacyNS,
+		Name: "old", Reason: autoscalerv1alpha1.WriterReasonLegacyAPIGroup}}; !reflect.DeepEqual(withConflict.Status.Conflicts, want) {
+		t.Fatalf("status.conflicts = %v, want %v", withConflict.Status.Conflicts, want)
+	}
+	if err := f.c.Delete(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	reconcileOnce(t, f.r, f.req)
+	if d := lastDecision(t, f.path); d.Action != "scale_up" || *f.deployment(t).Spec.Replicas != 5 {
+		t.Fatalf("after the legacy object is gone the write proceeds: %+v", d)
+	}
+	var cleared autoscalerv1alpha1.PredictiveAutoscaler
+	if err := f.c.Get(ctx, f.req.NamespacedName, &cleared); err != nil || len(cleared.Status.Conflicts) != 0 {
+		t.Fatalf("status.conflicts must clear: %v %v", cleared.Status.Conflicts, err)
+	}
+}
+
+// A condition message longer than the schema's 32768 bytes would make the API server reject the whole status update;
+// the operator truncates it (conditionMessage) and the update is accepted.
+func TestEnvtestALongConditionMessageDoesNotBreakTheStatusUpdate(t *testing.T) {
+	f := envHarness(t, autoscalerv1alpha1.ModeRecommend)
+	ctx := context.Background()
+	long := strings.Repeat("conflict ", maxConditionMessage/8)
+	update := func(msg string) error {
+		var pa autoscalerv1alpha1.PredictiveAutoscaler
+		if err := f.c.Get(ctx, f.req.NamespacedName, &pa); err != nil {
+			return err
+		}
+		meta.SetStatusCondition(&pa.Status.Conditions, metav1.Condition{Type: "ConflictDetected", Status: metav1.ConditionTrue,
+			Reason: "ReplicaWriter", Message: msg, ObservedGeneration: pa.Generation})
+		return f.c.Status().Update(ctx, &pa)
+	}
+	if err := update(long); err == nil {
+		t.Fatal("precondition: the API server must reject an over-long message")
+	}
+	if err := update(conditionMessage(long)); err != nil {
+		t.Fatalf("a truncated message must be accepted: %v", err)
+	}
+}
+
+// chunkedBody hides its length, so net/http sends it chunked, as kubectl's raw DELETE does.
+type chunkedBody struct{ r io.Reader }
+
+func (b chunkedBody) Read(p []byte) (int, error) { return b.r.Read(p) }
+
+// The migration tool deletes legacy autoscalers with `kubectl delete --raw <path> -f <DeleteOptions>`: kubectl sends the
+// file as a chunked body without a Content-Type. The real API server must enforce its preconditions (UID and
+// resourceVersion) for exactly that request (hack/migrate-api-group.py, Codex task-08 r26/r27).
+func TestEnvtestARawDeleteWithPreconditionsIsEnforcedByTheServer(t *testing.T) {
+	cfg := startEnv(t)
+	c, err := client.New(cfg, client.Options{Scheme: envScheme()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	envMu.Lock()
+	envSeq++
+	ns := fmt.Sprintf("envtest-%d", envSeq)
+	envMu.Unlock()
+	if err := c.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}); err != nil {
+		t.Fatal(err)
+	}
+	old := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": autoscalerv1alpha1.LegacyGroup + "/v1alpha1", "kind": "PredictiveAutoscaler",
+		"metadata": map[string]interface{}{"name": "old", "namespace": ns},
+		"spec":     map[string]interface{}{"targetDeployment": map[string]interface{}{"name": "web"}},
+	}}
+	if err := c.Create(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	hc, err := rest.HTTPClientFor(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	del := func(uid, rv string) int {
+		body := fmt.Sprintf(`{"kind":"DeleteOptions","apiVersion":"v1","preconditions":{"uid":%q,"resourceVersion":%q}}`, uid, rv)
+		req, err := http.NewRequest(http.MethodDelete, strings.TrimRight(cfg.Host, "/")+
+			"/apis/"+autoscalerv1alpha1.LegacyGroup+"/v1alpha1/namespaces/"+ns+"/predictiveautoscalers/old", chunkedBody{strings.NewReader(body)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := hc.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+	uid, rv := string(old.GetUID()), old.GetResourceVersion()
+	if code := del("someone-else", rv); code != http.StatusConflict {
+		t.Fatalf("a wrong UID must be refused with 409, got %d", code)
+	}
+	if code := del(uid, "1"); code != http.StatusConflict {
+		t.Fatalf("a stale resourceVersion must be refused with 409, got %d", code)
+	}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(old), old); err != nil {
+		t.Fatalf("the object must still exist after refused deletes: %v", err)
+	}
+	if code := del(uid, rv); code != http.StatusOK {
+		t.Fatalf("matching preconditions must delete, got %d", code)
+	}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(old), old); err == nil {
+		t.Fatal("the object must be gone")
 	}
 }

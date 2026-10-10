@@ -24,7 +24,7 @@ from typing import Callable, Optional
 from data.bounded_http import BodyTooLarge, TransportFailure, bounded_get
 
 CONTRACT = "requests-per-second/v1"
-API_GROUP = "autoscaler.example.com"
+API_GROUP = "autoscaling.devkuban.com"
 API_VERSION = "v1alpha1"
 SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
 DEADLINE_S = 8.0               # the whole exchange, headers and body

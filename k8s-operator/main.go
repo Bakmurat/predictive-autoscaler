@@ -33,6 +33,10 @@ func init() {
 	utilruntime.Must(autoscalerv1alpha1.AddToScheme(scheme))
 }
 
+// leaderElectionID is the Lease the operator elects on. It is not the legacy operator's "predictive-autoscaler-leader",
+// so both can run side by side during the API-group migration without one blocking the other (docs/upgrading.md).
+const leaderElectionID = "predictive-autoscaler.autoscaling.devkuban.com"
+
 func main() {
 	var metricsAddr string
 	var enableLeaderElection bool
@@ -67,7 +71,7 @@ func main() {
 		Metrics:                 metricsserver.Options{BindAddress: metricsAddr}, // plain HTTP, as before
 		HealthProbeBindAddress:  probeAddr,
 		LeaderElection:          enableLeaderElection,
-		LeaderElectionID:        "predictive-autoscaler-leader",
+		LeaderElectionID:        leaderElectionID,
 		LeaderElectionNamespace: leaderElectionNamespace,
 		// The manager exits right after it stops, so releasing the Lease on shutdown is safe and hands over at once.
 		LeaderElectionReleaseOnCancel: true,

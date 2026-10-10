@@ -25,11 +25,14 @@ import (
 //   - a KEDA ScaledObject on the Deployment, unless it is paused with autoscaling.keda.sh/paused: "true" (a
 //     paused-replicas annotation makes KEDA set that count: a writer). The generated HPA of a paused ScaledObject is
 //     removed by KEDA; while it still exists the HPA check above reports it;
-//   - another PredictiveAutoscaler in Active mode on the same Deployment (both refuse; no ownership policy is implied).
+//   - another PredictiveAutoscaler in Active mode on the same Deployment (both refuse; no ownership policy is implied);
+//   - any PredictiveAutoscaler of the legacy API group (autoscaler.example.com, before v0.1.0) on the Deployment, in any
+//     namespace: no released legacy operator has a Recommend mode (it writes on every reconcile and may target another
+//     namespace), so whatever its spec says it is a writer (Codex task-08 r23/r24; see docs/upgrading.md).
 // A VerticalPodAutoscaler in any mode except Off is reported as a warning: it changes the pods' resource requests but
 // does not own the replica count.
 //
-// KEDA and the VPA are optional APIs. One counts as absent only when a fresh discovery succeeds and shows it is not
+// KEDA, the VPA and the legacy group are optional APIs. One counts as absent only when a fresh discovery succeeds and shows it is not
 // served (the group is not served, or its version is served without the resource). A served group without the expected
 // version, a failed discovery, or any error reading a served API makes the check fail, which blocks writes like a
 // conflict (Codex task-08 r05: a 404 alone is no proof of absence). The checks are not atomic across resources; they
@@ -50,6 +53,7 @@ type optionalAPI struct {
 var (
 	kedaScaledObjects = optionalAPI{schema.GroupVersion{Group: "keda.sh", Version: "v1alpha1"}, "scaledobjects", "ScaledObjectList"}
 	vpaObjects        = optionalAPI{schema.GroupVersion{Group: "autoscaling.k8s.io", Version: "v1"}, "verticalpodautoscalers", "VerticalPodAutoscalerList"}
+	legacyAutoscalers = optionalAPI{schema.GroupVersion{Group: autoscalerv1alpha1.LegacyGroup, Version: "v1alpha1"}, "predictiveautoscalers", "PredictiveAutoscalerList"}
 )
 
 // APIDiscovery is the part of API discovery the check needs, bounded by the check's context (client-go's
@@ -79,10 +83,20 @@ func (d RESTDiscovery) ServerResourcesForGroupVersion(ctx context.Context, group
 	return &l, nil
 }
 
+// finish sorts the writers and derives their String() forms.
+func (w *writerCheck) finish() {
+	sort.Slice(w.Writers, func(i, j int) bool { return w.Writers[i].String() < w.Writers[j].String() })
+	w.Conflicts = nil
+	for _, x := range w.Writers {
+		w.Conflicts = append(w.Conflicts, x.String())
+	}
+}
+
 type writerCheck struct {
-	Conflicts  []string // "Kind/name" of every other replica writer on the target
-	Warnings   []string // "Kind/name (mode)" of VerticalPodAutoscalers that change the target's pods
-	VPAChecked bool     // the VPA part completed (Warnings is meaningful)
+	Writers    []autoscalerv1alpha1.ReplicaWriter // every other replica writer on the target, sorted by String()
+	Conflicts  []string                           // their String() forms (conditions, events, the decision ledger)
+	Warnings   []string                           // "Kind/name (mode)" of VerticalPodAutoscalers that change the target's pods
+	VPAChecked bool                               // the VPA part completed (Warnings is meaningful)
 }
 
 // servedAPIs returns, from one fresh discovery, whether each optional API is served. d == nil (unit tests with a fake
@@ -163,11 +177,11 @@ func listOptional(ctx context.Context, rd client.Reader, a optionalAPI, ns strin
 
 // checkReplicaWriters lists the replica writers on dep through rd (an uncached reader in production) after a fresh
 // discovery of the optional APIs through d.
-func checkReplicaWriters(ctx context.Context, rd client.Reader, d APIDiscovery, pa *autoscalerv1alpha1.PredictiveAutoscaler, dep *appsv1.Deployment) (writerCheck, error) {
-	var out writerCheck
+func checkReplicaWriters(ctx context.Context, rd client.Reader, d APIDiscovery, pa *autoscalerv1alpha1.PredictiveAutoscaler, dep *appsv1.Deployment) (out writerCheck, err error) {
+	defer out.finish() // also on a failed check: the writers found before the failure are reported
 	ns := client.InNamespace(dep.Namespace)
 
-	served, err := servedAPIs(ctx, d, kedaScaledObjects, vpaObjects)
+	served, err := servedAPIs(ctx, d, kedaScaledObjects, vpaObjects, legacyAutoscalers)
 	if err != nil {
 		return out, err
 	}
@@ -179,7 +193,7 @@ func checkReplicaWriters(ctx context.Context, rd client.Reader, d APIDiscovery, 
 	for _, h := range hpas.Items {
 		ref := h.Spec.ScaleTargetRef
 		if targetsDeployment(ref.Kind, ref.APIVersion, ref.Name, dep) {
-			out.Conflicts = append(out.Conflicts, "HorizontalPodAutoscaler/"+h.Name)
+			out.Writers = append(out.Writers, autoscalerv1alpha1.ReplicaWriter{Group: "autoscaling", Kind: "HorizontalPodAutoscaler", Namespace: h.Namespace, Name: h.Name})
 		}
 	}
 
@@ -197,9 +211,10 @@ func checkReplicaWriters(ctx context.Context, rd client.Reader, d APIDiscovery, 
 			}
 			ann := so.GetAnnotations()
 			if _, fixed := ann["autoscaling.keda.sh/paused-replicas"]; fixed {
-				out.Conflicts = append(out.Conflicts, "ScaledObject/"+so.GetName()+" (paused-replicas)")
+				out.Writers = append(out.Writers, autoscalerv1alpha1.ReplicaWriter{Group: "keda.sh", Kind: "ScaledObject", Namespace: so.GetNamespace(), Name: so.GetName(),
+					Reason: autoscalerv1alpha1.WriterReasonPausedReplicas})
 			} else if ann["autoscaling.keda.sh/paused"] != "true" {
-				out.Conflicts = append(out.Conflicts, "ScaledObject/"+so.GetName())
+				out.Writers = append(out.Writers, autoscalerv1alpha1.ReplicaWriter{Group: "keda.sh", Kind: "ScaledObject", Namespace: so.GetNamespace(), Name: so.GetName()})
 			}
 		}
 	}
@@ -217,7 +232,25 @@ func checkReplicaWriters(ctx context.Context, rd client.Reader, d APIDiscovery, 
 			tns = o.Namespace
 		}
 		if o.Spec.TargetDeployment.Name == dep.Name && tns == dep.Namespace && o.Spec.EffectiveMode() == autoscalerv1alpha1.ModeActive {
-			out.Conflicts = append(out.Conflicts, "PredictiveAutoscaler/"+o.Name)
+			out.Writers = append(out.Writers, autoscalerv1alpha1.ReplicaWriter{Group: autoscalerv1alpha1.GroupVersion.Group, Kind: "PredictiveAutoscaler", Namespace: o.Namespace, Name: o.Name})
+		}
+	}
+
+	if served[legacyAutoscalers] {
+		olds, err := listOptional(ctx, rd, legacyAutoscalers, metav1.NamespaceAll)
+		if err != nil {
+			return out, err
+		}
+		for _, o := range olds.Items {
+			name, _, _ := unstructured.NestedString(o.Object, "spec", "targetDeployment", "name")
+			tns, _, _ := unstructured.NestedString(o.Object, "spec", "targetDeployment", "namespace")
+			if tns == "" {
+				tns = o.GetNamespace()
+			}
+			if name == dep.Name && tns == dep.Namespace {
+				out.Writers = append(out.Writers, autoscalerv1alpha1.ReplicaWriter{Group: autoscalerv1alpha1.LegacyGroup, Kind: "PredictiveAutoscaler", Namespace: o.GetNamespace(), Name: o.GetName(),
+					Reason: autoscalerv1alpha1.WriterReasonLegacyAPIGroup})
+			}
 		}
 	}
 
@@ -240,7 +273,7 @@ func checkReplicaWriters(ctx context.Context, rd client.Reader, d APIDiscovery, 
 		}
 	}
 	out.VPAChecked = true
-	sort.Strings(out.Conflicts)
+
 	sort.Strings(out.Warnings)
 	return out, nil
 }

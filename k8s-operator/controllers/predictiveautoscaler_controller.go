@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
@@ -209,9 +210,9 @@ type VMInstantQueryResponse struct {
 	} `json:"data"`
 }
 
-//+kubebuilder:rbac:groups=autoscaler.example.com,resources=predictiveautoscalers,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=autoscaler.example.com,resources=predictiveautoscalers/status,verbs=get;update;patch
-//+kubebuilder:rbac:groups=autoscaler.example.com,resources=predictiveautoscalers/finalizers,verbs=update
+//+kubebuilder:rbac:groups=autoscaling.devkuban.com,resources=predictiveautoscalers,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=autoscaling.devkuban.com,resources=predictiveautoscalers/status,verbs=get;update;patch
+//+kubebuilder:rbac:groups=autoscaling.devkuban.com,resources=predictiveautoscalers/finalizers,verbs=update
 //+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch
 //+kubebuilder:rbac:groups=apps,resources=deployments/scale,verbs=get;update
 //+kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
@@ -220,6 +221,7 @@ type VMInstantQueryResponse struct {
 //+kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch
 //+kubebuilder:rbac:groups=keda.sh,resources=scaledobjects,verbs=get;list;watch
 //+kubebuilder:rbac:groups=autoscaling.k8s.io,resources=verticalpodautoscalers,verbs=get;list;watch
+//+kubebuilder:rbac:groups=autoscaler.example.com,resources=predictiveautoscalers,verbs=get;list;watch
 
 // Reconcile is the unified scaling loop. On every cycle (default 60s):
 // 1. Get ML predictions (cached 5 min) → predicted replicas within lead-time window
@@ -621,7 +623,7 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		current: currentReplicas, ready: deployment.Status.ReadyReplicas, keepCurrent: keepCurrent,
 		telemetry: dec.TelemetryStatus, telemetryError: dec.TelemetryError, forecastStatus: dec.ForecastStatus,
 		forecastIssuedAt: dec.ForecastIssuedAt, targetUID: string(deployment.UID),
-		conflicts: check.Conflicts, warnings: check.Warnings, vpaChecked: check.VPAChecked, checkError: checkMsg, guard: guard,
+		conflicts: check.Conflicts, writers: check.Writers, warnings: check.Warnings, vpaChecked: check.VPAChecked, checkError: checkMsg, guard: guard,
 	}); err != nil {
 		log.Error(err, "Failed to update status")
 	}
@@ -1333,6 +1335,7 @@ type statusInputs struct {
 	telemetryError, forecastIssuedAt                          *string
 	targetUID                                                 string
 	conflicts, warnings                                       []string
+	writers                                                   []autoscalerv1alpha1.ReplicaWriter
 	vpaChecked                                                bool
 	checkError, guard                                         string
 }
@@ -1354,6 +1357,7 @@ func (r *PredictiveAutoscalerReconciler) updateStatus(ctx context.Context, autos
 	st.PredictedReplicas = in.calculated // deprecated field, historical meaning (the calculated count)
 	st.CalculatedReplicas, st.ForecastReplicas, st.StabilizedReplicas = in.calculated, in.forecast, in.stabilized
 	st.CurrentReplicas, st.ReadyReplicas = in.current, in.ready
+	st.Conflicts = in.writers
 	if in.mode != autoscalerv1alpha1.ModeActive {
 		st.StabilizedReplicas = 0
 	}
@@ -1374,10 +1378,10 @@ func (r *PredictiveAutoscalerReconciler) updateStatus(ctx context.Context, autos
 		if ok {
 			status = metav1.ConditionTrue
 		}
-		meta.SetStatusCondition(&st.Conditions, metav1.Condition{Type: t, Status: status, Reason: reason, Message: msg, ObservedGeneration: gen})
+		meta.SetStatusCondition(&st.Conditions, metav1.Condition{Type: t, Status: status, Reason: reason, Message: conditionMessage(msg), ObservedGeneration: gen})
 	}
 	setStatus := func(t string, status metav1.ConditionStatus, reason, msg string) {
-		meta.SetStatusCondition(&st.Conditions, metav1.Condition{Type: t, Status: status, Reason: reason, Message: msg, ObservedGeneration: gen})
+		meta.SetStatusCondition(&st.Conditions, metav1.Condition{Type: t, Status: status, Reason: reason, Message: conditionMessage(msg), ObservedGeneration: gen})
 	}
 	set("Ready", true, "ReconcileCompleted", fmt.Sprintf("calculated=%d current=%d mode=%s", in.calculated, in.current, in.mode))
 	if in.telemetry == "measured" {
@@ -1505,6 +1509,23 @@ func (r *PredictiveAutoscalerReconciler) event(a *autoscalerv1alpha1.PredictiveA
 	}
 }
 
+// maxConditionMessage is metav1.Condition's schema limit on message (bytes); a longer message would make the API server
+// reject the whole status update.
+const maxConditionMessage = 32768
+
+// conditionMessage keeps a condition message within the schema limit, cut at a UTF-8 boundary with a marker.
+func conditionMessage(msg string) string {
+	if len(msg) <= maxConditionMessage {
+		return msg
+	}
+	const marker = " …(truncated)"
+	cut := maxConditionMessage - len(marker)
+	for cut > 0 && !utf8.RuneStart(msg[cut]) {
+		cut--
+	}
+	return msg[:cut] + marker
+}
+
 // updateStatusWithError records a failed reconcile (Ready=False, transition time preserved).
 func (r *PredictiveAutoscalerReconciler) updateStatusWithError(
 	ctx context.Context,
@@ -1517,7 +1538,7 @@ func (r *PredictiveAutoscalerReconciler) updateStatusWithError(
 	autoscaler.Status.Mode = autoscaler.Spec.EffectiveMode()
 	for _, c := range []string{"Ready", "ScalingActive"} {
 		meta.SetStatusCondition(&autoscaler.Status.Conditions, metav1.Condition{Type: c, Status: metav1.ConditionFalse,
-			Reason: reason, Message: message, ObservedGeneration: autoscaler.Generation})
+			Reason: reason, Message: conditionMessage(message), ObservedGeneration: autoscaler.Generation})
 	}
 	if !statusEqual(before, &autoscaler.Status) {
 		if err := r.Status().Update(ctx, autoscaler); err != nil {

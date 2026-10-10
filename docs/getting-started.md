@@ -46,7 +46,7 @@ images:
 Apply and check that everything came up:
 ```sh
 kubectl apply -k k8s-manifests/base
-kubectl wait --for=condition=Established crd/predictiveautoscalers.autoscaler.example.com --timeout=60s
+kubectl wait --for=condition=Established crd/predictiveautoscalers.autoscaling.devkuban.com --timeout=60s
 kubectl -n ml-engine rollout status deploy/ml-api --timeout=300s
 kubectl -n ml-engine rollout status deploy/predictive-operator --timeout=120s
 ```

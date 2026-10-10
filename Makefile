@@ -1,5 +1,5 @@
 # Publication is gated on `make verify` returning 0. See scripts/verify.sh and README "Testing".
-.PHONY: setup verify verify-selftest verify-python verify-go precommit-selftest envtest
+.PHONY: setup verify verify-selftest verify-python verify-go precommit-selftest envtest manifests manifests-check
 
 setup:
 	@git config core.hooksPath .githooks
@@ -16,6 +16,13 @@ verify-go:
 
 verify-selftest:
 	@scripts/verify-selftest.sh
+
+# The CRD and the deepcopy functions are generated from the API types' markers (controller-gen, pinned in the script).
+manifests:
+	@scripts/gen-manifests.sh write
+
+manifests-check:
+	@scripts/gen-manifests.sh check
 
 precommit-selftest:
 	@scripts/precommit-selftest.sh
