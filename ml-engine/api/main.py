@@ -31,6 +31,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 from models.lstm_model import LSTMForecastModel, asymmetric_mse  # noqa: F401 — registers custom loss for keras model loading
 from data.victoriametrics_collector import VictoriaMetricsCollector
 from api.accuracy import AccuracyTracker
+from api.auth import AuthMiddleware, TokenReviewer, config_from_env
 from api.identity import CONTRACT, KubeReader, LookupFailed, ProvenanceRefused, resolve_signal
 from api.registry import ModelIncompatible, ModelRegistry, artifact_paths, load_record, model_key as registry_key
 from data.history import HistoryRefused, HistoryUnavailable, query_history
@@ -112,6 +113,12 @@ app = FastAPI(
     description="LSTM-based Machine Learning API for Kubernetes Predictive Autoscaling",
     version="3.8.0"
 )
+
+# Caller authentication (B5e): with FORECASTER_AUTH=tokenreview, protected paths need the operator's projected service
+# account token, checked with TokenReview before the body is read. An unsafe configuration stops the service here.
+auth_config = config_from_env()
+if auth_config.enabled:
+    app.add_middleware(AuthMiddleware, config=auth_config, reviewer=TokenReviewer(auth_config))
 
 class LSTMPredictor:
     """LSTM-based predictor using real neural network models."""

@@ -93,6 +93,32 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "auth": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "audience": {"type": "string", "pattern": "^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$"}
+          }
+        },
+        "tls": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "source": {"enum": ["selfSigned", "certManager", "existingSecret"]},
+            "existingSecret": {"type": "string"},
+            "certManager": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "issuerRef": {"type": "object", "additionalProperties": false, "properties": {"name": {"type": "string"}, "kind": {"enum": ["Issuer", "ClusterIssuer"]}}},
+                "duration": {"type": "string"},
+                "renewBefore": {"type": "string"}
+              }
+            },
+            "selfSigned": {"type": "object", "additionalProperties": false, "properties": {"validityDays": {"type": "integer", "minimum": 1, "maximum": 3650}}}
+          }
+        },
         "resources": {"$ref": "#/definitions/resources"},
         "persistence": {
           "type": "object",

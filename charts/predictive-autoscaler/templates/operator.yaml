@@ -51,6 +51,12 @@ spec:
             - name: FORECAST_LOG
               value: /var/lib/predictive-autoscaler/forecasts.jsonl
             {{- end }}
+            {{- if .Values.forecaster.auth.enabled }}
+            - name: ML_API_TOKEN_FILE
+              value: /var/run/secrets/predictive-autoscaler/forecaster-token/token
+            - name: ML_API_CA_FILE
+              value: /etc/predictive-autoscaler/forecaster-ca/ca.crt
+            {{- end }}
           ports:
             - {name: metrics, containerPort: 8080}
             - {name: probes, containerPort: 8081}
@@ -62,18 +68,39 @@ spec:
             periodSeconds: 10
           securityContext: {{- include "pa.containerSecurity" . | nindent 12 }}
           resources: {{- toYaml .Values.operator.resources | nindent 12 }}
-          {{- if $ledger.enabled }}
+          {{- if or $ledger.enabled .Values.forecaster.auth.enabled }}
           volumeMounts:
+            {{- if $ledger.enabled }}
             - {name: ledger, mountPath: /var/lib/predictive-autoscaler}
+            {{- end }}
+            {{- if .Values.forecaster.auth.enabled }}
+            - {name: forecaster-token, mountPath: /var/run/secrets/predictive-autoscaler/forecaster-token, readOnly: true}
+            - {name: forecaster-ca, mountPath: /etc/predictive-autoscaler/forecaster-ca, readOnly: true}
+            {{- end }}
           {{- end }}
-      {{- if $ledger.enabled }}
+      {{- if or $ledger.enabled .Values.forecaster.auth.enabled }}
       volumes:
+        {{- if $ledger.enabled }}
         - name: ledger
           {{- if $ledger.persistence.existingClaim }}
           persistentVolumeClaim: {claimName: {{ $ledger.persistence.existingClaim | quote }}}
           {{- else }}
           emptyDir: {}
           {{- end }}
+        {{- end }}
+        {{- if .Values.forecaster.auth.enabled }}
+        - name: forecaster-token     # audience-bound, rotated by the kubelet; read on every request
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: {{ .Values.forecaster.auth.audience | quote }}
+                  expirationSeconds: 3600
+                  path: token
+        - name: forecaster-ca        # only the CA: the forecasting service's private key never reaches this pod
+          secret:
+            secretName: {{ include "pa.forecasterTLSSecret" . }}
+            items: [{key: ca.crt, path: ca.crt}]
+        {{- end }}
       {{- end }}
       {{- with .Values.operator.nodeSelector }}
       nodeSelector: {{- toYaml . | nindent 8 }}

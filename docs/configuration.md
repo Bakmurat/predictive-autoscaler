@@ -82,6 +82,8 @@ measured as a real zero and scales normally.
 | `PROMETHEUS_URL` | `http://vmselect-vmst.monitoring.svc.cluster.local:8481/select/0/prometheus` | Prometheus-compatible query endpoint (any Prometheus API works). `VICTORIAMETRICS_URL` is still read as a deprecated fallback. |
 | `FORECAST_LOG` | unset | Path of the append-only forecast/decision ledger (JSONL). |
 | `WATCH_NAMESPACES` | all | Comma-separated namespaces to watch. |
+| `ML_API_TOKEN_FILE` | unset | A projected service account token for the forecasting service's audience, read on every request and sent as `Authorization: Bearer`. With it set, `ML_API_URL` must be https, and a missing or empty file sends nothing (forecast status `auth_misconfigured`, reactive rule). |
+| `ML_API_CA_FILE` | unset | The forecasting service's CA bundle. It is reloaded when it changes (checked at most every 60 s); a configured file that is missing or invalid sends nothing. Redirects are never followed. |
 The forecasting service reads the endpoint from a differently named variable, `VICTORIA_METRICS_URL`; set both.
 
 ## Forecasting service
@@ -91,6 +93,9 @@ The forecasting service reads the endpoint from a differently named variable, `V
 | `MODEL_DIR` | `/app/models/trained` | Model store (artifacts `lstm_<key>.pkl` + `.meta.json`). |
 | `COLD_START_CRONJOB` | unset | Without any compatible model at startup, create one Job from this CronJob. Unset = never (a local run or a test cannot create Jobs). |
 | `FORECAST_ADMISSION` / `FORECAST_INFERENCE_SLOTS` | `4` / `2` | Concurrent forecast jobs / concurrent inferences; beyond that the service answers 503. |
+| `FORECASTER_AUTH` | `off` | `tokenreview`: every path except `/health`, `/ready` and open `/metrics` needs exactly one `Authorization: Bearer` token that TokenReview authenticates for `FORECASTER_AUTH_AUDIENCE` (default `predictive-autoscaler-forecaster`) and whose user is in `FORECASTER_AUTH_SUBJECTS` (comma-separated `system:serviceaccount:<ns>:<sa>`; required). This includes API docs, path variants and future endpoints. The token is checked before the body is read; the body is capped at 1 MiB. Answers: 401 Unauthenticated, 403 Forbidden, 503 AuthUnavailable (TokenReview cannot judge: never an open door), 500 TLSRequired (the request did not arrive over TLS). Positive results are cached for at most 60 s and never past the token's expiry, so a revocation takes effect within 60 s. The service needs `create` on `tokenreviews`. Unsafe settings stop the service at startup. |
+| `FORECASTER_TLS_CERT` / `FORECASTER_TLS_KEY` | unset | Serve HTTPS (port 8443, `FORECASTER_PORT`). Required with `FORECASTER_AUTH=tokenreview`. When the files change (a renewal), the service restarts itself to load them (checked every 60 s). |
+| `FORECASTER_AUTH_METRICS` / `FORECASTER_AUTH_METRICS_SUBJECTS` | `false` / unset | Protect `/metrics` too, for the scraper subjects only (the Helm chart does not offer it yet). Otherwise `/metrics` and `/health` are open; keep them behind network policies. |
 | `ALLOW_BENCHMARK_EXPERIMENTS` | unset | Benchmark experiment arms (`SEASONAL_EXPERIMENT`, `ENSEMBLE_EXPERIMENT`) refuse to start without it; their answers never carry the product attestation. |
 
 The service never accepts a query or a history from a request. It reads the PredictiveAutoscaler named in the request

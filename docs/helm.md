@@ -35,7 +35,7 @@ and new autoscalers run in Recommend mode (they publish recommendations and chan
 | Component | Runs as | Can do | Writes to |
 |---|---|---|---|
 | operator (Deployment; leader election always on; one replica and Recreate when the ledger uses a claim) | uid 65532 | read autoscalers and Deployments; write replicas only through `deployments/scale`; read HPAs, KEDA ScaledObjects, VPAs and legacy-group autoscalers (coexistence); read its own CRD (revision gate); emit events; a Lease in the release namespace | nothing (or `/var/lib/predictive-autoscaler` with `operator.forecastLedger.enabled`) |
-| forecasting service (Deployment, 1 replica) | uid 10001 | get autoscalers and Deployments | `/models` (the model volume), `/tmp` (an emptyDir with a size limit) |
+| forecasting service (Deployment, 1 replica) | uid 10001 | get autoscalers and Deployments; create TokenReviews when authentication is enabled | `/models` (the model volume), `/tmp` (an emptyDir with a size limit) |
 | trainer (one CronJob per `training.targets` entry) | uid 10001 | get autoscalers and Deployments | `/models`, `/tmp` |
 
 Every container runs non-root with a read-only root filesystem, no privilege escalation, all capabilities dropped and
@@ -100,9 +100,33 @@ The forecasting service and the trainer share the model volume.
 `metrics.serviceMonitor.enabled` (Prometheus Operator) or `metrics.vmServiceScrape.enabled` (VictoriaMetrics
 Operator) scrapes the operator (port 8080) and the forecasting service (port 8000).
 
+## Authentication between the operator and the forecasting service
+
+It is on by default (`forecaster.auth.enabled`).
+- The operator sends a projected service account token for the forecasting service's audience. The kubelet rotates
+  it (it is valid for an hour) and the operator reads it on every request.
+- The forecasting service checks each token with TokenReview, before reading the request, and accepts only the
+  operator's service account: another caller gets 401 or 403. If TokenReview cannot answer it gets 503, never an open
+  door. Kubernetes may report a wrong-audience token as a TokenReview error; that also returns 503 AuthUnavailable.
+  API docs and new endpoints require authentication too; only `/health`, `/ready` and open `/metrics` are exempt.
+- Everything runs over TLS (port 8443). The operator verifies the certificate against the CA, and it mounts only the
+  CA, never the private key. `/health` and `/metrics` stay open, behind the network policies.
+
+The certificate comes from `forecaster.tls.source`:
+
+| Source | Use it for | Renewal |
+|---|---|---|
+| `selfSigned` (default) | plain Helm, the quickstart | valid `selfSigned.validityDays` (365); renew by deleting the Secret `<release>-predictive-autoscaler-forecaster-tls` and running `helm upgrade`. `helm upgrade` keeps it through `lookup`, which Argo CD and `helm template` cannot do, so **do not use it with Argo CD** |
+| `certManager` | Argo CD, production | cert-manager renews it (`duration`, `renewBefore`); the Issuer must put its CA into the Secret's `ca.crt` (a CA issuer does) |
+| `existingSecret` | certificates managed elsewhere | yours: a Secret with `tls.crt`, `tls.key` and `ca.crt` |
+
+When the certificate files change, the forecasting service restarts itself within about a minute to load them, and
+the operator reloads the CA. For those seconds the operator uses a recent cached forecast or the reactive rule. The
+smoke test runs a rotation.
+
+`forecaster.auth.enabled: false` goes back to plain HTTP on port 8000, with the network policies as the only boundary.
+
 ## Not in the chart (yet)
-- Authentication between the operator and the forecasting service: planned for v0.1, with TokenReview over TLS.
-  Until then the NetworkPolicies are the boundary.
 - The release images and the published chart: these come with v0.1.0.
 - Benchmark tooling (forecast experiments, evidence archiving): repository only.
 

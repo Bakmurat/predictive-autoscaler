@@ -19,7 +19,7 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
       ports:
-        - {protocol: TCP, port: 8000}
+        - {protocol: TCP, port: {{ include "pa.forecasterPort" . }}}
   egress: {{- include "pa.commonEgress" . | nindent 4 }}
 ---
 # Operator: scraped on its metrics port only; talks to DNS, the API server, Prometheus and the forecaster.
@@ -45,7 +45,7 @@ spec:
         - podSelector:
             matchLabels: {{- include "pa.selector" (list . "forecaster") | nindent 14 }}
       ports:
-        - {protocol: TCP, port: 8000}
+        - {protocol: TCP, port: {{ include "pa.forecasterPort" . }}}
 ---
 # Trainer: no ingress; talks to DNS, the API server and Prometheus.
 apiVersion: networking.k8s.io/v1

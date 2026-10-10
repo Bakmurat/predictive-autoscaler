@@ -12,7 +12,9 @@
 #   7. the CRD gate blocks an operator on an older CRD revision and releases it;
 #   8. NetworkPolicy allow/deny from each component's identity, the API server reached through its Service with the
 #      API CIDRs tightened;
-#   9. a helm upgrade keeps the model; helm uninstall keeps the CRD, the autoscaler, the claim and the replica count.
+#   9. authentication (on by default): only the operator's audience-bound token is accepted; a certificate rotation
+#      leaves forecasts flowing;
+#  10. a helm upgrade keeps the model; helm uninstall keeps the CRD, the autoscaler, the claim and the replica count.
 #
 # It only ever talks to its own cluster: a kubeconfig in its work directory, and a context it checks before every step.
 #   hack/smoke-kind.sh            build images, create the cluster, run, delete the cluster
@@ -85,6 +87,10 @@ wait_replacement() {
     sleep 3
   done
 }
+# The operator refreshes its five-minute cache on a one-minute reconciliation cadence. Allow both intervals plus
+# margin after restarts: a five-minute deadline can expire one reconcile before a genuinely fresh response.
+FRESH_FORECAST_TIMEOUT=420
+
 # A forecast issued AFTER <time> is in use: proves the (re)started forecasting service served it, not a cached one
 # (the operator sets the issue time only on a fresh response). An empty reference time never counts.
 fresh_forecast_after() {
@@ -249,6 +255,10 @@ for sa in operator forecaster trainer; do
     [ "$(can $sa $denied)" = no ] || die "$sa may $denied"
   done
 done
+[ "$(can forecaster create tokenreviews.authentication.k8s.io)" = yes ] || die "the forecaster cannot review tokens"
+for sa in operator trainer; do
+  [ "$(can $sa create tokenreviews.authentication.k8s.io)" = no ] || die "$sa may review tokens"
+done
 for sa in forecaster trainer; do
   [ "$(can $sa get predictiveautoscalers -n demo)" = yes ] || die "$sa cannot get autoscalers"
   [ "$(can $sa list predictiveautoscalers -n demo)" = no ] || die "$sa may list autoscalers"
@@ -282,7 +292,7 @@ read -r old_name old_uid <<<"$cur"
 k -n "$NS" delete pod "$old_name" --wait=true >/dev/null
 read -r _ _ ready_at <<<"$(wait_replacement forecaster "$old_uid")"
 [ -n "$ready_at" ] || die "no Ready replacement forecasting-service pod"
-wait_for 300 "a forecast from the restarted forecasting service is used" fresh_forecast_after "$ready_at"
+wait_for "$FRESH_FORECAST_TIMEOUT" "a forecast from the restarted forecasting service is used" fresh_forecast_after "$ready_at"
 pass "the model survives a forecasting-service restart (loaded from the volume, no retraining)"
 
 # 6. a query change refuses the old model until retrained
@@ -342,7 +352,7 @@ print("blocked" if expect == "ok" else "ok")'
   k -n "$ns" delete pod "$name" --wait=false >/dev/null 2>&1 || true
 }
 sel="app.kubernetes.io/name=predictive-autoscaler,app.kubernetes.io/instance=pa"
-forecaster="http://pa-predictive-autoscaler-forecaster.$NS.svc:8000/health"
+forecaster="https://pa-predictive-autoscaler-forecaster.$NS.svc:8443/health"
 https_other="https://synth.monitoring.svc:6443/"     # HTTPS on the API server's port, at another address
 # Positive controls from a pod no policy selects: the destinations denied below are reachable, so a denial is the policy.
 [ "$(probe np-ctl-synth app=control demo http://synth.monitoring.svc:8000/ ok)" = ok ] || die "control: synth unreachable"
@@ -363,7 +373,70 @@ done
 [ "$(app_pods forecaster | wc -l | tr -d ' ')" = 1 ] || die "the forecaster Service must have one application pod"
 pass "network policies: forecaster reachable only from the operator; every component reaches DNS, the API Service and Prometheus only; HTTPS on the API port elsewhere is denied"
 
-# 9. upgrade and uninstall retention
+# 9. authentication: only the operator's audience-bound token is accepted; certificate rotation keeps forecasts flowing
+# auth_probe <name> <token or ""> : POSTs /predict from a pod with the operator's labels (so the network policy lets it
+# through) but the namespace's default service account, and prints the HTTP status.
+auth_probe() {
+  local name=$1 token=$2 path=${3:-/predict} method=${4:-POST}
+  local code='import json,os,ssl,sys,urllib.request,urllib.error
+req = urllib.request.Request(sys.argv[1], data=b"{}" if sys.argv[2] == "POST" else None, method=sys.argv[2], headers={"Content-Type": "application/json"})
+if os.environ.get("TOKEN"): req.add_header("Authorization", "Bearer " + os.environ["TOKEN"])
+for _ in range(20):
+    try:
+        print(urllib.request.urlopen(req, timeout=5, context=ssl._create_unverified_context()).status); break
+    except urllib.error.HTTPError as e:
+        if e.code == 503:
+            try: error = json.load(e).get("detail", {}).get("error", "unknown")
+            except Exception: error = "unknown"
+            print("503:" + str(error))
+        else:
+            print(e.code)
+        break
+    except Exception:
+        import time; time.sleep(3)
+else:
+    print("unreachable")'
+  k -n "$NS" run "$name" --restart=Never --image="$FORECASTER_IMAGE" --image-pull-policy=Never \
+    --labels="$sel,app.kubernetes.io/component=operator" --env="TOKEN=$token" \
+    --overrides='{"apiVersion":"v1","spec":{"readinessGates":[{"conditionType":"smoke.devkuban.com/never-ready"}]}}' \
+    --command -- python3 -c "$code" "https://pa-predictive-autoscaler-forecaster.$NS.svc:8443$path" "$method" >/dev/null
+  k -n "$NS" wait --for=jsonpath='{.status.phase}'=Succeeded "pod/$name" --timeout=120s >/dev/null 2>&1 || true
+  k -n "$NS" logs "$name" 2>/dev/null | tail -1
+  k -n "$NS" delete pod "$name" --wait=false >/dev/null 2>&1 || true
+}
+other_aud="$(k -n "$NS" create token default --audience predictive-autoscaler-forecaster --duration 10m)"
+api_aud="$(k -n "$NS" create token default --duration 10m)"
+[ "$(auth_probe auth-none "")" = 401 ] || die "the forecasting service answered without a token"
+[ "$(auth_probe auth-docs "" /docs GET)" = 401 ] || die "API documentation is reachable without a token"
+[ "$(auth_probe auth-openapi "" /openapi.json GET)" = 401 ] || die "the API schema is reachable without a token"
+[ "$(auth_probe auth-variant "" /predict/)" = 401 ] || die "a path variant is reachable without a token"
+wrong_audience_status="$(auth_probe auth-api-aud "$api_aud")"
+# Kubernetes may return status.error for an audience mismatch (with authenticated:false omitted). The service must
+# report any review error as AuthUnavailable/503, so both 401 and 503 are fail-closed outcomes. The next check's 403
+# proves reviews work, and the operator's fresh forecast after rotation proves the authorized path still works.
+case "$wrong_audience_status" in
+  401|503:AuthUnavailable) ;;
+  *) die "a token for another audience was not refused (HTTP $wrong_audience_status)" ;;
+esac
+[ "$(auth_probe auth-other-sa "$other_aud")" = 403 ] || die "another service account's token was accepted"
+unset other_aud api_aud
+# Rotation: a new certificate (the Secret deleted, then regenerated by the upgrade). The forecasting service restarts
+# when its files change; the operator reloads the CA; forecasts flow again.
+guard
+cur="$(current_app_pod forecaster)" || die "no single forecasting-service pod before the rotation"
+read -r fc_name _ <<<"$cur"
+restarts_before="$(k -n "$NS" get pod "$fc_name" -o jsonpath='{.status.containerStatuses[0].restartCount}')"
+k -n "$NS" delete secret pa-predictive-autoscaler-forecaster-tls >/dev/null
+h upgrade pa "$ROOT/charts/predictive-autoscaler" -n "$NS" -f "$WORK/values.yaml" --wait --timeout 6m >/dev/null || die "helm upgrade (rotation)"
+wait_for 300 "the forecasting service restarts on the new certificate" sh -c "
+  n=\$(kubectl --kubeconfig '$KCFG' --context 'kind-$CLUSTER' -n '$NS' get pod '$fc_name' -o jsonpath='{.status.containerStatuses[0].restartCount}')
+  [ \"\$n\" -gt '$restarts_before' ] && [ \"\$(kubectl --kubeconfig '$KCFG' --context 'kind-$CLUSTER' -n '$NS' get pod '$fc_name' -o jsonpath='{.status.containerStatuses[0].ready}')\" = true ]"
+rotated_at="$(k -n "$NS" get pod "$fc_name" -o jsonpath='{.status.conditions[?(@.type=="Ready")].lastTransitionTime}')"
+[ -n "$rotated_at" ] || die "no Ready time after the rotation"
+wait_for "$FRESH_FORECAST_TIMEOUT" "a forecast over the rotated certificate is used" fresh_forecast_after "$rotated_at"
+pass "authentication: no token 401, another audience $wrong_audience_status, another service account 403; forecasts flow after a certificate rotation"
+
+# 10. upgrade and uninstall retention
 replicas_before="$(k -n demo get deploy web -o jsonpath='{.spec.replicas}')"
 guard
 cur="$(current_app_pod forecaster)" || die "no single forecasting-service pod before the upgrade"
@@ -373,7 +446,7 @@ h upgrade pa "$ROOT/charts/predictive-autoscaler" -n "$NS" -f "$WORK/values.yaml
   --set-string forecaster.podAnnotations.smoke/upgrade=2 --wait --timeout 6m >/dev/null || die "helm upgrade"
 read -r _ _ ready_at <<<"$(wait_replacement forecaster "$old_uid")"
 [ -n "$ready_at" ] || die "no Ready replacement forecasting-service pod"     # dies if the pod was not replaced
-wait_for 300 "a forecast from the upgraded forecasting service is used" fresh_forecast_after "$ready_at"
+wait_for "$FRESH_FORECAST_TIMEOUT" "a forecast from the upgraded forecasting service is used" fresh_forecast_after "$ready_at"
 h uninstall pa -n "$NS" --wait >/dev/null || die "helm uninstall"
 k get crd "$crd" >/dev/null || die "uninstall deleted the CRD"
 k -n demo get pa web-pa >/dev/null || die "uninstall deleted the autoscaler"

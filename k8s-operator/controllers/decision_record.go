@@ -19,7 +19,7 @@ type decisionRecord struct {
 	Application      string          `json:"application"`
 	Namespace        string          `json:"namespace"`
 	Forecasting      bool            `json:"forecasting"`
-	ForecastStatus   string          `json:"forecast_status"` // used|unavailable|horizon_elapsed|sanity_rejected|disabled
+	ForecastStatus   string          `json:"forecast_status"` // used|unavailable|horizon_elapsed|sanity_rejected|disabled|unauthorized|forbidden|auth_unavailable|auth_misconfigured
 	ForecastIssuedAt *string         `json:"forecast_issued_at"`
 	ArtifactSHA256   *string         `json:"artifact_sha256"`
 	ModelVersion     *string         `json:"model_version"`
