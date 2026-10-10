@@ -49,6 +49,10 @@ spec:
                   value: {{ $target | quote }}
                 - name: TRAINING_HOURS
                   value: {{ $.Values.training.hours | quote }}
+                {{- with $.Values.training.epochs }}
+                - name: TRAINING_EPOCHS
+                  value: {{ . | quote }}
+                {{- end }}
                 - name: PROMETHEUS_URL
                   value: {{ required "prometheus.url is required" $.Values.prometheus.url | quote }}
               securityContext: {{- include "pa.containerSecurity" $ | nindent 16 }}

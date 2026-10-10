@@ -80,6 +80,8 @@ They are on by default, and work only with a CNI that enforces them.
 - The trainer accepts none.
 - All three may reach DNS, the Kubernetes API and Prometheus. The operator may also reach the forecasting service.
 
+Enforcement depends on the CNI. Some implementations apply a new pod's policies only once their agent has learned the
+pod, and let its first connections through (kind's kube-network-policies did for about ten seconds in the smoke test).
 Tighten `networkPolicy.kubeAPI.cidrs` to your API server's addresses: the default allows any address on ports
 443/6443. Set `networkPolicy.enabled: false` if your CNI ignores policies or you manage them elsewhere.
 

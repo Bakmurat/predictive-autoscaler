@@ -130,6 +130,7 @@
           }
         },
         "hours": {"type": "integer", "minimum": 24},
+        "epochs": {"type": ["integer", "null"], "minimum": 1},
         "activeDeadlineSeconds": {"type": "integer", "minimum": 60},
         "resources": {"$ref": "#/definitions/resources"},
         "nodeSelector": {"$ref": "#/definitions/scheduling/nodeSelector"},

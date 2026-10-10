@@ -53,6 +53,7 @@ training:
   # reports reactive recommendations).
   targets: []
   hours: 168                 # history per training (the model needs about a week)
+  epochs: null               # training epochs; null: the trainer's default
   activeDeadlineSeconds: 3600
   resources:
     requests: {cpu: 300m, memory: 2Gi}

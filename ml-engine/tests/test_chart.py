@@ -202,6 +202,13 @@ def test_one_training_cronjob_per_target(render):
     assert len({j["metadata"]["name"] for j in jobs}) == 2
 
 
+def test_training_epochs_are_optional(render):
+    env_of = lambda docs: [{e["name"]: e.get("value") for e in j["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]["env"]}
+                           for j in by_kind(docs, "CronJob")]
+    assert all("TRAINING_EPOCHS" not in env for env in env_of(render()))
+    assert all(env["TRAINING_EPOCHS"] == "3" for env in env_of(render({"training": {"epochs": 3}})))
+
+
 def test_rwx_models_need_no_affinity_and_duplicate_targets_fail(render):
     docs = render({"forecaster": {"persistence": {"accessMode": "ReadWriteMany"}}})
     assert all("affinity" not in j["spec"]["jobTemplate"]["spec"]["template"]["spec"] for j in by_kind(docs, "CronJob"))
