@@ -43,7 +43,7 @@ VictoriaMetrics ──► Collector ──► Training job (every 6 h) ──►
 1. **Collect.** Per-pod request rate from the Istio service mesh, plus CPU and memory, are pulled from VictoriaMetrics at ten-minute resolution.
 2. **Train.** Every six hours a CronJob retrains the model on the previous seven days and writes it to a shared volume; the service reloads it by modification time. Per-model locks and the job-based design eliminated the concurrent-retraining failures of early versions.
 3. **Forecast.** The service returns the expected demand for the next hour in six steps, blended with the seven-day pattern, with a confidence signal.
-4. **Scale.** On every reconcile (60 seconds by default) the operator converts the forecast at the configured lead time (20 minutes by default) into a replica count and applies the additive rule.
+4. **Scale.** On every reconcile (60 seconds in the quickstart) the operator converts the forecast at the configured lead time (15 minutes in the quickstart) into a replica count and applies the additive rule.
 5. **Guard.** Overestimate detection compares recent forecasts with actuals and shrinks the forecast's influence when it runs hot; stabilization and cooldown bound every scale-down; confidence dampening discounts low-confidence forecasts.
 
 ## Evaluation approach
@@ -54,20 +54,34 @@ Accuracy figures are deliberately not published yet. A controlled, repeatable be
 
 ## Getting started
 
-Both components ship as container images:
+Start from a source checkout on a disposable local cluster. The quickstart builds the operator and forecasting
+images, installs the authenticated Helm chart, and sends requests to a small HTTP demo:
 
 ```sh
-cd ml-engine    && docker build -t <your-registry>/predictive-autoscaler-ml-api:dev .
-cd k8s-operator && docker build -t <your-registry>/predictive-autoscaler-operator:dev .
+git clone https://github.com/Bakmurat/predictive-autoscaler.git
+cd predictive-autoscaler
+# Until the first release, use the product integration branch.
+git switch product/b5b-chart
+quickstart/kind.sh up
+quickstart/kind.sh status
 ```
 
-Set the image names in `k8s-manifests/base/kustomization.yaml` and the Deployment manifests, choose a storage class in `03-pvc.yaml`, point `02-configmap-victoriametrics.yaml` at your VictoriaMetrics query endpoint, then:
+Docker, kind v0.33 or later, kubectl, Helm and Python 3 are required. Allocate at least 6 GiB of memory and 15 GiB of
+free Docker disk space. Downloads and source builds can take several minutes. The default is **Recommend**: the demo
+stays at one replica while the operator reports its reactive recommendation. A new install has no trained model.
+
+For a forecast immediately, use a separate run with explicitly generated history:
 
 ```sh
-kubectl apply -k k8s-manifests/base
+PA_QUICKSTART_STATE="$HOME/.local/state/pa-synthetic" quickstart/kind.sh up --synthetic-history
+PA_QUICKSTART_STATE="$HOME/.local/state/pa-synthetic" quickstart/kind.sh active
 ```
 
-Prerequisites: VictoriaMetrics with Istio request metrics, and KEDA for the reactive backstop. The API group is `autoscaling.devkuban.com` (renamed from the placeholder `autoscaler.example.com` before v0.1.0; see [docs/upgrading.md](docs/upgrading.md)).
+This backfills eight synthetic days, trains a model, verifies a fresh forecast, and then opts into scaling. It
+proves the installation and scaling loop; it does not measure forecast quality. See the [quickstart](quickstart/README.md)
+for status, stopping and cleanup, or [getting started](docs/getting-started.md) to install against your own metrics.
+The chart works with a Prometheus-compatible API and a workload request counter; Istio and KEDA are optional.
+There are no published release images yet: build from source or use this quickstart.
 
 ### Declare an autoscaler
 
@@ -81,7 +95,7 @@ spec:
   targetDeployment:
     name: web
     namespace: demo
-    container: web
+  mode: Recommend
   minReplicas: 2
   maxReplicas: 40
   metrics:
@@ -163,7 +177,7 @@ Both suites pass. Last full run 2026-09-20: Go `go vet` + `go test -race` green;
 3. Validation of the newest forecasting model (five input features, direct six-step output, robust scaling) against the benchmark.
 4. Adaptive blend weights in place of the fixed 0.70-to-0.908 schedule.
 5. A training-time validation gate so a new model can never replace a better one.
-6. Multi-tenant model management, CPU and memory forecasting paths, CRD validation and defaults via webhooks, Helm chart, end-to-end operator tests on kind.
+6. Broader training and storage support, CPU and memory forecasting, and a signed release. The generated CRD, source Helm chart and kind installation checks are available now.
 
 ## Status
 
