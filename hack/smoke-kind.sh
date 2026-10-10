@@ -87,6 +87,10 @@ wait_replacement() {
     sleep 3
   done
 }
+# The operator refreshes its five-minute cache on a one-minute reconciliation cadence. Allow both intervals plus
+# margin after restarts: a five-minute deadline can expire one reconcile before a genuinely fresh response.
+FRESH_FORECAST_TIMEOUT=420
+
 # A forecast issued AFTER <time> is in use: proves the (re)started forecasting service served it, not a cached one
 # (the operator sets the issue time only on a fresh response). An empty reference time never counts.
 fresh_forecast_after() {
@@ -288,7 +292,7 @@ read -r old_name old_uid <<<"$cur"
 k -n "$NS" delete pod "$old_name" --wait=true >/dev/null
 read -r _ _ ready_at <<<"$(wait_replacement forecaster "$old_uid")"
 [ -n "$ready_at" ] || die "no Ready replacement forecasting-service pod"
-wait_for 300 "a forecast from the restarted forecasting service is used" fresh_forecast_after "$ready_at"
+wait_for "$FRESH_FORECAST_TIMEOUT" "a forecast from the restarted forecasting service is used" fresh_forecast_after "$ready_at"
 pass "the model survives a forecasting-service restart (loaded from the volume, no retraining)"
 
 # 6. a query change refuses the old model until retrained
@@ -429,7 +433,7 @@ wait_for 300 "the forecasting service restarts on the new certificate" sh -c "
   [ \"\$n\" -gt '$restarts_before' ] && [ \"\$(kubectl --kubeconfig '$KCFG' --context 'kind-$CLUSTER' -n '$NS' get pod '$fc_name' -o jsonpath='{.status.containerStatuses[0].ready}')\" = true ]"
 rotated_at="$(k -n "$NS" get pod "$fc_name" -o jsonpath='{.status.conditions[?(@.type=="Ready")].lastTransitionTime}')"
 [ -n "$rotated_at" ] || die "no Ready time after the rotation"
-wait_for 420 "a forecast over the rotated certificate is used" fresh_forecast_after "$rotated_at"
+wait_for "$FRESH_FORECAST_TIMEOUT" "a forecast over the rotated certificate is used" fresh_forecast_after "$rotated_at"
 pass "authentication: no token 401, another audience $wrong_audience_status, another service account 403; forecasts flow after a certificate rotation"
 
 # 10. upgrade and uninstall retention
@@ -442,7 +446,7 @@ h upgrade pa "$ROOT/charts/predictive-autoscaler" -n "$NS" -f "$WORK/values.yaml
   --set-string forecaster.podAnnotations.smoke/upgrade=2 --wait --timeout 6m >/dev/null || die "helm upgrade"
 read -r _ _ ready_at <<<"$(wait_replacement forecaster "$old_uid")"
 [ -n "$ready_at" ] || die "no Ready replacement forecasting-service pod"     # dies if the pod was not replaced
-wait_for 300 "a forecast from the upgraded forecasting service is used" fresh_forecast_after "$ready_at"
+wait_for "$FRESH_FORECAST_TIMEOUT" "a forecast from the upgraded forecasting service is used" fresh_forecast_after "$ready_at"
 h uninstall pa -n "$NS" --wait >/dev/null || die "helm uninstall"
 k get crd "$crd" >/dev/null || die "uninstall deleted the CRD"
 k -n demo get pa web-pa >/dev/null || die "uninstall deleted the autoscaler"
