@@ -82,6 +82,23 @@ measured as a real zero and scales normally.
 | `WATCH_NAMESPACES` | all | Comma-separated namespaces to watch. |
 The forecasting service reads the endpoint from a differently named variable, `VICTORIA_METRICS_URL`; set both.
 
+## Forecasting service
+| Variable | Default | Purpose |
+|---|---|---|
+| `PROMETHEUS_URL` | the in-cluster VictoriaMetrics address | Prometheus-compatible query endpoint for the history. `VICTORIA_METRICS_URL` is still read as a deprecated fallback. |
+| `MODEL_DIR` | `/app/models/trained` | Model store (artifacts `lstm_<key>.pkl` + `.meta.json`). |
+| `COLD_START_CRONJOB` | unset | Without any compatible model at startup, create one Job from this CronJob. Unset = never (a local run or a test cannot create Jobs). |
+| `FORECAST_ADMISSION` / `FORECAST_INFERENCE_SLOTS` | `4` / `2` | Concurrent forecast jobs / concurrent inferences; beyond that the service answers 503. |
+| `ALLOW_BENCHMARK_EXPERIMENTS` | unset | Benchmark experiment arms (`SEASONAL_EXPERIMENT`, `ENSEMBLE_EXPERIMENT`) refuse to start without it; their answers never carry the product attestation. |
+
+The service never accepts a query or a history from a request. It reads the PredictiveAutoscaler named in the request
+and its target Deployment from the Kubernetes API, checks the generation, the UIDs, the query hash and the contract,
+and only then reads the history (168 h, 10-minute grid) with the compiled query. A refusal is 422 (provenance, no
+compatible model, an answer that is not one valid series, an incomplete input window); an outage is 503 (Kubernetes or
+metrics unreachable, at capacity). Models are keyed by namespace and name and carry their query hash, contract and
+autoscaler/target UIDs. **Models trained before this version are not loaded: retrain** (the training job must run
+once with the current version). `POST /train` is disabled (410): models come only from the training job.
+
 ## Operator flags
 | Flag | Default | Purpose |
 |---|---|---|

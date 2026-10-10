@@ -122,6 +122,14 @@ def load_record(path: Path, loader: Callable[[bytes], object] = _joblib_from_byt
                        meta=MappingProxyType(copy.deepcopy(meta)), artifact_sha256=digest)
 
 
+def _scaler_range(model) -> Optional[dict]:
+    scaler = getattr(model, "scaler", None)
+    try:
+        return {"center": float(scaler.center_[0]), "scale": float(scaler.scale_[0])}
+    except (AttributeError, IndexError, TypeError):
+        return None
+
+
 class ModelRegistry:
     """The service's loaded models, by key. Install replaces atomically; pin keeps a record alive while in use."""
 
@@ -175,7 +183,8 @@ class ModelRegistry:
         with self._lock:
             return [{"key": r.key, "namespace": r.namespace, "name": r.name, "metric": r.metric,
                      "artifact_sha256": r.artifact_sha256, "metric_query_sha256": r.meta.get("metric_query_sha256"),
-                     "trained_at": r.meta.get("trained_at")} for r in self._records.values()]
+                     "trained_at": r.meta.get("trained_at"), "provenance": copy.deepcopy(dict(r.meta)),
+                     "scaler_range": _scaler_range(r.model)} for r in self._records.values()]
 
     def __contains__(self, key: str) -> bool:
         with self._lock:
