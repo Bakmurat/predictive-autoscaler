@@ -1,0 +1,12 @@
+apiVersion: v2
+name: predictive-autoscaler
+description: Forecast-driven replica recommendations and scaling for Kubernetes Deployments (operator, forecasting service, trainer).
+type: application
+# The chart and the images are released together; the image tag defaults to appVersion.
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.33.0-0"
+home: https://github.com/Bakmurat/predictive-autoscaler
+sources:
+  - https://github.com/Bakmurat/predictive-autoscaler
+keywords: [autoscaling, forecasting, kubernetes-operator]

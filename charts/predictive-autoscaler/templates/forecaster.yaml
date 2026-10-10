@@ -1,0 +1,126 @@
+{{- $p := .Values.forecaster.persistence }}
+{{- if not $p.existingClaim }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "pa.modelsClaim" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "pa.labels" . | nindent 4 }}
+  {{- if $p.retain }}
+  annotations:
+    helm.sh/resource-policy: keep
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+  {{- end }}
+spec:
+  accessModes: [{{ $p.accessMode }}]
+  {{- with $p.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $p.size }}
+---
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pa.fullname" . }}-forecaster
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "pa.labels" . | nindent 4 }}
+    app.kubernetes.io/component: forecaster
+spec:
+  replicas: 1                # one writer of the model registry; the volume may be ReadWriteOnce
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {{- include "pa.selector" (list . "forecaster") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "pa.selector" (list . "forecaster") | nindent 8 }}
+      {{- with .Values.forecaster.podAnnotations }}
+      annotations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "pa.fullname" . }}-forecaster
+      securityContext: {{- include "pa.podSecurity" 10001 | nindent 8 }}
+      {{- with .Values.images.pullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: forecaster
+          image: {{ include "pa.image" (list . .Values.images.forecaster) }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          env:
+            {{- include "pa.pythonEnv" . | nindent 12 }}
+            - name: PROMETHEUS_URL
+              value: {{ required "prometheus.url is required" .Values.prometheus.url | quote }}
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            {{- if .Values.forecaster.auth.enabled }}
+            - name: FORECASTER_AUTH
+              value: tokenreview
+            - name: FORECASTER_AUTH_AUDIENCE
+              value: {{ .Values.forecaster.auth.audience | quote }}
+            - name: FORECASTER_AUTH_SUBJECTS
+              value: {{ include "pa.operatorSubject" . | quote }}
+            - name: FORECASTER_TLS_CERT
+              value: /etc/predictive-autoscaler/tls/tls.crt
+            - name: FORECASTER_TLS_KEY
+              value: /etc/predictive-autoscaler/tls/tls.key
+            {{- end }}
+          ports:
+            - {name: http, containerPort: {{ include "pa.forecasterPort" . }}}
+          startupProbe:
+            httpGet: {path: /health, port: http{{ if .Values.forecaster.auth.enabled }}, scheme: HTTPS{{ end }}}
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: {path: /health, port: http{{ if .Values.forecaster.auth.enabled }}, scheme: HTTPS{{ end }}}
+            periodSeconds: 60
+            timeoutSeconds: 30
+            failureThreshold: 8
+          readinessProbe:
+            httpGet: {path: /ready, port: http{{ if .Values.forecaster.auth.enabled }}, scheme: HTTPS{{ end }}}
+            periodSeconds: 10
+            timeoutSeconds: 10
+          securityContext: {{- include "pa.containerSecurity" . | nindent 12 }}
+          resources: {{- toYaml .Values.forecaster.resources | nindent 12 }}
+          volumeMounts:
+            - {name: models, mountPath: /models}
+            - {name: tmp, mountPath: /tmp}
+            {{- if .Values.forecaster.auth.enabled }}
+            - {name: tls, mountPath: /etc/predictive-autoscaler/tls, readOnly: true}
+            {{- end }}
+      volumes:
+        - name: models
+          persistentVolumeClaim: {claimName: {{ include "pa.modelsClaim" . | quote }}}
+        - name: tmp
+          emptyDir: {sizeLimit: {{ .Values.forecaster.tmpSizeLimit }}}
+        {{- if .Values.forecaster.auth.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ include "pa.forecasterTLSSecret" . }}
+            items: [{key: tls.crt, path: tls.crt}, {key: tls.key, path: tls.key}]
+        {{- end }}
+      {{- with .Values.forecaster.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.forecaster.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.forecaster.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pa.fullname" . }}-forecaster
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "pa.labels" . | nindent 4 }}
+    app.kubernetes.io/component: forecaster
+spec:
+  selector: {{- include "pa.selector" (list . "forecaster") | nindent 4 }}
+  ports:
+    - {name: http, port: {{ include "pa.forecasterPort" . }}, targetPort: http}

@@ -13,6 +13,7 @@ import (
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -89,6 +90,22 @@ func main() {
 		setupLog.Info("Restricting watches to namespaces", "namespaces", namespaces)
 	}
 	restConfig := ctrl.GetConfigOrDie()
+
+	// The CRD revision gate runs BEFORE the manager exists: ctrl.NewManager already binds the probe and metrics ports
+	// (so the gate's own probe server could not), and nothing may campaign for leadership or start a controller until
+	// the installed CRD is one this operator works with. Meanwhile the probes report alive and not ready. A direct,
+	// uncached client reads the CRD's metadata (found by the kind smoke test, 2026-10-10).
+	ctx := ctrl.SetupSignalHandler()
+	gateClient, err := client.New(restConfig, client.Options{Scheme: scheme})
+	if err != nil {
+		setupLog.Error(err, "unable to create the client for the CRD gate")
+		os.Exit(1)
+	}
+	if err := controllers.WaitForCRDRevision(ctx, gateClient, controllers.RequiredCRDRevision, probeAddr, setupLog); err != nil {
+		setupLog.Error(err, "stopped while waiting for a compatible CRD")
+		os.Exit(1)
+	}
+
 	mgr, err := ctrl.NewManager(restConfig, mgrOpts)
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
@@ -127,7 +144,7 @@ func main() {
 	}
 
 	setupLog.Info("starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(ctx); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}

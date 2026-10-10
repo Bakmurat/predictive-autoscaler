@@ -1,0 +1,99 @@
+# Defaults for the predictive-autoscaler chart. values.schema.json validates every key. See docs/helm.md.
+
+images:
+  operator:
+    repository: ghcr.io/bakmurat/predictive-autoscaler-operator
+    tag: ""        # default: the chart's appVersion
+    digest: ""     # sha256:... ; preferred over the tag when set
+  forecaster:      # the forecasting service; the trainer runs the same image
+    repository: ghcr.io/bakmurat/predictive-autoscaler-ml-api
+    tag: ""
+    digest: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []  # [{name: regcred}]
+
+# The Prometheus-compatible query API (Prometheus, VictoriaMetrics vmselect, Thanos Query, ...): required.
+# Example: http://prometheus-server.monitoring.svc.cluster.local:80
+prometheus:
+  url: ""
+
+operator:
+  replicas: 1                # more replicas only add standby leaders (leader election is always on)
+  watchNamespaces: []        # empty: every namespace
+  forecastLedger:            # the append-only forecast/decision evidence log; off by default
+    enabled: false
+    persistence:
+      existingClaim: ""      # empty: an emptyDir (lost on restart); a claim needs replicas: 1 (the chart uses Recreate)
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+    limits: {memory: 256Mi}
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+forecaster:
+  # Only the operator may call the forecasting service: its projected service account token, checked with TokenReview,
+  # over TLS. Off: plain HTTP, and the NetworkPolicies are the only boundary.
+  auth:
+    enabled: true
+    audience: predictive-autoscaler-forecaster
+  tls:
+    source: selfSigned       # selfSigned (plain Helm; kept with lookup) | certManager | existingSecret (Argo CD: not selfSigned)
+    existingSecret: ""       # a Secret with tls.crt, tls.key and ca.crt
+    certManager:
+      issuerRef: {name: "", kind: Issuer}   # the Issuer's CA must end up in the Secret's ca.crt
+      duration: 2160h
+      renewBefore: 360h
+    selfSigned:
+      validityDays: 365      # renewal: delete the Secret, then helm upgrade
+  resources:
+    requests: {cpu: 500m, memory: 1Gi}
+    limits: {memory: 4Gi}
+  persistence:               # the model volume, shared with the trainer
+    existingClaim: ""        # a claim managed outside the chart: ReadWriteOnce or ReadWriteMany, never ReadWriteOncePod
+    storageClass: ""         # empty: the cluster default
+    size: 5Gi
+    accessMode: ReadWriteOnce  # ReadWriteMany removes the need to schedule the trainer next to the forecaster
+    retain: true             # keep the chart-created claim when the release (or its Argo CD Application) is deleted
+  tmpSizeLimit: 2Gi
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+training:
+  # One CronJob per autoscaler to train for: {namespace, name, schedule}. Empty: no training (Recommend mode still
+  # reports reactive recommendations).
+  targets: []
+  hours: 168                 # history per training (the model needs about a week)
+  epochs: null               # training epochs; null: the trainer's default
+  activeDeadlineSeconds: 3600
+  resources:
+    requests: {cpu: 300m, memory: 2Gi}
+    limits: {memory: 6Gi}
+  nodeSelector: {}
+  tolerations: []
+
+networkPolicy:
+  enabled: true              # needs a CNI that enforces NetworkPolicy
+  dns:
+    namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+    podSelector: {matchLabels: {k8s-app: kube-dns}}
+  kubeAPI:
+    cidrs: []                # empty: any address on the ports below (weak; set the API server's addresses)
+    ports: [443, 6443]
+  # Where Prometheus is: at least one selector or ipBlock is required when networkPolicy.enabled.
+  prometheus:
+    namespaceSelector: {}
+    podSelector: {}
+    ipBlocks: []             # ["10.0.0.0/8"]
+    ports: [9090]
+  metricsFrom: []            # peers allowed to scrape the metrics ports: [{namespaceSelector: {...}, podSelector: {...}}]
+
+metrics:
+  serviceMonitor: {enabled: false, interval: 30s}   # Prometheus Operator
+  vmServiceScrape: {enabled: false, interval: 30s}  # VictoriaMetrics Operator
+
+nameOverride: ""
+fullnameOverride: ""

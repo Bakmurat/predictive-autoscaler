@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Generated code from the API types' kubebuilder markers: the CRD (k8s-manifests/base/01-crd.yaml) and the deepcopy
-# functions (k8s-operator/api/v1alpha1/zz_generated.deepcopy.go). Neither is edited by hand.
+# Generated code from the API types' kubebuilder markers: the CRD (k8s-manifests/base/01-crd.yaml and the chart's
+# crds/) and the deepcopy functions (k8s-operator/api/v1alpha1/zz_generated.deepcopy.go). None is edited by hand.
 #
 #   scripts/gen-manifests.sh write   regenerate both in place (make manifests)
 #   scripts/gen-manifests.sh check   fail when either differs from what the markers generate (make manifests-check, CI)
@@ -11,6 +11,7 @@ set -euo pipefail
 CONTROLLER_GEN_VERSION="${CONTROLLER_GEN_VERSION:-v0.20.1}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CRD_OUT="$ROOT/k8s-manifests/base/01-crd.yaml"
+CHART_CRD="$ROOT/charts/predictive-autoscaler/crds/predictiveautoscalers.autoscaling.devkuban.com.yaml"
 DEEPCOPY="api/v1alpha1/zz_generated.deepcopy.go"
 mode="${1:-}"
 case "$mode" in write|check) ;; *) echo "usage: $0 write|check" >&2; exit 2 ;; esac
@@ -38,12 +39,14 @@ crds=("$work"/crd/*.yaml)
 
 if [ "$mode" = write ]; then
   cp "$work/01-crd.yaml" "$CRD_OUT"
+  cp "$work/01-crd.yaml" "$CHART_CRD"
   cp "$work/op/$DEEPCOPY" "$ROOT/k8s-operator/$DEEPCOPY"
-  echo "gen-manifests: wrote k8s-manifests/base/01-crd.yaml and k8s-operator/$DEEPCOPY"
+  echo "gen-manifests: wrote k8s-manifests/base/01-crd.yaml, the chart's CRD and k8s-operator/$DEEPCOPY"
   exit 0
 fi
 rc=0
 diff -u "$CRD_OUT" "$work/01-crd.yaml" || { echo "gen-manifests: 01-crd.yaml is not what the markers generate" >&2; rc=1; }
+diff -u "$CHART_CRD" "$work/01-crd.yaml" || { echo "gen-manifests: the chart's CRD is not what the markers generate" >&2; rc=1; }
 diff -u "$ROOT/k8s-operator/$DEEPCOPY" "$work/op/$DEEPCOPY" || { echo "gen-manifests: $DEEPCOPY is stale" >&2; rc=1; }
 [ "$rc" -eq 0 ] && echo "gen-manifests: generated code is current"
 [ "$rc" -eq 0 ] || echo "gen-manifests: run 'make manifests' and commit the result" >&2

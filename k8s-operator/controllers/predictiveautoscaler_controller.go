@@ -110,6 +110,18 @@ type PredictiveAutoscalerReconciler struct {
 	// Discovery is an uncached discovery client: optional APIs (KEDA, VPA) count as absent only when a fresh discovery
 	// shows they are not served. nil (tests) treats them as served.
 	Discovery APIDiscovery
+	// MLAPI reaches the forecasting service (token, TLS, no redirects); nil builds one from the environment on first use.
+	MLAPI     *mlAPIClient
+	mlAPIOnce sync.Once
+}
+
+func (r *PredictiveAutoscalerReconciler) mlAPI() *mlAPIClient {
+	r.mlAPIOnce.Do(func() {
+		if r.MLAPI == nil {
+			r.MLAPI = newMLAPIClientFromEnv(mlAPITimeout)
+		}
+	})
+	return r.MLAPI
 }
 
 func (r *PredictiveAutoscalerReconciler) reader() client.Reader {
@@ -222,6 +234,7 @@ type VMInstantQueryResponse struct {
 //+kubebuilder:rbac:groups=keda.sh,resources=scaledobjects,verbs=get;list;watch
 //+kubebuilder:rbac:groups=autoscaling.k8s.io,resources=verticalpodautoscalers,verbs=get;list;watch
 //+kubebuilder:rbac:groups=autoscaler.example.com,resources=predictiveautoscalers,verbs=get;list;watch
+//+kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,resourceNames=predictiveautoscalers.autoscaling.devkuban.com,verbs=get
 
 // Reconcile is the unified scaling loop. On every cycle (default 60s):
 // 1. Get ML predictions (cached 5 min) → predicted replicas within lead-time window
@@ -336,7 +349,8 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	if !forecasting {
 		log.V(1).Info("Forecasting disabled for this autoscaler; reactive rule only")
 	} else if predErr != nil {
-		log.Info("Prediction unavailable, using reactive only", "error", predErr.Error())
+		dec.ForecastStatus = forecastFailureStatus(predErr)
+		log.Info("Prediction unavailable, using reactive only", "error", predErr.Error(), "status", dec.ForecastStatus)
 	} else if prediction != nil {
 		var usable bool
 		var det predictedDetail
@@ -920,9 +934,10 @@ func (r *PredictiveAutoscalerReconciler) getCachedPredictionObserved(
 	// Fetch fresh prediction from ML API
 	prediction, err := r.getPredictionObserved(ctx, autoscaler, lookup)
 	if err != nil {
-		if isForecastRefusal(err) {
-			// The API refused the request as invalid input (for example its freshness guard: the
-			// latest observation is missing or too old). That is not a transport failure: a
+		var cfg *mlAPIConfigError
+		if isForecastRefusal(err) || stderrors.As(err, &cfg) {
+			// The API refused the request (invalid input, for example its freshness guard, or an authentication
+			// refusal), or the client could not send it (missing token or CA). That is not a transport failure: a
 			// cached forecast must not stand in for it. Drop the cache → reactive only.
 			delete(r.predictionCache, key)
 			lookup.returned(nil, "unavailable", "delete")
@@ -1216,18 +1231,18 @@ func (r *PredictiveAutoscalerReconciler) getPredictionObserved(
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	// Call ML API (120s timeout to allow for LSTM training on first call)
-	httpClient := &http.Client{Timeout: mlAPITimeout}
+	// Call ML API (bounded by mlAPITimeout; authenticated and over TLS when configured, see mlapi_client.go)
 	completion, started := r.beginForecastAttempt(lookup, jsonData)
 	// The closure's normal return is the one completion boundary. Panic/termination
 	// leaves only the start; no deferred success is fabricated.
 	prediction, callErr := func() (*MLPredictionResponse, error) {
-		resp, err := httpClient.Post(
-			fmt.Sprintf("%s/predict", mlAPIURL),
-			"application/json",
-			bytes.NewBuffer(jsonData),
-		)
+		resp, err := r.mlAPI().post(ctx, fmt.Sprintf("%s/predict", mlAPIURL), jsonData)
 		if err != nil {
+			var cfg *mlAPIConfigError
+			if stderrors.As(err, &cfg) {
+				completion.failure("auth_misconfigured", "configuration", "request", err)
+				return nil, err
+			}
 			completion.failure("transport_error", "transport", "request", err)
 			return nil, fmt.Errorf("failed to call ML API: %w", err)
 		}
@@ -1239,11 +1254,19 @@ func (r *PredictiveAutoscalerReconciler) getPredictionObserved(
 		if resp.StatusCode != http.StatusOK {
 			body, bodyErr := io.ReadAll(resp.Body)
 			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-				completion.failure("http_refusal", "http_status", "response_body", bodyErr)
+				kind := "http_refusal"
+				if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+					kind = "auth_refused"
+				}
+				completion.failure(kind, "http_status", "response_body", bodyErr)
 				return nil, &forecastRefusedError{status: resp.StatusCode, body: string(body)}
 			}
-			completion.failure("http_error", "http_status", "response_body", bodyErr)
-			return nil, fmt.Errorf("ML API returned status %d: %s", resp.StatusCode, string(body))
+			kind := "http_error"
+			if resp.StatusCode == http.StatusServiceUnavailable && strings.Contains(string(body), "AuthUnavailable") {
+				kind = "auth_unavailable"
+			}
+			completion.failure(kind, "http_status", "response_body", bodyErr)
+			return nil, &forecastServerError{status: resp.StatusCode, body: string(body)}
 		}
 
 		var prediction MLPredictionResponse
@@ -1341,7 +1364,9 @@ type statusInputs struct {
 }
 
 var forecastReasons = map[string]string{"disabled": "Disabled", "unavailable": "Unavailable",
-	"horizon_elapsed": "HorizonElapsed", "sanity_rejected": "SanityRejected"}
+	"horizon_elapsed": "HorizonElapsed", "sanity_rejected": "SanityRejected",
+	"unauthorized": "Unauthorized", "forbidden": "Forbidden", "auth_unavailable": "AuthUnavailable",
+	"auth_misconfigured": "AuthMisconfigured"}
 
 // updateStatus writes the status when it changed: replica counts, mode, observedGeneration and the conditions Ready,
 // TelemetryAvailable, ForecastAvailable and ScalingActive (transition times preserved). Events are emitted on

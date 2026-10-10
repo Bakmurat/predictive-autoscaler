@@ -6,7 +6,7 @@
 | **Operator** (Go, controller-runtime) | Watches `PredictiveAutoscaler` objects; every reconcile reads the current request rate, asks the forecasting service for a forecast, combines both and sets the target Deployment's replica count. Appends one JSON line per decision (and per forecast attempt) to an optional ledger (`FORECAST_LOG`). | `k8s-operator/` |
 | **Forecasting service** (`ml-api`, Python/FastAPI) | Serves forecasts for the next hour in six 10-minute steps from the trained model blended with the seven-day pattern; refuses when its input window is not complete enough. | `ml-engine/api/` |
 | **Trainer** (CronJob) | Every six hours trains a model for one workload from the last seven days of request rate and writes it, with a provenance sidecar, to the model volume; the service reloads it. | `ml-engine/training/`, `k8s-manifests/base/10-training-cronjob.yaml` |
-| **Metrics store** (yours) | Prometheus-compatible endpoint holding Istio request metrics; read by all three. | — |
+| **Metrics store** (yours) | Prometheus-compatible endpoint holding the workload request counter; read by all three. | — |
 
 ## One decision
 1. **Reactive:** current request rate (req/min) → `ceil(rate / per-pod capacity)`.

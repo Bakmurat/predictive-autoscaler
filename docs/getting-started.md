@@ -1,100 +1,134 @@
-# Getting started (current version: build and install from source)
+# Getting started
 
-There are no published images, Helm chart or releases yet; a chart and a kind quickstart are planned. This guide installs
-the current version from source. Read `limitations.md` first. In `Active` mode the operator refuses to scale while another autoscaler targets the same
-Deployment (`coexistence.md`).
+For a disposable local installation, start with the [kind quickstart](../quickstart/README.md). It builds images,
+installs the Helm chart with TLS and authentication, and verifies recommendations against real demo requests.
+An optional synthetic history demonstrates training and forecasts without waiting a week.
 
-## 1. Prerequisites
-- A Kubernetes cluster and `kubectl` pointed at it explicitly (`kubectl config current-context`); try it on a disposable
-  cluster first.
-- The Deployment you want to scale already exists, in its own namespace, and receives traffic.
-- **Istio** sidecars on the workload you want to scale (the request-rate signal is
-  `istio_requests_total{reporter="destination"}`).
-- A **Prometheus-compatible query endpoint** that stores those Istio metrics (Prometheus or VictoriaMetrics), with at
-  least 7 days of retention once you want trained forecasts.
-- A storage class for two small ReadWriteOnce volumes (models, forecast ledger).
-- Optional: the VictoriaMetrics operator. The base includes `11-vmservicescrapes.yaml` (VMServiceScrape objects), which
-  fails to apply without its CRDs; remove it from `k8s-manifests/base/kustomization.yaml` if you scrape another way.
+For your own workload, use the source Helm chart below. Release images and a published chart are not available yet.
+Use an explicit kubeconfig and context for every command, and start on a test cluster.
 
-## 2. Build and push the images
+## 1. Prepare metrics and images
+
+You need Kubernetes 1.33–1.35, Helm, a Deployment, a default storage class supporting ReadWriteOnce and filesystem
+`flock`, and a Prometheus-compatible endpoint holding the workload's request counter. Istio is needed only for the
+`istio` source preset; a custom `prometheus` query works without a service mesh. KEDA is optional.
+
 ```sh
-docker build -t <registry>/predictive-autoscaler-ml-api:dev ml-engine
 docker build -t <registry>/predictive-autoscaler-operator:dev k8s-operator
-docker push <registry>/predictive-autoscaler-ml-api:dev
+docker build -t <registry>/predictive-autoscaler-ml-api:dev ml-engine
 docker push <registry>/predictive-autoscaler-operator:dev
+docker push <registry>/predictive-autoscaler-ml-api:dev
 ```
 
-## 3. Configure the base (`k8s-manifests/base`)
-| File | Change |
-|---|---|
-| `kustomization.yaml` | `images:` → your two images (example below). The ml-api entry covers the API and the trainer. |
-| `02-configmap-victoriametrics.yaml` | `victoria_metrics_url` → your query endpoint (read by the forecasting API and the trainer). |
-| `09-operator-deployment.yaml` | `VICTORIAMETRICS_URL` → the same endpoint (the operator does not read the ConfigMap). |
-| `10-training-cronjob.yaml` | `TRAINING_TARGET` → `<namespace>/<PredictiveAutoscaler>` to train for (one per CronJob). The model is trained on exactly that autoscaler's compiled request-rate query, so create the PredictiveAutoscaler first and let the operator publish its `status.metricSource`. |
-| `03-pvc.yaml`, `12-forecast-log-pvc.yaml` | `storageClassName` for your cluster. |
+Build for your nodes' architecture. The trainer and forecasting service use the same image. The quickstart loads
+local images into kind and requires no registry.
 
-Image overrides keep the original `name` as the key and set `newName`/`newTag`:
+## 2. Install the chart
+
+Create `my-values.yaml`, replacing the registry, metrics address and network selectors with your own:
+
 ```yaml
 images:
-  - name: registry.example.com/predictive-autoscaler/predictive-autoscaler-ml-api
-    newName: <registry>/predictive-autoscaler-ml-api
-    newTag: dev
-  - name: registry.example.com/predictive-autoscaler/predictive-autoscaler-operator
-    newName: <registry>/predictive-autoscaler-operator
-    newTag: dev
-```
-Apply and check that everything came up:
-```sh
-kubectl apply -k k8s-manifests/base
-kubectl wait --for=condition=Established crd/predictiveautoscalers.autoscaling.devkuban.com --timeout=60s
-kubectl -n ml-engine rollout status deploy/ml-api --timeout=300s
-kubectl -n ml-engine rollout status deploy/predictive-operator --timeout=120s
+  operator: {repository: <registry>/predictive-autoscaler-operator, tag: dev}
+  forecaster: {repository: <registry>/predictive-autoscaler-ml-api, tag: dev}
+prometheus:
+  url: http://prometheus-server.monitoring.svc:9090
+networkPolicy:
+  prometheus:
+    namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: monitoring}}
+    podSelector: {matchLabels: {app: prometheus}}
+    ports: [9090]
+training:
+  targets:
+    - {namespace: shop, name: web-pa, schedule: "0 */6 * * *"}
 ```
 
-## 4. Create a PredictiveAutoscaler
-Start from `k8s-operator/config/samples/autoscaler_v1alpha1_predictiveautoscaler.yaml`.
-- A new autoscaler runs in **Recommend** mode: it computes and shows the replica count it would set
-  (`kubectl get pa`: Calculated) without changing the Deployment. Watch it for a while, then set `mode: Active` to let it
-  scale.
-- Set `metrics.requests.enabled: true` and `targetRPS` (requests per second one pod should handle).
-- Choose the request-rate source: the default `istio` preset, or a `prometheus` query (`configuration.md`).
-- Set `leadTimeMinutes` and `updateIntervalSeconds` explicitly: the CRD defaults are 15 and 300.
-```sh
-kubectl apply -f my-autoscaler.yaml
-kubectl get pa -A
-# The operator compiles the query and publishes it; training and forecasts use exactly this one.
-kubectl -n <namespace> get pa <name> -o jsonpath='{.status.metricSource}{"\n"}'
-```
-Wait until `status.metricSource` is present, with `observedGeneration` equal to the object's `metadata.generation`.
-Until a model exists, the forecasting service answers 422 (`ModelUnavailable`). Meanwhile the operator computes a
-reactive recommendation from the current request rate; in Active mode it scales on that recommendation.
+The chart separates service accounts and permissions, uses non-root containers and NetworkPolicies, and protects the
+forecasting API with TokenReview over TLS. The default self-signed certificate is for plain Helm; Argo CD needs
+cert-manager or an existing TLS Secret. Tighten the Kubernetes API egress addresses for your cluster. See
+[Helm configuration](helm.md), including storage and CRD upgrade requirements.
 
-## 5. Train a first model
-Point the training CronJob at the autoscaler (`TRAINING_TARGET=<namespace>/<name>` in `10-training-cronjob.yaml`).
-Training needs history in the metrics store; the scheduled CronJob uses the last 7 days. To train now:
 ```sh
-kubectl -n ml-engine create job first-training --from=cronjob/ml-training
-kubectl -n ml-engine logs -f job/first-training
+helm --kubeconfig <file> --kube-context <context> install pa charts/predictive-autoscaler \
+  -n predictive-autoscaler --create-namespace -f my-values.yaml --wait --timeout 6m
 ```
-- A successful run ends with a JSON line containing `"status": "success"` and the published `artifact_sha256`, and the
-  API logs `Loaded model <namespace>/<name>` shortly after.
-- With too little history, the run stops with `insufficient history: have N of M ten-minute points` and publishes
-  nothing; that is expected on a new cluster.
-- After you change the autoscaler's metric source, train again: a model trained on another query is never served.
 
-## 6. Stop or remove
-**Stop scaling one workload** (its replica count stays where it is):
-```sh
-kubectl -n <namespace> delete pa <name>
+## 3. Create an autoscaler in Recommend mode
+
+For an application exporting `http_requests_total` with `namespace` and `service` labels:
+
+```yaml
+apiVersion: autoscaling.devkuban.com/v1alpha1
+kind: PredictiveAutoscaler
+metadata: {name: web-pa, namespace: shop}
+spec:
+  mode: Recommend
+  targetDeployment: {name: web, namespace: shop}
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    requests:
+      enabled: true
+      targetRPS: 100
+      source:
+        preset: prometheus
+        query: 'sum(rate(http_requests_total{namespace="{{ .Namespace }}",service="{{ .Name }}"}[2m]))'
+  prediction: {enabled: true, leadTimeMinutes: 15, horizonMinutes: 60, updateIntervalSeconds: 60}
 ```
-**Remove this installation** but keep the CRD (other installations or your CRs elsewhere may use it): delete the CRs you
-created, then the components:
+
+Adapt the metric and labels to your scrape. The query must return exactly one finite, non-negative series, in
+**requests per second for this Deployment**. `{{ .Name }}` is the Deployment name: use the actual Service label if it
+differs. Choose `targetRPS` from a load test of one pod at acceptable latency; 100 above is an example, not measured
+capacity. [Configuration](configuration.md) explains templates, units and nested defaults.
+
 ```sh
-kubectl -n ml-engine delete deploy/predictive-operator deploy/ml-api cronjob/ml-training svc/ml-api-service
-kubectl delete clusterrolebinding predictive-operator-binding
-kubectl delete clusterrole predictive-operator-role
-kubectl -n ml-engine delete pvc ml-models-pvc forecast-log-pvc   # trained models and the ledger; see your reclaim policy
+kubectl --kubeconfig <file> --context <context> apply -f my-autoscaler.yaml
+kubectl --kubeconfig <file> --context <context> -n shop get pa web-pa -o yaml
 ```
-**Complete teardown — disposable clusters only.** `kubectl delete -k k8s-manifests/base` also deletes the CRD, which
-deletes **every** PredictiveAutoscaler in the cluster, and the whole `ml-engine` namespace with its PVCs. Whether the
-volumes' data survives depends on the StorageClass reclaim policy (`Delete` loses it).
+
+Wait for current-generation `Ready=True` and `TelemetryAvailable=True`, and `status.metricSource` with
+`observedGeneration` matching `metadata.generation`. Recommend publishes `calculatedReplicas` without changing the
+Deployment. Before training, `ForecastAvailable=False` / model unavailable is expected: recommendations are reactive.
+Missing telemetry holds the replica count; it is not interpreted as zero traffic.
+
+## 4. Train and verify a forecast
+
+Training requires roughly a week of usable history and a complete recent inference window. Merely waiting for the
+first CronJob does not create that history. With insufficient history training publishes nothing and reactive
+recommendations continue. The chart schedules one CronJob per `training.targets` entry; its annotation
+`autoscaling.devkuban.com/training-target` identifies the target.
+
+```sh
+kubectl --kubeconfig <file> --context <context> -n predictive-autoscaler get cronjobs \
+  -o custom-columns='NAME:.metadata.name,TARGET:.metadata.annotations.autoscaling\.devkuban\.com/training-target'
+kubectl --kubeconfig <file> --context <context> -n predictive-autoscaler create job first-training \
+  --from=cronjob/<matching-cronjob>
+kubectl --kubeconfig <file> --context <context> -n predictive-autoscaler wait \
+  --for=condition=complete job/first-training --timeout=30m
+kubectl --kubeconfig <file> --context <context> -n predictive-autoscaler logs job/first-training
+```
+
+A successful training log ends with `"status": "success"` and an `artifact_sha256`. Verify current-generation
+`ForecastAvailable=True`, a recent `status.lastPrediction`, and `status.forecastReplicas`. A changed query, autoscaler
+UID or target UID requires retraining; incompatible models are refused. See [upgrading](upgrading.md) for compatibility
+and rollback boundaries. The [limitations](limitations.md) describe the experimental neural model and storage limits.
+
+## 5. Enable scaling, then stop
+
+Review recommendations and [coexistence](coexistence.md) first. Remove or correctly pause other replica writers,
+including GitOps applying a fixed replica count. Active mode refuses a detected conflicting scaler.
+
+```sh
+kubectl --kubeconfig <file> --context <context> -n shop patch pa web-pa \
+  --type merge -p '{"spec":{"mode":"Active"}}'
+# Check ScalingActive, current/stabilized/applied replicas and the Deployment's ready replicas.
+kubectl --kubeconfig <file> --context <context> -n shop get pa/web-pa deploy/web
+# Stop writes and retain the current replica count:
+kubectl --kubeconfig <file> --context <context> -n shop patch pa web-pa \
+  --type merge -p '{"spec":{"mode":"Recommend"}}'
+```
+
+To remove the installation, stop scaling first, then `helm uninstall pa` with the same explicit kubeconfig, context
+and namespace. Helm retains the CRD, PredictiveAutoscalers and model PVC by default. Delete your own autoscaler objects
+separately when no longer needed. Delete retained model data only intentionally; never delete the CRD as routine
+uninstall, because doing so deletes every PredictiveAutoscaler in the cluster.

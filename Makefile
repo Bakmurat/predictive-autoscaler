@@ -1,5 +1,5 @@
 # Publication is gated on `make verify` returning 0. See scripts/verify.sh and README "Testing".
-.PHONY: setup verify verify-selftest verify-python verify-go precommit-selftest envtest manifests manifests-check
+.PHONY: setup verify verify-selftest verify-python verify-go precommit-selftest envtest manifests manifests-check chart-check smoke quickstart
 
 setup:
 	@git config core.hooksPath .githooks
@@ -23,6 +23,19 @@ manifests:
 
 manifests-check:
 	@scripts/gen-manifests.sh check
+
+# The chart's static checks (helm lint/template, kubeconform for Kubernetes 1.33-1.35); needs helm and kubeconform.
+chart-check:
+	@scripts/chart-check.sh
+
+# The install smoke test on a throwaway kind cluster (its own kubeconfig; never another cluster). Needs docker, kind,
+# kubectl, helm. KEEP=1 keeps the cluster; OPERATOR_IMAGE/FORECASTER_IMAGE skip the image builds.
+smoke:
+	@hack/smoke-kind.sh
+
+# The newcomer path: Recommend mode with actual HTTP request telemetry on its own kind cluster.
+quickstart:
+	@quickstart/kind.sh up
 
 precommit-selftest:
 	@scripts/precommit-selftest.sh

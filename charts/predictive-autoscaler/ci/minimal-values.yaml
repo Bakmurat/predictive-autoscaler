@@ -1,0 +1,7 @@
+# The smallest install: no policies (a CNI that ignores them), no training yet.
+prometheus:
+  url: http://prometheus:9090
+networkPolicy:
+  enabled: false
+forecaster:
+  auth: {enabled: false}

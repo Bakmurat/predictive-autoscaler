@@ -1,0 +1,33 @@
+# Every option set.
+images:
+  operator: {repository: registry.example.com/pa/operator, digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"}
+  forecaster: {repository: registry.example.com/pa/ml-api, tag: "0.1.0-rc1"}
+  pullPolicy: Always
+  pullSecrets: [{name: regcred}]
+prometheus:
+  url: https://vmselect.monitoring.svc:8481/select/0/prometheus
+operator:
+  replicas: 1
+  watchNamespaces: [shop, payments]
+  forecastLedger: {enabled: true, persistence: {existingClaim: pa-ledger}}
+  podAnnotations: {example.com/team: platform}
+  nodeSelector: {kubernetes.io/os: linux}
+forecaster:
+  tls: {source: certManager, certManager: {issuerRef: {name: cluster-ca, kind: ClusterIssuer}}}
+  persistence: {storageClass: fast, size: 20Gi, accessMode: ReadWriteMany, retain: false}
+  tmpSizeLimit: 4Gi
+training:
+  targets:
+    - {namespace: shop, name: web-pa, schedule: "15 */6 * * *"}
+  hours: 336
+  activeDeadlineSeconds: 7200
+networkPolicy:
+  kubeAPI: {cidrs: ["10.43.0.1/32"], ports: [443]}
+  prometheus:
+    ipBlocks: ["10.0.0.0/8"]
+    ports: [8481]
+  metricsFrom:
+    - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: monitoring}}
+metrics:
+  serviceMonitor: {enabled: true, interval: 60s}
+  vmServiceScrape: {enabled: true}
