@@ -1,4 +1,4 @@
-"""deploy/prodcluster/collect_load_evidence.py v8: server-side gate, inventory since a declared start, verified snapshots.
+"""deploy/prodcluster/collect_load_evidence.py v9: server-side gate, inventory since a declared start, verified snapshots.
 
 Fixture timing follows prodcluster measurements (2026-10-05): k6 pushes every 10 s (k6_vus at x.475 s, a changed
 counter stamped with its latest event); Envoy targets scraped every 30 s with `up` and every series sharing the scrape
@@ -310,6 +310,8 @@ class FakeVM:
                     out.append((lab, pts, stale))
                     if o.get("dup_start") and name == "kube_pod_start_time" and p.endswith("p1"):
                         out.append(({"pod": p, "container": "istio-proxy", "uid": "other"}, pts, []))
+            if name == "kube_pod_container_state_started" and o.get("proxy_history"):
+                out = [x for e in out for x in self.proxy_history(e, arm_pods)]
             return out
         if name == "up":
             out = []
@@ -372,6 +374,33 @@ class FakeVM:
             return []
         raise AssertionError(sel)
 
+    def proxy_history(self, entry, arm_pods):
+        """v9 cases: the 2026-10-12 reboot restarted the istio-proxy container in place (an older start before sw) and gave
+        kube-state-metrics a new address (instance), so a pod that lived across it can have two start series."""
+        lab, pts, stale = entry
+        suffix, mode = self.o["proxy_history"]
+        if not lab["pod"].endswith(suffix):
+            return [entry]
+        d = arm_pods[lab["pod"]]
+        sw, old = d["start"] + 600, d["start"] + 2 - 5000
+        a, b = dict(lab, instance="10.42.12.226:8080"), dict(lab, instance="10.42.12.132:8080")
+        before, after = [(t, v) for t, v in pts if t < sw], [(t, v) for t, v in pts if t >= sw]
+        if mode == "moved":                        # new KSM address, same container
+            return [x for x in ((a, before, []), (b, after, stale)) if x[1]]
+        if mode == "restarted":                    # same KSM address, in-place container restart
+            return [(lab, [(t, old) for t, _ in before] + after, stale)]
+        if mode == "both":                         # the 2026-10-12 case
+            return [x for x in ((a, [(t, old) for t, _ in before], []), (b, after, stale)) if x[1]]
+        if mode == "overlap":                      # a stale series keeps reporting the old start
+            return [(a, [(t, old) for t, _ in pts], []), (b, after, stale)]
+        if mode == "other_label":                  # differs beyond the scrape address
+            return [x for x in ((a, before, []), (dict(b, uid="other"), after, stale)) if x[1]]
+        if mode == "after_capture":                # the start moves after the capture
+            return [(lab, [(t, v + (60 if t > d["snap"] else 0)) for t, v in pts], stale)]
+        if mode == "silent":                       # no observation within KSM_GAP before the capture
+            return [(lab, [(t, v) for t, v in pts if t < d["snap"] - cle.KSM_GAP - 1], stale)]
+        raise AssertionError(mode)
+
     def instant(self, query, t):
         app = self.app_of(query)
         if query.startswith("count by (pod) (count_over_time("):
@@ -409,7 +438,7 @@ def test_healthy_hour_passes_and_qualifies_only_with_the_recorded_approval():
     assert early["status"] == "PASS" and not early["qualification"]["qualifies"] and not early["maturity"]["finalized"]
     missed = run(FakeVM(), now=T1 + cle.FINAL_AFTER + 3600 + 60)   # after the sixth window: not finalized
     assert not missed["qualification"]["qualifies"] and not missed["maturity"]["finalized"]
-    assert r["failed"] == [0, 0] and r["dropped"] == [0, 0] and r["collector"].endswith("v8")
+    assert r["failed"] == [0, 0] and r["dropped"] == [0, 0] and r["collector"].endswith("v9")
     assert r["observed"][0] <= r["planned"] <= r["observed"][1] and r["p95_server_ms_interior"] is not None
     q = run(FakeVM(), approvals={}, now=FINAL_NOW)["qualification"]
     assert not q["qualifies"] and q["pending_user_approval"] == ["A1'"]
@@ -632,3 +661,46 @@ def test_snapshot_pod_restart_bracket_ends_at_its_capture():
     # live 11:00Z: the last scrape of a terminating pod followed kube-state-metrics' last sample by under a second
     r = run(FakeVM(scaled_down="snapshot", ksm_ends_before_last_scrape=True))
     assert r["status"] == "PASS" and r["final_snapshots_in_hour"] == ["nginx-test-aaaa1111-p3"], r
+
+
+# ---------- v9: snapshot bound to the istio-proxy incarnation at its capture (2026-10-13) ----------
+
+def ksm(pts, instance="10.42.12.132:8080", **extra):
+    return (dict({"pod": "x", "container": "istio-proxy", "instance": instance}, **extra), pts, [])
+
+
+def test_v9_proxy_start_at_capture_pure():
+    c = T0 + 1815.0
+    obs = [(t, T0 - 100.0) for t in grid(T0 - 300, T0 + 1830, 20, 0.486)]
+    assert cle.proxy_start_at_capture([ksm(obs)], c, "x") == T0 - 100.0
+    old = [(t, T0 - 9000.0) for t in grid(T0 - 2000, T0 - 600, 20, 0.486)]
+    assert cle.proxy_start_at_capture([ksm(old, "10.42.12.226:8080"), ksm(obs)], c, "x") == T0 - 100.0   # moved + restarted
+    assert cle.proxy_start_at_capture([ksm(old + obs)], c, "x") == T0 - 100.0                           # restarted in place
+    bad = [
+        [],                                                                          # nothing observed
+        [ksm(old + [(t, T0 - 9000.0) for t, _ in obs], "10.42.12.226:8080"), ksm(obs)],   # stale series overlaps
+        [ksm(obs), ksm([(obs[5][0], T0 - 50.0)], "10.42.12.226:8080")],             # two values at one timestamp
+        [ksm(old, "10.42.12.226:8080"), ksm(obs, uid="other")],                     # differs beyond the KSM address
+        [ksm([(t, v + (60 if t > c else 0)) for t, v in obs])],                     # changes after the capture
+        [ksm([(t, v) for t, v in obs if t < c - cle.KSM_GAP - 1])],                 # silent before the capture
+        [ksm(obs + [(T0 + 1900.486, T0 - 9000.0)])],                                  # moves backwards after the capture
+    ]
+    for series in bad:
+        with pytest.raises(cle.Incomplete):
+            cle.proxy_start_at_capture(series, c, "x")
+
+
+@pytest.mark.parametrize("mode", ["moved", "restarted", "both"])
+def test_v9_reboot_history_no_longer_blocks_later_hours(mode):
+    # a pod closed before the hour (the 2026-10-13 08Z/09Z case) and a pod scaled down inside the hour
+    assert run(FakeVM(pre_hour="snapshot", proxy_history=("p0", mode)))["status"] == "PASS"
+    assert run(FakeVM(scaled_down="snapshot", proxy_history=("p3", mode)))["status"] == "PASS"
+
+
+@pytest.mark.parametrize("mode,msg", [("overlap", "conflict"), ("other_label", "beyond"),
+                                      ("after_capture", "after the capture"), ("silent", "before the capture")])
+def test_v9_ambiguous_proxy_history_stays_incomplete(mode, msg):
+    for over in ({"pre_hour": "snapshot", "proxy_history": ("p0", mode)},
+                 {"scaled_down": "snapshot", "proxy_history": ("p3", mode)}):
+        r = run(FakeVM(**over))
+        assert r["status"] == "INCOMPLETE" and msg in r["reason"], (over, r.get("reason"))

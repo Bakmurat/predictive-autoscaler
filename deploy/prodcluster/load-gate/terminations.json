@@ -39,6 +39,14 @@
   "recorded_by": "claude (benchmark agent)",
   "terminated_before": "2026-10-05T10:32:02Z"
  },
+ "nginx-ensemble-q95-d956c77c4-6lxkq": {
+  "at": "2026-10-13T19:00:02Z",
+  "evidence": "operator scale-down (D-1108; Codex r86 BLOCKER, resolved r87): deletionTimestamp 2026-10-13T10:39:17Z with terminationGracePeriodSeconds 75 (deletion requested ~10:38:02Z; not a force deletion); node crwnv Ready=true at every sample 10:20-10:50Z, kubelet up=1 and process start 06:29:13Z unchanged (no kubelet restart), node boot unchanged; kube-state-metrics up=1 at every 20 s scrape 10:38:30-10:40:50Z: the pod's last finite KSM observation is 10:38:50.671Z and its 10:39:10.671Z sample is a staleness marker (NaN), while the seven other q95 pods of that moment stay listed (an eighth appears 10:44:10Z): the API object disappeared, consistent with normal graceful termination on a healthy kubelet (this does not directly prove the hook ran nor categorically exclude a later force-delete). Pod start = created 10:02:02Z, istio-proxy/nginx started 10:02:05Z, restarts 0. No final-snapshot series observed (no bench_final_* series for this pod in 8 days). The kubelet logged at 10:38:19.230956Z \"PreStop hook failed ... final-snapshot.sh' exited with 1: \" with empty output (crwnv kubelet.log read by infra, summary kubelet-log-summary-infra-20261013T1935Z.md sha256 d6b11d9c1c24935171a8815e9e6c9f39e69cca18d7b9c9ef17885bf2e1b85035); why the script exited 1 is unknown (flagged): the only one of ~130 demo pods ended 10-12 13:46Z to 10-13 18:36Z without a receipt. Raw VictoriaMetrics responses with hashes: agent-coordination/03-predictive-benchmark-aws/prodcluster-20261005/evidence-6lxkq-20261013/ (SHA256SUMS sha256 c8cfd2955ad847513eeee28563c23588bc7bf9da3b9654c9092a7a1973eb6ba7, workspace repo). Closes the pod for hours after 10:40:00Z only; its own hour (10Z) stays INCOMPLETE.",
+  "pod_start": "2026-10-13T10:02:02Z",
+  "pod_uid": "not recorded: this kube-state-metrics exports no UID, the pod object was deleted 10:39Z and no snapshot carried one",
+  "recorded_by": "claude (predictivescaler, benchmark agent)",
+  "terminated_before": "2026-10-13T10:40:00Z"
+ },
  "nginx-reactive-7b6c858f4b-ft64g": {
   "at": "2026-10-05T11:10:00Z",
   "created": "2026-10-05T10:02:00Z",

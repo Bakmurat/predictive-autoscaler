@@ -773,7 +773,7 @@ def hour_tag(h):
 
 
 FETCHER = "fetch_load_attempts.sh v1"
-COLLECTOR = "collect_load_evidence.py v8"
+COLLECTOR = "collect_load_evidence.py v9"
 FILE_NAME = re.compile(r"^(attempts/)?load-(\d{8}T\d{4}Z)(-\d{8}T\d{6}Z-\d+)?\.json$")
 
 

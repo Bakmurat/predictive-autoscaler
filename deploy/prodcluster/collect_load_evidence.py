@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
-"""Hourly load evidence for the six benchmark arms on a VictoriaMetrics cluster (prodcluster campaign), v8.
+"""Hourly load evidence for the six benchmark arms on a VictoriaMetrics cluster (prodcluster campaign), v9.
 
+v9 (2026-10-13): a final snapshot is bound to the istio-proxy incarnation kube-state-metrics observed at its capture,
+not to one constant container start over the whole inventory window. The 2026-10-12 VM reboot restarted every arm
+container in place and gave kube-state-metrics a new scrape address (instance), so each pod that lived across it has two
+start series; under v8 every hour after such a pod ended was INCOMPLETE for its arm, indefinitely. Series may differ only
+in the KSM scrape address, starts may only move forward in time, every observation from KSM_GAP before the capture on
+must agree, and one must lie in [c - KSM_GAP, c]. Hourly lifecycle checks of pods alive in the hour are unchanged.
 v8 (2026-10-07, D-1083): G3 reads the generator's dense failure counter (bench_req_failed) when the run has it; the
 built-in sparse series is kept and must intersect it. A pod deleted just before the start-time window, whose
 kube-state-metrics series shows only a staleness marker inside it, no longer makes the hour INCOMPLETE.
@@ -67,6 +73,7 @@ SHORT = 180.0
 DENSE_FAILED = "k6_bench_req_failed_total"   # D-1083: dense failure counter of the generator script
 SCRAPE_LABELS = {"__name__", "app", "container", "endpoint", "instance", "job", "prometheus", "namespace", "pod", "service"}
 SNAP_LABELS = {"__name__", "namespace", "pod", "pod_uid", "snapshot_version"}
+KSM_TARGET_LABELS = {"__name__", "instance"}   # v9: a kube-state-metrics restart changes only its scrape address
 ASSUMPTIONS = {"A1'": "G2/G3 (k6 dropped/failed): a k6 sample reaches the exporter within 600 s of its event time"}
 RECHECK_HOURS = 6        # the in-cluster CronJob re-evaluates each hour at its next six hourly runs (protocol P4)
 FINAL_AFTER = RECHECK_HOURS * 3600 + GRACE   # an hour's verdict is final only in its sixth scheduled evaluation window
@@ -425,6 +432,26 @@ def lifecycle_value(series, what, pod):
     return next(iter(vals))
 
 
+def proxy_start_at_capture(series, c, pod):
+    """v9: kube-state-metrics' istio-proxy container start for the incarnation alive at the capture c. series: the raw
+    [(labels, finite samples, staleness times)] over the inventory window. Series may differ only in the KSM scrape
+    address; their samples are merged. A container start may only move forward in time (an in-place restart), so a
+    decrease, or two values at one timestamp, means conflicting or stale observations. Every observation from
+    c - KSM_GAP on must show one value, and at least one must lie in [c - KSM_GAP, c]."""
+    if not series or len({native(m, KSM_TARGET_LABELS) for m, _, _ in series}) != 1:
+        raise Incomplete(f"pod {pod}: istio-proxy start series missing or differing beyond the kube-state-metrics address")
+    pts = sorted((ms(t), v) for _, s, _ in series for t, v in s)
+    if any(a[0] == b[0] and a[1] != b[1] for a, b in zip(pts, pts[1:])) or any(b[1] < a[1] for a, b in zip(pts, pts[1:])):
+        raise Incomplete(f"pod {pod}: istio-proxy start observations conflict (simultaneous or moving backwards)")
+    C, G = ms(c), ms(KSM_GAP)
+    if not any(C - G <= t <= C for t, _ in pts):
+        raise Incomplete(f"pod {pod}: istio-proxy start not observed within {int(KSM_GAP)} s before the capture")
+    vals = {v for t, v in pts if t >= C - G}
+    if len(vals) != 1:
+        raise Incomplete(f"pod {pod}: istio-proxy start changed around or after the capture")
+    return next(iter(vals))
+
+
 def verify_snapshot(vm, app, pod, t_inv, end, terminations):
     """(capture, uid) of a pod whose scrapes stopped: its final snapshot, re-verified from VictoriaMetrics (no cache), or
     (terminated_before, None) from a validated manual termination record."""
@@ -453,9 +480,7 @@ def verify_snapshot(vm, app, pod, t_inv, end, terminations):
     payload = [(m, v) for m, s, _ in vm.raw(f'{{__name__=~"bench_final_istio_.*",namespace="{NAMESPACE}",pod="{pod}"}}', end, W)
                for t, v in s if ms(t) == ms(c)]
     started = vm.raw(f'kube_pod_container_state_started{{namespace="{NAMESPACE}",pod="{pod}",container="istio-proxy"}}', end, W)
-    if len(started) != 1:
-        raise Incomplete(f"pod {pod}: istio-proxy container start not observed exactly once")
-    c, uid = check_snapshot(receipts, payload, lifecycle_value(started[0][1], "istio-proxy start time", pod))
+    c, uid = check_snapshot(receipts, payload, proxy_start_at_capture(started, c, pod))
     # nothing may change after the capture: every scrape after it equals the final value, none before it exceeds it
     finals = {native(m, SNAP_LABELS): v for m, v in payload if m.get("__name__") == "bench_final_istio_requests_total"}
     sel = f'reporter="destination",destination_workload="{app}",destination_workload_namespace="{NAMESPACE}"'
@@ -600,7 +625,7 @@ def collect(vm, hour_start, t_inv, terminations=None, approvals=None, now=None):
     now = time.time() if now is None else now
     rows = []
     for app in APPS:
-        r = {"app": app, "hour_start": hour_start.strftime("%Y-%m-%dT%H:%M:%SZ"), "collector": "collect_load_evidence.py v8",
+        r = {"app": app, "hour_start": hour_start.strftime("%Y-%m-%dT%H:%M:%SZ"), "collector": "collect_load_evidence.py v9",
              "collector_sha256": COLLECTOR_SHA256, "inventory_start": utc(t_inv), "collection_cutoff": utc(end),
              "terminations_used": sorted(terminations), "inputs_sha256": inputs_sha256, "identity": IDENTITY_NOTE}
         try:

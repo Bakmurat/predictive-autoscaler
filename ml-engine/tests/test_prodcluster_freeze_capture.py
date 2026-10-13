@@ -306,7 +306,7 @@ def fetch_output(files, hours, extractor="fetch_load_attempts.sh v1", tamper=Fal
 def attempt(h, final=True, status="PASS", q=None, arms=fz.ARMS, collector_sha="c" * 64, gen=None):
     q = (status == "PASS" and final) if q is None else q
     return json.dumps([{"app": a, "hour_start": h, "status": status, "maturity": {"finalized": final},
-                        "qualification": {"qualifies": q}, "collector": "collect_load_evidence.py v8",
+                        "qualification": {"qualifies": q}, "collector": "collect_load_evidence.py v9",
                         "collector_sha256": collector_sha, "inputs_sha256": EXPECT["inputs_sha256"],
                         "generator_pod": (gen or {}).get(a, f"k6-{a}-abcdef1234-xyz12")} for a in arms])
 
