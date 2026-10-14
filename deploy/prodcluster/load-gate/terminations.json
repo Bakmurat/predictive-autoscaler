@@ -47,6 +47,14 @@
   "recorded_by": "claude (predictivescaler, benchmark agent)",
   "terminated_before": "2026-10-13T10:40:00Z"
  },
+ "nginx-ensemble-q95-d956c77c4-nf9rt": {
+  "at": "2026-10-14T07:35:02Z",
+  "evidence": "operator scale-down, a recurrence of 6lxkq (D-1108; flagged in the 10-14 coverage read before this record): deletionTimestamp 2026-10-13T20:27:18Z with terminationGracePeriodSeconds 75 (deletion requested ~20:26:03Z; not a force deletion as far as observed); node crwnv Ready=true at every sample 20:07-20:37Z, kubelet up=1 and process start 06:29:13Z unchanged (no kubelet restart); kube-state-metrics up=1 at every scrape 20:07-20:37Z: the pod's last finite KSM observation is 20:26:50.671Z and its 20:27:10.671Z sample is a staleness marker (NaN), while the two other q95 pods of that moment (dqdf7, lhf9p) stay listed: the API object disappeared, consistent with normal graceful termination on a healthy kubelet (VM disappearance alone does not establish hook execution, and does not categorically exclude a later force-delete; the kubelet log below separately confirms execution and exit 1). Pod start = created 07:50:02Z, istio-proxy/nginx started 07:50:04Z, restarts 0. No final-snapshot series observed (no bench_final_* series for this pod in 8 days). The kubelet logged at 20:26:19.078443Z \"PreStop hook failed ... final-snapshot.sh' exited with 1: \" with empty output, ~16 s after the deletion request (inference, not established: as for 6lxkq this fits SETTLE 6 s + WAIT 10 s, i.e. the inbound-quiescence timeout; the script's own message is gone with the container), then removed the containers at 20:27:03.777Z (crwnv kubelet.log read by infra; it also gives the pod UID, which this kube-state-metrics does not export, summary kubelet-log-summary-infra-20261014T0734Z.md sha256 26ce1e3624e2c7cbbff39c243850d49358f4bc3054fd2ac3b20e562d8e610882); why the script exited 1 is unknown (flagged). The only one of 31 demo arm pods ended 10-13 19:00Z to 10-14 07:20Z without a receipt. Raw VictoriaMetrics responses with hashes: agent-coordination/03-predictive-benchmark-aws/prodcluster-20261005/evidence-nf9rt-20261014/ (SHA256SUMS sha256 713d7669db63289729bbc6607c652e52f2dc04cedbe84b828e0838967d4a9af0, workspace repo). Closes the pod for hours after 20:28:00Z only; its own hour (20Z) stays INCOMPLETE.",
+  "pod_start": "2026-10-13T07:50:02Z",
+  "pod_uid": "6025a083-708e-4445-99b4-09e8bb02dbc0",
+  "recorded_by": "claude (predictivescaler, benchmark agent)",
+  "terminated_before": "2026-10-13T20:28:00Z"
+ },
  "nginx-reactive-7b6c858f4b-ft64g": {
   "at": "2026-10-05T11:10:00Z",
   "created": "2026-10-05T10:02:00Z",
