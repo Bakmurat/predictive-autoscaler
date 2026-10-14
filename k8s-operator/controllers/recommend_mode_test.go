@@ -121,10 +121,13 @@ func TestModeChangeAndTargetRecreationResetTheScaleState(t *testing.T) {
 	if err := r.Update(context.Background(), a); err != nil {
 		t.Fatal(err)
 	}
-	runRPMReconcile(t, r, req, path) // at target: no new timestamps
+	switched := time.Now()
+	runRPMReconcile(t, r, req, path) // at target: no write
 	st := r.scaleStates[key]
-	if st.mode != "Active" || !st.lastScaleUp.IsZero() || st.overrideActive {
-		t.Fatalf("switching to Active must start from a clean state: %+v", st)
+	// No Recommend-mode (hypothetical) history carries over; the fresh Active state counts as a write at the switch
+	// (the startup floor of restart_continuity_test.go), so the stale hypothetical timestamps are gone.
+	if st.mode != "Active" || st.lastScaleUp.Before(switched) || st.overrideActive || !st.belowCurrentSince.IsZero() {
+		t.Fatalf("switching to Active must start from a fresh state: %+v", st)
 	}
 	// a re-created target (new UID) resets it too
 	st.lastScaleUp = stale
@@ -136,8 +139,9 @@ func TestModeChangeAndTargetRecreationResetTheScaleState(t *testing.T) {
 	if err := r.Update(context.Background(), &dep); err != nil {
 		t.Fatal(err)
 	}
+	recreated := time.Now()
 	runRPMReconcile(t, r, req, path)
-	if st := r.scaleStates[key]; st.targetUID != "re-created" || !st.lastScaleUp.IsZero() {
+	if st := r.scaleStates[key]; st.targetUID != "re-created" || st.lastScaleUp.Before(recreated) {
 		t.Fatalf("a re-created target must reset the state: %+v", st)
 	}
 }

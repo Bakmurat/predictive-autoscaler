@@ -304,6 +304,17 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	mode := autoscaler.Spec.EffectiveMode()
 	if st := r.getOrCreateScaleState(key); st.mode != mode || st.targetUID != deployment.UID {
 		*st = scaleState{mode: mode, targetUID: deployment.UID}
+		// A fresh Active state (operator restart, leader change, switch to Active, re-created target) has no write
+		// history, and the persisted status can lag the last write (a failed status update after a successful scale).
+		// It is treated as if a write had just happened (hold bookkeeping only: nothing is written and
+		// status.lastScaleTime is unchanged): the scale-up hold, then the below-current timer, block
+		// scale-down for both windows, and the cooldown (which also applies under the overestimate override) starts
+		// now, independent of the persisted status. Scale-up is not affected. Forecast-dependent state (cache,
+		// overestimate tracking, ramp reference) also starts again, so forecast decisions may still differ.
+		if mode == autoscalerv1alpha1.ModeActive {
+			now := time.Now()
+			st.lastScaleUp, st.lastScaleDown = now, now
+		}
 	}
 
 	// --- METRIC SOURCE ---

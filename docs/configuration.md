@@ -64,7 +64,14 @@ need.
 Scale-up is applied at once. Scale-down needs desired below current **continuously for 5 minutes** and no scale-up in the
 last 5 minutes (stabilization), at least 2 minutes since the previous scale-down (cooldown), and then removes at most
 `max(ceil(10 % × current), 2)` pods per step. When the overestimate cap is active, the stabilization checks are skipped but
-the cooldown still applies. This state is kept in memory, so an operator restart resets it.
+the cooldown still applies. This state is kept in memory. A fresh Active state (an operator restart, a leadership change,
+a switch to Active or a re-created target) is treated as if a scale write had just happened. This is internal hold
+bookkeeping only: nothing is written and `status.lastScaleTime` does not change. Scale-down then waits **at least 10
+minutes** (5 minutes after the assumed write, then the 5-minute continuously-lower window; longer with a slow reconcile
+period), and under the overestimate cap at least the 2-minute cooldown. This does not depend on the persisted status.
+Scale-up is not delayed. A restart also clears the forecast cache and the overestimate and ramp tracking; a switch to
+Active resets the tracking but keeps the cache, and a re-created target invalidates both. Forecast decisions may
+therefore differ after a restart.
 
 **When the current request rate cannot be measured, the replica count is held.** Only a complete, successful answer with
 exactly one finite, non-negative sample counts as a measurement; a failed or partial query, an empty result (no series),
