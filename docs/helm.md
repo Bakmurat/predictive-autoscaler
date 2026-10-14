@@ -50,8 +50,12 @@ Pods or read Secrets. The chart has no cold start: retrain by hand with
   apply it explicitly:
 
   ```
-  kubectl apply --server-side -f charts/predictive-autoscaler/crds/
+  kubectl apply --server-side --force-conflicts -f charts/predictive-autoscaler/crds/
   ```
+
+  `--force-conflicts` is needed because Helm created the CRD with another field manager; without it the apply stops on
+  a conflict and leaves the old revision in place, and the new operator then waits, unready, on the revision gate (seen
+  in the soak, observation O2). The CRD is the only object it takes over.
 
 - The CRD carries a revision label (`autoscaling.devkuban.com/crd-revision`). The operator reads it before starting.
   Revisions: 1 = the first `autoscaling.devkuban.com` schema; 2 = adds `spec.behavior.scaleDown.headroomPercent`.
