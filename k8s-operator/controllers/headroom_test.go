@@ -2,7 +2,11 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 	"math"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -144,16 +148,67 @@ func TestHeadroomNeverDelaysScaleUp(t *testing.T) {
 	}
 }
 
-func TestTheOverrideAndTheRestartFloorDoNotBypassTheHeadroom(t *testing.T) {
-	r, req, path := headroomHarness(t, 6, "2900", nil)
-	st := agedState(t, r, req, path)
-	st.overrideActive = true
-	if rec := runRPMReconcile(t, r, req, path); rec.Action != "hold_headroom" {
-		t.Fatalf("the overestimate override bypassed the headroom: %s", rec.Action)
+// forecastServer serves a usable forecast of `rpm` at every step (fresh anchor, no trend), or a 503 while rpm is 0.
+func forecastServer(t *testing.T) *atomic.Value {
+	t.Helper()
+	var level atomic.Value
+	level.Store(0.0)
+	srv := httptest.NewServer(echoProvenance(func(w http.ResponseWriter, _ *http.Request) {
+		v := level.Load().(float64)
+		if v == 0 {
+			w.WriteHeader(503)
+			return
+		}
+		b := componentResponse(time.Now().UTC().Truncate(10 * time.Minute))
+		nums := []interface{}{v, v, v, v, v, v}
+		b["predictions"] = nums
+		comps := b["components"].(map[string]interface{})
+		comps["pattern"], comps["blended"], comps["final"], comps["lstm"] = nums, nums, nums, nums
+		fmt.Fprint(w, componentBody(t, b))
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("ML_API_URL", srv.URL)
+	return &level
+}
+
+func TestTheOverestimateOverrideStaysActiveAndTheHeadroomStillHolds(t *testing.T) {
+	// 5999 rpm at 600/pod: reactive 10, the overestimate cap ceil(1.1 x 10) = 11, the headroom floor ceil(5999/540) = 12.
+	r, req, path := headroomHarness(t, 12, "5999", nil)
+	a := getPA(t, r, req)
+	a.Spec.MaxReplicas = 20
+	if err := r.Update(context.Background(), a); err != nil {
+		t.Fatal(err)
 	}
-	r.scaleStates = map[string]*scaleState{} // a restart: the startup floor applies as well
-	if rec := runRPMReconcile(t, r, req, path); rec.Action != "hold_headroom" || rec.AppliedReplicas != 6 {
-		t.Fatalf("after a restart: %s %d", rec.Action, rec.AppliedReplicas)
+	level := forecastServer(t)
+	st := agedState(t, r, req, path) // no forecast yet
+	st.overestimateStreak, st.lastRPM = 2, 5999
+	level.Store(9000.0) // a steady forecast of 15 replicas: the third overestimating reconcile caps it at 11
+	rec := runRPMReconcile(t, r, req, path)
+	capped := false
+	for _, g := range rec.Safeguards {
+		capped = capped || g == "overestimate_cap"
+	}
+	if !capped || !st.overrideActive || rec.DesiredReplicas != 11 {
+		t.Fatalf("precondition: the override must be active with desired 11: safeguards %v override %v desired %d",
+			rec.Safeguards, st.overrideActive, rec.DesiredReplicas)
+	}
+	if rec.Action != "hold_headroom" || rec.AppliedReplicas != 12 || !st.overrideActive {
+		t.Fatalf("the override bypassed the headroom: %s %d (override still active: %v)", rec.Action, rec.AppliedReplicas, st.overrideActive)
+	}
+	// (A restart resets the overestimate tracking — documented — so the uncapped forecast may then scale up; the startup
+	// floor's own tests are in restart_continuity_test.go.)
+}
+
+func TestAForecastDerivedCountRemainsALowerBound(t *testing.T) {
+	// 2900 rpm: reactive 5, floor 6; a forecast of 4000 rpm wants 7. From 8 the gradual step would reach 6, but the
+	// forecast's 7 bounds it.
+	r, req, path := headroomHarness(t, 8, "2900", nil)
+	level := forecastServer(t)
+	agedState(t, r, req, path)
+	level.Store(4000.0)
+	rec := runRPMReconcile(t, r, req, path)
+	if rec.DesiredReplicas != 7 || rec.Action != "scale_down" || rec.AppliedReplicas != 7 {
+		t.Fatalf("the forecast's count must bound the scale-down: desired %d %s %d", rec.DesiredReplicas, rec.Action, rec.AppliedReplicas)
 	}
 }
 
@@ -168,6 +223,19 @@ func TestALoweredMaximumIsStillApplied(t *testing.T) {
 	rec := runRPMReconcile(t, r, req, path)
 	if rec.Action != "scale_down" || rec.AppliedReplicas >= 9 || rec.ScaleDownHeadroomFloor == nil || *rec.ScaleDownHeadroomFloor != 6 {
 		t.Fatalf("the floor must be capped at max: %s %d floor %v", rec.Action, rec.AppliedReplicas, rec.ScaleDownHeadroomFloor)
+	}
+}
+
+func TestMissingTelemetryAboveTheMaximumRecordsNoFloor(t *testing.T) {
+	r, req, path := headroomHarness(t, 9, "", nil) // no measurement, and the count is above a lowered maximum
+	a := getPA(t, r, req)
+	a.Spec.MaxReplicas = 6
+	if err := r.Update(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	agedState(t, r, req, path)
+	if rec := runRPMReconcile(t, r, req, path); rec.ScaleDownHeadroomFloor != nil {
+		t.Fatalf("an unmeasured rate must record no floor: %s %d floor %d", rec.Action, rec.AppliedReplicas, *rec.ScaleDownHeadroomFloor)
 	}
 }
 

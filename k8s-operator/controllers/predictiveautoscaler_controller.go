@@ -599,19 +599,14 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		// lowered maximum still takes effect.
 		headroomPct = autoscaler.Spec.ScaleDownHeadroomPercent()
 		floor := int32(0)
-		if vmErr == nil {
+		if vmErr == nil { // an unmeasured rate gives no floor and records none
 			floor = headroomFloor(currentRPM, perPodRPM, headroomPct, autoscaler.Spec.MaxReplicas)
+			dec.ScaleDownHeadroomFloor = &floor
 		}
-		dec.ScaleDownHeadroomFloor = &floor
-		eventual := desiredReplicas
-		if floor > eventual {
-			eventual = floor
-		}
+		var eventual int32
+		eventual, headroomHold = headroomEventual(state, currentReplicas, desiredReplicas, floor)
 		target := currentReplicas
-		if eventual >= currentReplicas {
-			headroomHold = true
-			state.belowCurrentSince = time.Time{} // eligibility lost: a later scale-down waits a full window again
-		} else {
+		if !headroomHold {
 			target = r.calculateScaleDownTarget(log, state, currentReplicas, eventual)
 		}
 		if headroomHold {
@@ -880,6 +875,21 @@ func headroomFloor(rpm, perPodRPM float64, headroomPercent, maxReplicas int32) i
 		f = maxReplicas
 	}
 	return f
+}
+
+// headroomEventual is a scale-down's eventual count: the larger of the decision and the headroom floor. When that is
+// not below the current count, the floor holds it (hold = true) and the below-current window restarts, so a later
+// scale-down waits a full window again. Shared with the replay harness, so the two cannot diverge.
+func headroomEventual(state *scaleState, current, desired, floor int32) (eventual int32, hold bool) {
+	eventual = desired
+	if floor > eventual {
+		eventual = floor
+	}
+	if eventual >= current {
+		state.belowCurrentSince = time.Time{}
+		return current, true
+	}
+	return eventual, false
 }
 
 // boundedReplicas converts a computed replica count to int32 without wrapping: NaN and non-positive values are 0, values
@@ -1518,7 +1528,8 @@ func (r *PredictiveAutoscalerReconciler) updateStatus(ctx context.Context, autos
 		setStatus("ScaleDownHeadroom", metav1.ConditionTrue, "Holding", fmt.Sprintf(
 			"a lower count would leave less than %d%% spare request capacity at the measured rate; holding %d", in.headroomPercent, in.current))
 	default:
-		setStatus("ScaleDownHeadroom", metav1.ConditionFalse, "NotHolding", fmt.Sprintf("headroom %d%%", in.headroomPercent))
+		setStatus("ScaleDownHeadroom", metav1.ConditionFalse, "NotHolding", fmt.Sprintf(
+			"headroom %d%% is not blocking a scale-down", in.headroomPercent))
 	}
 	if statusEqual(before, st) {
 		return nil
