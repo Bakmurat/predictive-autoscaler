@@ -9,7 +9,7 @@ metadata:
     argocd.argoproj.io/sync-wave: "-1"
     controller-gen.kubebuilder.io/version: v0.20.1
   labels:
-    autoscaling.devkuban.com/crd-revision: "1"
+    autoscaling.devkuban.com/crd-revision: "2"
   name: predictiveautoscalers.autoscaling.devkuban.com
 spec:
   group: autoscaling.devkuban.com
@@ -76,6 +76,26 @@ spec:
           spec:
             description: PredictiveAutoscalerSpec defines the desired state of PredictiveAutoscaler
             properties:
+              behavior:
+                description: Behavior tunes how Active mode applies its decisions.
+                properties:
+                  scaleDown:
+                    description: ScaleDown tunes scale-down.
+                    properties:
+                      headroomPercent:
+                        default: 10
+                        description: |-
+                          HeadroomPercent is the spare request capacity a scale-down must leave in the resulting fleet: Active mode
+                          scales down to n replicas only while the measured request rate is at most n x targetRPS x (1 - headroom/100),
+                          so the smallest count it scales down to is ceil(rate / (targetRPS x (1 - headroom/100))). It prevents
+                          oscillation at a replica boundary (a scale-down that the next small rise undoes). Scale-up is unaffected.
+                          0 disables it. Default 10.
+                        format: int32
+                        maximum: 99
+                        minimum: 0
+                        type: integer
+                    type: object
+                type: object
               maxReplicas:
                 description: MaxReplicas is the maximum number of replicas
                 format: int32

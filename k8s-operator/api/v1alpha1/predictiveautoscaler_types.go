@@ -34,6 +34,42 @@ type PredictiveAutoscalerSpec struct {
 	// +kubebuilder:default=Recommend
 	// +optional
 	Mode string `json:"mode,omitempty"`
+
+	// Behavior tunes how Active mode applies its decisions.
+	// +optional
+	Behavior *BehaviorConfig `json:"behavior,omitempty"`
+}
+
+// BehaviorConfig tunes how decisions are applied.
+type BehaviorConfig struct {
+	// ScaleDown tunes scale-down.
+	// +optional
+	ScaleDown *ScaleDownBehavior `json:"scaleDown,omitempty"`
+}
+
+// ScaleDownBehavior tunes scale-down.
+type ScaleDownBehavior struct {
+	// HeadroomPercent is the spare request capacity a scale-down must leave in the resulting fleet: Active mode
+	// scales down to n replicas only while the measured request rate is at most n x targetRPS x (1 - headroom/100),
+	// so the smallest count it scales down to is ceil(rate / (targetRPS x (1 - headroom/100))). It prevents
+	// oscillation at a replica boundary (a scale-down that the next small rise undoes). Scale-up is unaffected.
+	// 0 disables it. Default 10.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=99
+	// +kubebuilder:default=10
+	// +optional
+	HeadroomPercent *int32 `json:"headroomPercent,omitempty"`
+}
+
+// DefaultScaleDownHeadroomPercent applies when spec.behavior.scaleDown.headroomPercent is absent.
+const DefaultScaleDownHeadroomPercent int32 = 10
+
+// ScaleDownHeadroomPercent is the effective scale-down headroom (the default when the field or a parent is absent).
+func (s PredictiveAutoscalerSpec) ScaleDownHeadroomPercent() int32 {
+	if s.Behavior == nil || s.Behavior.ScaleDown == nil || s.Behavior.ScaleDown.HeadroomPercent == nil {
+		return DefaultScaleDownHeadroomPercent
+	}
+	return *s.Behavior.ScaleDown.HeadroomPercent
 }
 
 const (
@@ -282,7 +318,7 @@ type PredictiveAutoscalerStatus struct {
 //+kubebuilder:object:root=true
 //+kubebuilder:subresource:status
 //+kubebuilder:resource:shortName=pa
-//+kubebuilder:metadata:labels="autoscaling.devkuban.com/crd-revision=1"
+//+kubebuilder:metadata:labels="autoscaling.devkuban.com/crd-revision=2"
 //+kubebuilder:metadata:annotations="argocd.argoproj.io/sync-options=Prune=false,Delete=false,ServerSideApply=true"
 //+kubebuilder:metadata:annotations="argocd.argoproj.io/sync-wave=-1"
 //+kubebuilder:printcolumn:name="Target",type="string",JSONPath=".spec.targetDeployment.name"

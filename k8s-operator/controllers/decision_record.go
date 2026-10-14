@@ -47,7 +47,10 @@ type decisionRecord struct {
 	DesiredSource      string   `json:"desired_source"` // prediction|reactive|tie|min_replicas|max_replicas|keep_current
 	CurrentReplicas    int32    `json:"current_replicas"`
 	AppliedReplicas    int32    `json:"applied_replicas"`
-	Action             string   `json:"action"` // scale_up|scale_down|hold_stabilizing|hold_cooldown|at_target|keep_current|scale_error|recommend|conflict_hold|guard_abort
+	Action             string   `json:"action"` // scale_up|scale_down|hold_stabilizing|hold_cooldown|hold_headroom|at_target|keep_current|scale_error|recommend|conflict_hold|guard_abort
+	// ScaleDownHeadroomFloor is the smallest count that keeps spec.behavior.scaleDown.headroomPercent of spare capacity at
+	// the measured rate (Active scale-down decisions only; absent otherwise).
+	ScaleDownHeadroomFloor *int32 `json:"scale_down_headroom_floor,omitempty"`
 }
 
 func newDecisionRecord(a *autoscalerv1alpha1.PredictiveAutoscaler, forecasting bool, current int32) *decisionRecord {

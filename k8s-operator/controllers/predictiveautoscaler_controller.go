@@ -381,14 +381,14 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	// Query VictoriaMetrics for current RPM
 	currentRPM, vmErr := r.queryCurrentRPM(ctx, compiled.Query)
 	reactiveReplicas := int32(0)
+	perPodRPM := 20000.0
+	if autoscaler.Spec.Metrics.Requests != nil && autoscaler.Spec.Metrics.Requests.TargetRPS > 0 {
+		perPodRPM = float64(autoscaler.Spec.Metrics.Requests.TargetRPS) * 60
+	}
 	if vmErr != nil {
 		log.Info("Current request rate unavailable; the decision will hold the current replica count", "error", vmErr.Error())
 	} else {
-		targetRPM := 20000.0
-		if autoscaler.Spec.Metrics.Requests != nil && autoscaler.Spec.Metrics.Requests.TargetRPS > 0 {
-			targetRPM = float64(autoscaler.Spec.Metrics.Requests.TargetRPS) * 60
-		}
-		reactiveReplicas = boundedReplicas(math.Ceil(currentRPM / targetRPM))
+		reactiveReplicas = boundedReplicas(math.Ceil(currentRPM / perPodRPM))
 	}
 	dec.ReactiveReplicas, dec.CurrentRPM = reactiveReplicas, currentRPM
 	dec.TelemetryStatus = "measured"
@@ -561,6 +561,7 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	// --- APPLY SCALING ---
 	// Recommend mode: the decision is complete and recorded, nothing is written and no scale history is advanced.
 	stabilized, applied := int32(0), int32(0)
+	headroomHold, headroomPct := false, autoscaler.Spec.ScaleDownHeadroomPercent()
 	if mode != autoscalerv1alpha1.ModeActive {
 		log.Info("Recommend mode: not scaling", "calculated", desiredReplicas, "current", currentReplicas)
 		r.recordDecision(dec, "recommend", currentReplicas)
@@ -592,11 +593,35 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		}
 
 	} else if desiredReplicas < currentReplicas {
-		// SCALE DOWN: with stabilization window and gradual reduction
-		target := r.calculateScaleDownTarget(log, state, currentReplicas, desiredReplicas)
-		if target < currentReplicas {
+		// SCALE DOWN: no lower than the headroom floor (spare capacity in the resulting fleet at the measured rate),
+		// then with the stabilization window, cooldown and gradual reduction. The floor is checked before those holds,
+		// so neither the overestimate override nor the restart floor bypasses it; it is capped at maxReplicas, so a
+		// lowered maximum still takes effect.
+		headroomPct = autoscaler.Spec.ScaleDownHeadroomPercent()
+		floor := int32(0)
+		if vmErr == nil {
+			floor = headroomFloor(currentRPM, perPodRPM, headroomPct, autoscaler.Spec.MaxReplicas)
+		}
+		dec.ScaleDownHeadroomFloor = &floor
+		eventual := desiredReplicas
+		if floor > eventual {
+			eventual = floor
+		}
+		target := currentReplicas
+		if eventual >= currentReplicas {
+			headroomHold = true
+			state.belowCurrentSince = time.Time{} // eligibility lost: a later scale-down waits a full window again
+		} else {
+			target = r.calculateScaleDownTarget(log, state, currentReplicas, eventual)
+		}
+		if headroomHold {
+			log.Info("Scale-down held for headroom", "desired", desiredReplicas, "headroomFloor", floor,
+				"headroomPercent", headroomPct, "current", currentReplicas, "currentRPM", fmt.Sprintf("%.0f", currentRPM))
+			r.recordDecision(dec, "hold_headroom", currentReplicas)
+			stabilized = currentReplicas
+		} else if target < currentReplicas {
 			log.Info("Scaling DOWN",
-				"from", currentReplicas, "to", target, "eventualTarget", desiredReplicas)
+				"from", currentReplicas, "to", target, "eventualTarget", eventual)
 			wrote, err := write(target)
 			if err != nil {
 				log.Error(err, "Failed to scale down")
@@ -648,6 +673,7 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		current: currentReplicas, ready: deployment.Status.ReadyReplicas, keepCurrent: keepCurrent,
 		telemetry: dec.TelemetryStatus, telemetryError: dec.TelemetryError, forecastStatus: dec.ForecastStatus,
 		forecastIssuedAt: dec.ForecastIssuedAt, targetUID: string(deployment.UID),
+		headroomHold: headroomHold, headroomPercent: headroomPct,
 		conflicts: check.Conflicts, writers: check.Writers, warnings: check.Warnings, vpaChecked: check.VPAChecked, checkError: checkMsg, guard: guard,
 	}); err != nil {
 		log.Error(err, "Failed to update status")
@@ -840,6 +866,20 @@ func (r *PredictiveAutoscalerReconciler) queryCurrentRPM(ctx context.Context, qu
 		return 0, fmt.Errorf("%w: value %q overflows when converted to requests per minute", errMetricsUnavailable, valueStr)
 	}
 	return rpm, nil
+}
+
+// headroomFloor is the smallest replica count that leaves headroomPercent of spare request capacity at the measured rate:
+// ceil(rpm / (perPodRPM x (1 - headroomPercent/100))), capped at maxReplicas. 0 when the headroom is off, the capacity is
+// unknown or the rate is not a finite non-negative measurement (the caller then applies no floor).
+func headroomFloor(rpm, perPodRPM float64, headroomPercent, maxReplicas int32) int32 {
+	if headroomPercent <= 0 || headroomPercent >= 100 || !(perPodRPM > 0) || math.IsNaN(rpm) || math.IsInf(rpm, 0) || rpm < 0 {
+		return 0
+	}
+	f := boundedReplicas(math.Ceil(rpm / (perPodRPM * (1 - float64(headroomPercent)/100))))
+	if f > maxReplicas {
+		f = maxReplicas
+	}
+	return f
 }
 
 // boundedReplicas converts a computed replica count to int32 without wrapping: NaN and non-positive values are 0, values
@@ -1372,6 +1412,8 @@ type statusInputs struct {
 	writers                                                   []autoscalerv1alpha1.ReplicaWriter
 	vpaChecked                                                bool
 	checkError, guard                                         string
+	headroomHold                                              bool
+	headroomPercent                                           int32
 }
 
 var forecastReasons = map[string]string{"disabled": "Disabled", "unavailable": "Unavailable",
@@ -1467,6 +1509,16 @@ func (r *PredictiveAutoscalerReconciler) updateStatus(ctx context.Context, autos
 		set("ScalingActive", false, "TelemetryHold", "holding the current replica count: the current request rate is unavailable")
 	default:
 		set("ScalingActive", true, "Active", "the operator scales the target")
+	}
+	// Informational: a scale-down held for headroom is normal operation, so it never affects Ready or ScalingActive.
+	switch {
+	case in.mode != autoscalerv1alpha1.ModeActive:
+		setStatus("ScaleDownHeadroom", metav1.ConditionFalse, "RecommendMode", "Recommend mode applies no scale-down")
+	case in.headroomHold:
+		setStatus("ScaleDownHeadroom", metav1.ConditionTrue, "Holding", fmt.Sprintf(
+			"a lower count would leave less than %d%% spare request capacity at the measured rate; holding %d", in.headroomPercent, in.current))
+	default:
+		setStatus("ScaleDownHeadroom", metav1.ConditionFalse, "NotHolding", fmt.Sprintf("headroom %d%%", in.headroomPercent))
 	}
 	if statusEqual(before, st) {
 		return nil
