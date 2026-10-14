@@ -27,6 +27,7 @@ brackets (20 and 60). The same applies to `metrics.requests`. Set these fields e
 | `prediction.horizonMinutes` | int ≥ 5 | no | 60 [60] | yes | How far ahead the forecaster predicts. |
 | `prediction.leadTimeMinutes` | int ≥ 1 | no | **15** [20] | yes | The operator sizes for the highest forecast in the next `leadTimeMinutes` (see the decision rule). Set it explicitly; the quickstart uses 15. |
 | `prediction.updateIntervalSeconds` | int ≥ 60 | no | **300** [60] | yes | Reconcile period. Examples set 60. |
+| `behavior.scaleDown.headroomPercent` | int 0–99 | no | 10 | yes | Spare request capacity a scale-down must leave in the resulting fleet at the measured rate (see the decision rule). `0` disables it. |
 | `resources.*` | — | no | 100 m / 128 MB / 10,000 rpm | **no** | Accepted, ignored. |
 
 ## status
@@ -44,7 +45,7 @@ brackets (20 and 60). The same applies to `metrics.requests`. Set these fields e
 | `metricSource` | The compiled request-rate query: `query`, `sha256` (of the exact query text), `observedGeneration`, `targetUID`, `contract` (`requests-per-second/v1`). It is published before the forecasting service is asked. The service uses a forecast only when it was computed for this query, generation and target; any other forecast is refused, and the reactive rule applies. It is absent while the configuration is invalid. |
 | `predictedReplicas` | Deprecated: the calculated count (historical meaning). Use `calculatedReplicas` and `forecastReplicas`. |
 | `lastPrediction` | Issue time of the last forecast used. |
-| `conditions` | `Ready` (the reconcile completed), `TelemetryAvailable` (`Measured` / `MetricsUnavailable`), `ForecastAvailable` (`Used`, `Disabled`, `Unavailable`, `HorizonElapsed`, `SanityRejected`), `ScalingActive` (`Active`, `RecommendMode`, `TelemetryHold`, `Conflict`, `CheckFailed`, `GuardAborted`, or the failure reason), `ConflictDetected` (`NoConflict`; `ReplicaWriter` when an HPA, an unpaused KEDA ScaledObject or another Active PredictiveAutoscaler targets the Deployment; `Unknown`/`CheckFailed` when the check failed), `VPAInterference` (`None`; `VPAUpdatesPods` for a VPA in any mode except `Off`; `Unknown`/`CheckFailed` when the check did not complete). See coexistence.md. |
+| `conditions` | `Ready` (the reconcile completed), `TelemetryAvailable` (`Measured` / `MetricsUnavailable`), `ForecastAvailable` (`Used`, `Disabled`, `Unavailable`, `HorizonElapsed`, `SanityRejected`), `ScalingActive` (`Active`, `RecommendMode`, `TelemetryHold`, `Conflict`, `CheckFailed`, `GuardAborted`, or the failure reason), `ConflictDetected` (`NoConflict`; `ReplicaWriter` when an HPA, an unpaused KEDA ScaledObject or another Active PredictiveAutoscaler targets the Deployment; `Unknown`/`CheckFailed` when the check failed), `VPAInterference` (`None`; `VPAUpdatesPods` for a VPA in any mode except `Off`; `Unknown`/`CheckFailed` when the check did not complete), `ScaleDownHeadroom` (`Holding` while a scale-down is held for headroom; `NotHolding` when headroom is not currently blocking a scale-down, which says nothing about how much spare capacity exists; `RecommendMode`; informational: it never affects `Ready` or `ScalingActive`). See coexistence.md. |
 
 Events are emitted when a condition changes (and on `ScaledUp` / `ScaledDown`), never on every reconcile; the
 coexistence events are `ConflictDetected`, `ConflictResolved`, `ConflictCheckFailed`, `VPAInterference` and
@@ -61,7 +62,14 @@ desired   = clamp(max(forecast, reactive), minReplicas, maxReplicas)
 Safeguards on the forecast: it is discarded when its **first step** exceeds 10× the current rate (checked only when the
 current rate is positive); an overestimate cap limits its influence after consecutive forecasts well above the reactive
 need.
-Scale-up is applied at once. Scale-down needs desired below current **continuously for 5 minutes** and no scale-up in the
+Scale-up is applied at once. Scale-down never goes below the **headroom floor**: the smallest count that leaves
+`behavior.scaleDown.headroomPercent` (default 10 %) of spare capacity at the measured rate,
+`ceil(rate / (targetRPS × (1 − headroom/100)))`, capped at `maxReplicas`. For example, at 798 rpm and 2 requests/s per pod
+(120 rpm) seven pods would run at 95 % of capacity, so eight are kept; seven are allowed from 756 rpm down. While the
+floor holds the count (ledger action `hold_headroom`, condition `ScaleDownHeadroom=True`), the scale-down window starts
+again. The floor uses the measured rate only, never the forecast. It is applied after the forecast adjustments (the
+sanity check and the overestimate cap) and before the scale-down holds, so neither the overestimate override nor the
+restart floor bypasses it; a forecast-derived count above the floor still bounds the scale-down. Scale-down then needs desired below current **continuously for 5 minutes** and no scale-up in the
 last 5 minutes (stabilization), at least 2 minutes since the previous scale-down (cooldown), and then removes at most
 `max(ceil(10 % × current), 2)` pods per step. When the overestimate cap is active, the stabilization checks are skipped but
 the cooldown still applies. This state is kept in memory. A fresh Active state (an operator restart, a leadership change,

@@ -4,10 +4,12 @@ tests pin what the chart promises in its rendered objects."""
 
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
 import pytest
+
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -249,7 +251,9 @@ def test_the_crd_is_protected_and_versioned(render):
     crd = by_kind(render(), "CustomResourceDefinition")
     assert [c["metadata"]["name"] for c in crd] == [NEW_CRD]
     meta = crd[0]["metadata"]
-    assert meta["labels"]["autoscaling.devkuban.com/crd-revision"] == "1"
+    # the chart ships exactly the revision the operator requires (its CRD gate), so the two never drift apart
+    required = re.search(r"RequiredCRDRevision = (\d+)", (ROOT / "k8s-operator/controllers/crd_gate.go").read_text())
+    assert required and meta["labels"]["autoscaling.devkuban.com/crd-revision"] == required.group(1)
     assert meta["annotations"]["argocd.argoproj.io/sync-options"] == "Prune=false,Delete=false,ServerSideApply=true"
     assert meta["annotations"]["argocd.argoproj.io/sync-wave"] == "-1"
     generated = [d for d in yaml.safe_load_all((ROOT / "k8s-manifests/base/01-crd.yaml").read_text()) if d]

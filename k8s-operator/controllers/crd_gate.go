@@ -26,7 +26,7 @@ const (
 	// CRDRevisionLabel is the label on the CRD that numbers its schema revision (a kubebuilder marker on the type).
 	CRDRevisionLabel = "autoscaling.devkuban.com/crd-revision"
 	// RequiredCRDRevision is the lowest CRD revision this operator works with.
-	RequiredCRDRevision = 1
+	RequiredCRDRevision = 2 // 2: spec.behavior.scaleDown.headroomPercent
 )
 
 // CRDName is the operator's own CRD.
