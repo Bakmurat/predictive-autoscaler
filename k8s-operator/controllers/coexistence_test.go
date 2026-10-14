@@ -809,6 +809,11 @@ func TestAConflictHoldStopsTheScaleDownTimer(t *testing.T) {
 		t.Fatalf("precondition: %+v", dec)
 	}
 	st := r.scaleStates[req.NamespacedName.String()]
+	// The fresh Active state's startup floor holds first; once it has passed, the below-current timer starts.
+	st.lastScaleUp, st.lastScaleDown = time.Now().Add(-time.Hour), time.Now().Add(-time.Hour)
+	if dec := runRPMReconcile(t, r, req, path); dec.Action != "hold_stabilizing" {
+		t.Fatalf("precondition after the startup floor: %+v", dec)
+	}
 	if st.belowCurrentSince.IsZero() {
 		t.Fatal("precondition: the scale-down timer runs")
 	}
