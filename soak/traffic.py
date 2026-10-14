@@ -33,7 +33,10 @@ def send(service, low, high):
     last = time.monotonic()
     while True:
         now = time.monotonic()
-        debt += rate(low, high, time.time()) * (now - last)
+        rps = rate(low, high, time.time())
+        # Open-loop arrivals: requests missed while the service was failing are dropped, not replayed as a burst
+        # (soak observation O3); at most one second of arrivals is ever pending.
+        debt = min(debt + rps * (now - last), max(rps, 1.0))
         last = now
         while debt >= 1:
             debt -= 1

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Install or update the soak (soak/README.md) on an EXISTING local kind cluster.
 #   KUBECONFIG=<own file> soak/up.sh <operator-image:tag> <forecaster-image:tag> [<state-dir>]
+# SOAK_APP_IMAGE (default: the forecaster image of the FIRST install, recorded in the state dir) runs the demo workloads
+# and the traffic generator: keeping it fixed means a product upgrade does not restart the workloads (soak O3).
 # The images must already be loaded into the kind nodes (kind load docker-image). Refuses any cluster that is not a
 # local kind cluster reached on 127.0.0.1: the soak never touches a lab or production cluster.
 set -euo pipefail
@@ -29,8 +31,10 @@ fi
 for img in "$OP" "$FC"; do [[ "$img" == *:* && "$img" != *@* ]] || { echo "expected repository:tag: $img" >&2; exit 2; }; done
 
 umask 077; mkdir -p "$STATE"
+[ -f "$STATE/app-image" ] || printf '%s\n' "${SOAK_APP_IMAGE:-$FC}" > "$STATE/app-image"
+APP="${SOAK_APP_IMAGE:-$(cat "$STATE/app-image")}"
 log "soak on $CTX ($SERVER); state $STATE"
-{ echo "commit $(git -C "$ROOT" rev-parse HEAD)"; echo "operator $OP"; echo "forecaster $FC"; echo "installed_at $(date -u +%FT%TZ)"; } \
+{ echo "commit $(git -C "$ROOT" rev-parse HEAD)"; echo "operator $OP"; echo "forecaster $FC"; echo "app $APP"; echo "installed_at $(date -u +%FT%TZ)"; } \
   > "$STATE/install-$(date -u +%Y%m%dT%H%M%SZ).txt"
 
 # --- namespaces, scripts, metrics store -----------------------------------------------------------------------------
@@ -45,7 +49,7 @@ print("\n---\n".join(d for d in docs if "name: vm," in d))     # the store and i
 PY
 
 # --- workloads: active (Active), recommend (Recommend), conflict (Active; HPA injected by check C2) --------------
-python3 - "$FC" <<'PY' | k apply -f -
+python3 - "$APP" <<'PY' | k apply -f -
 import json, sys
 image = sys.argv[1]
 for name in ("active", "recommend", "conflict"):
