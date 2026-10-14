@@ -23,6 +23,7 @@ package controllers
 
 import (
 	"encoding/json"
+	"math"
 	"os"
 	"testing"
 	"time"
@@ -79,6 +80,12 @@ func TestReplayHarness(t *testing.T) {
 		t.Fatalf("parse %s: %v", inPath, err)
 	}
 
+	if in.HeadroomPercent < 0 || in.HeadroomPercent > 99 {
+		t.Fatalf("headroom_percent %d outside 0-99", in.HeadroomPercent)
+	}
+	if in.HeadroomPercent > 0 && !(in.PerPodRPM > 0 && !math.IsInf(in.PerPodRPM, 0)) {
+		t.Fatalf("headroom_percent %d needs a finite positive per_pod_rpm, got %v", in.HeadroomPercent, in.PerPodRPM)
+	}
 	r := &PredictiveAutoscalerReconciler{scaleStates: map[string]*scaleState{}}
 	state := r.getOrCreateScaleState("replay/app")
 	log := logr.Discard()
