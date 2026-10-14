@@ -304,6 +304,13 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	mode := autoscaler.Spec.EffectiveMode()
 	if st := r.getOrCreateScaleState(key); st.mode != mode || st.targetUID != deployment.UID {
 		*st = scaleState{mode: mode, targetUID: deployment.UID}
+		// A fresh state after an operator restart or a leader change has lost the in-memory write history. The
+		// persisted time of the last write to this same target seeds the scale-down cooldown, so the cooldown (which
+		// also applies under the overestimate override) holds across the gap. The stabilization holds need no seed:
+		// a fresh state restarts the below-current timer, which already blocks scale-down for the full window.
+		if mode == autoscalerv1alpha1.ModeActive {
+			st.lastScaleDown = persistedWriteTime(&autoscaler, deployment.UID, time.Now())
+		}
 	}
 
 	// --- METRIC SOURCE ---
@@ -1179,6 +1186,20 @@ func (r *PredictiveAutoscalerReconciler) calculateScaleDownTarget(
 	}
 
 	return target
+}
+
+// persistedWriteTime returns status.lastScaleTime when the status describes the same target object (zero otherwise).
+// A timestamp ahead of now (clock skew between operator replicas) is capped at now, so the hold never exceeds one
+// cooldown from the present.
+func persistedWriteTime(a *autoscalerv1alpha1.PredictiveAutoscaler, target types.UID, now time.Time) time.Time {
+	st := a.Status
+	if st.LastScaleTime == nil || st.TargetUID == "" || st.TargetUID != string(target) {
+		return time.Time{}
+	}
+	if t := st.LastScaleTime.Time; t.Before(now) {
+		return t
+	}
+	return now
 }
 
 // getOrCreateScaleState returns the scale state for a given key, creating it if needed.

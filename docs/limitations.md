@@ -17,8 +17,10 @@ production-ready. Known limits, most important first:
    namespace and name. Models from earlier versions carry no query provenance and must be retrained after an upgrade.
 5. **Single forecasting replica on a ReadWriteOnce volume:** the API and the trainer must run on the same node; the API is
    a single point of failure (the operator falls back to the reactive rule when it is down).
-6. **Operator state in memory:** cooldowns, stabilization windows and forecast caches are lost on restart, and when
-   leadership moves to another instance.
+6. **Operator state in memory:** stabilization timers and forecast caches are lost on restart and when leadership moves
+   to another instance. The holds err towards keeping replicas: the stabilization window starts again and the cooldown
+   is seeded from `status.lastScaleTime` (see Configuration), so a restart can delay a scale-down but never bring it
+   forward. A restarted operator fetches a fresh forecast before using one.
 7. **Permissions and authentication outside the chart:** the Helm chart gives each component its own least-privilege
    service account, NetworkPolicies, and TokenReview authentication over TLS between the operator and the forecasting
    service (helm.md). The plain manifests in `k8s-manifests/` still share one broad role and run the forecasting service

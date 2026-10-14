@@ -64,7 +64,10 @@ need.
 Scale-up is applied at once. Scale-down needs desired below current **continuously for 5 minutes** and no scale-up in the
 last 5 minutes (stabilization), at least 2 minutes since the previous scale-down (cooldown), and then removes at most
 `max(ceil(10 % × current), 2)` pods per step. When the overestimate cap is active, the stabilization checks are skipped but
-the cooldown still applies. This state is kept in memory, so an operator restart resets it.
+the cooldown still applies. This state is kept in memory. After an operator restart or a leadership change it errs
+towards holding: the 5-minute continuously-lower timer starts again, and the cooldown counts from the last write recorded
+in `status.lastScaleTime` (for the same target object), so no scale-down happens sooner than it would have without the
+restart. Scale-up is never delayed by a restart.
 
 **When the current request rate cannot be measured, the replica count is held.** Only a complete, successful answer with
 exactly one finite, non-negative sample counts as a measurement; a failed or partial query, an empty result (no series),
