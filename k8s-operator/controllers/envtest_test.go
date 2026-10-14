@@ -481,6 +481,8 @@ func TestEnvtestTheGeneratedSchemaValidatesAndDefaults(t *testing.T) {
 		"zero-baseline":   {"resources": map[string]interface{}{"baselineRPM": int64(0)}},
 		"unknown-mode":    {"mode": "Auto"},
 		"empty-target":    {"targetDeployment": map[string]interface{}{"name": "", "namespace": f.req.Namespace}},
+		"headroom-100":    {"behavior": map[string]interface{}{"scaleDown": map[string]interface{}{"headroomPercent": int64(100)}}},
+		"headroom-neg":    {"behavior": map[string]interface{}{"scaleDown": map[string]interface{}{"headroomPercent": int64(-1)}}},
 	} {
 		if _, err := create(name, spec); err == nil {
 			t.Errorf("%s: must be rejected", name)
@@ -503,8 +505,17 @@ func TestEnvtestTheGeneratedSchemaValidatesAndDefaults(t *testing.T) {
 			t.Errorf("%s = %v: an explicit false must not be defaulted", path, got)
 		}
 	}
+	zero, err := create("headroom-zero", map[string]interface{}{"behavior": map[string]interface{}{
+		"scaleDown": map[string]interface{}{"headroomPercent": int64(0)}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _, _ := unstructured.NestedFieldNoCopy(zero.Object, "spec", "behavior", "scaleDown", "headroomPercent"); got != int64(0) {
+		t.Errorf("an explicit headroomPercent 0 must not be defaulted, got %v", got)
+	}
 	u, err := create("defaults", map[string]interface{}{"metrics": map[string]interface{}{"cpu": map[string]interface{}{}},
-		"prediction": map[string]interface{}{}, "resources": map[string]interface{}{}})
+		"prediction": map[string]interface{}{}, "resources": map[string]interface{}{},
+		"behavior": map[string]interface{}{"scaleDown": map[string]interface{}{}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -513,6 +524,7 @@ func TestEnvtestTheGeneratedSchemaValidatesAndDefaults(t *testing.T) {
 		"spec.prediction.enabled": true, "spec.prediction.horizonMinutes": int64(60), "spec.prediction.leadTimeMinutes": int64(15),
 		"spec.prediction.updateIntervalSeconds": int64(300), "spec.resources.baselineRPM": int64(10000),
 		"spec.resources.cpuRequestMillicores": int64(100), "spec.resources.memoryRequestMB": int64(128),
+		"spec.behavior.scaleDown.headroomPercent": int64(10),
 	} {
 		got, found, _ := unstructured.NestedFieldNoCopy(u.Object, strings.Split(path, ".")...)
 		if !found || got != want {
@@ -524,7 +536,7 @@ func TestEnvtestTheGeneratedSchemaValidatesAndDefaults(t *testing.T) {
 	if err := f.c.Get(ctx, types.NamespacedName{Name: "predictiveautoscalers." + autoscalerv1alpha1.GroupVersion.Group}, &crd); err != nil {
 		t.Fatal(err)
 	}
-	if crd.GetLabels()["autoscaling.devkuban.com/crd-revision"] != "1" {
+	if crd.GetLabels()["autoscaling.devkuban.com/crd-revision"] != "2" {
 		t.Fatalf("the CRD revision label is missing: %v", crd.GetLabels())
 	}
 }

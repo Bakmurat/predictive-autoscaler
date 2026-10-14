@@ -12,7 +12,7 @@ package controllers
 //
 //	REPLAY_IN=in.json REPLAY_OUT=out.json go test ./controllers -run TestReplayHarness
 //
-// Input JSON:  {"min":1,"max":12,"steps":[{"t":"RFC3339","reactive":3,"predicted":5,
+// Input JSON:  {"min":1,"max":12,"headroom_percent":10,"per_pod_rpm":600,"steps":[{"t":"RFC3339","reactive":3,"predicted":5,
 //               "current_rpm":1234.5,"predictions":[...]}, ...]}
 // A keep_current step represents a missing current request rate (a failed, partial, empty or non-finite metrics
 // answer): its reactive count and RPM must be empty; a forecast may be present but cannot move the decision, because
@@ -23,6 +23,7 @@ package controllers
 
 import (
 	"encoding/json"
+	"math"
 	"os"
 	"testing"
 	"time"
@@ -43,6 +44,10 @@ type replayInput struct {
 	Min   int32        `json:"min"`
 	Max   int32        `json:"max"`
 	Steps []replayStep `json:"steps"`
+	// Scale-down headroom policy (spec.behavior.scaleDown.headroomPercent). Absent or 0 replays without it, which is
+	// how every controller before it behaved (the campaign's image included); per_pod_rpm is targetRPS x 60.
+	HeadroomPercent int32   `json:"headroom_percent,omitempty"`
+	PerPodRPM       float64 `json:"per_pod_rpm,omitempty"`
 }
 
 type replayDecision struct {
@@ -75,6 +80,12 @@ func TestReplayHarness(t *testing.T) {
 		t.Fatalf("parse %s: %v", inPath, err)
 	}
 
+	if in.HeadroomPercent < 0 || in.HeadroomPercent > 99 {
+		t.Fatalf("headroom_percent %d outside 0-99", in.HeadroomPercent)
+	}
+	if in.HeadroomPercent > 0 && !(in.PerPodRPM > 0 && !math.IsInf(in.PerPodRPM, 0)) {
+		t.Fatalf("headroom_percent %d needs a finite positive per_pod_rpm, got %v", in.HeadroomPercent, in.PerPodRPM)
+	}
 	r := &PredictiveAutoscalerReconciler{scaleStates: map[string]*scaleState{}}
 	state := r.getOrCreateScaleState("replay/app")
 	log := logr.Discard()
@@ -109,7 +120,14 @@ func TestReplayHarness(t *testing.T) {
 			state.lastScaleUp = time.Now()
 			state.belowCurrentSince = time.Time{}
 		case desired < current:
-			applied = r.calculateScaleDownTarget(log, state, current, desired)
+			floor := int32(0)
+			if !s.KeepCurrent {
+				floor = headroomFloor(s.CurrentRPM, in.PerPodRPM, in.HeadroomPercent, in.Max)
+			}
+			eventual, hold := headroomEventual(state, current, desired, floor)
+			if !hold {
+				applied = r.calculateScaleDownTarget(log, state, current, eventual)
+			}
 			if applied < current {
 				state.lastScaleDown = time.Now()
 				state.overrideActive = false

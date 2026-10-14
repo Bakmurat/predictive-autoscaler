@@ -306,6 +306,8 @@ pass "a query change refused the old model; retraining restored the forecast"
 # 7. the CRD gate
 crd=predictiveautoscalers.autoscaling.devkuban.com
 guard
+orig_rev="$(k get crd "$crd" -o jsonpath='{.metadata.labels.autoscaling\.devkuban\.com/crd-revision}')"
+[[ "$orig_rev" =~ ^[1-9][0-9]*$ ]] || die "the installed CRD has no valid revision label"
 k label crd "$crd" autoscaling.devkuban.com/crd-revision=0 --overwrite >/dev/null
 cur="$(current_app_pod operator)" || die "no single operator pod before the gate check"
 read -r old_op old_op_uid <<<"$cur"
@@ -316,7 +318,7 @@ op_pod="$(app_pods operator | awk -v old="$old_op_uid" '$2 != old {print $1}' | 
 [ "$(k -n "$NS" get pod "$op_pod" -o jsonpath='{.status.containerStatuses[0].ready}')" = false ] || die "the operator is ready on an incompatible CRD"
 [ "$(k -n "$NS" get pod "$op_pod" -o jsonpath='{.status.containerStatuses[0].restartCount}')" = 0 ] || die "the gate must keep the operator alive (no restarts)"
 k -n "$NS" logs "$op_pod" | grep -q "Waiting for a compatible CRD" || die "the gate's reason is not logged"
-k label crd "$crd" autoscaling.devkuban.com/crd-revision=1 --overwrite >/dev/null
+k label crd "$crd" "autoscaling.devkuban.com/crd-revision=$orig_rev" --overwrite >/dev/null
 wait_for 120 "the operator becomes ready once the CRD fits" k -n "$NS" wait --for=condition=ready "pod/$op_pod" --timeout=5s
 pass "the CRD gate held the operator unready (alive) on an older revision and released it"
 
