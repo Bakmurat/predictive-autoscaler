@@ -19,7 +19,7 @@ production-ready. Known limits, most important first:
    a single point of failure (the operator falls back to the reactive rule when it is down).
 6. **Operator state in memory:** the stabilization timers, overestimate tracking and forecast cache are lost on restart
    and when leadership moves to another instance. Scale-down holds restart conservatively (see Configuration: a fresh
-   state counts as a write at that moment), but forecast-dependent decisions may differ from an uninterrupted run.
+   state is held as if a scale write had just happened, at least 10 minutes before a scale-down), but forecast-dependent decisions may differ from an uninterrupted run.
 7. **Permissions and authentication outside the chart:** the Helm chart gives each component its own least-privilege
    service account, NetworkPolicies, and TokenReview authentication over TLS between the operator and the forecasting
    service (helm.md). The plain manifests in `k8s-manifests/` still share one broad role and run the forecasting service
