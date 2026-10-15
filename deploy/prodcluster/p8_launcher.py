@@ -7,9 +7,10 @@ Modes (one run = /evidence/<P8_RUN>/, held by a run-level lock while a mode runs
   gates    copies, for every hour the window needs (start - 1 h … stop - 1 h), the hour's ONE retained final attempt
            (/gates/attempts/, Codex r89) into a temporary directory, validates the COPIED bytes (exactly the six arm
            rows per hour, each finalized; any verdict — PASS, FAIL or INCOMPLETE — is admissible), then publishes them as
-           an immutable, hashed gates-<id>/. An hour without a final attempt, with more than one (conflicting finals) or
-           with any malformed attempt (unreadable, wrong arms or hour, missing/non-boolean or mixed finality; Codex r90)
-           publishes nothing. The mutable projection load-<hour>.json is never the source; the manifest records whether
+           an immutable, hashed gates-<id>/. An hour with more than one final attempt (conflicting finals) or any
+           malformed attempt (unreadable, wrong arms or hour, missing/non-boolean or mixed finality; Codex r90) publishes
+           nothing. An hour with no final attempt (all its attempts valid but non-final, or none) is published as an
+           explicit "unfinalized" slot without a gate file, so the detector classifies it unverified (Codex r97). The mutable projection load-<hour>.json is never the source; the manifest records whether
            it still equals the final attempt, and the name and hash of every attempt collected after the final one.
   final    re-verifies the newest gates directory against the requested window (exact hour set, no duplicates, hashes,
            every row re-validated), then re-analyses the run's attempt offline with it and, when mounted, the frozen
@@ -131,10 +132,17 @@ def copy_gates(src, rd, start, stop):
     for h in hours:
         final, later, pre, bad = hour_attempts(src, h)
         problems += [f"{hour_name(h)}: {b}" for b in bad]
-        if len(final) != 1:
-            problems.append(f"{hour_name(h)}: {len(final)} final attempts "
-                            + ("(none retained)" if not final else f"(conflicting finals {[os.path.basename(p) for p in final]})"))
-        if bad or len(final) != 1:
+        if len(final) > 1:
+            problems.append(f"{hour_name(h)}: {len(final)} final attempts (conflicting finals {[os.path.basename(p) for p in final]})")
+        if bad or len(final) > 1:
+            continue
+        if not final:
+            # Codex r97 (P9 amendment 2026-10-15): no final attempt, every retained attempt valid but non-final (or
+            # none at all) -> an explicit unfinalized slot. No gate file is published for it, so the detector classifies
+            # the hour unverified (all six arms INCOMPLETE); no provisional result is selected and nothing is invented.
+            kept = sorted(glob.glob(os.path.join(src, "attempts", hour_name(h)[:-len(".json")] + "-*.json")))
+            manifest.append({"file": hour_name(h), "status": "unfinalized",
+                             "attempts": [{"file": os.path.basename(p), "sha256": sha(p)} for p in kept]})
             continue
         dst = os.path.join(tmp, hour_name(h))
         shutil.copyfile(final[0], dst)
@@ -142,7 +150,7 @@ def copy_gates(src, rd, start, stop):
             os.fsync(fh.fileno())
         problems += check_gate_file(dst, h)                  # the bytes that are kept are the bytes validated
         proj = os.path.join(src, hour_name(h))
-        manifest.append({"file": hour_name(h), "sha256": sha(dst), "bytes": os.path.getsize(dst),
+        manifest.append({"file": hour_name(h), "status": "final", "sha256": sha(dst), "bytes": os.path.getsize(dst),
                          "source_attempt": os.path.basename(final[0]),
                          "projection_matches": os.path.exists(proj) and sha(proj) == sha(dst),
                          "later_attempts": [{"file": os.path.basename(p), "sha256": sha(p)} for p in later],
@@ -151,7 +159,8 @@ def copy_gates(src, rd, start, stop):
         shutil.rmtree(tmp)
         sys.exit("gate rows not admissible, nothing published:\n  " + "\n  ".join(problems))
     with open(os.path.join(tmp, "manifest.json"), "w") as fh:
-        json.dump({"window": [start, stop], "hours": len(hours), "files": manifest}, fh, indent=1)
+        json.dump({"window": [start, stop], "hours": len(hours), "files": manifest,
+                   "unfinalized": [f["file"] for f in manifest if f["status"] == "unfinalized"]}, fh, indent=1)
         fh.flush()
         os.fsync(fh.fileno())
     final_dir = fresh(os.path.join(rd, "gates-" + stamp()))
@@ -172,15 +181,32 @@ def verified_gates(rd, start, stop):
         sys.exit(f"{d} was made for window {m.get('window')}, not {[start, stop]}")
     if len(names) != len(set(names)) or sorted(names) != sorted(hour_name(h) for h in hours):
         sys.exit(f"{d} does not hold exactly the window's hours")
-    problems = []
+    slots = sorted(f["file"] for f in m["files"] if f.get("status") == "unfinalized")
+    if m.get("unfinalized") != slots:                # the report's list of unfinalized hours must be the manifest's
+        sys.exit(f"{d}: the unfinalized list {m.get('unfinalized')} does not match the slots {slots}")
+    problems, published = [], []
     for f, h in zip(sorted(m["files"], key=lambda f: f["file"]), sorted(hours)):
         p = os.path.join(d, f["file"])
+        if f.get("status") == "unfinalized":
+            if os.path.exists(p):                    # an unfinalized slot never carries a gate file (no later rerun)
+                sys.exit(f"{p} exists for an unfinalized slot")
+            tag = f["file"][:-len(".json")] + "-"
+            atts = f.get("attempts")
+            if not isinstance(atts, list) or not all(
+                    isinstance(a, dict) and isinstance(a.get("file"), str) and a["file"].startswith(tag)
+                    and isinstance(a.get("sha256"), str) and len(a["sha256"]) == 64
+                    and all(c in "0123456789abcdef" for c in a["sha256"]) for a in atts):
+                sys.exit(f"{f['file']}: malformed attempts list in an unfinalized slot")
+            continue
+        if f.get("status") != "final":
+            sys.exit(f"{f['file']}: unknown manifest status {f.get('status')!r}")
+        published.append(f["file"])
         if sha(p) != f["sha256"] or os.path.getsize(p) != f["bytes"]:
             sys.exit(f"gates file {p} does not match its manifest")
         problems += check_gate_file(p, h)
     if problems:
         sys.exit("gate rows not admissible:\n  " + "\n  ".join(problems))
-    extra = set(os.listdir(d)) - set(names) - {"manifest.json"}
+    extra = set(os.listdir(d)) - set(published) - {"manifest.json"}
     if extra:
         sys.exit(f"unexpected files in {d}: {sorted(extra)}")
     return d

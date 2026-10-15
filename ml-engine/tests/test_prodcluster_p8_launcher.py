@@ -46,14 +46,27 @@ def test_gates_are_copied_only_when_every_hour_has_six_finalized_rows(tmp_path):
     assert pl.verified_gates(str(run), S, E) == str(g)
 
 
-@pytest.mark.parametrize("kw", [{"hours": range(S, E, 3600)}, {"finalized": False}, {"drop_arm": True}])
-def test_missing_unfinalized_or_incomplete_hours_publish_nothing(tmp_path, kw):
-    src = gate_dir(tmp_path, **kw)
+def test_an_hour_with_a_malformed_attempt_publishes_nothing(tmp_path):
+    src = gate_dir(tmp_path, drop_arm=True)
     run = tmp_path / "run"
     run.mkdir()
     with pytest.raises(SystemExit):
         pl.copy_gates(src, str(run), S, E)
     assert not [p for p in run.iterdir() if p.name.startswith("gates")]
+
+
+@pytest.mark.parametrize("kw,unfinal", [({"hours": range(S, E, 3600)}, 1), ({"finalized": False}, 4)])
+def test_r97_hours_without_a_final_attempt_are_published_unfinalized(tmp_path, kw, unfinal):
+    """No final attempt (none retained, or only valid provisional ones): an explicit unfinalized slot, no gate file."""
+    src = gate_dir(tmp_path, **kw)
+    run = tmp_path / "run"
+    run.mkdir()
+    pl.copy_gates(src, str(run), S, E)
+    m, g = published_manifest(run)
+    slots = [f for f in m["files"] if f["status"] == "unfinalized"]
+    assert len(slots) == unfinal and m["unfinalized"] == [f["file"] for f in slots]
+    assert all(not (g / f["file"]).exists() for f in slots)          # nothing invented, no provisional row selected
+    assert pl.verified_gates(str(run), S, E) == str(g)
 
 
 def test_finalized_fail_rows_are_admissible(tmp_path):
@@ -191,13 +204,11 @@ def test_r89_the_final_attempt_is_copied_even_when_the_projection_was_rewritten(
     assert all(f["projection_matches"] and f["later_attempts"] == [] for f in m["files"] if f is not entry)
 
 
-@pytest.mark.parametrize("case", ["no_final", "two_finals", "unreadable"])
+@pytest.mark.parametrize("case", ["two_finals", "unreadable"])
 def test_r89_hours_without_exactly_one_readable_final_publish_nothing(tmp_path, case):
     src = gate_dir(tmp_path)
     att = tmp_path / "gates" / "attempts"
-    if case == "no_final":
-        (att / attempt_name(S, "20261007T091500Z")).write_text(json.dumps(rows_for(S, finalized=False)))
-    elif case == "two_finals":                                    # a manual rerun inside the final window
+    if case == "two_finals":                                    # a manual rerun inside the final window
         (att / attempt_name(S, "20261007T093000Z")).write_text(json.dumps(rows_for(S, status="FAIL")))
     else:
         (att / attempt_name(S, "20261007T101500Z")).write_text("{truncated")
@@ -274,3 +285,52 @@ def test_r90_only_the_listed_pre_maturity_collector_is_exempt(tmp_path):
     run2.mkdir()
     with pytest.raises(SystemExit):
         pl.copy_gates(src, str(run2), S, E)
+
+
+def test_r97_an_unfinalized_slot_can_never_gain_a_gate_file(tmp_path):
+    src = gate_dir(tmp_path, hours=range(S, E, 3600))           # the hour before start has no attempts at all
+    run = tmp_path / "run"
+    run.mkdir()
+    pl.copy_gates(src, str(run), S, E)
+    m, g = published_manifest(run)
+    (slot,) = [f for f in m["files"] if f["status"] == "unfinalized"]
+    (g / slot["file"]).write_text(json.dumps(rows_for(S - 3600)))   # a later "rerun" placed into the published slot
+    with pytest.raises(SystemExit):
+        pl.verified_gates(str(run), S, E)
+
+
+def test_r97_the_detector_classifies_an_unfinalized_hour_unverified(tmp_path):
+    spec = importlib.util.spec_from_file_location("infra_events", os.path.join(HERE, "..", "..", "deploy", "prodcluster", "infra_events.py"))
+    ie = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ie)
+    src = gate_dir(tmp_path, hours=range(S, E, 3600))
+    run = tmp_path / "run"
+    run.mkdir()
+    pl.copy_gates(src, str(run), S, E)
+    gates, files = ie.gate_hours(pl.verified_gates(str(run), S, E))
+    assert (S - 3600) * 1000 not in gates and len(files) == 3
+    cl = ie.Classifier.build([], [], gates, list(pl.ARMS))
+    assert cl.capacity((S - 3600) * 1000, (S - 3000) * 1000) == "unverified"
+
+
+@pytest.mark.parametrize("edit", ["drop_from_list", "extra_in_list", "bad_digest", "foreign_attempt", "not_a_list"])
+def test_r98_an_inconsistent_unfinalized_manifest_is_refused(tmp_path, edit):
+    src = gate_dir(tmp_path, finalized=False)                     # four unfinalized slots, each with one attempt
+    run = tmp_path / "run"
+    run.mkdir()
+    pl.copy_gates(src, str(run), S, E)
+    m, g = published_manifest(run)
+    slot = next(f for f in m["files"] if f["status"] == "unfinalized")
+    if edit == "drop_from_list":
+        m["unfinalized"] = m["unfinalized"][1:]
+    elif edit == "extra_in_list":
+        m["unfinalized"] = m["unfinalized"] + ["load-20991231T2300Z.json"]
+    elif edit == "bad_digest":
+        slot["attempts"][0]["sha256"] = "XYZ"
+    elif edit == "foreign_attempt":
+        slot["attempts"][0]["file"] = "load-20991231T2300Z-20991231T235900Z-1.json"
+    else:
+        slot["attempts"] = "none"
+    (g / "manifest.json").write_text(json.dumps(m))
+    with pytest.raises(SystemExit):
+        pl.verified_gates(str(run), S, E)
