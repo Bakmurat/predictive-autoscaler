@@ -42,11 +42,33 @@ for n in monitoring pa-soak; do k create namespace "$n" --dry-run=client -o yaml
 k -n pa-soak create configmap soak-scripts --from-file="$ROOT/soak/app.py" --dry-run=client -o yaml | k apply -f -
 k -n monitoring create configmap soak-scripts --from-file="$ROOT/soak/traffic.py" --from-file="$ROOT/hack/smoke/synth.py" \
   --dry-run=client -o yaml | k apply -f -
-python3 - "$ROOT/quickstart/backend.yaml" <<'PY' | k apply -f -
-import sys
-docs = open(sys.argv[1]).read().split("\n---\n")
-print("\n---\n".join(d for d in docs if "name: vm," in d))     # the store and its Service; not the quickstart traffic
+# The metrics store keeps its data on a PVC (soak O4: with the container layer, a restart lost all history and reset
+# the training warm-up). A running store without the volume is left untouched: replacing it would lose its data.
+if [ -n "$(k -n monitoring get deploy vm --ignore-not-found -o name)" ] \
+   && [ -z "$(k -n monitoring get deploy vm -o jsonpath='{.spec.template.spec.volumes[*].name}')" ]; then
+  log "keeping the running metrics store without a volume (replacing it would lose its data; soak O4)"
+else
+  python3 - "$VM_IMAGE" <<'PY' | k apply -f -
+import json, sys
+print(json.dumps({"apiVersion": "v1", "kind": "PersistentVolumeClaim", "metadata": {"name": "vm-data", "namespace": "monitoring"},
+                  "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "5Gi"}}}}))
+print("---")
+print(json.dumps({"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "vm", "namespace": "monitoring"},
+    "spec": {"strategy": {"type": "Recreate"}, "selector": {"matchLabels": {"app": "vm"}},
+             "template": {"metadata": {"labels": {"app": "vm"}}, "spec": {
+                 "containers": [{"name": "vm", "image": sys.argv[1], "imagePullPolicy": "Never",
+                                 "args": ["-retentionPeriod=30d", "-search.latencyOffset=0s", "-search.disableCache",
+                                          "-memory.allowedPercent=60", "-storageDataPath=/vm-data"],
+                                 "ports": [{"containerPort": 8428}],
+                                 "resources": {"requests": {"cpu": "100m", "memory": "128Mi"}, "limits": {"memory": "512Mi"}},
+                                 "readinessProbe": {"httpGet": {"path": "/health", "port": 8428}},
+                                 "volumeMounts": [{"name": "data", "mountPath": "/vm-data"}]}],
+                 "volumes": [{"name": "data", "persistentVolumeClaim": {"claimName": "vm-data"}}]}}}}))
+print("---")
+print(json.dumps({"apiVersion": "v1", "kind": "Service", "metadata": {"name": "vm", "namespace": "monitoring"},
+                  "spec": {"selector": {"app": "vm"}, "ports": [{"port": 8428}]}}))
 PY
+fi
 
 # --- workloads: active (Active), recommend (Recommend), conflict (Active; HPA injected by check C2) --------------
 python3 - "$APP" <<'PY' | k apply -f -
