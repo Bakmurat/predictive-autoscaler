@@ -1,9 +1,15 @@
 # Release: on a version tag vX.Y.Z only, publish the two images (linux/amd64 + linux/arm64) and the Helm chart to GHCR.
-# - The tag must equal the chart's version and appVersion (Chart.yaml); a mismatch fails before anything is pushed.
-# - Images carry an SBOM and SLSA provenance (buildx attestations) and are signed keyless with cosign (GitHub OIDC); the
-#   chart is pushed as an OCI artifact and signed the same way.
-# - Security (public repository): actions pinned to commit SHAs, write access only to packages, no other secrets, and
-#   never triggered by pull requests or branch pushes. workflow_dispatch runs a dry run (build, no push, no signing).
+# Gate (before anything is pushed):
+#   - the tag is a strict semantic version equal to the chart's version and appVersion (Chart.yaml parsed as YAML);
+#   - the tagged commit is on main, and every required CI check for that exact commit succeeded;
+#   - the packaged chart's default images are exactly the images this release publishes;
+#   - none of the three artifacts exists yet (versions are immutable; a partial release is never overwritten).
+# Publishing: images built from the tagged commit, with an SBOM and SLSA provenance, signed keyless with cosign by digest;
+# the chart pushed as an OCI artifact and signed the same way; a release inventory (version, source SHA, digests) is
+# uploaded as a workflow artifact. workflow_dispatch is a read-only dry run (gate checks, builds, chart render; no push).
+# Security (public repository): actions pinned to commit SHAs; QEMU (binfmt), BuildKit and Buildx pinned by digest or
+# version; publishing jobs alone get packages:write and id-token:write; never triggered by pull requests or branches.
+# Tag protection (who may create, move or delete v* tags) is a repository ruleset: see docs/releasing.md.
 name: release
 
 on:
@@ -25,42 +31,100 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   OWNER: bakmurat                                 # lower-case owner for OCI references
-  PUSH: ${{ github.event_name == 'push' }}
+  CHART: charts/predictive-autoscaler
+  BINFMT_IMAGE: tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+  BUILDKIT_IMAGE: moby/buildkit:v0.34.0@sha256:b059f8d7226d0b326bc871af489a5dddf65e36af4d20d14251b072974d9ee87c
+  BUILDX_VERSION: v0.38.0
+  HELM_VERSION: v3.22.0
+  HELM_SHA256: 1e4ab49e429626cf6c6958d914248b78c9730803c2751b87627e171dc800e7bb
+  # the CI checks that must have succeeded on the tagged commit (ci.yml, quickstart.yml, smoke.yml job names)
+  REQUIRED_CHECKS: |
+    operator (go vet, go test -race)
+    operator write path (envtest, Kubernetes 1.35 API server)
+    forecaster + evaluation tooling (pytest, scorer, archive)
+    chart (helm v3.22.0 lint + template, kubeconform 1.33–1.35)
+    chart (helm v4.3.0 lint + template, kubeconform 1.33–1.35)
+    newcomer install (kind, Kubernetes 1.35)
+    install smoke test (kind, Kubernetes 1.35)
 
 jobs:
-  version:
-    name: version check (tag = chart version = appVersion)
+  gate:
+    name: gate (version, source on main, CI green, chart images)
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      checks: read
     outputs:
       version: ${{ steps.v.outputs.version }}
+      sha: ${{ steps.v.outputs.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.sha }}
       - id: v
         env:
+          EVENT: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
           INPUT_VERSION: ${{ inputs.version }}
+          SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          if [ "$PUSH" = true ]; then v="${REF_NAME#v}"; else v="${INPUT_VERSION#v}"; fi
-          [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "not a semantic version: $v" >&2; exit 1; }
-          cv=$(awk '/^version:/ {print $2}' charts/predictive-autoscaler/Chart.yaml)
-          av=$(awk '/^appVersion:/ {gsub(/"/, "", $2); print $2}' charts/predictive-autoscaler/Chart.yaml)
-          [ "$v" = "$cv" ] && [ "$v" = "$av" ] || { echo "tag $v != chart version $cv / appVersion $av" >&2; exit 1; }
-          echo "version=$v" >> "$GITHUB_OUTPUT"
+          if [ "$EVENT" = push ]; then v="${REF_NAME#v}"; else v="${INPUT_VERSION#v}"; fi
+          [[ "$v" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo "not a strict semantic version: $v" >&2; exit 1; }
+          cv=$(yq -r '.version' "$CHART/Chart.yaml"); av=$(yq -r '.appVersion' "$CHART/Chart.yaml")
+          [ "$v" = "$cv" ] && [ "$v" = "$av" ] || { echo "version $v != chart version $cv / appVersion $av" >&2; exit 1; }
+          git merge-base --is-ancestor "$SHA" origin/main || { echo "commit $SHA is not on main" >&2; [ "$EVENT" = push ] && exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"; echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+      - name: required CI checks succeeded on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$REPO/commits/$SHA/check-runs?per_page=100" --jq '.check_runs[] | [.name, (.conclusion // .status)] | @tsv' > runs.tsv
+          missing=0
+          while IFS= read -r name; do
+            [ -z "$name" ] && continue
+            if ! awk -F'\t' -v n="$name" '$1 == n && $2 == "success" {ok=1} END {exit !ok}' runs.tsv; then
+              echo "required check not successful on $SHA: $name"; missing=1
+            fi
+          done <<< "$REQUIRED_CHECKS"
+          if [ "$missing" = 1 ] && [ "$EVENT" = push ]; then exit 1; fi
+      - name: install helm (checksum verified)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin" && cd "$RUNNER_TEMP"
+          curl -fsSLo helm.tgz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  helm.tgz" | sha256sum -c -
+          tar -xzf helm.tgz linux-amd64/helm && mv linux-amd64/helm bin/
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: lint, package, and check the packaged chart's images
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          # the chart requires prometheus.url (no default); lint every reviewed value set, as scripts/chart-check.sh does
+          for f in "$CHART"/ci/*.yaml; do helm lint --strict "$CHART" -f "$f" --kube-version 1.35.0; done
+          helm package "$CHART" -d "$RUNNER_TEMP/dist"
+          pkg="$RUNNER_TEMP/dist/predictive-autoscaler-${VERSION}.tgz"
+          got=$(helm template pa "$pkg" -f "$CHART/ci/default-values.yaml" --kube-version 1.35.0 \
+                | awk '$1 == "image:" {print $2}' | tr -d '"' | sort -u)
+          want=$(printf '%s\n' "$REGISTRY/$OWNER/predictive-autoscaler-ml-api:$VERSION" "$REGISTRY/$OWNER/predictive-autoscaler-operator:$VERSION" | sort -u)
+          [ "$got" = "$want" ] || { printf 'packaged chart images:\n%s\nexpected:\n%s\n' "$got" "$want" >&2; exit 1; }
 
-  images:
-    name: image ${{ matrix.name }}
-    needs: version
+  build:
+    name: build ${{ matrix.name }}${{ github.event_name == 'push' && ' (push, sign)' || ' (dry run)' }}
+    needs: gate
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
       contents: read
-      packages: write
-      id-token: write                             # keyless cosign signing
-      attestations: write
+    if: github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: true
       matrix:
@@ -71,51 +135,95 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ needs.gate.outputs.sha }}
       - uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392   # v3.6.0
+        with:
+          image: ${{ env.BINFMT_IMAGE }}
       - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435   # v3.11.1
-      - if: env.PUSH == 'true'
-        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772   # v3.4.0
+        with:
+          version: ${{ env.BUILDX_VERSION }}
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
+      - uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83   # v6.18.0
+        with:
+          context: ${{ matrix.context }}
+          platforms: linux/amd64,linux/arm64
+          push: false
+          tags: ${{ env.REGISTRY }}/${{ env.OWNER }}/${{ matrix.name }}:${{ needs.gate.outputs.version }}
+
+  images:
+    name: publish ${{ matrix.name }}
+    needs: gate
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write                             # keyless cosign signing
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - {name: predictive-autoscaler-operator, context: k8s-operator}
+          - {name: predictive-autoscaler-ml-api, context: ml-engine}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.gate.outputs.sha }}
+      - uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392   # v3.6.0
+        with:
+          image: ${{ env.BINFMT_IMAGE }}
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435   # v3.11.1
+        with:
+          version: ${{ env.BUILDX_VERSION }}
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
+      - uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772   # v3.4.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: refuse an existing version (immutable releases)
+        env:
+          REF: ${{ env.REGISTRY }}/${{ env.OWNER }}/${{ matrix.name }}:${{ needs.gate.outputs.version }}
+        run: |
+          if docker buildx imagetools inspect "$REF" >/dev/null 2>&1; then
+            echo "$REF already exists: versions are immutable; release a new patch version instead" >&2; exit 1
+          fi
       - id: build
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83   # v6.18.0
         with:
           context: ${{ matrix.context }}
           platforms: linux/amd64,linux/arm64
-          push: ${{ env.PUSH == 'true' }}
+          push: true
           provenance: mode=max
           sbom: true
-          tags: ${{ env.REGISTRY }}/${{ env.OWNER }}/${{ matrix.name }}:${{ needs.version.outputs.version }}
+          tags: ${{ env.REGISTRY }}/${{ env.OWNER }}/${{ matrix.name }}:${{ needs.gate.outputs.version }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ needs.version.outputs.version }}
+            org.opencontainers.image.revision=${{ needs.gate.outputs.sha }}
+            org.opencontainers.image.version=${{ needs.gate.outputs.version }}
             org.opencontainers.image.licenses=Apache-2.0
-      - if: env.PUSH == 'true'
-        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac   # v3.9.1
-      - if: env.PUSH == 'true'
-        env:
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac   # v3.9.1
+      - env:
           REF: ${{ env.REGISTRY }}/${{ env.OWNER }}/${{ matrix.name }}@${{ steps.build.outputs.digest }}
         run: cosign sign --yes "$REF"
 
   chart:
-    name: chart (package, push to OCI, sign)
-    needs: [version, images]
+    name: publish chart and inventory
+    needs: [gate, images]
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: read
       packages: write
       id-token: write
-    env:
-      HELM_VERSION: v3.22.0
-      HELM_SHA256: 1e4ab49e429626cf6c6958d914248b78c9730803c2751b87627e171dc800e7bb
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ needs.gate.outputs.sha }}
       - name: install helm (checksum verified)
         run: |
           set -euo pipefail
@@ -124,27 +232,39 @@ jobs:
           echo "${HELM_SHA256}  helm.tgz" | sha256sum -c -
           tar -xzf helm.tgz linux-amd64/helm && mv linux-amd64/helm bin/
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
-      - name: lint and package
-        run: |
-          set -euo pipefail
-          # the chart requires prometheus.url (no default); lint every reviewed value set, as scripts/chart-check.sh does
-          for f in charts/predictive-autoscaler/ci/*.yaml; do helm lint --strict charts/predictive-autoscaler -f "$f" --kube-version 1.35.0; done
-          helm package charts/predictive-autoscaler -d "$RUNNER_TEMP/dist"
-          ls -l "$RUNNER_TEMP/dist"
-      - if: env.PUSH == 'true'
-        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac   # v3.9.1
-      - if: env.PUSH == 'true'
-        name: push and sign
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435   # v3.11.1
+        with:
+          version: ${{ env.BUILDX_VERSION }}
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac   # v3.9.1
+      - name: push and sign the chart; write the inventory
         env:
-          VERSION: ${{ needs.version.outputs.version }}
+          VERSION: ${{ needs.gate.outputs.version }}
+          SHA: ${{ needs.gate.outputs.sha }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
           printf '%s' "$GH_TOKEN" | helm registry login "$REGISTRY" -u "$ACTOR" --password-stdin
-          out=$(helm push "$RUNNER_TEMP/dist/predictive-autoscaler-${VERSION}.tgz" "oci://${REGISTRY}/${OWNER}/charts" 2>&1)
-          echo "$out"
-          digest=$(echo "$out" | awk '/^Digest:/ {print $2}')
-          [ -n "$digest" ] || { echo "no digest from helm push" >&2; exit 1; }
+          printf '%s' "$GH_TOKEN" | docker login "$REGISTRY" -u "$ACTOR" --password-stdin
+          if helm show chart "oci://$REGISTRY/$OWNER/charts/predictive-autoscaler" --version "$VERSION" >/dev/null 2>&1; then
+            echo "chart $VERSION already exists: versions are immutable" >&2; exit 1
+          fi
+          helm package "$CHART" -d "$RUNNER_TEMP/dist"
+          out=$(helm push "$RUNNER_TEMP/dist/predictive-autoscaler-${VERSION}.tgz" "oci://$REGISTRY/$OWNER/charts" 2>&1); echo "$out"
+          digests=$(echo "$out" | grep -oE 'sha256:[0-9a-f]{64}' | sort -u)
+          [ "$(echo "$digests" | grep -c .)" = 1 ] || { echo "expected exactly one chart digest from helm push" >&2; exit 1; }
           printf '%s' "$GH_TOKEN" | cosign login "$REGISTRY" -u "$ACTOR" --password-stdin
-          cosign sign --yes "${REGISTRY}/${OWNER}/charts/predictive-autoscaler@${digest}"
+          cosign sign --yes "$REGISTRY/$OWNER/charts/predictive-autoscaler@${digests}"
+          img() { docker buildx imagetools inspect "$REGISTRY/$OWNER/$1:$VERSION" --format '{{json .Manifest.Digest}}' | tr -d '"'; }
+          jq -n --arg v "$VERSION" --arg sha "$SHA" --arg op "$(img predictive-autoscaler-operator)" \
+                --arg ml "$(img predictive-autoscaler-ml-api)" --arg chart "$digests" --arg reg "$REGISTRY/$OWNER" '{
+            version: $v, source_sha: $sha,
+            images: {("\($reg)/predictive-autoscaler-operator"): $op, ("\($reg)/predictive-autoscaler-ml-api"): $ml},
+            chart: {("oci://\($reg)/charts/predictive-autoscaler"): $chart}}' > "$RUNNER_TEMP/release-inventory-${VERSION}.json"
+          cat "$RUNNER_TEMP/release-inventory-${VERSION}.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2
+        with:
+          name: release-inventory-${{ needs.gate.outputs.version }}
+          path: ${{ runner.temp }}/release-inventory-${{ needs.gate.outputs.version }}.json
+          if-no-files-found: error
