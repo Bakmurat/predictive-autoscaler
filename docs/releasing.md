@@ -16,17 +16,20 @@ identity is this repository's `release` workflow at that exact tag. Before anyth
 - none of the artifacts exists yet (versions are immutable).
 Each run uploads a `release-inventory-X.Y.Z` artifact (version, source commit, image and chart digests).
 
+## Before the first release (once)
+- Add a repository ruleset for tags `v*`: only the maintainer may create them; updates and deletions are blocked. This
+  must be in place **before the first tag is pushed**, because a workflow cannot protect its own tags.
+- After the first release, make the three GHCR packages public (package settings on GitHub).
+
 ## Steps
 1. Set `version` and `appVersion` in `charts/predictive-autoscaler/Chart.yaml` to `X.Y.Z` (the workflow refuses a tag
-   that differs from either), update `docs/upgrading.md`, and merge to `main` with CI green.
-2. Optional dry run: run the `release` workflow by hand with `version: X.Y.Z` (it builds both images and packages the
-   chart, and pushes nothing).
+   that differs from either), update `docs/upgrading.md`, and merge to `main` with every CI check green (the workflow
+   checks them on the tagged commit itself).
+2. Optional dry run: run the `release` workflow by hand with `version: X.Y.Z`. It runs the gate, builds both images and
+   checks the packaged chart, and pushes nothing.
 3. Tag and push: `git tag -s vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z`.
-4. The first time only: make the three GHCR packages public (package settings on GitHub), and add a repository
-   ruleset for tags `v*` that allows only the maintainer to create them and blocks updates and deletions (a workflow
-   cannot protect its own tags).
-5. If a release fails half-way (for example one image pushed), do not rerun it: versions are immutable, and the rerun
-   refuses. Delete the partial package versions on GitHub, or release the next patch version.
+4. If a release fails half-way (for example one image pushed), that version is **abandoned**: never delete its packages
+   to reuse the number, and never rerun it (the preflight refuses). Fix the cause and release the next patch version.
 
 ## Installing a release
 ```bash
