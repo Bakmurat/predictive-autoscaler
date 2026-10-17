@@ -55,7 +55,8 @@ def classify_http(status, body):
         codes = {e.get("code") for e in (json.loads(body or "{}").get("errors") or []) if isinstance(e, dict)}
     except (ValueError, AttributeError):
         pass
-    if status == 404 and codes & {"MANIFEST_UNKNOWN", "NAME_UNKNOWN"}:
+    codes.discard(None)
+    if status == 404 and codes and codes <= {"MANIFEST_UNKNOWN", "NAME_UNKNOWN"}:   # only absence codes; mixed fails closed
         return "absent"
     raise RuntimeError(f"registry answered HTTP {status} {sorted(c for c in codes if c)}: not a confirmed absence")
 
@@ -65,23 +66,37 @@ MANIFEST_TYPES = ", ".join(["application/vnd.oci.image.index.v1+json", "applicat
                             "application/vnd.docker.distribution.manifest.v2+json"])
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect: credentials (Basic or Bearer) must never be re-sent to another location."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise RuntimeError(f"refusing HTTP {code} redirect to {newurl}")
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def _get(url, headers):
+    """(status, body) of a GET without following redirects; HTTP errors return their status."""
+    try:
+        with _OPENER.open(urllib.request.Request(url, headers=headers, method="GET"), timeout=60) as r:
+            return r.status, r.read(65536).decode(errors="replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read(65536).decode(errors="replace")
+
+
 def lookup(registry, repository, tag, user, token):
     """(status, body) of GET /v2/<repository>/manifests/<tag>, with a pull token from the registry's token endpoint
     (Basic auth with the workflow token). A failed token exchange raises."""
     basic = base64.b64encode(f"{user}:{token}".encode()).decode()
     q = urllib.parse.urlencode({"scope": f"repository:{repository}:pull", "service": registry})
-    req = urllib.request.Request(f"https://{registry}/token?{q}", headers={"Authorization": f"Basic {basic}"})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        bearer = json.load(r).get("token")
+    status, body = _get(f"https://{registry}/token?{q}", {"Authorization": f"Basic {basic}"})
+    if status != 200:
+        raise RuntimeError(f"registry token exchange answered HTTP {status}")
+    bearer = json.loads(body).get("token")
     if not bearer:
         raise RuntimeError("no registry token")
-    req = urllib.request.Request(f"https://{registry}/v2/{repository}/manifests/{tag}", method="GET",
-                                 headers={"Authorization": f"Bearer {bearer}", "Accept": MANIFEST_TYPES})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            return r.status, r.read(4096).decode(errors="replace")
-    except urllib.error.HTTPError as e:
-        return e.code, e.read(4096).decode(errors="replace")
+    return _get(f"https://{registry}/v2/{repository}/manifests/{tag}",
+                {"Authorization": f"Bearer {bearer}", "Accept": MANIFEST_TYPES})
 
 
 def check_ci(check_runs, workflow_runs, sha, repo, required=REQUIRED_CHECKS, event="push", branch="main"):

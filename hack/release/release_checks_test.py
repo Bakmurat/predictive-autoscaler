@@ -49,9 +49,49 @@ class Lookup(unittest.TestCase):
                 rc.classify_http(status, NOT_FOUND)
 
     def test_unrecognised_404(self):
-        for body in ("", "not json", '{"errors":[{"code":"DENIED"}]}'):
+        for body in ("", "not json", '{"errors":[]}', '{"errors":[{"code":"DENIED"}]}',
+                     '{"errors":[{"code":"MANIFEST_UNKNOWN"},{"code":"DENIED"}]}'):   # mixed codes fail closed
             with self.assertRaises(RuntimeError, msg=body):
                 rc.classify_http(404, body)
+
+
+class NoRedirect(unittest.TestCase):
+    """Neither Basic nor Bearer credentials may follow a redirect (Codex r4), including to plain HTTP elsewhere."""
+    def test_redirect_is_refused_and_the_target_never_sees_credentials(self):
+        import http.server
+        import threading
+        seen = []
+
+        class Target(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append(self.headers.get("Authorization"))
+                self.send_response(200); self.end_headers(); self.wfile.write(b"{}")
+
+            def log_message(self, *a):
+                pass
+
+        target = http.server.HTTPServer(("127.0.0.1", 0), Target)
+
+        class Redirector(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(302)
+                self.send_header("Location", f"http://127.0.0.1:{target.server_port}/stolen")
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        redirector = http.server.HTTPServer(("127.0.0.1", 0), Redirector)
+        for srv in (target, redirector):
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            for auth in ("Basic dXNlcjpzZWNyZXQ=", "Bearer token-value"):
+                with self.assertRaises(RuntimeError):
+                    rc._get(f"http://127.0.0.1:{redirector.server_port}/token", {"Authorization": auth})
+            self.assertEqual(seen, [])
+        finally:
+            for srv in (target, redirector):
+                srv.shutdown()
 
 
 class Ci(unittest.TestCase):
