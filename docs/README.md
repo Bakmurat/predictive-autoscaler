@@ -8,6 +8,7 @@
 | [coexistence.md](coexistence.md) | Running next to HPA/KEDA/VPA, the paused-KEDA fallback pattern, GitOps. |
 | [helm.md](helm.md) | Installing with the Helm chart: required values, permissions, the CRD under Helm and Argo CD, network policies. |
 | [upgrading.md](upgrading.md) | Moving autoscalers from the legacy API group `autoscaler.example.com` to `autoscaling.devkuban.com`. |
+| [releasing.md](releasing.md) | Publishing a release (signed multi-arch images and the OCI Helm chart on GHCR), installing and verifying one. |
 | [limitations.md](limitations.md) | What the current version does not do, most important first. |
 | [RESEARCH-2026-09-22.md](RESEARCH-2026-09-22.md) | Literature review behind the design. |
 
