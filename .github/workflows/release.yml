@@ -1,0 +1,150 @@
+# Release: on a version tag vX.Y.Z only, publish the two images (linux/amd64 + linux/arm64) and the Helm chart to GHCR.
+# - The tag must equal the chart's version and appVersion (Chart.yaml); a mismatch fails before anything is pushed.
+# - Images carry an SBOM and SLSA provenance (buildx attestations) and are signed keyless with cosign (GitHub OIDC); the
+#   chart is pushed as an OCI artifact and signed the same way.
+# - Security (public repository): actions pinned to commit SHAs, write access only to packages, no other secrets, and
+#   never triggered by pull requests or branch pushes. workflow_dispatch runs a dry run (build, no push, no signing).
+name: release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "dry run for this version (must equal Chart.yaml); nothing is pushed"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  OWNER: bakmurat                                 # lower-case owner for OCI references
+  PUSH: ${{ github.event_name == 'push' }}
+
+jobs:
+  version:
+    name: version check (tag = chart version = appVersion)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          persist-credentials: false
+      - id: v
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$PUSH" = true ]; then v="${REF_NAME#v}"; else v="${INPUT_VERSION#v}"; fi
+          [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "not a semantic version: $v" >&2; exit 1; }
+          cv=$(awk '/^version:/ {print $2}' charts/predictive-autoscaler/Chart.yaml)
+          av=$(awk '/^appVersion:/ {gsub(/"/, "", $2); print $2}' charts/predictive-autoscaler/Chart.yaml)
+          [ "$v" = "$cv" ] && [ "$v" = "$av" ] || { echo "tag $v != chart version $cv / appVersion $av" >&2; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+  images:
+    name: image ${{ matrix.name }}
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write                             # keyless cosign signing
+      attestations: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - {name: predictive-autoscaler-operator, context: k8s-operator}
+          - {name: predictive-autoscaler-ml-api, context: ml-engine}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392   # v3.6.0
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435   # v3.11.1
+      - if: env.PUSH == 'true'
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772   # v3.4.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83   # v6.18.0
+        with:
+          context: ${{ matrix.context }}
+          platforms: linux/amd64,linux/arm64
+          push: ${{ env.PUSH == 'true' }}
+          provenance: mode=max
+          sbom: true
+          tags: ${{ env.REGISTRY }}/${{ env.OWNER }}/${{ matrix.name }}:${{ needs.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}
+            org.opencontainers.image.licenses=Apache-2.0
+      - if: env.PUSH == 'true'
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac   # v3.9.1
+      - if: env.PUSH == 'true'
+        env:
+          REF: ${{ env.REGISTRY }}/${{ env.OWNER }}/${{ matrix.name }}@${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "$REF"
+
+  chart:
+    name: chart (package, push to OCI, sign)
+    needs: [version, images]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    env:
+      HELM_VERSION: v3.22.0
+      HELM_SHA256: 1e4ab49e429626cf6c6958d914248b78c9730803c2751b87627e171dc800e7bb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install helm (checksum verified)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin" && cd "$RUNNER_TEMP"
+          curl -fsSLo helm.tgz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  helm.tgz" | sha256sum -c -
+          tar -xzf helm.tgz linux-amd64/helm && mv linux-amd64/helm bin/
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: lint and package
+        run: |
+          set -euo pipefail
+          # the chart requires prometheus.url (no default); lint every reviewed value set, as scripts/chart-check.sh does
+          for f in charts/predictive-autoscaler/ci/*.yaml; do helm lint --strict charts/predictive-autoscaler -f "$f" --kube-version 1.35.0; done
+          helm package charts/predictive-autoscaler -d "$RUNNER_TEMP/dist"
+          ls -l "$RUNNER_TEMP/dist"
+      - if: env.PUSH == 'true'
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac   # v3.9.1
+      - if: env.PUSH == 'true'
+        name: push and sign
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | helm registry login "$REGISTRY" -u "$ACTOR" --password-stdin
+          out=$(helm push "$RUNNER_TEMP/dist/predictive-autoscaler-${VERSION}.tgz" "oci://${REGISTRY}/${OWNER}/charts" 2>&1)
+          echo "$out"
+          digest=$(echo "$out" | awk '/^Digest:/ {print $2}')
+          [ -n "$digest" ] || { echo "no digest from helm push" >&2; exit 1; }
+          printf '%s' "$GH_TOKEN" | cosign login "$REGISTRY" -u "$ACTOR" --password-stdin
+          cosign sign --yes "${REGISTRY}/${OWNER}/charts/predictive-autoscaler@${digest}"

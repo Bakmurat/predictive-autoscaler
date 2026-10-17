@@ -5,6 +5,8 @@ least privilege it needs. It installs no PredictiveAutoscaler: those belong with
 
 ```
 helm install pa charts/predictive-autoscaler -n predictive-autoscaler --create-namespace -f my-values.yaml
+# from a release (docs/releasing.md):
+# helm install pa oci://ghcr.io/bakmurat/charts/predictive-autoscaler --version X.Y.Z -n predictive-autoscaler --create-namespace -f my-values.yaml
 ```
 
 Requirements: Kubernetes 1.33 or later, and a Prometheus-compatible query API with the request metrics of your
