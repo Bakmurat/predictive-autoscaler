@@ -23,6 +23,14 @@
   "recorded_by": "claude (benchmark agent)",
   "terminated_before": "2026-10-05T10:32:02Z"
  },
+ "nginx-ensemble-85c768566b-tfc9f": {
+  "at": "2026-10-17T23:54:28Z",
+  "evidence": "operator scale-down after T0, the first E1 (nginx-ensemble) preStop miss and the second after T0 (cjw6v; P9 amendment R1-R4; flagged by R8 at 17:32Z): deletionTimestamp 2026-10-17T16:08:22Z with terminationGracePeriodSeconds 75 (deletion requested ~16:07:07Z; replicas 10->9 at 16:07:30Z); node k5nbm Ready=true at every sample 15:45-16:25Z, kubelet up=1 and process start unchanged (kubelet PID 1235 started 2026-10-12T03:40:52Z, no restart); kube-state-metrics up=1 on all three targets at every scrape 15:45-16:25Z: the pod's last finite kube_pod_info sample is 16:07:50.671Z and its 16:08:10.671Z sample is a staleness marker (NaN), while the other nginx-ensemble pods of that moment (incl. kcszn and srpp5 on k5nbm) stay listed; envoy up=1 to 16:07:43.623Z, 0 at 16:08:13.623Z, stale 16:08:32.037Z; no series of the pod in 16:10-23:50Z (no contradictory later observation); no bench_final_* series for this pod. Pod start 13:50:07Z (kube_pod_start_time; kubelet first line 13:50:07.496Z), istio-proxy/nginx started 13:50:09Z, restarts 0. The kubelet logged at 16:07:23.183603Z \"PreStop hook failed\" err=\"command '/bin/sh /opt/final-snapshot/final-snapshot.sh' exited with 1: \" with empty output, ~16 s after the deletion request (inference, not established: the same timing as 6lxkq/nf9rt/cjw6v, SETTLE 6 s + WAIT 10 s), tore down the pod volumes 16:08:07.98-.99Z, removed the containers at 16:08:08.08-.10Z (nginx 0d769d93b1b8 at 16:08:08.103630Z) and cleaned the pod dir 16:08:09.569Z (k5nbm kubelet.log read by the main session; it gives the pod UID, which this kube-state-metrics does not export; summary kubelet-log-summary-main-20261017T235350Z.md sha256 50ea326c22013f1782fa8903ca0ab35292d7655c7c8461f62f0abc61234b3720; no Killing/SyncLoop lines at this verbosity). Why the script exited 1 is unknown (flagged). Bound: later of KSM disappearance 16:08:10.671Z + 90 s = 16:09:40.671Z and container removal 16:08:08.104Z, rounded strictly up = 16:10:00Z. Raw VictoriaMetrics responses (read through the API server's service proxy) with hashes: agent-coordination/03-predictive-benchmark-aws/prodcluster-20261005/evidence-tfc9f-20261017/ (SHA256SUMS sha256 325b57b3e025d0e0baaa547ebc75a62422f5834c4e3721155a4df0ce28817eaa, workspace repo). Closes the pod for hours after 16:10:00Z only; its own hour (16Z) stays INCOMPLETE.",
+  "pod_start": "2026-10-17T13:50:07Z",
+  "pod_uid": "96df1bae-941a-4761-a92d-4c6cdcc0ba28",
+  "recorded_by": "claude (predictivescaler, benchmark agent)",
+  "terminated_before": "2026-10-17T16:10:00Z"
+ },
  "nginx-ensemble-q95-674c599b8b-v8ctc": {
   "at": "2026-10-05T11:10:00Z",
   "created": "2026-10-05T10:23:58Z",
