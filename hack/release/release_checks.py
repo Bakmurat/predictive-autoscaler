@@ -3,7 +3,8 @@
 decision is unit-tested (release_checks_test.py; Codex partner review of PR #14). Standard library only.
 
   release_checks.py semver <version>
-  release_checks.py absent <oci-reference>                  # runs `crane manifest`; exit 0 only on a confirmed 404
+  release_checks.py absent <registry> <repository> <tag>    # registry API (GHCR_USER/GHCR_TOKEN); exit 0 only on an
+                                                             # authenticated HTTP 404 MANIFEST_UNKNOWN/NAME_UNKNOWN
   release_checks.py ci <repo> <sha> <check-runs.json> <workflow-runs.json>
   release_checks.py chart-images <version> <registry/owner> <rendered.jsonl>
   release_checks.py digest <value>
@@ -13,8 +14,11 @@ to a default: anything the check cannot confirm is a problem.
 """
 import json
 import re
-import subprocess
+import base64
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 
 DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 SEMVER = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
@@ -40,49 +44,76 @@ def check_digest(d):
     return [] if isinstance(d, str) and DIGEST.fullmatch(d) else [f"not a sha256 digest: {d!r}"]
 
 
-def classify_lookup(returncode, stderr):
-    """'present' or 'absent' for a `crane manifest` result; anything unconfirmed (authentication, permission, timeout,
-    server error, unknown output) raises, so a registry problem is never mistaken for an absent version."""
-    if returncode == 0:
+def classify_http(status, body):
+    """'present' or 'absent' for the HTTP response of an authenticated manifest GET. Only 200 is present and only a 404
+    whose registry error code is MANIFEST_UNKNOWN or NAME_UNKNOWN is absent; every other status (401, 403, 429, 5xx, ...)
+    or an unrecognised 404 raises, so a registry problem is never mistaken for an absent version."""
+    if status == 200:
         return "present"
-    if re.search(r"UNAUTHORIZED|DENIED|FORBIDDEN|TOOMANYREQUESTS|timeout|i/o timeout|connection refused|5\d\d ", stderr, re.I):
-        raise RuntimeError(f"registry lookup failed, not a confirmed absence: {stderr.strip()[:300]}")
-    if re.search(r"\b(MANIFEST_UNKNOWN|NAME_UNKNOWN)\b", stderr):
+    codes = set()
+    try:
+        codes = {e.get("code") for e in (json.loads(body or "{}").get("errors") or []) if isinstance(e, dict)}
+    except (ValueError, AttributeError):
+        pass
+    if status == 404 and codes & {"MANIFEST_UNKNOWN", "NAME_UNKNOWN"}:
         return "absent"
-    raise RuntimeError(f"unrecognised registry response, not a confirmed absence: {stderr.strip()[:300]}")
+    raise RuntimeError(f"registry answered HTTP {status} {sorted(c for c in codes if c)}: not a confirmed absence")
 
 
-def check_ci(check_runs, workflow_runs, sha, repo, required=REQUIRED_CHECKS):
-    """Every required check is bound to a GitHub Actions run of the expected workflow file, for exactly this commit and
-    repository (no fork), and the newest attempt of that check succeeded. A same-name check from another producer
-    (another app, another workflow, another repository) is a problem, never a substitute."""
+MANIFEST_TYPES = ", ".join(["application/vnd.oci.image.index.v1+json", "application/vnd.oci.image.manifest.v1+json",
+                            "application/vnd.docker.distribution.manifest.list.v2+json",
+                            "application/vnd.docker.distribution.manifest.v2+json"])
+
+
+def lookup(registry, repository, tag, user, token):
+    """(status, body) of GET /v2/<repository>/manifests/<tag>, with a pull token from the registry's token endpoint
+    (Basic auth with the workflow token). A failed token exchange raises."""
+    basic = base64.b64encode(f"{user}:{token}".encode()).decode()
+    q = urllib.parse.urlencode({"scope": f"repository:{repository}:pull", "service": registry})
+    req = urllib.request.Request(f"https://{registry}/token?{q}", headers={"Authorization": f"Basic {basic}"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        bearer = json.load(r).get("token")
+    if not bearer:
+        raise RuntimeError("no registry token")
+    req = urllib.request.Request(f"https://{registry}/v2/{repository}/manifests/{tag}", method="GET",
+                                 headers={"Authorization": f"Bearer {bearer}", "Accept": MANIFEST_TYPES})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.status, r.read(4096).decode(errors="replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read(4096).decode(errors="replace")
+
+
+def check_ci(check_runs, workflow_runs, sha, repo, required=REQUIRED_CHECKS, event="push", branch="main"):
+    """For each required workflow file, the NEWEST eligible run (GitHub Actions, this repository, this exact commit, a
+    push to main; no forks) is selected first; its latest attempt must have succeeded, and each required check of that
+    workflow must exist in that run's check suite with its newest check run successful. Attempt numbers are only
+    compared within one run. A same-name check from another producer is a problem, never a substitute."""
     problems = []
-    runs = {r.get("check_suite_id"): r for r in workflow_runs}
-    for name, path in required.items():
-        same = [c for c in check_runs if c.get("name") == name]
-        foreign = [c for c in same if (c.get("app") or {}).get("slug") != ACTIONS_APP]
+    for name in required:
+        foreign = [c for c in check_runs if c.get("name") == name and (c.get("app") or {}).get("slug") != ACTIONS_APP]
         if foreign:
             problems.append(f"{name}: a check with this name from another producer ({(foreign[0].get('app') or {}).get('slug')!r})")
-        bound = []
-        for c in same:
-            if (c.get("app") or {}).get("slug") != ACTIONS_APP or c.get("head_sha") != sha:
-                continue
-            r = runs.get((c.get("check_suite") or {}).get("id"))
-            if not r:
-                problems.append(f"{name}: no workflow run for its check suite")
-                continue
-            if r.get("path") != path or r.get("head_sha") != sha or (r.get("head_repository") or {}).get("full_name") != repo:
-                problems.append(f"{name}: produced by {r.get('path')} at {str(r.get('head_sha'))[:12]} in "
-                                f"{(r.get('head_repository') or {}).get('full_name')}, expected {path} at {sha[:12]} in {repo}")
-                continue
-            bound.append((r.get("run_attempt") or 0, c.get("started_at") or "", c, r))
-        if not bound:
-            problems.append(f"{name}: no check from {path} on {sha[:12]}")
+    for path in sorted(set(required.values())):
+        eligible = [r for r in workflow_runs if r.get("path") == path and r.get("head_sha") == sha
+                    and (r.get("head_repository") or {}).get("full_name") == repo
+                    and r.get("event") == event and r.get("head_branch") == branch]
+        if not eligible:
+            problems.append(f"{path}: no {event} run on {branch} for {sha[:12]} in {repo}")
             continue
-        _, _, c, r = max(bound, key=lambda t: (t[0], t[1]))
-        if c.get("status") != "completed" or c.get("conclusion") != "success" \
-                or r.get("status") != "completed" or r.get("conclusion") != "success":
-            problems.append(f"{name}: newest attempt {c.get('status')}/{c.get('conclusion')} (run {r.get('conclusion')})")
+        run = max(eligible, key=lambda r: (r.get("created_at") or "", r.get("run_number") or 0, r.get("id") or 0))
+        if run.get("status") != "completed" or run.get("conclusion") != "success":
+            problems.append(f"{path}: newest run {run.get('id')} (attempt {run.get('run_attempt')}) "
+                            f"{run.get('status')}/{run.get('conclusion')}")
+        for name in [n for n, p in required.items() if p == path]:
+            mine = [c for c in check_runs if c.get("name") == name and (c.get("app") or {}).get("slug") == ACTIONS_APP
+                    and c.get("head_sha") == sha and (c.get("check_suite") or {}).get("id") == run.get("check_suite_id")]
+            if not mine:
+                problems.append(f"{name}: not in the newest {path} run {run.get('id')}")
+                continue
+            c = max(mine, key=lambda c: (c.get("started_at") or "", c.get("id") or 0))
+            if c.get("status") != "completed" or c.get("conclusion") != "success":
+                problems.append(f"{name}: newest check run {c.get('status')}/{c.get('conclusion')}")
     return problems
 
 
@@ -126,13 +157,15 @@ def main(argv):
     elif cmd == "digest":
         problems = check_digest(args[0])
     elif cmd == "absent":
-        p = subprocess.run(["crane", "manifest", args[0]], capture_output=True, text=True, timeout=120)
+        import os
+        registry, repository, tag = args
         try:
-            state = classify_lookup(p.returncode, p.stderr)
-        except RuntimeError as e:
-            print(f"{args[0]}: {e}")
+            status, body = lookup(registry, repository, tag, os.environ["GHCR_USER"], os.environ["GHCR_TOKEN"])
+            state = classify_http(status, body)
+        except (RuntimeError, OSError, KeyError, ValueError) as e:
+            print(f"{registry}/{repository}:{tag}: {e}")
             return 1
-        problems = [] if state == "absent" else [f"{args[0]} already exists: versions are immutable"]
+        problems = [] if state == "absent" else [f"{registry}/{repository}:{tag} already exists: versions are immutable"]
     elif cmd == "ci":
         repo, sha, cr, wr = args
         problems = check_ci(json.load(open(cr)).get("check_runs", []), json.load(open(wr)).get("workflow_runs", []), sha, repo)
