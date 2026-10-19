@@ -260,6 +260,7 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	if err := r.Get(ctx, req.NamespacedName, &autoscaler); err != nil {
 		if errors.IsNotFound(err) {
 			log.Info("PredictiveAutoscaler resource not found, ignoring")
+			forgetConditionMetrics(req.Namespace, req.Name)
 			return ctrl.Result{}, nil
 		}
 		log.Error(err, "Failed to get PredictiveAutoscaler")
@@ -1532,12 +1533,14 @@ func (r *PredictiveAutoscalerReconciler) updateStatus(ctx context.Context, autos
 			"headroom %d%% is not blocking a scale-down", in.headroomPercent))
 	}
 	if statusEqual(before, st) {
+		recordConditionMetrics(autoscaler.Namespace, autoscaler.Name, predictionEnabled(autoscaler), st.Conditions)
 		return nil
 	}
 	if err := r.Status().Update(ctx, autoscaler); err != nil {
 		return err
 	}
-	r.transitionEvents(autoscaler, before.Conditions, st.Conditions) // only after the status is persisted
+	recordConditionMetrics(autoscaler.Namespace, autoscaler.Name, predictionEnabled(autoscaler), st.Conditions) // the persisted conditions only
+	r.transitionEvents(autoscaler, before.Conditions, st.Conditions)                                            // only after the status is persisted
 	return nil
 }
 
@@ -1645,6 +1648,7 @@ func (r *PredictiveAutoscalerReconciler) updateStatusWithError(
 		}
 		r.transitionEvents(autoscaler, before.Conditions, autoscaler.Status.Conditions)
 	}
+	recordConditionMetrics(autoscaler.Namespace, autoscaler.Name, predictionEnabled(autoscaler), autoscaler.Status.Conditions)
 	return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
 }
 

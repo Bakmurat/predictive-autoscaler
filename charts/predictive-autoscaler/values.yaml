@@ -94,6 +94,18 @@ networkPolicy:
 metrics:
   serviceMonitor: {enabled: false, interval: 30s}   # Prometheus Operator
   vmServiceScrape: {enabled: false, interval: 30s}  # VictoriaMetrics Operator
+  # Alert rules on the operator's predictive_autoscaler_condition and model metrics plus the two scrape targets (the
+  # rules expect the scrape objects above: job = the Service name). One kind per rule engine.
+  alerts:
+    prometheusRule: {enabled: false}   # Prometheus Operator
+    vmRule: {enabled: false}           # VictoriaMetrics Operator
+    labels: {}                         # added to every alert, e.g. {team: platform}
+    notReadyFor: 15m                   # Ready=False (reconcile failing)
+    telemetryFor: 10m                  # TelemetryAvailable=False (the operator holds the replica count)
+    forecastFor: 2h                    # ForecastAvailable=False; expected during the training warm-up
+    conflictFor: 5m                    # ConflictDetected=True (another replica writer; the operator writes nothing)
+    modelStaleHours: 26                # served model's training cutoff older than this
+    absentFor: 10m                     # a scrape target down or missing
 
 nameOverride: ""
 fullnameOverride: ""

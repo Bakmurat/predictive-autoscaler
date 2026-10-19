@@ -406,3 +406,41 @@ def test_the_forecaster_is_scraped_over_tls(render):
     docs = render({"metrics": {"serviceMonitor": {"enabled": True}}})
     sm = next(d for d in docs if d["kind"] == "ServiceMonitor" and d["metadata"]["name"].endswith("-forecaster"))
     assert sm["spec"]["endpoints"][0]["scheme"] == "https"
+
+
+def test_alert_rules_are_opt_in_and_identical_for_both_rule_engines(render):
+    assert not by_kind(render(), "PrometheusRule") and not by_kind(render(), "VMRule")
+    docs = render({"metrics": {"alerts": {"prometheusRule": {"enabled": True}, "vmRule": {"enabled": True},
+                                          "labels": {"team": "platform"}}}})
+    (pr,), (vr,) = by_kind(docs, "PrometheusRule"), by_kind(docs, "VMRule")
+    assert pr["spec"] == vr["spec"] and pr["metadata"]["namespace"] == NS
+    rules = pr["spec"]["groups"][0]["rules"]
+    assert {r["alert"] for r in rules} == {
+        "PredictiveAutoscalerNotReady", "PredictiveAutoscalerTelemetryUnavailable",
+        "PredictiveAutoscalerForecastUnavailable", "PredictiveAutoscalerConflict", "PredictiveAutoscalerModelStale",
+        "PredictiveAutoscalerOperatorDown", "PredictiveAutoscalerForecasterDown"}
+    assert all(r["labels"]["team"] == "platform" and r["labels"]["severity"] and r["labels"]["pa_release"] == "pa"
+               and r["labels"]["pa_release_namespace"] == NS for r in rules)
+    # every selector is scoped to this installation
+    assert all(r["expr"].count(f'pa_install_namespace="{NS}"') == r["expr"].count("{") for r in rules), rules
+    # the scrape alerts name the chart's own Services (job = Service name under both scrape operators)
+    services = {d["metadata"]["name"] for d in by_kind(docs, "Service")}
+    jobs = {re.search(r'job="([^"]+)"', r["expr"]).group(1) for r in rules if "absent(" in r["expr"]}
+    assert jobs and jobs <= services
+
+
+def test_operator_scrape_keeps_the_autoscaler_namespace_label(render):
+    docs = render({"metrics": {"serviceMonitor": {"enabled": True}, "vmServiceScrape": {"enabled": True}}})
+    for kind in ("ServiceMonitor", "VMServiceScrape"):
+        for d in by_kind(docs, kind):
+            (ep,) = d["spec"]["endpoints"]
+            assert ep.get("honorLabels") is (True if d["metadata"]["name"].endswith("-operator") else None), d
+            relabel = ep["relabelings" if kind == "ServiceMonitor" else "relabelConfigs"]
+            assert relabel == [{"sourceLabels": ["__meta_kubernetes_namespace"], "targetLabel": "pa_install_namespace"}]
+
+
+@pytest.mark.parametrize("bad", [{"notReadyFor": "15 minutes"}, {"modelStaleHours": 0}, {"modelStaleHours": 1.5},
+                                 {"unknown": 1}])
+def test_alert_values_are_validated(render, bad):
+    p = render({"metrics": {"alerts": bad}}, check=False)
+    assert p.returncode != 0

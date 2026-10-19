@@ -24,9 +24,11 @@ manifests:
 manifests-check:
 	@scripts/gen-manifests.sh check
 
-# The chart's static checks (helm lint/template, kubeconform for Kubernetes 1.33-1.35); needs helm and kubeconform.
+# The chart's static checks (helm lint/template, kubeconform for Kubernetes 1.33-1.35) and the alert rule tests
+# (promtool); needs helm and kubeconform, and promtool for the rule tests (skipped without it outside CI).
 chart-check:
 	@scripts/chart-check.sh
+	@scripts/alerts-check.sh
 
 # The install smoke test on a throwaway kind cluster (its own kubeconfig; never another cluster). Needs docker, kind,
 # kubectl, helm. KEEP=1 keeps the cluster; OPERATOR_IMAGE/FORECASTER_IMAGE skip the image builds.

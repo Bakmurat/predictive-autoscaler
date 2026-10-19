@@ -138,3 +138,58 @@ capabilities:
 {{- range $p.ports }}{{ $ports = append $ports (dict "protocol" "TCP" "port" .) }}{{ end -}}
 {{- toYaml (dict "to" $to "ports" $ports) -}}
 {{- end -}}
+
+{{/* The alert rules (one group), shared by the PrometheusRule and the VMRule. Every selector is scoped to this
+installation (its scrape job and pa_install_namespace, set by the scrape objects in metrics.yaml), and every alert
+carries the release and its namespace. */}}
+{{- define "pa.alertGroups" -}}
+{{- $a := .Values.metrics.alerts -}}
+{{- $ns := .Release.Namespace -}}
+{{- $op := printf "job=%q, pa_install_namespace=%q" (printf "%s-operator-metrics" (include "pa.fullname" .)) $ns -}}
+{{- $fc := printf "job=%q, pa_install_namespace=%q" (printf "%s-forecaster" (include "pa.fullname" .)) $ns -}}
+{{- $cond := printf "max by (namespace, autoscaler) (predictive_autoscaler_condition{%s, type=%%q, status=%%q})" $op -}}
+{{- $cutoff := printf "predictive_autoscaler_model_training_cutoff_timestamp_seconds{%s}" $op -}}
+{{- $issued := printf "predictive_autoscaler_forecast_issued_timestamp_seconds{%s}" $op -}}
+{{- $base := dict "pa_release" .Release.Name "pa_release_namespace" $ns -}}
+{{- $rules := list
+  (dict "alert" "PredictiveAutoscalerNotReady" "for" $a.notReadyFor "severity" "warning"
+        "expr" (printf "%s == 0" (printf $cond "Ready" "True"))
+        "summary" "{{ $labels.namespace }}/{{ $labels.autoscaler }}: reconcile failing"
+        "description" "Ready has not been True for the alert's duration; see the autoscaler's conditions and events.")
+  (dict "alert" "PredictiveAutoscalerTelemetryUnavailable" "for" $a.telemetryFor "severity" "warning"
+        "expr" (printf "%s == 0" (printf $cond "TelemetryAvailable" "True"))
+        "summary" "{{ $labels.namespace }}/{{ $labels.autoscaler }}: request rate unavailable, replica count held"
+        "description" "The operator cannot measure the target's request rate and holds the current replica count.")
+  (dict "alert" "PredictiveAutoscalerForecastUnavailable" "for" $a.forecastFor "severity" "info"
+        "expr" (printf "(%s == 0) unless on (namespace, autoscaler) (max by (namespace, autoscaler) (predictive_autoscaler_forecasting_enabled{%s}) == 0)" (printf $cond "ForecastAvailable" "True") $op)
+        "summary" "{{ $labels.namespace }}/{{ $labels.autoscaler }}: no forecast used"
+        "description" "Decisions use the measured rate only. Expected until the first training has enough history; autoscalers with spec.prediction.enabled=false never alert.")
+  (dict "alert" "PredictiveAutoscalerConflict" "for" $a.conflictFor "severity" "warning"
+        "expr" (printf "%s == 1" (printf $cond "ConflictDetected" "True"))
+        "summary" "{{ $labels.namespace }}/{{ $labels.autoscaler }}: another replica writer targets the Deployment"
+        "description" "The operator writes nothing while another writer (an HPA, KEDA, another autoscaler) exists.")
+  (dict "alert" "PredictiveAutoscalerModelStale" "for" "15m" "severity" "warning"
+        "expr" (printf "max by (namespace, application) ((time() - %s > %d) and (%s > 0) and (time() - %s < 3600))" $cutoff (mul (int $a.modelStaleHours) 3600) $cutoff $issued)
+        "summary" "{{ $labels.namespace }}/{{ $labels.application }}: served model is stale"
+        "description" (printf "Forecasts in the last hour came from a model whose training cutoff is older than %d h; check the training CronJob." (int $a.modelStaleHours)))
+  (dict "alert" "PredictiveAutoscalerOperatorDown" "for" $a.absentFor "severity" "critical"
+        "expr" (printf "absent(up{%s} == 1)" $op)
+        "summary" "predictive-autoscaler operator not scraped"
+        "description" "No operator scrape target is up. A healthy scrape proves only that the endpoint answers, not that reconciles succeed (see PredictiveAutoscalerNotReady).")
+  (dict "alert" "PredictiveAutoscalerForecasterDown" "for" $a.absentFor "severity" "warning"
+        "expr" (printf "absent(up{%s} == 1)" $fc)
+        "summary" "predictive-autoscaler forecaster not scraped"
+        "description" "No forecaster scrape target is up; the operator falls back to the measured rate.")
+-}}
+- name: predictive-autoscaler
+  rules:
+{{- range $rules }}
+    - alert: {{ .alert }}
+      expr: {{ .expr | quote }}
+      for: {{ .for }}
+      labels: {{- merge (dict "severity" .severity) $base ($a.labels | default dict) | toYaml | nindent 8 }}
+      annotations:
+        summary: {{ .summary | quote }}
+        description: {{ .description | quote }}
+{{- end }}
+{{- end -}}

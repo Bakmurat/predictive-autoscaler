@@ -196,7 +196,13 @@
       "additionalProperties": false,
       "properties": {
         "serviceMonitor": {"type": "object", "additionalProperties": false, "properties": {"enabled": {"type": "boolean"}, "interval": {"type": "string"}}},
-        "vmServiceScrape": {"type": "object", "additionalProperties": false, "properties": {"enabled": {"type": "boolean"}, "interval": {"type": "string"}}}
+        "vmServiceScrape": {"type": "object", "additionalProperties": false, "properties": {"enabled": {"type": "boolean"}, "interval": {"type": "string"}}},
+        "alerts": {"type": "object", "additionalProperties": false, "properties": {
+          "prometheusRule": {"type": "object", "additionalProperties": false, "properties": {"enabled": {"type": "boolean"}}},
+          "vmRule": {"type": "object", "additionalProperties": false, "properties": {"enabled": {"type": "boolean"}}},
+          "labels": {"type": "object", "additionalProperties": {"type": "string"}},
+          "notReadyFor": {"type": "string", "pattern": "^[0-9]+(ms|s|m|h|d)$"}, "telemetryFor": {"type": "string", "pattern": "^[0-9]+(ms|s|m|h|d)$"}, "forecastFor": {"type": "string", "pattern": "^[0-9]+(ms|s|m|h|d)$"}, "conflictFor": {"type": "string", "pattern": "^[0-9]+(ms|s|m|h|d)$"}, "absentFor": {"type": "string", "pattern": "^[0-9]+(ms|s|m|h|d)$"},
+          "modelStaleHours": {"type": "integer", "minimum": 1}}}
       }
     },
     "nameOverride": {"type": "string"},
