@@ -16,6 +16,12 @@ spec:
     - port: {{ ternary "metrics" "http" (eq $component "operator") }}
       path: /metrics
       interval: {{ $cfg.interval }}
+      {{- if eq $component "operator" }}
+      honorLabels: true    # keep the autoscaler's own namespace label (not renamed to exported_namespace)
+      {{- end }}
+      # the installation's namespace under its own name (the alert rules select this installation by it)
+      {{ ternary "relabelings" "relabelConfigs" (eq $kind "ServiceMonitor") }}:
+        - {sourceLabels: [__meta_kubernetes_namespace], targetLabel: pa_install_namespace}
       {{- if and (eq $component "forecaster") $.Values.forecaster.auth.enabled }}
       scheme: https
       tlsConfig: {insecureSkipVerify: true}    # an in-cluster scrape of an open /metrics, limited by metricsFrom

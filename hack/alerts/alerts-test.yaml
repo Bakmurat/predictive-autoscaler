@@ -1,0 +1,161 @@
+# promtool unit tests for the chart's alert rules, rendered by scripts/alerts-check.sh (release "pa" in namespace
+# "pa-system", default thresholds). Series carry the labels the chart's scrape objects produce (job = Service name,
+# pa_install_namespace, instance, pod; the operator's own namespace label kept by honorLabels). A second installation
+# (pa_install_namespace="other") is unhealthy throughout and must never fire this installation's alerts. Every alert is
+# tested firing, recovering and silent, including the missing-series cases.
+rule_files: [rules.yaml]
+evaluation_interval: 1m
+tests:
+  - name: condition alerts fire and recover; another installation never fires them
+    interval: 1m
+    input_series:
+      - series: 'predictive_autoscaler_condition{job="pa-predictive-autoscaler-operator-metrics", pa_install_namespace="pa-system", instance="10.0.0.11:8080", pod="pa-op-1", namespace="shop", autoscaler="web", type="Ready", status="True"}'
+        values: '0x20 1x20'
+      - series: 'predictive_autoscaler_condition{job="pa-predictive-autoscaler-operator-metrics", pa_install_namespace="pa-system", instance="10.0.0.11:8080", pod="pa-op-1", namespace="shop", autoscaler="web", type="TelemetryAvailable", status="True"}'
+        values: '0x12 1x20'
+      - series: 'predictive_autoscaler_condition{job="pa-predictive-autoscaler-operator-metrics", pa_install_namespace="pa-system", instance="10.0.0.11:8080", pod="pa-op-1", namespace="shop", autoscaler="web", type="ConflictDetected", status="True"}'
+        values: '1x7 0x20'
+      - series: 'predictive_autoscaler_condition{job="pa-predictive-autoscaler-operator-metrics", pa_install_namespace="pa-system", instance="10.0.0.11:8080", pod="pa-op-1", namespace="shop", autoscaler="api", type="Ready", status="True"}'
+        values: '1x40'
+      - series: 'predictive_autoscaler_condition{job="pa-predictive-autoscaler-operator-metrics", pa_install_namespace="pa-system", instance="10.0.0.11:8080", pod="pa-op-1", namespace="shop", autoscaler="api", type="TelemetryAvailable", status="True"}'
+        values: '1x40'
+      - series: 'predictive_autoscaler_condition{job="pa-predictive-autoscaler-operator-metrics", pa_install_namespace="pa-system", instance="10.0.0.11:8080", pod="pa-op-1", namespace="shop", autoscaler="api", type="ConflictDetected", status="True"}'
+        values: '0x40'
+      - series: 'predictive_autoscaler_condition{job="pa-predictive-autoscaler-operator-metrics", pa_install_namespace="other", instance="10.0.1.11:8080", pod="pa-op-9", namespace="shop", autoscaler="web", type="Ready", status="True"}'
+        values: '0x40'
+      - series: 'predictive_autoscaler_condition{job="pa-predictive-autoscaler-operator-metrics", pa_install_namespace="other", instance="10.0.1.11:8080", pod="pa-op-9", namespace="shop", autoscaler="web", type="TelemetryAvailable", status="True"}'
+        values: '0x40'
+      - series: 'predictive_autoscaler_condition{job="pa-predictive-autoscaler-operator-metrics", pa_install_namespace="other", instance="10.0.1.11:8080", pod="pa-op-9", namespace="shop", autoscaler="web", type="ConflictDetected", status="True"}'
+        values: '1x40'
+    alert_rule_test:
+      - {eval_time: 14m, alertname: PredictiveAutoscalerNotReady, exp_alerts: []}
+      - eval_time: 16m
+        alertname: PredictiveAutoscalerNotReady
+        exp_alerts:
+          - exp_labels: {severity: warning, pa_release: pa, pa_release_namespace: pa-system, namespace: shop, autoscaler: web}
+            exp_annotations:
+              summary: "shop/web: reconcile failing"
+              description: "Ready has not been True for the alert's duration; see the autoscaler's conditions and events."
+      - {eval_time: 22m, alertname: PredictiveAutoscalerNotReady, exp_alerts: []}
+      - {eval_time: 35m, alertname: PredictiveAutoscalerNotReady, exp_alerts: []}
+      - {eval_time: 9m, alertname: PredictiveAutoscalerTelemetryUnavailable, exp_alerts: []}
+      - eval_time: 11m
+        alertname: PredictiveAutoscalerTelemetryUnavailable
+        exp_alerts:
+          - exp_labels: {severity: warning, pa_release: pa, pa_release_namespace: pa-system, namespace: shop, autoscaler: web}
+            exp_annotations:
+              summary: "shop/web: request rate unavailable, replica count held"
+              description: "The operator cannot measure the target's request rate and holds the current replica count."
+      - {eval_time: 14m, alertname: PredictiveAutoscalerTelemetryUnavailable, exp_alerts: []}
+      - {eval_time: 4m, alertname: PredictiveAutoscalerConflict, exp_alerts: []}
+      - eval_time: 6m
+        alertname: PredictiveAutoscalerConflict
+        exp_alerts:
+          - exp_labels: {severity: warning, pa_release: pa, pa_release_namespace: pa-system, namespace: shop, autoscaler: web}
+            exp_annotations:
+              summary: "shop/web: another replica writer targets the Deployment"
+              description: "The operator writes nothing while another writer (an HPA, KEDA, another autoscaler) exists."
+      - {eval_time: 9m, alertname: PredictiveAutoscalerConflict, exp_alerts: []}
+      - {eval_time: 30m, alertname: PredictiveAutoscalerConflict, exp_alerts: []}
+
+  - name: no condition series means no condition alert (the scrape alerts cover a missing operator)
+    interval: 1m
+    input_series:
+      - series: 'up{job="pa-predictive-autoscaler-operator-metrics", pa_install_namespace="pa-system", instance="10.0.0.11:8080", pod="pa-op-1", namespace="pa-system", service="pa-predictive-autoscaler-operator-metrics"}'
+        values: '1x30'
+    alert_rule_test:
+      - {eval_time: 25m, alertname: PredictiveAutoscalerNotReady, exp_alerts: []}
+      - {eval_time: 25m, alertname: PredictiveAutoscalerTelemetryUnavailable, exp_alerts: []}
+      - {eval_time: 25m, alertname: PredictiveAutoscalerConflict, exp_alerts: []}
+      - {eval_time: 25m, alertname: PredictiveAutoscalerForecastUnavailable, exp_alerts: []}
+      - {eval_time: 25m, alertname: PredictiveAutoscalerOperatorDown, exp_alerts: []}
+
+  - name: forecast unavailable after two hours, never for disabled forecasting or another installation
+    interval: 1m
+    input_series:
+      - series: 'predictive_autoscaler_condition{job="pa-predictive-autoscaler-operator-metrics", pa_install_namespace="pa-system", instance="10.0.0.11:8080", pod="pa-op-1", namespace="shop", autoscaler="web", type="ForecastAvailable", status="True"}'
+        values: '0x125 1x10'
+      - series: 'predictive_autoscaler_forecasting_enabled{job="pa-predictive-autoscaler-operator-metrics", pa_install_namespace="pa-system", instance="10.0.0.11:8080", pod="pa-op-1", namespace="shop", autoscaler="web"}'
+        values: '1x135'
+      - series: 'predictive_autoscaler_condition{job="pa-predictive-autoscaler-operator-metrics", pa_install_namespace="pa-system", instance="10.0.0.11:8080", pod="pa-op-1", namespace="shop", autoscaler="batch", type="ForecastAvailable", status="True"}'
+        values: '0x135'
+      - series: 'predictive_autoscaler_forecasting_enabled{job="pa-predictive-autoscaler-operator-metrics", pa_install_namespace="pa-system", instance="10.0.0.11:8080", pod="pa-op-1", namespace="shop", autoscaler="batch"}'
+        values: '0x135'
+      - series: 'predictive_autoscaler_condition{job="pa-predictive-autoscaler-operator-metrics", pa_install_namespace="other", instance="10.0.1.11:8080", pod="pa-op-9", namespace="shop", autoscaler="web", type="ForecastAvailable", status="True"}'
+        values: '0x135'
+      - series: 'predictive_autoscaler_forecasting_enabled{job="pa-predictive-autoscaler-operator-metrics", pa_install_namespace="other", instance="10.0.1.11:8080", pod="pa-op-9", namespace="shop", autoscaler="web"}'
+        values: '1x135'
+    alert_rule_test:
+      - {eval_time: 119m, alertname: PredictiveAutoscalerForecastUnavailable, exp_alerts: []}
+      - eval_time: 121m
+        alertname: PredictiveAutoscalerForecastUnavailable
+        exp_alerts:
+          - exp_labels: {severity: info, pa_release: pa, pa_release_namespace: pa-system, namespace: shop, autoscaler: web}
+            exp_annotations:
+              summary: "shop/web: no forecast used"
+              description: "Decisions use the measured rate only. Expected until the first training has enough history; autoscalers with spec.prediction.enabled=false never alert."
+      - {eval_time: 128m, alertname: PredictiveAutoscalerForecastUnavailable, exp_alerts: []}
+
+  - name: model staleness fires while a stale model serves and recovers after retraining or when forecasts stop
+    interval: 1m
+    input_series:
+      - series: 'predictive_autoscaler_model_training_cutoff_timestamp_seconds{job="pa-predictive-autoscaler-operator-metrics", pa_install_namespace="pa-system", instance="10.0.0.11:8080", pod="pa-op-1", namespace="shop", application="web"}'
+        values: '60x1700'
+      - series: 'predictive_autoscaler_forecast_issued_timestamp_seconds{job="pa-predictive-autoscaler-operator-metrics", pa_install_namespace="pa-system", instance="10.0.0.11:8080", pod="pa-op-1", namespace="shop", application="web"}'
+        values: '0+60x1600 96000x100'
+      - series: 'predictive_autoscaler_model_training_cutoff_timestamp_seconds{job="pa-predictive-autoscaler-operator-metrics", pa_install_namespace="pa-system", instance="10.0.0.11:8080", pod="pa-op-1", namespace="shop", application="api"}'
+        values: '60x1590 95000x110'
+      - series: 'predictive_autoscaler_forecast_issued_timestamp_seconds{job="pa-predictive-autoscaler-operator-metrics", pa_install_namespace="pa-system", instance="10.0.0.11:8080", pod="pa-op-1", namespace="shop", application="api"}'
+        values: '0+60x1700'
+      - series: 'predictive_autoscaler_model_training_cutoff_timestamp_seconds{job="pa-predictive-autoscaler-operator-metrics", pa_install_namespace="pa-system", instance="10.0.0.11:8080", pod="pa-op-1", namespace="shop", application="batch"}'
+        values: '-1x1700'
+      - series: 'predictive_autoscaler_forecast_issued_timestamp_seconds{job="pa-predictive-autoscaler-operator-metrics", pa_install_namespace="pa-system", instance="10.0.0.11:8080", pod="pa-op-1", namespace="shop", application="batch"}'
+        values: '0+60x1700'
+      - series: 'predictive_autoscaler_model_training_cutoff_timestamp_seconds{job="pa-predictive-autoscaler-operator-metrics", pa_install_namespace="other", instance="10.0.1.11:8080", pod="pa-op-9", namespace="shop", application="web"}'
+        values: '60x1700'
+      - series: 'predictive_autoscaler_forecast_issued_timestamp_seconds{job="pa-predictive-autoscaler-operator-metrics", pa_install_namespace="other", instance="10.0.1.11:8080", pod="pa-op-9", namespace="shop", application="web"}'
+        values: '0+60x1700'
+    alert_rule_test:
+      - {eval_time: 1570m, alertname: PredictiveAutoscalerModelStale, exp_alerts: []}
+      - eval_time: 1580m
+        alertname: PredictiveAutoscalerModelStale
+        exp_alerts:
+          - exp_labels: {severity: warning, pa_release: pa, pa_release_namespace: pa-system, namespace: shop, application: api}
+            exp_annotations: {summary: "shop/api: served model is stale", description: "Forecasts in the last hour came from a model whose training cutoff is older than 26 h; check the training CronJob."}
+          - exp_labels: {severity: warning, pa_release: pa, pa_release_namespace: pa-system, namespace: shop, application: web}
+            exp_annotations: {summary: "shop/web: served model is stale", description: "Forecasts in the last hour came from a model whose training cutoff is older than 26 h; check the training CronJob."}
+      - eval_time: 1595m
+        alertname: PredictiveAutoscalerModelStale
+        exp_alerts:
+          - exp_labels: {severity: warning, pa_release: pa, pa_release_namespace: pa-system, namespace: shop, application: web}
+            exp_annotations: {summary: "shop/web: served model is stale", description: "Forecasts in the last hour came from a model whose training cutoff is older than 26 h; check the training CronJob."}
+      - {eval_time: 1665m, alertname: PredictiveAutoscalerModelStale, exp_alerts: []}
+
+  - name: scrape targets down or missing, then healthy; another installation's target is irrelevant
+    interval: 1m
+    input_series:
+      - series: 'up{job="pa-predictive-autoscaler-operator-metrics", pa_install_namespace="pa-system", instance="10.0.0.11:8080", pod="pa-op-1", namespace="pa-system", service="pa-predictive-autoscaler-operator-metrics"}'
+        values: '1x4 0x20 1x10'
+      - series: 'up{job="pa-predictive-autoscaler-forecaster", pa_install_namespace="pa-system", instance="10.0.0.12:8000", pod="pa-fc-1", namespace="pa-system", service="pa-predictive-autoscaler-forecaster"}'
+        values: '_x15 1x20'
+      - series: 'up{job="pa-predictive-autoscaler-operator-metrics", pa_install_namespace="other", instance="10.0.1.11:8080", pod="pa-op-9", namespace="other", service="pa-predictive-autoscaler-operator-metrics"}'
+        values: '0x35'
+    alert_rule_test:
+      - {eval_time: 14m, alertname: PredictiveAutoscalerOperatorDown, exp_alerts: []}
+      - eval_time: 16m
+        alertname: PredictiveAutoscalerOperatorDown
+        exp_alerts:
+          - exp_labels: {severity: critical, pa_release: pa, pa_release_namespace: pa-system}
+            exp_annotations:
+              summary: "predictive-autoscaler operator not scraped"
+              description: "No operator scrape target is up. A healthy scrape proves only that the endpoint answers, not that reconciles succeed (see PredictiveAutoscalerNotReady)."
+      - {eval_time: 27m, alertname: PredictiveAutoscalerOperatorDown, exp_alerts: []}
+      - {eval_time: 9m, alertname: PredictiveAutoscalerForecasterDown, exp_alerts: []}
+      - eval_time: 11m
+        alertname: PredictiveAutoscalerForecasterDown
+        exp_alerts:
+          - exp_labels: {severity: warning, pa_release: pa, pa_release_namespace: pa-system}
+            exp_annotations:
+              summary: "predictive-autoscaler forecaster not scraped"
+              description: "No forecaster scrape target is up; the operator falls back to the measured rate."
+      - {eval_time: 17m, alertname: PredictiveAutoscalerForecasterDown, exp_alerts: []}

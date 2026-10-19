@@ -2,6 +2,8 @@ package controllers
 
 import (
 	"github.com/prometheus/client_golang/prometheus"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
@@ -135,10 +137,60 @@ var (
 		},
 		[]string{"application", "namespace"},
 	)
+	// One series per (autoscaler, condition type, status), kube-state-metrics style: 1 for the condition's current
+	// status, 0 for the other two. Bounded by conditionMetricTypes; the alert rules in the chart read it.
+	conditionGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "predictive_autoscaler_condition",
+			Help: "Status condition of a PredictiveAutoscaler: 1 for the current status (True, False or Unknown), 0 for the others",
+		},
+		[]string{"namespace", "autoscaler", "type", "status"},
+	)
+	// 1 when spec.prediction.enabled is on (the default), 0 when forecasting is switched off on purpose: the chart's
+	// forecast alert skips those autoscalers.
+	forecastingEnabledGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "predictive_autoscaler_forecasting_enabled",
+			Help: "1 when the autoscaler's forecasting component is enabled (spec.prediction.enabled), 0 when disabled",
+		},
+		[]string{"namespace", "autoscaler"},
+	)
 )
 
+// conditionMetricTypes are the condition types exported by conditionGauge (every type updateStatus sets).
+var conditionMetricTypes = []string{
+	"Ready", "TelemetryAvailable", "ForecastAvailable", "ConflictDetected", "VPAInterference", "ScalingActive",
+	"ScaleDownHeadroom",
+}
+
+// recordConditionMetrics publishes an autoscaler's persisted conditions (a type it does not carry has no series) and
+// whether its forecasting is enabled.
+func recordConditionMetrics(ns, name string, forecasting bool, conds []metav1.Condition) {
+	forecastingEnabledGauge.WithLabelValues(ns, name).Set(map[bool]float64{true: 1, false: 0}[forecasting])
+	for _, t := range conditionMetricTypes {
+		c := meta.FindStatusCondition(conds, t)
+		for _, s := range []metav1.ConditionStatus{metav1.ConditionTrue, metav1.ConditionFalse, metav1.ConditionUnknown} {
+			if c == nil {
+				conditionGauge.DeleteLabelValues(ns, name, t, string(s))
+				continue
+			}
+			v := 0.0
+			if c.Status == s {
+				v = 1
+			}
+			conditionGauge.WithLabelValues(ns, name, t, string(s)).Set(v)
+		}
+	}
+}
+
+// forgetConditionMetrics removes a deleted autoscaler's condition and forecasting-enabled series.
+func forgetConditionMetrics(ns, name string) {
+	conditionGauge.DeletePartialMatch(prometheus.Labels{"namespace": ns, "autoscaler": name})
+	forecastingEnabledGauge.DeleteLabelValues(ns, name)
+}
+
 func init() {
-	metrics.Registry.MustRegister(forecastRpmGauge, forecastTargetTsGauge, forecastIssuedTsGauge, forecastStepMinutesGauge, modelTrainedTsGauge, modelTrainingCutoffTsGauge, modelInfoGauge, scaleEventsTotal, desiredReplicasGauge)
+	metrics.Registry.MustRegister(forecastRpmGauge, forecastTargetTsGauge, forecastIssuedTsGauge, forecastStepMinutesGauge, modelTrainedTsGauge, modelTrainingCutoffTsGauge, modelInfoGauge, scaleEventsTotal, desiredReplicasGauge, conditionGauge, forecastingEnabledGauge)
 	metrics.Registry.MustRegister(
 		predictedReplicasGauge,
 		actualNeededReplicasGauge,

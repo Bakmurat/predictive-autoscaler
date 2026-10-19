@@ -30,6 +30,7 @@ REQUIRED_CHECKS = {
     "forecaster + evaluation tooling (pytest, scorer, archive)": ".github/workflows/ci.yml",
     "chart (helm v3.22.0 lint + template, kubeconform 1.33–1.35)": ".github/workflows/ci.yml",
     "chart (helm v4.3.0 lint + template, kubeconform 1.33–1.35)": ".github/workflows/ci.yml",
+    "alert rules (promtool check + unit tests)": ".github/workflows/ci.yml",
     "newcomer install (kind, Kubernetes 1.35)": ".github/workflows/quickstart.yml",
     "install smoke test (kind, Kubernetes 1.35)": ".github/workflows/smoke.yml",
 }

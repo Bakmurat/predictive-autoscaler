@@ -105,7 +105,36 @@ The forecasting service and the trainer share the model volume.
 ## Monitoring
 
 `metrics.serviceMonitor.enabled` (Prometheus Operator) or `metrics.vmServiceScrape.enabled` (VictoriaMetrics
-Operator) scrapes the operator (port 8080) and the forecasting service (port 8000).
+Operator) scrapes the operator (port 8080) and the forecasting service (port 8000). The operator's scrape keeps the
+metrics' own `namespace` label (the autoscaler's namespace; `honorLabels`), so it is not renamed to
+`exported_namespace`. Both scrapes add `pa_install_namespace`, the namespace the chart is installed in; together with
+`job` (the Service name) it identifies one installation.
+
+The operator exports every autoscaler's conditions as `predictive_autoscaler_condition{namespace, autoscaler, type,
+status}`: 1 for the current status (`True`, `False` or `Unknown`), 0 for the other two, in the style of
+kube-state-metrics. `predictive_autoscaler_forecasting_enabled{namespace, autoscaler}` is 1 unless
+`spec.prediction.enabled` is false. The series are removed with the autoscaler.
+
+### Alerts
+
+`metrics.alerts.prometheusRule.enabled` (Prometheus Operator) or `metrics.alerts.vmRule.enabled` (VictoriaMetrics
+Operator) installs these rules. They need the matching scrape object above. Every rule selects only this
+installation's metrics (its `job` and `pa_install_namespace`), and every alert carries `pa_release` and
+`pa_release_namespace`, so several installations in one cluster never fire or merge each other's alerts.
+
+| Alert | Fires when | Default `for` | Severity |
+|---|---|---|---|
+| `PredictiveAutoscalerNotReady` | `Ready` is not True (reconciles fail) | `notReadyFor` 15m | warning |
+| `PredictiveAutoscalerTelemetryUnavailable` | the request rate cannot be measured, so the replica count is held | `telemetryFor` 10m | warning |
+| `PredictiveAutoscalerForecastUnavailable` | no forecast is used; expected until the first training has enough history; never for `spec.prediction.enabled: false` | `forecastFor` 2h | info |
+| `PredictiveAutoscalerConflict` | another replica writer targets the Deployment, so the operator writes nothing | `conflictFor` 5m | warning |
+| `PredictiveAutoscalerModelStale` | forecasts in the last hour came from a model whose training cutoff is older than `modelStaleHours` (26) | 15m | warning |
+| `PredictiveAutoscalerOperatorDown` | no operator scrape target is up (down or missing); a healthy scrape does not prove reconciles succeed, which `NotReady` covers | `absentFor` 10m | critical |
+| `PredictiveAutoscalerForecasterDown` | no forecaster scrape target is up | `absentFor` 10m | warning |
+
+`metrics.alerts.labels` adds labels (for example a team label for routing) to every alert. `make chart-check` runs
+the rules' unit tests with promtool (`hack/alerts/alerts-test.yaml`): each alert firing, recovering and staying silent,
+including missing series.
 
 ## Authentication between the operator and the forecasting service
 

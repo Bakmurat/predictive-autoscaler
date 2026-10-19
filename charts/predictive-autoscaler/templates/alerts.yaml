@@ -1,0 +1,14 @@
+{{- $a := .Values.metrics.alerts -}}
+{{- range $kind, $cfg := dict "PrometheusRule" $a.prometheusRule "VMRule" $a.vmRule }}
+{{- if $cfg.enabled }}
+apiVersion: {{ ternary "monitoring.coreos.com/v1" "operator.victoriametrics.com/v1beta1" (eq $kind "PrometheusRule") }}
+kind: {{ $kind }}
+metadata:
+  name: {{ include "pa.fullname" $ }}
+  namespace: {{ $.Release.Namespace }}
+  labels: {{- include "pa.labels" $ | nindent 4 }}
+spec:
+  groups: {{- include "pa.alertGroups" $ | nindent 4 }}
+---
+{{- end }}
+{{- end }}
