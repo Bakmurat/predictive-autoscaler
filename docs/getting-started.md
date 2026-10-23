@@ -9,7 +9,7 @@ Use an explicit kubeconfig and context for every command, and start on a test cl
 
 ## 1. Prepare metrics and images
 
-You need Kubernetes 1.33–1.35, Helm, a Deployment, a default storage class supporting ReadWriteOnce and filesystem
+You need Kubernetes 1.33–1.35 (tested; the chart admits any version from 1.33, later ones untested), Helm, a Deployment, a default storage class supporting ReadWriteOnce and filesystem
 `flock`, and a Prometheus-compatible endpoint holding the workload's request counter. Istio is needed only for the
 `istio` source preset; a custom `prometheus` query works without a service mesh. KEDA is optional.
 

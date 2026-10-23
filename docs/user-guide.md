@@ -83,7 +83,7 @@ it says nothing about forecast quality. Details: [quickstart/README.md](../quick
 
 ## 4. Install with Helm
 
-Requirements: Kubernetes 1.33 or later, Helm, a default storage class (ReadWriteOnce with `flock` support), and a
+Requirements: Kubernetes 1.33–1.35 (tested; the chart admits any version from 1.33, later ones are untested), Helm, a default storage class (ReadWriteOnce with `flock` support), and a
 Prometheus-compatible query API holding your workload's request counter. Istio is needed only for the `istio` metric
 preset; KEDA is optional. There are no published release images yet: build them from source
 ([getting-started.md](getting-started.md), step 1). Always pass an explicit kubeconfig and context, and start on a

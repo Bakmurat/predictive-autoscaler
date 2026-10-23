@@ -27,14 +27,14 @@ Built by [Bakmurat Kubanaliev](#author). Apache-2.0.
 | **Additive safety model** | Replicas are set to the **highest** of the forecast baseline, the live reactive requirement, and the configured minimum. The forecast can only add capacity. |
 | **Guard rails** | Overestimate detection, scale-down stabilization (a five-minute hold after any scale-up and a further five-minute hold after demand first drops below the current count; then at most one step per two minutes, each removing at most 10% of the pods or two pods, whichever is greater; an active overestimate override skips the holds but keeps the cooldown), and confidence dampening keep a wrong forecast from causing churn or cost. A forecast whose first step exceeds ten times the live rate is discarded as diverged and the reactive rule applies. |
 | **Reactive fallback** | When the forecasting service is unreachable (a transport failure), the operator keeps using its last forecast while that forecast is strictly less than ten minutes old, excluding steps whose target time has already passed, and then falls back to its own reactive calculation from live metrics. If the service *refuses* the request as invalid input (HTTP 4xx, for example its freshness guard), no cached forecast stands in for it and the reactive rule applies at once; a refusal takes effect when the service is actually queried, which happens when the five-minute prediction cache expires, not during an unexpired cache hit. Whenever no usable forecast participates in a reconcile, any overestimate override from earlier forecasts is cleared, so the normal scale-down holds apply. A KEDA `ScaledObject` can be kept on the same Deployment as an independent backstop; pause it while the operator is active (KEDA's `autoscaling.keda.sh/paused` annotation) so the two controllers do not compete. |
-| **Observability** | Prometheus metrics from both components and three Grafana dashboards: forecast versus actual, replica decisions, and guard-rail state. |
+| **Observability** | Prometheus metrics from both components, four research Grafana dashboards in `grafana/dashboards/`, and the chart's optional Help & Overview dashboard (`dashboards.enabled`). |
 
 ## How it works
 
 ```
 VictoriaMetrics ──► Collector ──► Training job (every 6 h) ──► Model store
-   (Istio RPS,          │                                           │
-    CPU, memory)        └──────────► Forecasting service (FastAPI) ◄┘
+   (request rate,       │                                           │
+     per Deployment)    └──────────► Forecasting service (FastAPI) ◄┘
                                               │  next 60 min, 6 steps
                                               ▼
                         Go operator ── max(forecast, reactive, min) ──► Deployment replicas
@@ -42,7 +42,7 @@ VictoriaMetrics ──► Collector ──► Training job (every 6 h) ──►
                                     KEDA ScaledObject (dormant backstop)
 ```
 
-1. **Collect.** Per-pod request rate from the Istio service mesh, plus CPU and memory, are pulled from VictoriaMetrics at ten-minute resolution.
+1. **Collect.** The Deployment's request rate (from Istio or your own Prometheus query) is read from any Prometheus-compatible store at ten-minute resolution. CPU and memory are not used for scaling (the CRD accepts those fields and ignores them).
 2. **Train.** Every six hours a CronJob retrains the model on the previous seven days and writes it to a shared volume; the service reloads it by modification time. Per-model locks and the job-based design eliminated the concurrent-retraining failures of early versions.
 3. **Forecast.** The service returns the expected demand for the next hour in six steps, blended with the seven-day pattern, with a confidence signal.
 4. **Scale.** On every reconcile (60 seconds in the quickstart) the operator converts the forecast at the configured lead time (15 minutes in the quickstart) into a replica count and applies the additive rule.
@@ -62,8 +62,6 @@ images, installs the authenticated Helm chart, and sends requests to a small HTT
 ```sh
 git clone https://github.com/Bakmurat/predictive-autoscaler.git
 cd predictive-autoscaler
-# Until the first release, use the product integration branch.
-git switch product/b5b-chart
 quickstart/kind.sh up
 quickstart/kind.sh status
 ```
@@ -155,7 +153,7 @@ Both suites pass. Last full run 2026-09-20: Go `go vet` + `go test -race` green;
 | `ml-engine/` | Forecasting service: FastAPI application (`api/`), model code (`models/lstm_model.py`), VictoriaMetrics collector (`data/`), training scripts (`training/`), unit tests (`tests/`), `Dockerfile`. |
 | `k8s-operator/` | Go operator: CRD types (`api/v1alpha1/`), reconciler and overestimate logic (`controllers/`), sample custom resources (`config/samples/`), `Dockerfile`. |
 | `k8s-manifests/base/` | Kustomize base: namespace, CRD, RBAC, both Deployments, the training CronJob, the model volume, and VictoriaMetrics scrape objects. |
-| `grafana/dashboards/` | Three dashboards (overview, forecast components, guard mechanisms). |
+| `grafana/dashboards/` | Four research dashboards (overview, forecast components, live comparison, v4.2 pod autoscaler). The chart ships its own Help & Overview dashboard (`charts/predictive-autoscaler/dashboards/`). |
 | `examples/nginx-test/` | The reference workload scaled by Predictive Autoscaler, with its k6 traffic generator and dormant KEDA backstop. |
 | `examples/myapptwo/` | The identical KEDA-only control workload. |
 
@@ -183,7 +181,7 @@ Both suites pass. Last full run 2026-09-20: Go `go vet` + `go test -race` green;
 
 ## Status
 
-Predictive Autoscaler is an actively developed personal research project (October 2025 to present). It is built to run alongside KEDA, which stays in place as the reactive backstop, and it is published so the design, code, and lessons are available to everyone working on the same problem. Evaluate it in your own environment with the shipped harness before relying on it.
+Predictive Autoscaler is an actively developed personal research project (October 2025 to present). It is built to run alongside KEDA, kept as a reactive backstop that is **paused** while the operator is Active (see [coexistence](docs/coexistence.md)), and it is published so the design, code, and lessons are available to everyone working on the same problem. Evaluate it in your own environment with the shipped harness before relying on it.
 
 Note on numbers: request-rate figures in the simulator configuration (for example a 60,000 requests-per-minute peak) are the synthetic load generator's settings, not measured throughput.
 

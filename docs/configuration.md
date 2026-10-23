@@ -45,12 +45,18 @@ brackets (20 and 60). The same applies to `metrics.requests`. Set these fields e
 | `metricSource` | The compiled request-rate query: `query`, `sha256` (of the exact query text), `observedGeneration`, `targetUID`, `contract` (`requests-per-second/v1`). It is published before the forecasting service is asked. The service uses a forecast only when it was computed for this query, generation and target; any other forecast is refused, and the reactive rule applies. It is absent while the configuration is invalid. |
 | `predictedReplicas` | Deprecated: the calculated count (historical meaning). Use `calculatedReplicas` and `forecastReplicas`. |
 | `lastPrediction` | Issue time of the last forecast used. |
-| `conditions` | `Ready` (the reconcile completed), `TelemetryAvailable` (`Measured` / `MetricsUnavailable`), `ForecastAvailable` (`Used`, `Disabled`, `Unavailable`, `HorizonElapsed`, `SanityRejected`), `ScalingActive` (`Active`, `RecommendMode`, `TelemetryHold`, `Conflict`, `CheckFailed`, `GuardAborted`, or the failure reason), `ConflictDetected` (`NoConflict`; `ReplicaWriter` when an HPA, an unpaused KEDA ScaledObject or another Active PredictiveAutoscaler targets the Deployment; `Unknown`/`CheckFailed` when the check failed), `VPAInterference` (`None`; `VPAUpdatesPods` for a VPA in any mode except `Off`; `Unknown`/`CheckFailed` when the check did not complete), `ScaleDownHeadroom` (`Holding` while a scale-down is held for headroom; `NotHolding` when headroom is not currently blocking a scale-down, which says nothing about how much spare capacity exists; `RecommendMode`; informational: it never affects `Ready` or `ScalingActive`). See coexistence.md. |
+| `conditions` | `Ready` (the reconcile completed: `ReconcileCompleted`; when False the reason names the failure: `CrossNamespaceTarget`, `DeploymentNotFound`, `InvalidMetricQuery` or `ScalingError`, and `ScalingActive` gets the same reason), `TelemetryAvailable` (`Measured` / `MetricsUnavailable`), `ForecastAvailable` (`Used`, `Disabled`, `Unavailable`, `HorizonElapsed`, `SanityRejected`, and for the operator-to-forecaster authentication `Unauthorized` (401), `Forbidden` (403), `AuthUnavailable` (TokenReview could not judge) and `AuthMisconfigured` (the operator's token or CA file is missing, empty or invalid, or a token is set with a non-https URL)); a cached forecast used during a forecaster outage counts as `Used`, `ScalingActive` (`Active`, `RecommendMode`, `TelemetryHold`, `Conflict`, `CheckFailed`, `GuardAborted`, or the failure reason), `ConflictDetected` (`NoConflict`; `ReplicaWriter` when an HPA, an unpaused KEDA ScaledObject or another Active PredictiveAutoscaler targets the Deployment; `Unknown`/`CheckFailed` when the check failed), `VPAInterference` (`None`; `VPAUpdatesPods` for a VPA in any mode except `Off`; `Unknown`/`CheckFailed` when the check did not complete), `ScaleDownHeadroom` (`Holding` while a scale-down is held for headroom; `NotHolding` when headroom is not currently blocking a scale-down, which says nothing about how much spare capacity exists; `RecommendMode`; informational: it never affects `Ready` or `ScalingActive`). See coexistence.md. |
 
-Events are emitted when a condition changes (and on `ScaledUp` / `ScaledDown`), never on every reconcile; the
+Events are emitted when a condition changes (and on `ScaledUp` / `ScaledDown`), never on every reconcile. The
+transition events are `TelemetryUnavailable` / `TelemetryRestored`, `ForecastUnavailable` / `ForecastRestored`,
+`ScalingInactive` / `ScalingActive` and `ReconcileFailed` / `ReconcileRecovered` (Warning when the condition turns
+False, Normal when it turns True; a first healthy observation emits nothing); a change to the configured states
+`RecommendMode` or `Disabled` is a Normal event of that name. The
 coexistence events are `ConflictDetected`, `ConflictResolved`, `ConflictCheckFailed`, `VPAInterference` and
 `VPAInterferenceCleared`; `kubectl
-describe pa <name>` shows them. `kubectl get pa` shows Target, Mode, Min, Max, Current, Calculated, Applied, Ready, Age.
+describe pa <name>` shows them. `kubectl get pa` shows Target, Min, Max, Mode, Current, Calculated, Applied, Ready, Age; Mode is `status.mode`, Applied
+is `status.appliedReplicas` (the last successful write, kept after a switch to Recommend), and Ready is the Deployment's
+ready replicas (`status.readyReplicas`), not the `Ready` condition.
 
 ## Decision rule
 ```
@@ -87,7 +93,15 @@ several series or a non-finite value is "unavailable" — never zero traffic. Wi
 current replica count (within `[minReplicas, maxReplicas]`), whether or not a forecast exists: it neither scales down on
 missing data nor scales on a forecast alone. The decision ledger records `telemetry_status: unavailable` with the reason and
 the safeguard `telemetry_unavailable_hold`, and the measurement gauges (current RPM, actual need, prediction error) are
-removed instead of showing stale or invented values. A workload whose request counter exists but sees no traffic is
+removed instead of showing stale or invented values.
+
+`predictive_autoscaler_prediction_error_percent` is `|forecast-side replicas − actual need| / actual need × 100` for the
+same decision, where the actual need is the reactive count for the current measured rate (at least `minReplicas`) and
+the forecast-side count is the forecast's replicas after confidence dampening and the overestimate cap. It compares two
+replica counts, not the accuracy of a forecast against the traffic that followed. It is 100 whenever the rate is
+measured and the forecast-side count is 0 (for example when no forecast is used or forecasting is disabled); after a
+sanity rejection the reactive count stands in for the forecast, so it can be 0; without a measurement the series is
+removed. A workload whose request counter exists but sees no traffic is
 measured as a real zero and scales normally.
 
 ## Operator environment
