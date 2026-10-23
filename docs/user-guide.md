@@ -39,8 +39,9 @@ ahead of a rise; it never removes capacity the measured rate needs. When no usab
 reactive only. When the request rate cannot be measured at all, the replica count is **held**, never scaled on a guess.
 
 Use it for a stateless Deployment whose traffic follows a daily pattern and whose pods take long enough to start that
-scaling after the rise is too late. It is less useful for traffic without a repeating pattern, and it needs about a
-week of request history per workload before forecasts start. Only the request rate is used; CPU and memory are not.
+scaling after the rise is too late. It is less useful for traffic without a repeating pattern, and forecasts start only
+after a successful training on enough request history (by default at least 235 usable 10-minute points, about 39 hours,
+out of a 7-day lookback; [section 7](#7-get-forecasts)). Only the request rate is used; CPU and memory are not.
 
 Every autoscaler starts in **Recommend** mode: it computes and publishes what it would do and changes nothing. You
 switch it to **Active** when you trust its recommendations.
@@ -51,7 +52,7 @@ switch it to **Active** when you trust its recommendations.
 |---|---|
 | **Operator** (Go) | Watches `PredictiveAutoscaler` objects. On each reconcile it measures the request rate, asks the forecasting service for a forecast, decides a replica count, publishes it in the status and metrics and, in Active mode only, writes it to the Deployment's `/scale`. |
 | **Forecasting service** (`ml-api`, Python) | Serves a forecast for the next hour in six 10-minute steps for one autoscaler. It reads the autoscaler and its Deployment from the Kubernetes API, reads the history itself with the autoscaler's compiled query, and refuses when its input or model does not fit. |
-| **Trainer** (one CronJob per autoscaler) | Every six hours (your schedule) trains a model for one autoscaler from the last week of request rate and publishes it to the model volume; the service picks it up. |
+| **Trainer** (one CronJob per autoscaler) | Every six hours (your schedule) trains a model for one autoscaler from its recent request rate (up to seven days by default) and publishes it to the model volume; the service picks it up. |
 | **Your metrics store** | Any Prometheus-compatible query API (Prometheus, VictoriaMetrics, Thanos Query, ...) that holds your workload's request counter. All three parts read it. |
 
 The Helm chart installs the first three; it does not install any `PredictiveAutoscaler`. Those live with the workloads
@@ -116,7 +117,7 @@ cluster, or give several releases disjoint `operator.watchNamespaces`. Other opt
 |---|---|
 | `operator.watchNamespaces` | Limit the operator to these namespaces (empty: all). |
 | `operator.forecastLedger.enabled` | Keep an append-only JSON-lines ledger of every forecast attempt and decision, for auditing; on an emptyDir unless you give `persistence.existingClaim`. |
-| `forecaster.persistence.*` | The model volume: size, storage class, access mode (`ReadWriteOnce` or `ReadWriteMany`, never `ReadWriteOncePod`), `retain` (kept on uninstall by default), or your own `existingClaim`. |
+| `forecaster.persistence.*` | The model volume: size, storage class, access mode (`ReadWriteOnce` or `ReadWriteMany`, never `ReadWriteOncePod`), `retain` (`true` by default: the chart-created claim is kept on uninstall), or your own `existingClaim`. |
 | `forecaster.auth.*`, `forecaster.tls.*` | Authentication and TLS between the operator and the forecasting service (on by default; see [Security](#12-security)). |
 | `training.hours`, `training.epochs`, `training.activeDeadlineSeconds` | History per training (168 h), epochs, and the time limit of a training run. |
 | `networkPolicy.*` | The NetworkPolicies (on by default): DNS, Kubernetes API addresses and ports, Prometheus peers, who may scrape metrics. |
@@ -190,7 +191,7 @@ calculated replica count. The Deployment does not change.
 | Mode | The mode applied in the last reconcile (`status.mode`). |
 | Current | The Deployment's replica count (`status.currentReplicas`). |
 | Calculated | The decision: what the operator would set now (`status.calculatedReplicas`), or the held count while the request rate cannot be measured. |
-| Applied | The last count the operator actually wrote (Active mode only; empty in Recommend). |
+| Applied | The last count the operator successfully wrote. Empty until the first write; it keeps showing that last write after a switch back to Recommend, and is cleared only when the target Deployment is replaced. |
 | Ready | The Deployment's **ready replicas** (`status.readyReplicas`), not the `Ready` condition. |
 | Age | Since the autoscaler was created. |
 
@@ -200,7 +201,7 @@ calculated replica count. The Deployment does not change.
   `metadata.generation`.
 - `forecastReplicas`: the replica count from the forecast alone (absent when no forecast was used).
 - `stabilizedReplicas`: Active mode only, what will be applied after the scale-down rules.
-- `appliedReplicas`, `lastScaleTime`: the last write. `lastPrediction`: when the forecast in use was issued.
+- `appliedReplicas`, `lastScaleTime`: the last successful write (kept after a switch to Recommend). `lastPrediction`: when the forecast in use was issued.
 - `metricSource`: the compiled query (`query`, `sha256`, `observedGeneration`, `targetUID`, `contract`). Run this query
   yourself when the telemetry looks wrong.
 - `conflicts`: other replica writers found on the target (`group`, `kind`, `namespace`, `name`, `reason`).
@@ -214,7 +215,7 @@ calculated replica count. The Deployment does not change.
 | `Ready` | The last reconcile completed. | `ReconcileCompleted` (True). When False, the reason names the failure: `CrossNamespaceTarget` (the target is in another namespace; nothing is written), `DeploymentNotFound`, `InvalidMetricQuery` (the query breaks the template rules; nothing is written), `ScalingError` (the write to `/scale` failed). |
 | `TelemetryAvailable` | The request rate was measured. | `Measured`; `MetricsUnavailable` when the query failed, returned no series, several series, a partial answer or a non-finite value. The replica count is then held. |
 | `ForecastAvailable` | A forecast took part in the decision. | `Used`; `Disabled` (`spec.prediction.enabled: false`); `Unavailable` (no model yet, a refusal or an outage: see [section 7](#7-get-forecasts)); `HorizonElapsed` (every step of the cached forecast has passed); `SanityRejected` (its first step exceeded ten times the measured rate, so it was discarded); and the authentication failures `Unauthorized`, `Forbidden`, `AuthUnavailable`, `AuthMisconfigured` ([section 12](#12-security)). |
-| `ScalingActive` | The operator is writing the replica count. | `Active`; `RecommendMode`; `TelemetryHold` (holding because the rate is unavailable); `Conflict` (another writer); `CheckFailed` (the coexistence check failed); `GuardAborted` (a last-moment check stopped a write; it retries within seconds); or the failure reason from `Ready`. |
+| `ScalingActive` | Scaling is permitted: Active mode, no conflict, the check succeeded, no guard abort, telemetry measured. It does not mean a write happened; `Applied`, `lastScaleTime` and the `ScaledUp`/`ScaledDown` events show writes. | `Active`; `RecommendMode`; `TelemetryHold` (holding because the rate is unavailable); `Conflict` (another writer); `CheckFailed` (the coexistence check failed); `GuardAborted` (a last-moment check stopped a write; it retries within seconds); or the failure reason from `Ready`. |
 | `ConflictDetected` | Another replica writer targets the Deployment. | `NoConflict` (False); `ReplicaWriter` (True: an HPA, an unpaused KEDA ScaledObject, another Active PredictiveAutoscaler or a legacy-group autoscaler); `CheckFailed` (status `Unknown`: the check could not finish, which blocks writes like a conflict). |
 | `VPAInterference` | A VerticalPodAutoscaler changes the pods' requests. | `None` (False); `VPAUpdatesPods` (True: a VPA in any mode except `Off`; scaling continues, but per-pod capacity may drift); `CheckFailed` (status `Unknown`). |
 | `ScaleDownHeadroom` | A scale-down is held to keep headroom. | `Holding` (True); `NotHolding` (headroom is not blocking a scale-down; it says nothing about how much spare capacity exists); `RecommendMode`. Informational: never affects `Ready` or `ScalingActive`. |
@@ -232,17 +233,25 @@ calculated replica count. The Deployment does not change.
 **What a forecast needs.**
 1. A **training target**: the autoscaler must be listed in the chart's `training.targets`. The chart creates one
    CronJob per entry; its annotation `autoscaling.devkuban.com/training-target` names the autoscaler.
-2. **History**: roughly a week of usable request-rate history for the autoscaler's query, plus a complete recent input
-   window. With too little history a training publishes nothing, and decisions stay reactive.
+2. **History**: the trainer reads the last `training.hours` (default 168, seven days) of the autoscaler's request
+   rate on a 10-minute grid. Seven days is the default lookback, not a minimum: with the default 24-hour input
+   sequence the trainer's preflight needs at least **235 usable 10-minute points** (about 39 hours) after the validity
+   mask, and the gap and sequence checks must still leave at least one training and one validation sequence;
+   otherwise the training publishes nothing and decisions stay reactive. More history gives the model more daily
+   cycles to learn from. Serving a forecast also needs a **complete recent input window** (the model's 24 hours, with a
+   fresh, really observed latest sample and only bounded interior gaps filled); an incomplete window is refused.
 3. A **successful training**. The chart has no automatic first training (no cold start). To train now instead of
    waiting for the schedule:
 
 ```sh
-kubectl -n predictive-autoscaler get cronjobs \
+kubectl --kubeconfig <file> --context <context> -n predictive-autoscaler get cronjobs \
   -o custom-columns='NAME:.metadata.name,TARGET:.metadata.annotations.autoscaling\.devkuban\.com/training-target'
-kubectl -n predictive-autoscaler create job first-training --from=cronjob/<matching-cronjob>
-kubectl -n predictive-autoscaler wait --for=condition=complete job/first-training --timeout=30m
-kubectl -n predictive-autoscaler logs job/first-training     # ends with "status": "success" and an artifact_sha256
+kubectl --kubeconfig <file> --context <context> -n predictive-autoscaler create job first-training \
+  --from=cronjob/<matching-cronjob>
+kubectl --kubeconfig <file> --context <context> -n predictive-autoscaler wait --for=condition=complete \
+  job/first-training --timeout=30m
+kubectl --kubeconfig <file> --context <context> -n predictive-autoscaler logs job/first-training
+# a successful log ends with "status": "success" and an artifact_sha256
 ```
 
 Then check `ForecastAvailable=True` (reason `Used`), a recent `status.lastPrediction` and `status.forecastReplicas`.
@@ -260,11 +269,19 @@ forecast's influence.
 
 **What refusals and outages mean.** The forecasting service refuses (HTTP 422) when the request does not fit: no
 compatible model, a provenance mismatch (generation, UIDs, query hash), an answer from your query that is not one valid
-series, or an incomplete input window. A refusal makes the decision reactive at once. An outage (HTTP 503: the
-Kubernetes API or the metrics store unreachable, or the service at capacity) or an unreachable service lets the
-operator keep using its last forecast while it is less than ten minutes old, and then it falls back to the reactive
-rule. Either way `ForecastAvailable` is False with reason `Unavailable`, and nothing breaks: the autoscaler simply
-behaves like a reactive one.
+series, or an incomplete input window. A refusal (any HTTP 4xx) drops the cached forecast and makes the decision
+reactive at once, with `ForecastAvailable=False` and reason `Unavailable`; an authentication refusal shows
+`Unauthorized` or `Forbidden` instead ([section 12](#12-security)). An outage (an HTTP 5xx such as 503: the Kubernetes
+API or the metrics store unreachable, or the service at capacity) or an unreachable service is different: the operator
+keeps using its last forecast while that forecast is less than ten minutes old and still covers the lead window. Such
+a cached forecast is a usable forecast, so `ForecastAvailable` can stay True (`Used`) during the outage. Only when no
+usable forecast remains does it turn False (`Unavailable`, or `HorizonElapsed` when the cached steps have passed), and
+the decision becomes reactive. A TokenReview outage is reported as `AuthUnavailable`, and an operator-side token or CA
+problem as `AuthMisconfigured`; neither reuses the cache.
+
+Losing the forecast leaves you with reactive scaling. Losing the **request rate** is more serious: the operator then
+holds the current replica count and does not follow demand in either direction until telemetry returns
+(`TelemetryAvailable=False`, `ScalingActive=False` with `TelemetryHold`).
 
 ## 8. Switch to Active, and how to stop
 
@@ -274,23 +291,25 @@ Before you switch:
   GitOps applying a fixed `replicas` ([section 10](#10-running-next-to-hpa-keda-vpa-and-gitops)).
 
 ```sh
-kubectl -n shop patch pa web-pa --type merge -p '{"spec":{"mode":"Active"}}'
-kubectl -n shop get pa/web-pa deploy/web       # Applied follows Calculated; check the Deployment's ready replicas
+kubectl --kubeconfig <file> --context <context> -n shop patch pa web-pa --type merge -p '{"spec":{"mode":"Active"}}'
+kubectl --kubeconfig <file> --context <context> -n shop get pa/web-pa deploy/web   # Applied, Calculated, ready replicas
 ```
 
-`ScalingActive=True` (reason `Active`) confirms the operator writes. It writes only the replica count, only through
-the Deployment's `/scale` subresource, and only if the count is still the one its decision was based on. Scale-ups are
-applied at once; scale-downs follow the rules in [section 9](#9-scale-down-behaviour-and-headroom). After a switch to
-Active (or an operator restart) scale-down waits at least ten minutes.
+`ScalingActive=True` (reason `Active`) means the operator is permitted to write; whether it writes depends on the
+decision. Writes show in `Applied`, `lastScaleTime` and the `ScaledUp`/`ScaledDown` events. The operator writes only
+the replica count, only through the Deployment's `/scale` subresource, and only if the count is still the one its
+decision was based on. Scale-ups are applied at once; scale-downs follow the rules in
+[section 9](#9-scale-down-behaviour-and-headroom). After a switch to Active (or an operator restart) a scale-down
+normally waits at least ten minutes; under an active overestimate override only the 2-minute cooldown applies.
 
 **To stop**, set the mode back:
 
 ```sh
-kubectl -n shop patch pa web-pa --type merge -p '{"spec":{"mode":"Recommend"}}'
+kubectl --kubeconfig <file> --context <context> -n shop patch pa web-pa --type merge -p '{"spec":{"mode":"Recommend"}}'
 ```
 
 Writes stop at the next reconcile and the Deployment keeps its current replica count. `ScalingActive` shows
-`RecommendMode`. Deleting the autoscaler also stops scaling and leaves the replica count as it is (the operator uses no
+`RecommendMode`. `Applied` keeps showing the last write made while Active. Deleting the autoscaler also stops scaling and leaves the replica count as it is (the operator uses no
 finalizer). To hand over to KEDA, follow the [paused-KEDA fallback pattern](coexistence.md#the-paused-keda-fallback-pattern).
 
 ## 9. Scale-down behaviour and headroom
@@ -301,14 +320,16 @@ Scaling down is deliberately slow and bounded; scaling up is immediate.
   10 %) spare capacity at the measured rate. Example: at 798 requests per minute and 2 requests/s (120 rpm) per pod,
   seven pods would run at 95 % of capacity, so eight are kept. While the floor holds, `ScaleDownHeadroom=True`
   (`Holding`). The floor uses the measured rate only, never the forecast. `0` switches it off.
-- **Stabilization:** the decision must stay below the current count **continuously for 5 minutes**, and no scale-up may
-  have happened in the last 5 minutes.
+- **Stabilization, two windows one after the other:** first, no scale-down within 5 minutes of the last scale-up (or
+  of the assumed write after a fresh start); only then does the second window start: the decision must stay below the
+  current count **continuously for 5 minutes**. So a fresh state waits at least 10 minutes.
 - **Cooldown:** at least 2 minutes between two scale-downs.
 - **Step size:** each step removes at most `max(ceil(10 % of current), 2)` pods.
-- **Overestimate override:** when the overestimate cap is active, the stabilization checks are skipped, but the
-  cooldown and the headroom floor still apply.
+- **Overestimate override:** when the overestimate cap is active, both stabilization windows are skipped, but the
+  2-minute cooldown and the headroom floor still apply.
 - **After a restart, a leadership change, a switch to Active or a re-created Deployment**, the operator behaves as if
-  it had just scaled: scale-down waits at least 10 minutes. This state lives in memory.
+  it had just scaled: scale-down normally waits at least 10 minutes (the two windows above), or the 2-minute cooldown
+  under an overestimate override. This state lives in memory.
 
 The full rule with its formulas: [configuration.md, Decision rule](configuration.md#decision-rule).
 
@@ -350,9 +371,14 @@ Most series carry `application` (the target Deployment's name) and `namespace`:
   forecast was used, so absence is not zero demand).
 - **Replicas:** `predictive_autoscaler_desired_replicas` (the decision before scale-down stabilization),
   `predictive_autoscaler_actual_needed_replicas` (what the measured rate alone needs) and
-  `predictive_autoscaler_predicted_replicas` (the forecast's count; 0 while no forecast is used).
-- **Prediction error:** `predictive_autoscaler_prediction_error_percent`, the forecast's replica count against the
-  measured need, in percent. It reads 100 while no forecast is used.
+  `predictive_autoscaler_predicted_replicas` (the forecast-side count after its safeguards: 0 while no forecast is
+  used, the reactive count after a sanity rejection).
+- **Prediction error:** `predictive_autoscaler_prediction_error_percent` =
+  `|forecast-side replicas − measured need| / measured need × 100`, where the measured need is the reactive count for the
+  **current** rate (at least `minReplicas`). It compares two replica counts of the same decision; it does not score how
+  accurate a forecast turned out against the traffic it predicted. It reads 100 whenever the rate is measured and the
+  forecast-side count is 0 (for example while no forecast is used), can read 0 after a sanity rejection (the reactive
+  count stands in), and the series is removed while the rate cannot be measured. Read it with `ForecastAvailable`.
 - **Scaling:** `predictive_autoscaler_scale_events_total{direction="up"|"down"}`.
 - **Forecast record:** `predictive_autoscaler_forecast_rpm{step}` and
   `predictive_autoscaler_forecast_target_timestamp_seconds{step}` (one series per step),
@@ -370,10 +396,21 @@ autoscaler. The forecasting service exports its own metrics as well.
 
 ### The Help & Overview dashboard
 
-Set `dashboards.enabled: true` and the chart ships the Grafana dashboard **"Predictive Autoscaler — Help & Overview"**
-as a ConfigMap labelled `grafana_dashboard: "1"`, which the Grafana dashboard sidecar loads. Add labels for your
-sidecar with `dashboards.labels` and, for example, a folder annotation with `dashboards.annotations`. Choose your
-Prometheus data source, namespace, autoscaler and application at the top. Its first panel is a short version of this
+Set `dashboards.enabled: true` and the chart ships the Grafana dashboard **"Predictive Autoscaler — Help & Overview
+(<namespace>/<release>)"** as a ConfigMap labelled `grafana_dashboard: "1"`, which the Grafana dashboard sidecar loads.
+Its uid and file name are derived from the release's namespace and name, so several installations can share one
+Grafana without replacing each other's dashboard. Add labels for your sidecar with `dashboards.labels` and, for
+example, a folder annotation with `dashboards.annotations`.
+
+The sidecar must be able to see the ConfigMap: by default the Grafana sidecar reads only its own namespace, so either
+install the chart there or configure the sidecar to search the chart's namespace or all namespaces (in the Grafana
+Helm chart: `sidecar.dashboards.searchNamespace`), which needs RBAC to list and watch ConfigMaps in those namespaces.
+The sidecar's label must match `dashboards.labels`.
+
+At the top, choose the data source, then the installation: **Installed in** (`pa_install_namespace`, the chart's
+namespace, added by the chart's scrape objects) and **Installation** (the release's full name, from the scrape `job`).
+The chart pre-selects its own installation. Every query is limited to that installation; then filter by namespace,
+autoscaler and application. Its first panel is a short version of this
 guide; the others show the conditions table, forecasting switch, measured vs forecast request rate, replicas, scale
 events, prediction error, model age and model in use, forecast freshness, guard rails and the scrape targets. The
 repository's `grafana/dashboards/` holds further, more detailed research dashboards.
@@ -391,7 +428,7 @@ Each rule watches only its own installation, and every alert carries `pa_release
 | `PredictiveAutoscalerTelemetryUnavailable` | warning | The request rate has been unmeasurable for 10 minutes; the replica count is held. | Check the metrics store and run `status.metricSource.query` yourself: it must return exactly one finite series. Fix the scrape or the query. |
 | `PredictiveAutoscalerForecastUnavailable` | info | No forecast used for 2 hours. Never fires when forecasting is switched off. | Expected until the first successful training. Otherwise read the `ForecastAvailable` reason, the training CronJob's last job and log, and the forecasting service log. |
 | `PredictiveAutoscalerConflict` | warning | Another replica writer has targeted the Deployment for 5 minutes; nothing is written. | Remove or pause the writer in `status.conflicts`, or switch this autoscaler to Recommend. |
-| `PredictiveAutoscalerModelStale` | warning | Forecasts in the last hour came from a model whose training data ends more than 26 hours ago. | Check the training CronJob (schedule, failed jobs, logs, `activeDeadlineSeconds`); train by hand with `kubectl create job --from=cronjob/...`. |
+| `PredictiveAutoscalerModelStale` | warning | Forecasts in the last hour came from a model whose training data ends more than 26 hours ago. | Check the training CronJob (schedule, failed jobs, logs, `activeDeadlineSeconds`); train by hand ([section 7](#7-get-forecasts)). |
 | `PredictiveAutoscalerOperatorDown` | critical | No operator scrape target has been up for 10 minutes. | Check the operator pod, its events and log. An unready operator after an upgrade usually means an old CRD ([section 13](#13-upgrading-and-the-api-group-migration)). Also check the scrape object and NetworkPolicy `metricsFrom`. |
 | `PredictiveAutoscalerForecasterDown` | warning | No forecasting-service scrape target has been up for 10 minutes. | Check the forecasting service pod, its log and the model volume. Decisions are reactive meanwhile. |
 
@@ -406,11 +443,15 @@ Reference: [helm.md, Monitoring](helm.md#monitoring).
   `Unauthorized`, `Forbidden`, `AuthUnavailable` (TokenReview could not judge) and `AuthMisconfigured` (the operator's
   token or CA file is missing, empty or invalid, or a token is configured with a non-https service URL).
 - **Certificates** (`forecaster.tls.source`): `selfSigned` for plain Helm (not with Argo CD), `certManager` for Argo
-  CD and long-running installs, or `existingSecret` (`tls.crt`, `tls.key`, `ca.crt`). A renewed certificate is
-  picked up within about a minute.
+  CD and long-running installs, or `existingSecret` (`tls.crt`, `tls.key`, `ca.crt`). A renewed certificate reaches
+  the pods through the mounted Secret (the kubelet's periodic sync); the forecasting service checks its files every 60
+  s and, when they changed, exits so that the kubelet restarts its container with the new files, and the operator
+  reloads the CA. Expect a delay of the Secret sync plus up to a minute, and a short restart, not an instant reload;
+  meanwhile the operator uses a recent cached forecast or the reactive rule.
 - **NetworkPolicies** (on by default, need an enforcing CNI): only the operator may call the forecasting service, the
-  trainer accepts no connections, and all three may reach only DNS, the Kubernetes API and your metrics store. Narrow
-  `networkPolicy.kubeAPI.cidrs` to your API server's addresses.
+  trainer accepts no connections, and all three may reach only DNS, the Kubernetes API and your metrics store.
+  **With `networkPolicy.kubeAPI.cidrs` empty (the default) the "Kubernetes API" rule allows any destination on the
+  configured API ports (443 and 6443)**; set it to your API server's addresses.
 - **Permissions:** each part has its own service account. The operator reads autoscalers, Deployments and the other
   scalers, and writes only `deployments/scale`, its status, events and its leader-election Lease. The forecasting
   service and the trainer only read autoscalers and Deployments (plus TokenReviews for the service). No role can read
@@ -424,7 +465,8 @@ Details: [helm.md](helm.md) (What it installs; Authentication).
 **Chart upgrades.** Helm never upgrades a CRD. Before `helm upgrade` to a release with a newer CRD, apply it:
 
 ```sh
-kubectl apply --server-side --force-conflicts -f charts/predictive-autoscaler/crds/
+kubectl --kubeconfig <file> --context <context> apply --server-side --force-conflicts \
+  -f charts/predictive-autoscaler/crds/
 ```
 
 The operator checks the CRD's revision label at start. If the CRD is older than it needs, it starts no controller:
@@ -441,11 +483,13 @@ autoscalers), and `activate` one autoscaler at a time. Full procedure: [upgradin
 
 1. Switch every autoscaler to `mode: Recommend` (or delete them). Their Deployments keep their replica counts.
 2. `helm uninstall pa -n predictive-autoscaler` with an explicit kubeconfig and context.
-3. What stays on purpose: the CRD, every PredictiveAutoscaler and the model volume (`forecaster.persistence.retain`).
-   Delete your autoscaler objects when you no longer need them, and the model claim only if you mean to lose the models.
+3. What stays on purpose: the CRD and every PredictiveAutoscaler. The chart-created model claim stays only with
+   `forecaster.persistence.retain: true` (the default); with `retain: false` it is deleted with the release, and a claim
+   you brought with `existingClaim` is never the chart's to delete. Delete your autoscaler objects when you no longer
+   need them, and a retained model claim only if you mean to lose the models.
 4. **Do not delete the CRD as routine.** Deleting it deletes every PredictiveAutoscaler in the cluster.
 
-With Argo CD the CRD and the model volume are also protected from pruning ([helm.md](helm.md#argo-cd)).
+With Argo CD the CRD (and, with `retain: true`, the model claim) are also protected from pruning ([helm.md](helm.md#argo-cd)).
 
 ## 15. Troubleshooting
 
@@ -456,7 +500,7 @@ With Argo CD the CRD and the model volume are also protected from pruning ([helm
 | `Ready=False`, `InvalidMetricQuery` | The query uses template features other than `{{ .Namespace }}` / `{{ .Name }}`, or is too long. | Rewrite the query ([configuration.md](configuration.md)). |
 | `TelemetryAvailable=False`, `MetricsUnavailable`; replicas do not change | The query returns no series, several series or an error; or the metrics store is down. | Run `status.metricSource.query` against your metrics store; aggregate to one series; check label names (`namespace` vs `exported_namespace`) and that a Service name differs from the Deployment name. |
 | Calculated is always `minReplicas` | `targetRPS` far too high, or the query counts another workload's traffic or is in the wrong unit (it must be per second). | Check `predictive_autoscaler_current_rpm` against what you expect (requests per minute = 60 × per second). |
-| `ForecastAvailable=False`, `Unavailable` on a new autoscaler | No model yet: not enough history or no training. | Expected. List it in `training.targets`; wait for about a week of history; train ([section 7](#7-get-forecasts)). |
+| `ForecastAvailable=False`, `Unavailable` on a new autoscaler | No model yet: not enough history or no training. | Expected. List it in `training.targets`; wait until the history passes the trainer's preflight (by default at least 235 usable 10-minute points); train ([section 7](#7-get-forecasts)). |
 | `ForecastAvailable=False`, `Unavailable` after it worked | The query, the autoscaler or the Deployment changed (model refused), or the forecasting service is down. | Retrain after a change; check the forecasting service pod and log. |
 | Training job fails or publishes nothing | Too little history, the deadline (`training.activeDeadlineSeconds`) or memory reached, or the model volume lacks `flock` support. | Read the job's log; raise the limits; use a storage class with `flock`. |
 | `ForecastAvailable=False`, `Unauthorized` / `Forbidden` | The caller is not the operator's service account, or the audience differs. | Use the chart's defaults; do not change `forecaster.auth.audience` on one side only. |

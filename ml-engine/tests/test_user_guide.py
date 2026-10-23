@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.test_chart import by_kind, render  # noqa: F401  (render is a fixture)
+from tests.test_chart import BASE, _merge, by_kind, helm, render  # noqa: F401  (render is a fixture)
 
 ROOT = Path(__file__).resolve().parents[2]
 GUIDE = ROOT / "docs" / "user-guide.md"
@@ -18,12 +18,18 @@ DASHBOARD = ROOT / "charts" / "predictive-autoscaler" / "dashboards" / "overview
 METRICS_GO = ROOT / "k8s-operator" / "controllers" / "metrics.go"
 HELPERS = ROOT / "charts" / "predictive-autoscaler" / "templates" / "_helpers.tpl"
 CONFIGURATION = ROOT / "docs" / "configuration.md"
-DATA_KEY = "predictive-autoscaler-overview.json"
+INSTALL_SELECTOR = 'job="${installation}-operator-metrics", pa_install_namespace="$install_namespace"'
 TITLE = "Predictive Autoscaler — Help & Overview"
 
 
 def dashboard_configmaps(docs):
-    return [d for d in by_kind(docs, "ConfigMap") if DATA_KEY in d.get("data", {})]
+    return [d for d in by_kind(docs, "ConfigMap")
+            if d["metadata"]["labels"].get("app.kubernetes.io/component") == "dashboards"]
+
+
+def embedded(cm):
+    (key,) = cm["data"]
+    return key, json.loads(cm["data"][key])
 
 
 @pytest.fixture(scope="module")
@@ -59,9 +65,29 @@ def test_the_dashboard_configmap_carries_the_sidecar_label_and_valid_json(render
     assert meta["labels"]["grafana_dashboard"] == "1" and meta["labels"]["team"] == "platform"
     assert meta["annotations"] == {"grafana_folder": "Predictive Autoscaler"}
     assert meta["namespace"] == "pa-system"
-    embedded = json.loads(cm["data"][DATA_KEY])
-    assert embedded == json.loads(DASHBOARD.read_text())
-    assert embedded["title"] == TITLE
+    key, got = embedded(cm)
+    assert key == f"{got['uid']}.json" and re.fullmatch(r"pa-help-[0-9a-f]{12}", got["uid"])
+    assert got["title"] == f"{TITLE} (pa-system/pa)"
+    current = {v["name"]: v["current"] for v in got["templating"]["list"]}
+    assert current["install_namespace"]["value"] == "pa-system"
+    assert current["installation"]["value"] == "pa-predictive-autoscaler"
+    # apart from the release-derived identity and default selection, the shipped JSON is embedded unchanged
+    want = json.loads(DASHBOARD.read_text())
+    for d in (got, want):
+        d.pop("uid"), d.pop("title")
+        for v in d["templating"]["list"]:
+            v.pop("current", None)
+    assert got == want
+
+
+def test_each_release_gets_its_own_dashboard_identity(tmp_path):
+    values = _merge(BASE, {"dashboards": {"enabled": True}})
+    ids = set()
+    for release in ("pa", "pb"):
+        (cm,) = dashboard_configmaps(helm(values, tmp_path, release=release))
+        key, got = embedded(cm)
+        ids.add((key, got["uid"], got["title"]))
+    assert len({k for k, _, _ in ids}) == len({u for _, u, _ in ids}) == len({t for _, _, t in ids}) == 2
 
 
 def test_the_sidecar_label_can_be_dropped_and_unknown_keys_are_rejected(render):
@@ -75,6 +101,7 @@ def test_the_notes_point_at_the_guide_and_the_dashboard():
     notes = (ROOT / "charts" / "predictive-autoscaler" / "templates" / "NOTES.txt").read_text()
     assert "docs/user-guide.md" in notes
     assert TITLE in notes and ".Values.dashboards.enabled" in notes
+    assert "in your checkout: docs/user-guide.md" in notes
 
 
 # --- the dashboard -------------------------------------------------------------------------------------------------
@@ -84,6 +111,7 @@ def test_the_first_panel_is_the_help_text_linking_the_guide(dashboard):
     assert first["type"] == "text" and first["title"] == "Help / User Guide"
     assert first["options"]["mode"] == "markdown"
     assert "docs/user-guide.md" in first["options"]["content"]
+    assert "In your checkout: `docs/user-guide.md`" in first["options"]["content"]
     assert min(p["gridPos"]["y"] for p in dashboard["panels"]) == first["gridPos"]["y"] == 0
     assert any("docs/user-guide.md" in link["url"] for link in dashboard["links"])
 
@@ -92,7 +120,22 @@ def test_the_dashboard_identity(dashboard):
     assert dashboard["uid"] == "pa-help-overview" and dashboard["title"] == TITLE
     names = {v["name"]: v for v in dashboard["templating"]["list"]}
     assert names["datasource"]["type"] == "datasource" and names["datasource"]["query"] == "prometheus"
-    assert {"namespace", "autoscaler", "application"} <= set(names)
+    assert {"install_namespace", "installation", "namespace", "autoscaler", "application"} <= set(names)
+
+
+def test_every_query_is_limited_to_one_installation(dashboard):
+    queries = [t["expr"] for p in dashboard["panels"] for t in p.get("targets", [])]
+    queries += [v["query"]["query"] for v in dashboard["templating"]["list"]
+                if v["type"] == "query" and v["name"] not in ("install_namespace", "installation")]
+    assert len(queries) > 15
+    for q in queries:
+        selectors = len(re.findall(r"(?<!\$)\{", q))  # label selectors, not ${variables}
+        if q.startswith("up{"):
+            assert 'pa_install_namespace="$install_namespace"' in q and "${installation}-" in q, q
+        else:
+            assert q.count(INSTALL_SELECTOR) == selectors, q
+    legends = [t["legendFormat"] for p in dashboard["panels"] if p["type"] == "timeseries" for t in p["targets"]]
+    assert all("{{namespace}}/{{application}}" in lf or "{{pa_install_namespace}} {{job}}" in lf for lf in legends)
 
 
 def test_every_metric_the_dashboard_uses_is_exported_by_the_operator(dashboard):

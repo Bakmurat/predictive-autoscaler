@@ -1,18 +1,23 @@
 predictive-autoscaler {{ .Chart.AppVersion }} is installed in namespace {{ .Release.Namespace }}.
 
 New autoscalers run in Recommend mode: they publish recommendations and change nothing until you set
-spec.mode: Active on each one. Forecasts need about a week of request history and a training per autoscaler
-(training.targets); until then the reactive rule applies.
+spec.mode: Active on each one. Forecasts need a successful training per autoscaler (training.targets): by default
+it trains on up to 7 days of request history and needs at least 235 usable 10-minute points (about 39 hours); until
+then the reactive rule applies.
 
-User Guide (every feature, end to end): docs/user-guide.md in https://github.com/Bakmurat/predictive-autoscaler
+User Guide (every feature, end to end):
+  in your checkout: docs/user-guide.md
+  on GitHub (main branch, once this version is merged):
+  https://github.com/Bakmurat/predictive-autoscaler/blob/main/docs/user-guide.md
 
   kubectl get predictiveautoscalers -A
   kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "pa.fullname" . }}-operator
 
 {{- if .Values.dashboards.enabled }}
 
-Grafana dashboard "Predictive Autoscaler — Help & Overview" is in ConfigMap {{ include "pa.fullname" . }}-dashboards
-(loaded by the Grafana dashboard sidecar); its first panel is the Help / User Guide.
+Grafana dashboard "Predictive Autoscaler — Help & Overview ({{ .Release.Namespace }}/{{ .Release.Name }})" is in
+ConfigMap {{ include "pa.fullname" . }}-dashboards; the Grafana dashboard sidecar must watch this namespace (or all
+namespaces). Its first panel is the Help / User Guide.
 {{- end }}
 {{- if .Values.networkPolicy.enabled }}
 

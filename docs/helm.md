@@ -117,11 +117,16 @@ kube-state-metrics. `predictive_autoscaler_forecasting_enabled{namespace, autosc
 
 ### Dashboard
 
-`dashboards.enabled` installs the Grafana dashboard "Predictive Autoscaler — Help & Overview"
+`dashboards.enabled` installs the Grafana dashboard "Predictive Autoscaler — Help & Overview (<namespace>/<release>)"
 (`dashboards/overview.json`) as a ConfigMap labelled `grafana_dashboard: "1"` for the Grafana dashboard sidecar;
-`dashboards.labels` and `dashboards.annotations` add your sidecar's labels or a folder annotation. Its first panel is a
-Help / User Guide text (walkthrough, panels, alerts); the panels use only the operator's metrics and `up`, with a data
-source variable. The full guide is [user-guide.md](user-guide.md).
+`dashboards.labels` and `dashboards.annotations` add your sidecar's labels or a folder annotation. Its uid and data key
+are derived from the release's namespace and name, so several installations can share one Grafana, and it
+pre-selects its own installation (`pa_install_namespace` and the scrape `job`, from the scrape objects above); every
+query is limited to the selected installation. The sidecar reads only its own namespace by default: install the chart
+there, or let the sidecar search this namespace or all namespaces (Grafana chart: `sidecar.dashboards.searchNamespace`),
+which needs RBAC to list and watch ConfigMaps there. Its first panel is a Help / User Guide text (walkthrough, panels,
+alerts); the panels use only the operator's metrics and `up`, with a data source variable. The full guide is
+[user-guide.md](user-guide.md).
 
 ### Alerts
 

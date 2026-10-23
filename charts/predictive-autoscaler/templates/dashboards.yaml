@@ -1,6 +1,20 @@
 {{- /* The optional Grafana "Help & Overview" dashboard (dashboards/overview.json) in a ConfigMap for the Grafana
-     dashboard sidecar, which loads ConfigMaps carrying its label (grafana_dashboard: "1" by default). */}}
+     dashboard sidecar, which loads ConfigMaps carrying its label (grafana_dashboard: "1" by default). The uid, the
+     title, the data key and the default installation selection are derived from this release, so several
+     installations can share one Grafana without overwriting each other's dashboard. */}}
 {{- if .Values.dashboards.enabled }}
+{{- $id := printf "%s/%s" .Release.Namespace .Release.Name }}
+{{- $uid := printf "pa-help-%s" (sha256sum $id | trunc 12) }}
+{{- $d := .Files.Get "dashboards/overview.json" | fromJson }}
+{{- $_ := set $d "uid" $uid }}
+{{- $_ := set $d "title" (printf "%s (%s)" (get $d "title") $id) }}
+{{- $defaults := dict "install_namespace" .Release.Namespace "installation" (include "pa.fullname" .) }}
+{{- range $v := $d.templating.list }}
+{{- if hasKey $defaults $v.name }}
+{{- $val := get $defaults $v.name }}
+{{- $_ := set $v "current" (dict "selected" true "text" $val "value" $val) }}
+{{- end }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -16,6 +30,6 @@ metadata:
   annotations: {{- toYaml . | nindent 4 }}
   {{- end }}
 data:
-  predictive-autoscaler-overview.json: |-
-    {{- .Files.Get "dashboards/overview.json" | trimSuffix "\n" | nindent 4 }}
+  {{ $uid }}.json: |-
+    {{- toPrettyJson $d | nindent 4 }}
 {{- end }}

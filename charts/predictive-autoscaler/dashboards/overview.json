@@ -39,6 +39,46 @@
         "regex": ""
       },
       {
+        "name": "install_namespace",
+        "label": "Installed in",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(up{pa_install_namespace!=\"\", job=~\".+-operator-metrics\"}, pa_install_namespace)",
+          "refId": "install_namespace"
+        },
+        "definition": "label_values(up{pa_install_namespace!=\"\", job=~\".+-operator-metrics\"}, pa_install_namespace)",
+        "refresh": 2,
+        "regex": "",
+        "includeAll": false,
+        "multi": false,
+        "sort": 1,
+        "current": {}
+      },
+      {
+        "name": "installation",
+        "label": "Installation",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(up{pa_install_namespace=\"$install_namespace\", job=~\".+-operator-metrics\"}, job)",
+          "refId": "installation"
+        },
+        "definition": "label_values(up{pa_install_namespace=\"$install_namespace\", job=~\".+-operator-metrics\"}, job)",
+        "refresh": 2,
+        "regex": "/^(.+)-operator-metrics$/",
+        "includeAll": false,
+        "multi": false,
+        "sort": 1,
+        "current": {}
+      },
+      {
         "name": "namespace",
         "label": "Namespace",
         "type": "query",
@@ -47,10 +87,10 @@
           "uid": "${datasource}"
         },
         "query": {
-          "query": "label_values(predictive_autoscaler_condition, namespace)",
+          "query": "label_values(predictive_autoscaler_condition{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\"}, namespace)",
           "refId": "namespace"
         },
-        "definition": "label_values(predictive_autoscaler_condition, namespace)",
+        "definition": "label_values(predictive_autoscaler_condition{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\"}, namespace)",
         "refresh": 2,
         "includeAll": true,
         "multi": true,
@@ -75,10 +115,10 @@
           "uid": "${datasource}"
         },
         "query": {
-          "query": "label_values(predictive_autoscaler_condition{namespace=~\"$namespace\"}, autoscaler)",
+          "query": "label_values(predictive_autoscaler_condition{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=~\"$namespace\"}, autoscaler)",
           "refId": "autoscaler"
         },
-        "definition": "label_values(predictive_autoscaler_condition{namespace=~\"$namespace\"}, autoscaler)",
+        "definition": "label_values(predictive_autoscaler_condition{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=~\"$namespace\"}, autoscaler)",
         "refresh": 2,
         "includeAll": true,
         "multi": true,
@@ -103,10 +143,10 @@
           "uid": "${datasource}"
         },
         "query": {
-          "query": "label_values(predictive_autoscaler_desired_replicas{namespace=~\"$namespace\"}, application)",
+          "query": "label_values(predictive_autoscaler_desired_replicas{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=~\"$namespace\"}, application)",
           "refId": "application"
         },
-        "definition": "label_values(predictive_autoscaler_desired_replicas{namespace=~\"$namespace\"}, application)",
+        "definition": "label_values(predictive_autoscaler_desired_replicas{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=~\"$namespace\"}, application)",
         "refresh": 2,
         "includeAll": true,
         "multi": true,
@@ -139,7 +179,7 @@
       },
       "options": {
         "mode": "markdown",
-        "content": "## Predictive Autoscaler: Help / User Guide\n\nA research prototype, tested only in test environments with generated load; it has no published performance figures.\nThe full guide is **docs/user-guide.md** in the repository ([open it on GitHub](https://github.com/Bakmurat/predictive-autoscaler/blob/main/docs/user-guide.md)), next to this chart's source.\n\n### Walkthrough: Recommend, train, Active, stop\n1. **Recommend.** Create a `PredictiveAutoscaler` with `spec.mode: Recommend` (the default). The operator computes and publishes a replica count (`kubectl get pa`, `kubectl describe pa`) and changes nothing.\n2. **Train.** List the autoscaler in the chart's `training.targets`. A forecast needs about a week of request history and a successful training; until then decisions use the measured request rate only and `ForecastAvailable=False` is expected.\n3. **Active.** Remove or pause every other replica writer (HPA, KEDA, GitOps replicas), then set `spec.mode: Active`. Check that `ScalingActive` is True.\n4. **Stop.** Set `spec.mode: Recommend` again: writes stop and the Deployment keeps its current replica count.\n\n### Panels\n- **Autoscaler conditions**: one row per autoscaler and condition (`Ready`, `TelemetryAvailable`, `ForecastAvailable`, `ScalingActive`, `ConflictDetected`, `VPAInterference`, `ScaleDownHeadroom`) with its current status. `kubectl describe pa` gives the reason and message.\n- **Forecasting switched on**: 1 unless `spec.prediction.enabled` is false.\n- **Request rate: measured vs forecast peak** (requests per minute): the forecast line is the peak in the lead window used by the last decision; it is absent when no forecast was used.\n- **Replicas**: the decision before scale-down stabilization, the count the measured rate alone needs, and the forecast's count (0 while no forecast is used).\n- **Scale events**: replica changes the operator applied (Active mode only), up and down.\n- **Model age** and **Model in use**: hours since the last observation the serving model was trained on, and its name and version.\n- **Forecast freshness**: minutes since the forecast in use was issued.\n- **Guard rails**: forecasts discarded as diverged (first step above 10x the live rate), overestimate overrides and the current overestimate streak.\n- **Prediction error**: the difference between the forecast's replica count and the count the measured rate needs, in percent of the latter. It reads 100 % while no forecast is used, so read it together with `ForecastAvailable`.\n- **Scrape targets**: whether Prometheus reaches the operator and the forecasting service.\n\n### Alerts (chart values `metrics.alerts.*`)\n| Alert | Means | What to do |\n|---|---|---|\n| PredictiveAutoscalerNotReady | Reconciles fail (`Ready` not True). | `kubectl describe pa`: fix the reason (missing Deployment, invalid query, cross-namespace target, scale error). |\n| PredictiveAutoscalerTelemetryUnavailable | The request rate cannot be measured; the replica count is held. | Check the metrics store and run the autoscaler's query (`status.metricSource.query`): it must return exactly one series. |\n| PredictiveAutoscalerForecastUnavailable | No forecast is used; decisions use the measured rate. | Expected until the first training. Otherwise check the training CronJob, the forecasting service and the `ForecastAvailable` reason. |\n| PredictiveAutoscalerConflict | Another replica writer targets the Deployment; nothing is written. | Remove or pause the HPA, KEDA ScaledObject or other autoscaler named in `status.conflicts`. |\n| PredictiveAutoscalerModelStale | Forecasts come from a model whose training data is too old. | Check the training CronJob's last runs and logs; retrain by hand if needed. |\n| PredictiveAutoscalerOperatorDown | No operator scrape target is up. | Check the operator pod, its logs and its readiness (the CRD revision gate). |\n| PredictiveAutoscalerForecasterDown | No forecasting service scrape target is up. | Check the forecasting service pod and logs; decisions fall back to the measured rate meanwhile. |\n"
+        "content": "## Predictive Autoscaler: Help / User Guide\n\nA research prototype, tested only in test environments with generated load; it has no published performance figures.\n**Full guide:** `docs/user-guide.md`. On GitHub: [docs/user-guide.md](https://github.com/Bakmurat/predictive-autoscaler/blob/main/docs/user-guide.md) (on the `main` branch once this version is merged). In your checkout: `docs/user-guide.md`.\n\nPick the installation at the top (**Installed in** = the chart's namespace, **Installation** = the release's full name): every panel shows that installation only.\n\n### Walkthrough: Recommend, train, Active, stop\n1. **Recommend.** Create a `PredictiveAutoscaler` with `spec.mode: Recommend` (the default). The operator computes and publishes a replica count (`kubectl get pa`, `kubectl describe pa`) and changes nothing.\n2. **Train.** List the autoscaler in the chart's `training.targets`. A forecast needs a successful training: by default it trains on up to 7 days and needs at least 235 usable 10-minute points (about 39 hours) that pass the gap checks, and serving needs a complete recent 24-hour input window. Until then decisions use the measured request rate only and `ForecastAvailable=False` is expected.\n3. **Active.** Remove or pause every other replica writer (HPA, KEDA, GitOps replicas), then set `spec.mode: Active`. `ScalingActive=True` means scaling is permitted; `Applied` and the scale events show actual writes.\n4. **Stop.** Set `spec.mode: Recommend` again: writes stop and the Deployment keeps its current replica count.\n\n### Panels\n- **Autoscaler conditions**: one row per autoscaler and condition (`Ready`, `TelemetryAvailable`, `ForecastAvailable`, `ScalingActive`, `ConflictDetected`, `VPAInterference`, `ScaleDownHeadroom`) with its current status. `kubectl describe pa` gives the reason and message.\n- **Forecasting switched on**: 1 unless `spec.prediction.enabled` is false.\n- **Request rate: measured vs forecast peak** (requests per minute): the forecast line is the peak in the lead window used by the last decision; it is absent when no forecast was used.\n- **Replicas**: the decision before scale-down stabilization, the count the measured rate alone needs, and the forecast-side count (0 while no forecast is used; the reactive count after a sanity rejection).\n- **Scale events**: replica changes the operator applied (Active mode only), up and down.\n- **Model age** and **Model in use**: hours since the last observation the serving model was trained on, and its name and version.\n- **Forecast freshness**: minutes since the forecast in use was issued.\n- **Guard rails**: forecasts discarded as diverged (first step above 10x the live rate), overestimate overrides and the current overestimate streak.\n- **Prediction error**: the forecast-side replica count (after its safeguards) against the count the current measured rate needs, in percent of the latter. It compares counts for the same decision, not how accurate past forecasts turned out. It reads 100 % whenever the rate is measured and the forecast count is 0 (for example while no forecast is used), can read 0 % after a sanity rejection (the reactive count stands in), and is absent while the rate cannot be measured; read it together with `ForecastAvailable`.\n- **Scrape targets**: whether Prometheus reaches the operator and the forecasting service.\n\n### Alerts (chart values `metrics.alerts.*`)\n| Alert | Means | What to do |\n|---|---|---|\n| PredictiveAutoscalerNotReady | Reconciles fail (`Ready` not True). | `kubectl describe pa`: fix the reason (missing Deployment, invalid query, cross-namespace target, scale error). |\n| PredictiveAutoscalerTelemetryUnavailable | The request rate cannot be measured; the replica count is held. | Check the metrics store and run the autoscaler's query (`status.metricSource.query`): it must return exactly one series. |\n| PredictiveAutoscalerForecastUnavailable | No forecast is used; decisions use the measured rate. | Expected until the first training. Otherwise check the training CronJob, the forecasting service and the `ForecastAvailable` reason. |\n| PredictiveAutoscalerConflict | Another replica writer targets the Deployment; nothing is written. | Remove or pause the HPA, KEDA ScaledObject or other autoscaler named in `status.conflicts`. |\n| PredictiveAutoscalerModelStale | Forecasts come from a model whose training data is too old. | Check the training CronJob's last runs and logs; retrain by hand if needed. |\n| PredictiveAutoscalerOperatorDown | No operator scrape target is up. | Check the operator pod, its logs and its readiness (the CRD revision gate). |\n| PredictiveAutoscalerForecasterDown | No forecasting service scrape target is up. | Check the forecasting service pod and logs; decisions fall back to the measured rate meanwhile. |\n"
       },
       "id": 1
     },
@@ -163,7 +203,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "max by (namespace, autoscaler, type, status) (predictive_autoscaler_condition{namespace=~\"$namespace\", autoscaler=~\"$autoscaler\"}) == 1",
+          "expr": "max by (namespace, autoscaler, type, status) (predictive_autoscaler_condition{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=~\"$namespace\", autoscaler=~\"$autoscaler\"}) == 1",
           "refId": "A",
           "legendFormat": "",
           "instant": true,
@@ -211,7 +251,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "max by (namespace, autoscaler) (predictive_autoscaler_forecasting_enabled{namespace=~\"$namespace\", autoscaler=~\"$autoscaler\"})",
+          "expr": "max by (namespace, autoscaler) (predictive_autoscaler_forecasting_enabled{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=~\"$namespace\", autoscaler=~\"$autoscaler\"})",
           "refId": "A",
           "legendFormat": "",
           "instant": true,
@@ -261,7 +301,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "predictive_autoscaler_current_rpm{namespace=~\"$namespace\", application=~\"$application\"}",
+          "expr": "predictive_autoscaler_current_rpm{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=~\"$namespace\", application=~\"$application\"}",
           "refId": "A",
           "legendFormat": "{{namespace}}/{{application}} measured"
         },
@@ -270,7 +310,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "predictive_autoscaler_predicted_rpm{namespace=~\"$namespace\", application=~\"$application\"}",
+          "expr": "predictive_autoscaler_predicted_rpm{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=~\"$namespace\", application=~\"$application\"}",
           "refId": "B",
           "legendFormat": "{{namespace}}/{{application}} forecast peak"
         }
@@ -295,7 +335,7 @@
     {
       "type": "timeseries",
       "title": "Replicas: decision, measured need, forecast",
-      "description": "desired: the operator's decision before scale-down stabilization; measured need: what the measured rate alone needs (at least minReplicas); forecast: the forecast's replica count after its safeguards (0 while no forecast is used).",
+      "description": "desired: the operator's decision before scale-down stabilization; measured need: what the measured rate alone needs (at least minReplicas); forecast: the forecast-side replica count after its safeguards (0 while no forecast is used; the reactive count after a sanity rejection).",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -312,7 +352,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "predictive_autoscaler_desired_replicas{namespace=~\"$namespace\", application=~\"$application\"}",
+          "expr": "predictive_autoscaler_desired_replicas{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=~\"$namespace\", application=~\"$application\"}",
           "refId": "A",
           "legendFormat": "{{namespace}}/{{application}} desired"
         },
@@ -321,7 +361,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "predictive_autoscaler_actual_needed_replicas{namespace=~\"$namespace\", application=~\"$application\"}",
+          "expr": "predictive_autoscaler_actual_needed_replicas{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=~\"$namespace\", application=~\"$application\"}",
           "refId": "B",
           "legendFormat": "{{namespace}}/{{application}} measured need"
         },
@@ -330,7 +370,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "predictive_autoscaler_predicted_replicas{namespace=~\"$namespace\", application=~\"$application\"}",
+          "expr": "predictive_autoscaler_predicted_replicas{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=~\"$namespace\", application=~\"$application\"}",
           "refId": "C",
           "legendFormat": "{{namespace}}/{{application}} forecast"
         }
@@ -372,7 +412,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (namespace, application, direction) (increase(predictive_autoscaler_scale_events_total{namespace=~\"$namespace\", application=~\"$application\"}[1h]))",
+          "expr": "sum by (namespace, application, direction) (increase(predictive_autoscaler_scale_events_total{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=~\"$namespace\", application=~\"$application\"}[1h]))",
           "refId": "A",
           "legendFormat": "{{namespace}}/{{application}} {{direction}}"
         }
@@ -397,7 +437,7 @@
     {
       "type": "timeseries",
       "title": "Prediction error (%)",
-      "description": "abs(forecast replicas - measured need) / measured need x 100. Absent while the request rate cannot be measured; 100 while no forecast is used (the forecast count is then 0).",
+      "description": "abs(forecast-side replicas - current measured need) / measured need x 100, for the same decision: not the accuracy of past forecasts. 100 when the rate is measured and the forecast count is 0 (e.g. no forecast used); can be 0 after a sanity rejection (the reactive count stands in); absent while the rate cannot be measured.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -414,7 +454,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "predictive_autoscaler_prediction_error_percent{namespace=~\"$namespace\", application=~\"$application\"}",
+          "expr": "predictive_autoscaler_prediction_error_percent{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=~\"$namespace\", application=~\"$application\"}",
           "refId": "A",
           "legendFormat": "{{namespace}}/{{application}}"
         }
@@ -456,7 +496,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "(time() - predictive_autoscaler_model_training_cutoff_timestamp_seconds{namespace=~\"$namespace\", application=~\"$application\"}) / 3600 and (predictive_autoscaler_model_training_cutoff_timestamp_seconds{namespace=~\"$namespace\", application=~\"$application\"} > 0)",
+          "expr": "(time() - predictive_autoscaler_model_training_cutoff_timestamp_seconds{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=~\"$namespace\", application=~\"$application\"}) / 3600 and (predictive_autoscaler_model_training_cutoff_timestamp_seconds{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=~\"$namespace\", application=~\"$application\"} > 0)",
           "refId": "A",
           "legendFormat": "{{namespace}}/{{application}}"
         }
@@ -498,7 +538,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "max by (namespace, application, model_name, model_version) (predictive_autoscaler_model_info{namespace=~\"$namespace\", application=~\"$application\"})",
+          "expr": "max by (namespace, application, model_name, model_version) (predictive_autoscaler_model_info{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=~\"$namespace\", application=~\"$application\"})",
           "refId": "A",
           "legendFormat": "",
           "instant": true,
@@ -510,7 +550,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "max by (namespace, application) (predictive_autoscaler_model_trained_timestamp_seconds{namespace=~\"$namespace\", application=~\"$application\"} > 0) * 1000",
+          "expr": "max by (namespace, application) (predictive_autoscaler_model_trained_timestamp_seconds{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=~\"$namespace\", application=~\"$application\"} > 0) * 1000",
           "refId": "B",
           "legendFormat": "",
           "instant": true,
@@ -578,7 +618,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "(time() - predictive_autoscaler_forecast_issued_timestamp_seconds{namespace=~\"$namespace\", application=~\"$application\"}) / 60",
+          "expr": "(time() - predictive_autoscaler_forecast_issued_timestamp_seconds{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=~\"$namespace\", application=~\"$application\"}) / 60",
           "refId": "A",
           "legendFormat": "{{namespace}}/{{application}}"
         }
@@ -620,7 +660,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "increase(predictive_autoscaler_sanity_rejections_total{namespace=~\"$namespace\", application=~\"$application\"}[1h])",
+          "expr": "increase(predictive_autoscaler_sanity_rejections_total{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=~\"$namespace\", application=~\"$application\"}[1h])",
           "refId": "A",
           "legendFormat": "{{namespace}}/{{application}} sanity rejections/h"
         },
@@ -629,7 +669,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "increase(predictive_autoscaler_overestimate_overrides_total{namespace=~\"$namespace\", application=~\"$application\"}[1h])",
+          "expr": "increase(predictive_autoscaler_overestimate_overrides_total{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=~\"$namespace\", application=~\"$application\"}[1h])",
           "refId": "B",
           "legendFormat": "{{namespace}}/{{application}} overestimate overrides/h"
         },
@@ -638,7 +678,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "predictive_autoscaler_overestimate_streak{namespace=~\"$namespace\", application=~\"$application\"}",
+          "expr": "predictive_autoscaler_overestimate_streak{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=~\"$namespace\", application=~\"$application\"}",
           "refId": "C",
           "legendFormat": "{{namespace}}/{{application}} overestimate streak"
         }
@@ -680,7 +720,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "up{pa_install_namespace!=\"\"}",
+          "expr": "up{job=~\"${installation}-(operator-metrics|forecaster)\", pa_install_namespace=\"$install_namespace\"}",
           "refId": "A",
           "legendFormat": "{{pa_install_namespace}} {{job}}"
         }
