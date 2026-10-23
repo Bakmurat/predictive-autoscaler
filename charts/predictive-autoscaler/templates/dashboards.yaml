@@ -1,0 +1,21 @@
+{{- /* The optional Grafana "Help & Overview" dashboard (dashboards/overview.json) in a ConfigMap for the Grafana
+     dashboard sidecar, which loads ConfigMaps carrying its label (grafana_dashboard: "1" by default). */}}
+{{- if .Values.dashboards.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pa.fullname" . }}-dashboards
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pa.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dashboards
+    {{- with .Values.dashboards.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.dashboards.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+data:
+  predictive-autoscaler-overview.json: |-
+    {{- .Files.Get "dashboards/overview.json" | trimSuffix "\n" | nindent 4 }}
+{{- end }}

@@ -115,6 +115,14 @@ status}`: 1 for the current status (`True`, `False` or `Unknown`), 0 for the oth
 kube-state-metrics. `predictive_autoscaler_forecasting_enabled{namespace, autoscaler}` is 1 unless
 `spec.prediction.enabled` is false. The series are removed with the autoscaler.
 
+### Dashboard
+
+`dashboards.enabled` installs the Grafana dashboard "Predictive Autoscaler — Help & Overview"
+(`dashboards/overview.json`) as a ConfigMap labelled `grafana_dashboard: "1"` for the Grafana dashboard sidecar;
+`dashboards.labels` and `dashboards.annotations` add your sidecar's labels or a folder annotation. Its first panel is a
+Help / User Guide text (walkthrough, panels, alerts); the panels use only the operator's metrics and `up`, with a data
+source variable. The full guide is [user-guide.md](user-guide.md).
+
 ### Alerts
 
 `metrics.alerts.prometheusRule.enabled` (Prometheus Operator) or `metrics.alerts.vmRule.enabled` (VictoriaMetrics

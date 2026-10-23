@@ -2,6 +2,7 @@
 
 | Page | For |
 |---|---|
+| [user-guide.md](user-guide.md) | **Start here.** The end-to-end User Guide: every feature, from a local try to Active scaling, monitoring, alerts, troubleshooting and uninstalling. |
 | [getting-started.md](getting-started.md) | Build, install and uninstall the current version from source. |
 | [concepts.md](concepts.md) | Components, how one scaling decision is made, units, the evidence ledger. |
 | [configuration.md](configuration.md) | Every `PredictiveAutoscaler` field (and which ones are ignored), effective defaults, operator settings. |

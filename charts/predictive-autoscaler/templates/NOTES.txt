@@ -4,9 +4,16 @@ New autoscalers run in Recommend mode: they publish recommendations and change n
 spec.mode: Active on each one. Forecasts need about a week of request history and a training per autoscaler
 (training.targets); until then the reactive rule applies.
 
+User Guide (every feature, end to end): docs/user-guide.md in https://github.com/Bakmurat/predictive-autoscaler
+
   kubectl get predictiveautoscalers -A
   kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "pa.fullname" . }}-operator
 
+{{- if .Values.dashboards.enabled }}
+
+Grafana dashboard "Predictive Autoscaler — Help & Overview" is in ConfigMap {{ include "pa.fullname" . }}-dashboards
+(loaded by the Grafana dashboard sidecar); its first panel is the Help / User Guide.
+{{- end }}
 {{- if .Values.networkPolicy.enabled }}
 
 NetworkPolicies are on: they only work with a CNI that enforces them.

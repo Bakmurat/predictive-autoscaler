@@ -1,0 +1,706 @@
+{
+  "uid": "pa-help-overview",
+  "title": "Predictive Autoscaler — Help & Overview",
+  "description": "Help and overview for the predictive-autoscaler operator: walkthrough, conditions, forecasts, replicas, model and alerts. Full guide: docs/user-guide.md.",
+  "tags": [
+    "predictive-autoscaler",
+    "help"
+  ],
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "version": 1,
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "refresh": "1m",
+  "timezone": "",
+  "links": [
+    {
+      "title": "User Guide (docs/user-guide.md)",
+      "type": "link",
+      "url": "https://github.com/Bakmurat/predictive-autoscaler/blob/main/docs/user-guide.md",
+      "targetBlank": true,
+      "icon": "doc",
+      "tooltip": "The full Predictive Autoscaler user guide"
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Data source",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "refresh": 1,
+        "regex": ""
+      },
+      {
+        "name": "namespace",
+        "label": "Namespace",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(predictive_autoscaler_condition, namespace)",
+          "refId": "namespace"
+        },
+        "definition": "label_values(predictive_autoscaler_condition, namespace)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "sort": 1,
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        }
+      },
+      {
+        "name": "autoscaler",
+        "label": "Autoscaler",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(predictive_autoscaler_condition{namespace=~\"$namespace\"}, autoscaler)",
+          "refId": "autoscaler"
+        },
+        "definition": "label_values(predictive_autoscaler_condition{namespace=~\"$namespace\"}, autoscaler)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "sort": 1,
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        }
+      },
+      {
+        "name": "application",
+        "label": "Application (target Deployment)",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(predictive_autoscaler_desired_replicas{namespace=~\"$namespace\"}, application)",
+          "refId": "application"
+        },
+        "definition": "label_values(predictive_autoscaler_desired_replicas{namespace=~\"$namespace\"}, application)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "sort": 1,
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        }
+      }
+    ]
+  },
+  "annotations": {
+    "list": []
+  },
+  "panels": [
+    {
+      "type": "text",
+      "title": "Help / User Guide",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 22
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "## Predictive Autoscaler: Help / User Guide\n\nA research prototype, tested only in test environments with generated load; it has no published performance figures.\nThe full guide is **docs/user-guide.md** in the repository ([open it on GitHub](https://github.com/Bakmurat/predictive-autoscaler/blob/main/docs/user-guide.md)), next to this chart's source.\n\n### Walkthrough: Recommend, train, Active, stop\n1. **Recommend.** Create a `PredictiveAutoscaler` with `spec.mode: Recommend` (the default). The operator computes and publishes a replica count (`kubectl get pa`, `kubectl describe pa`) and changes nothing.\n2. **Train.** List the autoscaler in the chart's `training.targets`. A forecast needs about a week of request history and a successful training; until then decisions use the measured request rate only and `ForecastAvailable=False` is expected.\n3. **Active.** Remove or pause every other replica writer (HPA, KEDA, GitOps replicas), then set `spec.mode: Active`. Check that `ScalingActive` is True.\n4. **Stop.** Set `spec.mode: Recommend` again: writes stop and the Deployment keeps its current replica count.\n\n### Panels\n- **Autoscaler conditions**: one row per autoscaler and condition (`Ready`, `TelemetryAvailable`, `ForecastAvailable`, `ScalingActive`, `ConflictDetected`, `VPAInterference`, `ScaleDownHeadroom`) with its current status. `kubectl describe pa` gives the reason and message.\n- **Forecasting switched on**: 1 unless `spec.prediction.enabled` is false.\n- **Request rate: measured vs forecast peak** (requests per minute): the forecast line is the peak in the lead window used by the last decision; it is absent when no forecast was used.\n- **Replicas**: the decision before scale-down stabilization, the count the measured rate alone needs, and the forecast's count (0 while no forecast is used).\n- **Scale events**: replica changes the operator applied (Active mode only), up and down.\n- **Model age** and **Model in use**: hours since the last observation the serving model was trained on, and its name and version.\n- **Forecast freshness**: minutes since the forecast in use was issued.\n- **Guard rails**: forecasts discarded as diverged (first step above 10x the live rate), overestimate overrides and the current overestimate streak.\n- **Prediction error**: the difference between the forecast's replica count and the count the measured rate needs, in percent of the latter. It reads 100 % while no forecast is used, so read it together with `ForecastAvailable`.\n- **Scrape targets**: whether Prometheus reaches the operator and the forecasting service.\n\n### Alerts (chart values `metrics.alerts.*`)\n| Alert | Means | What to do |\n|---|---|---|\n| PredictiveAutoscalerNotReady | Reconciles fail (`Ready` not True). | `kubectl describe pa`: fix the reason (missing Deployment, invalid query, cross-namespace target, scale error). |\n| PredictiveAutoscalerTelemetryUnavailable | The request rate cannot be measured; the replica count is held. | Check the metrics store and run the autoscaler's query (`status.metricSource.query`): it must return exactly one series. |\n| PredictiveAutoscalerForecastUnavailable | No forecast is used; decisions use the measured rate. | Expected until the first training. Otherwise check the training CronJob, the forecasting service and the `ForecastAvailable` reason. |\n| PredictiveAutoscalerConflict | Another replica writer targets the Deployment; nothing is written. | Remove or pause the HPA, KEDA ScaledObject or other autoscaler named in `status.conflicts`. |\n| PredictiveAutoscalerModelStale | Forecasts come from a model whose training data is too old. | Check the training CronJob's last runs and logs; retrain by hand if needed. |\n| PredictiveAutoscalerOperatorDown | No operator scrape target is up. | Check the operator pod, its logs and its readiness (the CRD revision gate). |\n| PredictiveAutoscalerForecasterDown | No forecasting service scrape target is up. | Check the forecasting service pod and logs; decisions fall back to the measured rate meanwhile. |\n"
+      },
+      "id": 1
+    },
+    {
+      "type": "table",
+      "title": "Autoscaler conditions",
+      "description": "Current status of each condition (predictive_autoscaler_condition == 1). See the Help panel and the user guide for every reason.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 22,
+        "w": 16,
+        "h": 10
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (namespace, autoscaler, type, status) (predictive_autoscaler_condition{namespace=~\"$namespace\", autoscaler=~\"$autoscaler\"}) == 1",
+          "refId": "A",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Value": true
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      },
+      "id": 2
+    },
+    {
+      "type": "table",
+      "title": "Forecasting switched on",
+      "description": "1: spec.prediction.enabled is on (the default); 0: forecasting is switched off on purpose (reactive only).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 22,
+        "w": 8,
+        "h": 10
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (namespace, autoscaler) (predictive_autoscaler_forecasting_enabled{namespace=~\"$namespace\", autoscaler=~\"$autoscaler\"})",
+          "refId": "A",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "renameByName": {
+              "Value": "enabled"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      },
+      "id": 3
+    },
+    {
+      "type": "timeseries",
+      "title": "Request rate: measured vs forecast peak",
+      "description": "Measured request rate and the forecast peak in the lead window used by the last decision, in requests per minute. The forecast series is absent when no usable forecast took part.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 32,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "predictive_autoscaler_current_rpm{namespace=~\"$namespace\", application=~\"$application\"}",
+          "refId": "A",
+          "legendFormat": "{{namespace}}/{{application}} measured"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "predictive_autoscaler_predicted_rpm{namespace=~\"$namespace\", application=~\"$application\"}",
+          "refId": "B",
+          "legendFormat": "{{namespace}}/{{application}} forecast peak"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "id": 4
+    },
+    {
+      "type": "timeseries",
+      "title": "Replicas: decision, measured need, forecast",
+      "description": "desired: the operator's decision before scale-down stabilization; measured need: what the measured rate alone needs (at least minReplicas); forecast: the forecast's replica count after its safeguards (0 while no forecast is used).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 32,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "predictive_autoscaler_desired_replicas{namespace=~\"$namespace\", application=~\"$application\"}",
+          "refId": "A",
+          "legendFormat": "{{namespace}}/{{application}} desired"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "predictive_autoscaler_actual_needed_replicas{namespace=~\"$namespace\", application=~\"$application\"}",
+          "refId": "B",
+          "legendFormat": "{{namespace}}/{{application}} measured need"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "predictive_autoscaler_predicted_replicas{namespace=~\"$namespace\", application=~\"$application\"}",
+          "refId": "C",
+          "legendFormat": "{{namespace}}/{{application}} forecast"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "id": 5
+    },
+    {
+      "type": "timeseries",
+      "title": "Scale events (per hour)",
+      "description": "Replica changes the operator applied, by direction. Recommend mode applies none.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 40,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (namespace, application, direction) (increase(predictive_autoscaler_scale_events_total{namespace=~\"$namespace\", application=~\"$application\"}[1h]))",
+          "refId": "A",
+          "legendFormat": "{{namespace}}/{{application}} {{direction}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "id": 6
+    },
+    {
+      "type": "timeseries",
+      "title": "Prediction error (%)",
+      "description": "abs(forecast replicas - measured need) / measured need x 100. Absent while the request rate cannot be measured; 100 while no forecast is used (the forecast count is then 0).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 40,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "predictive_autoscaler_prediction_error_percent{namespace=~\"$namespace\", application=~\"$application\"}",
+          "refId": "A",
+          "legendFormat": "{{namespace}}/{{application}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "id": 7
+    },
+    {
+      "type": "timeseries",
+      "title": "Model age (hours since training cutoff)",
+      "description": "Hours since the last observation the model behind the current forecast was trained on. The ModelStale alert fires above metrics.alerts.modelStaleHours (26 by default) while forecasts are issued.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 48,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "(time() - predictive_autoscaler_model_training_cutoff_timestamp_seconds{namespace=~\"$namespace\", application=~\"$application\"}) / 3600 and (predictive_autoscaler_model_training_cutoff_timestamp_seconds{namespace=~\"$namespace\", application=~\"$application\"} > 0)",
+          "refId": "A",
+          "legendFormat": "{{namespace}}/{{application}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "h"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "id": 8
+    },
+    {
+      "type": "table",
+      "title": "Model in use",
+      "description": "Name and version of the model behind each autoscaler's current forecast, and when it finished training.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 48,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (namespace, application, model_name, model_version) (predictive_autoscaler_model_info{namespace=~\"$namespace\", application=~\"$application\"})",
+          "refId": "A",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (namespace, application) (predictive_autoscaler_model_trained_timestamp_seconds{namespace=~\"$namespace\", application=~\"$application\"} > 0) * 1000",
+          "refId": "B",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Value #A": true
+            },
+            "renameByName": {
+              "Value #B": "trained at"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "trained at"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "dateTimeAsIso"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true
+      },
+      "id": 9
+    },
+    {
+      "type": "timeseries",
+      "title": "Forecast freshness (minutes since issue)",
+      "description": "Minutes since the forecast in use was issued by the forecasting service. The operator refreshes it about every 5 minutes; a growing value means no new forecast is arriving.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 56,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "(time() - predictive_autoscaler_forecast_issued_timestamp_seconds{namespace=~\"$namespace\", application=~\"$application\"}) / 60",
+          "refId": "A",
+          "legendFormat": "{{namespace}}/{{application}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "m"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "id": 10
+    },
+    {
+      "type": "timeseries",
+      "title": "Guard rails",
+      "description": "Forecasts discarded by the divergence check (first step above 10x the live rate) and overestimate overrides, per hour; and the current overestimate streak.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 56,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "increase(predictive_autoscaler_sanity_rejections_total{namespace=~\"$namespace\", application=~\"$application\"}[1h])",
+          "refId": "A",
+          "legendFormat": "{{namespace}}/{{application}} sanity rejections/h"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "increase(predictive_autoscaler_overestimate_overrides_total{namespace=~\"$namespace\", application=~\"$application\"}[1h])",
+          "refId": "B",
+          "legendFormat": "{{namespace}}/{{application}} overestimate overrides/h"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "predictive_autoscaler_overestimate_streak{namespace=~\"$namespace\", application=~\"$application\"}",
+          "refId": "C",
+          "legendFormat": "{{namespace}}/{{application}} overestimate streak"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "id": 11
+    },
+    {
+      "type": "timeseries",
+      "title": "Scrape targets",
+      "description": "1 when Prometheus scrapes the operator (job <release>-operator-metrics) or the forecasting service (job <release>-forecaster); needs metrics.serviceMonitor or metrics.vmServiceScrape.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 64,
+        "w": 24,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "up{pa_install_namespace!=\"\"}",
+          "refId": "A",
+          "legendFormat": "{{pa_install_namespace}} {{job}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "id": 12
+    }
+  ]
+}

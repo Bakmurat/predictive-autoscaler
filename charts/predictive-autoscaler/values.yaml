@@ -107,5 +107,13 @@ metrics:
     modelStaleHours: 26                # served model's training cutoff older than this
     absentFor: 10m                     # a scrape target down or missing
 
+# The optional Grafana "Help & Overview" dashboard (dashboards/overview.json): a walkthrough, what every panel and
+# alert means, and panels on the operator's metrics. Rendered as a ConfigMap for the Grafana dashboard sidecar.
+dashboards:
+  enabled: false
+  labels:                    # the sidecar loads ConfigMaps with this label; add labels, or set one to null to drop it
+    grafana_dashboard: "1"
+  annotations: {}            # e.g. {grafana_folder: Predictive Autoscaler} for a sidecar folder annotation
+
 nameOverride: ""
 fullnameOverride: ""

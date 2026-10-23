@@ -2,6 +2,8 @@
 
 **Scale before the traffic arrives, not after.**
 
+**New here? Read the [User Guide](docs/user-guide.md)**: every feature, end to end.
+
 Predictive Autoscaler is an open-source Kubernetes autoscaler that forecasts request demand and provisions capacity ahead of the load. Conventional autoscalers react to metrics that have already crossed a threshold, which means the first users of every traffic surge pay for it in latency and errors. Predictive Autoscaler is built to close that gap: it learns each workload's daily rhythm, predicts the next hour, and aims to have pods ready before the wave hits. A reactive floor means the forecast can only add capacity on top of what live metrics require.
 
 Built by [Bakmurat Kubanaliev](#author). Apache-2.0.

@@ -32,3 +32,4 @@ metrics:
   serviceMonitor: {enabled: true, interval: 60s}
   vmServiceScrape: {enabled: true}
   alerts: {prometheusRule: {enabled: true}, vmRule: {enabled: true}, labels: {team: platform}, modelStaleHours: 30}
+dashboards: {enabled: true, labels: {team: platform}, annotations: {grafana_folder: Predictive Autoscaler}}
