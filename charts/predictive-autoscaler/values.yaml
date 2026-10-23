@@ -66,7 +66,7 @@ training:
   # One CronJob per autoscaler to train for: {namespace, name, schedule}. Empty: no training (Recommend mode still
   # reports reactive recommendations).
   targets: []
-  hours: 168                 # history per training (the model needs about a week)
+  hours: 168                 # lookback per training (default seven days; the default model needs >= 235 usable 10-min points)
   epochs: null               # training epochs; null: the trainer's default
   activeDeadlineSeconds: 3600
   resources:

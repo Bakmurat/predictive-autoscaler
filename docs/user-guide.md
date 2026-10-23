@@ -277,7 +277,9 @@ keeps using its last forecast while that forecast is less than ten minutes old a
 a cached forecast is a usable forecast, so `ForecastAvailable` can stay True (`Used`) during the outage. Only when no
 usable forecast remains does it turn False (`Unavailable`, or `HorizonElapsed` when the cached steps have passed), and
 the decision becomes reactive. A TokenReview outage is reported as `AuthUnavailable`, and an operator-side token or CA
-problem as `AuthMisconfigured`; neither reuses the cache.
+problem as `AuthMisconfigured`. A TokenReview outage is an HTTP 503 like any other outage, so a recent usable cached
+forecast is still reused; `AuthMisconfigured` and the 401/403 refusals (`Unauthorized`, `Forbidden`) drop the cache
+when they occur.
 
 Losing the forecast leaves you with reactive scaling. Losing the **request rate** is more serious: the operator then
 holds the current replica count and does not follow demand in either direction until telemetry returns

@@ -31,7 +31,8 @@ training:
 ```
 
 `values.yaml` documents every option, and `values.schema.json` rejects unknown keys and malformed values. A forecast
-needs about a week of history and a training run per autoscaler. Until then each autoscaler runs on the reactive rule,
+needs enough request history (seven-day default lookback; at least 235 usable 10-minute points with the default model,
+subject to the trainer's sequence and gap checks and a complete recent inference window) and a training run per autoscaler. Until then each autoscaler runs on the reactive rule,
 and new autoscalers run in Recommend mode (they publish recommendations and change nothing until `spec.mode: Active`).
 
 ## What it installs
