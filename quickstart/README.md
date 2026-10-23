@@ -22,7 +22,8 @@ The workload starts at one replica. The generator sends about eight actual reque
 imports each replica's request counter every 15 seconds. The PA query sums per-pod rates, with `origin="demo"`.
 `targetRPS: 4` is a demonstration capacity, not a measured throughput limit. The operator recommends at least two
 replicas while **Recommend leaves the Deployment at one**. `ForecastAvailable=False` is expected: there is no model
-or historical data. Roughly a week of usable history and successful training are needed for forecasts; meanwhile
+or historical data. Forecasts need a successful training on enough history (seven-day default lookback; at least 235 usable 10-minute
+points with the default model, subject to sequence and gap checks) and a complete recent inference window; meanwhile
 the reactive recommendation works.
 
 ```sh

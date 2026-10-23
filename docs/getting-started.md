@@ -2,14 +2,14 @@
 
 For a disposable local installation, start with the [kind quickstart](../quickstart/README.md). It builds images,
 installs the Helm chart with TLS and authentication, and verifies recommendations against real demo requests.
-An optional synthetic history demonstrates training and forecasts without waiting a week.
+An optional synthetic history demonstrates training and forecasts without waiting for real history.
 
 For your own workload, use the source Helm chart below. Release images and a published chart are not available yet.
 Use an explicit kubeconfig and context for every command, and start on a test cluster.
 
 ## 1. Prepare metrics and images
 
-You need Kubernetes 1.33–1.35, Helm, a Deployment, a default storage class supporting ReadWriteOnce and filesystem
+You need Kubernetes 1.33–1.35 (tested; the chart admits any version from 1.33, later ones untested), Helm, a Deployment, a default storage class supporting ReadWriteOnce and filesystem
 `flock`, and a Prometheus-compatible endpoint holding the workload's request counter. Istio is needed only for the
 `istio` source preset; a custom `prometheus` query works without a service mesh. KEDA is optional.
 
@@ -93,7 +93,8 @@ Missing telemetry holds the replica count; it is not interpreted as zero traffic
 
 ## 4. Train and verify a forecast
 
-Training requires roughly a week of usable history and a complete recent inference window. Merely waiting for the
+Training looks back seven days by default and needs at least 235 usable 10-minute points (about 39 hours) with the
+default model, subject to the trainer's sequence and gap checks, plus a complete recent inference window. Merely waiting for the
 first CronJob does not create that history. With insufficient history training publishes nothing and reactive
 recommendations continue. The chart schedules one CronJob per `training.targets` entry; its annotation
 `autoscaling.devkuban.com/training-target` identifies the target.

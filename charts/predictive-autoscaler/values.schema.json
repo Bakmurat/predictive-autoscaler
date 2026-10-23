@@ -205,6 +205,15 @@
           "modelStaleHours": {"type": "integer", "minimum": 1}}}
       }
     },
+    "dashboards": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "labels": {"type": "object", "additionalProperties": {"type": ["string", "null"]}},
+        "annotations": {"type": "object", "additionalProperties": {"type": "string"}}
+      }
+    },
     "nameOverride": {"type": "string"},
     "fullnameOverride": {"type": "string"},
     "global": {"type": "object"}

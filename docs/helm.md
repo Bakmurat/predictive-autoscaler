@@ -9,7 +9,9 @@ helm install pa charts/predictive-autoscaler -n predictive-autoscaler --create-n
 # helm install pa oci://ghcr.io/bakmurat/charts/predictive-autoscaler --version X.Y.Z -n predictive-autoscaler --create-namespace -f my-values.yaml
 ```
 
-Requirements: Kubernetes 1.33 or later, and a Prometheus-compatible query API with the request metrics of your
+Requirements: Kubernetes 1.33–1.35 (the versions the chart is tested against: rendered and schema-checked on 1.33, 1.34
+and 1.35, the operator's envtest on 1.35; the chart's `kubeVersion` admits any version from 1.33, but later ones are
+untested), and a Prometheus-compatible query API with the request metrics of your
 workloads. Install **one release per cluster**, or give several releases disjoint `operator.watchNamespaces`: each
 release elects its own leader in its own namespace, so two releases watching the same namespace would both scale its
 autoscalers. With Helm 3, `helm template` needs `--kube-version` (its offline default is older than 1.33). Argo CD passes
@@ -25,11 +27,12 @@ networkPolicy:
     namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: monitoring}}
 training:
   targets:                                           # one training CronJob per autoscaler
-    - {namespace: shop, name: web, schedule: "0 */6 * * *"}
+    - {namespace: shop, name: web-pa, schedule: "0 */6 * * *"}   # the PredictiveAutoscaler's name (TRAINING_TARGET=shop/web-pa)
 ```
 
 `values.yaml` documents every option, and `values.schema.json` rejects unknown keys and malformed values. A forecast
-needs about a week of history and a training run per autoscaler. Until then each autoscaler runs on the reactive rule,
+needs enough request history (seven-day default lookback; at least 235 usable 10-minute points with the default model,
+subject to the trainer's sequence and gap checks and a complete recent inference window) and a training run per autoscaler. Until then each autoscaler runs on the reactive rule,
 and new autoscalers run in Recommend mode (they publish recommendations and change nothing until `spec.mode: Active`).
 
 ## What it installs
@@ -114,6 +117,19 @@ The operator exports every autoscaler's conditions as `predictive_autoscaler_con
 status}`: 1 for the current status (`True`, `False` or `Unknown`), 0 for the other two, in the style of
 kube-state-metrics. `predictive_autoscaler_forecasting_enabled{namespace, autoscaler}` is 1 unless
 `spec.prediction.enabled` is false. The series are removed with the autoscaler.
+
+### Dashboard
+
+`dashboards.enabled` installs the Grafana dashboard "Predictive Autoscaler — Help & Overview (<namespace>/<release>)"
+(`dashboards/overview.json`) as a ConfigMap labelled `grafana_dashboard: "1"` for the Grafana dashboard sidecar;
+`dashboards.labels` and `dashboards.annotations` add your sidecar's labels or a folder annotation. Its uid and data key
+are derived from the release's namespace and name, so several installations can share one Grafana, and it
+pre-selects its own installation (`pa_install_namespace` and the scrape `job`, from the scrape objects above); every
+query is limited to the selected installation. The sidecar reads only its own namespace by default: install the chart
+there, or let the sidecar search this namespace or all namespaces (Grafana chart: `sidecar.dashboards.searchNamespace`),
+which needs RBAC to list and watch ConfigMaps there. Its first panel is a Help / User Guide text (walkthrough, panels,
+alerts); the panels use only the operator's metrics and `up`, with a data source variable. The full guide is
+[user-guide.md](user-guide.md).
 
 ### Alerts
 

@@ -66,7 +66,7 @@ training:
   # One CronJob per autoscaler to train for: {namespace, name, schedule}. Empty: no training (Recommend mode still
   # reports reactive recommendations).
   targets: []
-  hours: 168                 # history per training (the model needs about a week)
+  hours: 168                 # lookback per training (default seven days; the default model needs >= 235 usable 10-min points)
   epochs: null               # training epochs; null: the trainer's default
   activeDeadlineSeconds: 3600
   resources:
@@ -106,6 +106,14 @@ metrics:
     conflictFor: 5m                    # ConflictDetected=True (another replica writer; the operator writes nothing)
     modelStaleHours: 26                # served model's training cutoff older than this
     absentFor: 10m                     # a scrape target down or missing
+
+# The optional Grafana "Help & Overview" dashboard (dashboards/overview.json): a walkthrough, what every panel and
+# alert means, and panels on the operator's metrics. Rendered as a ConfigMap for the Grafana dashboard sidecar.
+dashboards:
+  enabled: false
+  labels:                    # the sidecar loads ConfigMaps with this label; add labels, or set one to null to drop it
+    grafana_dashboard: "1"
+  annotations: {}            # e.g. {grafana_folder: Predictive Autoscaler} for a sidecar folder annotation
 
 nameOverride: ""
 fullnameOverride: ""
