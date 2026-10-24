@@ -7,6 +7,14 @@
   "recorded_by": "claude (benchmark agent)",
   "terminated_before": "2026-10-05T10:32:02Z"
  },
+ "myapptwo-6b858d6c44-r2jt9": {
+  "at": "2026-10-24T08:33:40Z",
+  "evidence": "lost in the USER-ordered Harvester power-off for the NIC install (D-1129; environment event, P9 R1-R4): every prod VM went down with the host, so no preStop hook (final-snapshot.sh) ran. Last observations before the outage: kube_pod_info 2026-10-23T00:50:50.671Z (finite, value 1), envoy up=1 at 2026-10-23T00:50:57.986000Z; node k5nbm Ready=true until monitoring itself went silent (no samples 00:51-02:26Z: the whole cluster and VictoriaMetrics were down). After the return, kube-state-metrics' three targets have their first healthy samples (up=1) at 02:26:51.554Z, 02:26:56.954Z and 02:27:06.312Z, and the pod is absent from every scrape from then through the evidence queries (2026-10-24 ~08:35Z; no kube_pod_info, no envoy up, no istio series), while the arm's replacement myapptwo-6b858d6c44-hnp68 is listed from 02:27-02:29Z; no bench_final_* series for this pod at any time. Pod start 2026-10-12T06:02:01Z (kube_pod_start_time); pod UID from the kubelet's prober_probe_total pod_uid label (this kube-state-metrics exports no UID). Bound: the latest of the three targets' first healthy samples, 02:27:06.312Z, + 90 s = 02:28:36.312Z, rounded up to the next whole minute = 02:29:00Z (conservative: the pod most likely died at the power-off ~00:51Z, but nothing observed it between 00:51Z and 02:26Z). Raw VictoriaMetrics responses with hashes: agent-coordination/03-predictive-benchmark-aws/prodcluster-20261005/evidence-outage-d1129-20261024/ (SHA256SUMS sha256 ce604219a3881877e47f07daa253677074ada92935768face881afaeda6479d0, workspace repo). Closes the pod for hours after 2026-10-23T02:29:00Z only; every hour already finalized stays as it was (no claim about earlier hours).",
+  "pod_start": "2026-10-12T06:02:01Z",
+  "pod_uid": "fc1c190c-00aa-494f-8adb-7488a8ff30df",
+  "recorded_by": "claude (predictivescaler, benchmark agent)",
+  "terminated_before": "2026-10-23T02:29:00Z"
+ },
  "nginx-ensemble-79897f9d-cjxwr": {
   "at": "2026-10-05T11:10:00Z",
   "created": "2026-10-05T10:23:55Z",
@@ -22,6 +30,14 @@
   "pod_uid": "fea17b3d-5c6d-40c4-932f-df65b3d2ec8d",
   "recorded_by": "claude (benchmark agent)",
   "terminated_before": "2026-10-05T10:32:02Z"
+ },
+ "nginx-ensemble-85c768566b-kcszn": {
+  "at": "2026-10-24T08:33:40Z",
+  "evidence": "lost in the USER-ordered Harvester power-off for the NIC install (D-1129; environment event, P9 R1-R4): every prod VM went down with the host, so no preStop hook (final-snapshot.sh) ran. Last observations before the outage: kube_pod_info 2026-10-23T00:50:50.671Z (finite, value 1), envoy up=1 at 2026-10-23T00:50:59.444000Z; node k5nbm Ready=true until monitoring itself went silent (no samples 00:51-02:26Z: the whole cluster and VictoriaMetrics were down). After the return, kube-state-metrics' three targets have their first healthy samples (up=1) at 02:26:51.554Z, 02:26:56.954Z and 02:27:06.312Z, and the pod is absent from every scrape from then through the evidence queries (2026-10-24 ~08:35Z; no kube_pod_info, no envoy up, no istio series), while the arm's replacement nginx-ensemble-85c768566b-g6x7w is listed from 02:27-02:29Z; no bench_final_* series for this pod at any time. Pod start 2026-10-12T05:50:00Z (kube_pod_start_time); pod UID from the kubelet's prober_probe_total pod_uid label (this kube-state-metrics exports no UID). Bound: the latest of the three targets' first healthy samples, 02:27:06.312Z, + 90 s = 02:28:36.312Z, rounded up to the next whole minute = 02:29:00Z (conservative: the pod most likely died at the power-off ~00:51Z, but nothing observed it between 00:51Z and 02:26Z). Raw VictoriaMetrics responses with hashes: agent-coordination/03-predictive-benchmark-aws/prodcluster-20261005/evidence-outage-d1129-20261024/ (SHA256SUMS sha256 ce604219a3881877e47f07daa253677074ada92935768face881afaeda6479d0, workspace repo). Closes the pod for hours after 2026-10-23T02:29:00Z only; every hour already finalized stays as it was (no claim about earlier hours).",
+  "pod_start": "2026-10-12T05:50:00Z",
+  "pod_uid": "e7871f1d-c854-4320-adaf-7ac9cea00dac",
+  "recorded_by": "claude (predictivescaler, benchmark agent)",
+  "terminated_before": "2026-10-23T02:29:00Z"
  },
  "nginx-ensemble-85c768566b-tfc9f": {
   "at": "2026-10-17T23:54:28Z",
@@ -63,6 +79,14 @@
   "recorded_by": "claude (predictivescaler, benchmark agent)",
   "terminated_before": "2026-10-17T13:49:00Z"
  },
+ "nginx-ensemble-q95-d956c77c4-dqdf7": {
+  "at": "2026-10-24T08:33:40Z",
+  "evidence": "lost in the USER-ordered Harvester power-off for the NIC install (D-1129; environment event, P9 R1-R4): every prod VM went down with the host, so no preStop hook (final-snapshot.sh) ran. Last observations before the outage: kube_pod_info 2026-10-23T00:50:50.671Z (finite, value 1), envoy up=1 at 2026-10-23T00:50:48.870000Z; node qcxlw Ready=true until monitoring itself went silent (no samples 00:51-02:26Z: the whole cluster and VictoriaMetrics were down). After the return, kube-state-metrics' three targets have their first healthy samples (up=1) at 02:26:51.554Z, 02:26:56.954Z and 02:27:06.312Z, and the pod is absent from every scrape from then through the evidence queries (2026-10-24 ~08:35Z; no kube_pod_info, no envoy up, no istio series), while the arm's replacement nginx-ensemble-q95-d956c77c4-j78bk is listed from 02:27-02:29Z; no bench_final_* series for this pod at any time. Pod start 2026-10-12T08:50:01Z (kube_pod_start_time); pod UID from the kubelet's prober_probe_total pod_uid label (this kube-state-metrics exports no UID). Bound: the latest of the three targets' first healthy samples, 02:27:06.312Z, + 90 s = 02:28:36.312Z, rounded up to the next whole minute = 02:29:00Z (conservative: the pod most likely died at the power-off ~00:51Z, but nothing observed it between 00:51Z and 02:26Z). Raw VictoriaMetrics responses with hashes: agent-coordination/03-predictive-benchmark-aws/prodcluster-20261005/evidence-outage-d1129-20261024/ (SHA256SUMS sha256 ce604219a3881877e47f07daa253677074ada92935768face881afaeda6479d0, workspace repo). Closes the pod for hours after 2026-10-23T02:29:00Z only; every hour already finalized stays as it was (no claim about earlier hours).",
+  "pod_start": "2026-10-12T08:50:01Z",
+  "pod_uid": "dc2eabb1-772b-49b3-969a-684e04860144",
+  "recorded_by": "claude (predictivescaler, benchmark agent)",
+  "terminated_before": "2026-10-23T02:29:00Z"
+ },
  "nginx-ensemble-q95-d956c77c4-nf9rt": {
   "at": "2026-10-14T07:35:02Z",
   "evidence": "operator scale-down, a recurrence of 6lxkq (D-1108; flagged in the 10-14 coverage read before this record): deletionTimestamp 2026-10-13T20:27:18Z with terminationGracePeriodSeconds 75 (deletion requested ~20:26:03Z; not a force deletion as far as observed); node crwnv Ready=true at every sample 20:07-20:37Z, kubelet up=1 and process start 06:29:13Z unchanged (no kubelet restart); kube-state-metrics up=1 at every scrape 20:07-20:37Z: the pod's last finite KSM observation is 20:26:50.671Z and its 20:27:10.671Z sample is a staleness marker (NaN), while the two other q95 pods of that moment (dqdf7, lhf9p) stay listed: the API object disappeared, consistent with normal graceful termination on a healthy kubelet (VM disappearance alone does not establish hook execution, and does not categorically exclude a later force-delete; the kubelet log below separately confirms execution and exit 1). Pod start = created 07:50:02Z, istio-proxy/nginx started 07:50:04Z, restarts 0. No final-snapshot series observed (no bench_final_* series for this pod in 8 days). The kubelet logged at 20:26:19.078443Z \"PreStop hook failed ... final-snapshot.sh' exited with 1: \" with empty output, ~16 s after the deletion request (inference, not established: as for 6lxkq this fits SETTLE 6 s + WAIT 10 s, i.e. the inbound-quiescence timeout; the script's own message is gone with the container), then removed the containers at 20:27:03.777Z (crwnv kubelet.log read by infra; it also gives the pod UID, which this kube-state-metrics does not export, summary kubelet-log-summary-infra-20261014T0734Z.md sha256 26ce1e3624e2c7cbbff39c243850d49358f4bc3054fd2ac3b20e562d8e610882); why the script exited 1 is unknown (flagged). The only one of 31 demo arm pods ended 10-13 19:00Z to 10-14 07:20Z without a receipt. Raw VictoriaMetrics responses with hashes: agent-coordination/03-predictive-benchmark-aws/prodcluster-20261005/evidence-nf9rt-20261014/ (SHA256SUMS sha256 713d7669db63289729bbc6607c652e52f2dc04cedbe84b828e0838967d4a9af0, workspace repo). Closes the pod for hours after 20:28:00Z only; its own hour (20Z) stays INCOMPLETE.",
@@ -70,6 +94,14 @@
   "pod_uid": "6025a083-708e-4445-99b4-09e8bb02dbc0",
   "recorded_by": "claude (predictivescaler, benchmark agent)",
   "terminated_before": "2026-10-13T20:28:00Z"
+ },
+ "nginx-reactive-67596d54db-cnbn8": {
+  "at": "2026-10-24T08:33:40Z",
+  "evidence": "lost in the USER-ordered Harvester power-off for the NIC install (D-1129; environment event, P9 R1-R4): every prod VM went down with the host, so no preStop hook (final-snapshot.sh) ran. Last observations before the outage: kube_pod_info 2026-10-23T00:50:50.671Z (finite, value 1), envoy up=1 at 2026-10-23T00:50:40.060000Z; node qcxlw Ready=true until monitoring itself went silent (no samples 00:51-02:26Z: the whole cluster and VictoriaMetrics were down). After the return, kube-state-metrics' three targets have their first healthy samples (up=1) at 02:26:51.554Z, 02:26:56.954Z and 02:27:06.312Z, and the pod is absent from every scrape from then through the evidence queries (2026-10-24 ~08:35Z; no kube_pod_info, no envoy up, no istio series), while the arm's replacement nginx-reactive-67596d54db-qtml8 is listed from 02:27-02:29Z; no bench_final_* series for this pod at any time. Pod start 2026-10-12T08:02:01Z (kube_pod_start_time); pod UID from the kubelet's prober_probe_total pod_uid label (this kube-state-metrics exports no UID). Bound: the latest of the three targets' first healthy samples, 02:27:06.312Z, + 90 s = 02:28:36.312Z, rounded up to the next whole minute = 02:29:00Z (conservative: the pod most likely died at the power-off ~00:51Z, but nothing observed it between 00:51Z and 02:26Z). Raw VictoriaMetrics responses with hashes: agent-coordination/03-predictive-benchmark-aws/prodcluster-20261005/evidence-outage-d1129-20261024/ (SHA256SUMS sha256 ce604219a3881877e47f07daa253677074ada92935768face881afaeda6479d0, workspace repo). Closes the pod for hours after 2026-10-23T02:29:00Z only; every hour already finalized stays as it was (no claim about earlier hours).",
+  "pod_start": "2026-10-12T08:02:01Z",
+  "pod_uid": "b38d02d2-24af-483b-a8f8-a61466f5811d",
+  "recorded_by": "claude (predictivescaler, benchmark agent)",
+  "terminated_before": "2026-10-23T02:29:00Z"
  },
  "nginx-reactive-7b6c858f4b-ft64g": {
   "at": "2026-10-05T11:10:00Z",
@@ -110,6 +142,22 @@
   "pod_uid": "6398c69a-072e-47d6-a957-041042525cc6",
   "recorded_by": "claude (benchmark agent)",
   "terminated_before": "2026-10-05T10:32:02Z"
+ },
+ "nginx-seasonal-694b66d47b-nqdp5": {
+  "at": "2026-10-24T08:33:40Z",
+  "evidence": "lost in the USER-ordered Harvester power-off for the NIC install (D-1129; environment event, P9 R1-R4): every prod VM went down with the host, so no preStop hook (final-snapshot.sh) ran. Last observations before the outage: kube_pod_info 2026-10-23T00:50:50.671Z (finite, value 1), envoy up=1 at 2026-10-23T00:50:43.980000Z; node qcxlw Ready=true until monitoring itself went silent (no samples 00:51-02:26Z: the whole cluster and VictoriaMetrics were down). After the return, kube-state-metrics' three targets have their first healthy samples (up=1) at 02:26:51.554Z, 02:26:56.954Z and 02:27:06.312Z, and the pod is absent from every scrape from then through the evidence queries (2026-10-24 ~08:35Z; no kube_pod_info, no envoy up, no istio series), while the arm's replacement nginx-seasonal-694b66d47b-m7shj is listed from 02:27-02:29Z; no bench_final_* series for this pod at any time. Pod start 2026-10-05T12:30:14Z (kube_pod_start_time); pod UID from the kubelet's prober_probe_total pod_uid label (this kube-state-metrics exports no UID). Bound: the latest of the three targets' first healthy samples, 02:27:06.312Z, + 90 s = 02:28:36.312Z, rounded up to the next whole minute = 02:29:00Z (conservative: the pod most likely died at the power-off ~00:51Z, but nothing observed it between 00:51Z and 02:26Z). Raw VictoriaMetrics responses with hashes: agent-coordination/03-predictive-benchmark-aws/prodcluster-20261005/evidence-outage-d1129-20261024/ (SHA256SUMS sha256 ce604219a3881877e47f07daa253677074ada92935768face881afaeda6479d0, workspace repo). Closes the pod for hours after 2026-10-23T02:29:00Z only; every hour already finalized stays as it was (no claim about earlier hours).",
+  "pod_start": "2026-10-05T12:30:14Z",
+  "pod_uid": "da770dbe-ca58-4051-ad12-031d10a105a6",
+  "recorded_by": "claude (predictivescaler, benchmark agent)",
+  "terminated_before": "2026-10-23T02:29:00Z"
+ },
+ "nginx-test-77d6cb8d96-4rzmb": {
+  "at": "2026-10-24T08:33:40Z",
+  "evidence": "lost in the USER-ordered Harvester power-off for the NIC install (D-1129; environment event, P9 R1-R4): every prod VM went down with the host, so no preStop hook (final-snapshot.sh) ran. Last observations before the outage: kube_pod_info 2026-10-23T00:50:50.671Z (finite, value 1), envoy up=1 at 2026-10-23T00:50:49.318000Z; node hbm2d Ready=true until monitoring itself went silent (no samples 00:51-02:26Z: the whole cluster and VictoriaMetrics were down). After the return, kube-state-metrics' three targets have their first healthy samples (up=1) at 02:26:51.554Z, 02:26:56.954Z and 02:27:06.312Z, and the pod is absent from every scrape from then through the evidence queries (2026-10-24 ~08:35Z; no kube_pod_info, no envoy up, no istio series), while the arm's replacement nginx-test-77d6cb8d96-jdgld is listed from 02:27-02:29Z; no bench_final_* series for this pod at any time. Pod start 2026-10-12T07:02:02Z (kube_pod_start_time); pod UID from the kubelet's prober_probe_total pod_uid label (this kube-state-metrics exports no UID). Bound: the latest of the three targets' first healthy samples, 02:27:06.312Z, + 90 s = 02:28:36.312Z, rounded up to the next whole minute = 02:29:00Z (conservative: the pod most likely died at the power-off ~00:51Z, but nothing observed it between 00:51Z and 02:26Z). Raw VictoriaMetrics responses with hashes: agent-coordination/03-predictive-benchmark-aws/prodcluster-20261005/evidence-outage-d1129-20261024/ (SHA256SUMS sha256 ce604219a3881877e47f07daa253677074ada92935768face881afaeda6479d0, workspace repo). Closes the pod for hours after 2026-10-23T02:29:00Z only; every hour already finalized stays as it was (no claim about earlier hours).",
+  "pod_start": "2026-10-12T07:02:02Z",
+  "pod_uid": "e93c227b-c37e-41b6-971f-57de8c3e19ef",
+  "recorded_by": "claude (predictivescaler, benchmark agent)",
+  "terminated_before": "2026-10-23T02:29:00Z"
  },
  "nginx-test-7f9cd5dc64-fph2g": {
   "at": "2026-10-05T11:10:00Z",

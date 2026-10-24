@@ -1,4 +1,4 @@
-"""deploy/prodcluster/collect_load_evidence.py v9: server-side gate, inventory since a declared start, verified snapshots.
+"""deploy/prodcluster/collect_load_evidence.py v10 (v9 + D-1131): server-side gate, inventory since a declared start, verified snapshots.
 
 Fixture timing follows prodcluster measurements (2026-10-05): k6 pushes every 10 s (k6_vus at x.475 s, a changed
 counter stamped with its latest event); Envoy targets scraped every 30 s with `up` and every series sharing the scrape
@@ -310,6 +310,16 @@ class FakeVM:
                     out.append((lab, pts, stale))
                     if o.get("dup_start") and name == "kube_pod_start_time" and p.endswith("p1"):
                         out.append(({"pod": p, "container": "istio-proxy", "uid": "other"}, pts, []))
+                    if o.get("ksm_split") and name == "kube_pod_start_time" and p.endswith("p0") and len(pts) > 1:
+                        # v10 (D-1131): the pod lived across a kube-state-metrics restart, so its start time has two
+                        # series that differ only in the scrape address (or, in the bad variants, in more)
+                        k = len(pts) // 2
+                        lab, (series, stl) = out.pop()[0], (pts, stale)
+                        b = dict(lab, instance="10.42.0.2:8080")
+                        if o["ksm_split"] == "label":
+                            b["uid"] = "other"
+                        late = [(t, v + 100) for t, v in series[k:]] if o["ksm_split"] == "value" else series[k:]
+                        out += [(dict(lab, instance="10.42.0.1:8080"), series[:k], []), (b, late, stl)]
             if name == "kube_pod_container_state_started" and o.get("proxy_history"):
                 out = [x for e in out for x in self.proxy_history(e, arm_pods)]
             return out
@@ -438,7 +448,7 @@ def test_healthy_hour_passes_and_qualifies_only_with_the_recorded_approval():
     assert early["status"] == "PASS" and not early["qualification"]["qualifies"] and not early["maturity"]["finalized"]
     missed = run(FakeVM(), now=T1 + cle.FINAL_AFTER + 3600 + 60)   # after the sixth window: not finalized
     assert not missed["qualification"]["qualifies"] and not missed["maturity"]["finalized"]
-    assert r["failed"] == [0, 0] and r["dropped"] == [0, 0] and r["collector"].endswith("v9")
+    assert r["failed"] == [0, 0] and r["dropped"] == [0, 0] and r["collector"].endswith("v10")
     assert r["observed"][0] <= r["planned"] <= r["observed"][1] and r["p95_server_ms_interior"] is not None
     q = run(FakeVM(), approvals={}, now=FINAL_NOW)["qualification"]
     assert not q["qualifies"] and q["pending_user_approval"] == ["A1'"]
@@ -535,6 +545,21 @@ def test_r22_manual_records_close_one_incarnation_only():
     assert r["status"] == "INCOMPLETE" and "does not match the observed incarnation" in r["reason"], r
     r = run(FakeVM(pre_hour="alive_after"), terminations={"nginx-test-aaaa1111-p0": dict(rec, terminated_before=iso(T0 - 700))})
     assert r["status"] == "INCOMPLETE" and "observed alive after" in r["reason"], r
+
+
+def test_d1131_v10_record_matches_a_start_split_across_ksm_scrape_addresses():
+    """D-1129 outage: nginx-seasonal's lost pod had lived across a KSM address change (two start series, one value).
+    v10 merges series that differ only in the scrape address; a second value or another label still fails closed."""
+    rec = {"terminated_before": iso(T0 - 500), "pod_start": iso(T0 - 7000), "pod_uid": "uid-p0",
+           "evidence": "outage; KSM absence after return", "recorded_by": "claude", "at": iso(T0)}
+    r = run(FakeVM(pre_hour="old", ksm_split="same"), terminations={"nginx-test-aaaa1111-p0": rec})
+    assert r["status"] == "PASS" and r["pods_closed_before_hour"] == 1, r
+    for bad in ("value", "label"):
+        r = run(FakeVM(pre_hour="old", ksm_split=bad), terminations={"nginx-test-aaaa1111-p0": rec})
+        assert r["status"] == "INCOMPLETE" and ("does not match the observed incarnation" in r["reason"] or
+                                              "missing or changing" in r["reason"]), (bad, r)
+    r = run(FakeVM(pre_hour="old", ksm_split="same"), terminations={"nginx-test-aaaa1111-p0": dict(rec, pod_start=iso(T0 - 6900))})
+    assert r["status"] == "INCOMPLETE" and "does not match the observed incarnation" in r["reason"], r
 
 
 def test_r22_a_closed_pods_counter_may_not_move_any_time_after_its_capture():

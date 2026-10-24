@@ -16,4 +16,6 @@ Inputs of the hourly load-evidence CronJob (`../ml-engine/load-evidence.yaml`), 
   (topology-spread cap, D-1080); and three q95 pods whose preStop hook exited 1 without a receipt during operator
   scale-downs, closed by manual assertion for hours after their bound only: 6lxkq (2026-10-13 10:40Z, D-1108, r86/r87),
   nf9rt (2026-10-13 20:28Z, r88) and, after T0 under the P9 amendment R1–R4, cjw6v (2026-10-17 13:49Z, r120); and one
-  nginx-ensemble pod with the same preStop exit, after T0: tfc9f (2026-10-17 16:10Z, r121).
+  nginx-ensemble pod with the same preStop exit, after T0: tfc9f (2026-10-17 16:10Z, r121); and the six arm pods (one per arm)
+  killed without a snapshot by the 2026-10-23 Harvester power-off (D-1129), closed for hours after 2026-10-23 02:29Z
+  (D-1131, P9 R9, r126/r127; matched by collector v10, which merges start series split across KSM scrape addresses).

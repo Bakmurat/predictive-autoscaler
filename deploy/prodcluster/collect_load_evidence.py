@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
-"""Hourly load evidence for the six benchmark arms on a VictoriaMetrics cluster (prodcluster campaign), v9.
+"""Hourly load evidence for the six benchmark arms on a VictoriaMetrics cluster (prodcluster campaign), v10.
 
+v10 (2026-10-24, D-1131): a manual termination record is matched against the pod's start (or creation) series merged
+across kube-state-metrics scrape addresses, as v9 does for snapshots. The D-1129 outage left one arm pod per arm without
+a final snapshot; nginx-seasonal's had lived across a KSM address change (two start series, one value), so under v9 its
+record could never match and every later hour of that arm stayed INCOMPLETE. Series may differ only in the KSM scrape
+address and must show one value; everything else in the record check is unchanged.
 v9 (2026-10-13): a final snapshot is bound to the istio-proxy incarnation kube-state-metrics observed at its capture,
 not to one constant container start over the whole inventory window. The 2026-10-12 VM reboot restarted every arm
 container in place and gave kube-state-metrics a new scrape address (instance), so each pod that lived across it has two
@@ -463,8 +468,10 @@ def verify_snapshot(vm, app, pod, t_inv, end, terminations):
             # the record closes ONE incarnation (name + pod start or creation time): the observed value must match it
             # (positive, finite evidence), and nothing of that name may be observed alive after the recorded bound
             metric = "kube_pod_start_time" if kind == "pod_start" else "kube_pod_created"
+            # v10: series may differ only in the KSM scrape address (as in proxy_start_at_capture); one value over all
             st = [x for x in vm.raw(f'{metric}{{namespace="{NAMESPACE}",pod="{pod}"}}', end, W) if x[1]]
-            if len(st) != 1 or abs(lifecycle_value(st[0][1], metric, pod) - ident) > 1:
+            if not st or len({native(m, KSM_TARGET_LABELS) for m, _, _ in st}) != 1 or \
+                    abs(lifecycle_value([p for _, s, _ in st for p in s], metric, pod) - ident) > 1:
                 raise Incomplete(f"pod {pod}: manual termination record does not match the observed incarnation")
             if kind == "created" and any(s for _, s, _ in vm.raw(f'kube_pod_start_time{{namespace="{NAMESPACE}",pod="{pod}"}}', end, W)):
                 raise Incomplete(f"pod {pod}: record identifies it by creation time but it has a start time")
@@ -625,7 +632,7 @@ def collect(vm, hour_start, t_inv, terminations=None, approvals=None, now=None):
     now = time.time() if now is None else now
     rows = []
     for app in APPS:
-        r = {"app": app, "hour_start": hour_start.strftime("%Y-%m-%dT%H:%M:%SZ"), "collector": "collect_load_evidence.py v9",
+        r = {"app": app, "hour_start": hour_start.strftime("%Y-%m-%dT%H:%M:%SZ"), "collector": "collect_load_evidence.py v10",
              "collector_sha256": COLLECTOR_SHA256, "inventory_start": utc(t_inv), "collection_cutoff": utc(end),
              "terminations_used": sorted(terminations), "inputs_sha256": inputs_sha256, "identity": IDENTITY_NOTE}
         try:
