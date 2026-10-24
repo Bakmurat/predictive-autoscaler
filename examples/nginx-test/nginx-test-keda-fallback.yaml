@@ -1,16 +1,16 @@
 ---
-# KEDA ScaledObject for nginx-test - FALLBACK SAFETY NET
+# KEDA ScaledObject for nginx-test - a PAUSED fallback, kept ready for a manual hand-over
 #
-# This is the REACTIVE fallback when PredictiveAutoscaler:
-#   - ML API is down or model unavailable
-#   - Predictions have low confidence
-#   - Actual load exceeds predicted load
+# Only ONE controller may own a Deployment's replica count. An active KEDA ScaledObject creates an HPA that writes
+# replicas on every sync, so running it next to the PredictiveAutoscaler (which also writes replicas) makes them fight.
+# This object is therefore created PAUSED (annotation below): KEDA keeps it but does not scale the Deployment.
 #
-# KEDA monitors actual metrics and scales IMMEDIATELY when thresholds are crossed.
-# Both PredictiveAutoscaler and KEDA target the same deployment:
-#   - They don't conflict - KEDA respects current replica count
-#   - If predictive already scaled up, KEDA thresholds won't fire
-#   - If predictive missed, KEDA catches it within seconds
+# Hand-over to KEDA (e.g. the forecaster is unavailable for a long time):
+#   1. delete the PredictiveAutoscaler (or stop the operator) so it no longer writes replicas;
+#   2. remove the annotation: kubectl -n default annotate scaledobject nginx-test-keda-fallback autoscaling.keda.sh/paused-
+# Hand-back: re-add the annotation (autoscaling.keda.sh/paused="true"), check that KEDA no longer changes replicas,
+# then re-create the PredictiveAutoscaler. Never run both active. See docs/coexistence.md and
+# https://keda.sh/docs/latest/concepts/scaling-deployments/#pause-autoscaling
 #
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
@@ -21,7 +21,8 @@ metadata:
     app: nginx-test
     scaler-type: reactive-fallback
   annotations:
-    description: "KEDA reactive fallback for nginx-test"
+    autoscaling.keda.sh/paused: "true"
+    description: "Paused KEDA fallback for nginx-test (manual hand-over only)"
     predictive-autoscaler-name: "nginx-test-autoscaler"
 spec:
   scaleTargetRef:
@@ -29,9 +30,9 @@ spec:
     kind: Deployment
     name: nginx-test
 
-  # Must match PredictiveAutoscaler boundaries
-  minReplicaCount: 2
-  maxReplicaCount: 50
+  # Same bounds as the PredictiveAutoscaler (nginx-test-predictive-autoscaler.yaml: 1..40)
+  minReplicaCount: 1
+  maxReplicaCount: 40
 
   # Reactive polling - checks frequently for safety
   pollingInterval: 10        # Check every 10 seconds
@@ -85,14 +86,13 @@ spec:
       value: "70"
 
   # -----------------------------------------------
-  # Request rate from VictoriaMetrics (LEADING FALLBACK)
-  # Uses RPS (requests per second) directly — no * 60 conversion
-  # This is the same metric the predictive autoscaler uses
+  # Request rate (requests per second), counted once per request: only the destination sidecar's report
+  # (without reporter="destination" Istio's source-side series double-count the traffic)
   # -----------------------------------------------
   - type: prometheus
     metadata:
       serverAddress: http://vmselect-vmst.monitoring.svc.cluster.local:8481/select/0/prometheus
       query: |
-        sum(rate(istio_requests_total{destination_workload="nginx-test"}[1m]))
+        sum(rate(istio_requests_total{reporter="destination",destination_workload="nginx-test",destination_workload_namespace="default"}[1m]))
       threshold: "300"             # Scale if per-pod avg RPS > 300
-      activationThreshold: "150"   # Start evaluating at 150 RPS per-pod avg
+      activationThreshold: "150"   # KEDA activates the scaler when the query value (total RPS, not per pod) exceeds 150

@@ -10,7 +10,7 @@
 # failure and publication is gated on this script returning 0 (see README, "Testing").
 #
 # Usage:
-#   scripts/verify.sh                 # full run, log to verify-<utc>.log
+#   scripts/verify.sh                 # full run, log to logs/verify-<utc>.log
 #   scripts/verify.sh --python-only   # skip Go (e.g. when Go is unavailable)
 #   scripts/verify.sh --go-only
 #   PYTEST_ARGS="-k pattern" scripts/verify.sh
@@ -19,7 +19,7 @@
 #   PYTHON   interpreter for the Python suite (default: eval/.venv/bin/python if present,
 #            else python3)
 #   GO       go binary (default: go on PATH, else /usr/local/go/bin/go)
-#   LOG      log path (default: verify-<utc>.log in the repo root; use /dev/null to skip)
+#   LOG      log path (default: logs/verify-<utc>.log, gitignored; use /dev/null to skip)
 
 set -u
 set -o pipefail
@@ -35,7 +35,8 @@ GO="${GO:-}"
 if [ -z "$GO" ]; then
   if command -v go >/dev/null 2>&1; then GO="go"; elif [ -x /usr/local/go/bin/go ]; then GO="/usr/local/go/bin/go"; else GO=""; fi
 fi
-LOG="${LOG:-$ROOT/verify-$(date -u +%Y%m%dT%H%M%SZ).log}"
+LOG="${LOG:-$ROOT/logs/verify-$(date -u +%Y%m%dT%H%M%SZ).log}"
+case "$LOG" in "$ROOT"/logs/*) mkdir -p "$ROOT/logs" ;; esac
 PYTEST_ARGS="${PYTEST_ARGS:-}"
 
 run_go=1; run_py=1
