@@ -112,9 +112,14 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels: {{- include "pa.labels" . | nindent 4 }}
 rules:
+  # create cannot be limited by name (the object does not exist yet); everything else only on the operator's Lease.
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    verbs: ["create"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["predictive-autoscaler.autoscaling.devkuban.com"]
+    verbs: ["get", "update"]
   - apiGroups: ["", "events.k8s.io"]
     resources: ["events"]
     verbs: ["create", "patch"]

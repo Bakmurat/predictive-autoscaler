@@ -98,7 +98,12 @@ def test_rbac_matches_the_documented_least_privilege_table(render):
         (("authentication.k8s.io",), ("tokenreviews",), (), ("create",))}
     lease = by_kind(docs, "Role")
     assert len(lease) == 1 and lease[0]["metadata"]["namespace"] == NS
-    assert {tuple(r["resources"]) for r in lease[0]["rules"]} == {("leases",), ("events",)}
+    assert {(tuple(r["resources"]), tuple(r.get("resourceNames", [])), tuple(sorted(r["verbs"]))) for r in lease[0]["rules"]} == {
+        (("leases",), (), ("create",)),
+        (("leases",), ("predictive-autoscaler.autoscaling.devkuban.com",), ("get", "update")),
+        (("events",), (), ("create", "patch"))}
+    main_go = (ROOT / "k8s-operator" / "main.go").read_text()
+    assert 'leaderElectionID = "predictive-autoscaler.autoscaling.devkuban.com"' in main_go   # the Role's resourceName
     ev = next(r for r in lease[0]["rules"] if r["resources"] == ["events"])
     assert sorted(ev["verbs"]) == ["create", "patch"]
 
@@ -482,3 +487,41 @@ def test_operator_scrape_keeps_the_autoscaler_namespace_label(render):
 def test_alert_values_are_validated(render, bad):
     p = render({"metrics": {"alerts": bad}}, check=False)
     assert p.returncode != 0
+
+
+def _render_notes(tmp_path, values):
+    """NOTES.txt rendered offline: helm never renders NOTES in `helm template` and `helm install --dry-run` needs a
+    cluster, so a copy of the chart serves it as an ordinary template (--show-only)."""
+    import shutil
+    chart = tmp_path / "chart"
+    if not chart.exists():
+        shutil.copytree(CHART, chart)
+        shutil.copy(chart / "templates" / "NOTES.txt", chart / "notes-src.txt")
+        (chart / "templates" / "notes-under-test.yaml").write_text(
+            'apiVersion: v1\nkind: ConfigMap\nmetadata: {name: notes-under-test}\ndata:\n  notes: |\n'
+            '{{ tpl (.Files.Get "notes-src.txt") . | indent 4 }}\n')
+    f = tmp_path / "v.yaml"
+    f.write_text(yaml.safe_dump(values))
+    try:
+        p = subprocess.run(["helm", "template", "pa", str(chart), "-n", NS, "--kube-version", "1.35.0", "-f", str(f),
+                            "--show-only", "templates/notes-under-test.yaml"], capture_output=True, text=True, timeout=60)
+    except OSError as e:
+        if os.environ.get("CI"):
+            pytest.fail(f"helm is required in CI: {e}")
+        pytest.skip(f"helm not usable here: {e}")
+    assert p.returncode == 0, p.stderr
+    return yaml.safe_load(p.stdout)["data"]["notes"]
+
+
+@pytest.mark.parametrize("extra,want,unwanted", [
+    ({}, ["NOT renewed automatically"], ["DELETES the model"]),
+    ({"forecaster": {"persistence": {"retain": False}}}, ["DELETES the model"], []),
+    ({"forecaster": {"persistence": {"retain": False, "existingClaim": "models"}}}, [], ["DELETES the model"]),
+    ({"forecaster": {"tls": {"source": "existingSecret", "existingSecret": "x"}}}, [], ["NOT renewed automatically"]),
+])
+def test_notes_warn_about_self_signed_expiry_and_retention(tmp_path, extra, want, unwanted):
+    notes = _render_notes(tmp_path, _merge(BASE, extra))
+    for w in want:
+        assert w in notes
+    for u in unwanted:
+        assert u not in notes

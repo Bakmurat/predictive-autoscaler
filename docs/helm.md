@@ -76,7 +76,9 @@ Pods or read Secrets. The chart has no cold start: retrain by hand with
   leaves it, and all autoscalers, in place.
 - The model volume created by the chart is kept too (`forecaster.persistence.retain`, on by default): Helm's
   `resource-policy: keep` plus Argo's `Prune=false,Delete=false`. Use `forecaster.persistence.existingClaim` to manage
-  the claim yourself.
+  the claim yourself. **Turning `retain` off on a running release removes that protection from the existing claim**:
+  a later uninstall (or Application delete) then deletes the volume and every trained model. The install notes warn
+  when it is off.
 - The autoscalers are not the chart's. They live with their workloads, in the app's own Application, and are deleted
   with it. That is safe: the operator has no finalizer, and the Deployment keeps its replica count; only autoscaling
   stops. To keep an autoscaler when its Application is deleted, annotate it
@@ -176,7 +178,7 @@ The certificate comes from `forecaster.tls.source`:
 
 | Source | Use it for | Renewal |
 |---|---|---|
-| `selfSigned` (default) | plain Helm, the quickstart | valid `selfSigned.validityDays` (365); renew by deleting the Secret `<release>-predictive-autoscaler-forecaster-tls` and running `helm upgrade`. `helm upgrade` keeps it through `lookup`, which Argo CD and `helm template` cannot do, so **do not use it with Argo CD** |
+| `selfSigned` (default) | plain Helm, the quickstart | valid `selfSigned.validityDays` (365); it is **not** renewed automatically (the install notes say so): renew before it expires by deleting the Secret `<release>-predictive-autoscaler-forecaster-tls` and running `helm upgrade`; prefer `certManager` in production. The Secret's `ca.crt` does not tell you the served certificate's expiry: check `tls.crt` or the served certificate. `helm upgrade` keeps it through `lookup`, which Argo CD and `helm template` cannot do, so **do not use it with Argo CD** |
 | `certManager` | Argo CD, production | cert-manager renews it (`duration`, `renewBefore`); the Issuer must put its CA into the Secret's `ca.crt` (a CA issuer does) |
 | `existingSecret` | certificates managed elsewhere | yours: a Secret with `tls.crt`, `tls.key` and `ca.crt` |
 

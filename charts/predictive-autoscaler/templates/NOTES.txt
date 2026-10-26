@@ -23,6 +23,23 @@ namespaces). Its first panel is the Help / User Guide.
 
 NetworkPolicies are on: they only work with a CNI that enforces them.
 {{- end }}
+{{- if .Release.IsUpgrade }}
+
+Upgrade: Helm never upgrades the CRD in crds/. If this version ships a newer CRD, apply it first:
+  kubectl apply --server-side --force-conflicts -f charts/predictive-autoscaler/crds/
+The operator logs the CRD revision it found and the one it requires, and waits until they match.
+{{- end }}
+{{- if and (eq .Values.forecaster.tls.source "selfSigned") .Values.forecaster.auth.enabled }}
+
+TLS: the forecasting service uses a self-signed certificate valid {{ .Values.forecaster.tls.selfSigned.validityDays }} days from when the
+Secret {{ include "pa.fullname" . }}-forecaster-tls was created. It is NOT renewed automatically: before it expires,
+delete that Secret and run helm upgrade. For production prefer forecaster.tls.source=certManager (automatic renewal).
+{{- end }}
+{{- if and (not .Values.forecaster.persistence.existingClaim) (not .Values.forecaster.persistence.retain) }}
+
+WARNING: forecaster.persistence.retain is false: deleting this release (or its Argo CD Application) DELETES the model
+volume and every trained model. Turning retain off on a running release also makes a later delete remove it.
+{{- end }}
 {{- if not .Values.training.targets }}
 
 No training targets are configured (training.targets): no model will be trained.
