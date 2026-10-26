@@ -2,7 +2,8 @@
 # The chart's static checks: helm lint and helm template of every value set in charts/predictive-autoscaler/ci/, each
 # rendered output validated by kubeconform (strict) against Kubernetes 1.33, 1.34 and 1.35. Only kinds without a schema
 # there are skipped, by name: the CRD itself (envtest validates it on a real API server), the optional monitoring
-# resources (scrape objects and alert rules; scripts/alerts-check.sh tests the rules) and cert-manager's Certificate;
+# resources (scrape objects and alert rules; scripts/alerts-check.sh tests the rules), cert-manager's Certificate and
+# the opt-in CiliumNetworkPolicy (its shape is pinned in test_chart.py; its schema and enforcement are release gates);
 # any other unknown or misspelled kind fails. The render tests
 # (ml-engine/tests/test_chart.py) pin what the objects promise; the kind smoke test proves the install works.
 set -euo pipefail
@@ -19,7 +20,7 @@ for values in "$CHART"/ci/*-values.yaml; do
   for v in $VERSIONS; do
     if helm template pa "$CHART" -n pa-system --include-crds --kube-version "$v" -f "$values" \
         | kubeconform -strict -summary -kubernetes-version "$v" -output text \
-            -skip CustomResourceDefinition,ServiceMonitor,VMServiceScrape,PrometheusRule,VMRule,Certificate; then
+            -skip CustomResourceDefinition,ServiceMonitor,VMServiceScrape,PrometheusRule,VMRule,Certificate,CiliumNetworkPolicy; then
       echo "ok   $name on Kubernetes $v"
     else
       echo "FAIL $name on Kubernetes $v" >&2; rc=1
