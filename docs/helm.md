@@ -93,12 +93,15 @@ They are on by default, and work only with a CNI that enforces them.
 Enforcement depends on the CNI. Some implementations apply a new pod's policies only once their agent has learned the
 pod, and let its first connections through (kind's kube-network-policies did for about ten seconds in the smoke test).
 Tighten `networkPolicy.kubeAPI.cidrs` to your API server's addresses: the default allows any address on ports
-443/6443. Use the **endpoint** addresses and port, not the `kubernetes` Service's ClusterIP: policies are evaluated
-after the Service address is translated, so a rule for `10.43.0.1/32:443` never matches and locks the pods out. Read
-them with `kubectl get endpointslices -n default -l kubernetes.io/service-name=kubernetes` (typically the control-plane
-node IPs on 6443). Some CNIs (Cilium among them) treat the API server as a special identity, and an ipBlock may not
-match it; there, keep the default or allow it with the CNI's own policy (for example Cilium's `toEntities:
-[kube-apiserver]`) and set `cidrs: []`. Set `networkPolicy.enabled: false` if your CNI ignores policies or you manage them elsewhere.
+443/6443. Whether a policy sees the `kubernetes` Service's ClusterIP or the translated endpoint address depends on the
+CNI (Kubernetes leaves the order of Service translation and policy evaluation to the implementation), so an allow for
+the ClusterIP alone is not portable. Configure the addresses and ports your CNI evaluates; the endpoints are listed by
+`kubectl get endpointslices -n default -l kubernetes.io/service-name=kubernetes` (often the control-plane node IPs on
+6443, but check). **Cilium** normally excludes node addresses from CIDR matching (unless `policyCIDRMatchMode: nodes`),
+so an ipBlock for the API server may never match; Cilium's documented way is a CiliumNetworkPolicy with
+`toEntities: [kube-apiserver]`. Note that `cidrs: []` renders a ports-only rule that allows **every** destination on
+those ports, and allow rules add up, so adding a Cilium policy next to it does not narrow anything: the default is a
+connectivity fallback, not API-only isolation. Set `networkPolicy.enabled: false` if your CNI ignores policies or you manage them elsewhere.
 
 ## Persistence
 

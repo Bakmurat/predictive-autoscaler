@@ -81,7 +81,7 @@ networkPolicy:
     namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
     podSelector: {matchLabels: {k8s-app: kube-dns}}
   kubeAPI:
-    cidrs: []                # empty: any address on the ports below (weak). Set the API server ENDPOINT IPs (6443), never the Service ClusterIP; see docs/helm.md
+    cidrs: []                # empty: ANY destination on the ports below (weak). Set the addresses your CNI evaluates for the API server; see docs/helm.md
     ports: [443, 6443]
   # Where Prometheus is: at least one selector or ipBlock is required when networkPolicy.enabled.
   prometheus:
