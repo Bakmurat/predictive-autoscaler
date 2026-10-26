@@ -78,14 +78,16 @@ def test_rbac_matches_the_documented_least_privilege_table(render):
     ro = ("get", "list", "watch")
     assert rules_of(docs, "pa-predictive-autoscaler-operator") == {
         (("autoscaling.devkuban.com",), ("predictiveautoscalers",), (), ro),
-        (("autoscaling.devkuban.com",), ("predictiveautoscalers/status",), (), ("get", "patch", "update")),
         (("apps",), ("deployments",), (), ro),
-        (("apps",), ("deployments/scale",), (), ("get", "update")),
         (("autoscaling",), ("horizontalpodautoscalers",), (), ro),
         (("keda.sh",), ("scaledobjects",), (), ro),
         (("autoscaling.k8s.io",), ("verticalpodautoscalers",), (), ro),
         (("autoscaler.example.com",), ("predictiveautoscalers",), (), ro),
         (("apiextensions.k8s.io",), ("customresourcedefinitions",), (NEW_CRD,), ("get",)),
+    }
+    assert rules_of(docs, "pa-predictive-autoscaler-operator-write") == {
+        (("autoscaling.devkuban.com",), ("predictiveautoscalers/status",), (), ("get", "patch", "update")),
+        (("apps",), ("deployments/scale",), (), ("get", "update")),
         (("", "events.k8s.io"), ("events",), (), ("create", "patch")),
     }
     read_only = {(("autoscaling.devkuban.com",), ("predictiveautoscalers",), (), ("get",)),
@@ -114,9 +116,34 @@ def test_each_component_runs_as_its_own_service_account(render):
     for d, pod in pod_specs(docs):
         component = d["metadata"]["labels"]["app.kubernetes.io/component"]
         assert pod["serviceAccountName"] == f"pa-predictive-autoscaler-{component}"
-    for b in by_kind(docs, "ClusterRoleBinding"):
-        assert b["roleRef"]["name"] == b["metadata"]["name"] == b["subjects"][0]["name"]
-        assert b["subjects"][0]["namespace"] == NS
+    for b in by_kind(docs, "ClusterRoleBinding") + by_kind(docs, "RoleBinding"):
+        assert b["roleRef"]["name"] == b["metadata"]["name"]
+        assert len(b["subjects"]) == 1 and b["subjects"][0]["namespace"] == NS
+        assert b["subjects"][0]["name"] in sas and b["metadata"]["name"].startswith(b["subjects"][0]["name"])
+
+
+def _write_bindings(docs):
+    return [b for b in by_kind(docs, "ClusterRoleBinding") + by_kind(docs, "RoleBinding")
+            if b["roleRef"]["name"] == "pa-predictive-autoscaler-operator-write"]
+
+
+def test_operator_writes_are_cluster_wide_only_when_every_namespace_is_watched(render):
+    (b,) = _write_bindings(render())
+    assert b["kind"] == "ClusterRoleBinding"
+
+
+def test_watched_namespaces_limit_where_the_operator_can_scale(render):
+    docs = render({"operator": {"watchNamespaces": ["shop", "payments", "shop"]}})
+    binds = _write_bindings(docs)
+    assert {b["kind"] for b in binds} == {"RoleBinding"}
+    assert sorted(b["metadata"]["namespace"] for b in binds) == sorted(["shop", "payments", NS])
+    # The reads stay cluster-wide: coexistence must see replica writers outside the watched namespaces.
+    reads = [b for b in by_kind(docs, "ClusterRoleBinding") if b["roleRef"]["name"] == "pa-predictive-autoscaler-operator"]
+    assert len(reads) == 1
+    write_rules = rules_of(docs, "pa-predictive-autoscaler-operator-write")
+    read_rules = rules_of(docs, "pa-predictive-autoscaler-operator")
+    assert not any(r[1] in (("deployments/scale",), ("predictiveautoscalers/status",), ("events",)) for r in read_rules)
+    assert write_rules
 
 
 # --- workloads: non-root, read-only root, explicit writable paths ---------------------------------------------------
