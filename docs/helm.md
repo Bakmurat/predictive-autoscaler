@@ -62,6 +62,12 @@ Pods or read Secrets. The chart has no cold start: retrain by hand with
   a conflict and leaves the old revision in place, and the new operator then waits, unready, on the revision gate (seen
   in the soak, observation O2). The CRD is the only object it takes over.
 
+- Upgrading the forecasting service is a short outage: it is one replica with the Recreate strategy (its model volume
+  may be ReadWriteOnce), so the old pod stops before the new one is ready. Scaling does not stop meanwhile: the operator
+  keeps using a recent cached forecast, or else the reactive rule on live telemetry; it holds the replica count only
+  when the telemetry itself is missing (user guide, [section 7](user-guide.md#7-get-forecasts)). Upgrade outside your
+  peak if you rely on the forecast's lead time.
+
 - The CRD carries a revision label (`autoscaling.devkuban.com/crd-revision`). The operator reads it before starting.
   Revisions: 1 = the first `autoscaling.devkuban.com` schema; 2 = adds `spec.behavior.scaleDown.headroomPercent`.
   While the installed CRD is older than it needs, the operator starts no controller and does not campaign for
