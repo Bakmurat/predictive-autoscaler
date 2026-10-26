@@ -109,7 +109,10 @@ the ClusterIP alone is not portable. Configure the addresses and ports your CNI 
 so an ipBlock for the API server may never match; Cilium's documented way is a CiliumNetworkPolicy with
 `toEntities: [kube-apiserver]`. Note that `cidrs: []` renders a ports-only rule that allows **every** destination on
 those ports, and allow rules add up, so adding a Cilium policy next to it does not narrow anything: the default is a
-connectivity fallback, not API-only isolation. Set `networkPolicy.enabled: false` if your CNI ignores policies or you manage them elsewhere.
+connectivity fallback, not API-only isolation. On Cilium, set `networkPolicy.kubeAPI.cilium: true` (with `cidrs: []`):
+the chart then leaves the API rule out of its NetworkPolicies and renders one CiliumNetworkPolicy for the operator,
+forecaster and trainer that allows the `kubeAPI.ports` to the `kube-apiserver` entity only. It needs Cilium's CRDs
+(`cilium.io/v2`) and fails on a non-empty `cidrs`. Set `networkPolicy.enabled: false` if your CNI ignores policies or you manage them elsewhere.
 
 ## Persistence
 

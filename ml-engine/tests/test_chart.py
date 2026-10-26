@@ -350,6 +350,29 @@ def test_api_server_cidrs_narrow_the_egress(render):
     assert all(np["spec"]["egress"][1]["to"] == [{"ipBlock": {"cidr": "10.43.0.1/32"}}] for np in nps)
 
 
+
+def test_cilium_mode_moves_the_api_allow_to_the_kube_apiserver_entity(render):
+    docs = render({"networkPolicy": {"kubeAPI": {"cidrs": [], "ports": [6443], "cilium": True}}})
+    nps = {np["metadata"]["name"].rsplit("-", 1)[1]: np["spec"] for np in by_kind(docs, "NetworkPolicy")}
+    for spec in nps.values():                                                # no API rule, and no rule without a peer
+        assert all(rule.get("to") for rule in spec["egress"]), spec["egress"]
+        assert not any(p.get("port") == 6443 for rule in spec["egress"] for p in rule.get("ports", []))
+    assert nps["operator"]["egress"][2]["to"][0]["podSelector"]["matchLabels"]["app.kubernetes.io/component"] == "forecaster"
+    [cnp] = by_kind(docs, "CiliumNetworkPolicy")
+    sel = cnp["spec"]["endpointSelector"]
+    assert sel["matchLabels"]["app.kubernetes.io/instance"] == "pa"
+    assert sel["matchExpressions"] == [{"key": "app.kubernetes.io/component", "operator": "In",
+                                        "values": ["operator", "forecaster", "trainer"]}]
+    assert cnp["spec"]["egress"] == [{"toEntities": ["kube-apiserver"],
+                                      "toPorts": [{"ports": [{"port": "6443", "protocol": "TCP"}]}]}]
+    assert not by_kind(render(), "CiliumNetworkPolicy")                      # off by default
+
+
+def test_cilium_mode_rejects_api_cidrs(tmp_path):
+    p = helm(_merge(BASE, {"networkPolicy": {"kubeAPI": {"cidrs": ["10.0.0.1/32"], "cilium": True}}}), tmp_path, check=False)
+    assert p.returncode != 0 and "kubeAPI.cidrs must be empty" in p.stderr
+
+
 # --- values -----------------------------------------------------------------------------------------------------------
 
 def test_images_prefer_the_digest(render):

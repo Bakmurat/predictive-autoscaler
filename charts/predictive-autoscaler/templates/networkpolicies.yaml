@@ -59,4 +59,29 @@ spec:
     matchLabels: {{- include "pa.selector" (list . "trainer") | nindent 6 }}
   policyTypes: [Ingress, Egress]
   egress: {{- include "pa.commonEgress" . | nindent 4 }}
+{{- if $np.kubeAPI.cilium }}
+---
+# kubeAPI.cilium: the Kubernetes API for all three components, by Cilium's kube-apiserver entity (Cilium does not
+# match node addresses by CIDR by default). The NetworkPolicies above then carry no API rule at all.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: {{ include "pa.fullname" . }}-kube-apiserver
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "pa.labels" . | nindent 4 }}
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "pa.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+    matchExpressions:
+      - {key: app.kubernetes.io/component, operator: In, values: [operator, forecaster, trainer]}
+  egress:
+    - toEntities: [kube-apiserver]
+      toPorts:
+        - ports:
+            {{- range $np.kubeAPI.ports }}
+            - {port: {{ . | quote }}, protocol: TCP}
+            {{- end }}
+{{- end }}
 {{- end }}

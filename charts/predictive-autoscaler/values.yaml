@@ -83,6 +83,9 @@ networkPolicy:
   kubeAPI:
     cidrs: []                # empty: ANY destination on the ports below (weak). Set the addresses your CNI evaluates for the API server; see docs/helm.md
     ports: [443, 6443]
+    # true: the standard API allow is left out and a CiliumNetworkPolicy allows these ports to the kube-apiserver
+    # entity only (needs Cilium and its CRDs; cidrs must stay empty). See docs/helm.md
+    cilium: false
   # Where Prometheus is: at least one selector or ipBlock is required when networkPolicy.enabled.
   prometheus:
     namespaceSelector: {}
