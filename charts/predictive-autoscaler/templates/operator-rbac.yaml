@@ -51,8 +51,8 @@ subjects:
     namespace: {{ .Release.Namespace }}
 ---
 # The operator, writes: replicas only through deployments/scale, its autoscalers' status, events. Bound cluster-wide
-# when every namespace is watched; otherwise only in the watched namespaces and the release namespace (leader-election
-# events), so a narrowed install cannot scale anything outside them.
+# when every namespace is watched; otherwise only in the watched namespaces, so a narrowed install cannot scale anything
+# outside them. Leader-election events in the release namespace come from the Lease Role below.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -85,7 +85,7 @@ subjects:
     name: {{ include "pa.fullname" . }}-operator
     namespace: {{ .Release.Namespace }}
 {{- else }}
-{{- range (append $watch .Release.Namespace | uniq) }}
+{{- range ($watch | uniq) }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -104,7 +104,7 @@ subjects:
 {{- end }}
 {{- end }}
 ---
-# Leader election: the Lease in the release namespace only.
+# Leader election: the Lease in the release namespace only, and its events there.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -115,6 +115,9 @@ rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["", "events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

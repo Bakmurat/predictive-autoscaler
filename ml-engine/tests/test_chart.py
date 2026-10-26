@@ -98,7 +98,9 @@ def test_rbac_matches_the_documented_least_privilege_table(render):
         (("authentication.k8s.io",), ("tokenreviews",), (), ("create",))}
     lease = by_kind(docs, "Role")
     assert len(lease) == 1 and lease[0]["metadata"]["namespace"] == NS
-    assert {tuple(r["resources"]) for r in lease[0]["rules"]} == {("leases",)}
+    assert {tuple(r["resources"]) for r in lease[0]["rules"]} == {("leases",), ("events",)}
+    ev = next(r for r in lease[0]["rules"] if r["resources"] == ["events"])
+    assert sorted(ev["verbs"]) == ["create", "patch"]
 
 
 def test_no_role_can_create_workloads_or_read_secrets(render):
@@ -136,7 +138,16 @@ def test_watched_namespaces_limit_where_the_operator_can_scale(render):
     docs = render({"operator": {"watchNamespaces": ["shop", "payments", "shop"]}})
     binds = _write_bindings(docs)
     assert {b["kind"] for b in binds} == {"RoleBinding"}
-    assert sorted(b["metadata"]["namespace"] for b in binds) == sorted(["shop", "payments", NS])
+    # Only the watched namespaces: the (unwatched) release namespace gets no scale or status write, only the Lease
+    # Role's leader-election events.
+    assert sorted(b["metadata"]["namespace"] for b in binds) == ["payments", "shop"]
+    (lease,) = by_kind(docs, "Role")
+    assert lease["metadata"]["namespace"] == NS
+    assert not any(set(r["resources"]) & {"deployments/scale", "predictiveautoscalers/status"} for r in lease["rules"])
+    assert any(r["resources"] == ["events"] for r in lease["rules"])
+    # Watching the release namespace explicitly gives it the full write role like any other watched namespace.
+    docs2 = render({"operator": {"watchNamespaces": ["shop", NS]}})
+    assert sorted(b["metadata"]["namespace"] for b in _write_bindings(docs2)) == sorted(["shop", NS])
     # The reads stay cluster-wide: coexistence must see replica writers outside the watched namespaces.
     reads = [b for b in by_kind(docs, "ClusterRoleBinding") if b["roleRef"]["name"] == "pa-predictive-autoscaler-operator"]
     assert len(reads) == 1
