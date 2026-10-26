@@ -22,7 +22,7 @@ training:
   hours: 336
   activeDeadlineSeconds: 7200
 networkPolicy:
-  kubeAPI: {cidrs: ["10.43.0.1/32"], ports: [443]}
+  kubeAPI: {cidrs: ["192.0.2.10/32"], ports: [6443]}   # example endpoint IP (documentation range), never the ClusterIP
   prometheus:
     ipBlocks: ["10.0.0.0/8"]
     ports: [8481]
