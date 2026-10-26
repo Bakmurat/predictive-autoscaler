@@ -489,7 +489,7 @@ def test_alert_values_are_validated(render, bad):
     assert p.returncode != 0
 
 
-def _render_notes(tmp_path, values):
+def _render_notes(tmp_path, values, upgrade=False):
     """NOTES.txt rendered offline: helm never renders NOTES in `helm template` and `helm install --dry-run` needs a
     cluster, so a copy of the chart serves it as an ordinary template (--show-only)."""
     import shutil
@@ -504,7 +504,8 @@ def _render_notes(tmp_path, values):
     f.write_text(yaml.safe_dump(values))
     try:
         p = subprocess.run(["helm", "template", "pa", str(chart), "-n", NS, "--kube-version", "1.35.0", "-f", str(f),
-                            "--show-only", "templates/notes-under-test.yaml"], capture_output=True, text=True, timeout=60)
+                            "--show-only", "templates/notes-under-test.yaml"] + (["--is-upgrade"] if upgrade else []),
+                           capture_output=True, text=True, timeout=60)
     except OSError as e:
         if os.environ.get("CI"):
             pytest.fail(f"helm is required in CI: {e}")
@@ -525,3 +526,9 @@ def test_notes_warn_about_self_signed_expiry_and_retention(tmp_path, extra, want
         assert w in notes
     for u in unwanted:
         assert u not in notes
+
+
+def test_notes_on_upgrade_explain_the_crd_and_install_notes_do_not(tmp_path):
+    up = _render_notes(tmp_path, BASE, upgrade=True)
+    assert "Helm never upgrades the CRD" in up and "at\nleast the required one" in up and "--kubeconfig <file> --context <context>" in up
+    assert "Helm never upgrades the CRD" not in _render_notes(tmp_path, BASE)
