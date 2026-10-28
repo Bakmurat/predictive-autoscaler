@@ -455,7 +455,8 @@ Reference: [helm.md, Monitoring](helm.md#monitoring).
   **With `networkPolicy.kubeAPI.cidrs` empty (the default) the "Kubernetes API" rule allows any destination on the
   configured API ports (443 and 6443)**; set it to your API server's addresses.
 - **Permissions:** each part has its own service account. The operator reads autoscalers, Deployments and the other
-  scalers, and writes only `deployments/scale`, its status, events and its leader-election Lease. The forecasting
+  scalers, and writes only `deployments/scale`, its status, events and its leader-election Lease; with
+  `operator.watchNamespaces` set, those writes are granted only in the listed namespaces (its own namespace keeps just the Lease and its events). The forecasting
   service and the trainer only read autoscalers and Deployments (plus TokenReviews for the service). No role can read
   Secrets or create Pods or Jobs. Every container runs non-root with a read-only root filesystem and no capabilities.
 - The plain manifests in `k8s-manifests/` do not have these protections; use the chart.

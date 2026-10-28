@@ -106,7 +106,8 @@ capabilities:
   value: /models
 {{- end -}}
 
-{{/* NetworkPolicy egress rules every component needs: DNS, the Kubernetes API, Prometheus (built as data, then YAML). */}}
+{{/* NetworkPolicy egress rules every component needs: DNS, the Kubernetes API, Prometheus (built as data, then YAML).
+With kubeAPI.cilium the API rule is left out: the CiliumNetworkPolicy in networkpolicies.yaml allows it instead. */}}
 {{- define "pa.commonEgress" -}}
 {{- $np := .Values.networkPolicy -}}
 {{- $dns := dict "to" (list (dict "namespaceSelector" $np.dns.namespaceSelector "podSelector" $np.dns.podSelector)) "ports" (list (dict "protocol" "UDP" "port" 53) (dict "protocol" "TCP" "port" 53)) -}}
@@ -118,7 +119,12 @@ capabilities:
 {{- range $np.kubeAPI.cidrs }}{{ $to = append $to (dict "ipBlock" (dict "cidr" .)) }}{{ end -}}
 {{- $_ := set $api "to" $to -}}
 {{- end -}}
+{{- if $np.kubeAPI.cilium -}}
+{{- if $np.kubeAPI.cidrs }}{{ fail "networkPolicy.kubeAPI.cidrs must be empty when networkPolicy.kubeAPI.cilium is true (the CiliumNetworkPolicy names the kube-apiserver entity)" }}{{ end -}}
+{{- toYaml (list $dns (include "pa.prometheusRule" . | fromYaml)) -}}
+{{- else -}}
 {{- toYaml (list $dns $api (include "pa.prometheusRule" . | fromYaml)) -}}
+{{- end -}}
 {{- end -}}
 
 {{- define "pa.prometheusRule" -}}

@@ -78,14 +78,16 @@ def test_rbac_matches_the_documented_least_privilege_table(render):
     ro = ("get", "list", "watch")
     assert rules_of(docs, "pa-predictive-autoscaler-operator") == {
         (("autoscaling.devkuban.com",), ("predictiveautoscalers",), (), ro),
-        (("autoscaling.devkuban.com",), ("predictiveautoscalers/status",), (), ("get", "patch", "update")),
         (("apps",), ("deployments",), (), ro),
-        (("apps",), ("deployments/scale",), (), ("get", "update")),
         (("autoscaling",), ("horizontalpodautoscalers",), (), ro),
         (("keda.sh",), ("scaledobjects",), (), ro),
         (("autoscaling.k8s.io",), ("verticalpodautoscalers",), (), ro),
         (("autoscaler.example.com",), ("predictiveautoscalers",), (), ro),
         (("apiextensions.k8s.io",), ("customresourcedefinitions",), (NEW_CRD,), ("get",)),
+    }
+    assert rules_of(docs, "pa-predictive-autoscaler-operator-write") == {
+        (("autoscaling.devkuban.com",), ("predictiveautoscalers/status",), (), ("get", "patch", "update")),
+        (("apps",), ("deployments/scale",), (), ("get", "update")),
         (("", "events.k8s.io"), ("events",), (), ("create", "patch")),
     }
     read_only = {(("autoscaling.devkuban.com",), ("predictiveautoscalers",), (), ("get",)),
@@ -96,7 +98,14 @@ def test_rbac_matches_the_documented_least_privilege_table(render):
         (("authentication.k8s.io",), ("tokenreviews",), (), ("create",))}
     lease = by_kind(docs, "Role")
     assert len(lease) == 1 and lease[0]["metadata"]["namespace"] == NS
-    assert {tuple(r["resources"]) for r in lease[0]["rules"]} == {("leases",)}
+    assert {(tuple(r["resources"]), tuple(r.get("resourceNames", [])), tuple(sorted(r["verbs"]))) for r in lease[0]["rules"]} == {
+        (("leases",), (), ("create",)),
+        (("leases",), ("predictive-autoscaler.autoscaling.devkuban.com",), ("get", "update")),
+        (("events",), (), ("create", "patch"))}
+    main_go = (ROOT / "k8s-operator" / "main.go").read_text()
+    assert 'leaderElectionID = "predictive-autoscaler.autoscaling.devkuban.com"' in main_go   # the Role's resourceName
+    ev = next(r for r in lease[0]["rules"] if r["resources"] == ["events"])
+    assert sorted(ev["verbs"]) == ["create", "patch"]
 
 
 def test_no_role_can_create_workloads_or_read_secrets(render):
@@ -114,9 +123,43 @@ def test_each_component_runs_as_its_own_service_account(render):
     for d, pod in pod_specs(docs):
         component = d["metadata"]["labels"]["app.kubernetes.io/component"]
         assert pod["serviceAccountName"] == f"pa-predictive-autoscaler-{component}"
-    for b in by_kind(docs, "ClusterRoleBinding"):
-        assert b["roleRef"]["name"] == b["metadata"]["name"] == b["subjects"][0]["name"]
-        assert b["subjects"][0]["namespace"] == NS
+    for b in by_kind(docs, "ClusterRoleBinding") + by_kind(docs, "RoleBinding"):
+        assert b["roleRef"]["name"] == b["metadata"]["name"]
+        assert len(b["subjects"]) == 1 and b["subjects"][0]["namespace"] == NS
+        assert b["subjects"][0]["name"] in sas and b["metadata"]["name"].startswith(b["subjects"][0]["name"])
+
+
+def _write_bindings(docs):
+    return [b for b in by_kind(docs, "ClusterRoleBinding") + by_kind(docs, "RoleBinding")
+            if b["roleRef"]["name"] == "pa-predictive-autoscaler-operator-write"]
+
+
+def test_operator_writes_are_cluster_wide_only_when_every_namespace_is_watched(render):
+    (b,) = _write_bindings(render())
+    assert b["kind"] == "ClusterRoleBinding"
+
+
+def test_watched_namespaces_limit_where_the_operator_can_scale(render):
+    docs = render({"operator": {"watchNamespaces": ["shop", "payments", "shop"]}})
+    binds = _write_bindings(docs)
+    assert {b["kind"] for b in binds} == {"RoleBinding"}
+    # Only the watched namespaces: the (unwatched) release namespace gets no scale or status write, only the Lease
+    # Role's leader-election events.
+    assert sorted(b["metadata"]["namespace"] for b in binds) == ["payments", "shop"]
+    (lease,) = by_kind(docs, "Role")
+    assert lease["metadata"]["namespace"] == NS
+    assert not any(set(r["resources"]) & {"deployments/scale", "predictiveautoscalers/status"} for r in lease["rules"])
+    assert any(r["resources"] == ["events"] for r in lease["rules"])
+    # Watching the release namespace explicitly gives it the full write role like any other watched namespace.
+    docs2 = render({"operator": {"watchNamespaces": ["shop", NS]}})
+    assert sorted(b["metadata"]["namespace"] for b in _write_bindings(docs2)) == sorted(["shop", NS])
+    # The reads stay cluster-wide: coexistence must see replica writers outside the watched namespaces.
+    reads = [b for b in by_kind(docs, "ClusterRoleBinding") if b["roleRef"]["name"] == "pa-predictive-autoscaler-operator"]
+    assert len(reads) == 1
+    write_rules = rules_of(docs, "pa-predictive-autoscaler-operator-write")
+    read_rules = rules_of(docs, "pa-predictive-autoscaler-operator")
+    assert not any(r[1] in (("deployments/scale",), ("predictiveautoscalers/status",), ("events",)) for r in read_rules)
+    assert write_rules
 
 
 # --- workloads: non-root, read-only root, explicit writable paths ---------------------------------------------------
@@ -307,6 +350,29 @@ def test_api_server_cidrs_narrow_the_egress(render):
     assert all(np["spec"]["egress"][1]["to"] == [{"ipBlock": {"cidr": "10.43.0.1/32"}}] for np in nps)
 
 
+
+def test_cilium_mode_moves_the_api_allow_to_the_kube_apiserver_entity(render):
+    docs = render({"networkPolicy": {"kubeAPI": {"cidrs": [], "ports": [6443], "cilium": True}}})
+    nps = {np["metadata"]["name"].rsplit("-", 1)[1]: np["spec"] for np in by_kind(docs, "NetworkPolicy")}
+    for spec in nps.values():                                                # no API rule, and no rule without a peer
+        assert all(rule.get("to") for rule in spec["egress"]), spec["egress"]
+        assert not any(p.get("port") == 6443 for rule in spec["egress"] for p in rule.get("ports", []))
+    assert nps["operator"]["egress"][2]["to"][0]["podSelector"]["matchLabels"]["app.kubernetes.io/component"] == "forecaster"
+    [cnp] = by_kind(docs, "CiliumNetworkPolicy")
+    sel = cnp["spec"]["endpointSelector"]
+    assert sel["matchLabels"]["app.kubernetes.io/instance"] == "pa"
+    assert sel["matchExpressions"] == [{"key": "app.kubernetes.io/component", "operator": "In",
+                                        "values": ["operator", "forecaster", "trainer"]}]
+    assert cnp["spec"]["egress"] == [{"toEntities": ["kube-apiserver"],
+                                      "toPorts": [{"ports": [{"port": "6443", "protocol": "TCP"}]}]}]
+    assert not by_kind(render(), "CiliumNetworkPolicy")                      # off by default
+
+
+def test_cilium_mode_rejects_api_cidrs(tmp_path):
+    p = helm(_merge(BASE, {"networkPolicy": {"kubeAPI": {"cidrs": ["10.0.0.1/32"], "cilium": True}}}), tmp_path, check=False)
+    assert p.returncode != 0 and "kubeAPI.cidrs must be empty" in p.stderr
+
+
 # --- values -----------------------------------------------------------------------------------------------------------
 
 def test_images_prefer_the_digest(render):
@@ -444,3 +510,48 @@ def test_operator_scrape_keeps_the_autoscaler_namespace_label(render):
 def test_alert_values_are_validated(render, bad):
     p = render({"metrics": {"alerts": bad}}, check=False)
     assert p.returncode != 0
+
+
+def _render_notes(tmp_path, values, upgrade=False):
+    """NOTES.txt rendered offline: helm never renders NOTES in `helm template` and `helm install --dry-run` needs a
+    cluster, so a copy of the chart serves it as an ordinary template (--show-only)."""
+    import shutil
+    chart = tmp_path / "chart"
+    if not chart.exists():
+        shutil.copytree(CHART, chart)
+        shutil.copy(chart / "templates" / "NOTES.txt", chart / "notes-src.txt")
+        (chart / "templates" / "notes-under-test.yaml").write_text(
+            'apiVersion: v1\nkind: ConfigMap\nmetadata: {name: notes-under-test}\ndata:\n  notes: |\n'
+            '{{ tpl (.Files.Get "notes-src.txt") . | indent 4 }}\n')
+    f = tmp_path / "v.yaml"
+    f.write_text(yaml.safe_dump(values))
+    try:
+        p = subprocess.run(["helm", "template", "pa", str(chart), "-n", NS, "--kube-version", "1.35.0", "-f", str(f),
+                            "--show-only", "templates/notes-under-test.yaml"] + (["--is-upgrade"] if upgrade else []),
+                           capture_output=True, text=True, timeout=60)
+    except OSError as e:
+        if os.environ.get("CI"):
+            pytest.fail(f"helm is required in CI: {e}")
+        pytest.skip(f"helm not usable here: {e}")
+    assert p.returncode == 0, p.stderr
+    return yaml.safe_load(p.stdout)["data"]["notes"]
+
+
+@pytest.mark.parametrize("extra,want,unwanted", [
+    ({}, ["NOT renewed automatically"], ["DELETES the model"]),
+    ({"forecaster": {"persistence": {"retain": False}}}, ["DELETES the model"], []),
+    ({"forecaster": {"persistence": {"retain": False, "existingClaim": "models"}}}, [], ["DELETES the model"]),
+    ({"forecaster": {"tls": {"source": "existingSecret", "existingSecret": "x"}}}, [], ["NOT renewed automatically"]),
+])
+def test_notes_warn_about_self_signed_expiry_and_retention(tmp_path, extra, want, unwanted):
+    notes = _render_notes(tmp_path, _merge(BASE, extra))
+    for w in want:
+        assert w in notes
+    for u in unwanted:
+        assert u not in notes
+
+
+def test_notes_on_upgrade_explain_the_crd_and_install_notes_do_not(tmp_path):
+    up = _render_notes(tmp_path, BASE, upgrade=True)
+    assert "Helm never upgrades the CRD" in up and "at\nleast the required one" in up and "--kubeconfig <file> --context <context>" in up
+    assert "Helm never upgrades the CRD" not in _render_notes(tmp_path, BASE)

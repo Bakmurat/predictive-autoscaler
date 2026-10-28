@@ -5,8 +5,8 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels: {{- include "pa.labels" . | nindent 4 }}
 ---
-# The operator: reads autoscalers and their targets, writes replicas only through deployments/scale, reads every other
-# replica writer (coexistence), reads its own CRD (the revision gate), emits events.
+# The operator, reads: autoscalers and their targets, every other replica writer in any namespace (coexistence must see
+# writers outside the watched namespaces too), its own CRD (the revision gate). Cluster-wide.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -16,15 +16,9 @@ rules:
   - apiGroups: ["autoscaling.devkuban.com"]
     resources: ["predictiveautoscalers"]
     verbs: ["get", "list", "watch"]
-  - apiGroups: ["autoscaling.devkuban.com"]
-    resources: ["predictiveautoscalers/status"]
-    verbs: ["get", "update", "patch"]
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "list", "watch"]
-  - apiGroups: ["apps"]
-    resources: ["deployments/scale"]
-    verbs: ["get", "update"]
   - apiGroups: ["autoscaling"]
     resources: ["horizontalpodautoscalers"]
     verbs: ["get", "list", "watch"]
@@ -41,9 +35,6 @@ rules:
     resources: ["customresourcedefinitions"]
     resourceNames: ["predictiveautoscalers.autoscaling.devkuban.com"]
     verbs: ["get"]
-  - apiGroups: ["", "events.k8s.io"]
-    resources: ["events"]
-    verbs: ["create", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -59,7 +50,61 @@ subjects:
     name: {{ include "pa.fullname" . }}-operator
     namespace: {{ .Release.Namespace }}
 ---
-# Leader election: the Lease in the release namespace only.
+# The operator, writes: replicas only through deployments/scale, its autoscalers' status, events. Bound cluster-wide
+# when every namespace is watched; otherwise only in the watched namespaces, so a narrowed install cannot scale anything
+# outside them. Leader-election events in the release namespace come from the Lease Role below.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "pa.fullname" . }}-operator-write
+  labels: {{- include "pa.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["autoscaling.devkuban.com"]
+    resources: ["predictiveautoscalers/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    verbs: ["get", "update"]
+  - apiGroups: ["", "events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+{{- $watch := .Values.operator.watchNamespaces }}
+{{- if not $watch }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "pa.fullname" . }}-operator-write
+  labels: {{- include "pa.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "pa.fullname" . }}-operator-write
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "pa.fullname" . }}-operator
+    namespace: {{ .Release.Namespace }}
+{{- else }}
+{{- range ($watch | uniq) }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "pa.fullname" $ }}-operator-write
+  namespace: {{ . }}
+  labels: {{- include "pa.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "pa.fullname" $ }}-operator-write
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "pa.fullname" $ }}-operator
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- end }}
+---
+# Leader election: the Lease in the release namespace only, and its events there.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -67,9 +112,17 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels: {{- include "pa.labels" . | nindent 4 }}
 rules:
+  # create cannot be limited by name (the object does not exist yet); everything else only on the operator's Lease.
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    verbs: ["create"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["predictive-autoscaler.autoscaling.devkuban.com"]
+    verbs: ["get", "update"]
+  - apiGroups: ["", "events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

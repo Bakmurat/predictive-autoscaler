@@ -39,7 +39,7 @@ and new autoscalers run in Recommend mode (they publish recommendations and chan
 
 | Component | Runs as | Can do | Writes to |
 |---|---|---|---|
-| operator (Deployment; leader election always on; one replica and Recreate when the ledger uses a claim) | uid 65532 | read autoscalers and Deployments; write replicas only through `deployments/scale`; read HPAs, KEDA ScaledObjects, VPAs and legacy-group autoscalers (coexistence); read its own CRD (revision gate); emit events; a Lease in the release namespace | nothing (or `/var/lib/predictive-autoscaler` with `operator.forecastLedger.enabled`) |
+| operator (Deployment; leader election always on; one replica and Recreate when the ledger uses a claim) | uid 65532 | read autoscalers and Deployments; write replicas only through `deployments/scale`, its status and events, cluster-wide when every namespace is watched, otherwise only in `operator.watchNamespaces` (the reads stay cluster-wide; the release namespace gets only the Lease and its events). The watched namespaces must exist before install, and when you narrow or change them on an upgrade, check that the old write bindings are gone (with pruning off, Argo CD keeps them); read HPAs, KEDA ScaledObjects, VPAs and legacy-group autoscalers (coexistence); read its own CRD (revision gate); emit events; a Lease in the release namespace | nothing (or `/var/lib/predictive-autoscaler` with `operator.forecastLedger.enabled`) |
 | forecasting service (Deployment, 1 replica) | uid 10001 | get autoscalers and Deployments; create TokenReviews when authentication is enabled | `/models` (the model volume), `/tmp` (an emptyDir with a size limit) |
 | trainer (one CronJob per `training.targets` entry) | uid 10001 | get autoscalers and Deployments | `/models`, `/tmp` |
 
@@ -62,6 +62,13 @@ Pods or read Secrets. The chart has no cold start: retrain by hand with
   a conflict and leaves the old revision in place, and the new operator then waits, unready, on the revision gate (seen
   in the soak, observation O2). The CRD is the only object it takes over.
 
+- Upgrading the forecasting service is a short outage: it is one replica with the Recreate strategy (its model volume
+  may be ReadWriteOnce), so the old pod stops before the new one is ready. While the operator keeps running it uses a
+  usable cached forecast, or else the reactive rule on live telemetry, subject to the usual scaling safeguards
+  (headroom, stabilization, cooldown, conflict checks). Losing the forecaster adds no hold of its own; missing telemetry
+  triggers the existing telemetry hold (user guide, [section 7](user-guide.md#7-get-forecasts)). Upgrade outside your
+  peak if you rely on the forecast's lead time.
+
 - The CRD carries a revision label (`autoscaling.devkuban.com/crd-revision`). The operator reads it before starting.
   Revisions: 1 = the first `autoscaling.devkuban.com` schema; 2 = adds `spec.behavior.scaleDown.headroomPercent`.
   While the installed CRD is older than it needs, the operator starts no controller and does not campaign for
@@ -76,7 +83,9 @@ Pods or read Secrets. The chart has no cold start: retrain by hand with
   leaves it, and all autoscalers, in place.
 - The model volume created by the chart is kept too (`forecaster.persistence.retain`, on by default): Helm's
   `resource-policy: keep` plus Argo's `Prune=false,Delete=false`. Use `forecaster.persistence.existingClaim` to manage
-  the claim yourself.
+  the claim yourself. **Turning `retain` off on a running release removes that protection from the existing claim**:
+  a later uninstall (or Application delete) then deletes the volume and every trained model. The install notes warn
+  when it is off.
 - The autoscalers are not the chart's. They live with their workloads, in the app's own Application, and are deleted
   with it. That is safe: the operator has no finalizer, and the Deployment keeps its replica count; only autoscaling
   stops. To keep an autoscaler when its Application is deleted, annotate it
@@ -93,7 +102,18 @@ They are on by default, and work only with a CNI that enforces them.
 Enforcement depends on the CNI. Some implementations apply a new pod's policies only once their agent has learned the
 pod, and let its first connections through (kind's kube-network-policies did for about ten seconds in the smoke test).
 Tighten `networkPolicy.kubeAPI.cidrs` to your API server's addresses: the default allows any address on ports
-443/6443. Set `networkPolicy.enabled: false` if your CNI ignores policies or you manage them elsewhere.
+443/6443. Whether a policy sees the `kubernetes` Service's ClusterIP or the translated endpoint address depends on the
+CNI (Kubernetes leaves the order of Service translation and policy evaluation to the implementation), so an allow for
+the ClusterIP alone is not portable. Configure the addresses and ports your CNI evaluates; the endpoints are listed by
+`kubectl get endpointslices -n default -l kubernetes.io/service-name=kubernetes` (often the control-plane node IPs on
+6443, but check). **Cilium** normally excludes node addresses from CIDR matching (unless `policyCIDRMatchMode: nodes`),
+so an ipBlock for the API server may never match; Cilium's documented way is a CiliumNetworkPolicy with
+`toEntities: [kube-apiserver]`. Note that `cidrs: []` renders a ports-only rule that allows **every** destination on
+those ports, and allow rules add up, so adding a Cilium policy next to it does not narrow anything: the default is a
+connectivity fallback, not API-only isolation. On Cilium, set `networkPolicy.kubeAPI.cilium: true` (with `cidrs: []`):
+the chart then leaves the API rule out of its NetworkPolicies and renders one CiliumNetworkPolicy for the operator,
+forecaster and trainer that allows the `kubeAPI.ports` to the `kube-apiserver` entity only. It needs Cilium's CRDs
+(`cilium.io/v2`) and fails on a non-empty `cidrs`. Set `networkPolicy.enabled: false` if your CNI ignores policies or you manage them elsewhere.
 
 ## Persistence
 
@@ -168,7 +188,7 @@ The certificate comes from `forecaster.tls.source`:
 
 | Source | Use it for | Renewal |
 |---|---|---|
-| `selfSigned` (default) | plain Helm, the quickstart | valid `selfSigned.validityDays` (365); renew by deleting the Secret `<release>-predictive-autoscaler-forecaster-tls` and running `helm upgrade`. `helm upgrade` keeps it through `lookup`, which Argo CD and `helm template` cannot do, so **do not use it with Argo CD** |
+| `selfSigned` (default) | plain Helm, the quickstart | valid `selfSigned.validityDays` (365); it is **not** renewed automatically (the install notes say so): renew before it expires by deleting the Secret `<release>-predictive-autoscaler-forecaster-tls` and running `helm upgrade`; prefer `certManager` in production. The Secret's `ca.crt` does not tell you the served certificate's expiry: check `tls.crt` or the served certificate. `helm upgrade` keeps it through `lookup`, which Argo CD and `helm template` cannot do, so **do not use it with Argo CD** |
 | `certManager` | Argo CD, production | cert-manager renews it (`duration`, `renewBefore`); the Issuer must put its CA into the Secret's `ca.crt` (a CA issuer does) |
 | `existingSecret` | certificates managed elsewhere | yours: a Secret with `tls.crt`, `tls.key` and `ca.crt` |
 
