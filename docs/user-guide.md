@@ -37,6 +37,8 @@ answers on every reconcile:
 It takes the **higher** of the two, kept within your minimum and maximum. A forecast can therefore only add capacity
 ahead of a rise; it never removes capacity the measured rate needs. When no usable forecast exists, the decision is
 reactive only. When the request rate cannot be measured at all, the replica count is **held**, never scaled on a guess.
+Both answers divide by one number you configure: the request rate one replica serves within its SLO
+(`capacityPerReplica`). Without it the operator calculates nothing and holds the current count; it never assumes one.
 
 Use it for a stateless Deployment whose traffic follows a daily pattern and whose pods take long enough to start that
 scaling after the rise is too late. It is less useful for traffic without a repeating pattern, and forecasts start only
@@ -146,7 +148,7 @@ spec:
   metrics:
     requests:
       enabled: true                                   # required for forecasting
-      targetRPS: 100                                  # requests per second ONE pod should handle
+      capacityPerReplica: "40"                        # requests per second ONE ready replica serves within its SLO
       source:
         preset: prometheus
         query: 'sum(rate(http_requests_total{namespace="{{ .Namespace }}",service="{{ .Name }}"}[2m]))'
@@ -157,8 +159,12 @@ The fields that matter:
 
 - **`mode`**: `Recommend` (the default, also when absent) or `Active`.
 - **`minReplicas` / `maxReplicas`**: the bounds of every decision.
-- **`metrics.requests.targetRPS`**: the requests per second one pod can serve at acceptable latency. Measure it with a
-  load test; the number above is only an example.
+- **`metrics.requests.capacityPerReplica`**: the requests per second one ready replica serves while meeting its SLO
+  (for example its p99 latency target). Decimals are allowed (`"12.5"`). The number above is only an example: measure
+  yours with a load test ([how](configuration.md#measuring-capacitypereplica)). There is **no default**: without it the
+  autoscaler reports `CapacityConfigured=False` (reason `CapacityMissing`), shows no calculated count and holds the
+  current one. The older integer field `targetRPS` means the same and still works, but is deprecated; set one of the
+  two, never both.
 - **`metrics.requests.source`**: where the request rate comes from. `preset: istio` (the default) reads Istio's
   `istio_requests_total` for the Deployment. `preset: prometheus` uses your `query`, which must return **exactly one
   series, in requests per second, for this Deployment**. It may use only `{{ .Namespace }}` and `{{ .Name }}` (the
@@ -177,8 +183,8 @@ kubectl --kubeconfig <file> --context <context> apply -f web-pa.yaml
 kubectl --kubeconfig <file> --context <context> -n shop get pa web-pa
 ```
 
-Within one reconcile you should see `Ready=True` and `TelemetryAvailable=True` for the current generation, and a
-calculated replica count. The Deployment does not change.
+Within one reconcile you should see `Ready=True`, `CapacityConfigured=True` and `TelemetryAvailable=True` for the
+current generation, and a calculated replica count. The Deployment does not change.
 
 ## 6. Read its status
 
@@ -190,7 +196,7 @@ calculated replica count. The Deployment does not change.
 | Min, Max | `spec.minReplicas` and `spec.maxReplicas`. |
 | Mode | The mode applied in the last reconcile (`status.mode`). |
 | Current | The Deployment's replica count (`status.currentReplicas`). |
-| Calculated | The decision: what the operator would set now (`status.calculatedReplicas`), or the held count while the request rate cannot be measured. |
+| Calculated | The decision: what the operator would set now (`status.calculatedReplicas`), or the held count while the request rate cannot be measured. Empty while no per-replica capacity is configured: the recommendation is incomplete. |
 | Applied | The last count the operator successfully wrote. Empty until the first write; it keeps showing that last write after a switch back to Recommend, and is cleared only when the target Deployment is replaced. |
 | Ready | The Deployment's **ready replicas** (`status.readyReplicas`), not the `Ready` condition. |
 | Age | Since the autoscaler was created. |
@@ -213,9 +219,10 @@ calculated replica count. The Deployment does not change.
 | Condition | True means | Reasons |
 |---|---|---|
 | `Ready` | The last reconcile completed. | `ReconcileCompleted` (True). When False, the reason names the failure: `CrossNamespaceTarget` (the target is in another namespace; nothing is written), `DeploymentNotFound`, `InvalidMetricQuery` (the query breaks the template rules; nothing is written), `ScalingError` (the write to `/scale` failed). |
+| `CapacityConfigured` | A per-replica capacity is configured; the message names it in requests per second. | `CapacityPerReplica` (True); `DeprecatedTargetRPS` (True, from the deprecated `targetRPS`: move to `capacityPerReplica`); `CapacityMissing` (False: neither field is set, so nothing is calculated and the count is held); `CapacityInvalid` (False: a value the API server would reject, such as both fields at once). |
 | `TelemetryAvailable` | The request rate was measured. | `Measured`; `MetricsUnavailable` when the query failed, returned no series, several series, a partial answer or a non-finite value. The replica count is then held. |
-| `ForecastAvailable` | A forecast took part in the decision. | `Used`; `Disabled` (`spec.prediction.enabled: false`); `Unavailable` (no model yet, a refusal or an outage: see [section 7](#7-get-forecasts)); `HorizonElapsed` (every step of the cached forecast has passed); `SanityRejected` (its first step exceeded ten times the measured rate, so it was discarded); and the authentication failures `Unauthorized`, `Forbidden`, `AuthUnavailable`, `AuthMisconfigured` ([section 12](#12-security)). |
-| `ScalingActive` | Scaling is permitted: Active mode, no conflict, the check succeeded, no guard abort, telemetry measured. It does not mean a write happened; `Applied`, `lastScaleTime` and the `ScaledUp`/`ScaledDown` events show writes. | `Active`; `RecommendMode`; `TelemetryHold` (holding because the rate is unavailable); `Conflict` (another writer); `CheckFailed` (the coexistence check failed); `GuardAborted` (a last-moment check stopped a write; it retries within seconds); or the failure reason from `Ready`. |
+| `ForecastAvailable` | A forecast took part in the decision. | `Used`; `Disabled` (`spec.prediction.enabled: false`); `Unavailable` (no model yet, a refusal or an outage: see [section 7](#7-get-forecasts)); `HorizonElapsed` (every step of the cached forecast has passed); `SanityRejected` (its first step exceeded ten times the measured rate, so it was discarded); `CapacityMissing` (no forecast is requested without a per-replica capacity); and the authentication failures `Unauthorized`, `Forbidden`, `AuthUnavailable`, `AuthMisconfigured` ([section 12](#12-security)). |
+| `ScalingActive` | Scaling is permitted: Active mode, no conflict, the check succeeded, no guard abort, a capacity configured, telemetry measured. It does not mean a write happened; `Applied`, `lastScaleTime` and the `ScaledUp`/`ScaledDown` events show writes. | `Active`; `RecommendMode`; `CapacityMissing` (holding because no per-replica capacity is configured); `TelemetryHold` (holding because the rate is unavailable); `Conflict` (another writer); `CheckFailed` (the coexistence check failed); `GuardAborted` (a last-moment check stopped a write; it retries within seconds); or the failure reason from `Ready`. |
 | `ConflictDetected` | Another replica writer targets the Deployment. | `NoConflict` (False); `ReplicaWriter` (True: an HPA, an unpaused KEDA ScaledObject, another Active PredictiveAutoscaler or a legacy-group autoscaler); `CheckFailed` (status `Unknown`: the check could not finish, which blocks writes like a conflict). |
 | `VPAInterference` | A VerticalPodAutoscaler changes the pods' requests. | `None` (False); `VPAUpdatesPods` (True: a VPA in any mode except `Off`; scaling continues, but per-pod capacity may drift); `CheckFailed` (status `Unknown`). |
 | `ScaleDownHeadroom` | A scale-down is held to keep headroom. | `Holding` (True); `NotHolding` (headroom is not blocking a scale-down; it says nothing about how much spare capacity exists); `RecommendMode`. Informational: never affects `Ready` or `ScalingActive`. |
@@ -224,7 +231,8 @@ calculated replica count. The Deployment does not change.
 
 `kubectl describe pa <name>` shows events. They are emitted when a condition changes, not on every reconcile:
 `ScaledUp` and `ScaledDown` (each applied change); `TelemetryUnavailable` / `TelemetryRestored`;
-`ForecastUnavailable` / `ForecastRestored`; `ScalingInactive` / `ScalingActive`; `ReconcileFailed` /
+`ForecastUnavailable` / `ForecastRestored`; `ScalingInactive` / `ScalingActive`; `CapacityNotConfigured` (Warning) /
+`CapacityConfigured`; `ReconcileFailed` /
 `ReconcileRecovered`; `RecommendMode` and `Disabled` (configured states, type Normal); and for coexistence
 `ConflictDetected`, `ConflictResolved`, `ConflictCheckFailed`, `VPAInterference` and `VPAInterferenceCleared`.
 
@@ -347,8 +355,8 @@ discovery, a timeout) it writes nothing either (`CheckFailed`).
 - **KEDA as a fallback:** keep a ScaledObject for the same Deployment with `autoscaling.keda.sh/paused: "true"`. Hand
   over by switching the autoscaler to Recommend first, then unpausing KEDA; hand back by pausing KEDA, checking that
   no HPA targets the Deployment any more, then switching to Active. A `paused-replicas` annotation is not a pause.
-- **VPA:** allowed, but a VPA that changes requests (any mode except `Off`) changes the per-pod capacity `targetRPS`
-  assumes; the operator warns with `VPAInterference=True`. Tune the two together, or use `Off`.
+- **VPA:** allowed, but a VPA that changes requests (any mode except `Off`) changes the per-replica capacity
+  `capacityPerReplica` assumes; the operator warns with `VPAInterference=True`. Tune the two together, or use `Off`.
 - **GitOps (Argo CD, Flux):** exclude `spec.replicas` from the Deployment's comparison (Argo CD `ignoreDifferences` on
   `/spec/replicas`) or remove `replicas` from the managed manifest. The operator cannot detect a GitOps tool, a CI job
   or `kubectl scale` writing the count.
@@ -476,6 +484,11 @@ The operator checks the CRD's revision label at start. If the CRD is older than 
 the pod stays unready with the reason in its log. After an upgrade, check whether models must be retrained (a version
 that changes model provenance refuses older models).
 
+**The hidden capacity defaults are gone (CRD revision 3).** Earlier versions assumed 20,000 requests per minute per pod
+for the reactive rule and 30,000 for the forecast when `targetRPS` was unset. Now an autoscaler without a capacity holds
+its current count and reports `CapacityConfigured=False`. Before upgrading, list the autoscalers without one, and set
+`capacityPerReplica` on each ([upgrading.md](upgrading.md#capacityperreplica-replaces-the-hidden-defaults)).
+
 **From the legacy API group.** Before v0.1.0 the group was `autoscaler.example.com`; it is now
 `autoscaling.devkuban.com`. Objects are not converted; each one is re-created in the new group, in steps that never
 let two operators scale one Deployment: install the new version side by side, then `hack/migrate-api-group.py` `plan`,
@@ -502,7 +515,9 @@ With Argo CD the CRD (and, with `retain: true`, the model claim) are also protec
 | `Ready=False`, `DeploymentNotFound` | Wrong Deployment name, or it does not exist yet. | Fix `targetDeployment.name`. |
 | `Ready=False`, `InvalidMetricQuery` | The query uses template features other than `{{ .Namespace }}` / `{{ .Name }}`, or is too long. | Rewrite the query ([configuration.md](configuration.md)). |
 | `TelemetryAvailable=False`, `MetricsUnavailable`; replicas do not change | The query returns no series, several series or an error; or the metrics store is down. | Run `status.metricSource.query` against your metrics store; aggregate to one series; check label names (`namespace` vs `exported_namespace`) and that a Service name differs from the Deployment name. |
-| Calculated is always `minReplicas` | `targetRPS` far too high, or the query counts another workload's traffic or is in the wrong unit (it must be per second). | Check `predictive_autoscaler_current_rpm` against what you expect (requests per minute = 60 × per second). |
+| Calculated is empty, `CapacityConfigured=False` (`CapacityMissing`) | Neither `capacityPerReplica` nor `targetRPS` is set. The operator calculates nothing and holds the current count; it no longer assumes a capacity. | Measure the capacity ([how](configuration.md#measuring-capacitypereplica)) and set `metrics.requests.capacityPerReplica`. |
+| `CapacityConfigured=True`, `DeprecatedTargetRPS` | The capacity comes from the deprecated `targetRPS`. | Replace `targetRPS: N` with `capacityPerReplica: "N"` in one change (setting both is rejected). |
+| Calculated is always `minReplicas` | `capacityPerReplica` far too high, or the query counts another workload's traffic or is in the wrong unit (it must be per second). | Check `predictive_autoscaler_current_rpm` against what you expect (requests per minute = 60 × per second). |
 | `ForecastAvailable=False`, `Unavailable` on a new autoscaler | No model yet: not enough history or no training. | Expected. List it in `training.targets`; wait until the history passes the trainer's preflight (by default at least 235 usable 10-minute points); train ([section 7](#7-get-forecasts)). |
 | `ForecastAvailable=False`, `Unavailable` after it worked | The query, the autoscaler or the Deployment changed (model refused), or the forecasting service is down. | Retrain after a change; check the forecasting service pod and log. |
 | Training job fails or publishes nothing | Too little history, the deadline (`training.activeDeadlineSeconds`) or memory reached, or the model volume lacks `flock` support. | Read the job's log; raise the limits; use a storage class with `flock`. |
@@ -515,11 +530,12 @@ With Argo CD the CRD (and, with `retain: true`, the model claim) are also protec
 | `ScalingActive=False`, `Conflict` | An HPA, an unpaused KEDA ScaledObject or another Active autoscaler targets the Deployment. | Remove or pause it (see `status.conflicts`). |
 | `ScalingActive=False`, `CheckFailed` | The coexistence check failed: permissions, API discovery, a timeout. | Read the condition message and the operator log; check the operator's RBAC. |
 | `ScalingActive=False`, `GuardAborted` now and then | The autoscaler or the Deployment changed between the decision and the write. | Normal; a fresh reconcile follows within seconds. Frequent aborts mean another writer is changing the replica count. |
+| `ScalingActive=False`, `CapacityMissing` | No per-replica capacity is configured, so the count is held. | Set `capacityPerReplica` (see above). |
 | `ScalingActive=False`, `TelemetryHold` | The request rate cannot be measured, so the count is held. | Fix the telemetry (see above). |
 | Replicas flip back and forth | Another writer (GitOps `replicas`, a CI job, `kubectl scale`) that the operator cannot detect. | Remove `replicas` from the managed manifest or ignore the field in GitOps. |
 | No scale-down although traffic dropped | Stabilization, cooldown, the headroom floor (`ScaleDownHeadroom=True`), or a forecast that still asks for more pods. | Wait for the windows; compare `forecastReplicas`; see [section 9](#9-scale-down-behaviour-and-headroom). |
 | Operator pod unready after an upgrade | The CRD is older than the operator needs (revision gate). | Apply the new CRD ([section 13](#13-upgrading-and-the-api-group-migration)). |
-| `VPAInterference=True` | A VPA changes the pods' requests. | Use VPA mode `Off`, or retune `targetRPS` with it. |
+| `VPAInterference=True` | A VPA changes the pods' requests. | Use VPA mode `Off`, or measure `capacityPerReplica` again with it. |
 | Dashboard panels are empty | No scrape object, NetworkPolicy blocks the scraper, or the wrong data source. | Enable `metrics.serviceMonitor`/`vmServiceScrape`, set `networkPolicy.metricsFrom`, pick the data source variable. |
 
 ## 16. Limitations
@@ -538,11 +554,12 @@ releases yet. The full, ordered list: [limitations.md](limitations.md).
 | **Recommend mode** | Computes and publishes decisions, writes nothing. The default. |
 | **Active mode** | Writes the replica count to the Deployment's `/scale`. |
 | **Reconcile** | One evaluation of an autoscaler, every `updateIntervalSeconds`. |
-| **Reactive rule** | `ceil(measured rate / per-pod capacity)`: the decision without a forecast. |
+| **Reactive rule** | `ceil(measured rate / capacity per replica)`: the decision without a forecast. |
 | **Calculated replicas** | The decision: the higher of reactive and forecast, within `[minReplicas, maxReplicas]`. |
 | **Lead window** | The next `leadTimeMinutes`; the operator sizes for the highest forecast inside it. |
 | **Horizon** | How far ahead the forecast reaches (`horizonMinutes`, six 10-minute steps for one hour). |
-| **targetRPS** | Requests per second one pod should handle. Internally the operator works in requests per minute (RPM). |
+| **capacityPerReplica** | Requests per second one ready replica serves within its SLO, measured with a load test. The reactive rule, the forecast rule and the headroom floor all use it; there is no default. Internally the operator works in requests per minute (RPM). |
+| **targetRPS** | The deprecated integer form of `capacityPerReplica`. |
 | **Telemetry hold** | Keeping the current replica count because the request rate cannot be measured. |
 | **Headroom floor** | The lowest count a scale-down may reach while keeping `headroomPercent` spare capacity. |
 | **Stabilization / cooldown** | The waits before and between scale-downs. |

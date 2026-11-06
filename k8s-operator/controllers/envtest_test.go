@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -536,7 +537,7 @@ func TestEnvtestTheGeneratedSchemaValidatesAndDefaults(t *testing.T) {
 	if err := f.c.Get(ctx, types.NamespacedName{Name: "predictiveautoscalers." + autoscalerv1alpha1.GroupVersion.Group}, &crd); err != nil {
 		t.Fatal(err)
 	}
-	if crd.GetLabels()["autoscaling.devkuban.com/crd-revision"] != "2" {
+	if crd.GetLabels()["autoscaling.devkuban.com/crd-revision"] != strconv.Itoa(RequiredCRDRevision) {
 		t.Fatalf("the CRD revision label is missing: %v", crd.GetLabels())
 	}
 }

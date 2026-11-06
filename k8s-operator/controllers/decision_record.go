@@ -19,7 +19,7 @@ type decisionRecord struct {
 	Application      string          `json:"application"`
 	Namespace        string          `json:"namespace"`
 	Forecasting      bool            `json:"forecasting"`
-	ForecastStatus   string          `json:"forecast_status"` // used|unavailable|horizon_elapsed|sanity_rejected|disabled|unauthorized|forbidden|auth_unavailable|auth_misconfigured
+	ForecastStatus   string          `json:"forecast_status"` // used|unavailable|horizon_elapsed|sanity_rejected|disabled|unauthorized|forbidden|auth_unavailable|auth_misconfigured|capacity_missing
 	ForecastIssuedAt *string         `json:"forecast_issued_at"`
 	ArtifactSHA256   *string         `json:"artifact_sha256"`
 	ModelVersion     *string         `json:"model_version"`
@@ -34,6 +34,11 @@ type decisionRecord struct {
 	Safeguards        []string `json:"safeguards"`
 	ReactiveReplicas  int32    `json:"reactive_replicas"`
 	CurrentRPM        float64  `json:"current_rpm"`
+	// CapacitySource is the field the per-replica capacity came from: capacityPerReplica, targetRPS (deprecated) or
+	// missing. With missing, CapacityRPM is absent, no replica count was calculated (reactive_replicas and
+	// predicted_replicas are 0 placeholders) and the decision holds the current count.
+	CapacitySource string   `json:"capacity_source"`
+	CapacityRPM    *float64 `json:"capacity_rpm_per_replica,omitempty"`
 	// TelemetryStatus says whether current_rpm/reactive_replicas are a measurement ("measured") or not
 	// ("unavailable": both are then 0 placeholders, never zero traffic; TelemetryError says why).
 	TelemetryStatus string  `json:"telemetry_status"`
@@ -66,6 +71,15 @@ func newDecisionRecord(a *autoscalerv1alpha1.PredictiveAutoscaler, forecasting b
 		d.ForecastStatus = "disabled"
 	}
 	return d
+}
+
+// setCapacity records the resolved per-replica capacity (perReplicaCapacityRPM).
+func (d *decisionRecord) setCapacity(rpm float64, source string, ok bool) {
+	if !ok {
+		d.CapacitySource, d.CapacityRPM = capacitySourceMissing, nil
+		return
+	}
+	d.CapacitySource, d.CapacityRPM = source, &rpm
 }
 
 // setForecast records the forecast that was evaluated this reconcile and its intermediate values.

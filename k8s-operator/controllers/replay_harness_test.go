@@ -45,7 +45,8 @@ type replayInput struct {
 	Max   int32        `json:"max"`
 	Steps []replayStep `json:"steps"`
 	// Scale-down headroom policy (spec.behavior.scaleDown.headroomPercent). Absent or 0 replays without it, which is
-	// how every controller before it behaved (the campaign's image included); per_pod_rpm is targetRPS x 60.
+	// how every controller before it behaved (the campaign's image included); per_pod_rpm is the resolved
+	// per-replica capacity (capacityPerReplica or targetRPS) x 60.
 	HeadroomPercent int32   `json:"headroom_percent,omitempty"`
 	PerPodRPM       float64 `json:"per_pod_rpm,omitempty"`
 }

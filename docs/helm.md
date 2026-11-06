@@ -70,7 +70,8 @@ Pods or read Secrets. The chart has no cold start: retrain by hand with
   peak if you rely on the forecast's lead time.
 
 - The CRD carries a revision label (`autoscaling.devkuban.com/crd-revision`). The operator reads it before starting.
-  Revisions: 1 = the first `autoscaling.devkuban.com` schema; 2 = adds `spec.behavior.scaleDown.headroomPercent`.
+  Revisions: 1 = the first `autoscaling.devkuban.com` schema; 2 = adds `spec.behavior.scaleDown.headroomPercent`;
+  3 = adds `spec.metrics.requests.capacityPerReplica` and deprecates `targetRPS` ([upgrading.md](upgrading.md)).
   While the installed CRD is older than it needs, the operator starts no controller and does not campaign for
   leadership: its liveness probe passes and its readiness probe fails, with the reason in the log.
 - `helm uninstall` keeps the CRD, and with it every PredictiveAutoscaler. Delete the CRD by hand only if you want them

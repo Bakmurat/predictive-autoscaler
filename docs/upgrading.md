@@ -1,5 +1,44 @@
 # Upgrading
 
+## capacityPerReplica replaces the hidden defaults
+
+**What changed (CRD revision 3).** The per-replica capacity is now `spec.metrics.requests.capacityPerReplica`: the
+request rate, in requests per second, that one ready replica serves within its SLO. It is a Kubernetes quantity, so
+decimals work (`"12.5"`). The integer `targetRPS` still works with the same meaning, but is deprecated, and an object that
+sets both is rejected.
+
+Earlier versions filled in a capacity when `targetRPS` was unset: 20,000 requests per minute per pod for the reactive
+rule and 30,000 for the forecast, two different numbers for the same service. **Those defaults are removed.** An
+autoscaler without a capacity now calculates no replica count. It holds the current count (Active mode writes nothing,
+except to bring a count outside `[minReplicas, maxReplicas]` back within them), requests no forecast, leaves
+`status.calculatedReplicas` empty, and reports `CapacityConfigured=False` with reason `CapacityMissing` and a Warning
+event `CapacityNotConfigured`. The API server still accepts objects without a capacity, so nothing is rejected during the
+upgrade; a later release will require one for Active mode once existing objects have been migrated.
+
+**Before you upgrade:**
+
+1. Apply the new CRD first (revision 3; the new operator waits, unready, on an older one):
+   `kubectl --kubeconfig <file> --context <context> apply --server-side --force-conflicts -f charts/predictive-autoscaler/crds/`.
+2. List the autoscalers that have no capacity and would start holding:
+
+   ```sh
+   kubectl --kubeconfig <file> --context <context> get pa -A -o json | jq -r '.items[]
+     | select(.spec.metrics.requests.capacityPerReplica == null and (.spec.metrics.requests.targetRPS // 0) == 0)
+     | "\(.metadata.namespace)/\(.metadata.name) mode=\(.spec.mode // "Recommend")"'
+   ```
+
+3. For each one, measure the capacity of one replica with a load test
+   ([configuration.md](configuration.md#measuring-capacitypereplica)) and set it. Do not copy the old defaults: 20,000
+   requests per minute is 333 requests per second per pod, which is rarely what a pod serves within its SLO, so an
+   Active autoscaler relying on it may have been running too few replicas.
+4. Move the autoscalers that use `targetRPS` to `capacityPerReplica` in one change, removing `targetRPS` at the same time
+   (in Git, or with
+   `kubectl --kubeconfig <file> --context <context> -n <namespace> patch pa <name> --type merge -p '{"spec":{"metrics":{"requests":{"targetRPS":null,"capacityPerReplica":"10"}}}}'`).
+   The decision does not change: `targetRPS: 10` and `capacityPerReplica: "10"` mean the same.
+
+After the upgrade, `kubectl get pa -A` shows an empty Calculated column for every autoscaler still without a capacity, and
+the condition message of `CapacityConfigured` names the capacity each one uses.
+
 ## From the legacy API group (`autoscaler.example.com`) to `autoscaling.devkuban.com`
 
 Before v0.1.0 the API group was the placeholder `autoscaler.example.com`. It is now `autoscaling.devkuban.com`. A

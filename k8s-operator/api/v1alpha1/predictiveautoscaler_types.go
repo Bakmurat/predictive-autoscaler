@@ -1,6 +1,7 @@
 package v1alpha1
 
 import (
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -50,8 +51,9 @@ type BehaviorConfig struct {
 // ScaleDownBehavior tunes scale-down.
 type ScaleDownBehavior struct {
 	// HeadroomPercent is the spare request capacity a scale-down must leave in the resulting fleet: Active mode
-	// scales down to n replicas only while the measured request rate is at most n x targetRPS x (1 - headroom/100),
-	// so the smallest count it scales down to is ceil(rate / (targetRPS x (1 - headroom/100))). It prevents
+	// scales down to n replicas only while the measured request rate is at most n x capacity x (1 - headroom/100),
+	// where capacity is the per-replica capacity (spec.metrics.requests.capacityPerReplica or targetRPS), so the
+	// smallest count it scales down to is ceil(rate / (capacity x (1 - headroom/100))). It prevents
 	// oscillation at a replica boundary (a scale-down that the next small rise undoes). Scale-up is unaffected.
 	// 0 disables it. Default 10.
 	// +kubebuilder:validation:Minimum=0
@@ -145,15 +147,26 @@ type MemoryMetric struct {
 	TargetPercent int32 `json:"targetPercent,omitempty"`
 }
 
-// RequestsMetric defines request rate metric configuration
+// RequestsMetric defines request rate metric configuration. The per-replica capacity is capacityPerReplica (or the
+// deprecated targetRPS); with neither, the operator computes no replica count and holds the current one.
+// +kubebuilder:validation:XValidation:rule="!(has(self.capacityPerReplica) && has(self.targetRPS))",message="set capacityPerReplica or the deprecated targetRPS, not both"
+// +kubebuilder:validation:XValidation:rule="!has(self.capacityPerReplica) || (isQuantity(string(self.capacityPerReplica)) && quantity(string(self.capacityPerReplica)).isGreaterThan(quantity('0')) && quantity(string(self.capacityPerReplica)).compareTo(quantity('1000000')) <= 0)",message="capacityPerReplica must be greater than 0 and at most 1000000 requests per second"
 type RequestsMetric struct {
 	// Enabled indicates if request metrics should be used
 	// +kubebuilder:default=false
 	// +optional
 	Enabled bool `json:"enabled"`
 
-	// TargetRPS is the target requests per second per pod
+	// CapacityPerReplica is the request rate, in requests per second, that one ready replica serves within its SLO
+	// (for example its p99 latency target) under the real request mix. Decimals are allowed ("12.5"). Measure it with a
+	// load test of one replica; the operator never assumes a default. Greater than 0 and at most 1000000.
+	// +optional
+	CapacityPerReplica *resource.Quantity `json:"capacityPerReplica,omitempty"`
+
+	// TargetRPS is the integer requests per second one replica serves. Deprecated: use capacityPerReplica, which means
+	// the same and allows decimals. Setting both is rejected.
 	// +kubebuilder:validation:Minimum=1
+	// +optional
 	TargetRPS int32 `json:"targetRPS,omitempty"`
 
 	// Source names the request-rate signal of the target (default: the istio preset).
@@ -278,7 +291,8 @@ type PredictiveAutoscalerStatus struct {
 	ForecastReplicas int32 `json:"forecastReplicas,omitempty"`
 
 	// CalculatedReplicas is the decision rule's result: clamp(max(forecast, reactive), min, max), or the held count
-	// when the current request rate is unavailable.
+	// when the current request rate is unavailable. Absent while no per-replica capacity is configured: the
+	// recommendation is then incomplete (CapacityConfigured=False) and the decision holds the current count.
 	CalculatedReplicas int32 `json:"calculatedReplicas,omitempty"`
 
 	// StabilizedReplicas is what Active mode applies after the scale-down stabilization and cooldown (Active only:
@@ -318,7 +332,7 @@ type PredictiveAutoscalerStatus struct {
 //+kubebuilder:object:root=true
 //+kubebuilder:subresource:status
 //+kubebuilder:resource:shortName=pa
-//+kubebuilder:metadata:labels="autoscaling.devkuban.com/crd-revision=2"
+//+kubebuilder:metadata:labels="autoscaling.devkuban.com/crd-revision=3"
 //+kubebuilder:metadata:annotations="argocd.argoproj.io/sync-options=Prune=false,Delete=false,ServerSideApply=true"
 //+kubebuilder:metadata:annotations="argocd.argoproj.io/sync-wave=-1"
 //+kubebuilder:printcolumn:name="Target",type="string",JSONPath=".spec.targetDeployment.name"
