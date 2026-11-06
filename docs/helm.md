@@ -39,13 +39,13 @@ and new autoscalers run in Recommend mode (they publish recommendations and chan
 
 | Component | Runs as | Can do | Writes to |
 |---|---|---|---|
-| operator (Deployment; leader election always on; one replica and Recreate when the ledger uses a claim) | uid 65532 | read autoscalers and Deployments; write replicas only through `deployments/scale`, its status and events, cluster-wide when every namespace is watched, otherwise only in `operator.watchNamespaces` (the reads stay cluster-wide; the release namespace gets only the Lease and its events). The watched namespaces must exist before install, and when you narrow or change them on an upgrade, check that the old write bindings are gone (with pruning off, Argo CD keeps them); read HPAs, KEDA ScaledObjects, VPAs and legacy-group autoscalers (coexistence); read its own CRD (revision gate); emit events; a Lease in the release namespace | nothing (or `/var/lib/predictive-autoscaler` with `operator.forecastLedger.enabled`) |
+| operator (Deployment; leader election always on; one replica and Recreate when the ledger uses a claim) | uid 65532 | read autoscalers and Deployments; write replicas only through `deployments/scale`, its status and events, cluster-wide when every namespace is watched, otherwise only in `operator.watchNamespaces` (the reads stay cluster-wide; the release namespace gets only the Lease and its events). The watched namespaces must exist before install, and when you narrow or change them on an upgrade, check that the old write bindings are gone (with pruning off, Argo CD keeps them); read HPAs, KEDA ScaledObjects, VPAs and legacy-group autoscalers (coexistence); get/list the ReplicaSets and Pods of its targets (startup measurement, `ScaleOutBlocked`), bound like the writes; read its own CRD (revision gate); emit events; a Lease in the release namespace | nothing (or `/var/lib/predictive-autoscaler` with `operator.forecastLedger.enabled`) |
 | forecasting service (Deployment, 1 replica) | uid 10001 | get autoscalers and Deployments; create TokenReviews when authentication is enabled | `/models` (the model volume), `/tmp` (an emptyDir with a size limit) |
 | trainer (one CronJob per `training.targets` entry) | uid 10001 | get autoscalers and Deployments | `/models`, `/tmp` |
 
 Every container runs non-root with a read-only root filesystem, no privilege escalation, all capabilities dropped and
 seccomp `RuntimeDefault`. HOME, TMPDIR, the XDG and Keras directories point into `/tmp`. No role can create Jobs or
-Pods or read Secrets. The chart has no cold start: retrain by hand with
+Pods or read Secrets; Pods and ReplicaSets are only read (get/list), by the operator, where it scales. The chart has no cold start: retrain by hand with
 `kubectl -n <ns> create job --from=cronjob/<cronjob> <name>` (the CronJob's annotation
 `autoscaling.devkuban.com/training-target` names its autoscaler).
 
@@ -71,7 +71,9 @@ Pods or read Secrets. The chart has no cold start: retrain by hand with
 
 - The CRD carries a revision label (`autoscaling.devkuban.com/crd-revision`). The operator reads it before starting.
   Revisions: 1 = the first `autoscaling.devkuban.com` schema; 2 = adds `spec.behavior.scaleDown.headroomPercent`;
-  3 = adds `spec.metrics.requests.capacityPerReplica` and deprecates `targetRPS` ([upgrading.md](upgrading.md)).
+  3 = adds `spec.metrics.requests.capacityPerReplica` and deprecates `targetRPS` ([upgrading.md](upgrading.md));
+  4 = adds the forecast contract v2 settings (`spec.prediction.engine` and the keys after it), `spec.behavior.startup`
+  and `status.prediction`.
   While the installed CRD is older than it needs, the operator starts no controller and does not campaign for
   leadership: its liveness probe passes and its readiness probe fails, with the reason in the log.
 - `helm uninstall` keeps the CRD, and with it every PredictiveAutoscaler. Delete the CRD by hand only if you want them

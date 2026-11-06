@@ -16,6 +16,11 @@ rules:
   resources: ["pods"]
   verbs: ["get", "list", "watch"]
 
+# Read ReplicaSets: which pods belong to the target's current ReplicaSet (startup-delay measurement, ScaleOutBlocked)
+- apiGroups: ["apps"]
+  resources: ["replicasets"]
+  verbs: ["get", "list"]
+
 # Read the other replica writers on a target (coexistence check before every write; the operator never changes them)
 - apiGroups: ["autoscaling"]
   resources: ["horizontalpodautoscalers"]

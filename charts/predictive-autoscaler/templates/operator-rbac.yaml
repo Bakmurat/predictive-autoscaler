@@ -68,39 +68,58 @@ rules:
   - apiGroups: ["", "events.k8s.io"]
     resources: ["events"]
     verbs: ["create", "patch"]
+---
+# The operator, reads of the targets' own workload objects: the pods of a target's current ReplicaSet and the
+# ReplicaSets that resolve them (the startup-delay measurement and ScaleOutBlocked; uncached lists, so no watch). Bound
+# like the writes: only where the operator scales. Pod objects carry their spec (environment values included), so this
+# read is not cluster-wide unless every namespace is watched.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "pa.fullname" . }}-operator-targets
+  labels: {{- include "pa.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list"]
 {{- $watch := .Values.operator.watchNamespaces }}
+{{- range $role := list "write" "targets" }}
 {{- if not $watch }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: {{ include "pa.fullname" . }}-operator-write
-  labels: {{- include "pa.labels" . | nindent 4 }}
+  name: {{ include "pa.fullname" $ }}-operator-{{ $role }}
+  labels: {{- include "pa.labels" $ | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: {{ include "pa.fullname" . }}-operator-write
+  name: {{ include "pa.fullname" $ }}-operator-{{ $role }}
 subjects:
   - kind: ServiceAccount
-    name: {{ include "pa.fullname" . }}-operator
-    namespace: {{ .Release.Namespace }}
+    name: {{ include "pa.fullname" $ }}-operator
+    namespace: {{ $.Release.Namespace }}
 {{- else }}
 {{- range ($watch | uniq) }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: {{ include "pa.fullname" $ }}-operator-write
+  name: {{ include "pa.fullname" $ }}-operator-{{ $role }}
   namespace: {{ . }}
   labels: {{- include "pa.labels" $ | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: {{ include "pa.fullname" $ }}-operator-write
+  name: {{ include "pa.fullname" $ }}-operator-{{ $role }}
 subjects:
   - kind: ServiceAccount
     name: {{ include "pa.fullname" $ }}-operator
     namespace: {{ $.Release.Namespace }}
+{{- end }}
 {{- end }}
 {{- end }}
 ---

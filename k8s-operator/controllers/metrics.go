@@ -137,6 +137,29 @@ var (
 		},
 		[]string{"application", "namespace"},
 	)
+	// Forecast contract v2 (design C2 section 8): replicas the verified forecast added above the reactive need, whether
+	// the predictive-extra cap bound, and the forecasting service's trust phase (one-hot over the fixed phases).
+	predictiveExtraReplicasGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "predictive_autoscaler_predictive_extra_replicas",
+			Help: "Replicas a verified forecast (contract v2) added above the reactive need in the last decision, after the predictive-extra cap; absent when no forecast was used",
+		},
+		[]string{"namespace", "autoscaler"},
+	)
+	predictiveCappedGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "predictive_autoscaler_predictive_capped",
+			Help: "1 when the predictive-extra cap lowered the forecast's replica count in the last decision, 0 when it did not; absent when no forecast was used",
+		},
+		[]string{"namespace", "autoscaler"},
+	)
+	predictionGateGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "predictive_autoscaler_prediction_gate",
+			Help: "Trust phase of the last forecast (contract v2): 1 for the current phase, 0 for the others; absent without a forecast",
+		},
+		[]string{"namespace", "autoscaler", "phase"},
+	)
 	// One series per (autoscaler, condition type, status), kube-state-metrics style: 1 for the condition's current
 	// status, 0 for the other two. Bounded by conditionMetricTypes; the alert rules in the chart read it.
 	conditionGauge = prometheus.NewGaugeVec(
@@ -160,7 +183,7 @@ var (
 // conditionMetricTypes are the condition types exported by conditionGauge (every type updateStatus sets).
 var conditionMetricTypes = []string{
 	"Ready", "TelemetryAvailable", "ForecastAvailable", "ConflictDetected", "VPAInterference", "ScalingActive",
-	"ScaleDownHeadroom", "CapacityConfigured",
+	"ScaleDownHeadroom", "CapacityConfigured", "PredictionReady", "ScaleOutBlocked",
 }
 
 // recordConditionMetrics publishes an autoscaler's persisted conditions (a type it does not carry has no series) and
@@ -187,10 +210,12 @@ func recordConditionMetrics(ns, name string, forecasting bool, conds []metav1.Co
 func forgetConditionMetrics(ns, name string) {
 	conditionGauge.DeletePartialMatch(prometheus.Labels{"namespace": ns, "autoscaler": name})
 	forecastingEnabledGauge.DeleteLabelValues(ns, name)
+	forgetV2Metrics(ns, name)
 }
 
 func init() {
 	metrics.Registry.MustRegister(forecastRpmGauge, forecastTargetTsGauge, forecastIssuedTsGauge, forecastStepMinutesGauge, modelTrainedTsGauge, modelTrainingCutoffTsGauge, modelInfoGauge, scaleEventsTotal, desiredReplicasGauge, conditionGauge, forecastingEnabledGauge)
+	metrics.Registry.MustRegister(predictiveExtraReplicasGauge, predictiveCappedGauge, predictionGateGauge)
 	metrics.Registry.MustRegister(
 		predictedReplicasGauge,
 		actualNeededReplicasGauge,
