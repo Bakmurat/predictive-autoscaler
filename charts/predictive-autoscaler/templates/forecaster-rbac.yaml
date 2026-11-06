@@ -1,0 +1,42 @@
+{{- range $component := list "forecaster" "trainer" }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "pa.fullname" $ }}-{{ $component }}
+  namespace: {{ $.Release.Namespace }}
+  labels: {{- include "pa.labels" $ | nindent 4 }}
+---
+# The {{ $component }} resolves an autoscaler's compiled query and its live target: read-only, nothing else.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "pa.fullname" $ }}-{{ $component }}
+  labels: {{- include "pa.labels" $ | nindent 4 }}
+rules:
+  - apiGroups: ["autoscaling.devkuban.com"]
+    resources: ["predictiveautoscalers"]
+    verbs: ["get"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get"]
+  {{- if and (eq $component "forecaster") $.Values.forecaster.auth.enabled }}
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "pa.fullname" $ }}-{{ $component }}
+  labels: {{- include "pa.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "pa.fullname" $ }}-{{ $component }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "pa.fullname" $ }}-{{ $component }}
+    namespace: {{ $.Release.Namespace }}
+---
+{{- end }}

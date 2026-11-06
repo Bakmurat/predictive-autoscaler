@@ -89,15 +89,20 @@ class _FakeTrainedModel:
                                "pattern_weights": [0.0] * steps_ahead}}
 
 
+from tests.b4_helpers import install_model, make_signal, product_body, route_product_path  # noqa: E402
+
+SIGNAL = make_signal(namespace=NS, name=APP)
+HISTORY = []   # what the service reads as its history for SIGNAL (set by _post_ending_at)
+
+
 @pytest.fixture
 def api(monkeypatch):
     from fastapi.testclient import TestClient
     from api import main as api_main
 
-    monkeypatch.setattr(api_main.predictor, "_check_and_reload_model", lambda *a, **k: None)
-    monkeypatch.setitem(api_main.predictor.trained_models, KEY, _FakeTrainedModel())
-    monkeypatch.setitem(api_main.predictor.model_train_times, KEY, datetime.utcnow())
-    monkeypatch.setitem(api_main.predictor.model_meta, KEY, {"artifact_sha256": "a" * 64})
+    install_model(api_main.predictor, _FakeTrainedModel(), SIGNAL)
+    monkeypatch.setattr(api_main, "resolve_signal", lambda request, reader: SIGNAL)
+    monkeypatch.setattr(api_main, "query_history", lambda url, query: list(HISTORY))
     api_main.accuracy_tracker.pending.clear()
     api_main.accuracy_tracker.history.clear()
     api_main.accuracy_tracker.component_history.clear()
@@ -120,9 +125,8 @@ def _grid_now():
 
 def _post_ending_at(client, last, value=1200.0):
     idx = [last - GRID * (PER_DAY - 1 - i) for i in range(PER_DAY)]
-    body = {"application": APP, "namespace": NS, "metric_type": MT, "horizon_minutes": 60,
-            "metric_data": [{"timestamp": t.isoformat() + "Z", "value": value} for t in idx]}
-    return client.post("/predict", json=body)
+    HISTORY[:] = [{"timestamp": t.isoformat() + "Z", "value": value} for t in idx]
+    return client.post("/predict", json=product_body(SIGNAL))
 
 
 def _gauge(api_main, gauge):
@@ -193,17 +197,8 @@ def test_validation_mape_carries_its_scored_count_through_to_models_endpoint():
     assert meta["mape"] == 8.0
     assert meta["scored"] == 9, meta          # pre-fix: KeyError, the count was never recorded
 
-    # And it is exposed beside the figure on /models.
+    # B4b: train_on_data is a sandbox. Its candidate is never served, so /models (the served records only) does not
+    # list it: a model without query provenance must never stand beside the served ones.
     from api import main as api_main
-    api_main.predictor.validation_metadata["app1_requests"] = meta
-    api_main.predictor.trained_models["app1_requests"] = fake
-    api_main.predictor.model_train_times["app1_requests"] = datetime.utcnow()
-    try:
-        body = TestClient(api_main.app).get("/models").json()
-        info = body["models"]["app1_requests"]
-        assert info["validation_mape"] == 8.0
-        assert info["validation_scored"] == 9
-    finally:
-        api_main.predictor.validation_metadata.pop("app1_requests", None)
-        api_main.predictor.trained_models.pop("app1_requests", None)
-        api_main.predictor.model_train_times.pop("app1_requests", None)
+    body = TestClient(api_main.app).get("/models").json()
+    assert body["models"] == {} and body["trained_models"] == []

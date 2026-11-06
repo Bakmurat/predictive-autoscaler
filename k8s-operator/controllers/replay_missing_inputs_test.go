@@ -53,7 +53,7 @@ func TestReplayMissingInputResetsLastRPM(t *testing.T) {
 }
 
 func TestReplayRejectsContradictoryKeepCurrent(t *testing.T) {
-	for _, field := range []string{"reactive", "predicted", "current_rpm", "predictions"} {
+	for _, field := range []string{"reactive", "current_rpm"} {
 		t.Run(field, func(t *testing.T) {
 			step := map[string]any{"t": "2026-09-27T00:10:00Z", "keep_current": true}
 			step[field] = 1
@@ -76,9 +76,27 @@ func TestReplayRejectsContradictoryKeepCurrent(t *testing.T) {
 			cmd := exec.Command(exe, "-test.run=^TestReplayHarness$")
 			cmd.Env = append(os.Environ(), "REPLAY_IN="+in, "REPLAY_OUT="+out)
 			output, err := cmd.CombinedOutput()
-			if err == nil || !strings.Contains(string(output), "keep_current requires unavailable forecast and telemetry") {
+			if err == nil || !strings.Contains(string(output), "keep_current requires missing telemetry") {
 				t.Fatalf("contradictory input was not rejected: err=%v output=%s", err, output)
 			}
 		})
+	}
+}
+
+// Missing telemetry holds the current count even when a forecast is present (lower or higher): without a measured
+// rate the controller neither scales down on "no data" nor scales on a forecast alone (user decision 2026-10-09).
+func TestReplayMissingTelemetryHoldsDespiteAForecast(t *testing.T) {
+	got := runLifecycleReplay(t, map[string]any{"min": 1, "max": 12, "steps": []map[string]any{
+		{"t": "2026-09-27T00:00:00Z", "reactive": 6, "predicted": 6, "current_rpm": 3600},
+		{"t": "2026-09-27T00:10:00Z", "keep_current": true, "predicted": 2, "predictions": []float64{1200, 1200, 1200, 1200, 1200, 1200}},
+		{"t": "2026-09-27T00:20:00Z", "keep_current": true, "predicted": 10, "predictions": []float64{6000, 6000, 6000, 6000, 6000, 6000}},
+	}})
+	if len(got) != 3 {
+		t.Fatalf("got %d decisions", len(got))
+	}
+	for i, d := range got[1:] {
+		if d.Desired != 6 || d.Applied != 6 {
+			t.Errorf("step %d: %+v, want desired = applied = 6 (hold)", i+1, d)
+		}
 	}
 }

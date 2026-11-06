@@ -13,6 +13,10 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).parent))
 from test_api_availability import daily_series, fitted
 
+from b4_helpers import install_model, make_signal
+
+SOURCE = make_signal(namespace="demo", name="nginx-test")   # the baseline arm's resolved signal
+
 CONFIG = {"id": "seasonal-pattern-v1", "application": "nginx-seasonal",
           "namespace": "demo", "source_application": "nginx-test", "source_namespace": "demo"}
 
@@ -29,10 +33,7 @@ def experiment(monkeypatch):
     end = end.replace(minute=end.minute // 10 * 10)
     series = daily_series(3, end)
     model = fitted(series)
-    predictor.trained_models["nginx-test_requests"] = model
-    predictor.model_meta["nginx-test_requests"] = {"artifact_sha256": "a" * 64}
-    predictor.model_train_times["nginx-test_requests"] = end
-    monkeypatch.setattr(predictor, "_check_and_reload_model", lambda key: None)
+    install_model(predictor, model, SOURCE, trained_at=end.isoformat())
     monkeypatch.setattr(main, "predictor", predictor)
     monkeypatch.setattr(main, "resolve_floor_mape", lambda *args: 37.0 if args[0] == "nginx-seasonal" else 0.0)
     data = [{"timestamp": t.isoformat() + "Z", "value": float(v)} for t, v in series.items()]
@@ -41,11 +42,11 @@ def experiment(monkeypatch):
 
 def test_seasonal_uses_source_pattern_without_mutating_baseline(experiment, monkeypatch):
     main, predictor, model, data = experiment
-    before = predictor.predict("nginx-test", data, 60, "requests", "demo")
+    before = predictor.predict("nginx-test", data, 60, "requests", "demo", signal=SOURCE)
     state = copy.deepcopy({k: v for k, v in vars(model).items() if k not in ("model", "scaler")})
     def no_reload(key):
         pytest.fail("seasonal route must not trigger a source checkpoint reload")
-    monkeypatch.setattr(predictor, "_check_and_reload_model", no_reload)
+    monkeypatch.setattr(predictor, "_reload_if_changed", no_reload)
     seasonal = predictor.predict("nginx-seasonal", data, 60, "requests", "demo")
     assert seasonal["predictions"] == [round(v, 2) for v in seasonal["components"]["pattern"]]
     assert seasonal["components"]["pattern_weights"] == [1.0] * 6
@@ -61,8 +62,8 @@ def test_seasonal_uses_source_pattern_without_mutating_baseline(experiment, monk
             assert v.equals(getattr(model, k)), k
         else:
             assert getattr(model, k) == v, k
-    monkeypatch.setattr(predictor, "_check_and_reload_model", lambda key: None)
-    after = predictor.predict("nginx-test", data, 60, "requests", "demo")
+    monkeypatch.setattr(predictor, "_reload_if_changed", lambda key: None)
+    after = predictor.predict("nginx-test", data, 60, "requests", "demo", signal=SOURCE)
     for field in ("predictions", "components", "confidence", "model_version", "artifact_sha256"):
         assert before[field] == after[field], field
     assert "experiment" not in after
@@ -112,13 +113,11 @@ def test_endpoint_fetches_source_and_tracks_separate_target(experiment, monkeypa
     assert client.post("/predict", json={**body, "metric_data": data}).status_code == 422
 
 
-@pytest.mark.parametrize("missing", ["model", "hash"])
-def test_missing_source_refuses_without_mutation(experiment, missing):
+def test_missing_source_refuses_without_mutation(experiment):
+    # (A registry record always carries its artifact digest, so "source without a hash" cannot occur any more.)
     _, predictor, model, data = experiment
-    if missing == "model":
-        predictor.trained_models.clear()
-    else:
-        predictor.model_meta.clear()
+    from api.registry import model_key
+    predictor.registry.remove(model_key("demo", "nginx-test", "requests"))
     before = model.last_sequence.copy()
     with pytest.raises(HTTPException) as exc:
         predictor.predict("nginx-seasonal", data, 60, "requests", "demo")

@@ -88,25 +88,27 @@ def _model(idx, vals, *, network_scaled=None, raises=None):
     return m
 
 
+from tests.b4_helpers import install_model, make_signal, product_body, route_product_path  # noqa: E402
+
+
 @pytest.fixture
 def api(monkeypatch):
     from fastapi.testclient import TestClient
     from api import main as api_main
 
-    monkeypatch.setattr(api_main.predictor, "_check_and_reload_model", lambda *a, **k: None)
-    monkeypatch.setitem(api_main.predictor.model_train_times, KEY, datetime.utcnow())
-    monkeypatch.setitem(api_main.predictor.model_meta, KEY, {"artifact_sha256": "a" * 64})
     api_main.accuracy_tracker.pending.clear()
     api_main.accuracy_tracker.history.clear()
     return TestClient(api_main.app), api_main
 
 
-def _post(client, idx, vals):
-    body = {"application": "nginx-test", "namespace": "demo", "metric_type": "requests",
-            "horizon_minutes": 60,
-            "metric_data": [{"timestamp": t.isoformat() + "Z", "value": v}
-                            for t, v in zip(idx, vals)]}
-    return client.post("/predict", json=body)
+SIGNAL = make_signal(namespace="demo", name="nginx-test")
+
+
+def _post(client, api_main, monkeypatch, idx, vals):
+    """The service resolves SIGNAL and reads (idx, vals) as its history (the product path, B4b)."""
+    route_product_path(monkeypatch, api_main, SIGNAL,
+                       [{"timestamp": t.isoformat() + "Z", "value": v} for t, v in zip(idx, vals)])
+    return client.post("/predict", json=product_body(SIGNAL))
 
 
 def test_unservable_step_is_refused_not_served_as_null(api, monkeypatch):
@@ -118,10 +120,9 @@ def test_unservable_step_is_refused_not_served_as_null(api, monkeypatch):
     client, api_main = api
     idx, vals = _fresh_two_days()
     pidx, pvals = _drop_backing_observations(idx, vals, (2,))
-    monkeypatch.setitem(api_main.predictor.trained_models, KEY,
-                        _model(idx, vals, raises=RuntimeError("keras exploded")))
+    install_model(api_main.predictor, _model(idx, vals, raises=RuntimeError("keras exploded")), SIGNAL)
 
-    r = _post(client, pidx, pvals)
+    r = _post(client, api_main, monkeypatch, pidx, pvals)
     assert r.status_code == 422, (
         f"an unservable step must be refused, not served; got {r.status_code}: {r.text[:300]}"
     )
@@ -134,10 +135,9 @@ def test_a_served_response_never_carries_a_null_prediction(api, monkeypatch):
     client, api_main = api
     idx, vals = _fresh_two_days()
     pidx, pvals = _drop_backing_observations(idx, vals, (0, 3, 5))
-    monkeypatch.setitem(api_main.predictor.trained_models, KEY,
-                        _model(idx, vals, raises=RuntimeError("keras exploded")))
+    install_model(api_main.predictor, _model(idx, vals, raises=RuntimeError("keras exploded")), SIGNAL)
 
-    r = _post(client, pidx, pvals)
+    r = _post(client, api_main, monkeypatch, pidx, pvals)
     if r.status_code == 200:
         preds = r.json()["predictions"]
         assert all(isinstance(p, (int, float)) and np.isfinite(p) for p in preds), preds
@@ -149,10 +149,9 @@ def test_full_coverage_still_serves_200_with_all_finite_steps(api, monkeypatch):
     """The refusal must not fire when every step IS servable -- pattern-only, network dead."""
     client, api_main = api
     idx, vals = _fresh_two_days()
-    monkeypatch.setitem(api_main.predictor.trained_models, KEY,
-                        _model(idx, vals, raises=RuntimeError("keras exploded")))
+    install_model(api_main.predictor, _model(idx, vals, raises=RuntimeError("keras exploded")), SIGNAL)
 
-    r = _post(client, idx, vals)
+    r = _post(client, api_main, monkeypatch, idx, vals)
     assert r.status_code == 200, r.text
     body = r.json()
     assert len(body["predictions"]) == STEPS_AHEAD
@@ -167,10 +166,9 @@ def test_refusal_body_is_the_shape_the_operator_decodes(api, monkeypatch):
     client, api_main = api
     idx, vals = _fresh_two_days()
     pidx, pvals = _drop_backing_observations(idx, vals, (2,))
-    monkeypatch.setitem(api_main.predictor.trained_models, KEY,
-                        _model(idx, vals, raises=RuntimeError("keras exploded")))
+    install_model(api_main.predictor, _model(idx, vals, raises=RuntimeError("keras exploded")), SIGNAL)
 
-    r = _post(client, pidx, pvals)
+    r = _post(client, api_main, monkeypatch, pidx, pvals)
     assert r.status_code == 422
     parsed = json.loads(r.text)
     assert isinstance(parsed.get("detail"), str) and parsed["detail"]

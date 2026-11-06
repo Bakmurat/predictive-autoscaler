@@ -1,0 +1,58 @@
+# The install smoke test (hack/smoke-kind.sh): the chart on a throwaway kind cluster with images built from this commit.
+# It proves what rendering cannot: permissions, storage, training and reload, the CRD gate, network policies, retention.
+# Required before any release (DESIGN-B5). Same security rules as ci.yml: read-only token, no secrets, pinned tools.
+name: smoke
+
+on:
+  pull_request:
+    paths: ["charts/**", "k8s-operator/**", "ml-engine/**", "hack/smoke-kind.sh", "hack/smoke/**", ".github/workflows/smoke.yml"]
+  push:
+    branches: [main, "product/**"]
+    paths: ["charts/**", "k8s-operator/**", "ml-engine/**", "hack/smoke-kind.sh", "hack/smoke/**", ".github/workflows/smoke.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  kind:
+    name: install smoke test (kind, Kubernetes 1.35)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      KIND_VERSION: v0.33.0
+      KIND_SHA256: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
+      KUBECTL_VERSION: v1.35.9
+      KUBECTL_SHA256: 3cfeaf80be482b435b0aa214aff6e0b2c312ee23c0ff20810c75517b6004c6eb
+      HELM_VERSION: v3.22.0
+      HELM_SHA256: 1e4ab49e429626cf6c6958d914248b78c9730803c2751b87627e171dc800e7bb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install kind, kubectl, helm (checksums verified)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin" && cd "$RUNNER_TEMP"
+          curl -fsSLo bin/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          echo "${KIND_SHA256}  bin/kind" | sha256sum -c -
+          curl -fsSLo bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          echo "${KUBECTL_SHA256}  bin/kubectl" | sha256sum -c -
+          curl -fsSLo helm.tgz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  helm.tgz" | sha256sum -c -
+          tar -xzf helm.tgz linux-amd64/helm && mv linux-amd64/helm bin/
+          chmod +x bin/kind bin/kubectl
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: build the images from this commit
+        run: |
+          docker build -q -t pa-smoke/operator:ci k8s-operator
+          docker build -q -t pa-smoke/ml-api:ci ml-engine
+      - name: smoke test
+        env:
+          OPERATOR_IMAGE: pa-smoke/operator:ci
+          FORECASTER_IMAGE: pa-smoke/ml-api:ci
+        run: hack/smoke-kind.sh

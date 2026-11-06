@@ -12,7 +12,8 @@ from fastapi.testclient import TestClient
 
 from test_api_availability import fitted, daily_series, NETWORK_VALUE
 from test_pattern_availability import model, ORIGIN, series_ending, PER_DAY
-from test_seasonal_experiment import experiment  # noqa: F401
+from test_seasonal_experiment import SOURCE, experiment  # noqa: F401
+from b4_helpers import product_body, route_product_path
 
 
 @pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
@@ -81,11 +82,13 @@ def test_http_older_nonfinite_support_keeps_finite_forecast(experiment, monkeypa
             point["value"] = bad
     async def fetch(*args):
         return data
-    monkeypatch.setattr(main, "fetch_metrics_from_vm", fetch)
+    monkeypatch.setattr(main, "fetch_metrics_from_vm", fetch)       # the seasonal arm's source history
+    route_product_path(monkeypatch, main, SOURCE, data)             # the baseline's (product path)
     client = TestClient(main.app)
     for application in ("nginx-test", "nginx-seasonal"):
-        response = client.post("/predict", json={"application": application,
-            "namespace": "demo", "metric_type": "requests", "horizon_minutes": 60})
+        body = product_body(SOURCE) if application == "nginx-test" else {
+            "application": application, "namespace": "demo", "metric_type": "requests", "horizon_minutes": 60}
+        response = client.post("/predict", json=body)
         assert response.status_code == 200, response.text
         body = response.json()
         assert np.isfinite(body["predictions"]).all()
@@ -104,11 +107,12 @@ def test_http_missing_step_uses_network_but_seasonal_arm_refuses(experiment, mon
             point["value"] = "nan"
     async def fetch(*args):
         return data
-    monkeypatch.setattr(main, "fetch_metrics_from_vm", fetch)
+    monkeypatch.setattr(main, "fetch_metrics_from_vm", fetch)       # the seasonal arm's source history
+    route_product_path(monkeypatch, main, SOURCE, data)             # the baseline's (product path)
     client = TestClient(main.app)
     request = {"application": "nginx-test", "namespace": "demo",
                "metric_type": "requests", "horizon_minutes": 60}
-    response = client.post("/predict", json=request)
+    response = client.post("/predict", json=product_body(SOURCE))
     assert response.status_code == 200, response.text
     body = response.json()
     assert np.isfinite(body["predictions"]).all()

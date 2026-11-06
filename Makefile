@@ -1,5 +1,5 @@
 # Publication is gated on `make verify` returning 0. See scripts/verify.sh and README "Testing".
-.PHONY: setup verify verify-selftest verify-python verify-go precommit-selftest
+.PHONY: setup verify verify-selftest verify-python verify-go precommit-selftest envtest manifests manifests-check chart-check smoke quickstart
 
 setup:
 	@git config core.hooksPath .githooks
@@ -17,5 +17,37 @@ verify-go:
 verify-selftest:
 	@scripts/verify-selftest.sh
 
+# The CRD and the deepcopy functions are generated from the API types' markers (controller-gen, pinned in the script).
+manifests:
+	@scripts/gen-manifests.sh write
+
+manifests-check:
+	@scripts/gen-manifests.sh check
+
+# The chart's static checks (helm lint/template, kubeconform for Kubernetes 1.33-1.35) and the alert rule tests
+# (promtool); needs helm and kubeconform, and promtool for the rule tests (skipped without it outside CI).
+chart-check:
+	@scripts/chart-check.sh
+	@scripts/alerts-check.sh
+
+# The install smoke test on a throwaway kind cluster (its own kubeconfig; never another cluster). Needs docker, kind,
+# kubectl, helm. KEEP=1 keeps the cluster; OPERATOR_IMAGE/FORECASTER_IMAGE skip the image builds.
+smoke:
+	@hack/smoke-kind.sh
+
+# The newcomer path: Recommend mode with actual HTTP request telemetry on its own kind cluster.
+quickstart:
+	@quickstart/kind.sh up
+
 precommit-selftest:
 	@scripts/precommit-selftest.sh
+
+# The operator's write path against a real Kubernetes API server: setup-envtest (pinned) downloads kube-apiserver and
+# etcd for ENVTEST_K8S_VERSION into ENVTEST_BIN_DIR (checksums verified), then the TestEnvtest* tests run with them.
+ENVTEST_K8S_VERSION ?= 1.35.0
+SETUP_ENVTEST_VERSION ?= v0.0.0-20260305142021-f9589b9f2b9d
+ENVTEST_BIN_DIR ?= $(HOME)/.local/share/kubebuilder-envtest
+
+envtest:
+	@assets=$$(go run sigs.k8s.io/controller-runtime/tools/setup-envtest@$(SETUP_ENVTEST_VERSION) use $(ENVTEST_K8S_VERSION) --bin-dir "$(ENVTEST_BIN_DIR)" -p path) && \
+	cd k8s-operator && env -u KUBERNETES_SERVICE_HOST -u KUBERNETES_SERVICE_PORT KUBECONFIG=/dev/null KUBEBUILDER_ASSETS="$$assets" ENVTEST_REQUIRED=1 go test -race -count=1 -run Envtest -v ./controllers/

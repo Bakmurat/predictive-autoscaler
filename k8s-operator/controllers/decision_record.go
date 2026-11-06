@@ -19,7 +19,7 @@ type decisionRecord struct {
 	Application      string          `json:"application"`
 	Namespace        string          `json:"namespace"`
 	Forecasting      bool            `json:"forecasting"`
-	ForecastStatus   string          `json:"forecast_status"` // used|unavailable|horizon_elapsed|sanity_rejected|disabled
+	ForecastStatus   string          `json:"forecast_status"` // used|unavailable|horizon_elapsed|sanity_rejected|disabled|unauthorized|forbidden|auth_unavailable|auth_misconfigured
 	ForecastIssuedAt *string         `json:"forecast_issued_at"`
 	ArtifactSHA256   *string         `json:"artifact_sha256"`
 	ModelVersion     *string         `json:"model_version"`
@@ -34,13 +34,23 @@ type decisionRecord struct {
 	Safeguards        []string `json:"safeguards"`
 	ReactiveReplicas  int32    `json:"reactive_replicas"`
 	CurrentRPM        float64  `json:"current_rpm"`
-	MinReplicas       int32    `json:"min_replicas"`
-	MaxReplicas       int32    `json:"max_replicas"`
-	DesiredReplicas   int32    `json:"desired_replicas"`
-	DesiredSource     string   `json:"desired_source"` // prediction|reactive|tie|min_replicas|max_replicas|keep_current
-	CurrentReplicas   int32    `json:"current_replicas"`
-	AppliedReplicas   int32    `json:"applied_replicas"`
-	Action            string   `json:"action"` // scale_up|scale_down|hold_stabilizing|hold_cooldown|at_target|keep_current|scale_error
+	// TelemetryStatus says whether current_rpm/reactive_replicas are a measurement ("measured") or not
+	// ("unavailable": both are then 0 placeholders, never zero traffic; TelemetryError says why).
+	TelemetryStatus string  `json:"telemetry_status"`
+	TelemetryError  *string `json:"telemetry_error,omitempty"`
+	// Other replica writers on the target (coexistence check, run before every write) and its failure, if any.
+	Conflicts          []string `json:"conflicts,omitempty"`
+	ConflictCheckError *string  `json:"conflict_check_error,omitempty"`
+	MinReplicas        int32    `json:"min_replicas"`
+	MaxReplicas        int32    `json:"max_replicas"`
+	DesiredReplicas    int32    `json:"desired_replicas"`
+	DesiredSource      string   `json:"desired_source"` // prediction|reactive|tie|min_replicas|max_replicas|keep_current
+	CurrentReplicas    int32    `json:"current_replicas"`
+	AppliedReplicas    int32    `json:"applied_replicas"`
+	Action             string   `json:"action"` // scale_up|scale_down|hold_stabilizing|hold_cooldown|hold_headroom|at_target|keep_current|scale_error|recommend|conflict_hold|guard_abort
+	// ScaleDownHeadroomFloor is the smallest count that keeps spec.behavior.scaleDown.headroomPercent of spare capacity at
+	// the measured rate (Active scale-down decisions only; absent otherwise).
+	ScaleDownHeadroomFloor *int32 `json:"scale_down_headroom_floor,omitempty"`
 }
 
 func newDecisionRecord(a *autoscalerv1alpha1.PredictiveAutoscaler, forecasting bool, current int32) *decisionRecord {

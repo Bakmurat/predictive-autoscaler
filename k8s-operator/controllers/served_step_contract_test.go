@@ -65,7 +65,7 @@ func TestNullPredictionDecodesAsZero(t *testing.T) {
 // routes it to reactive-only scaling rather than to a cached forecast (C-17).
 func TestRefusedForecastIsClassifiedAsRefusal(t *testing.T) {
 	const detail = "forecast refused: no finite value for step(s) 3 of 6"
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(echoProvenance(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnprocessableEntity)
 		_, _ = w.Write([]byte(`{"detail":"` + detail + `"}`))
@@ -74,7 +74,7 @@ func TestRefusedForecastIsClassifiedAsRefusal(t *testing.T) {
 	t.Setenv("ML_API_URL", srv.URL)
 
 	r := &PredictiveAutoscalerReconciler{}
-	_, err := r.getPrediction(context.Background(), testAutoscaler())
+	_, err := r.getPrediction(context.Background(), withSource(t, testAutoscaler()))
 	if err == nil {
 		t.Fatal("expected an error for a 422 response")
 	}
@@ -89,7 +89,7 @@ func TestRefusedForecastIsClassifiedAsRefusal(t *testing.T) {
 // TestValidResponseDecodesEveryStepFinite is the positive half of the contract: a served
 // forecast arrives with every step a usable number, and the target anchor survives.
 func TestValidResponseDecodesEveryStepFinite(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(echoProvenance(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"predictions":[1200.5,1250.25,1300.0,1350.0,1400.0,1450.0],
 			"confidence":0.87,"model_name":"nginx-test_requests",
@@ -101,7 +101,7 @@ func TestValidResponseDecodesEveryStepFinite(t *testing.T) {
 	t.Setenv("ML_API_URL", srv.URL)
 
 	r := &PredictiveAutoscalerReconciler{}
-	resp, err := r.getPrediction(context.Background(), testAutoscaler())
+	resp, err := r.getPrediction(context.Background(), withSource(t, testAutoscaler()))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

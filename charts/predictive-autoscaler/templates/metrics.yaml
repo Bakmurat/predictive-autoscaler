@@ -1,0 +1,32 @@
+{{- range $kind, $cfg := dict "ServiceMonitor" .Values.metrics.serviceMonitor "VMServiceScrape" .Values.metrics.vmServiceScrape }}
+{{- if $cfg.enabled }}
+{{- range $component := list "operator" "forecaster" }}
+apiVersion: {{ ternary "monitoring.coreos.com/v1" "operator.victoriametrics.com/v1beta1" (eq $kind "ServiceMonitor") }}
+kind: {{ $kind }}
+metadata:
+  name: {{ include "pa.fullname" $ }}-{{ $component }}
+  namespace: {{ $.Release.Namespace }}
+  labels: {{- include "pa.labels" $ | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+      app.kubernetes.io/component: {{ $component }}
+  endpoints:
+    - port: {{ ternary "metrics" "http" (eq $component "operator") }}
+      path: /metrics
+      interval: {{ $cfg.interval }}
+      {{- if eq $component "operator" }}
+      honorLabels: true    # keep the autoscaler's own namespace label (not renamed to exported_namespace)
+      {{- end }}
+      # the installation's namespace under its own name (the alert rules select this installation by it)
+      {{ ternary "relabelings" "relabelConfigs" (eq $kind "ServiceMonitor") }}:
+        - {sourceLabels: [__meta_kubernetes_namespace], targetLabel: pa_install_namespace}
+      {{- if and (eq $component "forecaster") $.Values.forecaster.auth.enabled }}
+      scheme: https
+      tlsConfig: {insecureSkipVerify: true}    # an in-cluster scrape of an open /metrics, limited by metricsFrom
+      {{- end }}
+---
+{{- end }}
+{{- end }}
+{{- end }}

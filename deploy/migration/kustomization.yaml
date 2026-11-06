@@ -1,0 +1,46 @@
+# This version installed NEXT TO a legacy (autoscaler.example.com) install, for the API-group migration
+# (docs/upgrading.md). Its own namespace and name prefix keep every legacy object in place: the namespace ml-engine, the
+# Deployments predictive-operator and ml-api, the ClusterRole predictive-operator-role and its binding keep their names,
+# content and permissions until the migration's cutover. The two operators elect on different Leases.
+#   kubectl kustomize deploy/migration | kubectl apply --server-side -f -
+# Set the training CronJob's TRAINING_TARGET to the replacement you train first (one CronJob per autoscaler).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: predictive-autoscaler
+namePrefix: pa-
+
+resources:
+  - ../../k8s-manifests/base
+
+patches:
+  # The forecasting service's address is a string: name it with the prefix and the namespace.
+  - target: {kind: Deployment, name: predictive-operator}
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/env/0
+        value: {name: ML_API_URL, value: "http://pa-ml-api-service.predictive-autoscaler.svc.cluster.local:8000"}
+  # No cold start: the CronJob name is a string too, and creating Jobs is broader than this install needs.
+  - target: {kind: Deployment, name: ml-api}
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata: {name: ml-api}
+      spec:
+        template:
+          spec:
+            containers:
+              - name: api
+                env:
+                  - name: COLD_START_CRONJOB
+                    $patch: delete
+  - target: {kind: VMServiceScrape}
+    patch: |-
+      - op: replace
+        path: /spec/namespaceSelector/matchNames
+        value: [predictive-autoscaler]
+  - target: {kind: Namespace}
+    patch: |-
+      - op: replace
+        path: /metadata/labels/name
+        value: predictive-autoscaler

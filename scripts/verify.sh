@@ -10,7 +10,7 @@
 # failure and publication is gated on this script returning 0 (see README, "Testing").
 #
 # Usage:
-#   scripts/verify.sh                 # full run, log to verify-<utc>.log
+#   scripts/verify.sh                 # full run, log to logs/verify-<utc>.log
 #   scripts/verify.sh --python-only   # skip Go (e.g. when Go is unavailable)
 #   scripts/verify.sh --go-only
 #   PYTEST_ARGS="-k pattern" scripts/verify.sh
@@ -19,13 +19,19 @@
 #   PYTHON   interpreter for the Python suite (default: eval/.venv/bin/python if present,
 #            else python3)
 #   GO       go binary (default: go on PATH, else /usr/local/go/bin/go)
-#   LOG      log path (default: verify-<utc>.log in the repo root; use /dev/null to skip)
+#   LOG      log path (default: logs/verify-<utc>.log, gitignored; use /dev/null to skip)
 
 set -u
 set -o pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+
+# No test may reach a real cluster, whatever kubeconfig or in-cluster environment the caller has (a local run once
+# reached a production context through the forecasting service's cold-start kubectl). Every runner started below
+# (go test, pytest, the scorer and archive suites, their kubectl stubs) inherits an empty kubeconfig.
+export KUBECONFIG=/dev/null
+unset KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT
 
 PYTHON="${PYTHON:-}"
 if [ -z "$PYTHON" ]; then
@@ -35,7 +41,8 @@ GO="${GO:-}"
 if [ -z "$GO" ]; then
   if command -v go >/dev/null 2>&1; then GO="go"; elif [ -x /usr/local/go/bin/go ]; then GO="/usr/local/go/bin/go"; else GO=""; fi
 fi
-LOG="${LOG:-$ROOT/verify-$(date -u +%Y%m%dT%H%M%SZ).log}"
+LOG="${LOG:-$ROOT/logs/verify-$(date -u +%Y%m%dT%H%M%SZ).log}"
+case "$LOG" in "$ROOT"/logs/*) mkdir -p "$ROOT/logs" ;; esac
 PYTEST_ARGS="${PYTEST_ARGS:-}"
 
 run_go=1; run_py=1
@@ -64,6 +71,9 @@ if [ "$run_go" = 1 ]; then
     status_line "go vet" "$rc" | tee -a "$LOG"; [ "$rc" -eq 0 ] || overall=1
     ( cd k8s-operator && "$GO" test -race -count=1 ./... ) 2>&1 | tee -a "$LOG"; rc=${PIPESTATUS[0]}
     status_line "go test -race" "$rc" | tee -a "$LOG"; [ "$rc" -eq 0 ] || overall=1
+    # The CRD and deepcopy code must be exactly what the API types' markers generate.
+    scripts/gen-manifests.sh check 2>&1 | tee -a "$LOG"; rc=${PIPESTATUS[0]}
+    status_line "generated code" "$rc" | tee -a "$LOG"; [ "$rc" -eq 0 ] || overall=1
   fi
 fi
 
@@ -77,6 +87,9 @@ if [ "$run_py" = 1 ]; then
   # The in-cluster evidence archive (verified-pair archiving, log preservation, gap detection).
   ( cd deploy/eks-benchmark/instrumentation && "$PYTHON" -W ignore archive_test.py ) 2>&1 | tee -a "$LOG"; rc=${PIPESTATUS[0]}
   status_line "archive tests" "$rc" | tee -a "$LOG"; [ "$rc" -eq 0 ] || overall=1
+  # The release workflow's gate decisions (registry absence, CI provenance, chart image defaults, digests).
+  ( cd hack/release && "$PYTHON" -W ignore release_checks_test.py ) 2>&1 | tee -a "$LOG"; rc=${PIPESTATUS[0]}
+  status_line "release checks" "$rc" | tee -a "$LOG"; [ "$rc" -eq 0 ] || overall=1
 fi
 
 if [ "$overall" -eq 0 ]; then

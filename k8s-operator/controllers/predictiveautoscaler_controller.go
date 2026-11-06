@@ -12,15 +12,21 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -48,6 +54,17 @@ const (
 type cachedPrediction struct {
 	response  *MLPredictionResponse
 	fetchedAt time.Time
+	binding   string // the PA, target and compiled query the forecast belongs to (forecastBinding)
+}
+
+// forecastBinding identifies what a cached forecast is valid for: the PA object, the target object and the compiled
+// query with its contract. A change of any of them invalidates the cache.
+func forecastBinding(a *autoscalerv1alpha1.PredictiveAutoscaler) string {
+	ms := a.Status.MetricSource
+	if ms == nil {
+		return string(a.UID) + "|-"
+	}
+	return string(a.UID) + "|" + ms.TargetUID + "|" + ms.SHA256 + "|" + ms.Contract
 }
 
 // scaleState tracks scaling history per deployment for stabilization.
@@ -59,6 +76,12 @@ type scaleState struct {
 	lastRPM            float64   // Previous reconcile's current RPM (for ramp-up detection)
 	reEvalCounter      int       // Counts reconciles since last periodic re-evaluation (OPER-01)
 	overrideActive     bool      // True when overestimate cap fired; bypasses stabilization (OPER-03)
+	// The state belongs to one mode and one target object: it is reset when either changes, so hypothetical
+	// (Recommend-mode) history never carries into Active mode and a re-created target starts clean. Its
+	// signal-dependent part also belongs to one compiled query (signal = its hash) and restarts when that changes.
+	mode      string
+	signal    string
+	targetUID types.UID
 	// Replay-only (Codex C-52): the differential harness rebases wall-clock timestamps so a
 	// recorded sequence can be replayed at its own cadence through the real decision
 	// functions. Unused in production -- nothing outside replay_harness_test.go sets these.
@@ -79,6 +102,55 @@ type PredictiveAutoscalerReconciler struct {
 	predictionCache  map[string]*cachedPrediction
 	forecastLedger   forecastLedgerState
 	scaleStates      map[string]*scaleState
+	// Recorder emits Kubernetes events on condition transitions and scaling actions (nil-safe).
+	Recorder events.EventRecorder
+	// APIReader reads straight from the API server (no cache) for the coexistence check and the write guard;
+	// nil falls back to the client (tests).
+	APIReader client.Reader
+	// Discovery is an uncached discovery client: optional APIs (KEDA, VPA) count as absent only when a fresh discovery
+	// shows they are not served. nil (tests) treats them as served.
+	Discovery APIDiscovery
+	// MLAPI reaches the forecasting service (token, TLS, no redirects); nil builds one from the environment on first use.
+	MLAPI     *mlAPIClient
+	mlAPIOnce sync.Once
+}
+
+func (r *PredictiveAutoscalerReconciler) mlAPI() *mlAPIClient {
+	r.mlAPIOnce.Do(func() {
+		if r.MLAPI == nil {
+			r.MLAPI = newMLAPIClientFromEnv(mlAPITimeout)
+		}
+	})
+	return r.MLAPI
+}
+
+func (r *PredictiveAutoscalerReconciler) reader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
+}
+
+// identityGuard re-reads, uncached, the autoscaler and its target immediately before a write: the write is refused
+// when the autoscaler was deleted or changed (UID, generation, mode no longer Active) or the target was replaced.
+func (r *PredictiveAutoscalerReconciler) identityGuard(ctx context.Context, pa *autoscalerv1alpha1.PredictiveAutoscaler, dep *appsv1.Deployment) string {
+	ctx, cancel := context.WithTimeout(ctx, identityGuardTimeout)
+	defer cancel()
+	var fresh autoscalerv1alpha1.PredictiveAutoscaler
+	if err := r.reader().Get(ctx, types.NamespacedName{Namespace: pa.Namespace, Name: pa.Name}, &fresh); err != nil {
+		return "autoscaler re-read failed: " + err.Error()
+	}
+	if fresh.UID != pa.UID || fresh.Generation != pa.Generation || fresh.Spec.EffectiveMode() != autoscalerv1alpha1.ModeActive {
+		return "the autoscaler changed during the reconcile"
+	}
+	var target appsv1.Deployment
+	if err := r.reader().Get(ctx, types.NamespacedName{Namespace: dep.Namespace, Name: dep.Name}, &target); err != nil {
+		return "target re-read failed: " + err.Error()
+	}
+	if target.UID != dep.UID {
+		return "the target Deployment was replaced during the reconcile"
+	}
+	return ""
 }
 
 // MLPredictionRequest represents the request to ML API
@@ -87,6 +159,15 @@ type MLPredictionRequest struct {
 	Namespace      string `json:"namespace"`
 	MetricType     string `json:"metric_type"`
 	HorizonMinutes int32  `json:"horizon_minutes"`
+	// The PredictiveAutoscaler whose compiled query (status.metricSource) the service resolves and checks; the query
+	// itself is never sent.
+	AutoscalerName       string `json:"autoscaler_name,omitempty"`
+	AutoscalerNamespace  string `json:"autoscaler_namespace,omitempty"`
+	AutoscalerUID        string `json:"autoscaler_uid,omitempty"`
+	AutoscalerGeneration int64  `json:"autoscaler_generation,omitempty"`
+	TargetUID            string `json:"target_uid,omitempty"`
+	MetricQuerySHA256    string `json:"metric_query_sha256,omitempty"`
+	Contract             string `json:"contract,omitempty"`
 }
 
 // MLPredictionResponse represents the response from ML API
@@ -96,6 +177,9 @@ type MLPredictionResponse struct {
 	ModelName      string    `json:"model_name"`
 	ModelVersion   string    `json:"model_version"`
 	ModelTrainedAt string    `json:"model_trained_at"`
+	// The signal the forecast was computed on; a forecast is used only when both equal the compiled query's.
+	MetricQuerySHA256 string `json:"metric_query_sha256"`
+	Contract          string `json:"contract"`
 	// Provenance from the trainer's sidecar, passed through by the API (empty when unknown).
 	TrainingCutoff    string `json:"training_cutoff"`
 	ArtifactSHA256    string `json:"artifact_sha256"`
@@ -128,8 +212,9 @@ func predictionEnabled(a *autoscalerv1alpha1.PredictiveAutoscaler) bool {
 
 // VMInstantQueryResponse represents the VictoriaMetrics instant query response
 type VMInstantQueryResponse struct {
-	Status string `json:"status"`
-	Data   struct {
+	Status    string `json:"status"`
+	IsPartial bool   `json:"isPartial"` // VictoriaMetrics: some storage nodes did not answer
+	Data      struct {
 		ResultType string `json:"resultType"`
 		Result     []struct {
 			Value [2]interface{} `json:"value"` // [timestamp, "value_string"]
@@ -137,13 +222,19 @@ type VMInstantQueryResponse struct {
 	} `json:"data"`
 }
 
-//+kubebuilder:rbac:groups=autoscaler.example.com,resources=predictiveautoscalers,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=autoscaler.example.com,resources=predictiveautoscalers/status,verbs=get;update;patch
-//+kubebuilder:rbac:groups=autoscaler.example.com,resources=predictiveautoscalers/finalizers,verbs=update
-//+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;update;patch
-//+kubebuilder:rbac:groups=apps,resources=deployments/scale,verbs=get;update;patch
+//+kubebuilder:rbac:groups=autoscaling.devkuban.com,resources=predictiveautoscalers,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=autoscaling.devkuban.com,resources=predictiveautoscalers/status,verbs=get;update;patch
+//+kubebuilder:rbac:groups=autoscaling.devkuban.com,resources=predictiveautoscalers/finalizers,verbs=update
+//+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch
+//+kubebuilder:rbac:groups=apps,resources=deployments/scale,verbs=get;update
+//+kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 //+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+//+kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch
+//+kubebuilder:rbac:groups=keda.sh,resources=scaledobjects,verbs=get;list;watch
+//+kubebuilder:rbac:groups=autoscaling.k8s.io,resources=verticalpodautoscalers,verbs=get;list;watch
+//+kubebuilder:rbac:groups=autoscaler.example.com,resources=predictiveautoscalers,verbs=get;list;watch
+//+kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,resourceNames=predictiveautoscalers.autoscaling.devkuban.com,verbs=get
 
 // Reconcile is the unified scaling loop. On every cycle (default 60s):
 // 1. Get ML predictions (cached 5 min) → predicted replicas within lead-time window
@@ -169,6 +260,7 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	if err := r.Get(ctx, req.NamespacedName, &autoscaler); err != nil {
 		if errors.IsNotFound(err) {
 			log.Info("PredictiveAutoscaler resource not found, ignoring")
+			forgetConditionMetrics(req.Namespace, req.Name)
 			return ctrl.Result{}, nil
 		}
 		log.Error(err, "Failed to get PredictiveAutoscaler")
@@ -195,6 +287,13 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		"target", autoscaler.Spec.TargetDeployment.Name,
 		"namespace", autoscaler.Spec.TargetDeployment.Namespace)
 
+	// The target must be in the autoscaler's own namespace: a namespace-scoped cache could otherwise hide another
+	// autoscaler of the same target from the coexistence check.
+	if tns := autoscaler.Spec.TargetDeployment.Namespace; tns != "" && tns != autoscaler.Namespace {
+		return r.updateStatusWithError(ctx, &autoscaler, "CrossNamespaceTarget",
+			fmt.Sprintf("targetDeployment.namespace %q differs from the autoscaler's namespace %q", tns, autoscaler.Namespace))
+	}
+
 	// Get target deployment
 	deployment, err := r.getTargetDeployment(ctx, &autoscaler)
 	if err != nil {
@@ -203,6 +302,48 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		return r.updateStatusWithError(ctx, &autoscaler, "DeploymentNotFound", err.Error())
 	}
 	currentReplicas := *deployment.Spec.Replicas
+	mode := autoscaler.Spec.EffectiveMode()
+	if st := r.getOrCreateScaleState(key); st.mode != mode || st.targetUID != deployment.UID {
+		*st = scaleState{mode: mode, targetUID: deployment.UID}
+		// A fresh Active state (operator restart, leader change, switch to Active, re-created target) has no write
+		// history, and the persisted status can lag the last write (a failed status update after a successful scale).
+		// It is treated as if a write had just happened (hold bookkeeping only: nothing is written and
+		// status.lastScaleTime is unchanged): the scale-up hold, then the below-current timer, block
+		// scale-down for both windows, and the cooldown (which also applies under the overestimate override) starts
+		// now, independent of the persisted status. Scale-up is not affected. Forecast-dependent state (cache,
+		// overestimate tracking, ramp reference) also starts again, so forecast decisions may still differ.
+		if mode == autoscalerv1alpha1.ModeActive {
+			now := time.Now()
+			st.lastScaleUp, st.lastScaleDown = now, now
+		}
+	}
+
+	// --- METRIC SOURCE ---
+	// Compiled every reconcile and published in status before any consumer (the forecasting service, the trainer)
+	// resolves it; an invalid configuration withdraws the previous compiled query and the cached forecast.
+	compiled, err := compileMetricQuery(requestsSource(&autoscaler), deployment.Namespace, deployment.Name)
+	if err != nil {
+		autoscaler.Status.MetricSource = nil
+		delete(r.predictionCache, key)
+		return r.updateStatusWithError(ctx, &autoscaler, "InvalidMetricQuery", err.Error())
+	}
+	if st := r.getOrCreateScaleState(key); st.signal != compiled.SHA256 {
+		// Overestimate tracking, the override, the ramp reference and the scale-down timer describe the previous
+		// signal; the real write timestamps (lastScaleUp/lastScaleDown) stay, so cooldowns still apply.
+		st.overestimateStreak, st.overrideActive, st.lastRPM, st.reEvalCounter = 0, false, 0, 0
+		st.belowCurrentSince = time.Time{}
+		st.signal = compiled.SHA256
+	}
+	wantSource := &autoscalerv1alpha1.MetricSourceStatus{Query: compiled.Query, SHA256: compiled.SHA256,
+		ObservedGeneration: autoscaler.Generation, TargetUID: string(deployment.UID), Contract: metricContract}
+	if autoscaler.Status.MetricSource == nil || *autoscaler.Status.MetricSource != *wantSource {
+		autoscaler.Status.MetricSource = wantSource
+		if err := r.Status().Update(ctx, &autoscaler); err != nil {
+			log.Error(err, "Failed to publish the compiled metric query; not forecasting before it is published")
+			delete(r.lastReconcileMap, key)
+			return ctrl.Result{}, err
+		}
+	}
 
 	// --- PREDICTIVE COMPONENT ---
 	// Get ML prediction (cached, refresh every 5 min)
@@ -220,7 +361,8 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	if !forecasting {
 		log.V(1).Info("Forecasting disabled for this autoscaler; reactive rule only")
 	} else if predErr != nil {
-		log.Info("Prediction unavailable, using reactive only", "error", predErr.Error())
+		dec.ForecastStatus = forecastFailureStatus(predErr)
+		log.Info("Prediction unavailable, using reactive only", "error", predErr.Error(), "status", dec.ForecastStatus)
 	} else if prediction != nil {
 		var usable bool
 		var det predictedDetail
@@ -238,20 +380,23 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 
 	// --- REACTIVE COMPONENT ---
 	// Query VictoriaMetrics for current RPM
-	currentRPM, vmErr := r.queryCurrentRPM(autoscaler.Spec.TargetDeployment.Name, autoscaler.Spec.TargetDeployment.Namespace)
+	currentRPM, vmErr := r.queryCurrentRPM(ctx, compiled.Query)
 	reactiveReplicas := int32(0)
+	perPodRPM := 20000.0
+	if autoscaler.Spec.Metrics.Requests != nil && autoscaler.Spec.Metrics.Requests.TargetRPS > 0 {
+		perPodRPM = float64(autoscaler.Spec.Metrics.Requests.TargetRPS) * 60
+	}
 	if vmErr != nil {
-		log.Info("VM query failed, using prediction only", "error", vmErr.Error())
+		log.Info("Current request rate unavailable; the decision will hold the current replica count", "error", vmErr.Error())
 	} else {
-		targetRPM := int32(20000)
-		if autoscaler.Spec.Metrics.Requests != nil && autoscaler.Spec.Metrics.Requests.TargetRPS > 0 {
-			targetRPM = autoscaler.Spec.Metrics.Requests.TargetRPS * 60
-		}
-		if currentRPM > 0 {
-			reactiveReplicas = int32(math.Ceil(currentRPM / float64(targetRPM)))
-		}
+		reactiveReplicas = boundedReplicas(math.Ceil(currentRPM / perPodRPM))
 	}
 	dec.ReactiveReplicas, dec.CurrentRPM = reactiveReplicas, currentRPM
+	dec.TelemetryStatus = "measured"
+	if vmErr != nil {
+		msg := vmErr.Error()
+		dec.TelemetryStatus, dec.TelemetryError = "unavailable", &msg
+	}
 
 	// --- PREDICTION SANITY CHECK ---
 	// Guard against diverging LSTM predictions (exponential blowup).
@@ -307,29 +452,20 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	state.lastRPM = currentRPM
 
 	// --- UNIFIED DECISION ---
-	// desired = max(predicted_baseline, reactive_needed, minReplicas)
-	desiredReplicas := predictedReplicas
-	if reactiveReplicas > desiredReplicas {
-		desiredReplicas = reactiveReplicas
-	}
-	if desiredReplicas < autoscaler.Spec.MinReplicas {
-		desiredReplicas = autoscaler.Spec.MinReplicas
-	}
-	if desiredReplicas > autoscaler.Spec.MaxReplicas {
-		desiredReplicas = autoscaler.Spec.MaxReplicas
-	}
-
-	// No usable input (forecast off or failed, and the metrics query failed) — keep current replicas
-	keepCurrent := false
-	if (predErr != nil || !forecasting) && vmErr != nil {
-		log.Info("Both prediction and VM query failed, keeping current replicas",
-			"current", currentReplicas)
-		desiredReplicas = currentReplicas
-		keepCurrent = true
+	desiredReplicas, keepCurrent := unifiedDesired(predictedReplicas, reactiveReplicas,
+		autoscaler.Spec.MinReplicas, autoscaler.Spec.MaxReplicas, currentReplicas,
+		dec.ForecastStatus == "used", vmErr == nil)
+	if keepCurrent {
+		log.Info("Current request rate unavailable: holding the current replica count",
+			"current", currentReplicas, "desired", desiredReplicas, "error", vmErr.Error())
+		// A forecast may be available but does not take part in a hold.
+		dec.Safeguards = append(dec.Safeguards, "telemetry_unavailable_hold")
 	}
 	dec.setDecision(predictedReplicas, desiredReplicas, keepCurrent)
 
 	// --- ACCURACY METRICS ---
+	// The actual need and the prediction error come from a measured rate only: without one they would be invented
+	// (minReplicas, 100 % error), so their series are removed instead.
 	actualNeeded := reactiveReplicas
 	if actualNeeded < autoscaler.Spec.MinReplicas {
 		actualNeeded = autoscaler.Spec.MinReplicas
@@ -342,8 +478,13 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 
 	predictedReplicasGauge.WithLabelValues(appName, appNS).Set(float64(predictedReplicas))
 	desiredReplicasGauge.WithLabelValues(appName, appNS).Set(float64(desiredReplicas))
-	actualNeededReplicasGauge.WithLabelValues(appName, appNS).Set(float64(actualNeeded))
-	predictionErrorPercentGauge.WithLabelValues(appName, appNS).Set(errorPct)
+	if vmErr == nil {
+		actualNeededReplicasGauge.WithLabelValues(appName, appNS).Set(float64(actualNeeded))
+		predictionErrorPercentGauge.WithLabelValues(appName, appNS).Set(errorPct)
+	} else {
+		actualNeededReplicasGauge.DeleteLabelValues(appName, appNS)
+		predictionErrorPercentGauge.DeleteLabelValues(appName, appNS)
+	}
 
 	// RPM gauges (D-08, D-09) — update every reconcile cycle
 	if dec.ForecastStatus == "used" && dec.LeadWindowPeak != nil && prediction != nil && len(prediction.Predictions) > 0 {
@@ -354,8 +495,10 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		// Absence distinguishes an unused/empty forecast from a usable forecast of zero RPM.
 		predictedRpmGauge.DeleteLabelValues(appName, appNS)
 	}
-	if currentRPM > 0 {
-		currentRpmGauge.WithLabelValues(appName, appNS).Set(currentRPM)
+	if vmErr == nil {
+		currentRpmGauge.WithLabelValues(appName, appNS).Set(currentRPM) // a measured zero is published as zero
+	} else {
+		currentRpmGauge.DeleteLabelValues(appName, appNS) // never leave the previous measurement standing
 	}
 
 	log.Info("Unified scaling decision",
@@ -367,39 +510,128 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		"currentReplicas", currentReplicas,
 		"currentRPM", fmt.Sprintf("%.0f", currentRPM))
 
-	// --- APPLY SCALING ---
+	// --- COEXISTENCE CHECK AND WRITE GUARD (uncached, after the slow forecast work, immediately before any write) ---
+	checkCtx, cancelCheck := context.WithTimeout(ctx, coexistenceTimeout)
+	check, checkErr := checkReplicaWriters(checkCtx, r.reader(), r.Discovery, &autoscaler, deployment)
+	cancelCheck()
+	dec.Conflicts = check.Conflicts
+	checkMsg := ""
+	if checkErr != nil {
+		checkMsg = checkErr.Error()
+		dec.ConflictCheckError = &checkMsg
+	}
+	blocked := mode == autoscalerv1alpha1.ModeActive && (checkErr != nil || len(check.Conflicts) > 0)
+	// write re-reads the autoscaler and the target immediately before the write; guard holds the reason when it
+	// aborted the write (the object changed during the reconcile).
+	// The write itself goes through /scale and applies only if the replica count is still the one decided from; a
+	// change or a write conflict aborts it (never retried with the old decision) and the next reconcile, with fresh
+	// checks, follows soon.
+	guard, retrySoon := "", false
+	// Order (Codex r07): read the fresh Scale first, then the final authorization (identity guard), then the update, all
+	// within scaleWriteTimeout, so a slow read cannot leave the authorization old when the write begins.
+	write := func(to int32) (bool, error) {
+		wctx, cancel := context.WithTimeout(ctx, scaleWriteTimeout)
+		defer cancel()
+		stale := func(err error) (bool, error) {
+			guard, retrySoon = "the target changed since the decision: "+err.Error(), true
+			log.Info("Not scaling: the decision is stale", "guard", guard)
+			r.recordDecision(dec, "guard_abort", currentReplicas)
+			return false, nil
+		}
+		scale, err := r.freshScale(wctx, deployment, currentReplicas)
+		if stderrors.Is(err, errStaleDecision) {
+			return stale(err)
+		}
+		if err != nil {
+			return true, err
+		}
+		if guard = r.identityGuard(wctx, &autoscaler, deployment); guard != "" {
+			log.Info("Not scaling: the autoscaler or its target changed during the reconcile", "guard", guard)
+			r.recordDecision(dec, "guard_abort", currentReplicas)
+			return false, nil
+		}
+		if err := r.writeScale(wctx, deployment, scale, to); err != nil {
+			if errors.IsConflict(err) {
+				return stale(err)
+			}
+			return true, err
+		}
+		return true, nil
+	}
 
-	if desiredReplicas > currentReplicas {
+	// --- APPLY SCALING ---
+	// Recommend mode: the decision is complete and recorded, nothing is written and no scale history is advanced.
+	stabilized, applied := int32(0), int32(0)
+	headroomHold, headroomPct := false, autoscaler.Spec.ScaleDownHeadroomPercent()
+	if mode != autoscalerv1alpha1.ModeActive {
+		log.Info("Recommend mode: not scaling", "calculated", desiredReplicas, "current", currentReplicas)
+		r.recordDecision(dec, "recommend", currentReplicas)
+	} else if blocked {
+		// Another writer owns the count (or ownership is unknown): no write, and no scale-down timer keeps running.
+		log.Info("Not scaling: another replica writer or a failed coexistence check",
+			"conflicts", check.Conflicts, "checkError", checkMsg)
+		r.recordDecision(dec, "conflict_hold", currentReplicas)
+		state.belowCurrentSince = time.Time{}
+	} else if desiredReplicas > currentReplicas {
 		// SCALE UP: immediate — no delay for predicted or reactive
 		log.Info("Scaling UP",
 			"from", currentReplicas, "to", desiredReplicas,
 			"predictedComponent", predictedReplicas,
 			"reactiveComponent", reactiveReplicas)
-		if err := r.scaleDeployment(ctx, deployment, desiredReplicas); err != nil {
+		wrote, err := write(desiredReplicas)
+		if err != nil {
 			log.Error(err, "Failed to scale up")
 			r.recordDecision(dec, "scale_error", currentReplicas)
 			return r.updateStatusWithError(ctx, &autoscaler, "ScalingError", err.Error())
 		}
-		r.recordDecision(dec, "scale_up", desiredReplicas)
-		state.lastScaleUp = time.Now()
-		state.belowCurrentSince = time.Time{} // reset scale-down timer
-		log.Info("Scaled deployment", "from", currentReplicas, "to", desiredReplicas)
+		if wrote {
+			r.recordDecision(dec, "scale_up", desiredReplicas)
+			stabilized, applied = desiredReplicas, desiredReplicas
+			r.event(&autoscaler, "Normal", "ScaledUp", fmt.Sprintf("Scaled %s from %d to %d", deployment.Name, currentReplicas, desiredReplicas))
+			state.lastScaleUp = time.Now()
+			state.belowCurrentSince = time.Time{} // reset scale-down timer
+			log.Info("Scaled deployment", "from", currentReplicas, "to", desiredReplicas)
+		}
 
 	} else if desiredReplicas < currentReplicas {
-		// SCALE DOWN: with stabilization window and gradual reduction
-		target := r.calculateScaleDownTarget(log, state, currentReplicas, desiredReplicas)
-		if target < currentReplicas {
+		// SCALE DOWN: no lower than the headroom floor (spare capacity in the resulting fleet at the measured rate),
+		// then with the stabilization window, cooldown and gradual reduction. The floor is checked before those holds,
+		// so neither the overestimate override nor the restart floor bypasses it; it is capped at maxReplicas, so a
+		// lowered maximum still takes effect.
+		headroomPct = autoscaler.Spec.ScaleDownHeadroomPercent()
+		floor := int32(0)
+		if vmErr == nil { // an unmeasured rate gives no floor and records none
+			floor = headroomFloor(currentRPM, perPodRPM, headroomPct, autoscaler.Spec.MaxReplicas)
+			dec.ScaleDownHeadroomFloor = &floor
+		}
+		var eventual int32
+		eventual, headroomHold = headroomEventual(state, currentReplicas, desiredReplicas, floor)
+		target := currentReplicas
+		if !headroomHold {
+			target = r.calculateScaleDownTarget(log, state, currentReplicas, eventual)
+		}
+		if headroomHold {
+			log.Info("Scale-down held for headroom", "desired", desiredReplicas, "headroomFloor", floor,
+				"headroomPercent", headroomPct, "current", currentReplicas, "currentRPM", fmt.Sprintf("%.0f", currentRPM))
+			r.recordDecision(dec, "hold_headroom", currentReplicas)
+			stabilized = currentReplicas
+		} else if target < currentReplicas {
 			log.Info("Scaling DOWN",
-				"from", currentReplicas, "to", target, "eventualTarget", desiredReplicas)
-			if err := r.scaleDeployment(ctx, deployment, target); err != nil {
+				"from", currentReplicas, "to", target, "eventualTarget", eventual)
+			wrote, err := write(target)
+			if err != nil {
 				log.Error(err, "Failed to scale down")
 				r.recordDecision(dec, "scale_error", currentReplicas)
 				return r.updateStatusWithError(ctx, &autoscaler, "ScalingError", err.Error())
 			}
-			r.recordDecision(dec, "scale_down", target)
-			state.lastScaleDown = time.Now()
-			state.overrideActive = false // clear override after scale-down completes (per D-12)
-			log.Info("Scaled deployment", "from", currentReplicas, "to", target)
+			if wrote {
+				r.recordDecision(dec, "scale_down", target)
+				stabilized, applied = target, target
+				r.event(&autoscaler, "Normal", "ScaledDown", fmt.Sprintf("Scaled %s from %d to %d (calculated %d)", deployment.Name, currentReplicas, target, desiredReplicas))
+				state.lastScaleDown = time.Now()
+				state.overrideActive = false // clear override after scale-down completes (per D-12)
+				log.Info("Scaled deployment", "from", currentReplicas, "to", target)
+			}
 		} else {
 			// Still in stabilization or cooldown
 			reason := "stabilizing"
@@ -412,6 +644,7 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 			log.Info("Scale-down pending ("+reason+")",
 				"desired", desiredReplicas, "current", currentReplicas)
 			r.recordDecision(dec, "hold_"+reason, currentReplicas)
+			stabilized = currentReplicas
 		}
 
 	} else {
@@ -423,13 +656,29 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 			action = "keep_current"
 		}
 		r.recordDecision(dec, action, currentReplicas)
+		stabilized = currentReplicas
 	}
 
 	// Update status
-	if err := r.updateStatus(ctx, &autoscaler, desiredReplicas, currentReplicas); err != nil {
+	forecastReplicas := int32(0)
+	if dec.ForecastStatus == "used" {
+		forecastReplicas = predictedReplicas
+	}
+	if err := r.updateStatus(ctx, &autoscaler, statusInputs{
+		mode: mode, calculated: desiredReplicas, forecast: forecastReplicas, stabilized: stabilized, applied: applied,
+		current: currentReplicas, ready: deployment.Status.ReadyReplicas, keepCurrent: keepCurrent,
+		telemetry: dec.TelemetryStatus, telemetryError: dec.TelemetryError, forecastStatus: dec.ForecastStatus,
+		forecastIssuedAt: dec.ForecastIssuedAt, targetUID: string(deployment.UID),
+		headroomHold: headroomHold, headroomPercent: headroomPct,
+		conflicts: check.Conflicts, writers: check.Writers, warnings: check.Warnings, vpaChecked: check.VPAChecked, checkError: checkMsg, guard: guard,
+	}); err != nil {
 		log.Error(err, "Failed to update status")
 	}
 
+	if retrySoon {
+		delete(r.lastReconcileMap, key)
+		return ctrl.Result{RequeueAfter: staleDecisionRetry}, nil
+	}
 	return ctrl.Result{RequeueAfter: reconcileInterval}, nil
 }
 
@@ -502,12 +751,12 @@ func (r *PredictiveAutoscalerReconciler) calculatePredictedReplicasDetail(
 	}
 
 	// Calculate replicas from RPM (CR specifies targetRPS, convert to RPM internally)
-	targetRPM := int32(30000)
+	targetRPM := 30000.0
 	if autoscaler.Spec.Metrics.Requests != nil && autoscaler.Spec.Metrics.Requests.TargetRPS > 0 {
-		targetRPM = autoscaler.Spec.Metrics.Requests.TargetRPS * 60
+		targetRPM = float64(autoscaler.Spec.Metrics.Requests.TargetRPS) * 60
 	}
 
-	desiredReplicas := int32(math.Ceil(peakRPM / float64(targetRPM)))
+	desiredReplicas := boundedReplicas(math.Ceil(peakRPM / targetRPM))
 	det.PeakRPM, det.Raw = peakRPM, desiredReplicas
 
 	log.Info("Predicted replicas (lead-time window)",
@@ -522,7 +771,7 @@ func (r *PredictiveAutoscalerReconciler) calculatePredictedReplicasDetail(
 	if prediction.Confidence < 0.7 && prediction.Confidence > 0 {
 		dampened := float64(autoscaler.Spec.MinReplicas) +
 			prediction.Confidence*float64(desiredReplicas-autoscaler.Spec.MinReplicas)
-		desiredReplicas = int32(math.Ceil(dampened))
+		desiredReplicas = boundedReplicas(math.Ceil(dampened))
 		log.Info("Low confidence dampening",
 			"confidence", prediction.Confidence, "dampened", desiredReplicas)
 		if desiredReplicas != det.Raw {
@@ -545,24 +794,21 @@ func (r *PredictiveAutoscalerReconciler) calculatePredictedReplicasDetail(
 	return desiredReplicas, true, det
 }
 
-// queryCurrentRPM queries VictoriaMetrics for the current requests per minute
-// of the target deployment. This is the REACTIVE signal.
-func (r *PredictiveAutoscalerReconciler) queryCurrentRPM(deploymentName, namespace string) (float64, error) {
-	vmURL := os.Getenv("VICTORIAMETRICS_URL")
-	if vmURL == "" {
-		vmURL = "http://vmselect-vmst.monitoring.svc.cluster.local:8481/select/0/prometheus"
-	}
-
-	// Canonical request-count definition (shared with the forecasting service, the KEDA comparison,
-	// and the scorer): destination-reported requests only, one workload, one namespace.
-	query := fmt.Sprintf(`sum(rate(istio_requests_total{reporter="destination",destination_workload="%s",destination_workload_namespace="%s"}[1m])) * 60`, deploymentName, namespace)
-
+// queryCurrentRPM runs the compiled request-rate query (requests per second, contract requests-per-second/v1) as an
+// instant query and returns requests per minute. This is the REACTIVE signal.
+func (r *PredictiveAutoscalerReconciler) queryCurrentRPM(ctx context.Context, query string) (float64, error) {
+	vmURL := prometheusURL()
 	endpoint := fmt.Sprintf("%s/api/v1/query", vmURL)
 	params := url.Values{}
 	params.Set("query", query)
+	params.Set("deny_partial_response", "1") // VictoriaMetrics cluster: fail rather than answer partially (also checked below)
 
 	httpClient := &http.Client{Timeout: vmQueryTimeout}
-	resp, err := httpClient.Get(fmt.Sprintf("%s?%s", endpoint, params.Encode()))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s?%s", endpoint, params.Encode()), nil)
+	if err != nil {
+		return 0, fmt.Errorf("VM query failed: %w", err)
+	}
+	resp, err := httpClient.Do(httpReq)
 	if err != nil {
 		return 0, fmt.Errorf("VM query failed: %w", err)
 	}
@@ -578,21 +824,139 @@ func (r *PredictiveAutoscalerReconciler) queryCurrentRPM(deploymentName, namespa
 		return 0, fmt.Errorf("failed to decode VM response: %w", err)
 	}
 
-	if vmResp.Status != "success" || len(vmResp.Data.Result) == 0 {
-		return 0, nil // No data = 0 RPM (no traffic or metric not available yet)
+	// Only a complete, successful answer with exactly one finite, non-negative sample is a measurement. Anything else
+	// is "unavailable", never zero traffic: reading it as 0 req/min used to scale a workload down to minReplicas during a
+	// metrics outage. A workload whose request counter exists but sees no traffic returns one series with value 0 (a real
+	// zero); when scraping stops, rate(...[1m]) returns no series, which is unavailable.
+	if vmResp.Status != "success" {
+		return 0, fmt.Errorf("%w: status %q", errMetricsUnavailable, vmResp.Status)
+	}
+	if vmResp.IsPartial {
+		return 0, fmt.Errorf("%w: partial response", errMetricsUnavailable)
+	}
+	if vmResp.Data.ResultType != "vector" {
+		return 0, fmt.Errorf("%w: resultType %q, want vector", errMetricsUnavailable, vmResp.Data.ResultType)
+	}
+	if n := len(vmResp.Data.Result); n != 1 {
+		return 0, fmt.Errorf("%w: %d series, want exactly one", errMetricsUnavailable, n)
+	}
+	if _, ok := vmResp.Data.Result[0].Value[0].(float64); !ok {
+		return 0, fmt.Errorf("%w: malformed sample timestamp", errMetricsUnavailable)
 	}
 
 	valueStr, ok := vmResp.Data.Result[0].Value[1].(string)
 	if !ok {
-		return 0, fmt.Errorf("unexpected value type in VM response")
+		return 0, fmt.Errorf("%w: unexpected value type in VM response", errMetricsUnavailable)
 	}
 
-	rpm, err := strconv.ParseFloat(valueStr, 64)
+	rps, err := strconv.ParseFloat(valueStr, 64)
 	if err != nil {
-		return 0, fmt.Errorf("failed to parse RPM value '%s': %w", valueStr, err)
+		return 0, fmt.Errorf("%w: failed to parse the rate value '%s': %v", errMetricsUnavailable, valueStr, err)
+	}
+	if math.IsNaN(rps) || math.IsInf(rps, 0) || rps < 0 {
+		return 0, fmt.Errorf("%w: value %q is not a finite, non-negative rate", errMetricsUnavailable, valueStr)
 	}
 
+	rpm := rps * 60 // the one RPS → RPM conversion in the operator (contract requests-per-second/v1)
+	if math.IsInf(rpm, 0) {
+		return 0, fmt.Errorf("%w: value %q overflows when converted to requests per minute", errMetricsUnavailable, valueStr)
+	}
 	return rpm, nil
+}
+
+// headroomFloor is the smallest replica count that leaves headroomPercent of spare request capacity at the measured rate:
+// ceil(rpm / (perPodRPM x (1 - headroomPercent/100))), capped at maxReplicas. 0 when the headroom is off, the capacity is
+// unknown or the rate is not a finite non-negative measurement (the caller then applies no floor).
+func headroomFloor(rpm, perPodRPM float64, headroomPercent, maxReplicas int32) int32 {
+	if headroomPercent <= 0 || headroomPercent >= 100 || !(perPodRPM > 0) || math.IsNaN(rpm) || math.IsInf(rpm, 0) || rpm < 0 {
+		return 0
+	}
+	f := boundedReplicas(math.Ceil(rpm / (perPodRPM * (1 - float64(headroomPercent)/100))))
+	if f > maxReplicas {
+		f = maxReplicas
+	}
+	return f
+}
+
+// headroomEventual is a scale-down's eventual count: the larger of the decision and the headroom floor. When that is
+// not below the current count, the floor holds it (hold = true) and the below-current window restarts, so a later
+// scale-down waits a full window again. Shared with the replay harness, so the two cannot diverge.
+func headroomEventual(state *scaleState, current, desired, floor int32) (eventual int32, hold bool) {
+	eventual = desired
+	if floor > eventual {
+		eventual = floor
+	}
+	if eventual >= current {
+		state.belowCurrentSince = time.Time{}
+		return current, true
+	}
+	return eventual, false
+}
+
+// boundedReplicas converts a computed replica count to int32 without wrapping: NaN and non-positive values are 0, values
+// beyond int32 saturate (the caller clamps to maxReplicas).
+func boundedReplicas(x float64) int32 {
+	switch {
+	case math.IsNaN(x) || x <= 0:
+		return 0
+	case x >= math.MaxInt32:
+		return math.MaxInt32
+	}
+	return int32(x)
+}
+
+// prometheusURL is the Prometheus-compatible query endpoint: PROMETHEUS_URL, or the deprecated VICTORIAMETRICS_URL.
+func prometheusURL() string {
+	if u := os.Getenv("PROMETHEUS_URL"); u != "" {
+		return u
+	}
+	if u := os.Getenv("VICTORIAMETRICS_URL"); u != "" {
+		warnDeprecatedMetricsURL.Do(func() {
+			ctrl.Log.WithName("setup").Info("VICTORIAMETRICS_URL is deprecated; set PROMETHEUS_URL")
+		})
+		return u
+	}
+	return "http://vmselect-vmst.monitoring.svc.cluster.local:8481/select/0/prometheus"
+}
+
+var warnDeprecatedMetricsURL sync.Once
+
+func requestsSource(a *autoscalerv1alpha1.PredictiveAutoscaler) *autoscalerv1alpha1.MetricSource {
+	if a.Spec.Metrics.Requests == nil {
+		return nil
+	}
+	return a.Spec.Metrics.Requests.Source
+}
+
+// errMetricsUnavailable marks every metrics answer that is not a usable measurement of the current request rate.
+var errMetricsUnavailable = stderrors.New("current request rate unavailable")
+
+// unifiedDesired is the one decision rule, shared by Reconcile and the replay harness.
+//
+//	telemetry measured: desired = clamp(max(forecast replicas if a forecast is used, reactive replicas), min, max)
+//	telemetry missing:  hold the current count (clamped to the bounds) — never scale on a forecast alone, never
+//	                    read "no data" as zero traffic (user decision 2026-10-09: missing metrics → HOLD).
+func unifiedDesired(predicted, reactive, minReplicas, maxReplicas, current int32, forecastUsed, telemetryOK bool) (int32, bool) {
+	clamp := func(v int32) int32 {
+		if v < minReplicas {
+			v = minReplicas
+		}
+		if v > maxReplicas {
+			v = maxReplicas
+		}
+		return v
+	}
+	if !telemetryOK {
+		return clamp(current), true
+	}
+	desired := int32(0)
+	if forecastUsed {
+		desired = predicted
+	}
+	if reactive > desired {
+		desired = reactive
+	}
+	return clamp(desired), false
 }
 
 // getCachedPrediction returns ML predictions, using a 5-min cache to avoid
@@ -611,6 +975,10 @@ func (r *PredictiveAutoscalerReconciler) getCachedPredictionObserved(
 ) (*MLPredictionResponse, error, *forecastLookup) {
 	lookup := r.newForecastLookup(autoscaler)
 	defer r.recordForecastCompletion(lookup)
+	binding := forecastBinding(autoscaler)
+	if cached, ok := r.predictionCache[key]; ok && cached.binding != binding {
+		delete(r.predictionCache, key) // built for another object, target or signal
+	}
 	// Check cache
 	if cached, ok := r.predictionCache[key]; ok {
 		age := time.Since(cached.fetchedAt)
@@ -628,9 +996,10 @@ func (r *PredictiveAutoscalerReconciler) getCachedPredictionObserved(
 	// Fetch fresh prediction from ML API
 	prediction, err := r.getPredictionObserved(ctx, autoscaler, lookup)
 	if err != nil {
-		if isForecastRefusal(err) {
-			// The API refused the request as invalid input (for example its freshness guard: the
-			// latest observation is missing or too old). That is not a transport failure: a
+		var cfg *mlAPIConfigError
+		if isForecastRefusal(err) || stderrors.As(err, &cfg) {
+			// The API refused the request (invalid input, for example its freshness guard, or an authentication
+			// refusal), or the client could not send it (missing token or CA). That is not a transport failure: a
 			// cached forecast must not stand in for it. Drop the cache → reactive only.
 			delete(r.predictionCache, key)
 			lookup.returned(nil, "unavailable", "delete")
@@ -675,6 +1044,7 @@ func (r *PredictiveAutoscalerReconciler) getCachedPredictionObserved(
 	r.predictionCache[key] = &cachedPrediction{
 		response:  prediction,
 		fetchedAt: now,
+		binding:   binding,
 	}
 	r.recordForecast(autoscaler, prediction, now)
 	lookup.returned(prediction, "fresh_response", "replace")
@@ -923,18 +1293,18 @@ func (r *PredictiveAutoscalerReconciler) getPredictionObserved(
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	// Call ML API (120s timeout to allow for LSTM training on first call)
-	httpClient := &http.Client{Timeout: mlAPITimeout}
+	// Call ML API (bounded by mlAPITimeout; authenticated and over TLS when configured, see mlapi_client.go)
 	completion, started := r.beginForecastAttempt(lookup, jsonData)
 	// The closure's normal return is the one completion boundary. Panic/termination
 	// leaves only the start; no deferred success is fabricated.
 	prediction, callErr := func() (*MLPredictionResponse, error) {
-		resp, err := httpClient.Post(
-			fmt.Sprintf("%s/predict", mlAPIURL),
-			"application/json",
-			bytes.NewBuffer(jsonData),
-		)
+		resp, err := r.mlAPI().post(ctx, fmt.Sprintf("%s/predict", mlAPIURL), jsonData)
 		if err != nil {
+			var cfg *mlAPIConfigError
+			if stderrors.As(err, &cfg) {
+				completion.failure("auth_misconfigured", "configuration", "request", err)
+				return nil, err
+			}
 			completion.failure("transport_error", "transport", "request", err)
 			return nil, fmt.Errorf("failed to call ML API: %w", err)
 		}
@@ -946,11 +1316,19 @@ func (r *PredictiveAutoscalerReconciler) getPredictionObserved(
 		if resp.StatusCode != http.StatusOK {
 			body, bodyErr := io.ReadAll(resp.Body)
 			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-				completion.failure("http_refusal", "http_status", "response_body", bodyErr)
+				kind := "http_refusal"
+				if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+					kind = "auth_refused"
+				}
+				completion.failure(kind, "http_status", "response_body", bodyErr)
 				return nil, &forecastRefusedError{status: resp.StatusCode, body: string(body)}
 			}
-			completion.failure("http_error", "http_status", "response_body", bodyErr)
-			return nil, fmt.Errorf("ML API returned status %d: %s", resp.StatusCode, string(body))
+			kind := "http_error"
+			if resp.StatusCode == http.StatusServiceUnavailable && strings.Contains(string(body), "AuthUnavailable") {
+				kind = "auth_unavailable"
+			}
+			completion.failure(kind, "http_status", "response_body", bodyErr)
+			return nil, &forecastServerError{status: resp.StatusCode, body: string(body)}
 		}
 
 		var prediction MLPredictionResponse
@@ -965,6 +1343,14 @@ func (r *PredictiveAutoscalerReconciler) getPredictionObserved(
 			completion.Outcome = "decoded_response"
 		}
 		completion.classifyServed(captured.Bytes())
+		// Only a forecast computed on the compiled query (same hash and contract) may be used or cached; an older
+		// service that does not report them is refused too (the reactive rule applies).
+		if ms := autoscaler.Status.MetricSource; ms == nil || ms.SHA256 == "" ||
+			prediction.MetricQuerySHA256 != ms.SHA256 || prediction.Contract != ms.Contract {
+			completion.failure("query_mismatch", "provenance", "response_body", nil)
+			return nil, &forecastRefusedError{status: resp.StatusCode, body: fmt.Sprintf(
+				"forecast for metric query %q (contract %q) does not match the compiled query", prediction.MetricQuerySHA256, prediction.Contract)}
+		}
 
 		return &prediction, nil
 	}()
@@ -976,94 +1362,293 @@ func (r *PredictiveAutoscalerReconciler) getPredictionObserved(
 	return prediction, callErr
 }
 
-// scaleDeployment scales the target deployment to the specified replica count.
-func (r *PredictiveAutoscalerReconciler) scaleDeployment(
-	ctx context.Context,
-	deployment *appsv1.Deployment,
-	replicas int32,
-) error {
-	if deployment.Spec.Replicas != nil && *deployment.Spec.Replicas == replicas {
-		return nil // Already at target
+// errStaleDecision: the target is no longer the object, or no longer at the replica count, the decision was computed
+// from.
+var errStaleDecision = stderrors.New("stale decision")
+
+// staleDecisionRetry is how soon a reconcile follows a write aborted by a stale decision.
+const staleDecisionRetry = 5 * time.Second
+
+// scaleWriteTimeout bounds the fresh Scale read, the final authorization and the /scale update together.
+var scaleWriteTimeout = 10 * time.Second
+
+// freshScale reads the Deployment's /scale subresource and accepts it only for the same object (UID) at the replica
+// count the decision was computed from (from), with a resourceVersion to make the update conditional.
+func (r *PredictiveAutoscalerReconciler) freshScale(ctx context.Context, deployment *appsv1.Deployment, from int32) (*autoscalingv1.Scale, error) {
+	decidedUID := deployment.UID // captured first: a client may refresh the object it is given
+	scale := &autoscalingv1.Scale{}
+	if err := r.SubResource("scale").Get(ctx, deployment.DeepCopy(), scale); err != nil {
+		return nil, fmt.Errorf("read the scale subresource: %w", err)
+	}
+	switch {
+	case scale.UID == "" || decidedUID == "" || scale.UID != decidedUID:
+		return nil, fmt.Errorf("%w: the target Deployment was replaced (UID %q, decided for %q)", errStaleDecision, scale.UID, decidedUID)
+	case scale.ResourceVersion == "":
+		return nil, fmt.Errorf("%w: the Scale has no resourceVersion", errStaleDecision)
+	case scale.Spec.Replicas != from:
+		return nil, fmt.Errorf("%w: replica count decided from %d, now %d", errStaleDecision, from, scale.Spec.Replicas)
+	}
+	return scale, nil
+}
+
+// writeScale writes the replica count through /scale (never a full-object update, so no other field is touched). The
+// body keeps the Scale's UID and resourceVersion: the API server rejects it (Conflict) if the Deployment was replaced
+// or changed after the read. It is not retried here.
+func (r *PredictiveAutoscalerReconciler) writeScale(ctx context.Context, deployment *appsv1.Deployment, scale *autoscalingv1.Scale, replicas int32) error {
+	from := scale.Spec.Replicas
+	if replicas == from {
+		return nil // already at target
 	}
 	direction := "up"
-	if deployment.Spec.Replicas != nil && replicas < *deployment.Spec.Replicas {
+	if replicas < from {
 		direction = "down"
 	}
-	deployment.Spec.Replicas = &replicas
-	if err := r.Update(ctx, deployment); err != nil {
+	scale.Spec.Replicas = replicas
+	if err := r.SubResource("scale").Update(ctx, deployment.DeepCopy(), client.WithSubResourceBody(scale)); err != nil {
 		return err
 	}
 	scaleEventsTotal.WithLabelValues(deployment.Name, deployment.Namespace, direction).Inc()
 	return nil
 }
 
-// updateStatus updates the PredictiveAutoscaler status
-func (r *PredictiveAutoscalerReconciler) updateStatus(
-	ctx context.Context,
-	autoscaler *autoscalerv1alpha1.PredictiveAutoscaler,
-	predictedReplicas int32,
-	currentReplicas int32,
-) error {
-	now := metav1.Now()
-	autoscaler.Status.PredictedReplicas = predictedReplicas
-	autoscaler.Status.CurrentReplicas = currentReplicas
-	autoscaler.Status.LastPrediction = &now
-
-	condition := metav1.Condition{
-		Type:               "Ready",
-		Status:             metav1.ConditionTrue,
-		LastTransitionTime: now,
-		Reason:             "ScalingSuccessful",
-		Message:            fmt.Sprintf("Unified: predicted=%d, desired=%d, current=%d", predictedReplicas, predictedReplicas, currentReplicas),
-	}
-
-	found := false
-	for i, cond := range autoscaler.Status.Conditions {
-		if cond.Type == "Ready" {
-			autoscaler.Status.Conditions[i] = condition
-			found = true
-			break
-		}
-	}
-	if !found {
-		autoscaler.Status.Conditions = append(autoscaler.Status.Conditions, condition)
-	}
-
-	return r.Status().Update(ctx, autoscaler)
+// statusInputs carries one reconcile's results into the status.
+type statusInputs struct {
+	mode                                                      string
+	calculated, forecast, stabilized, applied, current, ready int32
+	keepCurrent                                               bool
+	telemetry, forecastStatus                                 string
+	telemetryError, forecastIssuedAt                          *string
+	targetUID                                                 string
+	conflicts, warnings                                       []string
+	writers                                                   []autoscalerv1alpha1.ReplicaWriter
+	vpaChecked                                                bool
+	checkError, guard                                         string
+	headroomHold                                              bool
+	headroomPercent                                           int32
 }
 
-// updateStatusWithError updates status with error condition
+var forecastReasons = map[string]string{"disabled": "Disabled", "unavailable": "Unavailable",
+	"horizon_elapsed": "HorizonElapsed", "sanity_rejected": "SanityRejected",
+	"unauthorized": "Unauthorized", "forbidden": "Forbidden", "auth_unavailable": "AuthUnavailable",
+	"auth_misconfigured": "AuthMisconfigured"}
+
+// updateStatus writes the status when it changed: replica counts, mode, observedGeneration and the conditions Ready,
+// TelemetryAvailable, ForecastAvailable and ScalingActive (transition times preserved). Events are emitted on
+// condition transitions only.
+func (r *PredictiveAutoscalerReconciler) updateStatus(ctx context.Context, autoscaler *autoscalerv1alpha1.PredictiveAutoscaler, in statusInputs) error {
+	before := autoscaler.Status.DeepCopy()
+	st := &autoscaler.Status
+	st.ObservedGeneration = autoscaler.Generation
+	st.Mode = in.mode
+	if st.TargetUID != in.targetUID { // a replaced or retargeted Deployment: its predecessor's history does not apply
+		st.TargetUID, st.AppliedReplicas, st.LastScaleTime = in.targetUID, 0, nil
+	}
+	st.PredictedReplicas = in.calculated // deprecated field, historical meaning (the calculated count)
+	st.CalculatedReplicas, st.ForecastReplicas, st.StabilizedReplicas = in.calculated, in.forecast, in.stabilized
+	st.CurrentReplicas, st.ReadyReplicas = in.current, in.ready
+	st.Conflicts = in.writers
+	if in.mode != autoscalerv1alpha1.ModeActive {
+		st.StabilizedReplicas = 0
+	}
+	if in.applied > 0 {
+		st.AppliedReplicas = in.applied
+		now := metav1.Now()
+		st.LastScaleTime = &now
+	}
+	if in.forecastIssuedAt != nil {
+		if t, err := time.Parse(time.RFC3339, normalizeRFC3339(*in.forecastIssuedAt)); err == nil {
+			mt := metav1.NewTime(t)
+			st.LastPrediction = &mt
+		}
+	}
+	gen := autoscaler.Generation
+	set := func(t string, ok bool, reason, msg string) {
+		status := metav1.ConditionFalse
+		if ok {
+			status = metav1.ConditionTrue
+		}
+		meta.SetStatusCondition(&st.Conditions, metav1.Condition{Type: t, Status: status, Reason: reason, Message: conditionMessage(msg), ObservedGeneration: gen})
+	}
+	setStatus := func(t string, status metav1.ConditionStatus, reason, msg string) {
+		meta.SetStatusCondition(&st.Conditions, metav1.Condition{Type: t, Status: status, Reason: reason, Message: conditionMessage(msg), ObservedGeneration: gen})
+	}
+	set("Ready", true, "ReconcileCompleted", fmt.Sprintf("calculated=%d current=%d mode=%s", in.calculated, in.current, in.mode))
+	if in.telemetry == "measured" {
+		set("TelemetryAvailable", true, "Measured", "the current request rate was measured")
+	} else {
+		msg := "the current request rate is unavailable"
+		if in.telemetryError != nil {
+			msg = *in.telemetryError
+		}
+		set("TelemetryAvailable", false, "MetricsUnavailable", msg)
+	}
+	if in.forecastStatus == "used" {
+		set("ForecastAvailable", true, "Used", "a forecast was used in the decision")
+	} else {
+		reason := forecastReasons[in.forecastStatus]
+		if reason == "" {
+			reason = "Unavailable"
+		}
+		set("ForecastAvailable", false, reason, "forecast status: "+in.forecastStatus)
+	}
+	switch {
+	case in.checkError != "":
+		setStatus("ConflictDetected", metav1.ConditionUnknown, "CheckFailed", in.checkError)
+	case len(in.conflicts) > 0:
+		setStatus("ConflictDetected", metav1.ConditionTrue, "ReplicaWriter", "other replica writers on the target: "+strings.Join(in.conflicts, ", "))
+	default:
+		setStatus("ConflictDetected", metav1.ConditionFalse, "NoConflict", "no other replica writer targets the Deployment")
+	}
+	switch {
+	case !in.vpaChecked:
+		setStatus("VPAInterference", metav1.ConditionUnknown, "CheckFailed", "the VerticalPodAutoscaler check did not complete")
+	case len(in.warnings) > 0:
+		setStatus("VPAInterference", metav1.ConditionTrue, "VPAUpdatesPods", "changes the pods' resource requests: "+strings.Join(in.warnings, ", "))
+	default:
+		setStatus("VPAInterference", metav1.ConditionFalse, "None", "no VerticalPodAutoscaler (other than Off) targets the Deployment")
+	}
+	switch {
+	case in.mode != autoscalerv1alpha1.ModeActive:
+		set("ScalingActive", false, "RecommendMode", "Recommend mode: the operator computes and publishes decisions and writes nothing")
+	case in.checkError != "":
+		set("ScalingActive", false, "CheckFailed", "the coexistence check failed, so nothing is written: "+in.checkError)
+	case len(in.conflicts) > 0:
+		set("ScalingActive", false, "Conflict", "another replica writer targets the Deployment: "+strings.Join(in.conflicts, ", "))
+	case in.guard != "":
+		set("ScalingActive", false, "GuardAborted", in.guard)
+	case in.keepCurrent:
+		set("ScalingActive", false, "TelemetryHold", "holding the current replica count: the current request rate is unavailable")
+	default:
+		set("ScalingActive", true, "Active", "the operator scales the target")
+	}
+	// Informational: a scale-down held for headroom is normal operation, so it never affects Ready or ScalingActive.
+	switch {
+	case in.mode != autoscalerv1alpha1.ModeActive:
+		setStatus("ScaleDownHeadroom", metav1.ConditionFalse, "RecommendMode", "Recommend mode applies no scale-down")
+	case in.headroomHold:
+		setStatus("ScaleDownHeadroom", metav1.ConditionTrue, "Holding", fmt.Sprintf(
+			"a lower count would leave less than %d%% spare request capacity at the measured rate; holding %d", in.headroomPercent, in.current))
+	default:
+		setStatus("ScaleDownHeadroom", metav1.ConditionFalse, "NotHolding", fmt.Sprintf(
+			"headroom %d%% is not blocking a scale-down", in.headroomPercent))
+	}
+	if statusEqual(before, st) {
+		recordConditionMetrics(autoscaler.Namespace, autoscaler.Name, predictionEnabled(autoscaler), st.Conditions)
+		return nil
+	}
+	if err := r.Status().Update(ctx, autoscaler); err != nil {
+		return err
+	}
+	recordConditionMetrics(autoscaler.Namespace, autoscaler.Name, predictionEnabled(autoscaler), st.Conditions) // the persisted conditions only
+	r.transitionEvents(autoscaler, before.Conditions, st.Conditions)                                            // only after the status is persisted
+	return nil
+}
+
+// statusEqual compares two statuses including condition contents (transition times are preserved by SetStatusCondition).
+func statusEqual(a, b *autoscalerv1alpha1.PredictiveAutoscalerStatus) bool {
+	ja, _ := json.Marshal(a)
+	jb, _ := json.Marshal(b)
+	return bytes.Equal(ja, jb)
+}
+
+// transitionEvents emits one event per condition whose status changed (or that first appears unhealthy).
+func (r *PredictiveAutoscalerReconciler) transitionEvents(a *autoscalerv1alpha1.PredictiveAutoscaler, old, cur []metav1.Condition) {
+	names := map[string][2]string{ // type → {event when it turns False, event when it turns True}
+		"TelemetryAvailable": {"TelemetryUnavailable", "TelemetryRestored"},
+		"ForecastAvailable":  {"ForecastUnavailable", "ForecastRestored"},
+		"ScalingActive":      {"ScalingInactive", "ScalingActive"},
+		"Ready":              {"ReconcileFailed", "ReconcileRecovered"},
+	}
+	for _, c := range cur {
+		if c.Type == "ConflictDetected" || c.Type == "VPAInterference" { // True is the problem for these two
+			prev := meta.FindStatusCondition(old, c.Type)
+			if prev != nil && prev.Status == c.Status && prev.Reason == c.Reason {
+				continue
+			}
+			switch {
+			case c.Status == metav1.ConditionTrue:
+				r.event(a, "Warning", c.Type, c.Message)
+			case c.Status == metav1.ConditionUnknown:
+				if c.Type == "ConflictDetected" { // an incomplete VPA check is covered by this event
+					r.event(a, "Warning", "ConflictCheckFailed", c.Message)
+				}
+			case c.Type == "ConflictDetected" && prev != nil && prev.Status != metav1.ConditionFalse:
+				r.event(a, "Normal", "ConflictResolved", c.Message)
+			case c.Type == "VPAInterference" && prev != nil && prev.Status == metav1.ConditionTrue:
+				r.event(a, "Normal", "VPAInterferenceCleared", c.Message) // only a completed check clears it
+			}
+			continue
+		}
+		n, ok := names[c.Type]
+		if !ok {
+			continue
+		}
+		prev := meta.FindStatusCondition(old, c.Type)
+		if prev != nil && prev.Status == c.Status && prev.Reason == c.Reason {
+			continue
+		}
+		if prev == nil && c.Status == metav1.ConditionTrue {
+			continue // a healthy first observation is not news
+		}
+		switch {
+		case c.Status == metav1.ConditionTrue:
+			r.event(a, "Normal", n[1], c.Message)
+		case c.Reason == "RecommendMode" || c.Reason == "Disabled": // configured states, not faults
+			r.event(a, "Normal", c.Reason, c.Message)
+		default:
+			r.event(a, "Warning", n[0], c.Reason+": "+c.Message)
+		}
+	}
+}
+
+func (r *PredictiveAutoscalerReconciler) event(a *autoscalerv1alpha1.PredictiveAutoscaler, typ, reason, msg string) {
+	if r.Recorder != nil {
+		action := "Reconcile"
+		if reason == "ScaledUp" || reason == "ScaledDown" {
+			action = "Scale"
+		}
+		r.Recorder.Eventf(a, nil, typ, reason, action, "%s", msg)
+	}
+}
+
+// maxConditionMessage is metav1.Condition's schema limit on message (bytes); a longer message would make the API server
+// reject the whole status update.
+const maxConditionMessage = 32768
+
+// conditionMessage keeps a condition message within the schema limit, cut at a UTF-8 boundary with a marker.
+func conditionMessage(msg string) string {
+	if len(msg) <= maxConditionMessage {
+		return msg
+	}
+	const marker = " …(truncated)"
+	cut := maxConditionMessage - len(marker)
+	for cut > 0 && !utf8.RuneStart(msg[cut]) {
+		cut--
+	}
+	return msg[:cut] + marker
+}
+
+// updateStatusWithError records a failed reconcile (Ready=False, transition time preserved).
 func (r *PredictiveAutoscalerReconciler) updateStatusWithError(
 	ctx context.Context,
 	autoscaler *autoscalerv1alpha1.PredictiveAutoscaler,
 	reason string,
 	message string,
 ) (ctrl.Result, error) {
-	now := metav1.Now()
-	condition := metav1.Condition{
-		Type:               "Ready",
-		Status:             metav1.ConditionFalse,
-		LastTransitionTime: now,
-		Reason:             reason,
-		Message:            message,
+	before := autoscaler.Status.DeepCopy()
+	autoscaler.Status.ObservedGeneration = autoscaler.Generation
+	autoscaler.Status.Mode = autoscaler.Spec.EffectiveMode()
+	for _, c := range []string{"Ready", "ScalingActive"} {
+		meta.SetStatusCondition(&autoscaler.Status.Conditions, metav1.Condition{Type: c, Status: metav1.ConditionFalse,
+			Reason: reason, Message: conditionMessage(message), ObservedGeneration: autoscaler.Generation})
 	}
-
-	found := false
-	for i, cond := range autoscaler.Status.Conditions {
-		if cond.Type == "Ready" {
-			autoscaler.Status.Conditions[i] = condition
-			found = true
-			break
+	if !statusEqual(before, &autoscaler.Status) {
+		if err := r.Status().Update(ctx, autoscaler); err != nil {
+			return ctrl.Result{}, err
 		}
+		r.transitionEvents(autoscaler, before.Conditions, autoscaler.Status.Conditions)
 	}
-	if !found {
-		autoscaler.Status.Conditions = append(autoscaler.Status.Conditions, condition)
-	}
-
-	if err := r.Status().Update(ctx, autoscaler); err != nil {
-		return ctrl.Result{}, err
-	}
-
+	recordConditionMetrics(autoscaler.Namespace, autoscaler.Name, predictionEnabled(autoscaler), autoscaler.Status.Conditions)
 	return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
 }
 

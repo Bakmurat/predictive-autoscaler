@@ -99,8 +99,13 @@ func predictionRequest(a *autoscalerv1alpha1.PredictiveAutoscaler) MLPredictionR
 	if horizon == 0 {
 		horizon = defaultHorizonMinutes
 	}
-	return MLPredictionRequest{Application: a.Spec.TargetDeployment.Name, Namespace: a.Spec.TargetDeployment.Namespace,
-		MetricType: metric, HorizonMinutes: horizon}
+	req := MLPredictionRequest{Application: a.Spec.TargetDeployment.Name, Namespace: a.Spec.TargetDeployment.Namespace,
+		MetricType: metric, HorizonMinutes: horizon,
+		AutoscalerName: a.Name, AutoscalerNamespace: a.Namespace, AutoscalerUID: string(a.UID), AutoscalerGeneration: a.Generation}
+	if ms := a.Status.MetricSource; ms != nil {
+		req.TargetUID, req.MetricQuerySHA256, req.Contract = ms.TargetUID, ms.SHA256, ms.Contract
+	}
+	return req
 }
 
 func (r *PredictiveAutoscalerReconciler) newForecastLookup(a *autoscalerv1alpha1.PredictiveAutoscaler) *forecastLookup {

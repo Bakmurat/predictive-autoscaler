@@ -1,0 +1,48 @@
+{{- /* The forecasting service's TLS certificate when authentication is on (B5e). Secret <fullname>-forecaster-tls holds
+       tls.crt, tls.key and ca.crt; the operator mounts only ca.crt. */}}
+{{- if .Values.forecaster.auth.enabled }}
+{{- $tls := .Values.forecaster.tls }}
+{{- $svc := printf "%s-forecaster" (include "pa.fullname" .) }}
+{{- $dns := list $svc (printf "%s.%s" $svc .Release.Namespace) (printf "%s.%s.svc" $svc .Release.Namespace) (printf "%s.%s.svc.cluster.local" $svc .Release.Namespace) }}
+{{- if eq $tls.source "selfSigned" }}
+{{- /* Kept across upgrades with lookup. Under Argo CD (no lookup) every render would make a new certificate: use
+       certManager or existingSecret there (docs/helm.md). */}}
+{{- $name := include "pa.forecasterTLSSecret" . }}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace $name }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "pa.labels" . | nindent 4 }}
+type: kubernetes.io/tls
+data:
+{{- if and $existing (index $existing.data "tls.crt") (index $existing.data "ca.crt") }}
+  tls.crt: {{ index $existing.data "tls.crt" }}
+  tls.key: {{ index $existing.data "tls.key" }}
+  ca.crt: {{ index $existing.data "ca.crt" }}
+{{- else }}
+{{- $ca := genCA (printf "%s-ca" $svc) (int $tls.selfSigned.validityDays) }}
+{{- $cert := genSignedCert $svc nil $dns (int $tls.selfSigned.validityDays) $ca }}
+  tls.crt: {{ $cert.Cert | b64enc }}
+  tls.key: {{ $cert.Key | b64enc }}
+  ca.crt: {{ $ca.Cert | b64enc }}
+{{- end }}
+{{- else if eq $tls.source "certManager" }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $svc }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "pa.labels" . | nindent 4 }}
+spec:
+  secretName: {{ include "pa.forecasterTLSSecret" . }}
+  dnsNames: {{- toYaml $dns | nindent 4 }}
+  duration: {{ $tls.certManager.duration }}
+  renewBefore: {{ $tls.certManager.renewBefore }}
+  issuerRef:
+    name: {{ required "forecaster.tls.certManager.issuerRef.name is required with tls.source certManager" $tls.certManager.issuerRef.name }}
+    kind: {{ $tls.certManager.issuerRef.kind }}
+    group: cert-manager.io
+{{- end }}
+{{- end }}
