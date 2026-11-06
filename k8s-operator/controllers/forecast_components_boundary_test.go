@@ -36,12 +36,12 @@ func apiComponentFixture(t *testing.T, name string) map[string]interface{} {
 func fixturePrediction(t *testing.T, body map[string]interface{}, namespace string) (*PredictiveAutoscalerReconciler, *autoscalerv1alpha1.PredictiveAutoscaler, *MLPredictionResponse) {
 	t.Helper()
 	raw := componentBody(t, body)
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, raw) }))
+	s := httptest.NewServer(echoProvenance(func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, raw) }))
 	t.Cleanup(s.Close)
 	t.Setenv("ML_API_URL", s.URL)
 	r := &PredictiveAutoscalerReconciler{Log: logr.Discard()}
 	a := &autoscalerv1alpha1.PredictiveAutoscaler{Spec: autoscalerv1alpha1.PredictiveAutoscalerSpec{TargetDeployment: autoscalerv1alpha1.TargetDeployment{Name: body["application"].(string), Namespace: namespace}, Prediction: autoscalerv1alpha1.PredictionConfig{HorizonMinutes: 60}}}
-	p, err := r.getPrediction(context.Background(), a)
+	p, err := r.getPrediction(context.Background(), withSource(t, a))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func TestForecastComponentFractionalAnchorUsesSerializedTargets(t *testing.T) {
 func TestForecastComponentLogFailureDoesNotChangeScaling(t *testing.T) {
 	r, _, req, _ := rpmGaugeReconciler(t)
 	body := componentBody(t, componentResponse(time.Now().UTC().Truncate(10*time.Minute)))
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, body) }))
+	s := httptest.NewServer(echoProvenance(func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, body) }))
 	defer s.Close()
 	t.Setenv("ML_API_URL", s.URL)
 	t.Setenv("FORECAST_LOG", t.TempDir()) // A directory cannot be appended as a log.

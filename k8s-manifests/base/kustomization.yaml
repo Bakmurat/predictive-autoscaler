@@ -17,6 +17,7 @@ resources:
   - 10-training-cronjob.yaml
   - 11-vmservicescrapes.yaml
   - 12-forecast-log-pvc.yaml
+  - 13-leader-election-role.yaml
 
 images:
   - name: registry.example.com/predictive-autoscaler/predictive-autoscaler-ml-api

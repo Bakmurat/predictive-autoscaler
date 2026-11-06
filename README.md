@@ -2,6 +2,8 @@
 
 **Scale before the traffic arrives, not after.**
 
+**New here? Read the [User Guide](docs/user-guide.md)**: every feature, end to end.
+
 Predictive Autoscaler is an open-source Kubernetes autoscaler that forecasts request demand and provisions capacity ahead of the load. Conventional autoscalers react to metrics that have already crossed a threshold, which means the first users of every traffic surge pay for it in latency and errors. Predictive Autoscaler is built to close that gap: it learns each workload's daily rhythm, predicts the next hour, and aims to have pods ready before the wave hits. A reactive floor means the forecast can only add capacity on top of what live metrics require.
 
 Built by [Bakmurat Kubanaliev](#author). Apache-2.0.
@@ -25,14 +27,14 @@ Built by [Bakmurat Kubanaliev](#author). Apache-2.0.
 | **Additive safety model** | Replicas are set to the **highest** of the forecast baseline, the live reactive requirement, and the configured minimum. The forecast can only add capacity. |
 | **Guard rails** | Overestimate detection, scale-down stabilization (a five-minute hold after any scale-up and a further five-minute hold after demand first drops below the current count; then at most one step per two minutes, each removing at most 10% of the pods or two pods, whichever is greater; an active overestimate override skips the holds but keeps the cooldown), and confidence dampening keep a wrong forecast from causing churn or cost. A forecast whose first step exceeds ten times the live rate is discarded as diverged and the reactive rule applies. |
 | **Reactive fallback** | When the forecasting service is unreachable (a transport failure), the operator keeps using its last forecast while that forecast is strictly less than ten minutes old, excluding steps whose target time has already passed, and then falls back to its own reactive calculation from live metrics. If the service *refuses* the request as invalid input (HTTP 4xx, for example its freshness guard), no cached forecast stands in for it and the reactive rule applies at once; a refusal takes effect when the service is actually queried, which happens when the five-minute prediction cache expires, not during an unexpired cache hit. Whenever no usable forecast participates in a reconcile, any overestimate override from earlier forecasts is cleared, so the normal scale-down holds apply. A KEDA `ScaledObject` can be kept on the same Deployment as an independent backstop; pause it while the operator is active (KEDA's `autoscaling.keda.sh/paused` annotation) so the two controllers do not compete. |
-| **Observability** | Prometheus metrics from both components and three Grafana dashboards: forecast versus actual, replica decisions, and guard-rail state. |
+| **Observability** | Prometheus metrics from both components, four research Grafana dashboards in `grafana/dashboards/`, and the chart's optional Help & Overview dashboard (`dashboards.enabled`). |
 
 ## How it works
 
 ```
 VictoriaMetrics ──► Collector ──► Training job (every 6 h) ──► Model store
-   (Istio RPS,          │                                           │
-    CPU, memory)        └──────────► Forecasting service (FastAPI) ◄┘
+   (request rate,       │                                           │
+     per Deployment)    └──────────► Forecasting service (FastAPI) ◄┘
                                               │  next 60 min, 6 steps
                                               ▼
                         Go operator ── max(forecast, reactive, min) ──► Deployment replicas
@@ -40,10 +42,10 @@ VictoriaMetrics ──► Collector ──► Training job (every 6 h) ──►
                                     KEDA ScaledObject (dormant backstop)
 ```
 
-1. **Collect.** Per-pod request rate from the Istio service mesh, plus CPU and memory, are pulled from VictoriaMetrics at ten-minute resolution.
+1. **Collect.** The Deployment's request rate (from Istio or your own Prometheus query) is read from any Prometheus-compatible store at ten-minute resolution. CPU and memory are not used for scaling (the CRD accepts those fields and ignores them).
 2. **Train.** Every six hours a CronJob retrains the model on the previous seven days and writes it to a shared volume; the service reloads it by modification time. Per-model locks and the job-based design eliminated the concurrent-retraining failures of early versions.
 3. **Forecast.** The service returns the expected demand for the next hour in six steps, blended with the seven-day pattern, with a confidence signal.
-4. **Scale.** On every reconcile (60 seconds by default) the operator converts the forecast at the configured lead time (20 minutes by default) into a replica count and applies the additive rule.
+4. **Scale.** On every reconcile (60 seconds in the quickstart) the operator converts the forecast at the configured lead time (15 minutes in the quickstart) into a replica count and applies the additive rule.
 5. **Guard.** Overestimate detection compares recent forecasts with actuals and shrinks the forecast's influence when it runs hot; stabilization and cooldown bound every scale-down; confidence dampening discounts low-confidence forecasts.
 
 ## Evaluation approach
@@ -54,25 +56,37 @@ Accuracy figures are deliberately not published yet. A controlled, repeatable be
 
 ## Getting started
 
-Both components ship as container images:
+Start from a source checkout on a disposable local cluster. The quickstart builds the operator and forecasting
+images, installs the authenticated Helm chart, and sends requests to a small HTTP demo:
 
 ```sh
-cd ml-engine    && docker build -t <your-registry>/predictive-autoscaler-ml-api:dev .
-cd k8s-operator && docker build -t <your-registry>/predictive-autoscaler-operator:dev .
+git clone https://github.com/Bakmurat/predictive-autoscaler.git
+cd predictive-autoscaler
+quickstart/kind.sh up
+quickstart/kind.sh status
 ```
 
-Set the image names in `k8s-manifests/base/kustomization.yaml` and the Deployment manifests, choose a storage class in `03-pvc.yaml`, point `02-configmap-victoriametrics.yaml` at your VictoriaMetrics query endpoint, then:
+Docker, kind v0.33 or later, kubectl, Helm and Python 3 are required. Allocate at least 6 GiB of memory and 15 GiB of
+free Docker disk space. Downloads and source builds can take several minutes. The default is **Recommend**: the demo
+stays at one replica while the operator reports its reactive recommendation. A new install has no trained model.
+
+For a forecast immediately, use a separate run with explicitly generated history:
 
 ```sh
-kubectl apply -k k8s-manifests/base
+PA_QUICKSTART_STATE="$HOME/.local/state/pa-synthetic" quickstart/kind.sh up --synthetic-history
+PA_QUICKSTART_STATE="$HOME/.local/state/pa-synthetic" quickstart/kind.sh active
 ```
 
-Prerequisites: VictoriaMetrics with Istio request metrics, and KEDA for the reactive backstop. The API group `autoscaler.example.com` is a placeholder; rename it (CRD, RBAC, Go types, samples) to a domain you control.
+This backfills eight synthetic days, trains a model, verifies a fresh forecast, and then opts into scaling. It
+proves the installation and scaling loop; it does not measure forecast quality. See the [quickstart](quickstart/README.md)
+for status, stopping and cleanup, or [getting started](docs/getting-started.md) to install against your own metrics.
+The chart works with a Prometheus-compatible API and a workload request counter; Istio and KEDA are optional.
+There are no published release images yet: build from source or use this quickstart.
 
 ### Declare an autoscaler
 
 ```yaml
-apiVersion: autoscaler.example.com/v1alpha1
+apiVersion: autoscaling.devkuban.com/v1alpha1
 kind: PredictiveAutoscaler
 metadata:
   name: web-autoscaler
@@ -81,7 +95,7 @@ spec:
   targetDeployment:
     name: web
     namespace: demo
-    container: web
+  mode: Recommend
   minReplicas: 2
   maxReplicas: 40
   metrics:
@@ -139,7 +153,7 @@ Both suites pass. Last full run 2026-09-20: Go `go vet` + `go test -race` green;
 | `ml-engine/` | Forecasting service: FastAPI application (`api/`), model code (`models/lstm_model.py`), VictoriaMetrics collector (`data/`), training scripts (`training/`), unit tests (`tests/`), `Dockerfile`. |
 | `k8s-operator/` | Go operator: CRD types (`api/v1alpha1/`), reconciler and overestimate logic (`controllers/`), sample custom resources (`config/samples/`), `Dockerfile`. |
 | `k8s-manifests/base/` | Kustomize base: namespace, CRD, RBAC, both Deployments, the training CronJob, the model volume, and VictoriaMetrics scrape objects. |
-| `grafana/dashboards/` | Three dashboards (overview, forecast components, guard mechanisms). |
+| `grafana/dashboards/` | Four research dashboards (overview, forecast components, live comparison, v4.2 pod autoscaler). The chart ships its own Help & Overview dashboard (`charts/predictive-autoscaler/dashboards/`). |
 | `examples/nginx-test/` | The reference workload scaled by Predictive Autoscaler, with its k6 traffic generator and dormant KEDA backstop. |
 | `examples/myapptwo/` | The identical KEDA-only control workload. |
 
@@ -163,11 +177,11 @@ Both suites pass. Last full run 2026-09-20: Go `go vet` + `go test -race` green;
 3. Validation of the newest forecasting model (five input features, direct six-step output, robust scaling) against the benchmark.
 4. Adaptive blend weights in place of the fixed 0.70-to-0.908 schedule.
 5. A training-time validation gate so a new model can never replace a better one.
-6. Multi-tenant model management, CPU and memory forecasting paths, CRD validation and defaults via webhooks, Helm chart, end-to-end operator tests on kind.
+6. Broader training and storage support, CPU and memory forecasting, and a signed release. The generated CRD, source Helm chart and kind installation checks are available now.
 
 ## Status
 
-Predictive Autoscaler is an actively developed personal research project (October 2025 to present). It is built to run alongside KEDA, which stays in place as the reactive backstop, and it is published so the design, code, and lessons are available to everyone working on the same problem. Evaluate it in your own environment with the shipped harness before relying on it.
+Predictive Autoscaler is an actively developed personal research project (October 2025 to present). It is built to run alongside KEDA, kept as a reactive backstop that is **paused** while the operator is Active (see [coexistence](docs/coexistence.md)), and it is published so the design, code, and lessons are available to everyone working on the same problem. Evaluate it in your own environment with the shipped harness before relying on it.
 
 Note on numbers: request-rate figures in the simulator configuration (for example a 60,000 requests-per-minute peak) are the synthetic load generator's settings, not measured throughput.
 
@@ -203,7 +217,6 @@ entered the scored window, has been withdrawn.
 - The seasonal ensemble implements Holt-Winters on NumPy/SciPy (the serving image has no statsmodels). Tests match its initial states and recursion to statsmodels and require an equal or lower fit error, but it is not the statsmodels code. Its margin is empirical, not a coverage guarantee, and a refit that lands inside a traffic burst can make it over-forecast for a while.
 - One target metric in practice (request rate per pod); CPU and memory paths exist in the schema but are not trained.
 - Model files live on a ReadWriteOnce volume, so a single forecasting replica is supported.
-- The API group `autoscaler.example.com` is a placeholder to rename before use.
 - Integration with a node-level autoscaler has not been tested; the operator manages replicas only.
 
 ## License

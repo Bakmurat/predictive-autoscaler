@@ -1,5 +1,5 @@
 # Build stage
-FROM --platform=$BUILDPLATFORM golang:1.21-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
 ARG TARGETARCH
 
 WORKDIR /workspace

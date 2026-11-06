@@ -18,13 +18,13 @@ func TestGetCachedPrediction_StaleBound(t *testing.T) {
 	a.Spec.TargetDeployment.Name, a.Spec.TargetDeployment.Namespace = "app", "ns"
 	resp := &MLPredictionResponse{Predictions: []float64{100, 100}}
 
-	r.predictionCache["k"] = &cachedPrediction{response: resp, fetchedAt: time.Now().Add(-predictionCacheTTL - time.Minute)}
+	r.predictionCache["k"] = &cachedPrediction{response: resp, fetchedAt: time.Now().Add(-predictionCacheTTL - time.Minute), binding: forecastBinding(a)}
 	got, err := r.getCachedPrediction(context.Background(), a, "k")
 	if err != nil || got != resp {
 		t.Fatalf("young stale cache should be reused: got=%v err=%v", got, err)
 	}
 
-	r.predictionCache["k"] = &cachedPrediction{response: resp, fetchedAt: time.Now().Add(-predictionStaleMax - time.Second)}
+	r.predictionCache["k"] = &cachedPrediction{response: resp, fetchedAt: time.Now().Add(-predictionStaleMax - time.Second), binding: forecastBinding(a)}
 	if _, err := r.getCachedPrediction(context.Background(), a, "k"); err == nil {
 		t.Fatalf("cache older than predictionStaleMax must not be reused")
 	}

@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: vm, namespace: monitoring}
+spec:
+  selector: {matchLabels: {app: vm}}
+  template:
+    metadata: {labels: {app: vm}}
+    spec:
+      containers:
+        - name: vm
+          image: victoriametrics/victoria-metrics:v1.153.0
+          imagePullPolicy: Never
+          args: ["-retentionPeriod=30d", "-search.latencyOffset=0s", "-search.disableCache", "-memory.allowedPercent=60"]
+          ports: [{containerPort: 8428}]
+          resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {memory: 512Mi}}
+          readinessProbe: {httpGet: {path: /health, port: 8428}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: vm, namespace: monitoring}
+spec: {selector: {app: vm}, ports: [{port: 8428}]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: traffic, namespace: monitoring}
+spec:
+  selector: {matchLabels: {app: traffic}}
+  template:
+    metadata: {labels: {app: traffic}}
+    spec:
+      securityContext: {runAsNonRoot: true, runAsUser: 10001, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: traffic
+          image: pa-quickstart/ml-api:dev
+          imagePullPolicy: Never
+          command: [python3, /demo/traffic.py]
+          resources: {requests: {cpu: 50m, memory: 32Mi}, limits: {memory: 128Mi}}
+          securityContext: {readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+          volumeMounts: [{name: scripts, mountPath: /demo, readOnly: true}]
+      volumes: [{name: scripts, configMap: {name: demo-scripts}}]

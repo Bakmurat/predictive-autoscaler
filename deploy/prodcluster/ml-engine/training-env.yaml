@@ -11,10 +11,8 @@ spec:
           containers:
             - name: trainer
               env:
-                - name: TRAINING_WORKLOAD
-                  value: "nginx-test"
-                - name: TRAINING_NAMESPACE
-                  value: "demo"
+                - name: TRAINING_TARGET   # the hybrid arm's PredictiveAutoscaler (metric contract, B4c)
+                  value: "demo/nginx-test-autoscaler"
                 # Provenance recorded in the model's sidecar (substituted by deploy.sh)
                 - name: IMAGE_REF
                   value: "HARBOR_REGISTRY/predictive-autoscaler-ml-api@ML_API_DIGEST"

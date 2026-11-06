@@ -1,4 +1,4 @@
-apiVersion: autoscaler.example.com/v1alpha1
+apiVersion: autoscaling.devkuban.com/v1alpha1
 kind: PredictiveAutoscaler
 metadata:
   name: nginx-seasonal-autoscaler
@@ -10,6 +10,8 @@ metadata:
   annotations:
     description: "S1 seasonal component from demo/nginx-test; own reactive demand"
 spec:
+  # Active: this autoscaler scales its Deployment (Recommend, observe-only, is the default when mode is absent).
+  mode: Active
   targetDeployment:
     name: nginx-seasonal
     namespace: demo

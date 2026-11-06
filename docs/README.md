@@ -1,0 +1,16 @@
+# Documentation
+
+| Page | For |
+|---|---|
+| [user-guide.md](user-guide.md) | **Start here.** The end-to-end User Guide: every feature, from a local try to Active scaling, monitoring, alerts, troubleshooting and uninstalling. |
+| [getting-started.md](getting-started.md) | Build, install and uninstall the current version from source. |
+| [concepts.md](concepts.md) | Components, how one scaling decision is made, units, the evidence ledger. |
+| [configuration.md](configuration.md) | Every `PredictiveAutoscaler` field (and which ones are ignored), effective defaults, operator settings. |
+| [coexistence.md](coexistence.md) | Running next to HPA/KEDA/VPA, the paused-KEDA fallback pattern, GitOps. |
+| [helm.md](helm.md) | Installing with the Helm chart: required values, permissions, the CRD under Helm and Argo CD, network policies. |
+| [upgrading.md](upgrading.md) | Moving autoscalers from the legacy API group `autoscaler.example.com` to `autoscaling.devkuban.com`. |
+| [releasing.md](releasing.md) | Publishing a release (signed multi-arch images and the OCI Helm chart on GHCR), installing and verifying one. |
+| [limitations.md](limitations.md) | What the current version does not do, most important first. |
+| [RESEARCH-2026-09-22.md](RESEARCH-2026-09-22.md) | Literature review behind the design. |
+
+Status: research prototype, tested only in test environments with generated load; no published performance figures.

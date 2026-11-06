@@ -3,37 +3,65 @@ kind: ClusterRole
 metadata:
   name: predictive-operator-role
 rules:
-# Read/Write Deployments (for scaling)
+# Read Deployments; replicas are written only through the scale subresource (never the whole object)
 - apiGroups: ["apps"]
-  resources: ["deployments", "deployments/scale"]
-  verbs: ["get", "list", "watch", "patch", "update"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments/scale"]
+  verbs: ["get", "update"]
 
 # Read Pods (for current metrics)
 - apiGroups: [""]
   resources: ["pods"]
   verbs: ["get", "list", "watch"]
 
-# Read/Write HPA (to coordinate with KEDA)
+# Read the other replica writers on a target (coexistence check before every write; the operator never changes them)
 - apiGroups: ["autoscaling"]
   resources: ["horizontalpodautoscalers"]
-  verbs: ["get", "list", "watch", "patch", "update"]
+  verbs: ["get", "list", "watch"]
 
-# Read KEDA ScaledObjects (optional)
+# KEDA ScaledObjects (optional API: absent is not a conflict)
 - apiGroups: ["keda.sh"]
   resources: ["scaledobjects"]
   verbs: ["get", "list", "watch"]
+
+# VerticalPodAutoscalers (optional API; reported as the VPAInterference warning)
+- apiGroups: ["autoscaling.k8s.io"]
+  resources: ["verticalpodautoscalers"]
+  verbs: ["get", "list", "watch"]
+
+# Legacy-group PredictiveAutoscalers (autoscaler.example.com, before v0.1.0; optional API): each one on a target is
+# another replica writer, in any namespace (docs/upgrading.md)
+- apiGroups: ["autoscaler.example.com"]
+  resources: ["predictiveautoscalers"]
+  verbs: ["get", "list", "watch"]
+
+# Read this operator's own CRD (the revision gate before startup), nothing else
+- apiGroups: ["apiextensions.k8s.io"]
+  resources: ["customresourcedefinitions"]
+  resourceNames: ["predictiveautoscalers.autoscaling.devkuban.com"]
+  verbs: ["get"]
 
 # Read ConfigMaps (for application config)
 - apiGroups: [""]
   resources: ["configmaps"]
   verbs: ["get", "list", "watch"]
 
+# Emit Kubernetes events (condition transitions, scaling actions)
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create", "patch"]
+- apiGroups: ["events.k8s.io"]
+  resources: ["events"]
+  verbs: ["create", "patch"]
+
 # Access PredictiveAutoscaler CRD
-- apiGroups: ["autoscaler.example.com"]
+- apiGroups: ["autoscaling.devkuban.com"]
   resources: ["predictiveautoscalers"]
   verbs: ["get", "list", "watch", "patch", "update"]
 
-- apiGroups: ["autoscaler.example.com"]
+- apiGroups: ["autoscaling.devkuban.com"]
   resources: ["predictiveautoscalers/status"]
   verbs: ["get", "patch", "update"]
 

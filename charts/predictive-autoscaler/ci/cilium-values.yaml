@@ -1,0 +1,10 @@
+# Cilium mode: the API-server egress as a CiliumNetworkPolicy (toEntities kube-apiserver) instead of a ports-only rule.
+prometheus:
+  url: http://prometheus.monitoring.svc:9090
+networkPolicy:
+  prometheus:
+    namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: monitoring}}
+  kubeAPI:
+    cidrs: []
+    ports: [6443]
+    cilium: true

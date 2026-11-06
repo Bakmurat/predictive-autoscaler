@@ -1,0 +1,10 @@
+# The documented default path: policies on, Prometheus in namespace monitoring, two training targets.
+prometheus:
+  url: http://prometheus-server.monitoring.svc:80
+networkPolicy:
+  prometheus:
+    namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: monitoring}}
+training:
+  targets:
+    - {namespace: shop, name: web-pa, schedule: "0 */6 * * *"}
+    - {namespace: shop, name: api-pa, schedule: "30 */6 * * *"}

@@ -193,10 +193,17 @@ def train_lstm_for_metric(
     epochs: int = 50,
     min_data_points: int = None,
     atomic: bool = False,
-    sequence_length: int = DEFAULT_SEQUENCE_LENGTH
+    sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
+    artifact_key: str = None,
+    previous_meta: dict = None,
 ) -> dict:
     """
     Train LSTM model for a specific metric.
+
+    artifact_key (metric contract, B4c): publish as lstm_<artifact_key>.pkl (the namespace-aware registry key) instead
+    of the legacy lstm_<app>_<metric>.pkl. previous_meta: the previous training's sidecar, already checked by the
+    caller to belong to the same autoscaler, target, query and contract ({} = no usable previous evidence); None keeps
+    the legacy behaviour of reading the legacy sidecar next to the model.
 
     Args:
         df: DataFrame with columns [timestamp, value]
@@ -266,10 +273,15 @@ def train_lstm_for_metric(
         # The stable rule pools the previous trainings' held-out evidence and keeps an incumbent blend
         # (hysteresis); both come from the previous sidecar next to the model, which the caller overwrites
         # only after this function returns. A sidecar from another rule contributes nothing.
-        prev_sidecar = Path(model_dir) / f"lstm_{app_name}_{metric_type}.meta.json"
-        previous, history_parts = history_from_sidecar(prev_sidecar)
+        if previous_meta is not None:
+            previous, history_parts = history_from_sidecar(previous_meta)
+            evidence_from = "the previous sidecar of the same signal" if previous_meta else "none (no matching sidecar)"
+        else:
+            prev_sidecar = Path(model_dir) / f"lstm_{app_name}_{metric_type}.meta.json"
+            previous, history_parts = history_from_sidecar(prev_sidecar)
+            evidence_from = prev_sidecar.name if prev_sidecar.exists() else "no sidecar"
         logger.info(f"Blend selection evidence: previous={previous}, pooled previous partitions={len(history_parts)} "
-                    f"(from {prev_sidecar.name if prev_sidecar.exists() else 'no sidecar'})")
+                    f"(from {evidence_from})")
         blend_selection = select_blend_weight(model, test_data, imputed=test_imputed,
                                               previous=previous, history_partitions=history_parts)
         eval_result = model.evaluate(test_data, target_column='value', imputed=test_imputed)
@@ -286,9 +298,12 @@ def train_lstm_for_metric(
         logger.info(f"Sample prediction confidence: {prediction['confidence']:.3f}")
 
         # Save model
-        model_path = model_dir / f"lstm_{app_name}_{metric_type}.pkl"
+        stem = f"lstm_{artifact_key}" if artifact_key else f"lstm_{app_name}_{metric_type}"
+        model_path = model_dir / f"{stem}.pkl"
         if atomic:
-            tmp_path = model_dir / f"lstm_{app_name}_{metric_type}.pkl.tmp"
+            # A private candidate per attempt (overlapping trainings never share a temporary file).
+            suffix = f".{os.getpid()}.{os.urandom(4).hex()}.tmp" if artifact_key else ".tmp"
+            tmp_path = model_dir / f"{stem}.pkl{suffix}"
             joblib.dump(model, tmp_path)
             logger.info(f"Model saved to {tmp_path} (atomic mode, awaiting rename)")
         else:
@@ -349,7 +364,10 @@ def train_requests_only(
     sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
     mask: dict = None,
     role: str = "benchmark",
-    fill: bool = True
+    fill: bool = True,
+    query: str = None,
+    artifact_key: str = None,
+    previous_meta: dict = None,
 ) -> dict:
     """
     Train LSTM model for requests metric only.
@@ -375,15 +393,26 @@ def train_requests_only(
     logger.info(f"Target: {namespace}/{workload_name}")
     logger.info(f"Fetching {hours} hours of data")
 
-    # Initialize collector
-    collector = VictoriaMetricsCollector(vm_url)
-
-    # Fetch only request rate metrics
-    df = collector.get_istio_request_rate(
-        destination_workload=workload_name,
-        namespace=namespace,
-        hours=hours
-    )
+    if query is not None:
+        # Metric contract (B4c): the autoscaler's compiled query through the strict, bounded history reader (one
+        # valid series, req/s converted to req/min once, on the 10-minute grid). A refused or unavailable history
+        # is a failed training, never a repaired one.
+        from data.history import HistoryRefused, HistoryUnavailable, query_history
+        try:
+            points = query_history(vm_url, query, hours=hours)
+        except (HistoryRefused, HistoryUnavailable) as e:
+            logger.error(f"History for {namespace}/{workload_name} not usable: {e}")
+            return {"success": False, "error": f"history not usable: {e}"}
+        df = pd.DataFrame({"timestamp": pd.to_datetime([pt["timestamp"] for pt in points]),
+                           "value": [pt["value"] for pt in points]}) if points else None
+    else:
+        # Legacy path (no autoscaler reference): the built-in Istio query.
+        collector = VictoriaMetricsCollector(vm_url)
+        df = collector.get_istio_request_rate(
+            destination_workload=workload_name,
+            namespace=namespace,
+            hours=hours
+        )
 
     if df is None or df.empty:
         logger.error("No request rate metrics retrieved from VictoriaMetrics")
@@ -413,7 +442,9 @@ def train_requests_only(
         model_dir=model_dir,
         epochs=epochs,
         atomic=True,
-        sequence_length=sequence_length
+        sequence_length=sequence_length,
+        artifact_key=artifact_key,
+        previous_meta=previous_meta,
     )
     if isinstance(result, dict):
         result["preflight"] = info
