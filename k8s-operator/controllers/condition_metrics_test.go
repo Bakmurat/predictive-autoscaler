@@ -58,7 +58,14 @@ func TestConditionMetricsFollowThePersistedConditions(t *testing.T) {
 	wantSeries(t, conditionSeries(t, req.Namespace, req.Name, "ScalingActive"), "False") // Recommend writes nothing
 	wantSeries(t, conditionSeries(t, req.Namespace, req.Name, "ConflictDetected"), "False")
 	for _, typ := range conditionMetricTypes {
-		if got := conditionSeries(t, req.Namespace, req.Name, typ); len(got) != 3 {
+		got := conditionSeries(t, req.Namespace, req.Name, typ)
+		if typ == "PredictionReady" { // the forecast v2 path only: a v1 autoscaler carries no such condition
+			if len(got) != 0 {
+				t.Fatalf("%s on a v1 autoscaler: %v", typ, got)
+			}
+			continue
+		}
+		if len(got) != 3 {
 			t.Fatalf("%s: %v", typ, got)
 		}
 	}

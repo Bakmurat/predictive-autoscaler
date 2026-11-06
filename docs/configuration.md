@@ -28,6 +28,12 @@ brackets (20 and 60). The same applies to `metrics.requests`. Set these fields e
 | `prediction.horizonMinutes` | int ≥ 5 | no | 60 [60] | yes | How far ahead the forecaster predicts. |
 | `prediction.leadTimeMinutes` | int ≥ 1 | no | **15** [20] | yes | The operator sizes for the highest forecast in the next `leadTimeMinutes` (see the decision rule). Set it explicitly; the quickstart uses 15. |
 | `prediction.updateIntervalSeconds` | int ≥ 60 | no | **300** [60] | yes | Reconcile period. Examples set 60. |
+| `prediction.engine` | `statistical` \| `legacyLstm` | no | — (the v1 path) | yes | `statistical` selects forecast contract v2 ([below](#forecast-contract-v2-engine-statistical-preview)); absent or `legacyLstm` keeps the v1 path unchanged. |
+| `prediction.sampleIntervalSeconds`, `seasonality`, `historyDays`, `settlementSeconds`, `outcomeGraceSeconds`, `risk.miscoverageBps`, `calibration.*`, `trust.*` | see the CRD | no | the forecasting service's defaults (300 s grid, daily, 14 days, 120 s, 600 s, 1000 bps, ...) | yes (engine `statistical`) | The v2 forecast settings. The forecasting service derives them from the live object and the operator hashes them the same way (the settings fingerprint both sides check). Cross-field limits (for example a horizon that is a multiple of the grid, at most 60 minutes and 60 steps) make the settings invalid: `PredictionReady=False`, reason `SettingsInvalid`, and decisions stay reactive. |
+| `prediction.predictiveExtra.maxReplicas`, `maxPercent` | int 0–1000 | no | 2, 50 | yes (engine `statistical`) | The most replicas a verified forecast may add above the reactive need: `min(maxReplicas, ceil(maxPercent × max(reactive, minReplicas) / 100))`. `0` in either disables predictive excess. |
+| `behavior.startup.fallbackDelaySeconds` | int 1–3600 | no | **none** | yes (engine `statistical`) | Scale-out-to-Ready budget used until enough starts are measured (20 completed starts of the current pod template in 7 days). Without it, and without measurements, no predictive lead is chosen and decisions stay reactive (`LeadInsufficient`). |
+| `behavior.startup.minimumDelaySeconds` | int 0–3600 | no | 0 | yes | A floor for the budget, kept even when measurements are lower. |
+| `behavior.startup.actuationAllowanceSeconds` | int 0–300 | no | 15 | yes | Time for the forecast request and the `/scale` write. |
 | `behavior.scaleDown.headroomPercent` | int 0–99 | no | 10 | yes | Spare request capacity a scale-down must leave in the resulting fleet at the measured rate (see the decision rule). `0` disables it. |
 | `resources.*` | — | no | 100 m / 128 MB / 10,000 rpm | **no** | Accepted, ignored. |
 
@@ -44,13 +50,16 @@ brackets (20 and 60). The same applies to `metrics.requests`. Set these fields e
 | `targetUID` | UID of the target Deployment the status describes. |
 | `conflicts` | The other replica writers the last coexistence check found on the target, each as `{group, kind, namespace, name, reason}`. `reason` is set only where the kind alone does not explain it: `PausedReplicas` (a paused KEDA ScaledObject holding a fixed count) or `LegacyAPIGroup` (an autoscaler of the legacy group). Empty when there are none. After a failed check (`ConflictDetected=Unknown`) it lists those found before the failure. Conditions, events and the decision ledger show the same writers as text (`Kind/name`). |
 | `metricSource` | The compiled request-rate query: `query`, `sha256` (of the exact query text), `observedGeneration`, `targetUID`, `contract` (`requests-per-second/v1`). It is published before the forecasting service is asked. The service uses a forecast only when it was computed for this query, generation and target; any other forecast is refused, and the reactive rule applies. It is absent while the configuration is invalid. |
+| `prediction` | Engine `statistical` only: `engine`, `settingsSHA256`, the published `lead` (`seconds`, `startupDelaySeconds`, `actuationAllowanceSeconds`, `method` `configured`/`measured`, `sampleCount`, `observedGeneration`; the forecasting service reads it), `leadBasis` and `frozenLeadSeconds`, `startup` (`delaySeconds`, `method`, `sampleCount`, `measuredP90Seconds`, `pendingSeconds`, `observable`), and the last forecast: `phase`, `reason`, `model`, `issuanceID`, `decisionOrigin`, `validUntil`, `baseWindowMaxRPS`, `upperWindowMaxRPS`, `calibrationWindows`, `prospectiveWindows`, `gateCoverageBps`, the operator's `eligible` verdict, and `predictiveReplicas` / `cappedReplicas` / `capBinding`. |
 | `predictedReplicas` | Deprecated: the calculated count (historical meaning). Use `calculatedReplicas` and `forecastReplicas`. |
 | `lastPrediction` | Issue time of the last forecast used. |
-| `conditions` | `Ready` (the reconcile completed: `ReconcileCompleted`; when False the reason names the failure: `CrossNamespaceTarget`, `DeploymentNotFound`, `InvalidMetricQuery` or `ScalingError`, and `ScalingActive` gets the same reason), `CapacityConfigured` (`CapacityPerReplica`, or `DeprecatedTargetRPS` while the capacity comes from `targetRPS`; False with `CapacityMissing` when neither is set, or `CapacityInvalid` for a value the API server would reject; the message names the resolved requests per second), `TelemetryAvailable` (`Measured` / `MetricsUnavailable`), `ForecastAvailable` (`Used`, `Disabled`, `Unavailable`, `HorizonElapsed`, `SanityRejected`, `CapacityMissing` (no forecast is requested without a capacity), and for the operator-to-forecaster authentication `Unauthorized` (401), `Forbidden` (403), `AuthUnavailable` (TokenReview could not judge) and `AuthMisconfigured` (the operator's token or CA file is missing, empty or invalid, or a token is set with a non-https URL)); a cached forecast used during a forecaster outage counts as `Used`, `ScalingActive` (`Active`, `RecommendMode`, `CapacityMissing`, `TelemetryHold`, `Conflict`, `CheckFailed`, `GuardAborted`, or the failure reason), `ConflictDetected` (`NoConflict`; `ReplicaWriter` when an HPA, an unpaused KEDA ScaledObject or another Active PredictiveAutoscaler targets the Deployment; `Unknown`/`CheckFailed` when the check failed), `VPAInterference` (`None`; `VPAUpdatesPods` for a VPA in any mode except `Off`; `Unknown`/`CheckFailed` when the check did not complete), `ScaleDownHeadroom` (`Holding` while a scale-down is held for headroom; `NotHolding` when headroom is not currently blocking a scale-down, which says nothing about how much spare capacity exists; `RecommendMode`; informational: it never affects `Ready` or `ScalingActive`). See coexistence.md. |
+| `conditions` | `Ready` (the reconcile completed: `ReconcileCompleted`; when False the reason names the failure: `CrossNamespaceTarget`, `DeploymentNotFound`, `InvalidMetricQuery` or `ScalingError`, and `ScalingActive` gets the same reason), `CapacityConfigured` (`CapacityPerReplica`, or `DeprecatedTargetRPS` while the capacity comes from `targetRPS`; False with `CapacityMissing` when neither is set, or `CapacityInvalid` for a value the API server would reject; the message names the resolved requests per second), `TelemetryAvailable` (`Measured` / `MetricsUnavailable`), `ForecastAvailable` (`Used`, `Disabled`, `Unavailable`, `HorizonElapsed`, `SanityRejected`, `CapacityMissing` (no forecast is requested without a capacity), on the v2 path `NotTrusted`, `Rejected`, `LeadInsufficient` and `SettingsInvalid`, and for the operator-to-forecaster authentication `Unauthorized` (401), `Forbidden` (403), `AuthUnavailable` (TokenReview could not judge) and `AuthMisconfigured` (the operator's token or CA file is missing, empty or invalid, or a token is set with a non-https URL)); a cached forecast used during a forecaster outage counts as `Used`, `PredictionReady` (engine `statistical` only; True `Ready` when the operator verified a forecast as usable now, which is readiness to activate, not authorization: Recommend still writes nothing; False with the forecasting service's reason, `HistoryInsufficient`, `CalibrationInsufficient`, `ShadowInsufficient`, `CoverageLow`, `DataUnavailable`, `IdentityMismatch`, `StateUnavailable`, `LeadInsufficient` or `ReplayGateMissing`, or the operator's own: `SettingsInvalid`, `CapacityMissing`, `RequestRefused`, `ForecastRejected`, `NotEligible`, `EvidenceInsufficient`, `EvidenceStale`, `IssuedInFuture`, `DeadlinePassed`), `ScaleOutBlocked` (True `Unschedulable`, `QuotaExceeded` or `FailedCreate` while a scale-out cannot complete; False `None`; `Unknown`/`PodsUnreadable` when the target's pods could not be read), `ScalingActive` (`Active`, `RecommendMode`, `CapacityMissing`, `TelemetryHold`, `Conflict`, `CheckFailed`, `GuardAborted`, or the failure reason), `ConflictDetected` (`NoConflict`; `ReplicaWriter` when an HPA, an unpaused KEDA ScaledObject or another Active PredictiveAutoscaler targets the Deployment; `Unknown`/`CheckFailed` when the check failed), `VPAInterference` (`None`; `VPAUpdatesPods` for a VPA in any mode except `Off`; `Unknown`/`CheckFailed` when the check did not complete), `ScaleDownHeadroom` (`Holding` while a scale-down is held for headroom; `NotHolding` when headroom is not currently blocking a scale-down, which says nothing about how much spare capacity exists; `RecommendMode`; informational: it never affects `Ready` or `ScalingActive`). See coexistence.md. |
 
 Events are emitted when a condition changes (and on `ScaledUp` / `ScaledDown`), never on every reconcile. The
 transition events are `TelemetryUnavailable` / `TelemetryRestored`, `ForecastUnavailable` / `ForecastRestored`,
-`ScalingInactive` / `ScalingActive`, `CapacityNotConfigured` / `CapacityConfigured` and `ReconcileFailed` /
+`ScalingInactive` / `ScalingActive`, `CapacityNotConfigured` / `CapacityConfigured`, `ScaleOutBlocked` (Warning) /
+`ScaleOutUnblocked`, `PredictionReady` / `PredictionNotReady` (Normal, except Warning for `ForecastRejected`,
+`RequestRefused` and `SettingsInvalid`) and `ReconcileFailed` /
 `ReconcileRecovered` (Warning when the condition turns
 False, Normal when it turns True; a first healthy observation emits nothing); a change to the configured states
 `RecommendMode` or `Disabled` is a Normal event of that name. The
@@ -137,6 +146,54 @@ measured and the forecast-side count is 0 (for example when no forecast is used 
 sanity rejection the reactive count stands in for the forecast, so it can be 0; without a measurement the series is
 removed. A workload whose request counter exists but sees no traffic is
 measured as a real zero and scales normally.
+
+## Forecast contract v2 (engine statistical, preview)
+
+With `spec.prediction.engine: statistical` the operator uses the statistical forecasting service's contract v2
+(`POST /v2/predict`, `window-max-rps/v1`) instead of the v1 forecast. The service forecasts the **peak request rate
+over a fixed future window** `W = {t+Δ, ..., t+L}` (Δ the grid, `t` the current grid origin, `L` the lead) and, once it
+has the evidence, a calibrated **upper bound** `U` of that peak, in requests per second. The operator:
+
+1. **Chooses the lead.** Startup budget `D`: the 90th percentile of measured starts plus 25 % once 20 completed starts of
+   the current pod template exist in the last 7 days (pod creation to Ready, pods that never restarted; only Ready pods
+   count as serving); otherwise `behavior.startup.fallbackDelaySeconds`; at least `minimumDelaySeconds`; and a start still
+   pending for longer than the budget becomes the budget. `L = ceil((D + C + A + Δ) / Δ) × Δ`, with `C` the decision
+   interval (the reconcile interval rounded up to the grid) and `A` the actuation allowance. Within one configuration the
+   lead never shrinks automatically (`frozenLeadSeconds`); it grows at once when a slower start needs it, which starts a
+   new evidence epoch on the service. A lead longer than the horizon, or no budget at all, means no lead
+   (`LeadInsufficient`) and reactive decisions. The lead is published in `status.prediction.lead` before any request.
+2. **Asks for the current origin** and checks the answer itself: every field present and nothing else, the identity
+   echo (autoscaler and target UIDs, generation, query hash, settings fingerprint, origin, lead), the evidence epoch,
+   the window and its targets, `valid_until`, finite non-negative rates in requests per second. A cached answer is reused
+   only for the same request and only while its own window is still actionable (`now + A` before the first target and
+   before `valid_until`); it is never moved to a later window.
+3. **Decides eligibility independently** of the service's flag: trust state `Trusted` and reason `Ready`, an upper bound,
+   at least `calibration.minWindows` calibration and `trust.minProspectiveWindows` prospective windows, a recent evidence
+   cutoff, an issue time not ahead of its clock, and the remaining window.
+4. **Forms the decision** with the shared capacity `c` (`capacityPerReplica`):
+
+   ```
+   R = ceil(rate / c)                                           # reactive
+   P = min(ceil(U / c), R + min(maxReplicas, ceil(maxPercent × max(R, minReplicas) / 100)))   # eligible forecasts only
+   desired = clamp(max(R, P, minReplicas), minReplicas, maxReplicas)
+   ```
+
+   There is no schedule floor yet. Without an eligible forecast `P` is absent and the decision is reactive; without a
+   measured rate the count is held, as on the v1 path. Confidence damping, the overestimate cap and the divergence check
+   do not run on v2. The headroom floor, the scale-down stabilization, the restart holds, the coexistence check and the
+   `/scale` write guards apply unchanged; Recommend mode writes nothing in any state.
+
+The decision ledger records `forecast_contract: window-max-rps/v1` and a `v2` block per decision: `issuance_id`,
+`decision_origin`, `valid_until`, `cached`, the service's `trust_state`, `service_reason` and `service_eligible`, the
+operator's `accepted` and `verdict`, `base_window_max_rps`, `upper_window_max_rps`, `capacity_rpm_per_replica`,
+`predictive_replicas_uncapped`, `predictive_extra_allowance`, `predictive_replicas` and `predictive_cap_binding`, the
+lead and the startup budget. The capped value is a budget, not the quantile: both are kept. Metrics:
+`predictive_autoscaler_predictive_extra_replicas`, `predictive_autoscaler_predictive_capped` and
+`predictive_autoscaler_prediction_gate{phase}`; `predictive_autoscaler_predicted_rpm` shows `U` (in requests per
+minute) when a v2 forecast was used. v2 reconciles are aligned to land one second after a grid origin.
+
+Reading the target's pods needs `get`/`list` on `pods`. Where the operator may not read them, `ScaleOutBlocked` is
+`Unknown` (`PodsUnreadable`), no start is measured, and only the configured budget applies.
 
 ## Operator environment
 | Variable | Default | Purpose |

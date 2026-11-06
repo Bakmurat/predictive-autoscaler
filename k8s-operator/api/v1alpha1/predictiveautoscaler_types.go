@@ -46,6 +46,10 @@ type BehaviorConfig struct {
 	// ScaleDown tunes scale-down.
 	// +optional
 	ScaleDown *ScaleDownBehavior `json:"scaleDown,omitempty"`
+
+	// Startup sets the scale-out-to-Ready budget the predictive lead is chosen from (engine statistical).
+	// +optional
+	Startup *StartupBehavior `json:"startup,omitempty"`
 }
 
 // ScaleDownBehavior tunes scale-down.
@@ -252,6 +256,9 @@ type PredictionConfig struct {
 	// +kubebuilder:default=300
 	// +kubebuilder:validation:Minimum=60
 	UpdateIntervalSeconds int32 `json:"updateIntervalSeconds,omitempty"`
+
+	// The forecast contract v2 settings (forecast_v2_types.go); used only with engine statistical.
+	ForecastV2Settings `json:",inline"`
 }
 
 // ResourcesConfig defines resource configuration for calculations
@@ -319,6 +326,11 @@ type PredictiveAutoscalerStatus struct {
 	// MetricSource is the compiled request-rate query (absent while the configuration is invalid).
 	MetricSource *MetricSourceStatus `json:"metricSource,omitempty"`
 
+	// Prediction is the forecast contract v2 state (engine statistical only): the published lead the forecasting
+	// service reads, the startup measurement, and the last forecast with the operator's own verdict on it.
+	// +optional
+	Prediction *PredictionStatus `json:"prediction,omitempty"`
+
 	// LastPrediction is the timestamp of the last prediction
 	LastPrediction *metav1.Time `json:"lastPrediction,omitempty"`
 
@@ -332,7 +344,7 @@ type PredictiveAutoscalerStatus struct {
 //+kubebuilder:object:root=true
 //+kubebuilder:subresource:status
 //+kubebuilder:resource:shortName=pa
-//+kubebuilder:metadata:labels="autoscaling.devkuban.com/crd-revision=3"
+//+kubebuilder:metadata:labels="autoscaling.devkuban.com/crd-revision=4"
 //+kubebuilder:metadata:annotations="argocd.argoproj.io/sync-options=Prune=false,Delete=false,ServerSideApply=true"
 //+kubebuilder:metadata:annotations="argocd.argoproj.io/sync-wave=-1"
 //+kubebuilder:printcolumn:name="Target",type="string",JSONPath=".spec.targetDeployment.name"

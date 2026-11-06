@@ -71,7 +71,9 @@ Pods or read Secrets. The chart has no cold start: retrain by hand with
 
 - The CRD carries a revision label (`autoscaling.devkuban.com/crd-revision`). The operator reads it before starting.
   Revisions: 1 = the first `autoscaling.devkuban.com` schema; 2 = adds `spec.behavior.scaleDown.headroomPercent`;
-  3 = adds `spec.metrics.requests.capacityPerReplica` and deprecates `targetRPS` ([upgrading.md](upgrading.md)).
+  3 = adds `spec.metrics.requests.capacityPerReplica` and deprecates `targetRPS` ([upgrading.md](upgrading.md));
+  4 = adds the forecast contract v2 settings (`spec.prediction.engine` and the keys after it), `spec.behavior.startup`
+  and `status.prediction`.
   While the installed CRD is older than it needs, the operator starts no controller and does not campaign for
   leadership: its liveness probe passes and its readiness probe fails, with the reason in the log.
 - `helm uninstall` keeps the CRD, and with it every PredictiveAutoscaler. Delete the CRD by hand only if you want them

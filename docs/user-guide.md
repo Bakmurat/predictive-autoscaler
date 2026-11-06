@@ -221,10 +221,12 @@ current generation, and a calculated replica count. The Deployment does not chan
 | `Ready` | The last reconcile completed. | `ReconcileCompleted` (True). When False, the reason names the failure: `CrossNamespaceTarget` (the target is in another namespace; nothing is written), `DeploymentNotFound`, `InvalidMetricQuery` (the query breaks the template rules; nothing is written), `ScalingError` (the write to `/scale` failed). |
 | `CapacityConfigured` | A per-replica capacity is configured; the message names it in requests per second. | `CapacityPerReplica` (True); `DeprecatedTargetRPS` (True, from the deprecated `targetRPS`: move to `capacityPerReplica`); `CapacityMissing` (False: neither field is set, so nothing is calculated and the count is held); `CapacityInvalid` (False: a value the API server would reject, such as both fields at once). |
 | `TelemetryAvailable` | The request rate was measured. | `Measured`; `MetricsUnavailable` when the query failed, returned no series, several series, a partial answer or a non-finite value. The replica count is then held. |
-| `ForecastAvailable` | A forecast took part in the decision. | `Used`; `Disabled` (`spec.prediction.enabled: false`); `Unavailable` (no model yet, a refusal or an outage: see [section 7](#7-get-forecasts)); `HorizonElapsed` (every step of the cached forecast has passed); `SanityRejected` (its first step exceeded ten times the measured rate, so it was discarded); `CapacityMissing` (no forecast is requested without a per-replica capacity); and the authentication failures `Unauthorized`, `Forbidden`, `AuthUnavailable`, `AuthMisconfigured` ([section 12](#12-security)). |
+| `ForecastAvailable` | A forecast took part in the decision. | `Used`; `Disabled` (`spec.prediction.enabled: false`); `Unavailable` (no model yet, a refusal or an outage: see [section 7](#7-get-forecasts)); `HorizonElapsed` (every step of the cached forecast has passed); `SanityRejected` (its first step exceeded ten times the measured rate, so it was discarded); `CapacityMissing` (no forecast is requested without a per-replica capacity); with engine `statistical`, `NotTrusted` (not yet eligible: see `PredictionReady`), `Rejected` (the answer failed the operator's checks), `LeadInsufficient` and `SettingsInvalid`; and the authentication failures `Unauthorized`, `Forbidden`, `AuthUnavailable`, `AuthMisconfigured` ([section 12](#12-security)). |
 | `ScalingActive` | Scaling is permitted: Active mode, no conflict, the check succeeded, no guard abort, a capacity configured, telemetry measured. It does not mean a write happened; `Applied`, `lastScaleTime` and the `ScaledUp`/`ScaledDown` events show writes. | `Active`; `RecommendMode`; `CapacityMissing` (holding because no per-replica capacity is configured); `TelemetryHold` (holding because the rate is unavailable); `Conflict` (another writer); `CheckFailed` (the coexistence check failed); `GuardAborted` (a last-moment check stopped a write; it retries within seconds); or the failure reason from `Ready`. |
 | `ConflictDetected` | Another replica writer targets the Deployment. | `NoConflict` (False); `ReplicaWriter` (True: an HPA, an unpaused KEDA ScaledObject, another Active PredictiveAutoscaler or a legacy-group autoscaler); `CheckFailed` (status `Unknown`: the check could not finish, which blocks writes like a conflict). |
 | `VPAInterference` | A VerticalPodAutoscaler changes the pods' requests. | `None` (False); `VPAUpdatesPods` (True: a VPA in any mode except `Off`; scaling continues, but per-pod capacity may drift); `CheckFailed` (status `Unknown`). |
+| `PredictionReady` | Engine `statistical` only: the operator verified the last forecast as usable now (ready to activate; Recommend still makes no writes). | `Ready` (True). False with the forecasting service's reason (`HistoryInsufficient`, `CalibrationInsufficient`, `ShadowInsufficient`, `CoverageLow`, `DataUnavailable`, `IdentityMismatch`, `StateUnavailable`, `LeadInsufficient`, `ReplayGateMissing`) or the operator's own: `SettingsInvalid`, `CapacityMissing`, `RequestRefused` (the service refused the request), `ForecastRejected` (the answer failed the operator's checks), `NotEligible`, `EvidenceInsufficient`, `EvidenceStale`, `IssuedInFuture`, `DeadlinePassed`. Collecting evidence is normal: decisions are reactive meanwhile. |
+| `ScaleOutBlocked` | A scale-out cannot complete. | `Unschedulable` (a pod the scheduler cannot place), `QuotaExceeded` or `FailedCreate` (the ReplicaSet cannot create pods) (True); `None` (False); `PodsUnreadable` (status `Unknown`: the operator may not read the target's pods). |
 | `ScaleDownHeadroom` | A scale-down is held to keep headroom. | `Holding` (True); `NotHolding` (headroom is not blocking a scale-down; it says nothing about how much spare capacity exists); `RecommendMode`. Informational: never affects `Ready` or `ScalingActive`. |
 
 ### Events
@@ -232,7 +234,8 @@ current generation, and a calculated replica count. The Deployment does not chan
 `kubectl describe pa <name>` shows events. They are emitted when a condition changes, not on every reconcile:
 `ScaledUp` and `ScaledDown` (each applied change); `TelemetryUnavailable` / `TelemetryRestored`;
 `ForecastUnavailable` / `ForecastRestored`; `ScalingInactive` / `ScalingActive`; `CapacityNotConfigured` (Warning) /
-`CapacityConfigured`; `ReconcileFailed` /
+`CapacityConfigured`; `ScaleOutBlocked` (Warning) / `ScaleOutUnblocked`; `PredictionReady` / `PredictionNotReady`
+(engine `statistical`; a warning only for `ForecastRejected`, `RequestRefused` and `SettingsInvalid`); `ReconcileFailed` /
 `ReconcileRecovered`; `RecommendMode` and `Disabled` (configured states, type Normal); and for coexistence
 `ConflictDetected`, `ConflictResolved`, `ConflictCheckFailed`, `VPAInterference` and `VPAInterferenceCleared`.
 
@@ -449,6 +452,20 @@ reactive. Time windows are counted in whole hours ("the last day" starts at the 
 up to an hour shorter). "Ready" here means ready to activate: Recommend mode still makes no writes, and coverage of
 forecast windows is not a latency or error-rate guarantee.
 
+**What the operator does with it** (`spec.prediction.engine: statistical`). It never takes the service's word for a
+write. It publishes the lead it needs (the scale-out-to-Ready budget, measured from the target's own pod starts or
+`spec.behavior.startup.fallbackDelaySeconds` until 20 starts are measured, plus a decision interval and an allowance),
+asks for the window starting at the current grid time, and checks the answer itself: identity, settings, window, an
+upper bound backed by enough evidence, and enough time left in the window. Only then does the bound count:
+`ceil(bound / capacityPerReplica)` replicas, but never more than `spec.prediction.predictiveExtra` above the reactive need
+(2 replicas or 50 % by default). Everything else stays as described here: the reactive need, the hold on missing
+telemetry, headroom, stabilization and every write check; Recommend never writes. `kubectl get pa -o yaml` shows it in
+`status.prediction`; `PredictionReady` says whether it would be used; the decision ledger links each decision to the
+forecast's `issuance_id`. The operator exports `predictive_autoscaler_predictive_extra_replicas`,
+`predictive_autoscaler_predictive_capped` and `predictive_autoscaler_prediction_gate`. A scale-out that cannot
+complete (unschedulable pods, an exceeded quota) shows as `ScaleOutBlocked` on every autoscaler. Details:
+[configuration.md](configuration.md#forecast-contract-v2-engine-statistical-preview).
+
 ### The Help & Overview dashboard
 
 Set `dashboards.enabled: true` and the chart ships the Grafana dashboard **"Predictive Autoscaler — Help & Overview
@@ -535,6 +552,11 @@ its current count and reports `CapacityConfigured=False`. Before upgrading, list
 `capacityPerReplica` on each. Keep `targetRPS` where it is set until the new operator runs and is verified, and never
 hand a capacity-only object back to an older Active operator
 ([upgrading.md](upgrading.md#capacityperreplica-replaces-the-hidden-defaults), with the rollback steps).
+
+**Forecast contract v2 (CRD revision 4).** Revision 4 adds the v2 settings under `spec.prediction`,
+`spec.behavior.startup` and `status.prediction`. Nothing changes for an autoscaler without `engine: statistical`. To try
+the statistical engine, set `spec.behavior.startup.fallbackDelaySeconds` too (or wait for 20 measured starts): without a
+startup budget there is no lead, and decisions stay reactive.
 
 **From the legacy API group.** Before v0.1.0 the group was `autoscaler.example.com`; it is now
 `autoscaling.devkuban.com`. Objects are not converted; each one is re-created in the new group, in steps that never

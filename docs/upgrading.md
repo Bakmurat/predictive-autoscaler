@@ -1,5 +1,17 @@
 # Upgrading
 
+## Forecast contract v2 settings (CRD revision 4)
+
+Revision 4 adds the statistical engine's settings (`spec.prediction.engine` and the keys after it), the startup budget
+(`spec.behavior.startup`) and `status.prediction`. Apply the CRD before the operator, as for every revision (the operator
+waits, unready, on an older one). Autoscalers without `engine: statistical` behave exactly as before.
+
+An autoscaler switched to `engine: statistical` needs a startup budget for its forecasts to count: set
+`spec.behavior.startup.fallbackDelaySeconds` to a conservative scale-out-to-Ready time, or let the operator measure 20
+starts. It also reads the target's pods to measure starts and to report `ScaleOutBlocked`; where its role may not read
+pods, it reports `PodsUnreadable` and uses only the configured budget. Switching back (`engine: legacyLstm` or no
+engine) returns to the v1 path; `status.prediction` and `PredictionReady` are removed.
+
 ## capacityPerReplica replaces the hidden defaults
 
 **What changed (CRD revision 3).** The per-replica capacity is now `spec.metrics.requests.capacityPerReplica`: the

@@ -113,6 +113,10 @@ type PredictiveAutoscalerReconciler struct {
 	// MLAPI reaches the forecasting service (token, TLS, no redirects); nil builds one from the environment on first use.
 	MLAPI     *mlAPIClient
 	mlAPIOnce sync.Once
+	// Clock is the time source of the forecast v2 path and the startup measurement (nil: time.Now); tests inject one.
+	Clock           func() time.Time
+	v2Cache         map[string]*v2CachedForecast
+	startupTrackers map[string]*startupTracker
 }
 
 func (r *PredictiveAutoscalerReconciler) mlAPI() *mlAPIClient {
@@ -350,13 +354,33 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	// no replica count is computed: the decision holds the current count and no forecast is requested.
 	capacityRPM, capacitySource, capacityOK := perReplicaCapacityRPM(autoscaler.Spec)
 
+	// --- STARTUP DELAY AND BLOCKED SCALE-OUTS (startup.go; every engine) ---
+	now := r.now()
+	startup := r.observeStartup(ctx, key, deployment, now)
+
+	// --- FORECAST CONTRACT V2 (engine statistical; forecast_v2.go, v2_reconcile.go) ---
+	// The settings, the startup budget and the lead are resolved, and the lead is published in status.prediction before
+	// the forecasting service is asked (it reads the lead from the live object). The v1 path below is not used.
+	useV2 := v2Selected(&autoscaler)
+	var v2out *v2Outcome
+	if useV2 {
+		var err error
+		if v2out, err = r.prepareV2(ctx, &autoscaler, startup, reconcileInterval); err != nil {
+			log.Error(err, "Failed to publish the forecast lead; not forecasting before it is published")
+			delete(r.lastReconcileMap, key)
+			return ctrl.Result{}, err
+		}
+	} else {
+		delete(r.v2Cache, key)
+	}
+
 	// --- PREDICTIVE COMPONENT ---
 	// Get ML prediction (cached, refresh every 5 min)
 	var prediction *MLPredictionResponse
 	var predErr error
 	var lookup *forecastLookup
 	forecasting := predictionEnabled(&autoscaler)
-	if forecasting && capacityOK {
+	if forecasting && capacityOK && !useV2 {
 		prediction, predErr, lookup = r.getCachedPredictionObserved(ctx, &autoscaler, key)
 	}
 	predictedReplicas := int32(0)
@@ -369,6 +393,14 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	} else if !capacityOK {
 		dec.ForecastStatus = "capacity_missing"
 		log.Info("No per-replica capacity configured; not forecasting and holding the current replica count")
+	} else if useV2 {
+		// Verified on the operator's side: a forecast that is not eligible now leaves the decision reactive.
+		r.runV2(ctx, key, &autoscaler, deployment, v2out, now)
+		dec.ForecastStatus = v2out.forecastStatus()
+		if dec.ForecastStatus != "used" {
+			_, reason, detail := v2out.readiness(capacityOK, mode)
+			log.Info("Forecast v2 not used, reactive only", "reason", reason, "detail", detail)
+		}
 	} else if predErr != nil {
 		dec.ForecastStatus = forecastFailureStatus(predErr)
 		log.Info("Prediction unavailable, using reactive only", "error", predErr.Error(), "status", dec.ForecastStatus)
@@ -398,6 +430,18 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	}
 	// needMeasured: the measured rate converts to a replica need only with a capacity; otherwise the decision holds.
 	needMeasured := vmErr == nil && capacityOK
+
+	// The v2 predictive term: ceil(U / capacity), capped at the predictive extra above the reactive need. No confidence
+	// damping, overestimate cap or divergence check runs on it (prediction stays nil on this path).
+	var v2pol *v2Policy
+	if useV2 && dec.ForecastStatus == "used" {
+		pol := v2PredictiveReplicas(*v2out.Response.UpperWindowMaxRPS, capacityRPM, reactiveReplicas,
+			autoscaler.Spec.MinReplicas, v2out.Settings.ExtraMaxReplicas, v2out.Settings.ExtraMaxPercent)
+		v2pol, predictedReplicas = &pol, pol.Capped
+		if pol.Binding {
+			dec.Safeguards = append(dec.Safeguards, "predictive_extra_cap")
+		}
+	}
 	dec.ReactiveReplicas, dec.CurrentRPM = reactiveReplicas, currentRPM
 	dec.TelemetryStatus = "measured"
 	if vmErr != nil {
@@ -454,6 +498,8 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 			reason = "forecasting_disabled"
 		} else if !capacityOK {
 			reason = "capacity_missing"
+		} else if useV2 {
+			reason = "forecast_contract_v2"
 		}
 		r.clearForecastOverride(log, state, appName, appNS, reason)
 	}
@@ -476,6 +522,11 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		dec.Safeguards = append(dec.Safeguards, "telemetry_unavailable_hold")
 	}
 	dec.setDecision(predictedReplicas, desiredReplicas, keepCurrent)
+	if useV2 {
+		dec.ForecastContract = forecastContractV2
+		dec.V2 = v2out.ledger(v2pol, capacityRPM, capacityOK, mode)
+	}
+	recordV2Metrics(autoscaler.Namespace, autoscaler.Name, v2out, v2pol, reactiveReplicas)
 
 	// --- ACCURACY METRICS ---
 	// The actual need and the prediction error come from a measured rate and a configured capacity only: without both
@@ -511,6 +562,9 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		// Reuse the exact window selected for this decision, including on cached reuse.
 		// Recalculating here could select a different window at a target-time boundary.
 		predictedRpmGauge.WithLabelValues(appName, appNS).Set(*dec.LeadWindowPeak)
+	} else if v2pol != nil {
+		// v2: the verified upper bound of the window peak the decision used (requests per minute).
+		predictedRpmGauge.WithLabelValues(appName, appNS).Set(*v2out.Response.UpperWindowMaxRPS * 60)
 	} else {
 		// Absence distinguishes an unused/empty forecast from a usable forecast of zero RPM.
 		predictedRpmGauge.DeleteLabelValues(appName, appNS)
@@ -689,7 +743,8 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		current: currentReplicas, ready: deployment.Status.ReadyReplicas, keepCurrent: keepCurrent,
 		telemetry: dec.TelemetryStatus, telemetryError: dec.TelemetryError, forecastStatus: dec.ForecastStatus,
 		forecastIssuedAt: dec.ForecastIssuedAt, targetUID: string(deployment.UID),
-		headroomHold: headroomHold, headroomPercent: headroomPct, capacityOK: capacityOK,
+		headroomHold: headroomHold, headroomPercent: headroomPct, capacityOK: capacityOK, startup: startup,
+		v2: v2out, v2Policy: v2pol,
 		conflicts: check.Conflicts, writers: check.Writers, warnings: check.Warnings, vpaChecked: check.VPAChecked, checkError: checkMsg, guard: guard,
 	}); err != nil {
 		log.Error(err, "Failed to update status")
@@ -698,6 +753,10 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	if retrySoon {
 		delete(r.lastReconcileMap, key)
 		return ctrl.Result{RequeueAfter: staleDecisionRetry}, nil
+	}
+	if useV2 && v2out.SettingsErr == nil {
+		// Early in a grid origin's interval, while that origin's window is still actionable.
+		return ctrl.Result{RequeueAfter: v2Requeue(r.now(), reconcileInterval, v2out.Settings.SampleIntervalSeconds)}, nil
 	}
 	return ctrl.Result{RequeueAfter: reconcileInterval}, nil
 }
@@ -1449,12 +1508,17 @@ type statusInputs struct {
 	headroomHold                                              bool
 	headroomPercent                                           int32
 	capacityOK                                                bool // a per-replica capacity resolved (capacity.go)
+	startup                                                   startupObservation
+	v2                                                        *v2Outcome // nil unless engine statistical
+	v2Policy                                                  *v2Policy
 }
 
 var forecastReasons = map[string]string{"disabled": "Disabled", "unavailable": "Unavailable",
 	"horizon_elapsed": "HorizonElapsed", "sanity_rejected": "SanityRejected",
 	"unauthorized": "Unauthorized", "forbidden": "Forbidden", "auth_unavailable": "AuthUnavailable",
-	"auth_misconfigured": "AuthMisconfigured", "capacity_missing": "CapacityMissing"}
+	"auth_misconfigured": "AuthMisconfigured", "capacity_missing": "CapacityMissing",
+	"not_eligible": "NotTrusted", "rejected": "Rejected", "lead_insufficient": "LeadInsufficient",
+	"settings_invalid": "SettingsInvalid"}
 
 // updateStatus writes the status when it changed: replica counts, mode, observedGeneration and the conditions Ready,
 // CapacityConfigured, TelemetryAvailable, ForecastAvailable and ScalingActive (transition times preserved). Events are
@@ -1558,6 +1622,22 @@ func (r *PredictiveAutoscalerReconciler) updateStatus(ctx context.Context, autos
 	}
 	// Informational: a scale-down held for headroom is normal operation, so it never affects Ready or ScalingActive.
 	switch {
+	case in.startup.Blocked != "":
+		setStatus("ScaleOutBlocked", metav1.ConditionTrue, in.startup.Blocked, in.startup.BlockedMsg)
+	case !in.startup.Observable:
+		setStatus("ScaleOutBlocked", metav1.ConditionUnknown, "PodsUnreadable", "the target's pods could not be read: "+in.startup.ReadError)
+	default:
+		setStatus("ScaleOutBlocked", metav1.ConditionFalse, "None", "no unschedulable pod and no failed pod creation")
+	}
+	if in.v2 != nil {
+		st.Prediction = in.v2.predictionStatus(in.v2Policy, in.capacityOK, in.mode)
+		ok, reason, msg := in.v2.readiness(in.capacityOK, in.mode)
+		set("PredictionReady", ok, reason, msg)
+	} else {
+		st.Prediction = nil
+		meta.RemoveStatusCondition(&st.Conditions, "PredictionReady")
+	}
+	switch {
 	case in.mode != autoscalerv1alpha1.ModeActive:
 		setStatus("ScaleDownHeadroom", metav1.ConditionFalse, "RecommendMode", "Recommend mode applies no scale-down")
 	case in.headroomHold:
@@ -1596,6 +1676,22 @@ func (r *PredictiveAutoscalerReconciler) transitionEvents(a *autoscalerv1alpha1.
 		"Ready":              {"ReconcileFailed", "ReconcileRecovered"},
 	}
 	for _, c := range cur {
+		if c.Type == "PredictionReady" {
+			r.predictionReadyEvent(a, meta.FindStatusCondition(old, c.Type), c)
+			continue
+		}
+		if c.Type == "ScaleOutBlocked" {
+			prev := meta.FindStatusCondition(old, c.Type)
+			if prev != nil && prev.Status == c.Status && prev.Reason == c.Reason {
+				continue
+			}
+			if c.Status == metav1.ConditionTrue {
+				r.event(a, "Warning", "ScaleOutBlocked", c.Reason+": "+c.Message)
+			} else if c.Status == metav1.ConditionFalse && prev != nil && prev.Status == metav1.ConditionTrue {
+				r.event(a, "Normal", "ScaleOutUnblocked", c.Message)
+			}
+			continue
+		}
 		if c.Type == "ConflictDetected" || c.Type == "VPAInterference" { // True is the problem for these two
 			prev := meta.FindStatusCondition(old, c.Type)
 			if prev != nil && prev.Status == c.Status && prev.Reason == c.Reason {
@@ -1788,4 +1884,20 @@ func (r *PredictiveAutoscalerReconciler) clearForecastOverride(log logr.Logger, 
 	state.overestimateStreak = 0
 	state.reEvalCounter = 0
 	overestimateStreakGauge.WithLabelValues(appName, appNS).Set(0)
+}
+
+// predictionReadyEvent reports PredictionReady transitions. Collecting evidence is normal operation, not a fault: only
+// a forecast the operator rejected, a refused request or invalid settings are warnings.
+func (r *PredictiveAutoscalerReconciler) predictionReadyEvent(a *autoscalerv1alpha1.PredictiveAutoscaler, prev *metav1.Condition, c metav1.Condition) {
+	if prev != nil && prev.Status == c.Status && prev.Reason == c.Reason {
+		return
+	}
+	switch {
+	case c.Status == metav1.ConditionTrue:
+		r.event(a, "Normal", "PredictionReady", c.Message)
+	case c.Reason == "ForecastRejected" || c.Reason == "RequestRefused" || c.Reason == "SettingsInvalid":
+		r.event(a, "Warning", "PredictionNotReady", c.Reason+": "+c.Message)
+	default:
+		r.event(a, "Normal", "PredictionNotReady", c.Reason+": "+c.Message)
+	}
 }

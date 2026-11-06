@@ -19,7 +19,7 @@ type decisionRecord struct {
 	Application      string          `json:"application"`
 	Namespace        string          `json:"namespace"`
 	Forecasting      bool            `json:"forecasting"`
-	ForecastStatus   string          `json:"forecast_status"` // used|unavailable|horizon_elapsed|sanity_rejected|disabled|unauthorized|forbidden|auth_unavailable|auth_misconfigured|capacity_missing
+	ForecastStatus   string          `json:"forecast_status"` // used|unavailable|horizon_elapsed|sanity_rejected|disabled|unauthorized|forbidden|auth_unavailable|auth_misconfigured|capacity_missing; v2 also not_eligible|rejected|lead_insufficient|settings_invalid
 	ForecastIssuedAt *string         `json:"forecast_issued_at"`
 	ArtifactSHA256   *string         `json:"artifact_sha256"`
 	ModelVersion     *string         `json:"model_version"`
@@ -56,6 +56,10 @@ type decisionRecord struct {
 	// ScaleDownHeadroomFloor is the smallest count that keeps spec.behavior.scaleDown.headroomPercent of spare capacity at
 	// the measured rate (Active scale-down decisions only; absent otherwise).
 	ScaleDownHeadroomFloor *int32 `json:"scale_down_headroom_floor,omitempty"`
+	// ForecastContract is window-max-rps/v1 on the forecast v2 path (engine statistical), absent on the v1 path; V2
+	// links the forecast by issuance ID and records its acceptance or rejection and the capped predictive term.
+	ForecastContract string            `json:"forecast_contract,omitempty"`
+	V2               *v2DecisionDetail `json:"v2,omitempty"`
 }
 
 func newDecisionRecord(a *autoscalerv1alpha1.PredictiveAutoscaler, forecasting bool, current int32) *decisionRecord {
