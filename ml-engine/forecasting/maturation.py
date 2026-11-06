@@ -30,12 +30,27 @@ def truth_deadline_ms(window_end: int, settlement_s: int, grace_s: int) -> int:
     return (window_end + settlement_s + grace_s) * 1000
 
 
+def check_window(targets: Sequence[int]) -> None:
+    """The exact window: one or more grid times, strictly increasing at a constant step (no hole, no repeat)."""
+    if not targets or any(not isinstance(t, int) or isinstance(t, bool) for t in targets):
+        raise ValueError("a window has integer target times")
+    steps = {b - a for a, b in zip(targets, targets[1:])}
+    if len(steps) > 1 or (steps and min(steps) <= 0):
+        raise ValueError("window targets must be evenly spaced and increasing")
+
+
+def targets_sha256(targets: Sequence[int]) -> str:
+    """The digest an outcome carries of the exact grid it was scored on (bound to the issued grid when calibrating)."""
+    return sha256_hex(canonical_json(list(targets)))
+
+
 def window_outcome(*, targets: Sequence[int], base_rps: float, upper_rps: Optional[float],
                    received: Mapping[int, Tuple[float, int]], now_ms: int, settlement_s: int, grace_s: int,
                    excluded: Optional[Callable[[int], Optional[str]]] = None) -> Optional[Tuple[str, dict]]:
     """None while the window is pending, else (status, payload) with status 'scored' or 'unscorable'.
 
     `received` maps event time -> (value RPS, first receipt ms); `excluded(t)` names the exclusion covering t, if any."""
+    check_window(targets)
     window_end = targets[-1]
     close_ms = (window_end + settlement_s) * 1000
     deadline_ms = truth_deadline_ms(window_end, settlement_s, grace_s)
@@ -45,6 +60,7 @@ def window_outcome(*, targets: Sequence[int], base_rps: float, upper_rps: Option
         hit = [(t, why) for t in targets if (why := excluded(t))]
         if hit:
             return "unscorable", {"schema": OUTCOME_SCHEMA, "reason": "excluded", "excluded_targets": len(hit),
+                                  "targets": len(targets), "targets_sha256": targets_sha256(targets),
                                   "first_excluded": hit[0][0], "exclusion": hit[0][1], "deadline_ms": deadline_ms}
     cutoff = min(now_ms, deadline_ms)          # nothing received after the fixed deadline is ever admitted
     values, missing, completed = [], [], 0
@@ -59,10 +75,40 @@ def window_outcome(*, targets: Sequence[int], base_rps: float, upper_rps: Option
         if now_ms < deadline_ms:
             return None
         return "unscorable", {"schema": OUTCOME_SCHEMA, "reason": "missing_truth", "missing_targets": len(missing),
+                              "targets": len(targets), "targets_sha256": targets_sha256(targets),
                               "first_missing": missing[0], "deadline_ms": deadline_ms}
     y = max(values)
-    return "scored", {"schema": OUTCOME_SCHEMA, "y_window_max_rps": y, "base_window_max_rps": base_rps,
+    return "scored", {"schema": OUTCOME_SCHEMA, "y_window_max_rps": y, "targets": len(targets),
+                      "targets_sha256": targets_sha256(targets), "base_window_max_rps": base_rps,
                       "upper_window_max_rps": upper_rps,
                       "covered": None if upper_rps is None else y <= upper_rps,
                       "residual_rps": y - base_rps, "abs_error_rps": abs(y - base_rps),
                       "values_sha256": sha256_hex(canonical_json(values)), "completed_at_ms": completed}
+
+
+def candidate(bundle: Mapping, model: str) -> Mapping:
+    """One model's issued values in an issuance bundle: {"recipe", "point_rps", "base_window_max_rps",
+    "upper_window_max_rps"}. A multi-model bundle lists them under "candidates"; a single-model bundle carries them at
+    the top level under its model_family. Anything else is refused: an outcome is only ever scored against the values
+    its own model issued."""
+    if "candidates" in bundle:
+        c = bundle["candidates"].get(model) if isinstance(bundle["candidates"], dict) else None
+        if not isinstance(c, dict):
+            raise ValueError(f"the issuance has no candidate {model!r}")
+        return c
+    if bundle.get("model_family") != model:
+        raise ValueError(f"the issuance was made by {bundle.get('model_family')!r}, not {model!r}")
+    return {"recipe": bundle.get("model_recipe"), "point_rps": bundle["point_rps"],
+            "base_window_max_rps": bundle["base_window_max_rps"],
+            "upper_window_max_rps": bundle["upper_window_max_rps"]}
+
+
+def issued_outcome(bundle: Mapping, model: str, *, received: Mapping[int, Tuple[float, int]], now_ms: int,
+                   settlement_s: int, grace_s: int,
+                   excluded: Optional[Callable[[int], Optional[str]]] = None) -> Optional[Tuple[str, dict]]:
+    """window_outcome for one model of an issuance, on the bundle's own immutable target grid and that model's issued
+    base and bound: the caller cannot pass a shortened, shifted or re-spaced window."""
+    c = candidate(bundle, model)
+    return window_outcome(targets=list(bundle["target_timestamps"]), base_rps=c["base_window_max_rps"],
+                          upper_rps=c["upper_window_max_rps"], received=received, now_ms=now_ms,
+                          settlement_s=settlement_s, grace_s=grace_s, excluded=excluded)
