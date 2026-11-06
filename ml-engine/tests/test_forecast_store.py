@@ -20,6 +20,8 @@ from forecasting.store import (ForecastStore, IntegrityConflict, IssuanceKey, Re
 
 ML_ENGINE = Path(__file__).resolve().parent.parent
 EK = "e" * 64
+MODELS = ("m",)
+TWO = ("seasonal_naive", "statistical")
 SETTINGS = "5" * 64
 SRC = "c" * 64
 T0 = 1_793_966_400            # 2026-11-06T12:00:00Z
@@ -82,19 +84,19 @@ def test_wal_mode_and_identity(store, tmp_path):
 
 
 def test_a_duplicate_retry_returns_the_committed_issuance(store):
-    rec, created = store.commit_issuance(key(), bundle())
+    rec, created = store.commit_issuance(key(), bundle(), models=MODELS)
     assert created and rec.issuance_id == store.issuance_id_for(key()) and rec.payload() == bundle()
-    again, created = store.commit_issuance(key(), bundle())
+    again, created = store.commit_issuance(key(), bundle(), models=MODELS)
     assert not created and again == rec
     assert len(store.issuances()) == 1
 
 
 def test_different_bytes_for_the_same_key_are_an_integrity_error(store):
-    store.commit_issuance(key(), bundle())
+    store.commit_issuance(key(), bundle(), models=MODELS)
     with pytest.raises(IntegrityConflict):
-        store.commit_issuance(key(), bundle(points=(9.0, 9.0, 9.0, 9.0)))
+        store.commit_issuance(key(), bundle(points=(9.0, 9.0, 9.0, 9.0)), models=MODELS)
     with pytest.raises(IntegrityConflict):
-        store.commit_issuance(key(), bundle(issued_at_ms=T0 * 1000 + 1))
+        store.commit_issuance(key(), bundle(issued_at_ms=T0 * 1000 + 1), models=MODELS)
     assert store.issuances()[0].payload() == bundle() and store.healthy
 
 
@@ -105,8 +107,8 @@ def test_get_or_issue_never_recomputes_a_committed_issuance(store):
         calls.append(iid)
         return bundle(issued_at_ms=T0 * 1000 + len(calls))    # a recomputation would differ (later issued_at)
 
-    first, created = store.get_or_issue(key(), build)
-    second, created2 = store.get_or_issue(key(), build)
+    first, created = store.get_or_issue(key(), build, models=MODELS)
+    second, created2 = store.get_or_issue(key(), build, models=MODELS)
     assert created and not created2 and first == second and len(calls) == 1
     assert calls[0] == first.issuance_id
 
@@ -125,7 +127,7 @@ def test_issuance_ids_bind_the_store_and_every_key_field(tmp_path):
 
 
 def test_journal_rows_cannot_be_edited_or_deleted(store, tmp_path):
-    rec, _ = store.commit_issuance(key(), bundle())
+    rec, _ = store.commit_issuance(key(), bundle(), models=TWO)
     store.clock.set((T0 + 1200) * 1000)
     store.commit_outcome(rec.issuance_id, "seasonal_naive", "unscorable", {"reason": "missing_truth"})
     store.record_observations("s", [(T0, 1.0, T0 * 1000)], SRC)
@@ -141,19 +143,19 @@ def test_journal_rows_cannot_be_edited_or_deleted(store, tmp_path):
 
 def test_bundles_are_canonical_and_capped(store):
     with pytest.raises(StoreError):
-        store.commit_issuance(key(), {"point_rps": [float("nan")]})
+        store.commit_issuance(key(), {"point_rps": [float("nan")]}, models=MODELS)
     with pytest.raises(StoreError):
-        store.commit_issuance(key(), {"blob": "x" * (8 << 10)})
+        store.commit_issuance(key(), {"blob": "x" * (8 << 10)}, models=MODELS)
     with pytest.raises(StoreError):
-        store.commit_issuance(key(), ["not", "an", "object"])
-    a, _ = store.commit_issuance(key(), {"b": 1, "a": [1, 2]})
+        store.commit_issuance(key(), ["not", "an", "object"], models=MODELS)
+    a, _ = store.commit_issuance(key(), {"b": 1, "a": [1, 2]}, models=MODELS)
     assert a.bundle == b'{"a":[1,2],"b":1}' and store.healthy
 
 
 # --- outcomes ---------------------------------------------------------------------------------------------------
 
 def test_one_terminal_outcome_per_issuance_and_model(store):
-    rec, _ = store.commit_issuance(key(), bundle())
+    rec, _ = store.commit_issuance(key(), bundle(), models=TWO)
     with pytest.raises(StoreError):            # the window has not ended yet
         store.commit_outcome(rec.issuance_id, "seasonal_naive", "scored", {"y": 1})
     store.clock.set((T0 + 1200) * 1000)
@@ -174,7 +176,7 @@ def test_one_terminal_outcome_per_issuance_and_model(store):
 
 def test_open_issuances_are_in_window_end_order(store):
     for origin in (T0 + 2 * DT, T0, T0 + DT):
-        store.commit_issuance(key(origin), bundle(origin))
+        store.commit_issuance(key(origin), bundle(origin), models=MODELS)
     store.clock.set((T0 + 3000) * 1000)
     assert [i.key.decision_origin for i in store.open_issuances(EK, "m", T0 + 1500)] == [T0, T0 + DT]
     store.commit_outcome(store.issuances()[1].issuance_id, "m", "scored", {})
@@ -208,7 +210,7 @@ def initial():
 def three_outcomes(store):
     ids = []
     for k in range(3):
-        rec, _ = store.commit_issuance(key(T0 + k * DT), bundle(T0 + k * DT))
+        rec, _ = store.commit_issuance(key(T0 + k * DT), bundle(T0 + k * DT), models=MODELS)
         ids.append(rec.issuance_id)
     store.clock.set((T0 + 3000) * 1000)
     for iid in ids:
@@ -259,6 +261,7 @@ CRASH = textwrap.dedent("""
     T0 = 1_793_966_400
     s = ForecastStore(path, clock=ManualClock((T0 + 3000) * 1000), store_id="test-store")
     k = IssuanceKey("e" * 64, T0, T0, T0 + 1200, "5" * 64)
+    MODELS = tuple(sys.argv[5].split(",")) if len(sys.argv) > 5 else ("m",)
     if op == "outcome":
         rec = s.get_issuance(k)
     if op == "compact":
@@ -266,19 +269,19 @@ CRASH = textwrap.dedent("""
                           retention_seconds=86400, observation_retention_seconds=86400)
     s._fault_hook = lambda st: os._exit(17) if st == stage else None
     if op == "issuance":
-        s.commit_issuance(k, {"decision_origin": T0, "point_rps": [1.0], "issued_at_ms": 1})
+        s.commit_issuance(k, {"decision_origin": T0, "point_rps": [1.0], "issued_at_ms": 1}, models=MODELS)
     elif op == "outcome":
-        s.commit_outcome(rec.issuance_id, "m", "scored", {"y": 3.0})
+        s.commit_outcome(rec.issuance_id, sys.argv[4] if len(sys.argv) > 4 else "m", "scored", {"y": 3.0})
     elif op == "compact":
         s.compact(T0 + 86400 + 4 * 3600)
     os._exit(0)
 """)
 
 
-def crash(path, stage, op):
+def crash(path, stage, op, *extra):
     env = {**{k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}, "PYTHONPATH": str(ML_ENGINE),
            "KUBECONFIG": "/dev/null"}
-    p = subprocess.run([sys.executable, "-c", CRASH, str(path), stage, op], cwd=ML_ENGINE, env=env,
+    p = subprocess.run([sys.executable, "-c", CRASH, str(path), stage, op, *extra], cwd=ML_ENGINE, env=env,
                        capture_output=True, text=True, timeout=60)
     assert p.returncode == 17, p.stderr[-2000:]
 
@@ -290,7 +293,7 @@ def test_a_crash_before_commit_leaves_nothing_and_the_retry_commits(tmp_path):
     s = open_store(path, clock=ManualClock((T0 + 3000) * 1000))
     assert s.issuances() == [] and s.healthy
     s.verify()
-    rec, created = s.commit_issuance(key(), {"decision_origin": T0, "point_rps": [1.0], "issued_at_ms": 1})
+    rec, created = s.commit_issuance(key(), {"decision_origin": T0, "point_rps": [1.0], "issued_at_ms": 1}, models=MODELS)
     assert created and len(s.issuances()) == 1
 
 
@@ -301,17 +304,17 @@ def test_a_crash_after_commit_keeps_the_issuance_and_the_retry_returns_it(tmp_pa
     s = open_store(path, clock=ManualClock((T0 + 3000) * 1000))
     s.verify()
     [rec] = s.issuances()
-    again, created = s.commit_issuance(key(), {"decision_origin": T0, "point_rps": [1.0], "issued_at_ms": 1})
+    again, created = s.commit_issuance(key(), {"decision_origin": T0, "point_rps": [1.0], "issued_at_ms": 1}, models=MODELS)
     assert not created and again == rec                  # a retry after a lost response counts once
     with pytest.raises(IntegrityConflict):              # and a recomputation cannot replace it
-        s.commit_issuance(key(), {"decision_origin": T0, "point_rps": [2.0], "issued_at_ms": 1})
+        s.commit_issuance(key(), {"decision_origin": T0, "point_rps": [2.0], "issued_at_ms": 1}, models=MODELS)
 
 
 @pytest.mark.parametrize("stage,durable", [("before_commit", False), ("after_commit", True)])
 def test_outcome_crashes_recover_exactly_once(tmp_path, stage, durable):
     path = tmp_path / "j.sqlite"
     s = open_store(path)
-    s.commit_issuance(key(), bundle())
+    s.commit_issuance(key(), bundle(), models=MODELS)
     s.close()
     crash(path, stage, "outcome")
     s = open_store(path, clock=ManualClock((T0 + 3000) * 1000))
@@ -329,7 +332,7 @@ def test_outcome_crashes_recover_exactly_once(tmp_path, stage, durable):
 
 def fill(store, n=10_000):
     for k in range(n):
-        store.commit_issuance(key(T0 + k * DT), {"pad": "x" * 6000, "k": k})
+        store.commit_issuance(key(T0 + k * DT), {"pad": "x" * 6000, "k": k}, models=MODELS)
 
 
 def test_the_quota_check_refuses_before_the_disk_fills(tmp_path):
@@ -355,7 +358,7 @@ def test_a_real_sqlite_full_marks_the_store_unhealthy_without_partial_records(tm
     big.verify()
     recs = big.issuances()
     assert len(recs) == committed > 0 and [r.payload()["k"] for r in recs] == list(range(committed))
-    big.commit_issuance(key(T0 + committed * DT), {"k": committed})         # space again: writes resume
+    big.commit_issuance(key(T0 + committed * DT), {"k": committed}, models=MODELS)         # space again: writes resume
     big.close()
 
 
@@ -371,7 +374,7 @@ def test_a_file_that_is_not_a_journal_is_corrupt(tmp_path):
 def test_a_damaged_header_is_corrupt(tmp_path):
     p = tmp_path / "j.sqlite"
     s = open_store(p)
-    s.commit_issuance(key(), bundle())
+    s.commit_issuance(key(), bundle(), models=MODELS)
     s._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     s.close()
     data = bytearray(p.read_bytes())
@@ -385,7 +388,7 @@ def test_damaged_pages_are_detected(tmp_path):
     p = tmp_path / "j.sqlite"
     s = open_store(p)
     for k in range(40):
-        s.commit_issuance(key(T0 + k * DT), {"pad": "y" * 3000, "k": k})
+        s.commit_issuance(key(T0 + k * DT), {"pad": "y" * 3000, "k": k}, models=MODELS)
     s._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     s.close()
     data = bytearray(p.read_bytes())
@@ -399,7 +402,7 @@ def test_damaged_pages_are_detected(tmp_path):
 
 
 def test_a_tampered_bundle_is_corrupt_and_disables_the_store(store, tmp_path):
-    store.commit_issuance(key(), bundle())
+    store.commit_issuance(key(), bundle(), models=MODELS)
     raw = sqlite3.connect(str(tmp_path / "j.sqlite"))
     raw.execute("DROP TRIGGER issuances_immutable")
     raw.execute("UPDATE issuances SET bundle = ?", (json.dumps(bundle(points=(9.0,))).encode(),))
@@ -409,7 +412,7 @@ def test_a_tampered_bundle_is_corrupt_and_disables_the_store(store, tmp_path):
         store.get_issuance(key())
     assert not store.healthy
     with pytest.raises(StoreUnavailable):
-        store.commit_issuance(key(T0 + DT), bundle(T0 + DT))
+        store.commit_issuance(key(T0 + DT), bundle(T0 + DT), models=MODELS)
 
 
 def test_an_unknown_schema_version_is_refused(tmp_path):
@@ -430,7 +433,7 @@ def test_retention_removes_only_old_windows_and_keeps_the_denominators(tmp_path)
     s = open_store(tmp_path / "j.sqlite", retention_seconds=86400, observation_retention_seconds=2 * 86400)
     ids = []
     for k in range(10):
-        rec, _ = s.commit_issuance(key(T0 + k * 3600), bundle(T0 + k * 3600))
+        rec, _ = s.commit_issuance(key(T0 + k * 3600), bundle(T0 + k * 3600), models=MODELS)
         ids.append(rec)
     s.record_observations("s", [(T0 - 2 * 86400 - DT, 1.0, 1), (T0, 2.0, 1)], SRC)
     s.clock.set((T0 + 12 * 3600) * 1000)
@@ -455,7 +458,7 @@ def test_retention_removes_only_old_windows_and_keeps_the_denominators(tmp_path)
 def test_the_journal_digest_ignores_row_numbers_but_not_content(tmp_path):
     a, b = open_store(tmp_path / "a.sqlite"), open_store(tmp_path / "b.sqlite")
     for s in (a, b):
-        s.commit_issuance(key(), bundle())
+        s.commit_issuance(key(), bundle(), models=MODELS)
     assert a.journal_digest() == b.journal_digest()
     b.record_observations("s", [(T0, 1.0, 1)], SRC)
     assert a.journal_digest() != b.journal_digest()
@@ -503,7 +506,7 @@ def test_missing_and_late_truth():
 def compaction_fixture(path):
     """Six hourly issuances with outcomes, a checkpoint covering the first four outcomes only, two open ones."""
     s = open_store(path, retention_seconds=86400, observation_retention_seconds=86400)
-    recs = [s.commit_issuance(key(T0 + k * 3600), bundle(T0 + k * 3600))[0] for k in range(8)]
+    recs = [s.commit_issuance(key(T0 + k * 3600), bundle(T0 + k * 3600), models=MODELS)[0] for k in range(8)]
     s.clock.set((T0 + 12 * 3600) * 1000)
     for rec in recs[:6]:
         s.commit_outcome(rec.issuance_id, "m", "scored", {"iid": rec.issuance_id})
@@ -525,7 +528,7 @@ def test_compaction_removes_only_checkpoint_covered_outcomes(tmp_path):
 
 def test_compaction_without_a_checkpoint_removes_nothing(tmp_path):
     s = open_store(tmp_path / "j.sqlite", retention_seconds=86400, observation_retention_seconds=86400)
-    rec, _ = s.commit_issuance(key(), bundle())
+    rec, _ = s.commit_issuance(key(), bundle(), models=MODELS)
     s.clock.set((T0 + 3000) * 1000)
     s.commit_outcome(rec.issuance_id, "m", "scored", {})
     assert s.compact(T0 + 2 * 86400)["kept"] == 1 and len(s.issuances()) == 1
@@ -554,14 +557,14 @@ def test_retired_keys_can_never_be_reissued(tmp_path):
     gone = recs[0]
     for payload in (gone.payload(), bundle(T0, points=(9.0,))):          # same bytes or different: both refused
         with pytest.raises(RetiredKey):
-            s.commit_issuance(gone.key, payload)
+            s.commit_issuance(gone.key, payload, models=MODELS)
         with pytest.raises(RetiredKey):
-            s.get_or_issue(gone.key, lambda iid: payload)
+            s.get_or_issue(gone.key, lambda iid: payload, models=MODELS)
     with pytest.raises(RetiredKey):                                       # a never-issued key below the horizon
-        s.commit_issuance(key(T0 + 30 * 60), bundle(T0 + 30 * 60))
+        s.commit_issuance(key(T0 + 30 * 60), bundle(T0 + 30 * 60), models=MODELS)
     kept = recs[4]                                                        # below the horizon but still held
-    assert s.commit_issuance(kept.key, kept.payload()) == (kept, False)
-    assert s.get_or_issue(kept.key, lambda iid: {})[0] == kept
+    assert s.commit_issuance(kept.key, kept.payload(), models=MODELS) == (kept, False)
+    assert s.get_or_issue(kept.key, lambda iid: {}, models=MODELS)[0] == kept
     raw = sqlite3.connect(str(tmp_path / "j.sqlite"))
     with pytest.raises(sqlite3.IntegrityError):                           # the trigger refuses it too
         raw.execute("INSERT INTO issuances (issuance_id, key_sha256, evidence_key, decision_origin, window_start, "
@@ -575,14 +578,14 @@ def test_retired_keys_can_never_be_reissued(tmp_path):
 def test_get_or_issue_refuses_both_paths_when_unhealthy(tmp_path):
     s = open_store(tmp_path / "j.sqlite", quota_bytes=256 << 10)
     early = key(T0 - 86400)
-    rec, _ = s.commit_issuance(early, bundle(T0 - 86400))
+    rec, _ = s.commit_issuance(early, bundle(T0 - 86400), models=MODELS)
     with pytest.raises(StoreFull):
         fill(s)
     built = []
     with pytest.raises(StoreUnavailable):                                 # the cached path
-        s.get_or_issue(early, lambda iid: built.append(iid) or bundle())
+        s.get_or_issue(early, lambda iid: built.append(iid) or bundle(), models=MODELS)
     with pytest.raises(StoreUnavailable):                                 # the build path
-        s.get_or_issue(key(T0 - 7200), lambda iid: built.append(iid) or bundle(T0 - 7200))
+        s.get_or_issue(key(T0 - 7200), lambda iid: built.append(iid) or bundle(T0 - 7200), models=MODELS)
     assert built == []
     assert s.get_issuance(early) == rec and s.issuances()                 # audit reads stay available
 
@@ -614,7 +617,7 @@ def test_a_restart_after_expiry_closes_the_window_unscorable(tmp_path):
     # The service was down across the deadline; the truth arrived while it was down, after the deadline.
     path = tmp_path / "j.sqlite"
     s = open_store(path)
-    rec, _ = s.commit_issuance(key(lead=300), bundle(points=(1.0,)))
+    rec, _ = s.commit_issuance(key(lead=300), bundle(points=(1.0,)), models=MODELS)
     s.close()
     s = open_store(path, clock=ManualClock((T0 + 5000) * 1000))
     received = {T0 + 300: (2.0, (T0 + 300 + 120 + 600 + 1) * 1000)}
@@ -628,3 +631,83 @@ def test_excluded_truth_is_unscorable_at_close():
     status, p = outcome(full(), END + 120, excluded=lambda t: "incident-7" if t == TARGETS[1] else None)
     assert status == "unscorable" and p["reason"] == "excluded" and p["exclusion"] == "incident-7"
     assert outcome(full(), END + 119, excluded=lambda t: "x") is None          # still waits for the close
+
+
+# --- expected model sets: compaction waits for every model (Codex review P1) -------------------------------------
+
+def two_model_fixture(path):
+    """One two-model bundle (window ended long ago): seasonal_naive scored and checkpointed, statistical pending."""
+    s = open_store(path, retention_seconds=86400, observation_retention_seconds=86400)
+    rec, _ = s.commit_issuance(key(), bundle(), models=TWO)
+    s.clock.set((T0 + 3000) * 1000)
+    s.commit_outcome(rec.issuance_id, "seasonal_naive", "scored", {"y": 1.0})
+    checkpoint_all(s)
+    return s, rec
+
+
+def checkpoint_all(s):
+    state, last, _ = s.recover(EK, count_fold, initial)
+    s.write_checkpoint(EK, state, last)
+
+
+def test_the_expected_model_set_is_persisted_and_enforced(tmp_path):
+    s, rec = two_model_fixture(tmp_path / "j.sqlite")
+    assert rec.models == TWO and s.get_issuance(key()).models == TWO
+    with pytest.raises(StoreError):
+        s.commit_outcome(rec.issuance_id, "lstm", "scored", {})               # not an expected model
+    with pytest.raises(IntegrityConflict):
+        s.commit_issuance(key(), bundle(), models=("seasonal_naive",))       # same bytes, other model set
+    with pytest.raises(IntegrityConflict):
+        s.get_or_issue(key(), lambda iid: bundle(), models=("statistical", "lstm"))
+    assert s.commit_issuance(key(), bundle(), models=("statistical", "seasonal_naive")) == (rec, False)  # order-free
+    for bad in ((), ("m", "m"), ("a", "b", "c", "d"), ("Bad-Name",), "m", [1]):
+        with pytest.raises(StoreError):
+            s.commit_issuance(key(T0 + DT), bundle(T0 + DT), models=bad)
+    assert [i.issuance_id for i in s.open_issuances(EK, "statistical", T0 + 3000)] == [rec.issuance_id]
+    assert s.open_issuances(EK, "lstm", T0 + 3000) == []                     # never expected: never open
+
+
+def test_partial_completion_is_never_compacted(tmp_path):
+    # Codex repro: seasonal_naive committed and checkpointed, statistical pending, then compaction.
+    s, rec = two_model_fixture(tmp_path / "j.sqlite")
+    assert s.compact(T0 + 3 * 86400) == {"issuances": 0, "outcomes": 0, "observations": 0, "kept": 1}
+    assert [i.issuance_id for i in s.open_issuances(EK, "statistical", T0 + 3000)] == [rec.issuance_id]
+    s.commit_outcome(rec.issuance_id, "statistical", "unscorable", {"reason": "missing_truth"})   # still possible
+    assert s.compact(T0 + 3 * 86400 + 1)["kept"] == 1             # complete, but statistical not checkpointed yet
+    checkpoint_all(s)
+    assert s.compact(T0 + 3 * 86400 + 2) == {"issuances": 1, "outcomes": 2, "observations": 0, "kept": 0}
+    assert s.issuances() == [] and s.retention_summary(EK)["issued"] == 1
+
+
+def test_full_completion_is_compacted_with_recovery_unchanged(tmp_path):
+    s, rec = two_model_fixture(tmp_path / "j.sqlite")
+    s.commit_outcome(rec.issuance_id, "statistical", "scored", {"y": 2.0})
+    checkpoint_all(s)
+    before = s.recover(EK, count_fold, initial)
+    assert s.compact(T0 + 3 * 86400)["issuances"] == 1
+    assert s.recover(EK, count_fold, initial) == before
+    with pytest.raises(RetiredKey):
+        s.commit_issuance(key(), bundle(), models=TWO)
+    s.verify()
+
+
+@pytest.mark.parametrize("stage", ["before_commit", "after_commit"])
+def test_a_crash_across_the_completion_transition_recovers_exactly(tmp_path, stage):
+    path = tmp_path / "j.sqlite"
+    s, rec = two_model_fixture(path)
+    s.close()
+    crash(path, stage, "outcome", "statistical", ",".join(TWO))       # the last model's outcome, killed mid-commit
+    s = open_store(path, clock=ManualClock((T0 + 3000) * 1000), retention_seconds=86400,
+                   observation_retention_seconds=86400)
+    s.verify()
+    durable = stage == "after_commit"
+    assert len(s.outcomes_after(EK, 0)) == 1 + durable
+    assert s.compact(T0 + 3 * 86400)["kept"] == 1                    # never removed before it is checkpointed
+    if not durable:                                                  # the restarted service closes it itself
+        assert len(s.open_issuances(EK, "statistical", T0 + 3000)) == 1
+        s.commit_outcome(rec.issuance_id, "statistical", "scored", {"y": 3.0})
+    state, last, applied = s.recover(EK, count_fold, initial)
+    assert (state["n"], applied) == (2, 1)                           # each outcome folded exactly once
+    s.write_checkpoint(EK, state, last)
+    assert s.compact(T0 + 3 * 86400 + 1)["issuances"] == 1
+    assert s.recover(EK, count_fold, initial) == (state, last, 0)

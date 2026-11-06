@@ -152,7 +152,7 @@ def _issue(store: ForecastStore, ek: str, settings_sha: str, dataset: Dataset, c
                 "sample_interval_seconds": view.interval, "point_rps": points, "base_window_max_rps": max(points),
                 "upper_window_max_rps": None, "issued_at_ms": view.now_ms, "input_end": input_end,
                 "input_received_through_ms": through}
-    _, created = store.get_or_issue(key, build)
+    _, created = store.get_or_issue(key, build, models=(config.model_family,))
     return int(created)
 
 

@@ -6,7 +6,9 @@ What it guarantees (design C2, section 6):
     A retry with the same bytes returns the committed record (created=False, so it is never counted twice); different
     bytes for the same key are an IntegrityConflict, never an overwrite. get_or_issue() returns a committed issuance
     before building a new one, so a recomputation (a later issued_at, a refit) cannot replace what was answered;
-  - exactly one terminal outcome per issuance and model, under the same rules;
+  - every issuance records the set of models it expects outcomes for (the selected and shadow candidates issued at
+    that origin); an outcome is accepted only for one of them, exactly one terminal outcome per issuance and model,
+    under the same rules;
   - observations keep their first receipt; a different value for the same event time is kept in a separate
     corrections table (audit only) and never changes what was scored online;
   - UPDATE is refused by triggers on every journal table, and DELETE is refused except below the retention horizon,
@@ -18,7 +20,7 @@ What it guarantees (design C2, section 6):
     A fresh or lost store starts a new epoch; it never presents itself as evidence it does not hold.
 The quota is enforced twice: SQLite's max_page_count (a hard SQLITE_FULL) and a check of database + WAL size before
 each write. Retention removes an issuance whose window ended more than `retention_seconds` ago only together with its
-outcomes, and only when every one of those outcomes is covered by the epoch's latest verified checkpoint, so recover()
+outcomes, and only when EVERY expected model has a terminal outcome covered by the epoch's latest verified checkpoint, so recover()
 gives the same state before and after compaction; per-epoch aggregate counts and a digest chain over what was removed
 are kept. Uncovered or still-open old issuances stay. Keys below the retention horizon are retired: committing one is
 refused (RetiredKey, and a trigger), so a removed issuance ID can never be reissued with other bytes.
@@ -49,6 +51,8 @@ OBSERVATION_RETENTION_SECONDS = 28 * 86400
 WAL_LIMIT_BYTES = 64 << 20
 CHECKPOINTS_KEPT = 3
 OUTCOME_STATUSES = ("scored", "unscorable")
+MAX_MODELS = 3                            # naive, statistical, optional LSTM: one chosen variant per family
+_MODEL = re.compile(r"^[a-z0-9_]{1,32}$")
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -65,6 +69,7 @@ CREATE TABLE issuances (
   settings_sha256 TEXT NOT NULL,
   bundle BLOB NOT NULL,
   bundle_sha256 TEXT NOT NULL,
+  models TEXT NOT NULL,
   committed_at_ms INTEGER NOT NULL);
 CREATE INDEX issuances_by_window ON issuances (evidence_key, window_end, seq);
 CREATE TABLE outcomes (
@@ -199,6 +204,7 @@ class Issuance:
     key: IssuanceKey
     bundle: bytes
     bundle_sha256: str
+    models: Tuple[str, ...]
     committed_at_ms: int
 
     def payload(self) -> dict:
@@ -388,16 +394,32 @@ class ForecastStore:
         return "iss-" + sha256_hex(f"{self.store_id}\0{key.sha256}".encode("ascii"))[:32]
 
     def _row_to_issuance(self, row) -> Issuance:
-        seq, iid, ek, origin, ws, we, ss, bundle, bsha, at = row
+        seq, iid, ek, origin, ws, we, ss, bundle, bsha, models, at = row
         bundle = bytes(bundle)
         if sha256_hex(bundle) != bsha:
             self._fail(f"issuance {iid} does not match its checksum")
             raise StoreCorrupt(f"issuance {iid} does not match its checksum")
+        try:
+            expected = self._models(json.loads(models))
+        except (ValueError, StoreError) as e:
+            self._fail(f"issuance {iid} has a malformed model set")
+            raise StoreCorrupt(f"issuance {iid} has a malformed model set") from e
         return Issuance(seq=seq, issuance_id=iid, key=IssuanceKey(ek, origin, ws, we, ss), bundle=bundle,
-                        bundle_sha256=bsha, committed_at_ms=at)
+                        bundle_sha256=bsha, models=expected, committed_at_ms=at)
+
+    @staticmethod
+    def _models(models) -> Tuple[str, ...]:
+        """The expected model set: 1..MAX_MODELS distinct names, kept sorted."""
+        if isinstance(models, (str, bytes)) or not isinstance(models, (list, tuple)):
+            raise StoreError("models must be a list of model names")
+        out = tuple(sorted(set(models)))
+        if len(out) != len(models) or not 1 <= len(out) <= MAX_MODELS or \
+                not all(isinstance(m, str) and _MODEL.match(m) for m in out):
+            raise StoreError(f"models must be 1..{MAX_MODELS} distinct names, got {models!r}")
+        return out
 
     _ISSUANCE_COLS = ("seq, issuance_id, evidence_key, decision_origin, window_start, window_end, settings_sha256, "
-                      "bundle, bundle_sha256, committed_at_ms")
+                      "bundle, bundle_sha256, models, committed_at_ms")
 
     def get_issuance(self, key: IssuanceKey) -> Optional[Issuance]:
         with self._lock, self._guard("read issuance"):
@@ -411,36 +433,41 @@ class ForecastStore:
                                    (issuance_id,)).fetchone()
             return self._row_to_issuance(row) if row else None
 
-    def commit_issuance(self, key: IssuanceKey, payload: Mapping) -> Tuple[Issuance, bool]:
-        """Commit an immutable issuance bundle; (record, created). Same bytes again: (committed record, False)."""
+    def commit_issuance(self, key: IssuanceKey, payload: Mapping, *, models) -> Tuple[Issuance, bool]:
+        """Commit an immutable issuance bundle expecting outcomes for `models`; (record, created). The same bytes and
+        model set again: (committed record, False); anything else for the same key is an IntegrityConflict."""
         bundle = self._encode(payload, self.max_bundle_bytes, "issuance bundle")
+        expected = self._models(models)
         iid = self.issuance_id_for(key)
         with self._lock, self._guard("commit issuance"):
             self._require_healthy()
             existing = self.get_issuance(key)
             if existing is not None:
-                return self._same(existing, bundle), False
+                return self._same(existing, bundle, expected), False
             self._refuse_retired(key)
             self._check_quota(len(bundle))
             now = self.clock.now_ms()
             with self._tx():
                 self._db.execute(
                     "INSERT INTO issuances (issuance_id, key_sha256, evidence_key, decision_origin, window_start, "
-                    "window_end, settings_sha256, bundle, bundle_sha256, committed_at_ms) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    "window_end, settings_sha256, bundle, bundle_sha256, models, committed_at_ms) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     (iid, key.sha256, key.evidence_key, key.decision_origin, key.window_start, key.window_end,
-                     key.settings_sha256, bundle, sha256_hex(bundle), now))
+                     key.settings_sha256, bundle, sha256_hex(bundle), canonical_json(list(expected)).decode(), now))
             return self.get_issuance(key), True
 
-    def get_or_issue(self, key: IssuanceKey, build: Callable[[str], Mapping]) -> Tuple[Issuance, bool]:
+    def get_or_issue(self, key: IssuanceKey, build: Callable[[str], Mapping], *, models) -> Tuple[Issuance, bool]:
         """The committed issuance for `key`, or build(issuance_id) committed now. A retry never recomputes.
         An unhealthy store answers neither path: an issuance it returns may be acted on. (Audit reads stay.)"""
         with self._lock, self._guard("issue"):
             self._require_healthy()
             existing = self.get_issuance(key)
             if existing is not None:
+                if existing.models != self._models(models):
+                    raise IntegrityConflict(f"issuance {existing.issuance_id} expects models {existing.models}")
                 return existing, False
             self._refuse_retired(key)
-            return self.commit_issuance(key, build(self.issuance_id_for(key)))
+            return self.commit_issuance(key, build(self.issuance_id_for(key)), models=models)
 
     def _horizon(self) -> int:
         return int(self._db.execute("SELECT value FROM meta WHERE key = 'retention_horizon'").fetchone()[0])
@@ -450,9 +477,10 @@ class ForecastStore:
             raise RetiredKey(f"issuance key with window end {key.window_end} is below the retention horizon")
 
     @staticmethod
-    def _same(existing: Issuance, bundle: bytes) -> Issuance:
-        if existing.bundle != bundle:
-            raise IntegrityConflict(f"issuance {existing.issuance_id} is already committed with different bytes")
+    def _same(existing: Issuance, bundle: bytes, models: Tuple[str, ...]) -> Issuance:
+        if existing.bundle != bundle or existing.models != models:
+            raise IntegrityConflict(f"issuance {existing.issuance_id} is already committed with different bytes "
+                                    "or models")
         return existing
 
     @staticmethod
@@ -476,7 +504,7 @@ class ForecastStore:
                 "WHERE i.evidence_key = ? AND i.window_end <= ? AND NOT EXISTS "
                 "(SELECT 1 FROM outcomes o WHERE o.issuance_id = i.issuance_id AND o.model = ?) "
                 "ORDER BY i.window_end, i.seq", (evidence_key, window_end_at_most, model)).fetchall()
-            return [self._row_to_issuance(r) for r in rows]
+            return [i for i in map(self._row_to_issuance, rows) if model in i.models]
 
     def issuances(self, evidence_key: Optional[str] = None) -> List[Issuance]:
         with self._lock, self._guard("read issuances"):
@@ -516,6 +544,8 @@ class ForecastStore:
             iss = self.get_issuance_by_id(issuance_id)
             if iss is None:
                 raise StoreError(f"no issuance {issuance_id}")
+            if model not in iss.models:
+                raise StoreError(f"issuance {issuance_id} expects outcomes for {iss.models}, not {model!r}")
             self._check_quota(len(data))
             now = self.clock.now_ms()
             if now < (iss.key.window_end) * 1000:
@@ -660,10 +690,13 @@ class ForecastStore:
                 kept = 0
                 for row in gone:
                     iss = self._row_to_issuance(row)
-                    outs = self._db.execute("SELECT seq, status, payload_sha256 FROM outcomes WHERE issuance_id = ? "
-                                            "ORDER BY seq", (iss.issuance_id,)).fetchall()
-                    if not outs or any(seq > covered[iss.key.evidence_key] for seq, _, _ in outs):
-                        kept += 1                      # open, or not yet folded into a checkpoint: keep it whole
+                    rows = self._db.execute("SELECT seq, status, payload_sha256, model FROM outcomes WHERE "
+                                            "issuance_id = ? ORDER BY seq", (iss.issuance_id,)).fetchall()
+                    outs = [r[:3] for r in rows]
+                    # Every expected model must have its terminal outcome, each folded into the checkpoint.
+                    if {r[3] for r in rows} != set(iss.models) or \
+                            any(seq > covered[iss.key.evidence_key] for seq, _, _ in outs):
+                        kept += 1
                         continue
                     epochs.setdefault(iss.key.evidence_key, []).append((iss, outs))
                 n_iss = n_out = 0
@@ -676,7 +709,7 @@ class ForecastStore:
                         scored += sum(1 for _, st, _ in outs if st == "scored")
                         unscorable += sum(1 for _, st, _ in outs if st == "unscorable")
                         digest = sha256_hex(canonical_json([digest, iss.issuance_id, iss.bundle_sha256,
-                                                            [p for _, _, p in outs]]))
+                                                            list(iss.models), [p for _, _, p in outs]]))
                         n_out += self._db.execute("DELETE FROM outcomes WHERE issuance_id = ?",
                                                   (iss.issuance_id,)).rowcount
                         n_iss += self._db.execute("DELETE FROM issuances WHERE issuance_id = ?",
@@ -718,7 +751,7 @@ class ForecastStore:
         with self._lock, self._guard("digest"):
             db = self._db
             for table, cols in (
-                    ("issuances", "issuance_id, key_sha256, bundle_sha256, committed_at_ms"),
+                    ("issuances", "issuance_id, key_sha256, bundle_sha256, models, committed_at_ms"),
                     ("outcomes", "issuance_id, model, status, payload_sha256, committed_at_ms"),
                     ("checkpoints", "evidence_key, last_outcome_seq, payload_sha256, created_at_ms"),
                     ("observation_corrections", "series, event_time, value, received_ms, source_sha256")):
