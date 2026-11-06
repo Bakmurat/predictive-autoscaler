@@ -151,6 +151,7 @@ Both suites pass. Last full run 2026-09-20: Go `go vet` + `go test -race` green;
 | Path | Contents |
 |---|---|
 | `ml-engine/` | Forecasting service: FastAPI application (`api/`), model code (`models/lstm_model.py`), VictoriaMetrics collector (`data/`), training scripts (`training/`), unit tests (`tests/`), `Dockerfile`. |
+| `ml-engine/forecasting/` | Forecast contract v2 (`window-max-rps/v1`, design C2), in progress and not yet served: typed v2 request/response and settings fingerprint (`contracts.py`), the strict parameterized RPS history reader (`history.py`). TensorFlow-free by test. |
 | `k8s-operator/` | Go operator: CRD types (`api/v1alpha1/`), reconciler and overestimate logic (`controllers/`), sample custom resources (`config/samples/`), `Dockerfile`. |
 | `k8s-manifests/base/` | Kustomize base: namespace, CRD, RBAC, both Deployments, the training CronJob, the model volume, and VictoriaMetrics scrape objects. |
 | `grafana/dashboards/` | Four research dashboards (overview, forecast components, live comparison, v4.2 pod autoscaler). The chart ships its own Help & Overview dashboard (`charts/predictive-autoscaler/dashboards/`). |
