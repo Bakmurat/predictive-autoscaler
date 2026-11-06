@@ -383,12 +383,13 @@ Most series carry `application` (the target Deployment's name) and `namespace`:
   `predictive_autoscaler_actual_needed_replicas` (what the measured rate alone needs) and
   `predictive_autoscaler_predicted_replicas` (the forecast-side count after its safeguards: 0 while no forecast is
   used, the reactive count after a sanity rejection).
-- **Prediction error:** `predictive_autoscaler_prediction_error_percent` =
+- **Replica disagreement (deprecated name "prediction error"):** `predictive_autoscaler_prediction_error_percent` =
   `|forecast-side replicas − measured need| / measured need × 100`, where the measured need is the reactive count for the
-  **current** rate (at least `minReplicas`). It compares two replica counts of the same decision; it does not score how
-  accurate a forecast turned out against the traffic it predicted. It reads 100 whenever the rate is measured and the
-  forecast-side count is 0 (for example while no forecast is used), can read 0 after a sanity rejection (the reactive
-  count stands in), and the series is removed while the rate cannot be measured. Read it with `ForecastAvailable`.
+  **current** rate (at least `minReplicas`). It compares two replica counts of the same decision; it is **not** forecast
+  accuracy and does not score how a forecast turned out against the traffic it predicted (see "Forecast quality" below).
+  It reads 100 whenever the rate is measured and the forecast-side count is 0 (for example while no forecast is used),
+  can read 0 after a sanity rejection (the reactive count stands in), and the series is removed while the rate cannot be
+  measured. Read it with `ForecastAvailable`.
 - **Scaling:** `predictive_autoscaler_scale_events_total{direction="up"|"down"}`.
 - **Forecast record:** `predictive_autoscaler_forecast_rpm{step}` and
   `predictive_autoscaler_forecast_target_timestamp_seconds{step}` (one series per step),
@@ -403,6 +404,50 @@ Two series carry `namespace` and `autoscaler` (the PredictiveAutoscaler's name) 
 `predictive_autoscaler_condition{type, status}` (1 for each condition's current status, 0 for the other two) and
 `predictive_autoscaler_forecasting_enabled` (1 unless `spec.prediction.enabled` is false). They disappear with the
 autoscaler. The forecasting service exports its own metrics as well.
+
+### Forecast quality (forecast contract v2, preview)
+
+The statistical forecasting service (forecast contract v2, `window-max-rps/v1`; in development, not in the current
+forecaster image) measures its forecasts against what actually happened. Each forecast covers a fixed future window and
+issues a point peak and, once calibrated, an upper bound for the window's peak request rate. When the window has passed
+and every sample in it has arrived, the window **matures**: its realised peak is compared with what was issued. Windows
+whose data never arrives are **unscorable** and stay in the availability count; nothing is filled in.
+
+Its series (all listed here) carry `namespace`, `autoscaler` and `model` (`seasonal_naive`, `statistical` or `lstm`),
+and at most one more fixed label:
+
+- **Coverage:** `predictive_autoscaler_forecast_window_coverage_ratio{cohort}`: the share of issued upper bounds the
+  realised peak stayed under over the last 7 days (`cohort="gate"`: non-overlapping windows, the ones trust uses;
+  `cohort="all"`: every window), next to `predictive_autoscaler_forecast_nominal_coverage_ratio` (the target, 0.9 by
+  default) and `predictive_autoscaler_forecast_working_miscoverage_ratio` (the adaptive level). Absent, not 0 or 100 %,
+  while no bound has matured.
+- **Error:** `predictive_autoscaler_forecast_window_mae_rps` and `predictive_autoscaler_forecast_window_bias_rps`
+  (forecast minus realised; positive = over-forecast) of the window peak, `predictive_autoscaler_forecast_step_mae_rps`
+  at the first, middle and last target, and `predictive_autoscaler_forecast_window_pinball_loss_rps`.
+- **Participation:** `predictive_autoscaler_forecast_issued_total`, `predictive_autoscaler_forecast_outcomes_total`
+  (`covered`, `missed`, `unscorable`), `predictive_autoscaler_forecast_scored_windows`,
+  `predictive_autoscaler_forecast_outcome_availability_ratio` (scored share of the last day's due windows, overdue
+  ones included),
+  `predictive_autoscaler_forecast_calibration_windows`, `predictive_autoscaler_forecast_history_seconds`,
+  `predictive_autoscaler_forecast_evidence_age_seconds` and `predictive_autoscaler_forecast_fit_failures_total`.
+- **Trust:** `predictive_autoscaler_forecast_trusted` (1 when that model's evidence gates pass) and the latest
+  `predictive_autoscaler_forecast_upper_window_rps` / `predictive_autoscaler_forecast_base_window_rps`.
+
+A model is trusted only on **prospective** evidence (forecasts issued live before their outcome; offline replays warm up
+calibration but never count, not even in availability or error figures): at least 48 hours and 64 non-overlapping
+windows with an issued bound, 7-day coverage at least the target minus 5 points (and on the worst day), no 5 misses in a
+row, enough calibration history, fresh input, the history minimum (1 day for seasonal-naive, 7 days for the statistical
+model), and over the last day at least 95 % of the due windows scored and 95 % of the forecast opportunities issued. A
+window whose outcome is overdue (its data deadline passed without one) counts as not scored, and an origin without a
+forecast counts as a missed opportunity. Evidence belongs to one model version (recipe): a new recipe starts again. A
+trusted model that fails a gate is demoted at once; it is trusted again only after its gates have held for 24 hours and
+32 new windows. The statistical model is used only when it is trusted **and** has beaten a trusted seasonal-naive
+forecast on the same windows (spanning at least 48 hours) for 24 hours in a row; it is then kept until it does worse
+than the seasonal-naive forecast, so small differences do not make the choice flip back and forth, but any safety
+failure falls back at once. Otherwise the seasonal-naive forecast is used when trusted, and otherwise scaling stays
+reactive. Time windows are counted in whole hours ("the last day" starts at the first whole hour inside it, so it can be
+up to an hour shorter). "Ready" here means ready to activate: Recommend mode still makes no writes, and coverage of
+forecast windows is not a latency or error-rate guarantee.
 
 ### The Help & Overview dashboard
 
