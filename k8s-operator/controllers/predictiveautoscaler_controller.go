@@ -345,21 +345,30 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		}
 	}
 
+	// --- PER-REPLICA CAPACITY ---
+	// One resolved capacity for the reactive rule, the forecast rule and the headroom floor (capacity.go). Without one
+	// no replica count is computed: the decision holds the current count and no forecast is requested.
+	capacityRPM, capacitySource, capacityOK := perReplicaCapacityRPM(autoscaler.Spec)
+
 	// --- PREDICTIVE COMPONENT ---
 	// Get ML prediction (cached, refresh every 5 min)
 	var prediction *MLPredictionResponse
 	var predErr error
 	var lookup *forecastLookup
 	forecasting := predictionEnabled(&autoscaler)
-	if forecasting {
+	if forecasting && capacityOK {
 		prediction, predErr, lookup = r.getCachedPredictionObserved(ctx, &autoscaler, key)
 	}
 	predictedReplicas := int32(0)
 	// Codex D-140: one decision record per reconcile (observation only; no decision changes).
 	dec := newDecisionRecord(&autoscaler, forecasting, currentReplicas)
+	dec.setCapacity(capacityRPM, capacitySource, capacityOK)
 	dec.ForecastLookup = lookup
 	if !forecasting {
 		log.V(1).Info("Forecasting disabled for this autoscaler; reactive rule only")
+	} else if !capacityOK {
+		dec.ForecastStatus = "capacity_missing"
+		log.Info("No per-replica capacity configured; not forecasting and holding the current replica count")
 	} else if predErr != nil {
 		dec.ForecastStatus = forecastFailureStatus(predErr)
 		log.Info("Prediction unavailable, using reactive only", "error", predErr.Error(), "status", dec.ForecastStatus)
@@ -382,15 +391,13 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	// Query VictoriaMetrics for current RPM
 	currentRPM, vmErr := r.queryCurrentRPM(ctx, compiled.Query)
 	reactiveReplicas := int32(0)
-	perPodRPM := 20000.0
-	if autoscaler.Spec.Metrics.Requests != nil && autoscaler.Spec.Metrics.Requests.TargetRPS > 0 {
-		perPodRPM = float64(autoscaler.Spec.Metrics.Requests.TargetRPS) * 60
-	}
 	if vmErr != nil {
 		log.Info("Current request rate unavailable; the decision will hold the current replica count", "error", vmErr.Error())
-	} else {
-		reactiveReplicas = boundedReplicas(math.Ceil(currentRPM / perPodRPM))
+	} else if capacityOK {
+		reactiveReplicas = boundedReplicas(math.Ceil(currentRPM / capacityRPM))
 	}
+	// needMeasured: the measured rate converts to a replica need only with a capacity; otherwise the decision holds.
+	needMeasured := vmErr == nil && capacityOK
 	dec.ReactiveReplicas, dec.CurrentRPM = reactiveReplicas, currentRPM
 	dec.TelemetryStatus = "measured"
 	if vmErr != nil {
@@ -445,6 +452,8 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		reason := "prediction_unavailable"
 		if !forecasting {
 			reason = "forecasting_disabled"
+		} else if !capacityOK {
+			reason = "capacity_missing"
 		}
 		r.clearForecastOverride(log, state, appName, appNS, reason)
 	}
@@ -454,8 +463,13 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	// --- UNIFIED DECISION ---
 	desiredReplicas, keepCurrent := unifiedDesired(predictedReplicas, reactiveReplicas,
 		autoscaler.Spec.MinReplicas, autoscaler.Spec.MaxReplicas, currentReplicas,
-		dec.ForecastStatus == "used", vmErr == nil)
-	if keepCurrent {
+		dec.ForecastStatus == "used", needMeasured)
+	if keepCurrent && !capacityOK {
+		log.Info("No per-replica capacity configured: holding the current replica count",
+			"current", currentReplicas, "desired", desiredReplicas)
+		dec.Safeguards = append(dec.Safeguards, "capacity_missing_hold")
+	}
+	if keepCurrent && vmErr != nil {
 		log.Info("Current request rate unavailable: holding the current replica count",
 			"current", currentReplicas, "desired", desiredReplicas, "error", vmErr.Error())
 		// A forecast may be available but does not take part in a hold.
@@ -464,8 +478,9 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	dec.setDecision(predictedReplicas, desiredReplicas, keepCurrent)
 
 	// --- ACCURACY METRICS ---
-	// The actual need and the prediction error come from a measured rate only: without one they would be invented
-	// (minReplicas, 100 % error), so their series are removed instead.
+	// The actual need and the prediction error come from a measured rate and a configured capacity only: without both
+	// they would be invented (minReplicas, 100 % error), so their series are removed instead. Without a capacity no
+	// replica count was calculated at all, so the predicted and desired series go too.
 	actualNeeded := reactiveReplicas
 	if actualNeeded < autoscaler.Spec.MinReplicas {
 		actualNeeded = autoscaler.Spec.MinReplicas
@@ -476,9 +491,14 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		errorPct = math.Abs(float64(predictedReplicas-actualNeeded)) / float64(actualNeeded) * 100
 	}
 
-	predictedReplicasGauge.WithLabelValues(appName, appNS).Set(float64(predictedReplicas))
-	desiredReplicasGauge.WithLabelValues(appName, appNS).Set(float64(desiredReplicas))
-	if vmErr == nil {
+	if capacityOK {
+		predictedReplicasGauge.WithLabelValues(appName, appNS).Set(float64(predictedReplicas))
+		desiredReplicasGauge.WithLabelValues(appName, appNS).Set(float64(desiredReplicas))
+	} else {
+		predictedReplicasGauge.DeleteLabelValues(appName, appNS)
+		desiredReplicasGauge.DeleteLabelValues(appName, appNS)
+	}
+	if needMeasured {
 		actualNeededReplicasGauge.WithLabelValues(appName, appNS).Set(float64(actualNeeded))
 		predictionErrorPercentGauge.WithLabelValues(appName, appNS).Set(errorPct)
 	} else {
@@ -600,8 +620,8 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		// lowered maximum still takes effect.
 		headroomPct = autoscaler.Spec.ScaleDownHeadroomPercent()
 		floor := int32(0)
-		if vmErr == nil { // an unmeasured rate gives no floor and records none
-			floor = headroomFloor(currentRPM, perPodRPM, headroomPct, autoscaler.Spec.MaxReplicas)
+		if needMeasured { // an unmeasured rate or a missing capacity gives no floor and records none
+			floor = headroomFloor(currentRPM, capacityRPM, headroomPct, autoscaler.Spec.MaxReplicas)
 			dec.ScaleDownHeadroomFloor = &floor
 		}
 		var eventual int32
@@ -669,7 +689,7 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		current: currentReplicas, ready: deployment.Status.ReadyReplicas, keepCurrent: keepCurrent,
 		telemetry: dec.TelemetryStatus, telemetryError: dec.TelemetryError, forecastStatus: dec.ForecastStatus,
 		forecastIssuedAt: dec.ForecastIssuedAt, targetUID: string(deployment.UID),
-		headroomHold: headroomHold, headroomPercent: headroomPct,
+		headroomHold: headroomHold, headroomPercent: headroomPct, capacityOK: capacityOK,
 		conflicts: check.Conflicts, writers: check.Writers, warnings: check.Warnings, vpaChecked: check.VPAChecked, checkError: checkMsg, guard: guard,
 	}); err != nil {
 		log.Error(err, "Failed to update status")
@@ -750,20 +770,23 @@ func (r *PredictiveAutoscalerReconciler) calculatePredictedReplicasDetail(
 		}
 	}
 
-	// Calculate replicas from RPM (CR specifies targetRPS, convert to RPM internally)
-	targetRPM := 30000.0
-	if autoscaler.Spec.Metrics.Requests != nil && autoscaler.Spec.Metrics.Requests.TargetRPS > 0 {
-		targetRPM = float64(autoscaler.Spec.Metrics.Requests.TargetRPS) * 60
+	// Calculate replicas from RPM with the same per-replica capacity as the reactive rule. Reconcile requests no
+	// forecast without one; a forecast is never converted on a guessed capacity.
+	capacityRPM, capacitySource, ok := perReplicaCapacityRPM(autoscaler.Spec)
+	if !ok {
+		log.Info("No per-replica capacity configured; the forecast is not converted to replicas")
+		return 0, false, det
 	}
 
-	desiredReplicas := boundedReplicas(math.Ceil(peakRPM / targetRPM))
+	desiredReplicas := boundedReplicas(math.Ceil(peakRPM / capacityRPM))
 	det.PeakRPM, det.Raw = peakRPM, desiredReplicas
 
 	log.Info("Predicted replicas (lead-time window)",
 		"leadTimeMinutes", leadTimeMinutes,
 		"leadTimeSteps", leadTimeSteps,
 		"peakRPM", fmt.Sprintf("%.0f", peakRPM),
-		"targetRPS", targetRPM/60,
+		"capacityRPS", capacityRPM/60,
+		"capacitySource", capacitySource,
 		"replicas", desiredReplicas,
 		"allPredictions", prediction.Predictions)
 
@@ -1425,16 +1448,17 @@ type statusInputs struct {
 	checkError, guard                                         string
 	headroomHold                                              bool
 	headroomPercent                                           int32
+	capacityOK                                                bool // a per-replica capacity resolved (capacity.go)
 }
 
 var forecastReasons = map[string]string{"disabled": "Disabled", "unavailable": "Unavailable",
 	"horizon_elapsed": "HorizonElapsed", "sanity_rejected": "SanityRejected",
 	"unauthorized": "Unauthorized", "forbidden": "Forbidden", "auth_unavailable": "AuthUnavailable",
-	"auth_misconfigured": "AuthMisconfigured"}
+	"auth_misconfigured": "AuthMisconfigured", "capacity_missing": "CapacityMissing"}
 
 // updateStatus writes the status when it changed: replica counts, mode, observedGeneration and the conditions Ready,
-// TelemetryAvailable, ForecastAvailable and ScalingActive (transition times preserved). Events are emitted on
-// condition transitions only.
+// CapacityConfigured, TelemetryAvailable, ForecastAvailable and ScalingActive (transition times preserved). Events are
+// emitted on condition transitions only.
 func (r *PredictiveAutoscalerReconciler) updateStatus(ctx context.Context, autoscaler *autoscalerv1alpha1.PredictiveAutoscaler, in statusInputs) error {
 	before := autoscaler.Status.DeepCopy()
 	st := &autoscaler.Status
@@ -1445,6 +1469,9 @@ func (r *PredictiveAutoscalerReconciler) updateStatus(ctx context.Context, autos
 	}
 	st.PredictedReplicas = in.calculated // deprecated field, historical meaning (the calculated count)
 	st.CalculatedReplicas, st.ForecastReplicas, st.StabilizedReplicas = in.calculated, in.forecast, in.stabilized
+	if !in.capacityOK { // no capacity, no calculation: the recommendation is incomplete, never a number
+		st.PredictedReplicas, st.CalculatedReplicas = 0, 0
+	}
 	st.CurrentReplicas, st.ReadyReplicas = in.current, in.ready
 	st.Conflicts = in.writers
 	if in.mode != autoscalerv1alpha1.ModeActive {
@@ -1472,7 +1499,13 @@ func (r *PredictiveAutoscalerReconciler) updateStatus(ctx context.Context, autos
 	setStatus := func(t string, status metav1.ConditionStatus, reason, msg string) {
 		meta.SetStatusCondition(&st.Conditions, metav1.Condition{Type: t, Status: status, Reason: reason, Message: conditionMessage(msg), ObservedGeneration: gen})
 	}
-	set("Ready", true, "ReconcileCompleted", fmt.Sprintf("calculated=%d current=%d mode=%s", in.calculated, in.current, in.mode))
+	calculated := strconv.Itoa(int(in.calculated))
+	if !in.capacityOK {
+		calculated = "incomplete"
+	}
+	set("Ready", true, "ReconcileCompleted", fmt.Sprintf("calculated=%s current=%d mode=%s", calculated, in.current, in.mode))
+	capOK, capReason, capMsg := capacityCondition(autoscaler.Spec)
+	set("CapacityConfigured", capOK, capReason, capMsg)
 	if in.telemetry == "measured" {
 		set("TelemetryAvailable", true, "Measured", "the current request rate was measured")
 	} else {
@@ -1516,6 +1549,8 @@ func (r *PredictiveAutoscalerReconciler) updateStatus(ctx context.Context, autos
 		set("ScalingActive", false, "Conflict", "another replica writer targets the Deployment: "+strings.Join(in.conflicts, ", "))
 	case in.guard != "":
 		set("ScalingActive", false, "GuardAborted", in.guard)
+	case !in.capacityOK:
+		set("ScalingActive", false, "CapacityMissing", "holding the current replica count: no per-replica capacity is configured")
 	case in.keepCurrent:
 		set("ScalingActive", false, "TelemetryHold", "holding the current replica count: the current request rate is unavailable")
 	default:
@@ -1557,6 +1592,7 @@ func (r *PredictiveAutoscalerReconciler) transitionEvents(a *autoscalerv1alpha1.
 		"TelemetryAvailable": {"TelemetryUnavailable", "TelemetryRestored"},
 		"ForecastAvailable":  {"ForecastUnavailable", "ForecastRestored"},
 		"ScalingActive":      {"ScalingInactive", "ScalingActive"},
+		"CapacityConfigured": {"CapacityNotConfigured", "CapacityConfigured"},
 		"Ready":              {"ReconcileFailed", "ReconcileRecovered"},
 	}
 	for _, c := range cur {

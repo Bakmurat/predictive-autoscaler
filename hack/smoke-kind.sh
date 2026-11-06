@@ -228,7 +228,7 @@ spec:
   metrics:
     requests:
       enabled: true
-      targetRPS: 4
+      capacityPerReplica: "4"
       source: {preset: prometheus, query: '$QUERY'}
   prediction: {updateIntervalSeconds: 60, horizonMinutes: 60, leadTimeMinutes: 15}
 EOF

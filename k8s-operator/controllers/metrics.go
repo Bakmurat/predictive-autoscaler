@@ -160,7 +160,7 @@ var (
 // conditionMetricTypes are the condition types exported by conditionGauge (every type updateStatus sets).
 var conditionMetricTypes = []string{
 	"Ready", "TelemetryAvailable", "ForecastAvailable", "ConflictDetected", "VPAInterference", "ScalingActive",
-	"ScaleDownHeadroom",
+	"ScaleDownHeadroom", "CapacityConfigured",
 }
 
 // recordConditionMetrics publishes an autoscaler's persisted conditions (a type it does not carry has no series) and

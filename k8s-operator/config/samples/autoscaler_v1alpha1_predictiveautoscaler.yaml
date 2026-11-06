@@ -2,8 +2,9 @@
 #
 # The operator scales the target Deployment to
 #   desired = clamp(max(forecast replicas, reactive replicas), minReplicas, maxReplicas)
-# where the reactive part is the current request rate divided by targetRPS, and the forecast part comes from the
-# forecasting service (ml-api) for the next leadTimeMinutes. Scale-up is immediate; scale-down is stabilized.
+# where the reactive part is the current request rate divided by capacityPerReplica, and the forecast part divides the
+# forecasting service's (ml-api) peak for the next leadTimeMinutes by the same capacity. Scale-up is immediate;
+# scale-down is stabilized. Without capacityPerReplica nothing is calculated and the replica count is held.
 #
 # Requirements in this version: the target's request rate must be visible as Istio's
 # istio_requests_total{reporter="destination"} in a Prometheus-compatible store, and a model must have been trained
@@ -28,7 +29,7 @@ spec:
   metrics:
     requests:
       enabled: true          # required: without it the operator cannot forecast and runs reactive-only
-      targetRPS: 200         # requests per second one pod handles at the desired utilization
+      capacityPerReplica: "200"  # requests per second one ready replica serves within its SLO (measure it; decimals allowed)
   prediction:
     enabled: true
     horizonMinutes: 60       # how far ahead the forecasting service predicts

@@ -26,7 +26,7 @@ evidence. A check is never redefined after its result is seen.
   | `recommend` | Recommend |
   | `conflict` | Active, plus a deliberate HPA during check C2 |
 
-- **Traffic:** a 24-hour diurnal cycle with two short spikes per day, at a demonstration capacity (`targetRPS`). Its
+- **Traffic:** a 24-hour diurnal cycle with two short spikes per day, at a demonstration capacity (`capacityPerReplica`). Its
   purpose is to exercise scale-up and scale-down repeatedly, not to model a real service.
 - **Training:** serialized and at most one at a time. Models live on the chart's PVC.
 

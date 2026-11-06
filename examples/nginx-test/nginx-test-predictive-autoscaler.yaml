@@ -40,7 +40,7 @@ spec:
     # enabled must be true: with it unset or false the operator cannot forecast and runs reactive-only.
     requests:
       enabled: true
-      targetRPS: 300      # capacity of one pod in requests per second (same threshold as the KEDA fallback)
+      capacityPerReplica: "300"  # requests per second one ready replica serves (same threshold as the KEDA fallback)
 
   prediction:
     horizonMinutes: 60          # ML API predicts 1 hour ahead (full context)

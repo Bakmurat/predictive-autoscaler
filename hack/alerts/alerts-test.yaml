@@ -71,8 +71,20 @@ tests:
       - {eval_time: 25m, alertname: PredictiveAutoscalerOperatorDown, exp_alerts: []}
 
   - name: forecast unavailable after two hours, never for disabled forecasting or another installation
+    # web falls back to the measured rate (fallback=reactive); cart has no per-replica capacity, so the operator holds
+    # instead and requests no forecast (fallback=capacity_hold). The two get different descriptions.
     interval: 1m
     input_series:
+      - series: 'predictive_autoscaler_condition{job="pa-predictive-autoscaler-operator-metrics", pa_install_namespace="pa-system", instance="10.0.0.11:8080", pod="pa-op-1", namespace="shop", autoscaler="web", type="CapacityConfigured", status="False"}'
+        values: '0x135'
+      - series: 'predictive_autoscaler_condition{job="pa-predictive-autoscaler-operator-metrics", pa_install_namespace="pa-system", instance="10.0.0.11:8080", pod="pa-op-1", namespace="shop", autoscaler="cart", type="ForecastAvailable", status="True"}'
+        values: '0x135'
+      - series: 'predictive_autoscaler_forecasting_enabled{job="pa-predictive-autoscaler-operator-metrics", pa_install_namespace="pa-system", instance="10.0.0.11:8080", pod="pa-op-1", namespace="shop", autoscaler="cart"}'
+        values: '1x135'
+      - series: 'predictive_autoscaler_condition{job="pa-predictive-autoscaler-operator-metrics", pa_install_namespace="pa-system", instance="10.0.0.11:8080", pod="pa-op-1", namespace="shop", autoscaler="cart", type="CapacityConfigured", status="False"}'
+        values: '1x125 0x10'
+      - series: 'predictive_autoscaler_condition{job="pa-predictive-autoscaler-operator-metrics", pa_install_namespace="other", instance="10.0.1.11:8080", pod="pa-op-9", namespace="shop", autoscaler="web", type="CapacityConfigured", status="False"}'
+        values: '1x135'
       - series: 'predictive_autoscaler_condition{job="pa-predictive-autoscaler-operator-metrics", pa_install_namespace="pa-system", instance="10.0.0.11:8080", pod="pa-op-1", namespace="shop", autoscaler="web", type="ForecastAvailable", status="True"}'
         values: '0x125 1x10'
       - series: 'predictive_autoscaler_forecasting_enabled{job="pa-predictive-autoscaler-operator-metrics", pa_install_namespace="pa-system", instance="10.0.0.11:8080", pod="pa-op-1", namespace="shop", autoscaler="web"}'
@@ -90,10 +102,15 @@ tests:
       - eval_time: 121m
         alertname: PredictiveAutoscalerForecastUnavailable
         exp_alerts:
-          - exp_labels: {severity: info, pa_release: pa, pa_release_namespace: pa-system, namespace: shop, autoscaler: web}
+          - exp_labels: {severity: info, pa_release: pa, pa_release_namespace: pa-system, namespace: shop, autoscaler: web, fallback: reactive}
             exp_annotations:
               summary: "shop/web: no forecast used"
-              description: "Decisions use the measured rate only. Expected until the first training has enough history; autoscalers with spec.prediction.enabled=false never alert."
+              description: "Decisions use the measured rate only. Expected until the first training has enough history. Autoscalers with spec.prediction.enabled=false never alert."
+          - exp_labels: {severity: info, pa_release: pa, pa_release_namespace: pa-system, namespace: shop, autoscaler: cart, fallback: capacity_hold}
+            exp_annotations:
+              summary: "shop/cart: no forecast used"
+              description: "No per-replica capacity is configured (CapacityConfigured=False, reason CapacityMissing): no forecast is requested and the replica count is held, not scaled on the measured rate. Set spec.metrics.requests.capacityPerReplica. Autoscalers with spec.prediction.enabled=false never alert."
+      # cart gets a capacity at 126m: its capacity_hold alert resolves; a reactive one starts its own two hours.
       - {eval_time: 128m, alertname: PredictiveAutoscalerForecastUnavailable, exp_alerts: []}
 
   - name: model staleness fires while a stale model serves and recovers after retraining or when forecasts stop

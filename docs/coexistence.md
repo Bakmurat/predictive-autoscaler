@@ -38,7 +38,7 @@ sync and the workload flaps between their answers.
 - **VerticalPodAutoscaler:** a VPA on the target in any mode except `Off` is reported as `VPAInterference=True` with a
   warning event, and scaling continues. No mode means `Auto`. `Initial` also changes requests (on pods created by
   scale-ups), and the in-place modes change running pods without recreating them. A VPA does not own the replica count,
-  but changing requests changes the per-pod capacity that `targetRPS` assumes. Tune the two together, or use `Off` to keep
+  but changing requests changes the per-replica capacity that `capacityPerReplica` assumes. Tune the two together, or use `Off` to keep
   only the VPA's recommendations. When the check could not complete, the condition is `Unknown` (reason `CheckFailed`)
   rather than `False`.
 - **Recommend mode** (the default) reports conflicts in the same conditions and writes nothing anyway. A

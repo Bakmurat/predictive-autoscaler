@@ -28,6 +28,7 @@ Exit status: 0 done, 1 a check failed (nothing further was changed), 2 usage. ku
 
 import argparse
 import copy
+import decimal
 import json
 import os
 import subprocess
@@ -151,14 +152,43 @@ def replacement_for(legacy, name):
     return {"apiVersion": f"{NEW_GROUP}/v1alpha1", "kind": "PredictiveAutoscaler", "metadata": out_meta, "spec": spec}
 
 
+QUANTITY_SUFFIXES = {"": 1, "m": decimal.Decimal("0.001"), "k": 10**3, "M": 10**6, "G": 10**9, "T": 10**12, "P": 10**15,
+                     "E": 10**18, "Ki": 2**10, "Mi": 2**20, "Gi": 2**30, "Ti": 2**40, "Pi": 2**50, "Ei": 2**60}
+
+
+def quantity(v):
+    """A Kubernetes quantity (int, or a string such as "12.5", "500m", "1e3") as a Decimal; None when it is not one."""
+    if isinstance(v, bool) or v is None:
+        return None
+    if isinstance(v, int):
+        return decimal.Decimal(v)
+    if not isinstance(v, str):
+        return None
+    for suffix in sorted(QUANTITY_SUFFIXES, key=len, reverse=True):
+        if suffix and v.endswith(suffix):
+            num, mult = v[:-len(suffix)], QUANTITY_SUFFIXES[suffix]
+            break
+    else:
+        num, mult = v, 1
+    try:
+        return decimal.Decimal(num) * decimal.Decimal(mult)
+    except decimal.InvalidOperation:
+        return None
+
+
 def spec_differences(legacy_spec, new_spec, path=""):
-    """Every field set in the legacy spec must have the same value in the replacement (the server may add defaults)."""
+    """Every field set in the legacy spec must have the same value in the replacement (the server may add defaults).
+    A legacy metrics.requests.targetRPS may be carried as the same value in capacityPerReplica (its replacement)."""
     diffs = []
     for k, v in legacy_spec.items():
         p = f"{path}.{k}" if path else k
         if p in ("mode", "targetDeployment.namespace"):
             continue
         nv = new_spec.get(k) if isinstance(new_spec, dict) else None
+        if p == "metrics.requests.targetRPS" and nv is None and isinstance(new_spec, dict):
+            carried = quantity(new_spec.get("capacityPerReplica"))
+            if carried is not None and carried == quantity(v):
+                continue
         if isinstance(v, dict) and isinstance(nv, dict):
             diffs += spec_differences(v, nv, p)
         elif v != nv:
@@ -236,6 +266,31 @@ def identity_problems(new, entry):
     return problems + spec_differences(src["spec"], new.get("spec") or {})
 
 
+def missing_capacity(o):
+    """True when the object sets neither metrics.requests.capacityPerReplica nor a positive targetRPS."""
+    requests = ((o.get("spec") or {}).get("metrics") or {}).get("requests") or {}
+    return requests.get("capacityPerReplica") is None and not requests.get("targetRPS")
+
+
+def capacity_problems(new):
+    """What keeps a replacement from having a per-replica capacity, as an action to take (empty when it has one). The
+    operator calculates nothing without one, so waiting never fixes it, and --allow-reactive does not waive it."""
+    rep = f"{new['metadata']['namespace']}/{new['metadata']['name']}"
+    if missing_capacity(new):
+        return [f"no per-replica capacity, so the operator recommends nothing (waiting will not change that): measure "
+                f"the requests per second one ready replica serves within its SLO (docs/configuration.md, Measuring "
+                f"capacityPerReplica) and set it on the replacement {rep} only, e.g. "
+                f"kubectl -n {new['metadata']['namespace']} patch {NEW} {new['metadata']['name']} --type merge "
+                f"-p '{{\"spec\":{{\"metrics\":{{\"requests\":{{\"capacityPerReplica\":\"<rps>\"}}}}}}}}'. Leave the "
+                f"legacy object unchanged"]
+    c = condition_at(new, "CapacityConfigured", new["metadata"].get("generation"))
+    if c.get("status") != "True":
+        return [f"CapacityConfigured is {c.get('status')} for generation {new['metadata'].get('generation')} "
+                f"({c.get('reason', '')}): fix spec.metrics.requests on the replacement {rep} (set capacityPerReplica "
+                f"or targetRPS, not both) and check that the operator is at CRD revision 3 or later"]
+    return []
+
+
 def check_replacement(kube, entry, legacy_keys, allow_reactive, legacy_conflicts_ok=True):
     """Problems with one replacement in Recommend mode (empty when ready), and the object as read:
     - it exists, with the provenance of its recorded source (namespace/name and UID);
@@ -243,6 +298,7 @@ def check_replacement(kube, entry, legacy_keys, allow_reactive, legacy_conflicts
     - spec.mode and status.mode are Recommend;
     - the operator observed its current generation: Ready, TelemetryAvailable and (unless allow_reactive)
       ForecastAvailable are True for it, and ConflictDetected is False or names only inventoried legacy PAs;
+    - it has a per-replica capacity with CapacityConfigured True (never waived: see capacity_problems);
     - a recommendation is in its status."""
     src, rep = entry["source"], entry["replacement"]
     new = kube.get(NEW, rep["namespace"], rep["name"])
@@ -267,7 +323,9 @@ def check_replacement(kube, entry, legacy_keys, allow_reactive, legacy_conflicts
                                 f"{w.get('namespace', '')}/{w.get('name')}")
     elif c.get("status") != "False":
         problems.append(f"ConflictDetected is {c.get('status')} for generation {gen} ({c.get('reason', '')})")
-    if st.get("calculatedReplicas") is None:
+    capacity = capacity_problems(new)
+    problems += capacity
+    if st.get("calculatedReplicas") is None and not capacity:
         problems.append("no recommendation in status yet")
     return problems, new
 
@@ -371,9 +429,12 @@ def cmd_prepare(kube, args):
                                   f"{ref(src)}: plan again with --rename")
             print(f"exists: {NEW}/{rep['namespace']}/{rep['name']}")
             continue
-        kube.run("create", "-f", "-", stdin=json.dumps(replacement_for(src, rep["name"])))
+        new = replacement_for(src, rep["name"])
+        kube.run("create", "-f", "-", stdin=json.dumps(new))
         created += 1
         print(f"created: {NEW}/{rep['namespace']}/{rep['name']} (Recommend) from {LEGACY}/{ref(src)}")
+        if missing_capacity(new):
+            print(f"    - {capacity_problems(new)[0]}")
     print(f"prepare: {created} created. Next: train for each new autoscaler, then verify.")
     return 0
 
