@@ -28,13 +28,13 @@ GRACE = 720                                # settlement 120 + grace 600
 class Feed:
     """Builds evidence for one candidate: issuances and outcomes with journal sequence numbers."""
 
-    def __init__(self, model="seasonal_naive", recipe="r"):
-        self.model, self.recipe, self.seq = model, recipe, 0
-        self.ledger = T.new_ledger(EPOCH, model, recipe, L)
+    def __init__(self, model="seasonal_naive", recipe="r", epoch=EPOCH):
+        self.model, self.recipe, self.seq, self.epoch = model, recipe, 0, epoch
+        self.ledger = T.new_ledger(epoch, model, recipe, L)
 
     def issue(self, origin, *, mode="prospective", bounded=True, recipe=None):
         self.seq += 1
-        self.ledger = T.note_issuance(self.ledger, seq=self.seq, issuance_id=f"iss-{self.seq}", epoch=EPOCH,
+        self.ledger = T.note_issuance(self.ledger, seq=self.seq, issuance_id=f"iss-{self.seq}", epoch=self.epoch,
                                       model=self.model, recipe=recipe or self.recipe, origin=origin,
                                       window_end=origin + L, deadline_s=origin + L + GRACE, lead_s=L, mode=mode,
                                       bounded=bounded)
@@ -43,7 +43,7 @@ class Feed:
     def outcome(self, seq, origin, *, covered=True, mode="prospective", status="scored", bounded=True, y=5.0,
                 recipe=None):
         upper = (y + 1.0 if covered else y - 1.0) if bounded else None
-        cal = CalibrationRecord(seq, EPOCH, self.model, recipe or self.recipe, f"iss-{seq}", origin, origin + L, 4.0,
+        cal = CalibrationRecord(seq, self.epoch, self.model, recipe or self.recipe, f"iss-{seq}", origin, origin + L, 4.0,
                                 upper, status, y if status == "scored" else None)
         r = T.EvidenceRecord(cal, mode, (origin + L) * 1000, (1.0, 2.0, 3.0) if status == "scored" else None)
         self.ledger = T.note_outcome(self.ledger, r, lead_s=L, nominal_miscoverage=NOMINAL, recent_n=32)
@@ -73,8 +73,8 @@ def mostly(t, every=10):
     return (t // L) % every != 0
 
 
-def good(model="seasonal_naive", hours=72, recipe="r"):
-    return Feed(model, recipe).run(hours, covered=lambda t: mostly(t, 20))  # 95%: above 0.90 - 0.05
+def good(model="seasonal_naive", hours=72, recipe="r", epoch=EPOCH):
+    return Feed(model, recipe, epoch).run(hours, covered=lambda t: mostly(t, 20))  # 95%: above 0.90 - 0.05
 
 
 NOW = START + 72 * H
@@ -294,7 +294,7 @@ def test_windows_are_whole_hours_from_the_first_hour_inside():
 
 def test_hysteresis_needs_24_hours_and_32_new_bounds():
     led = T.new_ledger(EPOCH, "seasonal_naive", "r", L)
-    h = T.step(T.new_hysteresis("r"), True, led, 0, TS)
+    h = T.step(T.new_hysteresis("r", EPOCH), True, led, 0, TS)
     assert h["trusted"] and h["ever_trusted"]                        # the first promotion is immediate
     h = T.step(h, False, led, 100, TS)
     assert not h["trusted"] and h["demoted_at_s"] == 100
@@ -314,8 +314,8 @@ def test_hysteresis_needs_24_hours_and_32_new_bounds():
 
 # --- fallback rungs, the paired gate and selection hysteresis -----------------------------------------------------
 
-def pairs_for(challenger, chal_loss, base_loss, n=200, hours=96, start=START - 24 * H, recipe="r"):
-    p = T.new_pairs(EPOCH, challenger, recipe, "r")
+def pairs_for(challenger, chal_loss, base_loss, n=200, hours=96, start=START - 24 * H, recipe="r", epoch=EPOCH):
+    p = T.new_pairs(epoch, challenger, recipe, "r")
     seq, every = 0, max(L, hours * H // n // L * L)
     for i in range(n):
         origin = start + i * every
@@ -323,7 +323,7 @@ def pairs_for(challenger, chal_loss, base_loss, n=200, hours=96, start=START - 2
             seq += 1
             y = 5.0
             upper = y + loss / 0.1 if loss else y                    # pinball (1 - tau) x (U - Y) = 0.1 x margin
-            cal = CalibrationRecord(seq, EPOCH, model, rc, f"iss-{i}", origin, origin + L, 4.0, upper, "scored", y)
+            cal = CalibrationRecord(seq, epoch, model, rc, f"iss-{i}", origin, origin + L, 4.0, upper, "scored", y)
             p = T.note_pair(p, T.EvidenceRecord(cal, "prospective", 0, None), lead_s=L, nominal_miscoverage=NOMINAL)
     return p
 
@@ -506,3 +506,43 @@ def test_evidence_records_come_from_the_journal_with_their_mode_and_step_errors(
     data = c.canonical_json(bundle)
     with pytest.raises(T.TrustError):
         T.EvidenceRecord.from_journal(dataclasses.replace(iss, bundle=data, bundle_sha256=c.sha256_hex(data)), out)
+
+
+# --- epoch binding (Codex review on #24) -------------------------------------------------------------------------
+
+OTHER = "f" * 64
+
+
+def test_paired_evidence_of_another_epoch_is_refused_even_with_matching_recipes():
+    # Codex repro: ledgers in epoch eeee..., pairs in ffff... with matching recipes; selected=statistical after the hold.
+    cands = [inputs(good()), inputs(good("statistical"))]
+    foreign = {"statistical": pairs_for("statistical", 0.5, 1.0, epoch=OTHER)}
+    with pytest.raises(T.TrustError):
+        settled(cands, foreign, {"statistical": COSTS})
+    swapped = pairs_for("statistical", 0.5, 1.0)
+    swapped["baseline"], swapped["challenger"] = "statistical", "seasonal_naive"
+    with pytest.raises(T.TrustError):                                       # challenger/baseline identities too
+        settled(cands, {"statistical": swapped}, {"statistical": COSTS})
+    renamed = {**pairs_for("lstm", 0.5, 1.0), "recipes": {"lstm": "r", "seasonal_naive": "r"}}
+    with pytest.raises(T.TrustError):                                       # lstm's pairs filed under statistical
+        settled(cands, {"statistical": renamed}, {"statistical": COSTS})
+
+
+def test_candidates_must_share_one_epoch():
+    with pytest.raises(T.TrustError):
+        verdict(good(), good("statistical", epoch=OTHER))
+
+
+def test_an_epoch_change_resets_hysteresis_and_selection():
+    cands = [inputs(good()), inputs(good("statistical"))]
+    pairs, costs = {"statistical": pairs_for("statistical", 0.5, 1.0)}, {"statistical": COSTS}
+    _, h = settled(cands, pairs, costs)
+    assert h[T.SELECTION]["selected"] == "statistical" and h["statistical"]["trusted"]
+    fresh = [inputs(good(epoch=OTHER)), inputs(good("statistical", epoch=OTHER))]
+    fresh_pairs = {"statistical": pairs_for("statistical", 0.5, 1.0, epoch=OTHER)}
+    v, h2 = T.evaluate(fresh, h, glob(NOW + 1), TS, pairs=fresh_pairs, costs=costs)
+    assert h2[T.SELECTION]["epoch"] == OTHER and h2[T.SELECTION]["entry_since"] == {"statistical:r": NOW + 1}
+    assert v.selected == "seasonal_naive"                                  # the old epoch's selection did not carry
+    assert all(h2[m]["epoch"] == OTHER for m in ("seasonal_naive", "statistical"))
+    demoted = T.step({**h["statistical"], "trusted": True, "ever_trusted": True}, False, fresh[1].ledger, NOW, TS)
+    assert demoted["epoch"] == OTHER and not demoted["ever_trusted"]       # old hysteresis never applies

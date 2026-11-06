@@ -29,11 +29,12 @@ Gates per candidate (all thresholds are TrustSettings parameters, fingerprinted 
                     (scored / (scored + unscorable + overdue)) and (b) the expected forecast opportunities issued
                     (issued origins / grid origins since the first issuance); None (nothing to count) fails
                                                                                                else DataUnavailable
-Hysteresis (per candidate, bound to its recipe): a trusted candidate failing any gate is demoted at once (Degraded).
+Hysteresis (per candidate, bound to its epoch and recipe): a trusted candidate failing any gate is demoted at once (Degraded).
 Once demoted, it is promoted again only after its gates have held for repromotion_hours and >= repromotion_windows new
 prospective gate bounds have matured since the demotion; never in the same evaluation as the demotion.
 
-Challenger promotion (paired, against the trusted daily naive, both recipes bound): >= challenger_min_pairs paired
+Challenger promotion (paired, against the trusted daily naive; the paired evidence must belong to the candidates'
+epoch, name the challenger and the naive, and carry both recipes): >= challenger_min_pairs paired
 prospective gate bounds whose retained window ends SPAN >= challenger_min_hours, mean pinball loss <=
 challenger_loss_ratio x the naive's, and the same-policy replay costs (shortage, replica-time, from the policy
 simulator) each <= challenger_cost_ratio x the naive's. A zero naive loss keeps the naive. Without the costs nothing
@@ -43,7 +44,8 @@ Selection (fallback order lstm -> statistical -> seasonal_naive -> reactive-only
 failure (the selected candidate, or the naive it was compared with, not trusted) falls back at once; a challenger is
 selected only after its promotion criteria have held continuously for repromotion_hours; once selected it is kept
 until its paired loss is worse than challenger_exit_loss_ratio x the naive's or its costs fail. Marginal superiority
-therefore cannot make the selection flap. Never an untrusted naive because a richer model failed.
+therefore cannot make the selection flap. The selection state is bound to the epoch: a new epoch starts it over. Never
+an untrusted naive because a richer model failed.
 PredictionReady additionally needs the activation evidence this service can check (versioned replay suite, startup
 budget): it means "ready to activate"; Recommend still makes no writes, and it says nothing about a workload's SLO.
 """
@@ -398,13 +400,13 @@ class Verdict:
     promoted: Mapping[str, bool] = field(default_factory=dict)
 
 
-def new_hysteresis(recipe: str) -> dict:
-    return {"recipe": recipe, "trusted": False, "ever_trusted": False, "demoted_at_s": None, "bounds_at_demotion": 0,
+def new_hysteresis(recipe: str, epoch: str) -> dict:
+    return {"epoch": epoch, "recipe": recipe, "trusted": False, "ever_trusted": False, "demoted_at_s": None, "bounds_at_demotion": 0,
             "gates_ok_since_s": None}
 
 
-def new_selection() -> dict:
-    return {"selected": None, "recipe": None, "since_s": None, "switches": 0, "entry_since": {}}
+def new_selection(epoch: str) -> dict:
+    return {"epoch": epoch, "selected": None, "recipe": None, "since_s": None, "switches": 0, "entry_since": {}}
 
 
 def candidate_gates(ci: CandidateInputs, g: Global, t: TrustSettings) -> Tuple[Dict[str, bool], dict]:
@@ -450,8 +452,9 @@ _GATE_REASON = (("identity", "IdentityMismatch"), ("state", "StateUnavailable"),
 
 
 def step(hyst: dict, gates_ok: bool, ledger: dict, now_s: int, t: TrustSettings) -> dict:
-    """The hysteresis transition for one evaluation (a state of another recipe starts over)."""
-    h = dict(hyst) if hyst.get("recipe") == ledger["recipe"] else new_hysteresis(ledger["recipe"])
+    """The hysteresis transition for one evaluation (a state of another epoch or recipe starts over)."""
+    same = (hyst.get("epoch"), hyst.get("recipe")) == (ledger["epoch"], ledger["recipe"])
+    h = dict(hyst) if same else new_hysteresis(ledger["recipe"], ledger["epoch"])
     bounds = ledger["totals"]["prospective_gate_bounded"]
     if h["trusted"]:
         if not gates_ok:                                  # demote at once
@@ -552,15 +555,22 @@ def evaluate(cands: Sequence[CandidateInputs], hyst: Mapping[str, dict], g: Glob
     by_model = {c.model: c for c in cands}
     if set(by_model) - set(FALLBACK_ORDER):
         raise TrustError(f"unknown candidates {set(by_model) - set(FALLBACK_ORDER)}")
+    epochs = {c.ledger["epoch"] for c in cands}
+    if len(epochs) > 1 or any(c.ledger["model"] != c.model for c in cands):
+        raise TrustError("the candidates' evidence belongs to different epochs or models")
+    epoch = next(iter(epochs), None)
     for m, p in (pairs or {}).items():
-        if m in by_model and (p["recipes"].get(m) != by_model[m].recipe or
-                              (NAIVE in by_model and p["recipes"].get(NAIVE) != by_model[NAIVE].recipe)):
-            raise TrustError(f"the paired evidence of {m} belongs to another recipe")
+        if m not in by_model or m == NAIVE:
+            continue
+        identity = (p["epoch"], p["challenger"], p["baseline"], p["recipes"].get(m), p["recipes"].get(NAIVE))
+        want = (epoch, m, NAIVE, by_model[m].recipe, by_model[NAIVE].recipe if NAIVE in by_model else None)
+        if identity != want:
+            raise TrustError(f"the paired evidence of {m} belongs to another epoch, model or recipe")
     new_h, verdicts = {}, {}
     for model, ci in by_model.items():
         gates, info = candidate_gates(ci, g, t)
         ok = all(gates.values())
-        h = step(hyst.get(model, new_hysteresis(ci.recipe)), ok, ci.ledger, g.now_s, t)
+        h = step(hyst.get(model, new_hysteresis(ci.recipe, epoch)), ok, ci.ledger, g.now_s, t)
         new_h[model] = h
         reason = next((r for gname, r in _GATE_REASON if not gates[gname]), "Ready")
         if h["trusted"]:
@@ -579,7 +589,10 @@ def evaluate(cands: Sequence[CandidateInputs], hyst: Mapping[str, dict], g: Glob
                                            info["coverage_all"], info["availability"],
                                            info["prediction_availability"], info["overdue"], info["prospective"],
                                            info["replay"], None if h["trusted"] else info["eta"])
-    sel, promoted = select(hyst.get(SELECTION, new_selection()), verdicts, pairs or {}, costs or {}, g.now_s, t)
+    prior = hyst.get(SELECTION)
+    if prior is None or prior.get("epoch") != epoch:          # a new epoch: no selection carries over
+        prior = new_selection(epoch)
+    sel, promoted = select(prior, verdicts, pairs or {}, costs or {}, g.now_s, t)
     new_h[SELECTION] = sel
     selected = sel["selected"]
     if selected is None:                                  # report the candidate furthest along, in fallback order on ties
