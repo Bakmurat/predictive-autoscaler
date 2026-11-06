@@ -157,6 +157,9 @@ carries the release and its namespace. */}}
 {{- $cutoff := printf "predictive_autoscaler_model_training_cutoff_timestamp_seconds{%s}" $op -}}
 {{- $issued := printf "predictive_autoscaler_forecast_issued_timestamp_seconds{%s}" $op -}}
 {{- $base := dict "pa_release" .Release.Name "pa_release_namespace" $ns -}}
+{{- /* No forecast used (forecasting enabled), split by why: a reactive fallback, or a hold for a missing capacity. */ -}}
+{{- $noForecast := printf "((%s == 0) unless on (namespace, autoscaler) (max by (namespace, autoscaler) (predictive_autoscaler_forecasting_enabled{%s}) == 0))" (printf $cond "ForecastAvailable" "True") $op -}}
+{{- $noCapacity := printf $cond "CapacityConfigured" "False" -}}
 {{- $rules := list
   (dict "alert" "PredictiveAutoscalerNotReady" "for" $a.notReadyFor "severity" "warning"
         "expr" (printf "%s == 0" (printf $cond "Ready" "True"))
@@ -167,9 +170,9 @@ carries the release and its namespace. */}}
         "summary" "{{ $labels.namespace }}/{{ $labels.autoscaler }}: request rate unavailable, replica count held"
         "description" "The operator cannot measure the target's request rate and holds the current replica count.")
   (dict "alert" "PredictiveAutoscalerForecastUnavailable" "for" $a.forecastFor "severity" "info"
-        "expr" (printf "(%s == 0) unless on (namespace, autoscaler) (max by (namespace, autoscaler) (predictive_autoscaler_forecasting_enabled{%s}) == 0)" (printf $cond "ForecastAvailable" "True") $op)
+        "expr" (printf "label_replace(%s unless on (namespace, autoscaler) (%s == 1), \"fallback\", \"reactive\", \"\", \"\") or label_replace(%s and on (namespace, autoscaler) (%s == 1), \"fallback\", \"capacity_hold\", \"\", \"\")" $noForecast $noCapacity $noForecast $noCapacity)
         "summary" "{{ $labels.namespace }}/{{ $labels.autoscaler }}: no forecast used"
-        "description" "Decisions use the measured rate only. Expected until the first training has enough history; autoscalers with spec.prediction.enabled=false never alert.")
+        "description" "{{ if eq $labels.fallback \"capacity_hold\" }}No per-replica capacity is configured (CapacityConfigured=False, reason CapacityMissing): no forecast is requested and the replica count is held, not scaled on the measured rate. Set spec.metrics.requests.capacityPerReplica.{{ else }}Decisions use the measured rate only. Expected until the first training has enough history.{{ end }} Autoscalers with spec.prediction.enabled=false never alert.")
   (dict "alert" "PredictiveAutoscalerConflict" "for" $a.conflictFor "severity" "warning"
         "expr" (printf "%s == 1" (printf $cond "ConflictDetected" "True"))
         "summary" "{{ $labels.namespace }}/{{ $labels.autoscaler }}: another replica writer targets the Deployment"

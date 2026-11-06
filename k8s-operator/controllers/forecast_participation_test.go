@@ -96,6 +96,7 @@ func TestCalculatePredictedReplicas_ElapsedHorizonIsUnusable(t *testing.T) {
 	a := &autoscalerv1alpha1.PredictiveAutoscaler{}
 	a.Spec.MinReplicas, a.Spec.MaxReplicas = 1, 10
 	a.Spec.Prediction.HorizonMinutes, a.Spec.Prediction.LeadTimeMinutes = 60, 20
+	a.Spec.Metrics.Requests = &autoscalerv1alpha1.RequestsMetric{TargetRPS: 10}
 	p := &MLPredictionResponse{Predictions: []float64{600, 600, 600, 600, 600, 600}, Confidence: 0.9}
 	p.anchorAt = time.Now().Add(-50 * time.Minute)
 	if _, ok := r.calculatePredictedReplicas(a, p); ok {

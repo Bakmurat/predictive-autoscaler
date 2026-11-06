@@ -9,7 +9,7 @@ metadata:
     argocd.argoproj.io/sync-wave: "-1"
     controller-gen.kubebuilder.io/version: v0.20.1
   labels:
-    autoscaling.devkuban.com/crd-revision: "2"
+    autoscaling.devkuban.com/crd-revision: "3"
   name: predictiveautoscalers.autoscaling.devkuban.com
 spec:
   group: autoscaling.devkuban.com
@@ -86,8 +86,9 @@ spec:
                         default: 10
                         description: |-
                           HeadroomPercent is the spare request capacity a scale-down must leave in the resulting fleet: Active mode
-                          scales down to n replicas only while the measured request rate is at most n x targetRPS x (1 - headroom/100),
-                          so the smallest count it scales down to is ceil(rate / (targetRPS x (1 - headroom/100))). It prevents
+                          scales down to n replicas only while the measured request rate is at most n x capacity x (1 - headroom/100),
+                          where capacity is the per-replica capacity (spec.metrics.requests.capacityPerReplica or targetRPS), so the
+                          smallest count it scales down to is ceil(rate / (capacity x (1 - headroom/100))). It prevents
                           oscillation at a replica boundary (a scale-down that the next small rise undoes). Scale-up is unaffected.
                           0 disables it. Default 10.
                         format: int32
@@ -139,6 +140,16 @@ spec:
                   requests:
                     description: Request rate metrics configuration
                     properties:
+                      capacityPerReplica:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: |-
+                          CapacityPerReplica is the request rate, in requests per second, that one ready replica serves within its SLO
+                          (for example its p99 latency target) under the real request mix. Decimals are allowed ("12.5"). Measure it with a
+                          load test of one replica; the operator never assumes a default. Greater than 0 and at most 1000000.
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
                       enabled:
                         default: false
                         description: Enabled indicates if request metrics should be
@@ -164,12 +175,23 @@ spec:
                           rule: 'self.preset == ''prometheus'' ? (has(self.query)
                             && size(self.query) > 0) : !has(self.query)'
                       targetRPS:
-                        description: TargetRPS is the target requests per second per
-                          pod
+                        description: |-
+                          TargetRPS is the integer requests per second one replica serves. Deprecated: use capacityPerReplica, which means
+                          the same and allows decimals. Setting both is rejected.
                         format: int32
                         minimum: 1
                         type: integer
                     type: object
+                    x-kubernetes-validations:
+                    - message: set capacityPerReplica or the deprecated targetRPS,
+                        not both
+                      rule: '!(has(self.capacityPerReplica) && has(self.targetRPS))'
+                    - message: capacityPerReplica must be greater than 0 and at most
+                        1000000 requests per second
+                      rule: '!has(self.capacityPerReplica) || (isQuantity(string(self.capacityPerReplica))
+                        && quantity(string(self.capacityPerReplica)).isGreaterThan(quantity(''0''))
+                        && quantity(string(self.capacityPerReplica)).compareTo(quantity(''1000000''))
+                        <= 0)'
                 type: object
               minReplicas:
                 description: MinReplicas is the minimum number of replicas
@@ -278,7 +300,8 @@ spec:
               calculatedReplicas:
                 description: |-
                   CalculatedReplicas is the decision rule's result: clamp(max(forecast, reactive), min, max), or the held count
-                  when the current request rate is unavailable.
+                  when the current request rate is unavailable. Absent while no per-replica capacity is configured: the
+                  recommendation is then incomplete (CapacityConfigured=False) and the decision holds the current count.
                 format: int32
                 type: integer
               conditions:

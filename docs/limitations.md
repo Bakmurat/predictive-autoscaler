@@ -25,7 +25,9 @@ production-ready. Known limits, most important first:
    service (helm.md). The plain manifests in `k8s-manifests/` still share one broad role and run the forecasting service
    without authentication.
 8. **Silent configuration mistakes:** ignored CRD fields (CPU, memory, resources, container), defaults that differ from
-   the README, and `metrics.requests.enabled` defaulting to `false` (see configuration.md).
+   the README, and `metrics.requests.enabled` defaulting to `false` (see configuration.md). A missing per-replica
+   capacity is no longer silent (it holds and reports `CapacityConfigured=False`), but admission does not require one
+   yet.
 9. **Heavy footprint:** the forecasting image includes TensorFlow (about 1 CPU / 1 GiB requested); the neural component
    has not shown a consistent advantage over the seasonal pattern in the evaluations so far.
 10. **No published images, chart or releases yet:** the chart is installed from the source tree (helm.md); images are

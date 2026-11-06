@@ -148,7 +148,7 @@ spec:
   metrics:
     requests:
       enabled: true
-      targetRPS: 2
+      capacityPerReplica: "2"
       source:
         preset: prometheus
         query: 'sum(rate(demo_requests_total{namespace="{{ .Namespace }}",service="{{ .Name }}",origin="soak"}[2m]))'

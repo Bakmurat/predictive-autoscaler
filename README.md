@@ -101,7 +101,7 @@ spec:
   metrics:
     requests:
       enabled: true
-      targetRPS: 300          # requests per second per pod
+      capacityPerReplica: "300"  # requests per second one ready replica serves within its SLO
   prediction:
     horizonMinutes: 60
     leadTimeMinutes: 20

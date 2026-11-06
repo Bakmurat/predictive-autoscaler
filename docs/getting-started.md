@@ -69,7 +69,7 @@ spec:
   metrics:
     requests:
       enabled: true
-      targetRPS: 100
+      capacityPerReplica: "40"
       source:
         preset: prometheus
         query: 'sum(rate(http_requests_total{namespace="{{ .Namespace }}",service="{{ .Name }}"}[2m]))'
@@ -78,15 +78,17 @@ spec:
 
 Adapt the metric and labels to your scrape. The query must return exactly one finite, non-negative series, in
 **requests per second for this Deployment**. `{{ .Name }}` is the Deployment name: use the actual Service label if it
-differs. Choose `targetRPS` from a load test of one pod at acceptable latency; 100 above is an example, not measured
-capacity. [Configuration](configuration.md) explains templates, units and nested defaults.
+differs. Set `capacityPerReplica` (requests per second, decimals allowed) from a load test of one replica within its
+SLO ([how](configuration.md#measuring-capacitypereplica)); 40 above is an example, not measured capacity. There is no
+default: without it the autoscaler calculates nothing and holds the count (`CapacityConfigured=False`).
+[Configuration](configuration.md) explains templates, units and nested defaults.
 
 ```sh
 kubectl --kubeconfig <file> --context <context> apply -f my-autoscaler.yaml
 kubectl --kubeconfig <file> --context <context> -n shop get pa web-pa -o yaml
 ```
 
-Wait for current-generation `Ready=True` and `TelemetryAvailable=True`, and `status.metricSource` with
+Wait for current-generation `Ready=True`, `CapacityConfigured=True` and `TelemetryAvailable=True`, and `status.metricSource` with
 `observedGeneration` matching `metadata.generation`. Recommend publishes `calculatedReplicas` without changing the
 Deployment. Before training, `ForecastAvailable=False` / model unavailable is expected: recommendations are reactive.
 Missing telemetry holds the replica count; it is not interpreted as zero traffic.
