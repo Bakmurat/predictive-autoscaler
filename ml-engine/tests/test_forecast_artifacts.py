@@ -283,3 +283,53 @@ def test_the_payload_carries_nothing_after_the_cutoff(series):
     p = A.fit_payload(series, series.end - 10 * DT, KS, BINDING)
     assert len(p["values"]) // 8 == series.index(series.end - 10 * DT) + 1
     assert W.FAILURE_REASONS == S.FAILURE_REASONS
+
+
+# --- lifecycle: one deadline for result and exit; shutdown races (Codex review) -----------------------------------
+
+def test_a_fit_that_sends_its_result_but_does_not_exit_is_killed_and_not_promoted(tmp_path, series, blob):
+    w = worker(tmp_path, ref="tests.c2_fit_helpers:lingering_fit", deadline_s=1.0)
+    try:
+        r = w.wait(w.submit(BINDING, S.RECIPE_E1, payload(series, artifact=blob)), timeout=60)
+    finally:
+        w.close()
+    assert (r.status, r.reason) == ("failed", "timeout") and r.artifact_sha256 is None
+    assert 1.0 <= r.finished - r.started < 4.0 and w._running == {}
+    assert A.ArtifactStore(str(tmp_path)).current(BINDING) is None
+
+
+def paused_close(w, stage):
+    """Install a hook that pauses the dispatcher at `stage` until released; returns (entered, release, threading, time)."""
+    import threading
+    import time
+    entered, release = threading.Event(), threading.Event()
+
+    def hook(at, t):
+        if at == stage:
+            entered.set()
+            assert release.wait(30)
+    w._hook = hook
+    return entered, release, threading, time
+
+
+@pytest.mark.parametrize("stage,message", [("dequeued", "before the fit started"),
+                                           ("publish", "before publication")])
+def test_close_resolves_an_admitted_fit_and_publishes_nothing(tmp_path, series, blob, stage, message):
+    w = worker(tmp_path)
+    entered, release, threading, time = paused_close(w, stage)
+    t = w.submit(BINDING, S.RECIPE_E1, payload(series, artifact=blob))
+    assert entered.wait(60)                             # dequeued (not yet started) / fitted (not yet published)
+    closer = threading.Thread(target=w.close)
+    closer.start()
+    for _ in range(3000):
+        if w._closed:
+            break
+        time.sleep(0.01)
+    assert w._closed and closer.is_alive()              # close() waits for the admitted ticket
+    release.set()
+    closer.join(60)
+    assert not closer.is_alive() and t.done.is_set()    # resolved by the time close() returned
+    assert (t.result.status, t.result.reason) == ("failed", "resource") and message in t.result.message
+    assert A.ArtifactStore(str(tmp_path)).current(BINDING) is None and w._running == {}
+    with pytest.raises(W.FitRefused):
+        w.submit(BINDING, S.RECIPE_E1, payload(series, artifact=blob))

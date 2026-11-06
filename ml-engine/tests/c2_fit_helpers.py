@@ -36,3 +36,10 @@ def history_fit(payload):
 
 def bad_reason_fit(payload):
     raise _Unavailable("whatever", "an unknown reason is reported as numeric")
+
+
+def lingering_fit(payload):
+    """Codex's repro: the result is ready, but a non-daemon thread keeps the process from exiting."""
+    import threading
+    threading.Thread(target=time.sleep, args=(60,), daemon=False).start()
+    return payload["artifact"]

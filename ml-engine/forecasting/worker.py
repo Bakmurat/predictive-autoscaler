@@ -5,9 +5,15 @@ recipe and a bounded payload; the worker runs it in a fresh spawned process, so 
 without touching the service:
   - one active or queued fit per signal: a second submit for the same signal returns the existing ticket;
   - a bounded queue (QueueFull when full, an HTTP 503 for the caller) and `max_active` concurrent fits (1 by default);
-  - each fit has a wall-clock deadline (30 s) and an address-space limit (RLIMIT_AS, 384 MiB) with one BLAS thread.
-    At the deadline the process is killed and its slot is released only after it has exited (joined): cancelled work
-    never runs alongside the next fit;
+  - each fit has ONE absolute wall-clock deadline (30 s) covering the result AND the process's exit, and an
+    address-space limit (RLIMIT_AS, 384 MiB) with one BLAS thread. A kill timer fires at the deadline, so neither the
+    wait for the result nor the wait for the exit can outlast it. A fit whose process has not exited by the deadline
+    (even after sending its result, e.g. a lingering thread) is killed, reaped and NOT promoted. The slot is released
+    only after the process has been reaped: cancelled work never runs alongside the next fit;
+  - shutdown is synchronized with admission, start, cancellation and publication: a child is started, and an artifact
+    published, only under the worker's lock and only while it is open. close() fails every queued ticket, kills
+    running children and returns only after every dequeued ticket is resolved, so no child starts and no artifact is
+    published after it returns;
   - only allowlisted recipes run, by dotted name, imported inside the fit process; this module imports no NumPy, so a
     fit process applies its limits before the numerical stack loads (unless the main module already loaded it);
   - a successful fit returns artifact bytes; the parent validates and promotes them through ArtifactStore (atomic
@@ -104,8 +110,9 @@ class FitWorker:
         self._cv = threading.Condition()
         self._queue: Deque[Ticket] = collections.deque()
         self._by_signal: Dict[str, Ticket] = {}
-        self._running: Dict[int, object] = {}
+        self._running: Dict[str, object] = {}         # signal key -> its live fit process
         self._closed = False
+        self._hook: Optional[Callable[[str, Ticket], None]] = None    # tests: pause at "dequeued" / "publish"
         self.failures: Dict[str, int] = {r: 0 for r in FAILURE_REASONS}
         self._threads = [threading.Thread(target=self._loop, name=f"fit-worker-{i}", daemon=True)
                          for i in range(max_active)]
@@ -142,7 +149,8 @@ class FitWorker:
         return ticket.result
 
     def close(self) -> None:
-        """Stop: queued fits fail (reason resource), running ones are killed; nothing is promoted afterwards."""
+        """Stop: queued fits fail (reason resource), running ones are killed; when this returns, every ticket is resolved
+        and nothing more is started or promoted."""
         with self._cv:
             self._closed = True
             dropped = list(self._queue)
@@ -155,8 +163,8 @@ class FitWorker:
         for t in dropped:
             t.result = FitResult(t.signal_key, t.recipe, "failed", "resource", "the worker was closed")
             t.done.set()
-        for th in self._threads:
-            th.join(timeout=10)
+        for th in self._threads:             # bounded: children are killed, publication refuses once closed
+            th.join()
 
     # --- execution ------------------------------------------------------------------------------------------------
 
@@ -169,6 +177,8 @@ class FitWorker:
                     return
                 t = self._queue.popleft()
             try:
+                if self._hook:
+                    self._hook("dequeued", t)
                 result = self._run(t)
             except Exception as e:                     # never lose a ticket
                 result = FitResult(t.signal_key, t.recipe, "failed", "storage", f"{type(e).__name__}: {e}")
@@ -179,43 +189,71 @@ class FitWorker:
                 del self._by_signal[t.signal_key]      # the signal may be submitted again only now
             t.done.set()
 
+    def _closed_result(self, t: Ticket, stage: str, **extra) -> FitResult:
+        return FitResult(t.signal_key, t.recipe, "failed", "resource", f"the worker was closed {stage}", **extra)
+
     def _run(self, t: Ticket) -> FitResult:
         recv, send = self._ctx.Pipe(duplex=False)
         p = self._ctx.Process(target=_child, args=(send, self.fits[t.recipe], t.payload, self.memory_bytes),
                               daemon=True)
-        started = self.clock()
-        p.start()
+        with self._cv:                                 # start only while open, and visible to close() at once
+            if self._closed:
+                send.close()
+                recv.close()
+                return self._closed_result(t, "before the fit started")
+            started = self.clock()
+            deadline = time.monotonic() + self.deadline_s
+            p.start()
+            self._running[t.signal_key] = p
         send.close()
-        with self._cv:
-            self._running[p.pid] = p
+        expired = threading.Event()
+
+        def expire():
+            expired.set()
+            p.kill()                                   # ends a pending recv (EOF) and a pending join alike
+
+        timer = threading.Timer(max(0.0, deadline - time.monotonic()), expire)
+        timer.daemon = True
+        timer.start()
         msg = None
         try:
-            if recv.poll(self.deadline_s):
+            if recv.poll(max(0.0, deadline - time.monotonic())):
                 try:
                     msg = recv.recv()
                 except (EOFError, OSError):
                     msg = None
+            p.join(max(0.0, deadline - time.monotonic()))
+            if p.is_alive():                           # the result is not enough: the process must also be gone
+                expire()
         finally:
-            if msg is None and p.is_alive():
-                p.kill()                               # the deadline passed: kill, then wait until it is gone
-            p.join()
+            p.join()                                   # reaped (after a kill this returns promptly)
+            timer.cancel()
             recv.close()
             with self._cv:
-                self._running.pop(p.pid, None)
+                self._running.pop(t.signal_key, None)
         finished = self.clock()
         base = dict(signal_key=t.signal_key, recipe=t.recipe, started=started, finished=finished)
-        if msg is None:
-            timed_out = finished - started >= self.deadline_s
-            return FitResult(**base, status="failed", reason="timeout" if timed_out else "resource",
-                             message="deadline exceeded" if timed_out else f"fit process exited {p.exitcode}")
+        if expired.is_set() or time.monotonic() > deadline:
+            return FitResult(**base, status="failed", reason="timeout",
+                             message="the fit did not finish and exit within its deadline")
+        if msg is None or p.exitcode != 0:
+            if msg is not None and msg[0] == "error":
+                return FitResult(**base, status="failed", reason=msg[1], message=msg[2])
+            return FitResult(**base, status="failed", reason="resource",
+                             message=f"fit process exited {p.exitcode} without a clean result")
         if msg[0] == "error":
             return FitResult(**base, status="failed", reason=msg[1], message=msg[2])
         _, data, cpu, rss = msg
-        try:
-            sha, promoted = self._promote(t, data)
-        except Exception as e:
-            return FitResult(**base, status="failed", reason="storage", message=f"{type(e).__name__}: {e}"[:500],
-                             cpu_seconds=cpu, max_rss_kib=rss)
+        if self._hook:
+            self._hook("publish", t)
+        with self._cv:                                 # publish only while open; close() waits for this to finish
+            if self._closed:
+                return self._closed_result(t, "before publication", started=started, finished=finished)
+            try:
+                sha, promoted = self._promote(t, data)
+            except Exception as e:
+                return FitResult(**base, status="failed", reason="storage",
+                                 message=f"{type(e).__name__}: {e}"[:500], cpu_seconds=cpu, max_rss_kib=rss)
         return FitResult(**base, status="promoted" if promoted else "unchanged", artifact_sha256=sha,
                          cpu_seconds=cpu, max_rss_kib=rss)
 
