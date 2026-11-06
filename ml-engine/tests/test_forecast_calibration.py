@@ -40,14 +40,14 @@ def policy(**kw):
 
 def rec(seq, y, base=0.0, upper=None, origin=None, status="scored", epoch=EPOCH):
     origin = seq * L if origin is None else origin
-    return CalibrationRecord(seq, epoch, f"iss-{seq}", origin, origin + L, base, upper, status,
+    return CalibrationRecord(seq, epoch, "m", "r", f"iss-{seq}", origin, origin + L, base, upper, status,
                              y if status == "scored" else None)
 
 
 def seeded(scores, p=None, **kw):
     """A state holding exactly these cohort scores (cold-start records: no bound, so the level does not move)."""
     p = p or policy(**kw)
-    s = cal.initial(p, EPOCH)
+    s = cal.initial(p, EPOCH, "m", "r")
     for i, e in enumerate(scores, 1):
         s = cal.apply(s, rec(i, y=10.0 + e, base=10.0), p)
     return s, p
@@ -92,7 +92,7 @@ def test_rank_overflow_gives_no_bound():
 
 def test_cold_start_seeds_scores_but_claims_nothing():
     p = policy(min_windows=5)
-    s = cal.initial(p, EPOCH)
+    s = cal.initial(p, EPOCH, "m", "r")
     for i in range(1, 5):
         s = cal.apply(s, rec(i, y=2.0, base=1.0), p)                     # issued without a bound
         assert cal.upper_bound(s, p, 1.0, NOW) == (None, {"n": i, "rank": cal.rank(i, s["a_e8"]),
@@ -132,7 +132,7 @@ def test_each_outcome_moves_the_level_exactly_once():
 
 def test_only_cohort_windows_calibrate():
     p = policy(lead_seconds=3 * L)
-    s = cal.initial(p, EPOCH)
+    s = cal.initial(p, EPOCH, "m", "r")
     s = cal.apply(s, rec(1, y=2.0, base=1.0, upper=1.5, origin=3 * L), p)            # cohort: origin mod L = 0
     s = cal.apply(s, rec(2, y=2.0, base=1.0, upper=1.5, origin=4 * L), p)            # overlapping: diagnostics only
     assert len(s["scores"]) == 1 and s["level_updates"] == 1
@@ -148,7 +148,7 @@ def test_unscorable_windows_neither_score_nor_move_the_level():
 
 def test_delayed_outcomes_apply_when_they_mature_and_never_rewrite_issued_bounds():
     p = policy(min_windows=3, nominal_bps=2500)
-    s = cal.initial(p, EPOCH)
+    s = cal.initial(p, EPOCH, "m", "r")
     s = cal.apply(s, rec(1, y=1.0, base=0.0, origin=1 * L), p)
     s = cal.apply(s, rec(2, y=3.0, base=0.0, origin=3 * L), p)
     s = cal.apply(s, rec(3, y=2.0, base=0.0, origin=5 * L), p)
@@ -178,8 +178,8 @@ def test_a_risk_or_lead_change_is_a_new_epoch_starting_at_nominal():
     assert len(keys) == 3
     p = CalibrationPolicy.from_settings(dataclasses.replace(base, risk=c.RiskSettings(500)), 900)
     assert (p.nominal_bps, p.lead_seconds, p.min_windows) == (500, 900, 128)
-    old = cal.apply(cal.initial(policy(), EPOCH), rec(1, y=1.0), policy())
-    fresh = cal.initial(p, "f" * 64)
+    old = cal.apply(cal.initial(policy(), EPOCH, "m", "r"), rec(1, y=1.0), policy())
+    fresh = cal.initial(p, "f" * 64, "m", "r")
     assert fresh["a_e8"] == 5_000_000 and fresh["scores"] == []
     with pytest.raises(CalibrationError):
         cal.apply(fresh, rec(2, y=1.0), p)                                            # a record of the old epoch
@@ -192,6 +192,7 @@ def journal_pair(upper=4.0, scored_upper=None, extra=None, status="scored", y=5.
     origin = 100 * L
     targets = [origin + L]
     bundle = {"decision_origin": origin, "target_timestamps": targets, "sample_interval_seconds": L,
+              "model_family": "m", "model_recipe": "r", "point_rps": [1.0],
               "base_window_max_rps": 1.0, "upper_window_max_rps": upper, **(extra or {})}
     data = c.canonical_json(bundle)
     key = IssuanceKey(EPOCH, origin, origin, origin + L, "5" * 64)
@@ -207,8 +208,9 @@ def test_records_come_only_from_an_issuance_and_its_matured_outcome():
     iss, out = journal_pair()
     r = CalibrationRecord.from_journal(iss, out)
     assert (r.seq, r.base_rps, r.upper_rps, r.y_rps, r.decision_origin) == (7, 1.0, 4.0, 5.0, 100 * L)
-    assert set(CalibrationRecord.__dataclass_fields__) == {"seq", "epoch", "issuance_id", "decision_origin",
-                                                           "window_end", "base_rps", "upper_rps", "status", "y_rps"}
+    assert set(CalibrationRecord.__dataclass_fields__) == {"seq", "epoch", "model", "recipe", "issuance_id",
+                                                           "decision_origin", "window_end", "base_rps", "upper_rps",
+                                                           "status", "y_rps"}
     other = dataclasses.replace(out, issuance_id="iss-2")
     with pytest.raises(CalibrationError):
         CalibrationRecord.from_journal(iss, other)
@@ -248,7 +250,7 @@ def simulate(eta_bps, shift_at, n=3000, phi=0.8, shift=3.0, seed=1, measure_from
     at `shift_at`. Returns the coverage of issued bounds after the shift settles."""
     rng = random.Random(seed)
     p = policy(eta_bps=eta_bps, min_windows=64, max_scores=256, nominal_bps=1000)
-    s = cal.initial(p, EPOCH)
+    s = cal.initial(p, EPOCH, "m", "r")
     pending, hits, total, z = None, 0, 0, 0.0
     for i in range(1, n + 1):
         t = i * L
@@ -260,7 +262,7 @@ def simulate(eta_bps, shift_at, n=3000, phi=0.8, shift=3.0, seed=1, measure_from
         if u is not None and i > measure_from:
             total += 1
             hits += int(y <= u)
-        pending = CalibrationRecord(i, EPOCH, f"iss-{i}", t - L, t, 10.0, u, "scored", y)
+        pending = CalibrationRecord(i, EPOCH, "m", "r", f"iss-{i}", t - L, t, 10.0, u, "scored", y)
     return hits / total, s
 
 
@@ -356,3 +358,125 @@ def test_a_killed_calibrating_replay_resumes_with_each_level_update_once(tmp_pat
     resumed = run_replay(ds.load_dataset(manifest), cfg, s)
     assert resumed.journal_sha256 == whole.journal_sha256 and resumed.checkpoint == whole.checkpoint
     assert resumed.checkpoint["calibration"]["level_updates"] > 0
+
+
+# --- per-model calibration and the issued grid (Codex review on #23) --------------------------------------------
+
+from forecasting.maturation import candidate, issued_outcome, targets_sha256  # noqa: E402
+
+TWO = ("seasonal_naive", "statistical")
+
+
+def two_model_pair(i, y, uppers, seq0):
+    """An issuance with two candidates on the same window, and each model's outcome matured from the bundle."""
+    origin = i * L
+    targets = [origin + L]
+    cands = {m: {"recipe": f"{m}/v1", "point_rps": [1.0], "base_window_max_rps": 1.0, "upper_window_max_rps": u}
+             for m, u in zip(TWO, uppers)}
+    bundle = {"decision_origin": origin, "target_timestamps": targets, "sample_interval_seconds": L,
+              "candidates": cands}
+    data = c.canonical_json(bundle)
+    iss = Issuance(i, f"iss-{i}", IssuanceKey(EPOCH, origin, origin, origin + L, "5" * 64), data, c.sha256_hex(data),
+                   TWO, 0)
+    outs = []
+    for k, m in enumerate(TWO):
+        status, payload = issued_outcome(bundle, m, received={targets[0]: (y, (origin + L) * 1000)},
+                                         now_ms=(origin + 3 * L) * 1000, settlement_s=0, grace_s=0)
+        pb = c.canonical_json(payload)
+        outs.append(Outcome(seq0 + k, iss.issuance_id, EPOCH, origin + L, m, status, pb, c.sha256_hex(pb), 0))
+    return iss, outs
+
+
+def test_two_models_never_pool_their_windows():
+    # Codex repro: 64 windows x 2 models made 128 scores and a bound. Each model keeps its own 64.
+    p = policy(min_windows=128, max_scores=512)
+    states = {m: cal.initial(p, EPOCH, m, f"{m}/v1") for m in TWO}
+    seq = 1
+    for i in range(1, 65):
+        iss, outs = two_model_pair(i, y=5.0, uppers=(None, None), seq0=seq)
+        seq += 2
+        for o in outs:
+            r = CalibrationRecord.from_journal(iss, o)
+            states[o.model] = cal.apply(states[o.model], r, p)
+            other = next(m for m in TWO if m != o.model)
+            with pytest.raises(CalibrationError):                 # never across models
+                cal.apply(states[other], r, p)
+    for m in TWO:
+        assert len(states[m]["scores"]) == 64 and cal.upper_bound(states[m], p, 1.0, 100 * L)[0] is None
+
+
+def test_each_model_has_its_own_level_and_bound():
+    p = policy(min_windows=4)
+    states = {m: cal.initial(p, EPOCH, m, f"{m}/v1") for m in TWO}
+    seq = 1
+    for i in range(1, 9):                                         # naive's bound 2.0 always missed, statistical's 9.0 held
+        iss, outs = two_model_pair(i, y=5.0 + (i % 3), uppers=(2.0, 9.0), seq0=seq)
+        seq += 2
+        for o in outs:
+            r = CalibrationRecord.from_journal(iss, o)
+            assert (r.model, r.recipe, r.upper_rps) == (o.model, f"{o.model}/v1", 2.0 if o.model == TWO[0] else 9.0)
+            states[o.model] = cal.apply(states[o.model], r, p)
+    naive, stat = states[TWO[0]], states[TWO[1]]
+    assert naive["a_e8"] == 10_000_000 - 8 * 450_000 and stat["a_e8"] == 10_000_000 + 8 * 50_000
+    assert cal.coverage(naive)["ratio"] == 0.0 and cal.coverage(stat)["ratio"] == 1.0
+    assert naive["level_updates"] == stat["level_updates"] == 8
+
+
+def test_an_outcome_selects_only_its_own_candidate():
+    iss, outs = two_model_pair(1, y=5.0, uppers=(2.0, 9.0), seq0=1)
+    b = json.loads(iss.bundle)
+    with pytest.raises(ValueError):
+        candidate(b, "lstm")
+    stranger = dataclasses.replace(outs[0], model="lstm")
+    with pytest.raises(CalibrationError):
+        CalibrationRecord.from_journal(iss, stranger)
+    swapped = dataclasses.replace(outs[0], model=TWO[1])           # naive's outcome relabelled as statistical's
+    with pytest.raises(CalibrationError):
+        CalibrationRecord.from_journal(iss, swapped)
+    single = {"model_family": "m", "model_recipe": "r", "point_rps": [1.0], "base_window_max_rps": 1.0,
+              "upper_window_max_rps": None}
+    with pytest.raises(ValueError):
+        candidate(single, "other")
+
+
+def grid_pair(scored_targets, truth=(100.0, 1.0), upper=4.0):
+    """Two targets issued (truth 100 then 1); the outcome is matured on `scored_targets` instead."""
+    origin = 100 * L
+    targets = [origin + L, origin + 2 * L]
+    bundle = {"decision_origin": origin, "target_timestamps": targets, "sample_interval_seconds": L,
+              "model_family": "m", "model_recipe": "r", "point_rps": [1.0, 1.0], "base_window_max_rps": 1.0,
+              "upper_window_max_rps": upper}
+    data = c.canonical_json(bundle)
+    iss = Issuance(1, "iss-1", IssuanceKey(EPOCH, origin, origin, origin + 2 * L, "5" * 64), data, c.sha256_hex(data),
+                   ("m",), 0)
+    received = {t: (v, (origin + 2 * L) * 1000) for t, v in zip(targets, truth)}
+    received.update({origin + 3 * L: (1.0, 0), origin + 4 * L: (1.0, 0)})
+    status, payload = window_outcome(targets=scored_targets, base_rps=1.0, upper_rps=upper, received=received,
+                                     now_ms=(origin + 9 * L) * 1000, settlement_s=0, grace_s=0)
+    pb = c.canonical_json(payload)
+    return iss, Outcome(5, "iss-1", EPOCH, origin + 2 * L, "m", status, pb, c.sha256_hex(pb), 0), bundle, received
+
+
+@pytest.mark.parametrize("shape", ["last_only", "shifted", "wrong_cadence"])
+def test_a_window_scored_on_another_grid_is_refused(shape):
+    origin = 100 * L
+    scored = {"last_only": [origin + 2 * L],                       # Codex repro: Y = 1, "covered", true max 100
+              "shifted": [origin + 2 * L, origin + 3 * L],
+              "wrong_cadence": [origin + 2 * L, origin + 4 * L]}[shape]
+    iss, out, _, _ = grid_pair(scored)
+    if shape == "last_only":
+        assert out.payload()["covered"] is True and out.payload()["y_window_max_rps"] == 1.0
+    with pytest.raises(CalibrationError):
+        CalibrationRecord.from_journal(iss, out)
+
+
+def test_maturing_from_the_bundle_scores_the_whole_issued_window():
+    iss, _, bundle, received = grid_pair([100 * L + 2 * L])
+    status, payload = issued_outcome(bundle, "m", received=received, now_ms=(100 * L + 9 * L) * 1000,
+                                     settlement_s=0, grace_s=0)
+    assert payload["y_window_max_rps"] == 100.0 and payload["covered"] is False
+    assert payload["targets_sha256"] == targets_sha256(bundle["target_timestamps"]) and payload["targets"] == 2
+    pb = c.canonical_json(payload)
+    r = CalibrationRecord.from_journal(iss, Outcome(5, "iss-1", EPOCH, 100 * L + 2 * L, "m", status, pb,
+                                                    c.sha256_hex(pb), 0))
+    assert (r.y_rps, r.upper_rps) == (100.0, 4.0)

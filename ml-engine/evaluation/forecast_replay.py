@@ -37,7 +37,7 @@ from forecasting import calibration as cal
 from forecasting.clock import ManualClock
 from forecasting.contracts import FORECAST_CONTRACT, canonical_json, sha256_hex
 from forecasting.history import watermark
-from forecasting.maturation import window_outcome
+from forecasting.maturation import issued_outcome
 from forecasting.store import ForecastStore, IssuanceKey, Outcome
 
 REPLAY_SCHEMA = "forecast-replay/v1"
@@ -174,10 +174,10 @@ def _issue(store: ForecastStore, ek: str, settings_sha: str, dataset: Dataset, c
     return int(created)
 
 
-def initial_state(epoch: str, policy: cal.CalibrationPolicy) -> dict:
+def initial_state(epoch: str, policy: cal.CalibrationPolicy, model: str, recipe: str) -> dict:
     return {"scored": 0, "unscorable": 0, "excluded": 0, "missing_truth": 0, "covered": 0, "missed": 0,
             "unbounded": 0, "abs_error_sum_rps": 0.0, "last_window_end": None,
-            "calibration": cal.initial(policy, epoch)}
+            "calibration": cal.initial(policy, epoch, model, recipe)}
 
 
 def fold(state: dict, o: Outcome, issuance, policy: cal.CalibrationPolicy) -> dict:
@@ -241,9 +241,7 @@ def run_replay(dataset: Dataset, config: ReplayConfig, store: ForecastStore, *,
             store.record_observations(series, batch, source)
         # 2. close windows that have settled, in window-end order
         for iss in store.open_issuances(ek, config.model_family, t - config.settlement_seconds):
-            p = iss.payload()
-            res = window_outcome(targets=p["target_timestamps"], base_rps=p["base_window_max_rps"],
-                                 upper_rps=p["upper_window_max_rps"], received=received, now_ms=now_ms,
+            res = issued_outcome(iss.payload(), config.model_family, received=received, now_ms=now_ms,
                                  settlement_s=config.settlement_seconds, grace_s=config.outcome_grace_seconds,
                                  excluded=dataset.excluded)
             if res is not None:
@@ -251,7 +249,7 @@ def run_replay(dataset: Dataset, config: ReplayConfig, store: ForecastStore, *,
         # 3. fold the new outcomes in exactly once (calibration, C2.4, will read this state before issuing)
         state, last, _ = store.recover(
             ek, lambda st, o: fold(st, o, store.get_issuance_by_id(o.issuance_id), policy),
-            lambda: initial_state(ek, policy))
+            lambda: initial_state(ek, policy, config.model_family, config.model_recipe))
         # 4. forecast from what is visible now; 5. commit the issuance before anything later is revealed
         view = VisibleHistory(received, now_ms, dt, through=watermark(t, dt, config.settlement_seconds),
                               excluded=dataset.excluded)
@@ -265,7 +263,7 @@ def run_replay(dataset: Dataset, config: ReplayConfig, store: ForecastStore, *,
         store.write_checkpoint(ek, {**state, "replay_tick": t}, last)
 
     cp = store.latest_checkpoint(ek)
-    totals = cp.state if cp else initial_state(ek, policy)
+    totals = cp.state if cp else initial_state(ek, policy, config.model_family, config.model_recipe)
     pending = len(store.open_issuances(ek, config.model_family, config.last_origin + config.lead_seconds))
     return ReplayResult(evidence_key=ek, settings_sha256=settings_sha, issued=issued, no_forecast=no_forecast,
                         scored=totals["scored"], unscorable=totals["unscorable"], excluded=totals["excluded"],

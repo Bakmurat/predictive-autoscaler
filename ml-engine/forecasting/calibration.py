@@ -21,9 +21,13 @@ sections 5 and 6).
     sequence is ignored, so a replayed or retried outcome never updates the level twice. Records are applied in
     journal order, which is window-end order within each processing tick; a delayed outcome is applied when it
     matures and never rewrites a bound already issued.
-  - Source: a record is built only from a committed issuance bundle and its terminal outcome (from_journal), which
-    must agree on the issued base and bound. Replica counts, caps and actions never enter: a capped action is not a
-    forecast and cannot calibrate one.
+  - Source: a record is built only from a committed issuance bundle and its terminal outcome (from_journal). The
+    outcome's model selects that model's issued values in the bundle (its candidate); the outcome must have been
+    scored on the issued target grid (same digest and count) against that candidate's base and bound. Replica counts,
+    caps and actions never enter: a capped action is not a forecast and cannot calibrate one.
+  - Per model: a state belongs to one epoch, one model and one recipe. Each candidate of a multi-model issuance has
+    its own scores, level and bound; a record of another model or recipe is refused, so two models never pool their
+    windows to meet the minimum count.
 The level is held as an integer in units of 1e-8 (bps x bps), so ranks and updates are exact and deterministic. This
 delayed-feedback, clipped, finite-buffer variant is conformal-STYLE (after Gibbs and Candès, NeurIPS 2021): it inherits
 none of the unmodified method's guarantees, and coverage must be measured, not assumed.
@@ -36,6 +40,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from forecasting.contracts import ForecastSettings
+from forecasting.maturation import candidate, targets_sha256
 
 STATE_SCHEMA = "window-calibration/v1"
 E8 = 100_000_000                       # the working level's unit: 1e-8
@@ -88,8 +93,9 @@ def pinball_rps(y: float, upper: float, miscoverage: float) -> float:
     return tau * (y - upper) if y >= upper else (1.0 - tau) * (upper - y)
 
 
-def initial(policy: CalibrationPolicy, epoch: str) -> dict:
-    return {"schema": STATE_SCHEMA, "epoch": epoch, "a_e8": policy.nominal_bps * BPS, "scores": [],
+def initial(policy: CalibrationPolicy, epoch: str, model: str, recipe: str) -> dict:
+    return {"schema": STATE_SCHEMA, "epoch": epoch, "model": model, "recipe": recipe,
+            "a_e8": policy.nominal_bps * BPS, "scores": [],
             "last_seq": 0, "newest_window_end": None,
             "all": {"scored": 0, "unscorable": 0, "bounded": 0, "covered": 0, "abs_error_sum_rps": 0.0},
             "gate": {"scored": 0, "unscorable": 0, "bounded": 0, "covered": 0, "pinball_sum_rps": 0.0},
@@ -100,6 +106,8 @@ def initial(policy: CalibrationPolicy, epoch: str) -> dict:
 class CalibrationRecord:
     seq: int                         # the outcome's journal sequence number
     epoch: str
+    model: str
+    recipe: str
     issuance_id: str
     decision_origin: int
     window_end: int
@@ -118,12 +126,22 @@ class CalibrationRecord:
         targets, dt, origin = b["target_timestamps"], b["sample_interval_seconds"], issuance.key.decision_origin
         if b["decision_origin"] != origin or targets != list(range(origin + dt, issuance.key.window_end + 1, dt)):
             raise CalibrationError("the issuance's targets are not exactly its window's grid")
-        base, upper = b["base_window_max_rps"], b["upper_window_max_rps"]
+        if outcome.model not in issuance.models:
+            raise CalibrationError(f"the issuance expected no outcome for model {outcome.model!r}")
+        try:
+            c = candidate(b, outcome.model)
+        except (ValueError, KeyError, TypeError) as e:
+            raise CalibrationError(str(e)) from e
+        if len(c["point_rps"]) != len(targets):
+            raise CalibrationError("the candidate's trajectory does not cover the issued targets")
+        if (p.get("targets"), p.get("targets_sha256")) != (len(targets), targets_sha256(targets)):
+            raise CalibrationError("the outcome was not matured on the issued target grid")
+        base, upper = c["base_window_max_rps"], c["upper_window_max_rps"]
         if outcome.status == "scored" and (p["base_window_max_rps"], p["upper_window_max_rps"]) != (base, upper):
             raise CalibrationError("the outcome was not scored against the bound that was issued")
-        return cls(outcome.seq, issuance.key.evidence_key, issuance.issuance_id, issuance.key.decision_origin,
-                   issuance.key.window_end, float(base), None if upper is None else float(upper), outcome.status,
-                   float(p["y_window_max_rps"]) if outcome.status == "scored" else None)
+        return cls(outcome.seq, issuance.key.evidence_key, outcome.model, c["recipe"], issuance.issuance_id,
+                   origin, issuance.key.window_end, float(base), None if upper is None else float(upper),
+                   outcome.status, float(p["y_window_max_rps"]) if outcome.status == "scored" else None)
 
 
 def buffered_scores(state: dict, policy: CalibrationPolicy, now_s: int) -> List[float]:
@@ -152,6 +170,8 @@ def apply(state: dict, record: CalibrationRecord, policy: CalibrationPolicy) -> 
     """The state after one matured record; unchanged when the record was already applied (seq <= last_seq)."""
     if record.epoch != state["epoch"]:
         raise CalibrationError("the record belongs to another calibration epoch")
+    if (record.model, record.recipe) != (state["model"], state["recipe"]):
+        raise CalibrationError("the record belongs to another model or recipe")
     if record.seq <= state["last_seq"]:
         return state
     if record.status not in ("scored", "unscorable"):
