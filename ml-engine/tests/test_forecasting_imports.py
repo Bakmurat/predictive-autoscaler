@@ -1,4 +1,5 @@
-"""C2: the statistical forecaster's modules import without TensorFlow, Keras or the legacy service (api.main).
+"""C2: the statistical forecaster's modules import without TensorFlow, Keras, the legacy service (api.main), pandas or
+scikit-learn (the light statistical image carries NumPy and SciPy only).
 
 Each module is imported in a fresh interpreter with those imports blocked (an import of any of them raises), and the
 interpreter then confirms none of them was loaded. A fresh process is needed: this test session may already hold
@@ -14,7 +15,7 @@ from pathlib import Path
 import pytest
 
 ML_ENGINE = Path(__file__).resolve().parent.parent
-BLOCKED = ("tensorflow", "keras", "tf_keras", "api.main")
+BLOCKED = ("tensorflow", "keras", "tf_keras", "api.main", "pandas", "sklearn")
 PACKAGES = ("forecasting", "evaluation")
 
 PROBE = r"""
@@ -44,7 +45,8 @@ def modules():
 
 
 def test_the_package_list_is_not_empty():
-    assert "forecasting.contracts" in modules() and "forecasting.history" in modules()
+    assert {"forecasting.contracts", "forecasting.history", "forecasting.statistical", "forecasting.artifacts",
+            "forecasting.worker"} <= set(modules())
 
 
 @pytest.mark.parametrize("module", modules())
