@@ -15,8 +15,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from forecasting.clock import ClockError, ManualClock, ReceiptClock  # noqa: E402
 from forecasting.contracts import sha256_hex  # noqa: E402
 from forecasting.maturation import window_outcome  # noqa: E402
-from forecasting.store import (ForecastStore, IntegrityConflict, IssuanceKey, StoreCorrupt, StoreError,  # noqa: E402
-                               StoreFull, StoreUnavailable)
+from forecasting.store import (ForecastStore, IntegrityConflict, IssuanceKey, RetiredKey, StoreCorrupt,  # noqa: E402
+                               StoreError, StoreFull, StoreUnavailable)
 
 ML_ENGINE = Path(__file__).resolve().parent.parent
 EK = "e" * 64
@@ -261,11 +261,16 @@ CRASH = textwrap.dedent("""
     k = IssuanceKey("e" * 64, T0, T0, T0 + 1200, "5" * 64)
     if op == "outcome":
         rec = s.get_issuance(k)
+    if op == "compact":
+        s = ForecastStore(path, clock=ManualClock((T0 + 3000) * 1000), store_id="test-store",
+                          retention_seconds=86400, observation_retention_seconds=86400)
     s._fault_hook = lambda st: os._exit(17) if st == stage else None
     if op == "issuance":
         s.commit_issuance(k, {"decision_origin": T0, "point_rps": [1.0], "issued_at_ms": 1})
     elif op == "outcome":
         s.commit_outcome(rec.issuance_id, "m", "scored", {"y": 3.0})
+    elif op == "compact":
+        s.compact(T0 + 86400 + 4 * 3600)
     os._exit(0)
 """)
 
@@ -431,13 +436,14 @@ def test_retention_removes_only_old_windows_and_keeps_the_denominators(tmp_path)
     s.clock.set((T0 + 12 * 3600) * 1000)
     for rec in ids[:6]:
         s.commit_outcome(rec.issuance_id, "m", "scored" if rec.key.decision_origin % 7200 else "unscorable", {})
+    s.write_checkpoint(EK, {"n": 6}, s.outcomes_after(EK, 0)[-1].seq)     # every outcome folded in
     removed = s.compact(T0 + 86400 + 4 * 3600)          # horizon T0 + 4 h: windows k = 0..3 end before it
-    assert removed == {"issuances": 4, "outcomes": 4, "observations": 1}
+    assert removed == {"issuances": 4, "outcomes": 4, "observations": 1, "kept": 0}
     assert [r.key.decision_origin for r in s.issuances()] == [T0 + k * 3600 for k in range(4, 10)]
     summary = s.retention_summary(EK)
     assert (summary["issued"], summary["scored"], summary["unscorable"]) == (4, 2, 2)
     assert summary["through_window_end"] == T0 + 4 * 3600 and len(summary["digest"]) == 64
-    assert s.compact(T0 + 86400) == {"issuances": 0, "outcomes": 0, "observations": 0}     # never backwards
+    assert s.compact(T0 + 86400) == {"issuances": 0, "outcomes": 0, "observations": 0, "kept": 0}  # never back
     raw = sqlite3.connect(str(tmp_path / "j.sqlite"))
     with pytest.raises(sqlite3.IntegrityError):                  # newer windows are still protected
         raw.execute("DELETE FROM issuances")
@@ -461,9 +467,9 @@ TARGETS = [T0 + DT, T0 + 2 * DT, T0 + 3 * DT]
 END = TARGETS[-1]
 
 
-def outcome(received, now_s, upper=None, settle=120, grace=600):
+def outcome(received, now_s, upper=None, settle=120, grace=600, excluded=None):
     return window_outcome(targets=TARGETS, base_rps=2.0, upper_rps=upper, received=received, now_ms=int(now_s * 1000),
-                          settlement_s=settle, grace_s=grace)
+                          settlement_s=settle, grace_s=grace, excluded=excluded)
 
 
 def full(at_s=END + 60):
@@ -490,3 +496,135 @@ def test_missing_and_late_truth():
     assert outcome(late, END + 700)[0] == "scored"
     future = {**gap, TARGETS[1]: (3.5, (END + 2000) * 1000)}                    # received after now: not there yet
     assert outcome(future, END + 720)[0] == "unscorable"
+
+
+# --- compaction keeps recovery and issuance identity intact (Codex review P1/P2) ---------------------------------
+
+def compaction_fixture(path):
+    """Six hourly issuances with outcomes, a checkpoint covering the first four outcomes only, two open ones."""
+    s = open_store(path, retention_seconds=86400, observation_retention_seconds=86400)
+    recs = [s.commit_issuance(key(T0 + k * 3600), bundle(T0 + k * 3600))[0] for k in range(8)]
+    s.clock.set((T0 + 12 * 3600) * 1000)
+    for rec in recs[:6]:
+        s.commit_outcome(rec.issuance_id, "m", "scored", {"iid": rec.issuance_id})
+    outs = s.outcomes_after(EK, 0)
+    s.write_checkpoint(EK, {"n": 4, "ids": [o.issuance_id for o in outs[:4]]}, outs[3].seq)
+    return s, recs
+
+
+def test_compaction_removes_only_checkpoint_covered_outcomes(tmp_path):
+    s, recs = compaction_fixture(tmp_path / "j.sqlite")
+    before = s.recover(EK, count_fold, initial)
+    # Horizon T0 + 7 h: windows k = 0..6 ended before it. k = 0..3 are covered; 4, 5 are not; 6 is still open.
+    assert s.compact(T0 + 86400 + 7 * 3600) == {"issuances": 4, "outcomes": 4, "observations": 0, "kept": 3}
+    assert [r.key.decision_origin for r in s.issuances()] == [T0 + k * 3600 for k in range(4, 8)]
+    assert s.recover(EK, count_fold, initial) == before          # same state, same last seq, same applied count
+    assert s.retention_summary(EK)["issued"] == 4
+    s.verify()
+
+
+def test_compaction_without_a_checkpoint_removes_nothing(tmp_path):
+    s = open_store(tmp_path / "j.sqlite", retention_seconds=86400, observation_retention_seconds=86400)
+    rec, _ = s.commit_issuance(key(), bundle())
+    s.clock.set((T0 + 3000) * 1000)
+    s.commit_outcome(rec.issuance_id, "m", "scored", {})
+    assert s.compact(T0 + 2 * 86400)["kept"] == 1 and len(s.issuances()) == 1
+    assert s.recover(EK, count_fold, initial)[2] == 1
+
+
+@pytest.mark.parametrize("stage", ["before_commit", "after_commit"])
+def test_a_crash_during_compaction_keeps_recovery_exact(tmp_path, stage):
+    path = tmp_path / "j.sqlite"
+    s, _ = compaction_fixture(path)
+    before = s.recover(EK, count_fold, initial)
+    s.close()
+    crash(path, stage, "compact")
+    s = open_store(path, clock=ManualClock((T0 + 12 * 3600) * 1000), retention_seconds=86400,
+                   observation_retention_seconds=86400)
+    s.verify()
+    assert len(s.issuances()) == (4 if stage == "after_commit" else 8)
+    assert s.recover(EK, count_fold, initial) == before
+    s.compact(T0 + 86400 + 4 * 3600)                         # a rerun after the restart is harmless
+    assert s.recover(EK, count_fold, initial) == before
+
+
+def test_retired_keys_can_never_be_reissued(tmp_path):
+    s, recs = compaction_fixture(tmp_path / "j.sqlite")
+    s.compact(T0 + 86400 + 7 * 3600)
+    gone = recs[0]
+    for payload in (gone.payload(), bundle(T0, points=(9.0,))):          # same bytes or different: both refused
+        with pytest.raises(RetiredKey):
+            s.commit_issuance(gone.key, payload)
+        with pytest.raises(RetiredKey):
+            s.get_or_issue(gone.key, lambda iid: payload)
+    with pytest.raises(RetiredKey):                                       # a never-issued key below the horizon
+        s.commit_issuance(key(T0 + 30 * 60), bundle(T0 + 30 * 60))
+    kept = recs[4]                                                        # below the horizon but still held
+    assert s.commit_issuance(kept.key, kept.payload()) == (kept, False)
+    assert s.get_or_issue(kept.key, lambda iid: {})[0] == kept
+    raw = sqlite3.connect(str(tmp_path / "j.sqlite"))
+    with pytest.raises(sqlite3.IntegrityError):                           # the trigger refuses it too
+        raw.execute("INSERT INTO issuances (issuance_id, key_sha256, evidence_key, decision_origin, window_start, "
+                    "window_end, settings_sha256, bundle, bundle_sha256, committed_at_ms) VALUES "
+                    "(?,?,?,?,?,?,?,?,?,?)", (gone.issuance_id, gone.key.sha256, EK, T0, T0, T0 + 1200, SETTINGS,
+                                             b"{}", sha256_hex(b"{}"), 1))
+    raw.close()
+    assert s.healthy
+
+
+def test_get_or_issue_refuses_both_paths_when_unhealthy(tmp_path):
+    s = open_store(tmp_path / "j.sqlite", quota_bytes=256 << 10)
+    early = key(T0 - 86400)
+    rec, _ = s.commit_issuance(early, bundle(T0 - 86400))
+    with pytest.raises(StoreFull):
+        fill(s)
+    built = []
+    with pytest.raises(StoreUnavailable):                                 # the cached path
+        s.get_or_issue(early, lambda iid: built.append(iid) or bundle())
+    with pytest.raises(StoreUnavailable):                                 # the build path
+        s.get_or_issue(key(T0 - 7200), lambda iid: built.append(iid) or bundle(T0 - 7200))
+    assert built == []
+    assert s.get_issuance(early) == rec and s.issuances()                 # audit reads stay available
+
+
+# --- the fixed truth deadline (Codex review P1) -------------------------------------------------------------------
+
+def test_codex_repro_truth_after_the_deadline_is_never_admitted():
+    # window end 300 s, settlement 120, grace 600: the deadline is 1020 s. Truth received at 1100 s, processed at 1200 s.
+    got = window_outcome(targets=[300], base_rps=1.0, upper_rps=None, received={300: (5.0, 1_100_000)},
+                         now_ms=1_200_000, settlement_s=120, grace_s=600)
+    assert got[0] == "unscorable" and got[1]["deadline_ms"] == 1_020_000
+
+
+@pytest.mark.parametrize("receipt_s,now_s,status", [
+    (1020, 1020, "scored"),            # received exactly at the deadline, processed then
+    (1020, 5000, "scored"),            # ... or much later: the same answer
+    (1021, 1021, "unscorable"),        # one second late
+    (1021, 99999, "unscorable"),
+    (1019, 1018, None),                # not received yet at now, deadline not reached: pending
+    (1100, 1019, None),
+])
+def test_the_deadline_boundary_does_not_depend_on_processing_time(receipt_s, now_s, status):
+    got = window_outcome(targets=[300], base_rps=1.0, upper_rps=None, received={300: (5.0, receipt_s * 1000)},
+                         now_ms=now_s * 1000, settlement_s=120, grace_s=600)
+    assert (got[0] if got else None) == status
+
+
+def test_a_restart_after_expiry_closes_the_window_unscorable(tmp_path):
+    # The service was down across the deadline; the truth arrived while it was down, after the deadline.
+    path = tmp_path / "j.sqlite"
+    s = open_store(path)
+    rec, _ = s.commit_issuance(key(lead=300), bundle(points=(1.0,)))
+    s.close()
+    s = open_store(path, clock=ManualClock((T0 + 5000) * 1000))
+    received = {T0 + 300: (2.0, (T0 + 300 + 120 + 600 + 1) * 1000)}
+    status, payload = window_outcome(targets=[T0 + 300], base_rps=1.0, upper_rps=None, received=received,
+                                     now_ms=s.clock.now_ms(), settlement_s=120, grace_s=600)
+    s.commit_outcome(rec.issuance_id, "m", status, payload)
+    assert s.outcomes_after(EK, 0)[0].status == "unscorable"
+
+
+def test_excluded_truth_is_unscorable_at_close():
+    status, p = outcome(full(), END + 120, excluded=lambda t: "incident-7" if t == TARGETS[1] else None)
+    assert status == "unscorable" and p["reason"] == "excluded" and p["exclusion"] == "incident-7"
+    assert outcome(full(), END + 119, excluded=lambda t: "x") is None          # still waits for the close

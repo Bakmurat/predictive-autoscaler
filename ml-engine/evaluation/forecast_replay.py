@@ -3,12 +3,15 @@
 The runner walks the decision origins of a dataset on its grid with a ManualClock (wall time = the origin). At each
 tick it does exactly what the service does, in the same order (design C2, section 6, "Event ordering"):
   1. ingest the observations whose receipt time has come (journal: first receipt kept, later values are corrections);
-  2. close the issued windows with window_end + settlement <= now, in window-end order, scoring them with values
-     received by now only (forecasting.maturation; missing truth waits out the grace, then closes unscorable);
+  2. close the issued windows with window_end + settlement <= now, in window-end order (forecasting.maturation: truth
+     counts only when received by the fixed deadline window_end + settlement + grace; excluded truth is unscorable);
   3. fold the new outcomes into the state exactly once (ForecastStore.recover: the checkpoint plus later outcomes);
-  4. forecast from a VisibleHistory: the observations received by now, nothing else;
+  4. forecast from a VisibleHistory: the live reader's finalized history, i.e. observations received by now whose
+     event time is at or before the settlement watermark floor((now - settle)/Δ)*Δ, minus the dataset's exclusions;
   5. commit the issuance for this origin (get_or_issue: a committed bundle is never recomputed);
   6. checkpoint the state with the tick it completed (replay_tick).
+Excluded observations are still ingested into the journal (their receipts stay auditable); they are invisible to
+forecasting and unavailable as truth, and their windows count as unscorable (reason excluded) in availability.
 Every record goes through forecasting.store, so a replay journal and a live one have the same shape; issuance bundles
 are labelled evidence_mode=replay and carry the dataset's manifest digest.
 
@@ -30,6 +33,7 @@ from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from evaluation.datasets import Dataset
 from forecasting.clock import ManualClock
 from forecasting.contracts import FORECAST_CONTRACT, canonical_json, sha256_hex
+from forecasting.history import watermark
 from forecasting.maturation import window_outcome
 from forecasting.store import ForecastStore, IssuanceKey, Outcome
 
@@ -64,14 +68,19 @@ class ReplayConfig:
 
 
 class VisibleHistory(Mapping):
-    """event time -> RPS for what had been received by `now_ms`. Read-only; nothing received later is reachable."""
+    """event time -> RPS of the finalized history at `now_ms`: received by then, event time <= `through` (the settlement
+    watermark) and not excluded. Read-only; nothing else is reachable."""
 
-    def __init__(self, received: Mapping[int, Tuple[float, int]], now_ms: int, interval: int):
+    def __init__(self, received: Mapping[int, Tuple[float, int]], now_ms: int, interval: int,
+                 through: Optional[int] = None, excluded: Optional[Callable[[int], Optional[str]]] = None):
         self._received, self.now_ms, self.interval = MappingProxyType(received), now_ms, interval
+        self.through, self._excluded = through, excluded
 
     def _visible(self, t) -> Optional[Tuple[float, int]]:
         got = self._received.get(t)
-        return got if got is not None and got[1] <= self.now_ms else None
+        if got is None or got[1] > self.now_ms or (self.through is not None and t > self.through):
+            return None
+        return None if self._excluded is not None and self._excluded(t) else got
 
     def __getitem__(self, t) -> float:
         got = self._visible(t)
@@ -87,13 +96,13 @@ class VisibleHistory(Mapping):
 
     def latest(self) -> Optional[int]:
         best = None
-        for t, (_, at) in self._received.items():
-            if at <= self.now_ms and (best is None or t > best):
+        for t in self._received:
+            if (best is None or t > best) and self._visible(t) is not None:
                 best = t
         return best
 
     def received_through_ms(self) -> Optional[int]:
-        ats = [at for _, at in self._received.values() if at <= self.now_ms]
+        ats = [got[1] for t in self._received if (got := self._visible(t)) is not None]
         return max(ats) if ats else None
 
 
@@ -119,7 +128,8 @@ class ReplayResult:
     issued: int                      # issuances committed by this run (a resumed run counts only its own)
     no_forecast: int                 # origins where the forecaster returned nothing
     scored: int
-    unscorable: int
+    unscorable: int                  # every unscorable window, excluded ones included (availability denominator)
+    excluded: int                    # of which: truth inside a declared exclusion
     pending: int                     # issued windows still open at the end
     checkpoint: Optional[dict]
     journal_sha256: str
@@ -147,7 +157,7 @@ def _issue(store: ForecastStore, ek: str, settings_sha: str, dataset: Dataset, c
 
 
 def initial_state() -> dict:
-    return {"scored": 0, "unscorable": 0, "covered": 0, "missed": 0, "unbounded": 0, "abs_error_sum_rps": 0.0,
+    return {"scored": 0, "unscorable": 0, "excluded": 0, "missing_truth": 0, "covered": 0, "missed": 0, "unbounded": 0, "abs_error_sum_rps": 0.0,
             "last_window_end": None}
 
 
@@ -157,6 +167,7 @@ def fold(state: dict, o: Outcome) -> dict:
     s["last_window_end"] = o.window_end
     if o.status == "unscorable":
         s["unscorable"] += 1
+        s[p["reason"]] += 1                      # excluded | missing_truth
         return s
     s["scored"] += 1
     s["abs_error_sum_rps"] = s["abs_error_sum_rps"] + p["abs_error_rps"]
@@ -212,13 +223,15 @@ def run_replay(dataset: Dataset, config: ReplayConfig, store: ForecastStore, *,
             p = iss.payload()
             res = window_outcome(targets=p["target_timestamps"], base_rps=p["base_window_max_rps"],
                                  upper_rps=p["upper_window_max_rps"], received=received, now_ms=now_ms,
-                                 settlement_s=config.settlement_seconds, grace_s=config.outcome_grace_seconds)
+                                 settlement_s=config.settlement_seconds, grace_s=config.outcome_grace_seconds,
+                                 excluded=dataset.excluded)
             if res is not None:
                 store.commit_outcome(iss.issuance_id, config.model_family, *res)
         # 3. fold the new outcomes in exactly once (calibration, C2.4, will read this state before issuing)
         state, last, _ = store.recover(ek, fold, initial_state)
         # 4. forecast from what is visible now; 5. commit the issuance before anything later is revealed
-        view = VisibleHistory(received, now_ms, dt)
+        view = VisibleHistory(received, now_ms, dt, through=watermark(t, dt, config.settlement_seconds),
+                              excluded=dataset.excluded)
         targets = tuple(t + k * dt for k in range(1, config.lead_seconds // dt + 1))
         points = forecaster(view, t, targets)
         if points is None:
@@ -232,5 +245,6 @@ def run_replay(dataset: Dataset, config: ReplayConfig, store: ForecastStore, *,
     totals = cp.state if cp else initial_state()
     pending = len(store.open_issuances(ek, config.model_family, config.last_origin + config.lead_seconds))
     return ReplayResult(evidence_key=ek, settings_sha256=settings_sha, issued=issued, no_forecast=no_forecast,
-                        scored=totals["scored"], unscorable=totals["unscorable"], pending=pending,
+                        scored=totals["scored"], unscorable=totals["unscorable"], excluded=totals["excluded"],
+                        pending=pending,
                         checkpoint=cp.state if cp else None, journal_sha256=store.journal_digest())

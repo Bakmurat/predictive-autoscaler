@@ -17,8 +17,11 @@ What it guarantees (design C2, section 6):
     unhealthy for good (until it is reopened): predictive eligibility needs a healthy store, reactive scaling does not.
     A fresh or lost store starts a new epoch; it never presents itself as evidence it does not hold.
 The quota is enforced twice: SQLite's max_page_count (a hard SQLITE_FULL) and a check of database + WAL size before
-each write. Retention removes issuances and outcomes whose window ended more than `retention_seconds` ago, keeping
-per-epoch aggregate counts and a digest chain over what was removed.
+each write. Retention removes an issuance whose window ended more than `retention_seconds` ago only together with its
+outcomes, and only when every one of those outcomes is covered by the epoch's latest verified checkpoint, so recover()
+gives the same state before and after compaction; per-epoch aggregate counts and a digest chain over what was removed
+are kept. Uncovered or still-open old issuances stay. Keys below the retention horizon are retired: committing one is
+refused (RetiredKey, and a trigger), so a removed issuance ID can never be reissued with other bytes.
 
 One writer process per file (Recreate, one replica): two independent writers sharing a volume are not supported.
 """
@@ -112,6 +115,9 @@ CREATE TRIGGER meta_horizon_forward BEFORE UPDATE ON meta
   WHEN OLD.key = 'retention_horizon' AND CAST(NEW.value AS INTEGER) < CAST(OLD.value AS INTEGER)
   BEGIN SELECT RAISE(ABORT, 'the retention horizon only moves forward'); END;
 CREATE TRIGGER meta_kept BEFORE DELETE ON meta BEGIN SELECT RAISE(ABORT, 'meta rows are permanent'); END;
+CREATE TRIGGER issuances_not_retired BEFORE INSERT ON issuances
+  WHEN NEW.window_end < (SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'retention_horizon')
+  BEGIN SELECT RAISE(ABORT, 'the issuance key is below the retention horizon (retired)'); END;
 CREATE TRIGGER issuances_immutable BEFORE UPDATE ON issuances
   BEGIN SELECT RAISE(ABORT, 'issuances are immutable'); END;
 CREATE TRIGGER issuances_retention_only BEFORE DELETE ON issuances
@@ -141,6 +147,11 @@ class StoreError(Exception):
 
 class IntegrityConflict(StoreError):
     """Different bytes for an existing immutable record (same issuance key, or same issuance and model)."""
+
+
+class RetiredKey(StoreError):
+    """An issuance key whose window ended below the retention horizon: it can never be (re)issued, so a removed ID
+    can never come back with different bytes."""
 
 
 class StoreUnavailable(StoreError):
@@ -409,6 +420,7 @@ class ForecastStore:
             existing = self.get_issuance(key)
             if existing is not None:
                 return self._same(existing, bundle), False
+            self._refuse_retired(key)
             self._check_quota(len(bundle))
             now = self.clock.now_ms()
             with self._tx():
@@ -420,12 +432,22 @@ class ForecastStore:
             return self.get_issuance(key), True
 
     def get_or_issue(self, key: IssuanceKey, build: Callable[[str], Mapping]) -> Tuple[Issuance, bool]:
-        """The committed issuance for `key`, or build(issuance_id) committed now. A retry never recomputes."""
-        with self._lock:
+        """The committed issuance for `key`, or build(issuance_id) committed now. A retry never recomputes.
+        An unhealthy store answers neither path: an issuance it returns may be acted on. (Audit reads stay.)"""
+        with self._lock, self._guard("issue"):
+            self._require_healthy()
             existing = self.get_issuance(key)
             if existing is not None:
                 return existing, False
+            self._refuse_retired(key)
             return self.commit_issuance(key, build(self.issuance_id_for(key)))
+
+    def _horizon(self) -> int:
+        return int(self._db.execute("SELECT value FROM meta WHERE key = 'retention_horizon'").fetchone()[0])
+
+    def _refuse_retired(self, key: IssuanceKey) -> None:
+        if key.window_end < self._horizon():
+            raise RetiredKey(f"issuance key with window end {key.window_end} is below the retention horizon")
 
     @staticmethod
     def _same(existing: Issuance, bundle: bytes) -> Issuance:
@@ -615,44 +637,58 @@ class ForecastStore:
     # --- retention --------------------------------------------------------------------------------------------------
 
     def compact(self, now_s: int) -> Dict[str, int]:
-        """Remove issuances and outcomes whose window ended before now - retention, and observations older than their
-        own retention, keeping per-epoch counts and a digest chain of what was removed. Returns removal counts."""
+        """Retire windows that ended before now - retention: remove each such issuance with its outcomes when all of
+        them are covered by the epoch's latest verified checkpoint (seq <= its last_outcome_seq), and observations
+        older than their own retention. Keeps per-epoch counts and a digest chain of what was removed. Returns removal
+        counts and how many old issuances had to stay (uncovered or still open)."""
         horizon = now_s - self.retention_seconds
         with self._lock, self._guard("compact"):
             self._require_healthy()
-            current = int(self._db.execute("SELECT value FROM meta WHERE key = 'retention_horizon'").fetchone()[0])
-            if horizon <= current:
-                return {"issuances": 0, "outcomes": 0, "observations": 0}
+            if horizon <= self._horizon():
+                return {"issuances": 0, "outcomes": 0, "observations": 0, "kept": 0}
+            covered = {}                               # epoch -> last outcome seq of its latest verified checkpoint
+            for (ek,) in self._db.execute("SELECT DISTINCT evidence_key FROM issuances WHERE window_end < ?",
+                                          (horizon,)).fetchall():
+                cp = self.latest_checkpoint(ek)        # raises StoreCorrupt for a checkpoint that fails its checksum
+                covered[ek] = cp.last_outcome_seq if cp else 0
             with self._tx():
+                # Raise the horizon first: the delete triggers admit only rows below it, and keys below it are retired.
+                self._db.execute("UPDATE meta SET value = ? WHERE key = 'retention_horizon'", (str(horizon),))
                 gone = self._db.execute(f"SELECT {self._ISSUANCE_COLS} FROM issuances WHERE window_end < ? "
                                         "ORDER BY seq", (horizon,)).fetchall()
                 epochs: Dict[str, List] = {}
+                kept = 0
                 for row in gone:
                     iss = self._row_to_issuance(row)
-                    outs = self._db.execute("SELECT status, payload_sha256 FROM outcomes WHERE issuance_id = ? "
+                    outs = self._db.execute("SELECT seq, status, payload_sha256 FROM outcomes WHERE issuance_id = ? "
                                             "ORDER BY seq", (iss.issuance_id,)).fetchall()
+                    if not outs or any(seq > covered[iss.key.evidence_key] for seq, _, _ in outs):
+                        kept += 1                      # open, or not yet folded into a checkpoint: keep it whole
+                        continue
                     epochs.setdefault(iss.key.evidence_key, []).append((iss, outs))
+                n_iss = n_out = 0
                 for ek, items in epochs.items():
                     prev = self._db.execute("SELECT issued, scored, unscorable, digest FROM retention WHERE "
                                             "evidence_key = ?", (ek,)).fetchone() or (0, 0, 0, "0" * 64)
                     issued, scored, unscorable, digest = prev
                     for iss, outs in items:
                         issued += 1
-                        scored += sum(1 for s, _ in outs if s == "scored")
-                        unscorable += sum(1 for s, _ in outs if s == "unscorable")
-                        link = canonical_json([digest, iss.issuance_id, iss.bundle_sha256, [p for _, p in outs]])
-                        digest = sha256_hex(link)
+                        scored += sum(1 for _, st, _ in outs if st == "scored")
+                        unscorable += sum(1 for _, st, _ in outs if st == "unscorable")
+                        digest = sha256_hex(canonical_json([digest, iss.issuance_id, iss.bundle_sha256,
+                                                            [p for _, _, p in outs]]))
+                        n_out += self._db.execute("DELETE FROM outcomes WHERE issuance_id = ?",
+                                                  (iss.issuance_id,)).rowcount
+                        n_iss += self._db.execute("DELETE FROM issuances WHERE issuance_id = ?",
+                                                  (iss.issuance_id,)).rowcount
                     self._db.execute("INSERT OR REPLACE INTO retention (evidence_key, through_window_end, issued, "
                                      "scored, unscorable, digest) VALUES (?,?,?,?,?,?)",
                                      (ek, horizon, issued, scored, unscorable, digest))
-                self._db.execute("UPDATE meta SET value = ? WHERE key = 'retention_horizon'", (str(horizon),))
-                n_out = self._db.execute("DELETE FROM outcomes WHERE window_end < ?", (horizon,)).rowcount
-                n_iss = self._db.execute("DELETE FROM issuances WHERE window_end < ?", (horizon,)).rowcount
                 n_obs = self._db.execute("DELETE FROM observations WHERE event_time < ?",
                                          (horizon - self._obs_extra,)).rowcount
             self._db.execute("PRAGMA incremental_vacuum")
             self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            return {"issuances": n_iss, "outcomes": n_out, "observations": n_obs}
+            return {"issuances": n_iss, "outcomes": n_out, "observations": n_obs, "kept": kept}
 
     def retention_summary(self, evidence_key: str) -> Optional[dict]:
         with self._lock, self._guard("read retention"):

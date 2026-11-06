@@ -231,7 +231,7 @@ def with_receipts(values: Iterable[Tuple[int, float]], *, settlement_s: int,
 
 def synthetic_dataset(directory: str, name: str, *, kind: str = "daily", start: int, days: float, interval: int,
                       seed: int = 0, settlement_s: int = 120, delays_ms: Optional[Dict[int, int]] = None,
-                      missing: Iterable[int] = (), **shape) -> str:
+                      missing: Iterable[int] = (), exclusions: Iterable[Mapping] = (), **shape) -> str:
     values = synthetic_values(kind, start=start, days=days, interval=interval, seed=seed, **shape)
     missing = list(missing)
     obs = with_receipts(values, settlement_s=settlement_s, delays_ms=delays_ms, missing=missing)
@@ -242,5 +242,5 @@ def synthetic_dataset(directory: str, name: str, *, kind: str = "daily", start: 
                          source={"kind": "synthetic", "generator": "evaluation.datasets.synthetic_values",
                                  "parameters": params},
                          interval_seconds=interval, series=f"synthetic/{kind}", observations=obs,
-                         availability={"mode": mode, "settlement_seconds": settlement_s},
+                         availability={"mode": mode, "settlement_seconds": settlement_s}, exclusions=exclusions,
                          extraction={"command": "evaluation.datasets.synthetic_dataset", "version": "1"})

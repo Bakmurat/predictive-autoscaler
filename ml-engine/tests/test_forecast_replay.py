@@ -314,3 +314,57 @@ def test_the_replay_never_touches_the_network(tmp_path, monkeypatch):
     monkeypatch.setattr(socket.socket, "connect_ex", refuse)
     r, _, _ = run(d, tmp_path / "j.sqlite")
     assert r.issued == 144
+
+
+# --- history validity: exclusions and the settlement watermark (Codex review P1) --------------------------------
+
+def test_excluded_truth_is_unavailable_and_counted(tmp_path):
+    lo, hi = START + DAY + 4 * 3600, START + DAY + 5 * 3600            # a one-hour incident
+    d = make(tmp_path, exclusions=[{"start": lo, "end": hi, "reason": "incident-42"}])
+    seen = []
+
+    def spy(view, origin, targets):
+        seen.extend(t for t in view if lo <= t < hi)
+        return daily_naive(view, origin, targets)
+
+    r, _, _ = run(d, tmp_path / "j.sqlite", forecaster=spy)
+    assert seen == []                                                 # forecasting never sees excluded data
+    out = outcomes_by_origin(tmp_path / "j.sqlite")
+    hit = {o for o in out if any(lo <= o + k * DT < hi for k in (1, 2, 3))}
+    assert len(hit) == 8
+    for o in hit:
+        status, p, at = out[o]
+        assert status == "unscorable" and p["reason"] == "excluded" and p["exclusion"] == "incident-42"
+        assert at == -(-(o + 1800 + 120) // DT) * DT * 1000           # closed when it could close, no grace wait
+    assert all(out[o][0] == "scored" for o in out if o not in hit)
+    assert (r.excluded, r.unscorable) == (8, 8) and r.checkpoint["missing_truth"] == 0
+    assert r.scored + r.unscorable + r.pending == r.issued             # excluded windows stay in the denominator
+    s = fresh_store(tmp_path / "j.sqlite")                            # the receipts stay in the journal for audit
+    assert len(s.observations("replay:" + d.manifest_sha256, lo, hi - DT)) == 6
+    s.close()
+
+
+def test_forecasting_uses_only_the_settlement_watermark(tmp_path):
+    # Samples available the instant they happen (dataset settlement 0); the service still waits the configured
+    # 120 s settlement: at origin t only event times <= floor((t - 120)/Δ)*Δ = t - Δ are finalized.
+    d = make(tmp_path, settlement_s=0)
+    assert d.observations[0].available_at_ms == d.observations[0].event_time * 1000
+    seen = []
+
+    def spy(view, origin, targets):
+        seen.append((origin, view.latest(), origin in view))
+        return last_value(view, origin, targets)
+
+    _, bundles, _ = run(d, tmp_path / "j.sqlite", config(), forecaster=spy)
+    assert all(latest == origin - DT and not at_origin for origin, latest, at_origin in seen)
+    first = json.loads(bundles[0])
+    assert first["input_end"] == START + DAY - DT
+    assert first["input_received_through_ms"] == (START + DAY - DT) * 1000
+
+
+def test_the_watermark_before_the_first_grid_point_hides_everything():
+    # Codex's case: origin 0, settlement 120, cadence 300 -> watermark -300; event 0 received at 0 is not usable.
+    from forecasting.history import watermark
+    assert watermark(0, 300, 120) == -300
+    v = VisibleHistory({0: (5.0, 0)}, now_ms=0, interval=300, through=watermark(0, 300, 120))
+    assert list(v) == [] and v.latest() is None and last_value(v, 0, (300,)) is None
