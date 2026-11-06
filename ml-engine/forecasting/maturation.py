@@ -83,7 +83,8 @@ def window_outcome(*, targets: Sequence[int], base_rps: float, upper_rps: Option
                       "upper_window_max_rps": upper_rps,
                       "covered": None if upper_rps is None else y <= upper_rps,
                       "residual_rps": y - base_rps, "abs_error_rps": abs(y - base_rps),
-                      "values_sha256": sha256_hex(canonical_json(values)), "completed_at_ms": completed}
+                      "values": values, "values_sha256": sha256_hex(canonical_json(values)),
+                      "completed_at_ms": completed}
 
 
 def candidate(bundle: Mapping, model: str) -> Mapping:

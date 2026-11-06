@@ -1,8 +1,10 @@
 """The built-in Help / User Guide (B10): docs/user-guide.md and the chart's optional Grafana "Help & Overview" dashboard.
 
 Pins that the dashboard renders only when asked, that its first panel is the Help text and points at the guide, that it
-uses only metrics the operator really exports (k8s-operator/controllers/metrics.go) and no hard-coded data source, and
-that the guide and the Help panel cover every alert rule and every documented condition type and reason."""
+uses only metrics the operator really exports (k8s-operator/controllers/metrics.go) or the forecasting service's
+forecast-quality collector defines (ml-engine/forecasting/metrics.py, each queried on its own scrape job) and no
+hard-coded data source, and that the guide and the Help panel cover every alert rule and every documented condition
+type and reason."""
 
 import json
 import re
@@ -19,6 +21,7 @@ METRICS_GO = ROOT / "k8s-operator" / "controllers" / "metrics.go"
 HELPERS = ROOT / "charts" / "predictive-autoscaler" / "templates" / "_helpers.tpl"
 CONFIGURATION = ROOT / "docs" / "configuration.md"
 INSTALL_SELECTOR = 'job="${installation}-operator-metrics", pa_install_namespace="$install_namespace"'
+FORECASTER_SELECTOR = 'job="${installation}-forecaster", pa_install_namespace="$install_namespace"'
 TITLE = "Predictive Autoscaler — Help & Overview"
 
 
@@ -43,6 +46,11 @@ def help_text(dashboard):
 
 def operator_metric_names():
     return set(re.findall(r'Name:\s*"(predictive_autoscaler_[a-z0-9_]+)"', METRICS_GO.read_text()))
+
+
+def forecaster_metric_names():
+    from forecasting.metrics import METRIC_NAMES
+    return set(METRIC_NAMES)
 
 
 def alert_names():
@@ -133,15 +141,19 @@ def test_every_query_is_limited_to_one_installation(dashboard):
         if q.startswith("up{"):
             assert 'pa_install_namespace="$install_namespace"' in q and "${installation}-" in q, q
         else:
-            assert q.count(INSTALL_SELECTOR) == selectors, q
+            assert q.count(INSTALL_SELECTOR) + q.count(FORECASTER_SELECTOR) == selectors, q
+        for name in re.findall(r"\b(predictive_autoscaler_[a-z0-9_]+)\{", q):   # each on its own scrape job
+            own = FORECASTER_SELECTOR if name in forecaster_metric_names() else INSTALL_SELECTOR
+            assert f"{name}{{{own}" in q, q
     legends = [t["legendFormat"] for p in dashboard["panels"] if p["type"] == "timeseries" for t in p["targets"]]
-    assert all("{{namespace}}/{{application}}" in lf or "{{pa_install_namespace}} {{job}}" in lf for lf in legends)
+    assert all("{{namespace}}/{{application}}" in lf or "{{namespace}}/{{autoscaler}}" in lf
+               or "{{pa_install_namespace}} {{job}}" in lf for lf in legends)
 
 
 def test_every_metric_the_dashboard_uses_is_exported_by_the_operator(dashboard):
     used = set(re.findall(r"predictive_autoscaler_[a-z0-9_]*[a-z0-9]", json.dumps(dashboard)))
-    exported = operator_metric_names()
-    assert len(exported) >= 15, exported
+    assert len(operator_metric_names()) >= 15, operator_metric_names()
+    exported = operator_metric_names() | forecaster_metric_names()
     assert used and used <= exported, used - exported
     exprs = [t["expr"] for p in dashboard["panels"] for t in p.get("targets", [])]
     other = {m for e in exprs for m in re.findall(r"\b([a-z_:][a-z0-9_:]*)\s*\{", e)} - exported
@@ -196,7 +208,17 @@ def test_the_docs_index_and_the_readme_link_the_guide():
 
 def test_every_metric_the_guide_names_is_exported_by_the_operator():
     named = set(re.findall(r"predictive_autoscaler_[a-z0-9_]*[a-z0-9]", GUIDE.read_text()))
-    assert named and named <= operator_metric_names(), named - operator_metric_names()
+    exported = operator_metric_names() | forecaster_metric_names()
+    assert named and named <= exported, named - exported
+
+
+def test_the_guide_and_the_dashboard_cover_every_forecast_quality_metric(dashboard):
+    guide = GUIDE.read_text()
+    assert all(name in guide for name in forecaster_metric_names()), forecaster_metric_names() - set(
+        re.findall(r"predictive_autoscaler_forecast_[a-z0-9_]*[a-z0-9]", guide))
+    assert not forecaster_metric_names() & operator_metric_names()        # never a reused operator name or meaning
+    text = help_text(dashboard)
+    assert "not** forecast accuracy" in text and "Recommend still makes no writes" in text
 
 
 def test_the_guide_keeps_the_status_statement_and_its_links_resolve():
