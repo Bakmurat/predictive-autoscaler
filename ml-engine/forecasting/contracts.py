@@ -415,7 +415,10 @@ def make_window(origin: int, settings: ForecastSettings, lead: LeadSelection) ->
 def evidence_key(signal: ResolvedSignal, settings: ForecastSettings, lead_seconds: int) -> str:
     """The identity forecast evidence belongs to. A new PA or Deployment, query, cadence, lead, seasonality, engine,
     risk, calibration policy or outcome timing starts a new key (a new epoch); a generation that changes only other
-    fields (mode, caps, trust thresholds) keeps it, and callers check the generation separately."""
+    fields (mode, caps, trust thresholds) keeps it, and callers check the generation separately.
+
+    Keeping forecast evidence is not keeping policy readiness: a change of capacity, predictive-extra caps or trust
+    policy must separately invalidate or re-evaluate policy readiness (trust state, C2.5; operator policy, C2.7)."""
     body = {"schema": EVIDENCE_SCHEMA, "autoscaler_uid": signal.autoscaler_uid, "target_uid": signal.target_uid,
             "query_sha256": signal.sha256, "signal_contract": signal.contract, "forecast_contract": FORECAST_CONTRACT,
             "interval_seconds": settings.sample_interval_seconds, "lead_seconds": lead_seconds,
@@ -669,18 +672,27 @@ def check_response(r: V2Response, bound: Optional[BoundRequest] = None) -> None:
         raise ContractRefused("evidence cutoff after the issue time")
     if r.target_namespace != r.autoscaler_namespace:
         raise ContractRefused("the target must be in the autoscaler's namespace")
+    # A forecast issued at or after its first target is a hindcast, never a forecast.
+    if r.issued_at_ms >= r.target_timestamps[0] * 1000:
+        raise ContractRefused("the issuance is not before the first target")
     if r.predictive_eligible and (r.upper_window_max_rps is None or r.trust_state != "Trusted" or r.reason != "Ready"):
         raise ContractRefused("an eligible forecast needs an upper bound, trust state Trusted and reason Ready")
+    # Eligibility also needs the remaining window at issuance: now + A before the first target and before valid_until.
+    if r.predictive_eligible and not win.actionable_at(r.issued_at_ms, lead):
+        raise ContractRefused("an eligible forecast must be issued while its window is still actionable")
     if bound is not None:
         s = bound.signal
-        echo = (r.autoscaler_namespace, r.autoscaler_name, r.autoscaler_uid, r.autoscaler_generation, r.target_namespace, r.target_name, r.target_uid,
-                r.metric_query_sha256, r.settings_sha256, r.decision_origin, r.sample_interval_seconds,
-                r.nominal_miscoverage_bps)
-        want = (bound.autoscaler_namespace, bound.autoscaler_name, s.autoscaler_uid, s.generation, s.namespace, s.name, s.target_uid, s.sha256, bound.settings_sha256,
-                bound.decision_origin, bound.settings.sample_interval_seconds, bound.settings.risk.miscoverage_bps)
+        echo = (r.autoscaler_namespace, r.autoscaler_name, r.autoscaler_uid, r.autoscaler_generation,
+                r.target_namespace, r.target_name, r.target_uid, r.metric_query_sha256, r.settings_sha256,
+                r.decision_origin, r.sample_interval_seconds, r.nominal_miscoverage_bps)
+        want = (bound.autoscaler_namespace, bound.autoscaler_name, s.autoscaler_uid, s.generation, s.namespace,
+                s.name, s.target_uid, s.sha256, bound.settings_sha256, bound.decision_origin,
+                bound.settings.sample_interval_seconds, bound.settings.risk.miscoverage_bps)
         if echo != want:
             raise ContractRefused("the response does not echo the request's identity, settings and origin")
         if bound.lead is None or (r.lead_seconds, r.startup_delay_seconds, r.actuation_allowance_seconds) != (
                 bound.lead.lead_seconds, bound.lead.startup_delay_seconds, bound.lead.actuation_allowance_seconds):
             raise ContractRefused("the response's lead differs from the autoscaler's")
+        if r.calibration_epoch != bound.evidence_key:
+            raise ContractRefused("the response's calibration epoch is not the request's evidence key")
 

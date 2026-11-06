@@ -319,11 +319,39 @@ def test_responses_for_another_request_are_refused(over):
         c.check_response(r, b)
 
 
+ELIGIBLE = dict(predictive_eligible=True, upper_window_max_rps=3.0, trust_state="Trusted", reason="Ready",
+                calibration_windows=128, prospective_windows=64, gate_coverage_ratio=0.9)
+
+
+@pytest.mark.parametrize("over", [
+    {"issued_at_ms": (ORIGIN + 300) * 1000},                       # issued at the first target: a hindcast
+    {"issued_at_ms": (ORIGIN + 900) * 1000, "input_received_through_ms": (ORIGIN + 900) * 1000},
+    {**ELIGIBLE, "issued_at_ms": (ORIGIN + 270) * 1000},             # eligible but issued at valid_until
+    {**ELIGIBLE, "issued_at_ms": (ORIGIN + 280) * 1000},             # after valid_until (and inside now + A)
+    {**ELIGIBLE, "issued_at_ms": (ORIGIN + 270) * 1000 + 1},
+])
+def test_issuance_timing_is_enforced(over):
+    b = c.bind_request(request(), FakeReader(), now_ms=NOW_MS)
+    with pytest.raises(ContractRefused):
+        c.check_response(make_response(b, **over))
+
+
+def test_a_late_shadow_response_is_coherent_but_never_eligible():
+    # After valid_until but before the first target: a shadow issuance may still be recorded; it cannot be eligible.
+    b = c.bind_request(request(), FakeReader(), now_ms=NOW_MS)
+    c.check_response(make_response(b, issued_at_ms=(ORIGIN + 280) * 1000), b)
+
+
+def test_the_calibration_epoch_must_be_the_requests_evidence_key():
+    b = c.bind_request(request(), FakeReader(), now_ms=NOW_MS)
+    for epoch in ("f" * 64, "", c.evidence_key(b.signal, b.settings, 900)):
+        with pytest.raises(ContractRefused):
+            c.check_response(make_response(b, calibration_epoch=epoch), b)
+
+
 def test_an_eligible_response_is_coherent_only_when_trusted():
     b = c.bind_request(request(), FakeReader(), now_ms=NOW_MS)
-    c.check_response(make_response(b, predictive_eligible=True, upper_window_max_rps=3.0, trust_state="Trusted",
-                                   reason="Ready", calibration_windows=128, prospective_windows=64,
-                                   gate_coverage_ratio=0.9), b)
+    c.check_response(make_response(b, **ELIGIBLE), b)
 
 
 def test_wire_decoding_is_strict():
