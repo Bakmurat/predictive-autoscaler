@@ -495,14 +495,20 @@ def test_alert_rules_are_opt_in_and_identical_for_both_rule_engines(render):
     assert jobs and jobs <= services
 
 
-def test_operator_scrape_keeps_the_autoscaler_namespace_label(render):
+def test_both_scrapes_keep_the_workload_namespace_label(render):
+    # The operator and the forecasting service both label series with the workload's namespace, which may differ from
+    # the installation's (a workload in "shop", the chart in "pa-system"): honorLabels keeps it as `namespace` instead
+    # of renaming it to exported_namespace, and the installation stays in pa_install_namespace.
     docs = render({"metrics": {"serviceMonitor": {"enabled": True}, "vmServiceScrape": {"enabled": True}}})
+    seen = set()
     for kind in ("ServiceMonitor", "VMServiceScrape"):
         for d in by_kind(docs, kind):
             (ep,) = d["spec"]["endpoints"]
-            assert ep.get("honorLabels") is (True if d["metadata"]["name"].endswith("-operator") else None), d
+            assert ep.get("honorLabels") is True, d
+            seen.add((kind, d["metadata"]["name"].rsplit("-", 1)[-1]))
             relabel = ep["relabelings" if kind == "ServiceMonitor" else "relabelConfigs"]
             assert relabel == [{"sourceLabels": ["__meta_kubernetes_namespace"], "targetLabel": "pa_install_namespace"}]
+    assert seen == {(k, c) for k in ("ServiceMonitor", "VMServiceScrape") for c in ("operator", "forecaster")}
 
 
 @pytest.mark.parametrize("bad", [{"notReadyFor": "15 minutes"}, {"modelStaleHours": 0}, {"modelStaleHours": 1.5},

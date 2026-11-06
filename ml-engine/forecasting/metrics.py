@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Dict, Iterator, List, Mapping, Optional, Tuple
 
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
@@ -26,7 +27,7 @@ from prometheus_client.registry import Collector
 
 from forecasting.calibration import E8
 from forecasting.contracts import MODEL_FAMILIES
-from forecasting.trust import DAY, window_sums
+from forecasting.trust import DAY, availability, window_sums
 
 PREFIX = "predictive_autoscaler_forecast_"
 BASE_LABELS = ("namespace", "autoscaler", "model")
@@ -44,7 +45,8 @@ METRICS: Dict[str, Tuple[str, Optional[str], str]] = {
                                             "bound is neither covered nor missed)."),
     "scored_windows": ("gauge", "cohort", "Scorable windows with an issued bound in the trailing 7 days."),
     "window_coverage_ratio": ("gauge", "cohort", "Covered / bounded windows (Y <= U) over 7 days; absent when none."),
-    "outcome_availability_ratio": ("gauge", None, "Scorable / matured windows over the last day; absent when none."),
+    "outcome_availability_ratio": ("gauge", None, "Scorable / (matured + overdue) issued windows over the last day; "
+                                                  "absent when none."),
     "window_mae_rps": ("gauge", None, "Mean |Y - b| of matured windows over 7 days, bound or not (requests/second)."),
     "window_bias_rps": ("gauge", None, "Mean b - Y over 7 days; positive means over-forecast (requests/second)."),
     "window_pinball_loss_rps": ("gauge", None, "Mean nominal-level pinball loss of issued gate bounds over 7 days."),
@@ -81,7 +83,7 @@ def model_samples(*, ledger: dict, calibration: Optional[dict], nominal_miscover
     out: List[Sample] = []
     tot = ledger["totals"]
     w7 = window_sums(ledger, now_s, 7 * DAY)
-    d1 = window_sums(ledger, now_s, DAY)
+    avail = availability(ledger, now_s)["outcomes"]
     out.append(("issued_total", (), float(tot["issued"])))
     for r in OUTCOME_RESULTS:
         out.append(("outcomes_total", (r,), float(tot[r])))
@@ -89,8 +91,8 @@ def model_samples(*, ledger: dict, calibration: Optional[dict], nominal_miscover
         out.append(("scored_windows", (cohort,), float(bd)))
         if bd:
             out.append(("window_coverage_ratio", (cohort,), cv / bd))
-    if d1["sc"] + d1["un"]:
-        out.append(("outcome_availability_ratio", (), d1["sc"] / (d1["sc"] + d1["un"])))
+    if avail is not None:
+        out.append(("outcome_availability_ratio", (), avail))
     if w7["sc"]:
         out.append(("window_mae_rps", (), w7["abs"] / w7["sc"]))
         out.append(("window_bias_rps", (), w7["bias"] / w7["sc"]))
@@ -118,8 +120,15 @@ def model_samples(*, ledger: dict, calibration: Optional[dict], nominal_miscover
 
 @dataclass(frozen=True)
 class Snapshot:
+    """An immutable copy: the caller's dicts and lists are copied into tuples at construction, so nothing the caller
+    changes afterwards reaches an admitted snapshot."""
     uid: str
     models: Mapping[str, List[Sample]] = field(default_factory=dict)
+
+    def __post_init__(self):
+        frozen = {str(m): tuple((str(n), tuple(str(x) for x in e), float(v)) for n, e, v in samples)
+                  for m, samples in dict(self.models).items()}
+        object.__setattr__(self, "models", MappingProxyType(frozen))
 
     def series(self) -> int:
         return sum(len(v) for v in self.models.values())
@@ -133,6 +142,7 @@ class ForecastMetrics(Collector):
         self._lock = threading.Lock()
 
     def update(self, namespace: str, autoscaler: str, snapshot: Snapshot) -> None:
+        snapshot = Snapshot(snapshot.uid, snapshot.models)        # validate and keep our own frozen copy
         for model, samples in snapshot.models.items():
             if model not in MODEL_FAMILIES:
                 raise ValueError(f"model {model!r} is not in the fixed enum {MODEL_FAMILIES}")

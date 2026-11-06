@@ -16,9 +16,9 @@ spec:
     - port: {{ ternary "metrics" "http" (eq $component "operator") }}
       path: /metrics
       interval: {{ $cfg.interval }}
-      {{- if eq $component "operator" }}
-      honorLabels: true    # keep the autoscaler's own namespace label (not renamed to exported_namespace)
-      {{- end }}
+      # Both components label series with the WORKLOAD's namespace (the autoscaler's): keep it, never rename it to
+      # exported_namespace; the installation's namespace is pa_install_namespace (below).
+      honorLabels: true
       # the installation's namespace under its own name (the alert rules select this installation by it)
       {{ ternary "relabelings" "relabelConfigs" (eq $kind "ServiceMonitor") }}:
         - {sourceLabels: [__meta_kubernetes_namespace], targetLabel: pa_install_namespace}

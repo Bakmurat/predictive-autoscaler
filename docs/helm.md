@@ -129,10 +129,10 @@ The forecasting service and the trainer share the model volume.
 ## Monitoring
 
 `metrics.serviceMonitor.enabled` (Prometheus Operator) or `metrics.vmServiceScrape.enabled` (VictoriaMetrics
-Operator) scrapes the operator (port 8080) and the forecasting service (port 8000). The operator's scrape keeps the
-metrics' own `namespace` label (the autoscaler's namespace; `honorLabels`), so it is not renamed to
-`exported_namespace`. Both scrapes add `pa_install_namespace`, the namespace the chart is installed in; together with
-`job` (the Service name) it identifies one installation.
+Operator) scrapes the operator (port 8080) and the forecasting service (port 8000). Both scrapes keep the metrics' own
+`namespace` label (the autoscaler's and its workload's namespace; `honorLabels`), so it is not renamed to
+`exported_namespace` even for a workload outside the chart's namespace. Both add `pa_install_namespace`, the namespace
+the chart is installed in; together with `job` (the Service name) it identifies one installation.
 
 The operator exports every autoscaler's conditions as `predictive_autoscaler_condition{namespace, autoscaler, type,
 status}`: 1 for the current status (`True`, `False` or `Unknown`), 0 for the other two, in the style of

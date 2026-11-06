@@ -134,3 +134,29 @@ def test_the_exposition_renders_counters_and_gauges():
     assert 'predictive_autoscaler_forecast_issued_total{autoscaler="web",model="statistical",namespace="shop"}' in text
     assert 'predictive_autoscaler_forecast_fit_failures_total{autoscaler="web",model="lstm",namespace="shop",' \
            'reason="timeout"} 2.0' in text
+
+
+def test_an_admitted_snapshot_cannot_be_changed_by_its_caller():
+    # Codex repro: appending to the caller's list after update() bypassed the series limit.
+    samples = [("trusted", (), 1.0)]
+    models = {"seasonal_naive": samples}
+    snap = M.Snapshot("u", models)
+    m = M.ForecastMetrics(max_series_per_autoscaler=2)
+    m.update("shop", "web", snap)
+    samples.extend([("trusted", (), 1.0)] * 10)
+    models["statistical"] = [("trusted", (), 1.0)] * 10
+    assert len(samples) == 11                                         # the caller's list did change ...
+    reg = registry(m)
+    assert len([x for fam in reg.collect() for x in fam.samples]) == 1  # ... the admitted copy did not
+    with pytest.raises((TypeError, AttributeError)):
+        snap.models["lstm"] = []
+
+
+def test_the_namespace_label_is_the_workloads_not_the_installations():
+    # A workload in "shop" served by an installation in "pa-system": the series carry namespace="shop"; the scrape
+    # keeps it (honorLabels, tests/test_chart.py) and adds pa_install_namespace="pa-system" itself.
+    m = M.ForecastMetrics()
+    m.update("shop", "web", snapshot())
+    labels = {s.labels["namespace"] for fam in registry(m).collect() for s in fam.samples}
+    assert labels == {"shop"}
+    assert all("pa_install_namespace" not in s.labels for fam in registry(m).collect() for s in fam.samples)

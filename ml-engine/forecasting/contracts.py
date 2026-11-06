@@ -155,7 +155,8 @@ class TrustSettings:
     repromotion_windows: int = 32
     challenger_min_pairs: int = 64
     challenger_min_hours: int = 48
-    challenger_loss_ratio_bps: int = 9500
+    challenger_loss_ratio_bps: int = 9500        # enter: pinball <= 0.95 x the naive's
+    challenger_exit_loss_ratio_bps: int = 10000  # leave (no safety failure): only once worse than the naive
     challenger_cost_ratio_bps: int = 10200
     max_fit_age_hours: int = 12
 
@@ -213,6 +214,7 @@ _TRUST = (("minShadowHours", "min_shadow_hours", 1, 24 * 28), ("minProspectiveWi
           ("challengerMinPairs", "challenger_min_pairs", 1, 4096),
           ("challengerMinHours", "challenger_min_hours", 1, 24 * 28),
           ("challengerLossRatioBps", "challenger_loss_ratio_bps", 1, BPS),
+          ("challengerExitLossRatioBps", "challenger_exit_loss_ratio_bps", 1, 2 * BPS),
           ("challengerCostRatioBps", "challenger_cost_ratio_bps", BPS, 2 * BPS),
           ("maxFitAgeHours", "max_fit_age_hours", 1, 24))
 _EXTRA = (("maxReplicas", "max_replicas", 0, 1000), ("maxPercent", "max_percent", 0, 1000))
@@ -319,6 +321,8 @@ def _check_feasible(s: ForecastSettings) -> None:
     t = s.trust
     if t.acute_recent_windows > c.max_scores or t.min_prospective_windows > c.max_scores:
         raise ContractRefused("trust window counts exceed the calibration buffer")
+    if t.challenger_exit_loss_ratio_bps < t.challenger_loss_ratio_bps:
+        raise ContractRefused("trust.challengerExitLossRatioBps must not be below challengerLossRatioBps")
     if t.min_shadow_hours > c.retention_days * 24:
         raise ContractRefused("trust.minShadowHours exceeds the retention")
 

@@ -1,42 +1,49 @@
 """Trust for forecast contract v2: evidence ledgers, per-candidate gates with hysteresis, paired challenger promotion,
-the fallback order and the ready-to-activate verdict. Pure and replayable: every function maps (state, inputs, now) to
-a new state or a verdict; nothing reads a clock, the network or Kubernetes (design C2, section 7).
+the fallback order with selection hysteresis and the ready-to-activate verdict. Pure and replayable: every function maps
+(state, inputs, now) to a new state or a verdict; nothing reads a clock, the network or Kubernetes (design C2, section
+7).
 
-Evidence ledger (one per epoch and model). Matured records and issuances are folded in exactly once (journal sequence
-numbers) into hourly buckets (by window end, or by origin for issuances), kept for the 7-day retention. A bucket counts
-issued windows, scored and unscorable outcomes, bounded/covered windows for all windows and for the nonoverlapping
-gate cohort, and sums for realised error. PROSPECTIVE and REPLAY evidence are counted apart: replay may warm up
-calibration and diagnostics, but every trust gate counts prospective evidence only (hindsight cannot authorize a
-write). A recent-results ring (the last acute_recent_windows prospective gate bounds) and a consecutive-miss counter
-drive acute demotion.
+Evidence ledger (one per epoch, model AND recipe; records of another recipe are refused, so a replacement recipe starts
+its own evidence). Issuances and matured records are folded in exactly once (journal sequence numbers) into hourly
+buckets (by window end, or by origin for issuances), kept for the 7-day retention. PROSPECTIVE and REPLAY evidence are
+counted apart in every count: replay may warm up calibration, but every gate, availability figure and error diagnostic
+uses prospective evidence only (hindsight cannot authorize a write). The ledger also tracks each prospective issuance
+whose outcome is still due, with its truth deadline: an issued window whose deadline has passed without an outcome is
+OVERDUE and counts against availability, so a stalled maturation cannot look healthy.
+
+Time windows are whole hours: a trailing window of S seconds at `now` covers the hour buckets from the first whole
+hour at or after now - S to the hour holding now. With an hour-aligned now it covers exactly [now - S, now]; otherwise
+up to one hour less (never more). Coverage, availability and pairs all use this rule.
 
 Gates per candidate (all thresholds are TrustSettings parameters, fingerprinted with the settings):
-  identity/storage  identity valid and the journal healthy                                  else IdentityMismatch /
-                                                                                                 StateUnavailable
-  data              current input fresh, and the fit no older than max_fit_age (statistical)  else DataUnavailable
-  history           the family's minimum history (naive: 1 day; E1-product: 7 days)          else HistoryInsufficient
-  calibration       an upper bound is available now (>= min_windows scores, rank feasible)   else CalibrationInsufficient
+  identity/storage  identity valid and the journal healthy                    else IdentityMismatch / StateUnavailable
+  data              current input fresh, and the fit no older than max_fit_age (statistical)    else DataUnavailable
+  history           the family's minimum history (naive: 1 day; E1-product: 7 days)            else HistoryInsufficient
+  calibration       an upper bound is available now (>= min_windows scores, rank feasible)  else CalibrationInsufficient
   prospective       >= min_shadow_hours since the first prospective bound and >= min_prospective_windows prospective
-                    gate bounds                                                              else ShadowInsufficient
+                    gate bounds                                                                else ShadowInsufficient
   coverage          7-day prospective gate coverage >= nominal - tolerance; the worst UTC day with >= worst_day_min
                     outcomes too; acute: no acute_consecutive_misses in a row, and the last acute_recent_windows
-                    bounds (once that many exist) at or above the threshold                  else CoverageLow
-  availability      >= min_availability of the last day's matured windows scorable (None, no matured window, fails)
-                                                                                             else DataUnavailable
-Hysteresis: a trusted candidate failing any gate is demoted at once (Degraded). Once demoted, it is promoted again only
-after its gates have held for repromotion_hours and >= repromotion_windows new prospective gate bounds have matured
-since the demotion; a demotion and a promotion can never happen in the same evaluation. A candidate never trusted
-before is promoted the first time its gates hold.
+                    bounds (once that many exist) at or above the threshold                    else CoverageLow
+  availability      over the last day, >= min_availability of (a) the matured-or-overdue issued windows scorable
+                    (scored / (scored + unscorable + overdue)) and (b) the expected forecast opportunities issued
+                    (issued origins / grid origins since the first issuance); None (nothing to count) fails
+                                                                                               else DataUnavailable
+Hysteresis (per candidate, bound to its recipe): a trusted candidate failing any gate is demoted at once (Degraded).
+Once demoted, it is promoted again only after its gates have held for repromotion_hours and >= repromotion_windows new
+prospective gate bounds have matured since the demotion; never in the same evaluation as the demotion.
 
-Challenger promotion (paired, against the trusted daily naive): >= challenger_min_pairs paired prospective gate bounds
-(both models bounded at the same origins) over >= challenger_min_hours, mean pinball loss <= challenger_loss_ratio x
-the naive's, and the same-policy replay costs (shortage and replica-time, supplied by the policy simulator) each <=
-challenger_cost_ratio x the naive's. A naive loss of zero keeps the naive (no tie logic). Without the costs nothing is
-promoted.
+Challenger promotion (paired, against the trusted daily naive, both recipes bound): >= challenger_min_pairs paired
+prospective gate bounds whose retained window ends SPAN >= challenger_min_hours, mean pinball loss <=
+challenger_loss_ratio x the naive's, and the same-policy replay costs (shortage, replica-time, from the policy
+simulator) each <= challenger_cost_ratio x the naive's. A zero naive loss keeps the naive. Without the costs nothing
+is promoted.
 
-Fallback order: lstm (an optional challenger) -> statistical (E1-product) -> seasonal_naive -> reactive-only. A
-candidate other than the naive is selected only when it is trusted AND promoted over a trusted naive; the naive is
-selected when it is trusted; otherwise nothing (reactive-only). Never an untrusted naive because a richer model failed.
+Selection (fallback order lstm -> statistical -> seasonal_naive -> reactive-only) has its own hysteresis: a safety
+failure (the selected candidate, or the naive it was compared with, not trusted) falls back at once; a challenger is
+selected only after its promotion criteria have held continuously for repromotion_hours; once selected it is kept
+until its paired loss is worse than challenger_exit_loss_ratio x the naive's or its costs fail. Marginal superiority
+therefore cannot make the selection flap. Never an untrusted naive because a richer model failed.
 PredictionReady additionally needs the activation evidence this service can check (versioned replay suite, startup
 budget): it means "ready to activate"; Recommend still makes no writes, and it says nothing about a workload's SLO.
 """
@@ -51,19 +58,23 @@ from forecasting.calibration import CalibrationRecord, in_cohort, pinball_rps
 from forecasting.contracts import TrustSettings
 from forecasting.maturation import candidate
 
-LEDGER_SCHEMA = "evidence-ledger/v1"
+LEDGER_SCHEMA = "evidence-ledger/v2"
 HOUR = 3600
 DAY = 86400
 FALLBACK_ORDER = ("lstm", "statistical", "seasonal_naive")
 NAIVE = "seasonal_naive"
 MODES = ("prospective", "replay")
+SELECTION = "_selection"
 REASON_ORDER = ("IdentityMismatch", "StateUnavailable", "DataUnavailable", "HistoryInsufficient",
                 "CalibrationInsufficient", "ShadowInsufficient", "CoverageLow", "LeadInsufficient",
                 "ReplayGateMissing", "Ready")
 # The candidate history minimums of the cold-start ladder (design C2, section 4); an optional LSTM brings its own.
 REQUIRED_HISTORY_SECONDS = {"seasonal_naive": DAY, "statistical": 7 * DAY}
-_FIELDS = ("iss", "g_iss", "sc", "un", "g_sc", "g_un", "a_bd", "a_cv", "g_bd", "g_cv", "r_bd", "r_cv", "pin", "abs",
-           "bias", "n_step", "st0", "st1", "st2")
+# Prospective: issued (all, gate), scored/unscorable (all, gate), bounded/covered (all, gate), pinball, error sums.
+# Replay: issued, scored, unscorable, gate bounded/covered. Nothing else is counted for replay.
+_FLOATS = ("pin", "abs", "bias", "st0", "st1", "st2")
+_FIELDS = ("iss", "g_iss", "sc", "un", "g_sc", "g_un", "a_bd", "a_cv", "g_bd", "g_cv", "n_step", *_FLOATS,
+           "r_iss", "r_sc", "r_un", "r_bd", "r_cv")
 
 
 class TrustError(Exception):
@@ -97,10 +108,11 @@ class EvidenceRecord:
         return cls(rec, mode, outcome.committed_at_ms, steps)
 
 
-def new_ledger(epoch: str, model: str) -> dict:
-    return {"schema": LEDGER_SCHEMA, "epoch": epoch, "model": model, "buckets": {}, "recent": [],
-            "consecutive_misses": 0, "first_prospective_s": None, "last_prospective_outcome_s": None,
-            "last_outcome_seq": 0, "last_issuance_seq": 0, "newest_s": None,
+def new_ledger(epoch: str, model: str, recipe: str, interval_s: int) -> dict:
+    return {"schema": LEDGER_SCHEMA, "epoch": epoch, "model": model, "recipe": recipe, "interval_s": interval_s,
+            "buckets": {}, "pending": {}, "recent": [], "consecutive_misses": 0, "first_prospective_s": None,
+            "first_issue_s": None, "last_prospective_outcome_s": None, "last_outcome_seq": 0, "last_issuance_seq": 0,
+            "newest_s": None,
             "totals": {"issued": 0, "covered": 0, "missed": 0, "unscorable": 0, "prospective_gate_bounded": 0,
                        "replay_gate_bounded": 0}}
 
@@ -109,9 +121,7 @@ def _bucket(ledger: dict, t: int) -> dict:
     key = str(t // HOUR)
     b = ledger["buckets"].get(key)
     if b is None:
-        b = ledger["buckets"][key] = {f: 0 for f in _FIELDS}
-        for f in ("pin", "abs", "bias", "st0", "st1", "st2"):
-            b[f] = 0.0
+        b = ledger["buckets"][key] = {f: (0.0 if f in _FLOATS else 0) for f in _FIELDS}
     return b
 
 
@@ -120,16 +130,25 @@ def _prune(ledger: dict, now_s: int, retention_s: int) -> None:
     ledger["newest_s"] = newest
     floor = (newest - retention_s) // HOUR
     ledger["buckets"] = {k: v for k, v in ledger["buckets"].items() if int(k) > floor}
+    ledger["pending"] = {k: v for k, v in ledger["pending"].items() if v[0] > newest - retention_s}
 
 
 def _copy(ledger: dict) -> dict:
     return {**ledger, "buckets": {k: dict(v) for k, v in ledger["buckets"].items()}, "recent": list(ledger["recent"]),
-            "totals": dict(ledger["totals"])}
+            "pending": dict(ledger["pending"]), "totals": dict(ledger["totals"])}
 
 
-def note_issuance(ledger: dict, *, seq: int, origin: int, lead_s: int, mode: str, bounded: bool,
+def _same_identity(ledger: dict, epoch: str, model: str, recipe: str) -> None:
+    if (epoch, model, recipe) != (ledger["epoch"], ledger["model"], ledger["recipe"]):
+        raise TrustError("the evidence belongs to another epoch, model or recipe")
+
+
+def note_issuance(ledger: dict, *, seq: int, issuance_id: str, epoch: str, model: str, recipe: str, origin: int,
+                  window_end: int, deadline_s: int, lead_s: int, mode: str, bounded: bool,
                   retention_s: int = 7 * DAY) -> dict:
-    """An issuance of this model at `origin` (exactly once by its journal sequence number)."""
+    """An issuance of this candidate at `origin` (exactly once by its journal sequence number). A prospective one is
+    pending until its outcome arrives; past deadline_s (window end + settlement + grace) it is overdue."""
+    _same_identity(ledger, epoch, model, recipe)
     if seq <= ledger["last_issuance_seq"]:
         return ledger
     if mode not in MODES:
@@ -137,29 +156,44 @@ def note_issuance(ledger: dict, *, seq: int, origin: int, lead_s: int, mode: str
     s = _copy(ledger)
     s["last_issuance_seq"] = seq
     b = _bucket(s, origin)
-    b["iss"] += 1
-    if in_cohort(origin, lead_s):
-        b["g_iss"] += 1
-    s["totals"]["issued"] += 1
-    if mode == "prospective" and bounded and s["first_prospective_s"] is None:
-        s["first_prospective_s"] = origin
+    if mode == "replay":
+        b["r_iss"] += 1
+    else:
+        b["iss"] += 1
+        b["g_iss"] += int(in_cohort(origin, lead_s))
+        s["totals"]["issued"] += 1
+        s["pending"][issuance_id] = [window_end, deadline_s]
+        if s["first_issue_s"] is None:
+            s["first_issue_s"] = origin
+        if bounded and s["first_prospective_s"] is None:
+            s["first_prospective_s"] = origin
     _prune(s, origin, retention_s)
     return s
 
 
 def note_outcome(ledger: dict, r: EvidenceRecord, *, lead_s: int, nominal_miscoverage: float, recent_n: int,
                  retention_s: int = 7 * DAY) -> dict:
-    """A matured outcome of this model (exactly once by its journal sequence number)."""
+    """A matured outcome of this candidate (exactly once by its journal sequence number)."""
     c = r.cal
-    if (c.epoch, c.model) != (ledger["epoch"], ledger["model"]):
-        raise TrustError("the record belongs to another epoch or model")
+    _same_identity(ledger, c.epoch, c.model, c.recipe)
     if c.seq <= ledger["last_outcome_seq"]:
         return ledger
     s = _copy(ledger)
     s["last_outcome_seq"] = c.seq
+    s["pending"].pop(c.issuance_id, None)
     gate = in_cohort(c.decision_origin, lead_s)
     b = _bucket(s, c.window_end)
-    if c.status == "unscorable":
+    scored = c.status == "scored"
+    covered = scored and c.upper_rps is not None and c.y_rps <= c.upper_rps
+    if r.mode == "replay":                      # counted apart, and only these counts
+        b["r_sc" if scored else "r_un"] += 1
+        if scored and gate and c.upper_rps is not None:
+            b["r_bd"] += 1
+            b["r_cv"] += int(covered)
+            s["totals"]["replay_gate_bounded"] += 1
+        _prune(s, c.window_end, retention_s)
+        return s
+    if not scored:
         b["un"] += 1
         b["g_un"] += int(gate)
         s["totals"]["unscorable"] += 1
@@ -172,35 +206,27 @@ def note_outcome(ledger: dict, r: EvidenceRecord, *, lead_s: int, nominal_miscov
     b["bias"] += base - y
     if r.step_abs_errors is not None:
         b["n_step"] += 1
-        b["st0"] += r.step_abs_errors[0]
-        b["st1"] += r.step_abs_errors[1]
-        b["st2"] += r.step_abs_errors[2]
+        for f, v in zip(("st0", "st1", "st2"), r.step_abs_errors):
+            b[f] += v
     if u is not None:
-        covered = y <= u
-        if r.mode == "replay":
-            if gate:
-                b["r_bd"] += 1
-                b["r_cv"] += int(covered)
-                s["totals"]["replay_gate_bounded"] += 1
-        else:
-            b["a_bd"] += 1
-            b["a_cv"] += int(covered)
-            s["totals"]["covered" if covered else "missed"] += 1
-            if gate:
-                b["g_bd"] += 1
-                b["g_cv"] += int(covered)
-                b["pin"] += pinball_rps(y, u, nominal_miscoverage)
-                s["totals"]["prospective_gate_bounded"] += 1
-                s["recent"] = (s["recent"] + [int(covered)])[-recent_n:]
-                s["consecutive_misses"] = 0 if covered else s["consecutive_misses"] + 1
-                s["last_prospective_outcome_s"] = c.window_end
+        b["a_bd"] += 1
+        b["a_cv"] += int(covered)
+        s["totals"]["covered" if covered else "missed"] += 1
+        if gate:
+            b["g_bd"] += 1
+            b["g_cv"] += int(covered)
+            b["pin"] += pinball_rps(y, u, nominal_miscoverage)
+            s["totals"]["prospective_gate_bounded"] += 1
+            s["recent"] = (s["recent"] + [int(covered)])[-recent_n:]
+            s["consecutive_misses"] = 0 if covered else s["consecutive_misses"] + 1
+            s["last_prospective_outcome_s"] = c.window_end
     _prune(s, c.window_end, retention_s)
     return s
 
 
 def _hours(now_s: int, seconds: int) -> Tuple[int, int]:
-    """The hour buckets of a trailing window: from the first whole hour at or after now - seconds to the hour holding
-    now (hour granularity; events after now do not exist yet)."""
+    """The hour buckets of a trailing window (module docstring): from the first whole hour at or after now - seconds
+    to the hour holding now."""
     return -(-(now_s - seconds) // HOUR), now_s // HOUR
 
 
@@ -215,12 +241,39 @@ def window_sums(ledger: dict, now_s: int, seconds: int) -> Dict[str, float]:
     return out
 
 
+def overdue(ledger: dict, now_s: int, seconds: int) -> int:
+    """Prospective issued windows in the trailing window whose truth deadline has passed without an outcome."""
+    lo, hi = _hours(now_s, seconds)
+    return sum(1 for end, deadline in ledger["pending"].values() if lo <= end // HOUR <= hi and deadline <= now_s)
+
+
+def expected_opportunities(ledger: dict, now_s: int, seconds: int) -> int:
+    """Grid origins in the trailing window since the first prospective issuance: every one should have an issuance."""
+    first, dt = ledger["first_issue_s"], ledger["interval_s"]
+    if first is None:
+        return 0
+    lo, _ = _hours(now_s, seconds)
+    start = max(lo * HOUR, first)
+    start, end = -(-start // dt) * dt, now_s // dt * dt
+    return (end - start) // dt + 1 if end >= start else 0
+
+
+def availability(ledger: dict, now_s: int, seconds: int = DAY) -> Dict[str, Optional[float]]:
+    """{"outcomes": scored / (scored + unscorable + overdue), "predictions": issued / expected origins}; None when
+    there is nothing to count. Prospective evidence only."""
+    w = window_sums(ledger, now_s, seconds)
+    late = overdue(ledger, now_s, seconds)
+    expected = expected_opportunities(ledger, now_s, seconds)
+    return {"outcomes": _ratio(w["sc"], w["sc"] + w["un"] + late),
+            "predictions": _ratio(min(w["iss"], expected), expected), "overdue": late}
+
+
 def _ratio(num, den) -> Optional[float]:
     return num / den if den else None
 
 
 def daily_gate_coverage(ledger: dict, now_s: int, seconds: int = 7 * DAY) -> List[Tuple[int, int, int]]:
-    """[(utc_day, gate_bounded, gate_covered)] for the UTC days in the window."""
+    """[(utc_day, gate_bounded, gate_covered)] for the UTC days in the window (prospective)."""
     days: Dict[int, List[int]] = {}
     lo, hi = _hours(now_s, seconds)
     for k, v in ledger["buckets"].items():
@@ -233,18 +286,21 @@ def daily_gate_coverage(ledger: dict, now_s: int, seconds: int = 7 * DAY) -> Lis
 
 # --- paired challenger evidence -------------------------------------------------------------------------------------
 
-def new_pairs(epoch: str, challenger: str, baseline: str = NAIVE) -> dict:
-    return {"epoch": epoch, "challenger": challenger, "baseline": baseline, "pending": {}, "buckets": {},
-            "first_pair_s": None, "last_seq": 0}
+def new_pairs(epoch: str, challenger: str, challenger_recipe: str, baseline_recipe: str, baseline: str = NAIVE) -> dict:
+    return {"epoch": epoch, "challenger": challenger, "baseline": baseline,
+            "recipes": {challenger: challenger_recipe, baseline: baseline_recipe}, "pending": {}, "buckets": {},
+            "last_seq": 0}
 
 
 def note_pair(pairs: dict, r: EvidenceRecord, *, lead_s: int, nominal_miscoverage: float,
               retention_s: int = 7 * DAY) -> dict:
-    """Pair prospective gate bounds of the challenger and the baseline at the same issuance (exactly once)."""
+    """Pair prospective gate bounds of the challenger and the baseline at the same issuance (exactly once). A record of
+    either model under another recipe is refused."""
     c = r.cal
-    if c.epoch != pairs["epoch"] or c.model not in (pairs["challenger"], pairs["baseline"]) or \
-            c.seq <= pairs["last_seq"]:
+    if c.epoch != pairs["epoch"] or c.model not in pairs["recipes"] or c.seq <= pairs["last_seq"]:
         return pairs
+    if c.recipe != pairs["recipes"][c.model]:
+        raise TrustError("the paired evidence belongs to another recipe")
     s = {**pairs, "pending": dict(pairs["pending"]), "buckets": {k: dict(v) for k, v in pairs["buckets"].items()},
          "last_seq": c.seq}
     if r.mode != "prospective" or c.status != "scored" or c.upper_rps is None or \
@@ -256,25 +312,31 @@ def note_pair(pairs: dict, r: EvidenceRecord, *, lead_s: int, nominal_miscoverag
         s["pending"][c.issuance_id] = [c.model, loss, c.window_end]
     else:
         chal, base = (loss, other[1]) if c.model == s["challenger"] else (other[1], loss)
-        b = s["buckets"].setdefault(str(c.window_end // HOUR), {"n": 0, "chal": 0.0, "base": 0.0})
+        b = s["buckets"].setdefault(str(c.window_end // HOUR), {"n": 0, "chal": 0.0, "base": 0.0,
+                                                                 "first": c.window_end, "last": c.window_end})
         b["n"] += 1
         b["chal"] += chal
         b["base"] += base
-        if s["first_pair_s"] is None:
-            s["first_pair_s"] = c.window_end
+        b["first"], b["last"] = min(b["first"], c.window_end), max(b["last"], c.window_end)
     floor = (c.window_end - retention_s) // HOUR
     s["buckets"] = {k: v for k, v in s["buckets"].items() if int(k) > floor}
     s["pending"] = {k: v for k, v in s["pending"].items() if v[2] > c.window_end - retention_s}
     return s
 
 
-def pair_sums(pairs: dict, now_s: int, seconds: int = 7 * DAY) -> Dict[str, float]:
+def pair_sums(pairs: dict, now_s: int, seconds: int = 7 * DAY) -> Dict[str, Optional[float]]:
+    """Retained pairs in the trailing window: count, loss sums and the SPAN of their window ends (expired pairs never
+    contribute, so waiting cannot stand in for paired evidence)."""
     lo, hi = _hours(now_s, seconds)
-    out = {"n": 0, "chal": 0.0, "base": 0.0}
+    out = {"n": 0, "chal": 0.0, "base": 0.0, "first": None, "last": None}
     for k, v in pairs["buckets"].items():
         if lo <= int(k) <= hi:
-            for f in out:
-                out[f] += v[f]
+            out["n"] += v["n"]
+            out["chal"] += v["chal"]
+            out["base"] += v["base"]
+            out["first"] = v["first"] if out["first"] is None else min(out["first"], v["first"])
+            out["last"] = v["last"] if out["last"] is None else max(out["last"], v["last"])
+    out["span"] = out["last"] - out["first"] if out["n"] else 0
     return out
 
 
@@ -283,7 +345,7 @@ def pair_sums(pairs: dict, now_s: int, seconds: int = 7 * DAY) -> Dict[str, floa
 @dataclass(frozen=True)
 class CandidateInputs:
     model: str
-    ledger: dict
+    ledger: dict                          # its recipe is the candidate's identity for trust and hysteresis
     bound_available: bool                 # forecasting.calibration.upper_bound gave a bound now
     calibration_windows: int              # scores in the buffer now
     min_calibration_windows: int
@@ -291,6 +353,10 @@ class CandidateInputs:
     required_history_seconds: int
     data_fresh: bool
     fit_age_seconds: Optional[int] = None         # None for kernels without a fit (seasonal-naive)
+
+    @property
+    def recipe(self) -> str:
+        return self.ledger["recipe"]
 
 
 @dataclass(frozen=True)
@@ -307,13 +373,16 @@ class Global:
 @dataclass(frozen=True)
 class CandidateVerdict:
     model: str
+    recipe: str
     gates: Mapping[str, bool]
     reason: str
     phase: str
     trusted: bool
     coverage_gate: Optional[float]
     coverage_all: Optional[float]
-    availability: Optional[float]
+    availability: Optional[float]                 # outcomes
+    prediction_availability: Optional[float]      # issued / expected opportunities
+    overdue: int
     prospective_gate_bounds: int
     replay_gate_bounds: int
     eta_seconds: Optional[int]
@@ -329,19 +398,22 @@ class Verdict:
     promoted: Mapping[str, bool] = field(default_factory=dict)
 
 
-def new_hysteresis() -> dict:
-    return {"trusted": False, "ever_trusted": False, "demoted_at_s": None, "bounds_at_demotion": 0,
+def new_hysteresis(recipe: str) -> dict:
+    return {"recipe": recipe, "trusted": False, "ever_trusted": False, "demoted_at_s": None, "bounds_at_demotion": 0,
             "gates_ok_since_s": None}
+
+
+def new_selection() -> dict:
+    return {"selected": None, "recipe": None, "since_s": None, "switches": 0, "entry_since": {}}
 
 
 def candidate_gates(ci: CandidateInputs, g: Global, t: TrustSettings) -> Tuple[Dict[str, bool], dict]:
     led, now = ci.ledger, g.now_s
     threshold = (1.0 - g.nominal_miscoverage) - t.coverage_tolerance_bps / 10_000
     w7 = window_sums(led, now, 7 * DAY)
-    d1 = window_sums(led, now, DAY)
+    av = availability(led, now)
     cov_gate = _ratio(w7["g_cv"], w7["g_bd"])
     cov_all = _ratio(w7["a_cv"], w7["a_bd"])
-    avail = _ratio(d1["sc"], d1["sc"] + d1["un"])
     first = led["first_prospective_s"]
     shadow_ok = first is not None and now - first >= t.min_shadow_hours * HOUR and \
         w7["g_bd"] >= t.min_prospective_windows
@@ -351,12 +423,13 @@ def candidate_gates(ci: CandidateInputs, g: Global, t: TrustSettings) -> Tuple[D
     acute_ok = led["consecutive_misses"] < t.acute_consecutive_misses and \
         (len(recent) < t.acute_recent_windows or sum(recent) / len(recent) >= threshold)
     fresh_fit = ci.fit_age_seconds is None or ci.fit_age_seconds <= t.max_fit_age_hours * HOUR
+    floor = t.min_availability_bps / 10_000
     gates = {
         "identity": g.identity_ok, "state": g.store_healthy, "data": ci.data_fresh and fresh_fit,
         "history": ci.history_seconds >= ci.required_history_seconds,
         "calibration": ci.bound_available, "prospective": shadow_ok,
         "coverage": cov_gate is not None and cov_gate >= threshold and worst_ok and acute_ok,
-        "availability": avail is not None and avail >= t.min_availability_bps / 10_000,
+        "availability": all(v is not None and v >= floor for v in (av["outcomes"], av["predictions"])),
     }
     missing = max(ci.min_calibration_windows - ci.calibration_windows,
                   t.min_prospective_windows - int(w7["g_bd"]), 0)
@@ -365,7 +438,8 @@ def candidate_gates(ci: CandidateInputs, g: Global, t: TrustSettings) -> Tuple[D
     eta = max(missing * g.lead_seconds, shadow_left, 0)
     if not gates["coverage"] and w7["g_bd"] >= t.min_prospective_windows:
         eta = None
-    return gates, {"coverage_gate": cov_gate, "coverage_all": cov_all, "availability": avail,
+    return gates, {"coverage_gate": cov_gate, "coverage_all": cov_all, "availability": av["outcomes"],
+                   "prediction_availability": av["predictions"], "overdue": av["overdue"],
                    "prospective": int(w7["g_bd"]), "replay": int(w7["r_bd"]), "eta": eta}
 
 
@@ -376,8 +450,8 @@ _GATE_REASON = (("identity", "IdentityMismatch"), ("state", "StateUnavailable"),
 
 
 def step(hyst: dict, gates_ok: bool, ledger: dict, now_s: int, t: TrustSettings) -> dict:
-    """The hysteresis transition for one evaluation."""
-    h = dict(hyst)
+    """The hysteresis transition for one evaluation (a state of another recipe starts over)."""
+    h = dict(hyst) if hyst.get("recipe") == ledger["recipe"] else new_hysteresis(ledger["recipe"])
     bounds = ledger["totals"]["prospective_gate_bounded"]
     if h["trusted"]:
         if not gates_ok:                                  # demote at once
@@ -398,17 +472,16 @@ def step(hyst: dict, gates_ok: bool, ledger: dict, now_s: int, t: TrustSettings)
     return h
 
 
-def challenger_promoted(pairs: Optional[dict], now_s: int, t: TrustSettings,
-                        costs: Optional[Mapping[str, Tuple[float, float]]]) -> bool:
-    """Paired promotion of a challenger over the naive (see the module docstring)."""
-    if pairs is None or costs is None or pairs["first_pair_s"] is None:
+def _paired_ok(pairs: Optional[dict], now_s: int, t: TrustSettings,
+               costs: Optional[Mapping[str, Tuple[float, float]]], loss_ratio_bps: int) -> bool:
+    if pairs is None or costs is None:
         return False
     ps = pair_sums(pairs, now_s)
-    if ps["n"] < t.challenger_min_pairs or now_s - pairs["first_pair_s"] < t.challenger_min_hours * HOUR:
+    if ps["n"] < t.challenger_min_pairs or ps["span"] < t.challenger_min_hours * HOUR:
         return False
     if ps["base"] <= 0:
         return False                                      # a zero baseline loss keeps the naive
-    if ps["chal"] / ps["n"] > (t.challenger_loss_ratio_bps / 10_000) * ps["base"] / ps["n"]:
+    if ps["chal"] / ps["n"] > (loss_ratio_bps / 10_000) * ps["base"] / ps["n"]:
         return False
     for name in ("shortage", "replica_time"):
         if name not in costs:
@@ -419,18 +492,75 @@ def challenger_promoted(pairs: Optional[dict], now_s: int, t: TrustSettings,
     return True
 
 
+def challenger_promoted(pairs, now_s, t, costs) -> bool:
+    """The entry test of a challenger over the naive (module docstring)."""
+    return _paired_ok(pairs, now_s, t, costs, t.challenger_loss_ratio_bps)
+
+
+def challenger_retained(pairs, now_s, t, costs) -> bool:
+    """The exit band: a selected challenger is kept while its loss is not worse than the exit ratio."""
+    return _paired_ok(pairs, now_s, t, costs, t.challenger_exit_loss_ratio_bps)
+
+
+def select(sel: dict, verdicts: Mapping[str, CandidateVerdict], pairs: Mapping[str, dict],
+           costs: Mapping[str, Mapping[str, Tuple[float, float]]], now_s: int, t: TrustSettings) -> Tuple[dict, dict]:
+    """(new selection state, entry flags) with selection hysteresis (module docstring)."""
+    s = {**sel, "entry_since": dict(sel["entry_since"])}
+    naive_ok = NAIVE in verdicts and verdicts[NAIVE].trusted
+    entry = {}
+    for m in verdicts:
+        if m == NAIVE:
+            continue
+        ok = naive_ok and challenger_promoted(pairs.get(m), now_s, t, costs.get(m))
+        entry[m] = ok
+        key = f"{m}:{verdicts[m].recipe}"
+        if ok:
+            s["entry_since"].setdefault(key, now_s)
+        else:
+            s["entry_since"].pop(key, None)
+    current = s["selected"]
+    if current is not None:
+        v = verdicts.get(current)
+        safe = v is not None and v.trusted and v.recipe == s["recipe"] and (current == NAIVE or naive_ok)
+        kept = current == NAIVE or challenger_retained(pairs.get(current), now_s, t, costs.get(current))
+        if not (safe and kept):
+            current = None                                # safety (or the exit band): fall back at once
+    target = None
+    for m in FALLBACK_ORDER:
+        v = verdicts.get(m)
+        if v is None or not v.trusted:
+            continue
+        if m == NAIVE:
+            target = m
+            break
+        since = s["entry_since"].get(f"{m}:{v.recipe}")
+        held = since is not None and now_s - since >= t.repromotion_hours * HOUR
+        if (m == current and naive_ok) or held:
+            target = m
+            break
+    if target != s["selected"]:
+        s.update(selected=target, recipe=verdicts[target].recipe if target else None, since_s=now_s,
+                 switches=s["switches"] + 1)
+    return s, entry
+
+
 def evaluate(cands: Sequence[CandidateInputs], hyst: Mapping[str, dict], g: Global, t: TrustSettings, *,
              pairs: Optional[Mapping[str, dict]] = None,
              costs: Optional[Mapping[str, Mapping[str, Tuple[float, float]]]] = None) -> Tuple[Verdict, Dict[str, dict]]:
-    """(verdict, new hysteresis states) for one autoscaler at g.now_s."""
+    """(verdict, new state) for one autoscaler at g.now_s. The state maps each model to its hysteresis and SELECTION
+    to the selection state."""
     by_model = {c.model: c for c in cands}
     if set(by_model) - set(FALLBACK_ORDER):
         raise TrustError(f"unknown candidates {set(by_model) - set(FALLBACK_ORDER)}")
+    for m, p in (pairs or {}).items():
+        if m in by_model and (p["recipes"].get(m) != by_model[m].recipe or
+                              (NAIVE in by_model and p["recipes"].get(NAIVE) != by_model[NAIVE].recipe)):
+            raise TrustError(f"the paired evidence of {m} belongs to another recipe")
     new_h, verdicts = {}, {}
     for model, ci in by_model.items():
         gates, info = candidate_gates(ci, g, t)
         ok = all(gates.values())
-        h = step(hyst.get(model, new_hysteresis()), ok, ci.ledger, g.now_s, t)
+        h = step(hyst.get(model, new_hysteresis(ci.recipe)), ok, ci.ledger, g.now_s, t)
         new_h[model] = h
         reason = next((r for gname, r in _GATE_REASON if not gates[gname]), "Ready")
         if h["trusted"]:
@@ -445,23 +575,19 @@ def evaluate(cands: Sequence[CandidateInputs], hyst: Mapping[str, dict], g: Glob
             phase = "Shadow"
         if reason == "Ready" and not h["trusted"]:
             reason = "ShadowInsufficient"                # gates hold, hysteresis still running
-        verdicts[model] = CandidateVerdict(model, gates, reason, phase, h["trusted"], info["coverage_gate"],
-                                           info["coverage_all"], info["availability"], info["prospective"],
+        verdicts[model] = CandidateVerdict(model, ci.recipe, gates, reason, phase, h["trusted"], info["coverage_gate"],
+                                           info["coverage_all"], info["availability"],
+                                           info["prediction_availability"], info["overdue"], info["prospective"],
                                            info["replay"], None if h["trusted"] else info["eta"])
-    naive_ok = NAIVE in verdicts and verdicts[NAIVE].trusted
-    promoted = {m: naive_ok and challenger_promoted((pairs or {}).get(m), g.now_s, t, (costs or {}).get(m))
-                for m in verdicts if m != NAIVE}
-    selected = None
-    for m in FALLBACK_ORDER:
-        if m in verdicts and verdicts[m].trusted and (m == NAIVE or promoted.get(m)):
-            selected = m
-            break
+    sel, promoted = select(hyst.get(SELECTION, new_selection()), verdicts, pairs or {}, costs or {}, g.now_s, t)
+    new_h[SELECTION] = sel
+    selected = sel["selected"]
     if selected is None:                                  # report the candidate furthest along, in fallback order on ties
         ordered = [verdicts[m] for m in FALLBACK_ORDER if m in verdicts]
         best = max(ordered, key=lambda v: REASON_ORDER.index(v.reason)) if ordered else None
         reason = best.reason if best else "HistoryInsufficient"
         phase = best.phase if best else "Collecting"
-        if best and best.trusted:                         # trusted but not promoted over a trusted naive
+        if best and best.trusted:                         # trusted but not (yet) selected over a trusted naive
             reason, phase = "ShadowInsufficient", "Shadow"
         return Verdict(None, phase, reason, False, verdicts, promoted), new_h
     if not g.replay_suite_passed:

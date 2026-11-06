@@ -1,5 +1,6 @@
-"""C2.5: trust: zero denominators, missingness, replay versus prospective evidence, every fallback rung, hysteresis,
-history minimums, the paired challenger gate and the ready-to-activate verdict."""
+"""C2.5: trust: zero denominators, missingness and overdue outcomes, replay versus prospective evidence, recipe
+isolation, every fallback rung, candidate and selection hysteresis, history minimums, the paired challenger gate, the
+hour-granular windows and the ready-to-activate verdict."""
 
 import dataclasses
 import os
@@ -21,23 +22,35 @@ H, DAY = 3600, 86400
 START = 1_793_923_200 - 1_793_923_200 % DAY
 TS = c.TrustSettings()
 NOMINAL = 0.10
+GRACE = 720                                # settlement 120 + grace 600
 
 
 class Feed:
-    """Builds evidence for one model: one issuance and one outcome per origin, with sequence numbers."""
+    """Builds evidence for one candidate: issuances and outcomes with journal sequence numbers."""
 
-    def __init__(self, model="seasonal_naive"):
-        self.model, self.ledger, self.seq = model, T.new_ledger(EPOCH, model), 0
+    def __init__(self, model="seasonal_naive", recipe="r"):
+        self.model, self.recipe, self.seq = model, recipe, 0
+        self.ledger = T.new_ledger(EPOCH, model, recipe, L)
 
-    def window(self, origin, *, covered=True, mode="prospective", status="scored", bounded=True, y=5.0):
+    def issue(self, origin, *, mode="prospective", bounded=True, recipe=None):
         self.seq += 1
-        self.ledger = T.note_issuance(self.ledger, seq=self.seq, origin=origin, lead_s=L, mode=mode, bounded=bounded)
+        self.ledger = T.note_issuance(self.ledger, seq=self.seq, issuance_id=f"iss-{self.seq}", epoch=EPOCH,
+                                      model=self.model, recipe=recipe or self.recipe, origin=origin,
+                                      window_end=origin + L, deadline_s=origin + L + GRACE, lead_s=L, mode=mode,
+                                      bounded=bounded)
+        return self.seq
+
+    def outcome(self, seq, origin, *, covered=True, mode="prospective", status="scored", bounded=True, y=5.0,
+                recipe=None):
         upper = (y + 1.0 if covered else y - 1.0) if bounded else None
-        cal = CalibrationRecord(self.seq, EPOCH, self.model, "r", f"iss-{self.seq}", origin, origin + L, 4.0, upper,
-                                status, y if status == "scored" else None)
+        cal = CalibrationRecord(seq, EPOCH, self.model, recipe or self.recipe, f"iss-{seq}", origin, origin + L, 4.0,
+                                upper, status, y if status == "scored" else None)
         r = T.EvidenceRecord(cal, mode, (origin + L) * 1000, (1.0, 2.0, 3.0) if status == "scored" else None)
         self.ledger = T.note_outcome(self.ledger, r, lead_s=L, nominal_miscoverage=NOMINAL, recent_n=32)
         return r
+
+    def window(self, origin, *, mode="prospective", bounded=True, **kw):
+        return self.outcome(self.issue(origin, mode=mode, bounded=bounded), origin, mode=mode, bounded=bounded, **kw)
 
     def run(self, hours, start=START, every=L, **kw):
         for t in range(start, start + hours * H, every):
@@ -56,12 +69,12 @@ def glob(now, **kw):
 
 
 def mostly(t, every=10):
-    """Covered except one window in `every` (90% coverage)."""
+    """Covered except one window in `every`."""
     return (t // L) % every != 0
 
 
-def good(model="seasonal_naive", hours=72):
-    return Feed(model).run(hours, covered=lambda t: mostly(t, 20))        # 95%: above 0.90 - 0.05
+def good(model="seasonal_naive", hours=72, recipe="r"):
+    return Feed(model, recipe).run(hours, covered=lambda t: mostly(t, 20))  # 95%: above 0.90 - 0.05
 
 
 NOW = START + 72 * H
@@ -72,12 +85,13 @@ def verdict(*feeds, now=NOW, hyst=None, pairs=None, costs=None, **g):
                       pairs=pairs, costs=costs)
 
 
-# --- zero denominators and missingness ------------------------------------------------------------------------------
+# --- zero denominators, missingness, overdue and missing issuances -------------------------------------------------
 
 def test_no_evidence_means_no_ratios_and_no_trust():
     f = Feed()
     gates, info = T.candidate_gates(inputs(f, bound=False, history=0), glob(NOW), TS)
     assert info["coverage_gate"] is None and info["coverage_all"] is None and info["availability"] is None
+    assert info["prediction_availability"] is None
     assert not gates["coverage"] and not gates["availability"] and not gates["prospective"]
     v, _ = verdict(T.CandidateInputs("seasonal_naive", f.ledger, False, 0, 128, 0, DAY, True))
     assert v.selected is None and v.phase == "Collecting" and v.reason == "HistoryInsufficient"
@@ -86,24 +100,56 @@ def test_no_evidence_means_no_ratios_and_no_trust():
 @pytest.mark.parametrize("unscorable_every,ok", [(25, True), (10, False)])
 def test_missing_truth_over_five_percent_of_the_last_day_blocks_trust(unscorable_every, ok):
     f = Feed().run(48, covered=lambda t: mostly(t, 20))
-    last = Feed()
-    last.ledger, last.seq = f.ledger, f.seq
-    for t in range(START + 48 * H, NOW, L):           # the last day: every n-th window unscorable
-        last.window(t, status="unscorable" if (t // L) % unscorable_every == 0 else "scored",
-                    covered=mostly(t, 20))
-    gates, info = T.candidate_gates(inputs(last), glob(NOW), TS)
+    for t in range(START + 48 * H, NOW, L):
+        f.window(t, status="unscorable" if (t // L) % unscorable_every == 0 else "scored", covered=mostly(t, 20))
+    gates, info = T.candidate_gates(inputs(f), glob(NOW), TS)
     assert gates["availability"] is ok and (info["availability"] >= 0.95) is ok
     if not ok:
-        assert verdict(last)[0].candidates["seasonal_naive"].reason == "DataUnavailable"
+        assert verdict(f)[0].candidates["seasonal_naive"].reason == "DataUnavailable"
 
 
 @pytest.mark.parametrize("unscorable,ok", [(0, True), (1, True), (2, False)])
 def test_the_availability_boundary_is_ninety_five_percent(unscorable, ok):
     f = Feed()
-    for i in range(20):                                              # 20 windows in the last day: 1 missing = 95%
-        f.window(NOW - DAY + (i + 1) * L, status="unscorable" if i < unscorable else "scored")
-    gates, info = T.candidate_gates(inputs(f), glob(NOW), TS)
-    assert info["availability"] == (20 - unscorable) / 20 and gates["availability"] is ok
+    f.ledger["first_issue_s"] = NOW - 19 * L                      # 20 expected origins, all issued below
+    for i in range(20):
+        f.window(NOW - (19 - i) * L - L, status="unscorable" if i < unscorable else "scored")
+    av = T.availability(f.ledger, NOW)
+    assert av["outcomes"] == (20 - unscorable) / 20 and T.candidate_gates(inputs(f), glob(NOW), TS)[0][
+        "availability"] is ok
+
+
+def test_overdue_outcomes_count_against_availability():
+    # Codex repro: after healthy history, 72 windows issued over 12 h with no outcome kept availability at 100 %.
+    f = good()
+    for i in range(72):
+        f.issue(NOW + i * L)                                      # 72 windows, 12 h, outcomes never arrive
+    later = NOW + 12 * H
+    av = T.availability(f.ledger, later)
+    assert av["overdue"] == 72 - (GRACE + L) // L                 # the last two are not due yet
+    assert av["outcomes"] < 0.95
+    v, _ = verdict(f, now=later, hyst=verdict(f)[1])
+    assert v.selected is None and v.candidates["seasonal_naive"].reason == "DataUnavailable"
+    assert v.candidates["seasonal_naive"].overdue == av["overdue"]
+
+
+def test_a_window_is_overdue_only_after_its_deadline():
+    f = Feed()
+    f.issue(NOW)
+    assert T.overdue(f.ledger, NOW + L + GRACE - 1, DAY) == 0
+    assert T.overdue(f.ledger, NOW + L + GRACE, DAY) == 1
+    f.outcome(1, NOW)
+    assert T.overdue(f.ledger, NOW + L + GRACE, DAY) == 0
+
+
+def test_missing_issuances_have_their_own_denominator():
+    f = good()
+    for t in range(NOW, NOW + 12 * H, L):                         # 12 h: only every third origin issued
+        if (t // L) % 3 == 0:
+            f.window(t, covered=True)
+    av = T.availability(f.ledger, NOW + 12 * H)
+    assert av["outcomes"] > 0.95 and av["predictions"] < 0.95
+    assert not T.candidate_gates(inputs(f), glob(NOW + 12 * H), TS)[0]["availability"]
 
 
 # --- replay versus prospective evidence -----------------------------------------------------------------------------
@@ -113,11 +159,24 @@ def test_replay_evidence_never_establishes_trust():
     v, _ = verdict(f)
     cv = v.candidates["seasonal_naive"]
     assert not cv.trusted and cv.reason == "ShadowInsufficient" and cv.replay_gate_bounds == 432
-    assert cv.prospective_gate_bounds == 0 and cv.coverage_gate is None
-    f.run(47, start=NOW, covered=lambda t: mostly(t, 20))           # 47 h prospective: still short of 48 h
+    assert cv.prospective_gate_bounds == 0 and cv.coverage_gate is None and cv.availability is None
+    f.run(47, start=NOW, covered=lambda t: mostly(t, 20))
     assert not verdict(f, now=NOW + 47 * H)[0].candidates["seasonal_naive"].trusted
     f.run(2, start=NOW + 47 * H, covered=lambda t: mostly(t, 20))
     assert verdict(f, now=NOW + 49 * H)[0].candidates["seasonal_naive"].trusted
+
+
+def test_replay_successes_do_not_repair_prospective_availability_or_errors():
+    # Codex repro: adding replay successes lifted availability from 89.66 % to 96.54 % and made it trusted.
+    f = Feed().run(72, covered=lambda t: mostly(t, 20),
+                   status=lambda t: "unscorable" if (t // L) % 10 == 0 and t >= NOW - DAY else "scored")
+    before = T.availability(f.ledger, NOW)
+    errors = {k: T.window_sums(f.ledger, NOW, 7 * DAY)[k] for k in ("sc", "abs", "bias", "n_step")}
+    for i in range(200):                                          # replayed successes on the same day
+        f.window(NOW - DAY + (i % 144) * L, mode="replay", covered=True)
+    assert T.availability(f.ledger, NOW) == before and before["outcomes"] < 0.95
+    assert {k: T.window_sums(f.ledger, NOW, 7 * DAY)[k] for k in errors} == errors
+    assert not verdict(f)[0].candidates["seasonal_naive"].trusted
 
 
 def test_prospective_needs_48_hours_and_64_bounds():
@@ -126,6 +185,33 @@ def test_prospective_needs_48_hours_and_64_bounds():
     sparse = Feed().run(72, every=2 * H, covered=True)              # 36 bounds over 72 h
     assert not T.candidate_gates(inputs(sparse), glob(NOW), TS)[0]["prospective"]
     assert verdict(good())[0].selected == "seasonal_naive"
+
+
+# --- recipe isolation -----------------------------------------------------------------------------------------------
+
+def test_a_replacement_recipe_never_joins_established_evidence():
+    # Codex repro: a replacement recipe's record raised an established ledger's prospective count to 433.
+    f = good()
+    count = f.ledger["totals"]["prospective_gate_bounded"]
+    with pytest.raises(T.TrustError):
+        f.window(NOW, recipe="r2")
+    with pytest.raises(T.TrustError):
+        f.outcome(9999, NOW, recipe="r2")
+    assert f.ledger["totals"]["prospective_gate_bounded"] == count == 432
+
+
+def test_hysteresis_and_pairs_are_bound_to_the_recipe():
+    v, h = verdict(good())
+    assert h["seasonal_naive"]["recipe"] == "r" and h["seasonal_naive"]["trusted"]
+    replacement = Feed("seasonal_naive", "r2")                    # a new recipe starts with no trust at all
+    v2, h2 = verdict(replacement, hyst=h)
+    assert not h2["seasonal_naive"]["ever_trusted"] and h2["seasonal_naive"]["recipe"] == "r2"
+    p = T.new_pairs(EPOCH, "statistical", "s1", "r")
+    other = CalibrationRecord(1, EPOCH, "statistical", "s2", "iss-1", START, START + L, 4.0, 6.0, "scored", 5.0)
+    with pytest.raises(T.TrustError):
+        T.note_pair(p, T.EvidenceRecord(other, "prospective", 0, None), lead_s=L, nominal_miscoverage=NOMINAL)
+    with pytest.raises(T.TrustError):                             # paired evidence of another recipe is refused
+        verdict(good(), good("statistical", recipe="s9"), pairs={"statistical": p})
 
 
 # --- history, data, calibration and coverage gates ----------------------------------------------------------------
@@ -156,11 +242,11 @@ def test_the_statistical_fit_must_be_fresh():
 
 
 def test_coverage_below_nominal_minus_tolerance_fails():
-    low = Feed().run(72, covered=lambda t: mostly(t, 8))             # 87.5%: at or above 0.85, passes
-    assert T.candidate_gates(inputs(low), glob(NOW), TS)[0]["coverage"]
-    lower = Feed().run(72, covered=lambda t: mostly(t, 5))           # 80% < 85%
-    assert not T.candidate_gates(inputs(lower), glob(NOW), TS)[0]["coverage"]
-    assert verdict(lower)[0].candidates["seasonal_naive"].reason == "CoverageLow"
+    ok = Feed().run(72, covered=lambda t: mostly(t, 8))              # 87.5%: at or above 0.85, passes
+    assert T.candidate_gates(inputs(ok), glob(NOW), TS)[0]["coverage"]
+    low = Feed().run(72, covered=lambda t: mostly(t, 5))             # 80% < 85%
+    assert not T.candidate_gates(inputs(low), glob(NOW), TS)[0]["coverage"]
+    assert verdict(low)[0].candidates["seasonal_naive"].reason == "CoverageLow"
 
 
 def test_the_worst_day_must_also_meet_the_threshold():
@@ -189,11 +275,26 @@ def test_the_recent_32_bounds_must_hold_the_threshold():
     assert not gates["coverage"] and f.ledger["consecutive_misses"] < 5
 
 
-# --- hysteresis -----------------------------------------------------------------------------------------------------
+# --- hour-granular windows (decision 1) -------------------------------------------------------------------------
+
+def test_windows_are_whole_hours_from_the_first_hour_inside():
+    f = Feed()
+    for origin in (NOW - DAY - L, NOW - DAY, NOW - L):                # windows ending at now - 1 day, +Δ, and now
+        f.window(origin)
+    assert T.window_sums(f.ledger, NOW, DAY)["sc"] == 3               # aligned now: exactly [now - 1 day, now]
+    g = Feed()
+    g.window(NOW - DAY - 2 * L)                                       # ends one interval before now - 1 day
+    assert T.window_sums(g.ledger, NOW, DAY)["sc"] == 0
+    unaligned = NOW + 1800                                            # 30 min past the hour: starts at NOW - DAY + 1 h
+    assert T._hours(unaligned, DAY) == ((NOW - DAY) // H + 1, NOW // H)
+    assert T.window_sums(f.ledger, unaligned, DAY)["sc"] == 1                 # only the window ending at now
+
+
+# --- candidate hysteresis -----------------------------------------------------------------------------------------
 
 def test_hysteresis_needs_24_hours_and_32_new_bounds():
-    led = T.new_ledger(EPOCH, "seasonal_naive")
-    h = T.step(T.new_hysteresis(), True, led, 0, TS)
+    led = T.new_ledger(EPOCH, "seasonal_naive", "r", L)
+    h = T.step(T.new_hysteresis("r"), True, led, 0, TS)
     assert h["trusted"] and h["ever_trusted"]                        # the first promotion is immediate
     h = T.step(h, False, led, 100, TS)
     assert not h["trusted"] and h["demoted_at_s"] == 100
@@ -211,23 +312,29 @@ def test_hysteresis_needs_24_hours_and_32_new_bounds():
     assert not T.step(again, True, led, 103 + 48 * H - 1, TS)["trusted"]
 
 
-# --- fallback rungs and the paired challenger gate ---------------------------------------------------------------
+# --- fallback rungs, the paired gate and selection hysteresis -----------------------------------------------------
 
-def pairs_for(challenger, chal_loss, base_loss, n=80, hours=60):
-    p = T.new_pairs(EPOCH, challenger)
-    seq, every = 0, max(1, hours * H // n)
+def pairs_for(challenger, chal_loss, base_loss, n=200, hours=96, start=START - 24 * H, recipe="r"):
+    p = T.new_pairs(EPOCH, challenger, recipe, "r")
+    seq, every = 0, max(L, hours * H // n // L * L)
     for i in range(n):
-        origin = START + i * every // L * L
-        for model, loss in ((challenger, chal_loss), ("seasonal_naive", base_loss)):
+        origin = start + i * every
+        for model, loss, rc in ((challenger, chal_loss, recipe), ("seasonal_naive", base_loss, "r")):
             seq += 1
             y = 5.0
             upper = y + loss / 0.1 if loss else y                    # pinball (1 - tau) x (U - Y) = 0.1 x margin
-            cal = CalibrationRecord(seq, EPOCH, model, "r", f"iss-{i}", origin, origin + L, 4.0, upper, "scored", y)
+            cal = CalibrationRecord(seq, EPOCH, model, rc, f"iss-{i}", origin, origin + L, 4.0, upper, "scored", y)
             p = T.note_pair(p, T.EvidenceRecord(cal, "prospective", 0, None), lead_s=L, nominal_miscoverage=NOMINAL)
     return p
 
 
 COSTS = {"shortage": (1.0, 1.0), "replica_time": (100.0, 100.0)}
+
+
+def settled(cands, pairs, costs, now=NOW):
+    """Evaluate a day earlier and then now: a challenger needs its entry criteria held for 24 hours."""
+    _, h = T.evaluate(cands, {}, glob(now - 24 * H), TS, pairs=pairs, costs=costs)
+    return T.evaluate(cands, h, glob(now), TS, pairs=pairs, costs=costs)
 
 
 @pytest.mark.parametrize("case,expected", [
@@ -263,20 +370,33 @@ def test_every_fallback_rung(case, expected):
         cands = [inputs(naive), inputs(stat), inputs(lstm, bound=case == "lstm_better")]
     elif case == "nothing":
         cands = [inputs(naive, fresh=False), inputs(stat, fresh=False)]
-    v, _ = T.evaluate(cands, {}, glob(NOW), TS, pairs=pairs, costs=costs)
+    v, _ = settled(cands, pairs, costs)
     assert v.selected == expected
     assert v.prediction_ready is (expected is not None)
 
 
-def test_the_paired_gate_needs_64_pairs_over_48_hours():
-    assert T.pair_sums(pairs_for("statistical", 0.5, 1.0, n=63), NOW)["n"] == 63
+def test_the_paired_gate_measures_the_span_of_retained_pairs():
     assert not T.challenger_promoted(pairs_for("statistical", 0.5, 1.0, n=63), NOW, TS, COSTS)
-    assert not T.challenger_promoted(pairs_for("statistical", 0.5, 1.0, n=80, hours=40), START + 41 * H, TS, COSTS)
     assert T.challenger_promoted(pairs_for("statistical", 0.5, 1.0), NOW, TS, COSTS)
+    # Codex repro: 64 pairs spanning 12 h qualified after waiting until hour 72. The span decides, not the wait.
+    short = pairs_for("statistical", 0.5, 1.0, n=64, hours=12, start=START)
+    assert T.pair_sums(short, START + 72 * H)["span"] < 12 * H
+    assert not T.challenger_promoted(short, START + 72 * H, TS, COSTS)
+    # An expired first pair does not establish the duration either.
+    old = pairs_for("statistical", 0.5, 1.0, n=1, hours=1, start=START)
+    for i in range(64):
+        cal = [CalibrationRecord(10 + 2 * i + k, EPOCH, m, "r", f"late-{i}", START + 7 * DAY + i * L,
+                                 START + 7 * DAY + (i + 1) * L, 4.0, 10.0 if m == "statistical" else 15.0,
+                                 "scored", 5.0) for k, m in enumerate(("statistical", "seasonal_naive"))]
+        for r in cal:
+            old = T.note_pair(old, T.EvidenceRecord(r, "prospective", 0, None), lead_s=L, nominal_miscoverage=NOMINAL)
+    now = START + 7 * DAY + 70 * L
+    ps = T.pair_sums(old, now)
+    assert ps["n"] == 64 and ps["span"] < 48 * H and not T.challenger_promoted(old, now, TS, COSTS)
 
 
 def test_pairs_need_both_models_at_the_same_origin():
-    p = T.new_pairs(EPOCH, "statistical")
+    p = T.new_pairs(EPOCH, "statistical", "r", "r")
     one = CalibrationRecord(1, EPOCH, "statistical", "r", "iss-1", START, START + L, 4.0, 6.0, "scored", 5.0)
     other = CalibrationRecord(2, EPOCH, "seasonal_naive", "r", "iss-2", START, START + L, 4.0, 6.0, "scored", 5.0)
     replay = CalibrationRecord(3, EPOCH, "seasonal_naive", "r", "iss-1", START, START + L, 4.0, 6.0, "scored", 5.0)
@@ -286,6 +406,47 @@ def test_pairs_need_both_models_at_the_same_origin():
     match = CalibrationRecord(4, EPOCH, "seasonal_naive", "r", "iss-1", START, START + L, 4.0, 6.0, "scored", 5.0)
     p = T.note_pair(p, T.EvidenceRecord(match, "prospective", 0, None), lead_s=L, nominal_miscoverage=NOMINAL)
     assert T.pair_sums(p, START + H)["n"] == 1
+
+
+def test_a_challenger_is_selected_only_after_its_entry_criteria_held_24_hours():
+    cands = [inputs(good()), inputs(good("statistical"))]
+    pairs, costs = {"statistical": pairs_for("statistical", 0.5, 1.0)}, {"statistical": COSTS}
+    v1, h = T.evaluate(cands, {}, glob(NOW - 24 * H), TS, pairs=pairs, costs=costs)
+    assert v1.selected == "seasonal_naive" and v1.promoted["statistical"]
+    v2, h = T.evaluate(cands, h, glob(NOW - 1), TS, pairs=pairs, costs=costs)
+    assert v2.selected == "seasonal_naive"
+    v3, h = T.evaluate(cands, h, glob(NOW), TS, pairs=pairs, costs=costs)
+    assert v3.selected == "statistical" and h[T.SELECTION]["switches"] == 2
+
+
+def test_marginal_superiority_does_not_flap():
+    cands = [inputs(good(hours=90)), inputs(good("statistical", hours=90))]      # evidence keeps flowing
+    costs = {"statistical": COSTS}
+    better, marginal = pairs_for("statistical", 0.5, 1.0), pairs_for("statistical", 0.97, 1.0)
+    _, h = settled(cands, {"statistical": better}, costs)
+    assert h[T.SELECTION]["selected"] == "statistical"
+    switches = h[T.SELECTION]["switches"]
+    for k in range(1, 13):                                           # alternating 0.5 / 0.97: inside the band
+        p = marginal if k % 2 else better
+        v, h = T.evaluate(cands, h, glob(NOW + k * H), TS, pairs={"statistical": p}, costs=costs)
+        assert v.selected == "statistical"
+    assert h[T.SELECTION]["switches"] == switches
+    worse = pairs_for("statistical", 1.05, 1.0)                      # beyond the exit ratio: leaves at once
+    v, h = T.evaluate(cands, h, glob(NOW + 13 * H), TS, pairs={"statistical": worse}, costs=costs)
+    assert v.selected == "seasonal_naive"
+    v, h = T.evaluate(cands, h, glob(NOW + 14 * H), TS, pairs={"statistical": better}, costs=costs)
+    assert v.selected == "seasonal_naive"                            # re-entry waits for a fresh 24 h hold
+
+
+def test_a_safety_failure_falls_back_at_once():
+    naive, stat = good(), good("statistical")
+    pairs, costs = {"statistical": pairs_for("statistical", 0.5, 1.0)}, {"statistical": COSTS}
+    _, h = settled([inputs(naive), inputs(stat)], pairs, costs)
+    assert h[T.SELECTION]["selected"] == "statistical"
+    v, h2 = T.evaluate([inputs(naive), inputs(stat, fresh=False)], h, glob(NOW + 1), TS, pairs=pairs, costs=costs)
+    assert v.selected == "seasonal_naive"                            # the statistical fit went stale
+    v, _ = T.evaluate([inputs(naive, fresh=False), inputs(stat)], h, glob(NOW + 1), TS, pairs=pairs, costs=costs)
+    assert v.selected is None                                        # its trusted naive basis failed
 
 
 @pytest.mark.parametrize("replay,startup,reason", [(False, True, "ReplayGateMissing"), (True, False, "LeadInsufficient"),
@@ -303,6 +464,13 @@ def test_the_eta_is_advisory_and_counts_missing_windows():
     assert verdict(low)[0].candidates["seasonal_naive"].eta_seconds is None
 
 
+def test_the_exit_ratio_is_a_validated_setting():
+    pa = {"spec": {"prediction": {"trust": {"challengerExitLossRatioBps": 9000}}}}
+    with pytest.raises(c.ContractRefused):                            # below the entry ratio: no band
+        c.resolve_settings(pa)
+    assert c.resolve_settings({"spec": {"prediction": {}}}).trust.challenger_exit_loss_ratio_bps == 10_000
+
+
 # --- exactly once, journal binding ------------------------------------------------------------------------------
 
 def test_ledger_updates_are_exactly_once():
@@ -310,9 +478,11 @@ def test_ledger_updates_are_exactly_once():
     r = f.window(START)
     before = f.ledger
     assert T.note_outcome(before, r, lead_s=L, nominal_miscoverage=NOMINAL, recent_n=32) is before
-    assert T.note_issuance(before, seq=1, origin=START, lead_s=L, mode="prospective", bounded=True) is before
+    assert T.note_issuance(before, seq=1, issuance_id="iss-1", epoch=EPOCH, model="seasonal_naive", recipe="r",
+                           origin=START, window_end=START + L, deadline_s=START + L + GRACE, lead_s=L,
+                           mode="prospective", bounded=True) is before
     with pytest.raises(T.TrustError):
-        T.note_outcome(T.new_ledger(EPOCH, "statistical"), dataclasses.replace(r, cal=dataclasses.replace(
+        T.note_outcome(T.new_ledger(EPOCH, "statistical", "r", L), dataclasses.replace(r, cal=dataclasses.replace(
             r.cal, seq=9)), lead_s=L, nominal_miscoverage=NOMINAL, recent_n=32)
 
 

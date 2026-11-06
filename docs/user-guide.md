@@ -426,20 +426,27 @@ and at most one more fixed label:
   at the first, middle and last target, and `predictive_autoscaler_forecast_window_pinball_loss_rps`.
 - **Participation:** `predictive_autoscaler_forecast_issued_total`, `predictive_autoscaler_forecast_outcomes_total`
   (`covered`, `missed`, `unscorable`), `predictive_autoscaler_forecast_scored_windows`,
-  `predictive_autoscaler_forecast_outcome_availability_ratio` (scorable share of the last day's matured windows),
+  `predictive_autoscaler_forecast_outcome_availability_ratio` (scored share of the last day's due windows, overdue
+  ones included),
   `predictive_autoscaler_forecast_calibration_windows`, `predictive_autoscaler_forecast_history_seconds`,
   `predictive_autoscaler_forecast_evidence_age_seconds` and `predictive_autoscaler_forecast_fit_failures_total`.
 - **Trust:** `predictive_autoscaler_forecast_trusted` (1 when that model's evidence gates pass) and the latest
   `predictive_autoscaler_forecast_upper_window_rps` / `predictive_autoscaler_forecast_base_window_rps`.
 
 A model is trusted only on **prospective** evidence (forecasts issued live before their outcome; offline replays warm up
-calibration but never count): at least 48 hours and 64 non-overlapping windows with an issued bound, 7-day coverage at
-least the target minus 5 points (and on the worst day), at least 95 % of the last day's windows scorable, no 5 misses in
-a row, enough calibration history, fresh input, and the history minimum (1 day for seasonal-naive, 7 days for the
-statistical model). A trusted model that fails a gate is demoted at once; it is trusted again only after its gates have
-held for 24 hours and 32 new windows. The statistical model is used only when it is trusted **and** has beaten a trusted
-seasonal-naive forecast on the same windows; otherwise the seasonal-naive forecast is used when trusted, and otherwise
-scaling stays reactive. "Ready" here means ready to activate: Recommend mode still makes no writes, and coverage of
+calibration but never count, not even in availability or error figures): at least 48 hours and 64 non-overlapping
+windows with an issued bound, 7-day coverage at least the target minus 5 points (and on the worst day), no 5 misses in a
+row, enough calibration history, fresh input, the history minimum (1 day for seasonal-naive, 7 days for the statistical
+model), and over the last day at least 95 % of the due windows scored and 95 % of the forecast opportunities issued. A
+window whose outcome is overdue (its data deadline passed without one) counts as not scored, and an origin without a
+forecast counts as a missed opportunity. Evidence belongs to one model version (recipe): a new recipe starts again. A
+trusted model that fails a gate is demoted at once; it is trusted again only after its gates have held for 24 hours and
+32 new windows. The statistical model is used only when it is trusted **and** has beaten a trusted seasonal-naive
+forecast on the same windows (spanning at least 48 hours) for 24 hours in a row; it is then kept until it does worse
+than the seasonal-naive forecast, so small differences do not make the choice flip back and forth, but any safety
+failure falls back at once. Otherwise the seasonal-naive forecast is used when trusted, and otherwise scaling stays
+reactive. Time windows are counted in whole hours ("the last day" starts at the first whole hour inside it, so it can be
+up to an hour shorter). "Ready" here means ready to activate: Recommend mode still makes no writes, and coverage of
 forecast windows is not a latency or error-rate guarantee.
 
 ### The Help & Overview dashboard
