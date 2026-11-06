@@ -436,7 +436,7 @@ Each rule watches only its own installation, and every alert carries `pa_release
 |---|---|---|---|
 | `PredictiveAutoscalerNotReady` | warning | `Ready` has not been True for 15 minutes: reconciles fail. | `kubectl describe pa`: fix the reason (`DeploymentNotFound`, `InvalidMetricQuery`, `CrossNamespaceTarget`, `ScalingError`) and read the operator log. |
 | `PredictiveAutoscalerTelemetryUnavailable` | warning | The request rate has been unmeasurable for 10 minutes; the replica count is held. | Check the metrics store and run `status.metricSource.query` yourself: it must return exactly one finite series. Fix the scrape or the query. |
-| `PredictiveAutoscalerForecastUnavailable` | info | No forecast used for 2 hours. Never fires when forecasting is switched off. | Expected until the first successful training. Otherwise read the `ForecastAvailable` reason, the training CronJob's last job and log, and the forecasting service log. |
+| `PredictiveAutoscalerForecastUnavailable` | info | No forecast used for 2 hours. Never fires when forecasting is switched off. Label `fallback=reactive`: decisions use the measured rate. `fallback=capacity_hold`: no per-replica capacity is configured, so no forecast is requested and the replica count is held. | `reactive`: expected until the first successful training; otherwise read the `ForecastAvailable` reason, the training CronJob's last job and log, and the forecasting service log. `capacity_hold`: set `capacityPerReplica` ([section 5](#5-create-your-first-autoscaler-in-recommend-mode)). |
 | `PredictiveAutoscalerConflict` | warning | Another replica writer has targeted the Deployment for 5 minutes; nothing is written. | Remove or pause the writer in `status.conflicts`, or switch this autoscaler to Recommend. |
 | `PredictiveAutoscalerModelStale` | warning | Forecasts in the last hour came from a model whose training data ends more than 26 hours ago. | Check the training CronJob (schedule, failed jobs, logs, `activeDeadlineSeconds`); train by hand ([section 7](#7-get-forecasts)). |
 | `PredictiveAutoscalerOperatorDown` | critical | No operator scrape target has been up for 10 minutes. | Check the operator pod, its events and log. An unready operator after an upgrade usually means an old CRD ([section 13](#13-upgrading-and-the-api-group-migration)). Also check the scrape object and NetworkPolicy `metricsFrom`. |
@@ -487,7 +487,9 @@ that changes model provenance refuses older models).
 **The hidden capacity defaults are gone (CRD revision 3).** Earlier versions assumed 20,000 requests per minute per pod
 for the reactive rule and 30,000 for the forecast when `targetRPS` was unset. Now an autoscaler without a capacity holds
 its current count and reports `CapacityConfigured=False`. Before upgrading, list the autoscalers without one, and set
-`capacityPerReplica` on each ([upgrading.md](upgrading.md#capacityperreplica-replaces-the-hidden-defaults)).
+`capacityPerReplica` on each. Keep `targetRPS` where it is set until the new operator runs and is verified, and never
+hand a capacity-only object back to an older Active operator
+([upgrading.md](upgrading.md#capacityperreplica-replaces-the-hidden-defaults), with the rollback steps).
 
 **From the legacy API group.** Before v0.1.0 the group was `autoscaler.example.com`; it is now
 `autoscaling.devkuban.com`. Objects are not converted; each one is re-created in the new group, in steps that never

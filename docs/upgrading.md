@@ -15,11 +15,14 @@ except to bring a count outside `[minReplicas, maxReplicas]` back within them), 
 event `CapacityNotConfigured`. The API server still accepts objects without a capacity, so nothing is rejected during the
 upgrade; a later release will require one for Active mode once existing objects have been migrated.
 
-**Before you upgrade:**
+**The order matters.** An operator older than this change does not know `capacityPerReplica`: for an object that has
+only `capacityPerReplica` it falls back to its 20,000/30,000 defaults. So keep `targetRPS` until the new operator runs and
+is verified, and never hand a capacity-only object back to an old Active operator.
 
-1. Apply the new CRD first (revision 3; the new operator waits, unready, on an older one):
+1. **Apply the new CRD** (revision 3; the new operator waits, unready, on an older one, and the old operator accepts it):
    `kubectl --kubeconfig <file> --context <context> apply --server-side --force-conflicts -f charts/predictive-autoscaler/crds/`.
-2. List the autoscalers that have no capacity and would start holding:
+   Leave every `targetRPS` in place.
+2. **List the autoscalers without any capacity.** Today they run on the hidden defaults; after the upgrade they hold:
 
    ```sh
    kubectl --kubeconfig <file> --context <context> get pa -A -o json | jq -r '.items[]
@@ -27,17 +30,33 @@ upgrade; a later release will require one for Active mode once existing objects 
      | "\(.metadata.namespace)/\(.metadata.name) mode=\(.spec.mode // "Recommend")"'
    ```
 
-3. For each one, measure the capacity of one replica with a load test
-   ([configuration.md](configuration.md#measuring-capacitypereplica)) and set it. Do not copy the old defaults: 20,000
-   requests per minute is 333 requests per second per pod, which is rarely what a pod serves within its SLO, so an
-   Active autoscaler relying on it may have been running too few replicas.
-4. Move the autoscalers that use `targetRPS` to `capacityPerReplica` in one change, removing `targetRPS` at the same time
-   (in Git, or with
-   `kubectl --kubeconfig <file> --context <context> -n <namespace> patch pa <name> --type merge -p '{"spec":{"metrics":{"requests":{"targetRPS":null,"capacityPerReplica":"10"}}}}'`).
-   The decision does not change: `targetRPS: 10` and `capacityPerReplica: "10"` mean the same.
+   For each one, measure the capacity of one replica with a load test
+   ([configuration.md](configuration.md#measuring-capacitypereplica)) and set `capacityPerReplica`. The old operator
+   ignores the field and keeps its defaults, which it applied to these objects anyway; the new operator uses it from
+   its first reconcile, so they do not start holding. Do not copy the old defaults: 20,000 requests per minute is 333
+   requests per second per pod, which is rarely what a pod serves within its SLO, so an Active autoscaler relying on it
+   may have been running too few replicas.
+3. **Upgrade the operator** (`helm upgrade`, or the manifests) and **verify it** before changing anything else: the
+   operator pod is ready (it passed the CRD revision gate), and every autoscaler reports, for its current generation,
+   `Ready=True` and `CapacityConfigured=True` (reason `DeprecatedTargetRPS` or `CapacityPerReplica`, with the capacity in
+   the message) and a calculated count in `kubectl get pa -A`. An empty Calculated column means no capacity
+   (`CapacityConfigured=False`, reason `CapacityMissing`): go back to step 2 for it.
+4. **Then migrate `targetRPS` to `capacityPerReplica`**, one object at a time, in one change that removes `targetRPS`
+   (setting both is rejected): in Git, or with
+   `kubectl --kubeconfig <file> --context <context> -n <namespace> patch pa <name> --type merge -p '{"spec":{"metrics":{"requests":{"targetRPS":null,"capacityPerReplica":"10"}}}}'`.
+   The decision does not change: `targetRPS: 10` and `capacityPerReplica: "10"` mean the same, and the condition reason
+   turns from `DeprecatedTargetRPS` to `CapacityPerReplica`.
 
-After the upgrade, `kubectl get pa -A` shows an empty Calculated column for every autoscaler still without a capacity, and
-the condition message of `CapacityConfigured` names the capacity each one uses.
+**Rolling back** to an operator older than this change:
+- Keep the revision-3 CRD. Applying an older CRD removes `capacityPerReplica` from the schema, and the API server then
+  drops the field from stored objects.
+- First give every autoscaler that has only `capacityPerReplica` a `targetRPS` again, or switch it to `mode: Recommend`.
+  Otherwise the old operator scales it on its 20,000/30,000 defaults. Remove `capacityPerReplica` in the same change,
+  because setting both is rejected.
+- `targetRPS` is an integer of at least 1, so a fractional capacity may not be representable. Round **down** (12.5
+  becomes 12: slightly more replicas), never up. Keep a capacity below 1 request per second in Recommend mode, since
+  it has no `targetRPS` equivalent.
+- After the rollback the old operator again applies its defaults to any object without `targetRPS`.
 
 ## From the legacy API group (`autoscaler.example.com`) to `autoscaling.devkuban.com`
 
@@ -75,6 +94,7 @@ replacement you train first (step 4). Its RBAC can read every namespace, as the 
 |---|---|---|
 | 2. Record the inventory | `hack/migrate-api-group.py plan --legacy-operator <ns>/<deployment> [...] --out inventory.json` | nothing (writes the file) |
 | 3. Create the replacements | `hack/migrate-api-group.py prepare --inventory inventory.json` | creates new-group autoscalers in **Recommend** mode |
+| 3a. Give each replacement a capacity | for every replacement without one (prepare names them): `kubectl patch predictiveautoscalers.autoscaling.devkuban.com <name> -n <ns> --type merge -p '{"spec":{"metrics":{"requests":{"capacityPerReplica":"<rps>"}}}}'` | the **replacement** only |
 | 4. Train for the new autoscalers | the training CronJob with `TRAINING_TARGET=<namespace>/<name>`, once per replacement | models |
 | 5. Check every replacement | `hack/migrate-api-group.py verify --inventory inventory.json` | nothing |
 | 6. Stop the legacy operators, delete the legacy autoscalers | `hack/migrate-api-group.py cutover --inventory inventory.json` | scales every legacy operator to 0, then deletes the legacy autoscalers |
@@ -102,12 +122,22 @@ What each step checks:
 - **Training is needed again.** Models are bound to the autoscaler's UID and compiled query, so the legacy models are
   not served for the new objects. Until the first training succeeds, a replacement reports "model unavailable" and
   the legacy operator keeps scaling.
+- **A capacity is needed on each replacement.** A legacy autoscaler without `targetRPS` ran on the legacy operator's
+  hidden defaults; its replacement has no capacity, so the new operator holds and recommends nothing
+  (`CapacityConfigured=False`, reason `CapacityMissing`). `prepare` names each such replacement. Measure the capacity
+  ([configuration.md](configuration.md#measuring-capacitypereplica)) and set `capacityPerReplica` on the **new
+  Recommend replacement only** (step 3a). Leave the inventoried legacy object unchanged: an edit gives it a new
+  generation, and every later step then stops until `plan` is run again. A replacement may also carry a legacy
+  `targetRPS` as the same value in `capacityPerReplica`; verify accepts that as unchanged.
 - **verify** requires, for every replacement:
   - the provenance of its recorded source, the recorded target, and the same value for every field the legacy spec
     set;
   - `mode: Recommend` in both spec and status;
   - its current generation observed, with `Ready` and `TelemetryAvailable` True for that generation;
   - `ForecastAvailable` True as well (`--allow-reactive` waives only this one);
+  - a per-replica capacity in its spec, with `CapacityConfigured` True for its generation. This is never waived, not
+    even by `--allow-reactive`: without a capacity there is no recommendation, and waiting does not create one, so
+    verify names the replacement and the command that sets it;
   - `ConflictDetected` either False, or naming only inventoried legacy autoscalers (from `status.conflicts`);
   - a recommendation in its status.
 - **cutover** changes nothing until the inventory matches and every replacement verifies. It also refuses while the

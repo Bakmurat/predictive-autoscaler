@@ -163,7 +163,7 @@ installation's metrics (its `job` and `pa_install_namespace`), and every alert c
 |---|---|---|---|
 | `PredictiveAutoscalerNotReady` | `Ready` is not True (reconciles fail) | `notReadyFor` 15m | warning |
 | `PredictiveAutoscalerTelemetryUnavailable` | the request rate cannot be measured, so the replica count is held | `telemetryFor` 10m | warning |
-| `PredictiveAutoscalerForecastUnavailable` | no forecast is used; expected until the first training has enough history; never for `spec.prediction.enabled: false` | `forecastFor` 2h | info |
+| `PredictiveAutoscalerForecastUnavailable` | no forecast is used; expected until the first training has enough history; never for `spec.prediction.enabled: false`. Label `fallback`: `reactive` (decisions use the measured rate) or `capacity_hold` (no per-replica capacity: nothing is forecast or calculated and the count is held; set `capacityPerReplica`) | `forecastFor` 2h | info |
 | `PredictiveAutoscalerConflict` | another replica writer targets the Deployment, so the operator writes nothing | `conflictFor` 5m | warning |
 | `PredictiveAutoscalerModelStale` | forecasts in the last hour came from a model whose training cutoff is older than `modelStaleHours` (26) | 15m | warning |
 | `PredictiveAutoscalerOperatorDown` | no operator scrape target is up (down or missing); a healthy scrape does not prove reconciles succeed, which `NotReady` covers | `absentFor` 10m | critical |

@@ -254,7 +254,8 @@ class Cluster:
 
 
 def reconciled(o, forecast="True", telemetry="True", conflicts=None):
-    """What the new operator would report for a replacement in Recommend mode next to its legacy PA."""
+    """What the new operator would report for a replacement in Recommend mode next to its legacy PA. Without a
+    per-replica capacity in its spec it reports CapacityMissing, holds, requests no forecast and recommends nothing."""
     gen = o["metadata"]["generation"]
     src_ns, src_name = o["metadata"]["annotations"]["autoscaling.devkuban.com/migrated-from"].split("/")
     if conflicts is None:
@@ -263,10 +264,17 @@ def reconciled(o, forecast="True", telemetry="True", conflicts=None):
 
     def cond(typ, status, reason):
         return {"type": typ, "status": status, "reason": reason, "observedGeneration": gen, "message": ""}
+    requests = ((o.get("spec") or {}).get("metrics") or {}).get("requests") or {}
+    capacity = requests.get("capacityPerReplica") is not None or bool(requests.get("targetRPS"))
     o["status"] = {"observedGeneration": gen, "mode": "Recommend", "calculatedReplicas": 4, "conflicts": conflicts,
                    "conditions": [cond("Ready", "True", "ReconcileCompleted"), cond("TelemetryAvailable", telemetry, "Measured"),
                                   cond("ForecastAvailable", forecast, "Used"),
-                                  cond("ConflictDetected", "True" if conflicts else "False", "ReplicaWriter")]}
+                                  cond("ConflictDetected", "True" if conflicts else "False", "ReplicaWriter"),
+                                  cond("CapacityConfigured", "True", "DeprecatedTargetRPS")]}
+    if not capacity:
+        o["status"].pop("calculatedReplicas")
+        _condition("CapacityConfigured", status="False", reason="CapacityMissing")(o)
+        _condition("ForecastAvailable", status="False", reason="CapacityMissing")(o)
 
 
 @pytest.fixture
@@ -418,7 +426,11 @@ def _condition(typ, **upd):
     (lambda o: o["metadata"]["annotations"].update({"autoscaling.devkuban.com/migrated-from-uid": "uid-other"}),
      "not the migrated replacement"),
     (lambda o: o["spec"]["targetDeployment"].update(name="other"), "differs from the recorded target"),
-    (lambda o: o["status"].pop("calculatedReplicas"), "no recommendation"),
+    (lambda o: o["status"].pop("calculatedReplicas"), "no recommendation in status yet"),
+    (_condition("CapacityConfigured", status="False", reason="CapacityInvalid"), "CapacityConfigured is False"),
+    (lambda o: o["status"]["conditions"].pop(), "CapacityConfigured is absent"),
+    (lambda o: o["spec"]["metrics"]["requests"].update(targetRPS=None, capacityPerReplica="12"),
+     "metrics.requests.targetRPS: legacy 10, replacement None"),
 ])
 def test_verify_names_what_is_not_ready(cluster, breakage, message):
     ready(cluster)
@@ -434,6 +446,57 @@ def test_allow_reactive_waives_only_the_forecast(cluster):
     cluster.edit(k(NEW, "shop", "web-pa"), _condition("TelemetryAvailable", status="False"))
     p = cluster.step("verify", "--allow-reactive")
     assert p.returncode == 1 and "TelemetryAvailable is False" in p.stdout
+
+
+def _no_capacity(o):
+    o["spec"]["metrics"]["requests"].pop("targetRPS")
+
+
+def _capacity_cluster(tmp_path):
+    """Two legacy PAs; web-pa has no capacity (the legacy operator's hidden defaults applied to it)."""
+    objects = base_objects()
+    _no_capacity(objects[k(LEGACY, "shop", "web-pa")])
+    return Cluster(tmp_path, objects)
+
+
+def test_a_replacement_without_a_capacity_gets_an_actionable_diagnostic_never_waived(tmp_path):
+    cluster = _capacity_cluster(tmp_path)
+    assert cluster.plan().returncode == 0
+    p = cluster.step("prepare")
+    assert p.returncode == 0 and "no per-replica capacity" in p.stdout and "shop/web-pa only" in p.stdout, p.stdout
+    for name in ("web-pa", "api-pa"):
+        cluster.edit(k(NEW, "shop", name), reconciled)
+    for extra in ((), ("--allow-reactive",)):
+        p = cluster.step("verify", *extra)
+        assert p.returncode == 1 and "1 of 2 replacements are not ready" in p.stderr, p.stdout + p.stderr
+        assert "no per-replica capacity" in p.stdout and "waiting will not change that" in p.stdout
+        assert '"capacityPerReplica":"<rps>"' in p.stdout and "Leave the legacy object unchanged" in p.stdout
+        assert "no recommendation in status yet" not in p.stdout   # not a wait: an action
+    legacy_before = cluster.objects[k(LEGACY, "shop", "web-pa")]
+    # The measured capacity goes on the new Recommend replacement only; the inventoried legacy object is unchanged.
+    cluster.edit(k(NEW, "shop", "web-pa"), lambda o: (o["spec"]["metrics"]["requests"].update(capacityPerReplica="12.5"),
+                                                      o["metadata"].update(generation=o["metadata"]["generation"] + 1)))
+    cluster.edit(k(NEW, "shop", "web-pa"), reconciled)
+    p = cluster.step("verify")
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert cluster.objects[k(LEGACY, "shop", "web-pa")] == legacy_before and cluster.verbs() == ["create", "create"]
+
+
+def test_allow_reactive_does_not_bypass_the_capacity_at_activation(tmp_path):
+    cluster = _capacity_cluster(tmp_path)
+    assert cluster.plan().returncode == 0 and cluster.step("prepare").returncode == 0
+    for name in ("web-pa", "api-pa"):
+        cluster.edit(k(NEW, "shop", name), reconciled)
+    p = cluster.step("cutover", "--allow-reactive")
+    assert p.returncode == 1 and "no per-replica capacity" in p.stdout and cluster.verbs() == ["create", "create"]
+
+
+def test_a_legacy_target_rps_may_be_carried_as_the_same_capacity_per_replica(cluster):
+    ready(cluster)
+    cluster.edit(k(NEW, "shop", "web-pa"), lambda o: (o["spec"]["metrics"]["requests"].pop("targetRPS"),
+                                                      o["spec"]["metrics"]["requests"].update(capacityPerReplica="10")))
+    p = cluster.step("verify")
+    assert p.returncode == 0, p.stdout
 
 
 # --- cutover -------------------------------------------------------------------------------------------------------
