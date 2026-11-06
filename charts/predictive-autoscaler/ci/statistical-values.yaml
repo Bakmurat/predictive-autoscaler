@@ -1,0 +1,8 @@
+# The light statistical forecaster profile (forecast contract v2, a Recommend-only preview): no trainers, own state.
+prometheus:
+  url: http://prometheus:9090
+forecaster:
+  engine: statistical
+networkPolicy:
+  prometheus:
+    namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: monitoring}}

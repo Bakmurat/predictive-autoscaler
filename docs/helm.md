@@ -126,6 +126,37 @@ The forecasting service and the trainer share the model volume.
 - The trainer serializes publications with `flock`, so the volume's filesystem must support it. Local disks and most
   block CSI drivers do; some NFS setups do not.
 
+## Statistical forecaster profile (preview)
+
+`forecaster.engine: statistical` replaces the TensorFlow forecasting service with the light statistical forecaster
+(forecast contract v2, `window-max-rps/v1`): image `images.statisticalForecaster` (built from
+`ml-engine/Dockerfile.statistical`; no TensorFlow, Keras, CUDA, pandas or scikit-learn), started as
+`python -m api.serve statistical`. The default stays `legacyLstm` until the release evaluation (design C2.8).
+
+- **What it serves:** `POST /v2/predict`, `/health`, `/ready` and `/metrics` only, behind the same TokenReview
+  authentication and TLS as the legacy service. Benchmark and legacy experiment switches (`ALLOW_BENCHMARK_EXPERIMENTS`,
+  `SEASONAL_EXPERIMENT`, ...) stop it from starting.
+- **A Recommend-only preview:** it issues shadow forecasts, calibrates them on matured windows and reports their quality
+  (the `predictive_autoscaler_forecast_*` metrics), but every answer has `predictive_eligible: false` until its release
+  gates pass. The current operator does not call `/v2/predict` yet.
+- **Resources:** `forecaster.statistical.resources` (requests 256Mi and 250m CPU, limits 512Mi and 1 CPU) instead of
+  `forecaster.resources`; one replica, `Recreate`.
+- **State:** a retained 2Gi claim (`<release>-forecast-state`, `forecaster.statistical.persistence`) mounted at
+  `/state` holds the forecast journal (SQLite, WAL) and the fit artifacts, with a journal budget of
+  `forecaster.statistical.stateQuota` (1536Mi). Issuances and outcomes are kept 7 days online, then compacted into
+  per-epoch counts. A lost or corrupt journal never carries evidence over: the service answers 503 until it can write
+  again, and a new journal starts every trust epoch from nothing.
+- **No trainers:** fits run inside the service on a bounded worker (one process, 30 s, 384 MiB address space); the
+  training CronJobs are not rendered, and `training.targets` with this engine is refused.
+- **Switching:** the Deployment, Service and operator URL stay the same in both profiles, and each profile's claim is
+  kept (`helm.sh/resource-policy: keep`) when the other one is installed, so an upgrade to `statistical` and a rollback
+  to `legacyLstm` both find their volume again.
+- **Checks:** `hack/sbom-check-statistical.py` checks the pinned requirements and the Dockerfile offline (part of the
+  test suite); with `--image <ref>` it lists the built image's packages and shared libraries and imports the service
+  with TensorFlow blocked (needs docker: a release step). `hack/statistical-envelope.py` estimates memory, CPU, latency
+  and journal growth offline; the release measurement runs the image on a kind cluster with this profile (8
+  autoscalers, 1-minute cadence, at least 24 hours) and reads the pod's working set, CPU and volume usage.
+
 ## Monitoring
 
 `metrics.serviceMonitor.enabled` (Prometheus Operator) or `metrics.vmServiceScrape.enabled` (VictoriaMetrics

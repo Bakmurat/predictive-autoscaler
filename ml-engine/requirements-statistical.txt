@@ -1,0 +1,18 @@
+# The statistical forecasting service (forecast contract v2): the complete runtime closure, every version pinned.
+# No TensorFlow, Keras, CUDA, pandas or scikit-learn (hack/sbom-check-statistical.py checks this file, the Dockerfile
+# and, given an image, its installed packages and shared libraries).
+annotated-types==0.8.0
+anyio==4.15.1
+click==8.5.0
+fastapi==0.115.0
+h11==0.16.0
+idna==3.20
+numpy==1.26.4
+prometheus-client==0.26.0
+pydantic==2.14.1
+pydantic-core==2.50.1
+scipy==1.17.1
+starlette==0.38.6
+typing-extensions==4.16.0
+typing-inspection==0.4.4
+uvicorn==0.32.0

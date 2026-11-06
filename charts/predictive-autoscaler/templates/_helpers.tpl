@@ -63,6 +63,24 @@ app.kubernetes.io/component: {{ index . 1 }}
 {{- printf "system:serviceaccount:%s:%s-operator" .Release.Namespace (include "pa.fullname" .) -}}
 {{- end -}}
 
+{{- define "pa.stateClaim" -}}
+{{- default (printf "%s-forecast-state" (include "pa.fullname" .)) .Values.forecaster.statistical.persistence.existingClaim -}}
+{{- end -}}
+
+{{- define "pa.statistical" -}}
+{{- if eq .Values.forecaster.engine "statistical" }}true{{ end -}}
+{{- end -}}
+
+{{/* The statistical journal's byte budget from forecaster.statistical.stateQuota (Mi or Gi). */}}
+{{- define "pa.stateQuotaBytes" -}}
+{{- $q := .Values.forecaster.statistical.stateQuota -}}
+{{- if hasSuffix "Gi" $q -}}
+{{- mul (trimSuffix "Gi" $q | atoi) 1073741824 -}}
+{{- else -}}
+{{- mul (trimSuffix "Mi" $q | atoi) 1048576 -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "pa.modelsClaim" -}}
 {{- default (printf "%s-models" (include "pa.fullname" .)) .Values.forecaster.persistence.existingClaim -}}
 {{- end -}}
@@ -102,8 +120,10 @@ capabilities:
   value: "1"
 - name: PYTHONUNBUFFERED
   value: "1"
+{{- if not (include "pa.statistical" .) }}
 - name: MODEL_DIR
   value: /models
+{{- end }}
 {{- end -}}
 
 {{/* NetworkPolicy egress rules every component needs: DNS, the Kubernetes API, Prometheus (built as data, then YAML).
