@@ -153,6 +153,10 @@ class ForecastService:
                 return self._issue(bound, grid, self.clock.now_ms())    # the time after the history and the lock
             except StoreUnavailable as e:
                 raise ServiceError(503, "StateUnavailable", f"the forecast journal failed: {e}") from e
+            except StoreError as e:
+                # A record the journal refuses (e.g. a state or bundle above its size cap): this autoscaler is
+                # unavailable with that reason, nothing is issued, and the error never escapes as a 500.
+                raise ServiceError(503, "StateUnavailable", f"the forecast state cannot be journaled: {e}") from e
 
     def _issue(self, bound: BoundRequest, grid, now_ms: int) -> Dict:
         store, s, sig, lead = self.store, bound.settings, bound.signal, bound.lead

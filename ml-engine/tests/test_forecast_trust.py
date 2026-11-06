@@ -403,7 +403,8 @@ def test_pairs_need_both_models_at_the_same_origin():
     for r, mode in ((one, "prospective"), (other, "prospective"), (replay, "replay")):
         p = T.note_pair(p, T.EvidenceRecord(r, mode, 0, None), lead_s=L, nominal_miscoverage=NOMINAL)
     assert T.pair_sums(p, START + H)["n"] == 0                       # different issuances; replay never pairs
-    match = CalibrationRecord(4, EPOCH, "seasonal_naive", "r", "iss-1", START, START + L, 4.0, 6.0, "scored", 5.0)
+    # (One issuance per origin within an epoch: a second issuance at the same window replaces the unpaired entry.)
+    match = CalibrationRecord(4, EPOCH, "statistical", "r", "iss-2", START, START + L, 4.0, 6.0, "scored", 5.0)
     p = T.note_pair(p, T.EvidenceRecord(match, "prospective", 0, None), lead_s=L, nominal_miscoverage=NOMINAL)
     assert T.pair_sums(p, START + H)["n"] == 1
 

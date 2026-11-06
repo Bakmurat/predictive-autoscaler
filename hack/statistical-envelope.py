@@ -106,7 +106,15 @@ def cgroup_peak_mib():
     return None
 
 
-def run(pas=8, interval=60, hours=6.0, history_days=2, fit_mode="off", state_dir=None, cgroup=False):
+def wait_for_fits(svc, limit_s=60.0) -> None:
+    """Real fits have a whole decision interval (and a 30 s deadline): give the in-flight ones that time, so the
+    compressed simulation does not outrun them."""
+    end = time.monotonic() + limit_s
+    while svc.worker is not None and svc.worker.busy() and time.monotonic() < end:
+        time.sleep(0.05)
+
+
+def run(pas=8, interval=60, hours=6.0, history_days=2, fit_mode="off", state_dir=None, cgroup=False, fits=None):
     lead = max(2 * interval, -(-(300 + interval + 30 + interval) // interval) * interval)
     objects = {f"web-{i}-pa": pa_object(i, interval, lead, history_days) for i in range(pas)}
     start = 1_793_923_200 - 1_793_923_200 % DAY + 3 * DAY
@@ -118,11 +126,17 @@ def run(pas=8, interval=60, hours=6.0, history_days=2, fit_mode="off", state_dir
     svc = ForecastService(ServiceConfig(prometheus_url="http://prom", state_dir=state_dir, fit_mode=fit_mode,
                                         max_autoscalers=max(8, pas)), reader=Reader(objects), fetch=backend,
                           clock=clock)
+    if fit_mode == "worker" and fits is not None:              # tests: another (e.g. failing) fit recipe
+        from forecasting.worker import FitWorker
+        svc.worker.close()
+        svc.worker = FitWorker(svc.artifacts, fits=fits)
     latencies, failures = [], 0
+    fit_failures, statistical = {}, 0
     cpu0 = time.process_time()
     try:
         for k in range(int(hours * 3600 // interval)):
             origin = start + k * interval
+            wait_for_fits(svc)
             clock.set(origin * 1000 + 5000)
             for name, pa in objects.items():
                 settings = c.resolve_settings(pa).fingerprint()
@@ -139,6 +153,10 @@ def run(pas=8, interval=60, hours=6.0, history_days=2, fit_mode="off", state_dir
                     failures += 1
                 latencies.append(time.perf_counter() - t0)
         journal = svc.store.usage_bytes() if svc.store else None
+        wait_for_fits(svc)
+        fit_failures = {k: v for k, v in (svc.worker.failures if svc.worker else {}).items() if v}
+        statistical = sum(1 for i in (svc.store.issuances() if svc.store else [])
+                          if (i.payload()["candidates"].get("statistical") or {}).get("artifact_sha256"))
     finally:
         svc.close()
         if tmp is not None:
@@ -149,7 +167,25 @@ def run(pas=8, interval=60, hours=6.0, history_days=2, fit_mode="off", state_dir
             "failures": failures, "peak_rss_mib": round(peak_rss_mib(), 1),
             "cpu_seconds": round(time.process_time() - cpu0, 3), "journal_bytes": journal,
             "cgroup_memory_peak_mib": cgroup_peak_mib() if cgroup else None,
+            "fit_mode": fit_mode, "fit_failures": fit_failures, "statistical_issuances": statistical,
             "p50_seconds": q(0.50), "p95_seconds": q(0.95), "max_seconds": latencies[-1] if latencies else None}
+
+
+def breaches(out, cgroup=False):
+    """What fails the run: a budget exceeded; a failed request; with fitting on, any failed fit or no issuance that
+    used a fitted artifact (the seasonal-naive fallback must not hide a broken fit path); a requested cgroup
+    measurement that is unavailable."""
+    found = [k for k, limit in BUDGET.items() if out[k] is not None and out[k] > limit]
+    if out["failures"]:
+        found.append("failures")
+    if out["fit_mode"] == "worker":
+        if out["fit_failures"]:
+            found.append("fit_failures")
+        if out["statistical_issuances"] < 1:
+            found.append("no_statistical_issuances")
+    if cgroup and out["cgroup_memory_peak_mib"] is None:
+        found.append("cgroup_unavailable")
+    return found
 
 
 def main(argv=None) -> int:
@@ -165,12 +201,9 @@ def main(argv=None) -> int:
                                                                  "inside the container: it includes the fit workers)")
     a = ap.parse_args(argv)
     out = run(a.pas, a.interval, a.hours, a.history_days, a.fit_mode, a.state_dir, a.cgroup_peak)
-    breaches = [k for k, limit in BUDGET.items() if out[k] is not None and out[k] > limit]
-    if out["failures"]:
-        breaches.append("failures")
-    out["breaches"] = breaches
+    out["breaches"] = breaches(out, cgroup=a.cgroup_peak)
     print(json.dumps(out, indent=2))
-    return 1 if a.check and breaches else 0
+    return 1 if a.check and out["breaches"] else 0
 
 
 if __name__ == "__main__":

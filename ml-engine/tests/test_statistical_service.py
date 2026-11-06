@@ -377,37 +377,61 @@ def test_readiness_follows_the_journal(tmp_path):
     assert not svc.ready() and svc.health()["state"] == "unavailable"
 
 
-def test_the_maximum_retained_state_fits_one_checkpoint(tmp_path):
-    """Three models at a 1-minute cadence with a full 7-day ledger, a full day of pending issuances, full calibration
-    buffers and paired evidence: the largest state the profile keeps still fits a checkpoint."""
+WORST_FLOAT = -1.2345678901234567e-05          # the longest repr a finite float takes
+
+
+def max_state(models):
+    """The largest epoch state the supported settings allow: a 1-minute cadence; per model a full 7-day hourly
+    ledger with every counter large and every sum a worst-case float, a full day of pending issuances (older ones are
+    dropped), 4096 calibration scores (calibration.maxScores' maximum) and the acute ring; paired evidence over 7 days
+    with a full day of unpaired outcomes; hysteresis and selection state."""
     from forecasting import trust as T
     from forecasting.calibration import CalibrationPolicy, initial
-    from forecasting.store import MAX_CHECKPOINT_BYTES, ForecastStore
-    ek = "e" * 64
-    now = T0 + 7 * DAY
-    models = {}
-    for m in ("seasonal_naive", "statistical", "lstm"):
+    ek, now = "e" * 64, T0 + 7 * DAY
+    out = {}
+    for m in models:
         led = T.new_ledger(ek, m, f"{m}/v1", 60)
-        for h in range(169):
+        for h in range(170):
             b = T._bucket(led, now - h * 3600)
             for f in b:
-                b[f] = 59.123456789012345 if isinstance(b[f], float) else 60
-        led["pending"] = {f"iss-{i:032x}": [now - i * 60, now - i * 60 + 720] for i in range(1440)}
-        led["recent"] = [1] * 32
-        cal = initial(CalibrationPolicy(3600), ek, m, f"{m}/v1")
-        cal["scores"] = [[now - i * 3600, -1.234567890123456] for i in range(512)]
-        models[m] = {"recipe": f"{m}/v1", "calibration": cal, "ledger": led}
+                b[f] = WORST_FLOAT if isinstance(b[f], float) else 10 ** 6
+        led["pending"] = {str(now - i * 60): now - i * 60 + 1800 for i in range(1441)}
+        led["recent"] = [1] * 4096
+        led["totals"] = {k: 10 ** 9 for k in led["totals"]}
+        cal = initial(CalibrationPolicy(3600, max_scores=4096, min_windows=128), ek, m, f"{m}/v1")
+        cal["scores"] = [[now - i * 60, WORST_FLOAT] for i in range(4096)]
+        out[m] = {"recipe": f"{m}/v1", "calibration": cal, "ledger": led}
     pairs = T.new_pairs(ek, "statistical", "statistical/v1", "seasonal_naive/v1")
-    pairs["buckets"] = {str(now // 3600 - h): {"n": 60, "chal": 12.3456789, "base": 13.456789, "first": now,
-                                                "last": now} for h in range(169)}
-    pairs["pending"] = {f"iss-{i:032x}": ["statistical", 0.123456789, now] for i in range(1440)}
-    state = {"schema": "statistical-service-state/v1", "epoch": ek, "last_outcome_seq": 10 ** 7,
-             "last_issuance_seq": 10 ** 7, "models": models, "pairs": {"statistical": pairs},
-             "trust": {m: T.new_hysteresis(f"{m}/v1", ek) for m in models}}
+    pairs["buckets"] = {str(now // 3600 - h): {"n": 10 ** 6, "chal": WORST_FLOAT, "base": WORST_FLOAT, "first": now,
+                                                "last": now} for h in range(170)}
+    pairs["pending"] = {str(now - i * 60): ["seasonal_naive", WORST_FLOAT, f"iss-{i:032x}"] for i in range(1441)}
+    trust = {m: T.new_hysteresis(f"{m}/v1", ek) for m in models}
+    trust[T.SELECTION] = {**T.new_selection(ek), "entry_since": {f"{m}:{m}/v1": now for m in models}}
+    return {"schema": "statistical-service-state/v1", "epoch": ek, "last_outcome_seq": 10 ** 12,
+            "last_issuance_seq": 10 ** 12, "models": out, "pairs": {"statistical": pairs}, "trust": trust}
+
+
+def test_the_maximum_supported_state_fits_one_checkpoint(tmp_path):
+    from forecasting.service import RECIPES
+    from forecasting.store import MAX_CHECKPOINT_BYTES, ForecastStore
+    state = max_state(tuple(RECIPES))                      # every family the service forecasts
     size = len(c.canonical_json(state))
     assert size < MAX_CHECKPOINT_BYTES, size
-    store = ForecastStore(str(tmp_path / "j.sqlite"), clock=ManualClock(now * 1000))
-    assert store.write_checkpoint(ek, state, 10 ** 7).state == state
+    three = len(c.canonical_json(max_state(("seasonal_naive", "statistical", "lstm"))))
+    assert three < MAX_CHECKPOINT_BYTES, three             # also the trust layer's three families (an LSTM later)
+    store = ForecastStore(str(tmp_path / "j.sqlite"), clock=ManualClock((T0 + 7 * DAY) * 1000))
+    assert store.write_checkpoint("e" * 64, state, 10 ** 12).state == state
+
+
+def test_an_oversize_state_is_a_clear_503_never_an_unhandled_error(tmp_path, monkeypatch):
+    import forecasting.store as store_module
+    svc, clock = make(tmp_path)
+    ask(svc, clock, T0)
+    monkeypatch.setattr(store_module, "MAX_CHECKPOINT_BYTES", 200)             # the state no longer fits
+    with pytest.raises(ServiceError) as e:
+        ask(svc, clock, T0 + DT)
+    assert (e.value.status, e.value.reason) == (503, "StateUnavailable") and "cannot be journaled" in e.value.message
+    assert len(svc.store.issuances()) == 1                                    # nothing issued without its state
 
 
 def test_a_one_minute_sixty_step_bundle_fits(tmp_path):

@@ -156,7 +156,8 @@ The forecasting service and the trainer share the model volume.
   with TensorFlow blocked (needs docker: a release gate). `hack/statistical-envelope.py` estimates memory, CPU, latency
   and journal growth offline. `hack/statistical-container-envelope.sh` (docker, on the aspire kind bed host) runs it
   inside the built image under the profile's limits (512 MiB, 1 CPU, read-only root) with the fit worker on and 8
-  days of history, and fails on an OOM kill or a budget breach: the gate for the 384 MiB fit limit and these resources.
+  days of history, and fails on an OOM kill, a budget breach, any failed fit, no issuance that used a fitted artifact,
+  or a missing cgroup measurement: the gate for the 384 MiB fit limit and these resources.
 - **Readiness:** `/ready` answers 503 while the journal cannot support issuance (and before start-up); `/health`
   stays the liveness probe. Young history or untrusted models do not make the service unready.
 

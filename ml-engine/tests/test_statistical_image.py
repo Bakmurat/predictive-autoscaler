@@ -103,3 +103,34 @@ def test_the_envelope_harness_runs_offline_and_checks_its_budget():
     out = json.loads(p.stdout)
     assert out["requests"] == 24 and out["failures"] == 0 and out["breaches"] == []
     assert out["journal_bytes"] > 0 and out["peak_rss_mib"] > 0 and out["p95_seconds"] < 2
+
+
+envelope = load("statistical_envelope", ROOT / "hack" / "statistical-envelope.py")
+
+
+def test_the_envelope_gate_fails_on_hidden_fit_failures_and_missing_measurements():
+    good = {"peak_rss_mib": 80, "p95_seconds": 0.1, "cgroup_memory_peak_mib": 200, "failures": 0, "fit_mode": "worker",
+            "fit_failures": {}, "statistical_issuances": 5}
+    assert envelope.breaches(good, cgroup=True) == []
+    assert envelope.breaches({**good, "fit_failures": {"numeric": 3}}) == ["fit_failures"]
+    assert envelope.breaches({**good, "statistical_issuances": 0}) == ["no_statistical_issuances"]
+    assert envelope.breaches({**good, "cgroup_memory_peak_mib": None}, cgroup=True) == ["cgroup_unavailable"]
+    assert envelope.breaches({**good, "cgroup_memory_peak_mib": 600}, cgroup=True) == ["cgroup_memory_peak_mib"]
+
+
+def test_failing_fits_cannot_pass_behind_the_naive_fallback():
+    # Codex: with every fit forced to fail, the run reported zero failures and no breach.
+    out = envelope.run(pas=1, interval=300, hours=1, history_days=8, fit_mode="worker",
+                       fits={"e1-product/v1": "tests.c2_fit_helpers:history_fit"})
+    assert out["failures"] == 0 and out["fit_failures"].get("history", 0) > 0 and out["statistical_issuances"] == 0
+    assert {"fit_failures", "no_statistical_issuances"} <= set(envelope.breaches(out))
+
+
+def test_real_worker_fits_reach_the_issuances():
+    # A fresh process: the budget check measures the harness itself, not this test session.
+    p = subprocess.run([sys.executable, str(ROOT / "hack" / "statistical-envelope.py"), "--pas", "1", "--interval",
+                        "300", "--hours", "2", "--history-days", "8", "--fit-mode", "worker", "--check"],
+                       capture_output=True, text=True, timeout=300, env=clean_env())
+    assert p.returncode == 0, p.stdout + p.stderr
+    out = json.loads(p.stdout)
+    assert out["fit_failures"] == {} and out["statistical_issuances"] > 0 and out["breaches"] == []

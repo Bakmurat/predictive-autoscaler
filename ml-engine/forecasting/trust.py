@@ -133,7 +133,7 @@ def _prune(ledger: dict, now_s: int, retention_s: int) -> None:
     floor = (newest - retention_s) // HOUR
     ledger["buckets"] = {k: v for k, v in ledger["buckets"].items() if int(k) > floor}
     # Pending issuances matter only to the last day's availability: older ones are dropped (bounded state).
-    ledger["pending"] = {k: v for k, v in ledger["pending"].items() if v[0] > newest - DAY}
+    ledger["pending"] = {k: v for k, v in ledger["pending"].items() if int(k) > newest - DAY}
 
 
 def _copy(ledger: dict) -> dict:
@@ -165,7 +165,7 @@ def note_issuance(ledger: dict, *, seq: int, issuance_id: str, epoch: str, model
         b["iss"] += 1
         b["g_iss"] += int(in_cohort(origin, lead_s))
         s["totals"]["issued"] += 1
-        s["pending"][issuance_id] = [window_end, deadline_s]
+        s["pending"][str(window_end)] = deadline_s     # one issuance per origin in an epoch: the window end names it
         if s["first_issue_s"] is None:
             s["first_issue_s"] = origin
         if bounded and s["first_prospective_s"] is None:
@@ -183,7 +183,7 @@ def note_outcome(ledger: dict, r: EvidenceRecord, *, lead_s: int, nominal_miscov
         return ledger
     s = _copy(ledger)
     s["last_outcome_seq"] = c.seq
-    s["pending"].pop(c.issuance_id, None)
+    s["pending"].pop(str(c.window_end), None)
     gate = in_cohort(c.decision_origin, lead_s)
     b = _bucket(s, c.window_end)
     scored = c.status == "scored"
@@ -247,7 +247,7 @@ def window_sums(ledger: dict, now_s: int, seconds: int) -> Dict[str, float]:
 def overdue(ledger: dict, now_s: int, seconds: int) -> int:
     """Prospective issued windows in the trailing window whose truth deadline has passed without an outcome."""
     lo, hi = _hours(now_s, seconds)
-    return sum(1 for end, deadline in ledger["pending"].values() if lo <= end // HOUR <= hi and deadline <= now_s)
+    return sum(1 for end, deadline in ledger["pending"].items() if lo <= int(end) // HOUR <= hi and deadline <= now_s)
 
 
 def expected_opportunities(ledger: dict, now_s: int, seconds: int) -> int:
@@ -310,9 +310,9 @@ def note_pair(pairs: dict, r: EvidenceRecord, *, lead_s: int, nominal_miscoverag
             not in_cohort(c.decision_origin, lead_s):
         return s
     loss = pinball_rps(c.y_rps, c.upper_rps, nominal_miscoverage)
-    other = s["pending"].pop(c.issuance_id, None)
-    if other is None or other[0] == c.model:
-        s["pending"][c.issuance_id] = [c.model, loss, c.window_end]
+    other = s["pending"].pop(str(c.window_end), None)          # one issuance per origin: the window end names it
+    if other is None or other[0] == c.model or other[2] != c.issuance_id:    # pair only the same issuance
+        s["pending"][str(c.window_end)] = [c.model, loss, c.issuance_id]
     else:
         chal, base = (loss, other[1]) if c.model == s["challenger"] else (other[1], loss)
         b = s["buckets"].setdefault(str(c.window_end // HOUR), {"n": 0, "chal": 0.0, "base": 0.0,
@@ -323,7 +323,8 @@ def note_pair(pairs: dict, r: EvidenceRecord, *, lead_s: int, nominal_miscoverag
         b["first"], b["last"] = min(b["first"], c.window_end), max(b["last"], c.window_end)
     floor = (c.window_end - retention_s) // HOUR
     s["buckets"] = {k: v for k, v in s["buckets"].items() if int(k) > floor}
-    s["pending"] = {k: v for k, v in s["pending"].items() if v[2] > c.window_end - retention_s}
+    # Both models' outcomes of one window mature together; a partner missing for a day never comes (bounded state).
+    s["pending"] = {k: v for k, v in s["pending"].items() if int(k) > c.window_end - DAY}
     return s
 
 

@@ -143,6 +143,11 @@ class FitWorker:
             self._cv.notify()
             return t
 
+    def busy(self) -> bool:
+        """A fit is queued or running."""
+        with self._cv:
+            return bool(self._by_signal)
+
     def wait(self, ticket: Ticket, timeout: Optional[float] = None) -> FitResult:
         if not ticket.done.wait(timeout):
             raise TimeoutError("the fit has not finished")
@@ -203,6 +208,8 @@ class FitWorker:
                 return self._closed_result(t, "before the fit started")
             started = self.clock()
             deadline = time.monotonic() + self.deadline_s
+            for name in _THREAD_ENV:          # inherited by the child before it imports anything (a main module
+                os.environ.setdefault(name, "1")   # that loads NumPy would otherwise start its BLAS threads first)
             p.start()
             self._running[t.signal_key] = p
         send.close()
