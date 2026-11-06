@@ -160,3 +160,12 @@ def test_the_namespace_label_is_the_workloads_not_the_installations():
     labels = {s.labels["namespace"] for fam in registry(m).collect() for s in fam.samples}
     assert labels == {"shop"}
     assert all("pa_install_namespace" not in s.labels for fam in registry(m).collect() for s in fam.samples)
+
+
+def test_reservation_is_atomic_and_counts_against_the_limit():
+    m = M.ForecastMetrics(max_autoscalers=1)
+    m.reserve("shop", "web")
+    m.reserve("shop", "web")                           # idempotent for the same autoscaler
+    with pytest.raises(M.RegistryFull):
+        m.reserve("shop", "api")
+    assert m.registered() == [("shop", "web")] and list(registry(m).collect())

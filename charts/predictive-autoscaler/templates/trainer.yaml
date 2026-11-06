@@ -1,5 +1,12 @@
+{{- if and (include "pa.statistical" .) .Values.training.targets }}
+{{- fail "training.targets: the statistical forecaster (forecaster.engine: statistical) has no trainers; its fits run inside the service. Remove training.targets or use engine legacyLstm." }}
+{{- end }}
 {{- $seen := dict }}
-{{- range $t := .Values.training.targets }}
+{{- $targets := .Values.training.targets }}
+{{- if include "pa.statistical" . }}
+{{- $targets = list }}
+{{- end }}
+{{- range $t := $targets }}
 {{- $target := printf "%s/%s" $t.namespace $t.name }}
 {{- if hasKey $seen $target }}
 {{- fail (printf "training.targets lists %s twice" $target) }}

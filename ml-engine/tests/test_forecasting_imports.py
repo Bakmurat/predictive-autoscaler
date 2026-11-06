@@ -17,6 +17,8 @@ import pytest
 ML_ENGINE = Path(__file__).resolve().parent.parent
 BLOCKED = ("tensorflow", "keras", "tf_keras", "api.main", "pandas", "sklearn")
 PACKAGES = ("forecasting", "evaluation")
+# The statistical service's own entry modules (the image runs these; api.main is never among them).
+ENTRY_MODULES = ("api.statistical", "api.admission", "api.serve", "api.auth", "api.identity")
 
 PROBE = r"""
 import importlib, importlib.abc, json, sys
@@ -41,12 +43,12 @@ def modules():
         d = ML_ENGINE / pkg
         if d.is_dir():
             out += [f"{pkg}.{p.stem}" if p.stem != "__init__" else pkg for p in sorted(d.glob("*.py"))]
-    return out
+    return out + list(ENTRY_MODULES)
 
 
 def test_the_package_list_is_not_empty():
     assert {"forecasting.contracts", "forecasting.history", "forecasting.statistical", "forecasting.artifacts",
-            "forecasting.worker"} <= set(modules())
+            "forecasting.worker", "forecasting.service", "api.statistical"} <= set(modules())
 
 
 @pytest.mark.parametrize("module", modules())

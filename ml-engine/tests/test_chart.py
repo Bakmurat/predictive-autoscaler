@@ -586,3 +586,91 @@ def test_notes_on_upgrade_explain_the_crd_and_install_notes_do_not(tmp_path):
     up = _render_notes(tmp_path, BASE, upgrade=True)
     assert "Helm never upgrades the CRD" in up and "at\nleast the required one" in up and "--kubeconfig <file> --context <context>" in up
     assert "Helm never upgrades the CRD" not in _render_notes(tmp_path, BASE)
+
+
+# --- the statistical forecaster profile (C2.6) ---------------------------------------------------------------------
+
+STAT = {"forecaster": {"engine": "statistical"}, "training": {"targets": []}}
+
+
+def forecaster_of(docs):
+    return next(d for d in by_kind(docs, "Deployment") if d["metadata"]["name"].endswith("-forecaster"))
+
+
+def test_the_statistical_profile_runs_the_light_image_with_its_own_state(render):
+    docs = render(STAT)
+    dep = forecaster_of(docs)
+    pod = dep["spec"]["template"]["spec"]
+    (c,) = pod["containers"]
+    assert c["image"].startswith("ghcr.io/bakmurat/predictive-autoscaler-forecaster-statistical:")
+    assert c["command"] == ["python", "-m", "api.serve", "statistical"]
+    assert c["resources"] == {"requests": {"cpu": "250m", "memory": "256Mi"}, "limits": {"cpu": "1", "memory": "512Mi"}}
+    assert dep["spec"]["strategy"] == {"type": "Recreate"} and dep["spec"]["replicas"] == 1
+    env = {e["name"]: e.get("value") for e in c["env"]}
+    assert env["FORECAST_STATE_DIR"] == "/state" and env["FORECAST_STATE_QUOTA_BYTES"] == str(1536 << 20)
+    assert "MODEL_DIR" not in env and not set(env) & {"COLD_START_CRONJOB", "ALLOW_BENCHMARK_EXPERIMENTS",
+                                                      "ENSEMBLE_EXPERIMENT", "SEASONAL_EXPERIMENT"}
+    assert env["FORECASTER_AUTH"] == "tokenreview"                              # the same caller authentication
+    mounts = {m["mountPath"]: m.get("readOnly", False) for m in c["volumeMounts"]}
+    assert mounts == {"/state": False, "/tmp": False, "/etc/predictive-autoscaler/tls": True}
+    assert c["securityContext"] == {"allowPrivilegeEscalation": False, "readOnlyRootFilesystem": True,
+                                    "capabilities": {"drop": ["ALL"]}}
+    assert pod["securityContext"]["runAsUser"] == 10001 and pod["securityContext"]["runAsNonRoot"] is True
+    assert dep["spec"]["template"]["metadata"]["annotations"]["autoscaling.devkuban.com/forecaster-engine"] == \
+        "statistical"
+    (pvc,) = by_kind(docs, "PersistentVolumeClaim")
+    assert pvc["metadata"]["name"] == "pa-predictive-autoscaler-forecast-state"
+    assert pvc["spec"]["accessModes"] == ["ReadWriteOnce"] and pvc["spec"]["resources"]["requests"]["storage"] == "2Gi"
+    assert pvc["metadata"]["annotations"] == {"helm.sh/resource-policy": "keep",
+                                              "argocd.argoproj.io/sync-options": "Prune=false,Delete=false"}
+    assert not by_kind(docs, "CronJob")                                          # no trainers in this profile
+    nps = {d["metadata"]["name"].rsplit("-", 1)[1] for d in by_kind(docs, "NetworkPolicy")}
+    assert nps == {"operator", "forecaster", "trainer"}                          # the policies stay
+
+
+def test_the_statistical_profile_refuses_training_targets(render):
+    p = render({"forecaster": {"engine": "statistical"}}, check=False)          # BASE lists two targets
+    assert p.returncode != 0 and "has no trainers" in p.stderr
+
+
+def test_the_statistical_state_can_be_brought_or_released(render):
+    docs = render(_merge(STAT, {"forecaster": {"statistical": {"persistence": {"existingClaim": "state-v1",
+                                                                               "retain": False}}}}))
+    assert not by_kind(docs, "PersistentVolumeClaim")
+    claims = {v["persistentVolumeClaim"]["claimName"] for v in forecaster_of(docs)["spec"]["template"]["spec"]["volumes"]
+              if "persistentVolumeClaim" in v}
+    assert claims == {"state-v1"}
+    released = by_kind(render(_merge(STAT, {"forecaster": {"statistical": {"persistence": {"retain": False}}}})),
+                       "PersistentVolumeClaim")
+    assert "annotations" not in released[0]["metadata"]
+
+
+def test_switching_profiles_keeps_the_service_and_both_volumes(render):
+    # Upgrade legacy -> statistical and roll back: the Deployment keeps its name and (immutable) selector, the Service
+    # and the operator's URL stay, and each profile's retained claim survives the other profile's releases.
+    legacy, stat = render(), render(STAT)
+    for a, b in ((legacy, stat), (stat, legacy)):
+        fa, fb = forecaster_of(a), forecaster_of(b)
+        assert fa["metadata"]["name"] == fb["metadata"]["name"]
+        assert fa["spec"]["selector"] == fb["spec"]["selector"]
+        assert [s["spec"] for s in by_kind(a, "Service") if s["metadata"]["name"].endswith("-forecaster")] == \
+               [s["spec"] for s in by_kind(b, "Service") if s["metadata"]["name"].endswith("-forecaster")]
+    op_env = lambda docs: {e["name"]: e.get("value") for e in next(  # noqa: E731
+        d for d in by_kind(docs, "Deployment") if d["metadata"]["name"].endswith("-operator"))
+        ["spec"]["template"]["spec"]["containers"][0]["env"]}
+    assert op_env(legacy)["ML_API_URL"] == op_env(stat)["ML_API_URL"]
+    (models,), (state,) = by_kind(legacy, "PersistentVolumeClaim"), by_kind(stat, "PersistentVolumeClaim")
+    assert models["metadata"]["name"] != state["metadata"]["name"]
+    for pvc in (models, state):                                   # helm keeps a claim the next release no longer renders
+        assert pvc["metadata"]["annotations"]["helm.sh/resource-policy"] == "keep"
+    assert forecaster_of(legacy)["spec"]["template"]["metadata"]["annotations"][
+        "autoscaling.devkuban.com/forecaster-engine"] == "legacyLstm"           # the default profile is unchanged
+    assert by_kind(legacy, "CronJob")
+
+
+@pytest.mark.parametrize("bad", [{"forecaster": {"engine": "prophet"}},
+                                 {"forecaster": {"statistical": {"persistence": {"accessMode": "ReadWriteMany"}}}},
+                                 {"forecaster": {"statistical": {"stateQuota": "1.5G"}}},
+                                 {"forecaster": {"statistical": {"replicas": 2}}}])
+def test_the_statistical_values_are_validated(render, bad):
+    assert render(_merge(STAT, bad), check=False).returncode != 0

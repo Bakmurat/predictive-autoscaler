@@ -1,4 +1,8 @@
-"""The forecasting service's entrypoint (B5e; Codex task-08 r34).
+"""The forecasting services' entrypoint (B5e; Codex task-08 r34; C2.6).
+
+`python -m api.serve` starts the legacy service (api.main:app); `python -m api.serve statistical` starts the
+TensorFlow-free statistical service (api.statistical:app). The app is chosen from this fixed allowlist only; any other
+argument is refused, so nothing else can be loaded through the entrypoint.
 
 With FORECASTER_TLS_CERT and FORECASTER_TLS_KEY set it serves HTTPS on FORECASTER_PORT (default 8443), otherwise
 plain HTTP on FORECASTER_PORT (default 8000). Authentication (api/auth.py) refuses requests that did not arrive over
@@ -12,12 +16,24 @@ service; the operator falls back to a recent cached forecast or the reactive rul
 
 import logging
 import os
+import sys
 import threading
 
 import uvicorn
 
 logger = logging.getLogger("api.serve")
 CERT_RECHECK_S = float(os.getenv("FORECASTER_CERT_RECHECK_S", "60"))
+APPS = {"legacy": "api.main:app", "statistical": "api.statistical:app"}
+
+
+def app_ref(argv):
+    """The ASGI app to serve for the command-line arguments (none: legacy). Raises SystemExit for anything else."""
+    if len(argv) > 1:
+        raise SystemExit(f"usage: python -m api.serve [{'|'.join(APPS)}]")
+    name = argv[0] if argv else "legacy"
+    if name not in APPS:
+        raise SystemExit(f"unknown app {name!r}; allowed: {', '.join(APPS)}")
+    return APPS[name]
 
 
 def stamp(paths):
@@ -51,9 +67,10 @@ def config_from_env(env=os.environ):
     return kwargs, ([cert, key] if tls else [])
 
 
-def main():
+def main(argv=None):
+    ref = app_ref(sys.argv[1:] if argv is None else argv)
     kwargs, watched = config_from_env()
-    server = uvicorn.Server(uvicorn.Config("api.main:app", **kwargs))
+    server = uvicorn.Server(uvicorn.Config(ref, **kwargs))
     stop = threading.Event()
     if watched:
         threading.Thread(target=watch, args=(server, watched, CERT_RECHECK_S, stop), daemon=True).start()

@@ -56,6 +56,7 @@
       "properties": {
         "operator": {"$ref": "#/definitions/image"},
         "forecaster": {"$ref": "#/definitions/image"},
+        "statisticalForecaster": {"$ref": "#/definitions/image"},
         "pullPolicy": {"enum": ["Always", "IfNotPresent", "Never"]},
         "pullSecrets": {"type": "array", "items": {"type": "object", "required": ["name"], "properties": {"name": {"type": "string"}}}}
       }
@@ -93,6 +94,25 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "engine": {"enum": ["legacyLstm", "statistical"], "description": "statistical: the TensorFlow-free forecaster (a Recommend-only preview); no trainers."},
+        "statistical": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "resources": {"$ref": "#/definitions/resources"},
+            "persistence": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "existingClaim": {"type": "string"},
+                "storageClass": {"type": "string"},
+                "size": {"type": "string", "pattern": "^[0-9]+(\\.[0-9]+)?(Ki|Mi|Gi|Ti)$"},
+                "retain": {"type": "boolean"}
+              }
+            },
+            "stateQuota": {"type": "string", "pattern": "^[0-9]+(Mi|Gi)$"}
+          }
+        },
         "auth": {
           "type": "object",
           "additionalProperties": false,

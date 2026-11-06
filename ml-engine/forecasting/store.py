@@ -46,6 +46,7 @@ SCHEMA_VERSION = 1
 DEFAULT_QUOTA_BYTES = 1536 << 20          # 1.5 GiB of a 2 GiB volume
 MAX_BUNDLE_BYTES = 8 << 10
 MAX_OUTCOME_BYTES = 4 << 10
+MAX_CHECKPOINT_BYTES = 1 << 20            # calibration buffers and 7-day trust ledgers of up to three models
 RETENTION_SECONDS = 7 * 86400
 OBSERVATION_RETENTION_SECONDS = 28 * 86400
 WAL_LIMIT_BYTES = 64 << 20
@@ -506,6 +507,13 @@ class ForecastStore:
                 "ORDER BY i.window_end, i.seq", (evidence_key, window_end_at_most, model)).fetchall()
             return [i for i in map(self._row_to_issuance, rows) if model in i.models]
 
+    def issuances_after(self, evidence_key: str, after_seq: int) -> List[Issuance]:
+        """An epoch's issuances committed after `after_seq`, in commit order (for exactly-once folding)."""
+        with self._lock, self._guard("read issuances"):
+            rows = self._db.execute(f"SELECT {self._ISSUANCE_COLS} FROM issuances WHERE evidence_key = ? AND seq > ? "
+                                    "ORDER BY seq", (evidence_key, after_seq)).fetchall()
+            return [self._row_to_issuance(r) for r in rows]
+
     def issuances(self, evidence_key: Optional[str] = None) -> List[Issuance]:
         with self._lock, self._guard("read issuances"):
             q = f"SELECT {self._ISSUANCE_COLS} FROM issuances"
@@ -620,7 +628,7 @@ class ForecastStore:
 
     def write_checkpoint(self, evidence_key: str, state: Mapping, last_outcome_seq: int) -> Checkpoint:
         """A new checkpoint; identical to the latest one: nothing is written. Older ones beyond CHECKPOINTS_KEPT go."""
-        data = self._encode(state, 64 << 10, "checkpoint")
+        data = self._encode(state, MAX_CHECKPOINT_BYTES, "checkpoint")
         with self._lock, self._guard("write checkpoint"):
             self._require_healthy()
             latest = self.latest_checkpoint(evidence_key)

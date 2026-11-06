@@ -9,6 +9,10 @@ images:
     repository: ghcr.io/bakmurat/predictive-autoscaler-ml-api
     tag: ""
     digest: ""
+  statisticalForecaster:   # the light statistical forecaster (forecaster.engine: statistical): no TensorFlow
+    repository: ghcr.io/bakmurat/predictive-autoscaler-forecaster-statistical
+    tag: ""
+    digest: ""
   pullPolicy: IfNotPresent
   pullSecrets: []  # [{name: regcred}]
 
@@ -33,6 +37,21 @@ operator:
   affinity: {}
 
 forecaster:
+  # legacyLstm: the TensorFlow forecasting service, its model volume and the training CronJobs (the default).
+  # statistical: the light, TensorFlow-free forecaster (forecast contract v2) with its own state volume and no trainers.
+  # A Recommend-only preview: it issues shadow forecasts and evidence, and is never eligible for predictive writes
+  # before its release gates pass. The default changes only after that evaluation.
+  engine: legacyLstm
+  statistical:
+    resources:
+      requests: {cpu: 250m, memory: 256Mi}
+      limits: {cpu: "1", memory: 512Mi}
+    persistence:             # the forecast journal and fit artifacts: losing it resets every trust epoch
+      existingClaim: ""
+      storageClass: ""
+      size: 2Gi
+      retain: true
+    stateQuota: 1536Mi       # the journal's own budget inside the volume (database + WAL)
   # Only the operator may call the forecasting service: its projected service account token, checked with TokenReview,
   # over TLS. Off: plain HTTP, and the NetworkPolicies are the only boundary.
   auth:

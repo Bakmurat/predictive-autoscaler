@@ -1,9 +1,13 @@
+{{- $stat := include "pa.statistical" . }}
 {{- $p := .Values.forecaster.persistence }}
+{{- if $stat }}
+{{- $p = .Values.forecaster.statistical.persistence }}
+{{- end }}
 {{- if not $p.existingClaim }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: {{ include "pa.modelsClaim" . }}
+  name: {{ ternary (include "pa.stateClaim" .) (include "pa.modelsClaim" .) (eq $stat "true") }}
   namespace: {{ .Release.Namespace }}
   labels: {{- include "pa.labels" . | nindent 4 }}
   {{- if $p.retain }}
@@ -12,7 +16,7 @@ metadata:
     argocd.argoproj.io/sync-options: Prune=false,Delete=false
   {{- end }}
 spec:
-  accessModes: [{{ $p.accessMode }}]
+  accessModes: [{{ if $stat }}ReadWriteOnce{{ else }}{{ $p.accessMode }}{{ end }}]
   {{- with $p.storageClass }}
   storageClassName: {{ . | quote }}
   {{- end }}
@@ -29,7 +33,7 @@ metadata:
   labels: {{- include "pa.labels" . | nindent 4 }}
     app.kubernetes.io/component: forecaster
 spec:
-  replicas: 1                # one writer of the model registry; the volume may be ReadWriteOnce
+  replicas: 1                # one writer of the model registry (or the forecast journal); the volume may be RWO
   strategy:
     type: Recreate
   selector:
@@ -37,9 +41,11 @@ spec:
   template:
     metadata:
       labels: {{- include "pa.selector" (list . "forecaster") | nindent 8 }}
-      {{- with .Values.forecaster.podAnnotations }}
-      annotations: {{- toYaml . | nindent 8 }}
-      {{- end }}
+      annotations:
+        autoscaling.devkuban.com/forecaster-engine: {{ .Values.forecaster.engine }}
+        {{- with .Values.forecaster.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
       serviceAccountName: {{ include "pa.fullname" . }}-forecaster
       securityContext: {{- include "pa.podSecurity" 10001 | nindent 8 }}
@@ -48,7 +54,12 @@ spec:
       {{- end }}
       containers:
         - name: forecaster
+          {{- if $stat }}
+          image: {{ include "pa.image" (list . .Values.images.statisticalForecaster) }}
+          command: ["python", "-m", "api.serve", "statistical"]
+          {{- else }}
           image: {{ include "pa.image" (list . .Values.images.forecaster) }}
+          {{- end }}
           imagePullPolicy: {{ .Values.images.pullPolicy }}
           env:
             {{- include "pa.pythonEnv" . | nindent 12 }}
@@ -56,6 +67,12 @@ spec:
               value: {{ required "prometheus.url is required" .Values.prometheus.url | quote }}
             - name: POD_NAMESPACE
               valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            {{- if $stat }}
+            - name: FORECAST_STATE_DIR
+              value: /state
+            - name: FORECAST_STATE_QUOTA_BYTES
+              value: {{ include "pa.stateQuotaBytes" . | quote }}
+            {{- end }}
             {{- if .Values.forecaster.auth.enabled }}
             - name: FORECASTER_AUTH
               value: tokenreview
@@ -85,16 +102,25 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 10
           securityContext: {{- include "pa.containerSecurity" . | nindent 12 }}
-          resources: {{- toYaml .Values.forecaster.resources | nindent 12 }}
+          resources: {{- toYaml (ternary .Values.forecaster.statistical.resources .Values.forecaster.resources (eq $stat "true")) | nindent 12 }}
           volumeMounts:
+            {{- if $stat }}
+            - {name: state, mountPath: /state}
+            {{- else }}
             - {name: models, mountPath: /models}
+            {{- end }}
             - {name: tmp, mountPath: /tmp}
             {{- if .Values.forecaster.auth.enabled }}
             - {name: tls, mountPath: /etc/predictive-autoscaler/tls, readOnly: true}
             {{- end }}
       volumes:
+        {{- if $stat }}
+        - name: state
+          persistentVolumeClaim: {claimName: {{ include "pa.stateClaim" . | quote }}}
+        {{- else }}
         - name: models
           persistentVolumeClaim: {claimName: {{ include "pa.modelsClaim" . | quote }}}
+        {{- end }}
         - name: tmp
           emptyDir: {sizeLimit: {{ .Values.forecaster.tmpSizeLimit }}}
         {{- if .Values.forecaster.auth.enabled }}
