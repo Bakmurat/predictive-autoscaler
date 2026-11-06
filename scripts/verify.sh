@@ -81,6 +81,9 @@ if [ "$run_py" = 1 ]; then
   # shellcheck disable=SC2086
   ( cd ml-engine && "$PYTHON" -m pytest -q $PYTEST_ARGS tests ) 2>&1 | tee -a "$LOG"; rc=${PIPESTATUS[0]}
   status_line "pytest" "$rc" | tee -a "$LOG"; [ "$rc" -eq 0 ] || overall=1
+  # The operator's forecast contract v2 fixtures must be what ml-engine/forecasting/contracts.py generates now.
+  "$PYTHON" k8s-operator/hack/gen_v2_fixtures.py check 2>&1 | tee -a "$LOG"; rc=${PIPESTATUS[0]}
+  status_line "v2 contract fixtures" "$rc" | tee -a "$LOG"; [ "$rc" -eq 0 ] || overall=1
   # The benchmark scorer's own suite (artifact attribution, transition and participation fixtures).
   ( cd deploy/eks-benchmark/scoring && "$PYTHON" -W ignore score_test.py ) 2>&1 | tee -a "$LOG"; rc=${PIPESTATUS[0]}
   status_line "scorer tests" "$rc" | tee -a "$LOG"; [ "$rc" -eq 0 ] || overall=1

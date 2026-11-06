@@ -9,7 +9,7 @@ metadata:
     argocd.argoproj.io/sync-wave: "-1"
     controller-gen.kubebuilder.io/version: v0.20.1
   labels:
-    autoscaling.devkuban.com/crd-revision: "3"
+    autoscaling.devkuban.com/crd-revision: "4"
   name: predictiveautoscalers.autoscaling.devkuban.com
 spec:
   group: autoscaling.devkuban.com
@@ -93,6 +93,35 @@ spec:
                           0 disables it. Default 10.
                         format: int32
                         maximum: 99
+                        minimum: 0
+                        type: integer
+                    type: object
+                  startup:
+                    description: Startup sets the scale-out-to-Ready budget the predictive
+                      lead is chosen from (engine statistical).
+                    properties:
+                      actuationAllowanceSeconds:
+                        description: |-
+                          ActuationAllowanceSeconds covers the request to the forecasting service, the write to /scale and the ReplicaSet
+                          controller creating the pods (default 15).
+                        format: int32
+                        maximum: 300
+                        minimum: 0
+                        type: integer
+                      fallbackDelaySeconds:
+                        description: |-
+                          FallbackDelaySeconds is the conservative scale-out-to-Ready budget used until enough measurements exist (20
+                          completed starts of the current pod template in the last 7 days). Choose it from observed starts, including
+                          scheduling, node provisioning, image pull and readiness.
+                        format: int32
+                        maximum: 3600
+                        minimum: 1
+                        type: integer
+                      minimumDelaySeconds:
+                        description: MinimumDelaySeconds is a floor kept even when
+                          measurements are lower (default 0).
+                        format: int32
+                        maximum: 3600
                         minimum: 0
                         type: integer
                     type: object
@@ -211,6 +240,41 @@ spec:
               prediction:
                 description: Prediction configuration
                 properties:
+                  calibration:
+                    description: ForecastCalibration tunes the window calibration
+                      (defaults in ml-engine/forecasting/contracts.py).
+                    properties:
+                      etaBps:
+                        format: int32
+                        maximum: 1000
+                        minimum: 1
+                        type: integer
+                      maxMiscoverageBps:
+                        format: int32
+                        maximum: 5000
+                        minimum: 1
+                        type: integer
+                      maxScores:
+                        format: int32
+                        maximum: 4096
+                        minimum: 16
+                        type: integer
+                      minMiscoverageBps:
+                        format: int32
+                        maximum: 5000
+                        minimum: 1
+                        type: integer
+                      minWindows:
+                        format: int32
+                        maximum: 4096
+                        minimum: 16
+                        type: integer
+                      retentionDays:
+                        format: int32
+                        maximum: 28
+                        minimum: 1
+                        type: integer
+                    type: object
                   enabled:
                     default: true
                     description: |-
@@ -218,6 +282,22 @@ spec:
                       the reactive request-rate rule only, which makes it a matched reactive-only control for benchmarks.
                       Defaults to true.
                     type: boolean
+                  engine:
+                    description: |-
+                      Engine selects the forecast path. statistical uses forecast contract v2: a calibrated upper bound of the peak
+                      request rate in the lead window, used only when the operator verifies it as trusted. legacyLstm, or no engine,
+                      keeps the v1 path.
+                    enum:
+                    - statistical
+                    - legacyLstm
+                    type: string
+                  historyDays:
+                    description: HistoryDays is the history the models learn from
+                      (default 14).
+                    format: int32
+                    maximum: 28
+                    minimum: 1
+                    type: integer
                   horizonMinutes:
                     default: 60
                     description: HorizonMinutes is how far ahead to predict (in minutes)
@@ -231,6 +311,154 @@ spec:
                     format: int32
                     minimum: 1
                     type: integer
+                  outcomeGraceSeconds:
+                    description: |-
+                      OutcomeGraceSeconds is how long a forecast window's outcome may stay incomplete before it is unscorable
+                      (default 600).
+                    format: int32
+                    maximum: 3600
+                    minimum: 0
+                    type: integer
+                  predictiveExtra:
+                    description: |-
+                      PredictiveExtra caps how many replicas a forecast may add above the reactive need. The stricter of the two caps
+                      applies; 0 in either disables predictive excess.
+                    properties:
+                      maxPercent:
+                        description: MaxPercent is the most a forecast may add, in
+                          percent of max(reactive need, minReplicas) (default 50).
+                        format: int32
+                        maximum: 1000
+                        minimum: 0
+                        type: integer
+                      maxReplicas:
+                        description: MaxReplicas is the most replicas a forecast may
+                          add (default 2).
+                        format: int32
+                        maximum: 1000
+                        minimum: 0
+                        type: integer
+                    type: object
+                  risk:
+                    description: ForecastRisk is the nominal risk of the upper bound.
+                    properties:
+                      miscoverageBps:
+                        description: |-
+                          MiscoverageBps is the share of windows whose peak may exceed the upper bound, in basis points (default 1000,
+                          90 % coverage).
+                        format: int32
+                        maximum: 2500
+                        minimum: 100
+                        type: integer
+                    type: object
+                  sampleIntervalSeconds:
+                    description: 'SampleIntervalSeconds is the forecast grid (default
+                      300): a minute multiple that divides a day.'
+                    enum:
+                    - 60
+                    - 120
+                    - 180
+                    - 240
+                    - 300
+                    - 360
+                    - 480
+                    - 600
+                    format: int32
+                    type: integer
+                  seasonality:
+                    description: Seasonality of the statistical models (default daily;
+                      only daily is supported so far).
+                    enum:
+                    - daily
+                    type: string
+                  settlementSeconds:
+                    description: SettlementSeconds is how long after a grid time its
+                      sample counts as final (default 120).
+                    format: int32
+                    maximum: 900
+                    minimum: 0
+                    type: integer
+                  trust:
+                    description: |-
+                      ForecastTrust tunes the evidence gates a model must pass before its forecast may scale (defaults in
+                      ml-engine/forecasting/contracts.py).
+                    properties:
+                      acuteConsecutiveMisses:
+                        format: int32
+                        maximum: 1000
+                        minimum: 1
+                        type: integer
+                      acuteRecentWindows:
+                        format: int32
+                        maximum: 4096
+                        minimum: 1
+                        type: integer
+                      challengerCostRatioBps:
+                        format: int32
+                        maximum: 20000
+                        minimum: 10000
+                        type: integer
+                      challengerExitLossRatioBps:
+                        format: int32
+                        maximum: 20000
+                        minimum: 1
+                        type: integer
+                      challengerLossRatioBps:
+                        format: int32
+                        maximum: 10000
+                        minimum: 1
+                        type: integer
+                      challengerMinHours:
+                        format: int32
+                        maximum: 672
+                        minimum: 1
+                        type: integer
+                      challengerMinPairs:
+                        format: int32
+                        maximum: 4096
+                        minimum: 1
+                        type: integer
+                      coverageToleranceBps:
+                        format: int32
+                        maximum: 2500
+                        minimum: 0
+                        type: integer
+                      maxFitAgeHours:
+                        format: int32
+                        maximum: 24
+                        minimum: 1
+                        type: integer
+                      minAvailabilityBps:
+                        format: int32
+                        maximum: 10000
+                        minimum: 0
+                        type: integer
+                      minProspectiveWindows:
+                        format: int32
+                        maximum: 4096
+                        minimum: 1
+                        type: integer
+                      minShadowHours:
+                        format: int32
+                        maximum: 672
+                        minimum: 1
+                        type: integer
+                      repromotionHours:
+                        format: int32
+                        maximum: 672
+                        minimum: 0
+                        type: integer
+                      repromotionWindows:
+                        format: int32
+                        maximum: 4096
+                        minimum: 1
+                        type: integer
+                      worstDayMinOutcomes:
+                        format: int32
+                        maximum: 1440
+                        minimum: 1
+                        type: integer
+                    type: object
                   updateIntervalSeconds:
                     default: 300
                     description: UpdateIntervalSeconds is how often to update predictions
@@ -441,6 +669,180 @@ spec:
                   for compatibility until the API-group migration; use calculatedReplicas and forecastReplicas.
                 format: int32
                 type: integer
+              prediction:
+                description: |-
+                  Prediction is the forecast contract v2 state (engine statistical only): the published lead the forecasting
+                  service reads, the startup measurement, and the last forecast with the operator's own verdict on it.
+                properties:
+                  baseWindowMaxRPS:
+                    description: |-
+                      BaseWindowMaxRPS and UpperWindowMaxRPS are the forecast window's point peak and calibrated upper bound, in
+                      requests per second, as decimal strings (UpperWindowMaxRPS absent while uncalibrated).
+                    type: string
+                  calibrationWindows:
+                    description: CalibrationWindows and ProspectiveWindows count the
+                      evidence behind the bound.
+                    format: int32
+                    type: integer
+                  capBinding:
+                    type: boolean
+                  cappedReplicas:
+                    format: int32
+                    type: integer
+                  decisionOrigin:
+                    description: DecisionOrigin and ValidUntil bound the last forecast's
+                      use.
+                    format: date-time
+                    type: string
+                  eligible:
+                    description: |-
+                      Eligible is the operator's verdict: the forecast passed every check and may set a predictive floor (it still
+                      writes only in Active mode).
+                    type: boolean
+                  engine:
+                    description: Engine is the forecast engine applied in the last
+                      reconcile.
+                    type: string
+                  frozenLeadSeconds:
+                    description: |-
+                      FrozenLeadSeconds is the longest lead selected for LeadBasis. A later selection never goes below it, also after
+                      a period without a lead: a shorter lead needs a change of the settings or the startup configuration.
+                    format: int32
+                    type: integer
+                  gateCoverageBps:
+                    description: GateCoverageBps is the coverage of the trust cohort,
+                      in basis points (absent with no scored window).
+                    format: int32
+                    type: integer
+                  issuanceID:
+                    description: IssuanceID is the last forecast's issuance (also
+                      in the decision ledger).
+                    type: string
+                  lead:
+                    description: Lead is the selected lead (absent when no startup
+                      budget is available, or it does not fit the horizon).
+                    properties:
+                      actuationAllowanceSeconds:
+                        description: ActuationAllowanceSeconds is the allowance A.
+                        format: int32
+                        type: integer
+                      method:
+                        description: Method is configured (spec.behavior.startup.fallbackDelaySeconds)
+                          or measured.
+                        enum:
+                        - configured
+                        - measured
+                        type: string
+                      observedGeneration:
+                        description: ObservedGeneration is the autoscaler generation
+                          the lead was selected for.
+                        format: int64
+                        type: integer
+                      sampleCount:
+                        description: SampleCount is the number of completed starts
+                          behind a measured budget (0 when configured).
+                        format: int32
+                        type: integer
+                      seconds:
+                        description: Seconds is the window length L, a multiple of
+                          the cadence covering startupDelay + cadence + allowance.
+                        format: int32
+                        type: integer
+                      startupDelaySeconds:
+                        description: StartupDelaySeconds is the startup budget D the
+                          lead was chosen for.
+                        format: int32
+                        type: integer
+                    required:
+                    - actuationAllowanceSeconds
+                    - method
+                    - observedGeneration
+                    - sampleCount
+                    - seconds
+                    - startupDelaySeconds
+                    type: object
+                  leadBasis:
+                    description: |-
+                      LeadBasis fingerprints the settings and startup configuration the lead was frozen for: the lead never shrinks
+                      automatically while it is unchanged.
+                    type: string
+                  model:
+                    description: Model is the selected model family.
+                    type: string
+                  phase:
+                    description: |-
+                      Phase is the forecasting service's trust state for the last forecast (Collecting, Calibrating, Shadow, Trusted,
+                      Degraded).
+                    type: string
+                  predictiveReplicas:
+                    description: |-
+                      PredictiveReplicas is ceil(upper bound / capacity) before the cap, CappedReplicas after it (both absent when the
+                      forecast is not eligible); CapBinding says the predictive-extra cap lowered it.
+                    format: int32
+                    type: integer
+                  prospectiveWindows:
+                    format: int32
+                    type: integer
+                  reason:
+                    description: 'Reason explains readiness: the service''s reason,
+                      or the operator''s own when it rejected the forecast.'
+                    type: string
+                  settingsSHA256:
+                    description: SettingsSHA256 is the fingerprint of the resolved
+                      v2 settings (the same hash the forecasting service computes).
+                    type: string
+                  startup:
+                    description: Startup is the startup-delay measurement.
+                    properties:
+                      delaySeconds:
+                        description: DelaySeconds is the startup budget in use (absent
+                          when there is none).
+                        format: int32
+                        type: integer
+                      measuredP90Seconds:
+                        description: MeasuredP90Seconds is the 90th percentile of
+                          those starts (absent with fewer than 20).
+                        format: int32
+                        type: integer
+                      measures:
+                        description: |-
+                          Measures names what a measured budget covers: podCreationToReady. It excludes the time from the scale request to
+                          the pod's creation, which actuationAllowanceSeconds covers.
+                        type: string
+                      method:
+                        description: Method is configured, measured or none.
+                        type: string
+                      observable:
+                        description: |-
+                          Observable is false when the operator could not read the target's ReplicaSets and pods, or could not identify the
+                          current ReplicaSet with certainty (the configured budget then applies).
+                        type: boolean
+                      pendingSeconds:
+                        description: |-
+                          PendingSeconds is the age of the oldest not-yet-Ready pod of the current template (absent when none); a pending
+                          start longer than the budget raises the budget.
+                        format: int32
+                        type: integer
+                      sampleCount:
+                        description: SampleCount is the number of completed starts
+                          of the current ReplicaSet's pods in the last 7 days.
+                        format: int32
+                        type: integer
+                    required:
+                    - observable
+                    - sampleCount
+                    type: object
+                  upperWindowMaxRPS:
+                    type: string
+                  validUntil:
+                    format: date-time
+                    type: string
+                required:
+                - calibrationWindows
+                - capBinding
+                - eligible
+                - prospectiveWindows
+                type: object
               readyReplicas:
                 description: ReadyReplicas is the target's ready replica count observed
                   in the last reconcile (a zero is reported).
