@@ -159,6 +159,17 @@ class ForecastMetrics(Collector):
                 raise RegistryFull(f"{self.max_autoscalers} autoscalers are already registered")
             self._snaps[key] = snapshot
 
+    def reserve(self, namespace: str, autoscaler: str) -> None:
+        """Admit an autoscaler before any work is done for it (atomic; an empty snapshot until its first update).
+        Raises RegistryFull when the limit is reached and it is not registered yet."""
+        key = (namespace, autoscaler)
+        with self._lock:
+            if key in self._snaps:
+                return
+            if len(self._snaps) >= self.max_autoscalers:
+                raise RegistryFull(f"{self.max_autoscalers} autoscalers are already registered")
+            self._snaps[key] = Snapshot("", {})
+
     def remove(self, namespace: str, autoscaler: str) -> None:
         with self._lock:
             self._snaps.pop((namespace, autoscaler), None)

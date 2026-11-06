@@ -214,6 +214,15 @@ class ArtifactStore:
             self._write_atomic(f"{binding.key()}.json", canonical_json({"sha256": sha, "fit_cutoff": fit.cutoff}))
             return sha, True
 
+    def load_snapshot(self, binding: Binding, ks: KernelSettings, *, input_end: int) -> Optional[Tuple[str, E1Fit]]:
+        """(sha256, fit) decoded from ONE read of the promoted bytes, so a concurrent promotion can never pair one
+        artifact's fit with another's digest. None when nothing is promoted; ArtifactRefused when stale or invalid."""
+        cur = self.current(binding)
+        if cur is None:
+            return None
+        sha, _, data = cur
+        return sha, decode(data, sha, binding, ks, input_end=input_end)
+
     def load(self, binding: Binding, ks: KernelSettings, *, input_end: int) -> Optional[E1Fit]:
         """The promoted fit, usable at input_end (raises ArtifactRefused when it is stale or invalid), or None."""
         cur = self.current(binding)

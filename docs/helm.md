@@ -153,9 +153,12 @@ The forecasting service and the trainer share the model volume.
   to `legacyLstm` both find their volume again.
 - **Checks:** `hack/sbom-check-statistical.py` checks the pinned requirements and the Dockerfile offline (part of the
   test suite); with `--image <ref>` it lists the built image's packages and shared libraries and imports the service
-  with TensorFlow blocked (needs docker: a release step). `hack/statistical-envelope.py` estimates memory, CPU, latency
-  and journal growth offline; the release measurement runs the image on a kind cluster with this profile (8
-  autoscalers, 1-minute cadence, at least 24 hours) and reads the pod's working set, CPU and volume usage.
+  with TensorFlow blocked (needs docker: a release gate). `hack/statistical-envelope.py` estimates memory, CPU, latency
+  and journal growth offline. `hack/statistical-container-envelope.sh` (docker, on the aspire kind bed host) runs it
+  inside the built image under the profile's limits (512 MiB, 1 CPU, read-only root) with the fit worker on and 8
+  days of history, and fails on an OOM kill or a budget breach: the gate for the 384 MiB fit limit and these resources.
+- **Readiness:** `/ready` answers 503 while the journal cannot support issuance (and before start-up); `/health`
+  stays the liveness probe. Young history or untrusted models do not make the service unready.
 
 ## Monitoring
 

@@ -333,3 +333,21 @@ def test_close_resolves_an_admitted_fit_and_publishes_nothing(tmp_path, series, 
     assert A.ArtifactStore(str(tmp_path)).current(BINDING) is None and w._running == {}
     with pytest.raises(W.FitRefused):
         w.submit(BINDING, S.RECIPE_E1, payload(series, artifact=blob))
+
+
+def test_a_snapshot_decodes_the_bytes_its_digest_names(tmp_path, series, blob, fit):
+    store = A.ArtifactStore(str(tmp_path))
+    assert store.load_snapshot(BINDING, KS, input_end=fit.cutoff) is None
+    older_fit = S.fit_e1(series, series.end - 6 * 3600, KS)
+    older = A.encode_e1(older_fit, BINDING)
+    sha_a, _ = store.promote(BINDING, older, KS)
+    real = store.current
+
+    def current_then_promote(binding):                 # a newer promotion lands right after the one read
+        out = real(binding)
+        A.ArtifactStore(str(tmp_path)).promote(BINDING, blob, KS)
+        return out
+    store.current = current_then_promote
+    got_sha, got_fit = store.load_snapshot(BINDING, KS, input_end=fit.cutoff)
+    assert (got_sha, got_fit) == (sha_a, older_fit)    # A's digest with A's fit, never A's digest with B's fit
+    assert real(BINDING)[0] == sha256_hex(blob)        # B is promoted now, for the next read

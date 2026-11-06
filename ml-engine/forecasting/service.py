@@ -8,9 +8,15 @@ For a request at decision origin t (all under one journal; nothing is wired to t
      (forecasting.calibration) and its evidence ledger (forecasting.trust), plus the paired challenger evidence;
   5. forecast every available family from what is finalized (seasonal-naive; E1-product when a fresh, verified fit
      exists; a due fit is queued on the bounded worker, never run on the request path);
-  6. evaluate trust (gates, hysteresis, selection) and commit ONE immutable issuance bundle holding every candidate,
-     its calibrated bound and the verdict, before answering; a retry at the same origin returns that bundle;
-  7. checkpoint the state and answer from the bundle (forecasting.contracts.V2Response, checked before it is sent).
+  6. evaluate trust (gates, hysteresis, selection) and checkpoint that state (the trust transition is durable before
+     anything is issued);
+  7. commit ONE immutable issuance bundle holding every candidate, its calibrated bound, the verdict and the digest of
+     the checkpoint it was computed from, stamped with the clock read just before the commit; an issuance that could no
+     longer act before its first target is refused instead (never backdated);
+  8. fold the issuance into the state, checkpoint again, and answer from the bundle alone (a retry at the same origin
+     returns the same bytes, whatever has matured since).
+Recovery is exact at every boundary: a crash before the issuance leaves the trust checkpoint (a retry re-decides from
+it); a crash after it leaves the issuance in the journal, folded in by the next request.
 
 This preview is shadow only: the release gates (G0-G5, C2.8) have not passed, so the verdict's PredictionReady and every
 response's predictive_eligible are false whatever the evidence says. A journal that cannot be opened or written answers
@@ -95,6 +101,10 @@ class ForecastService:
     def store_healthy(self) -> bool:
         return self.store is not None and self.store.healthy
 
+    def ready(self) -> bool:
+        """Readiness: the journal can support issuance. Young history or untrusted models do not make it unready."""
+        return self.store_healthy
+
     def health(self) -> Dict:
         problem = self.store_problem or (self.store.problem if self.store is not None else None)
         return {"status": "healthy", "state": "healthy" if self.store_healthy else "unavailable",
@@ -118,9 +128,10 @@ class ForecastService:
         except LookupFailed as e:
             raise ServiceError(503, "IdentityMismatch", f"the autoscaler could not be read: {e}") from e
         sig = bound.signal
-        if (sig.namespace, bound.autoscaler_name) not in self.metrics.registered() and \
-                len(self.metrics.registered()) >= self.config.max_autoscalers:
-            raise ServiceError(503, "StateUnavailable", "the service's registration limit is reached")
+        try:
+            self.metrics.reserve(sig.namespace, bound.autoscaler_name)       # atomic, before any expensive work
+        except RegistryFull as e:
+            raise ServiceError(503, "StateUnavailable", f"the service's registration limit is reached: {e}") from e
         if not self.store_healthy:
             raise ServiceError(503, "StateUnavailable", "the forecast journal is unavailable; no issuance")
         if bound.lead is None:
@@ -135,11 +146,11 @@ class ForecastService:
             raise ServiceError(422, "DataUnavailable", f"history refused: {e}") from e
         except HistoryUnavailable as e:
             raise ServiceError(503, "DataUnavailable", f"history unavailable: {e}") from e
-        if not grid.is_fresh(now_ms / 1000, s.settlement_seconds):
+        if not grid.is_fresh(self.clock.now_ms() / 1000, s.settlement_seconds):
             raise ServiceError(503, "DataUnavailable", "the newest finalized observation is too old")
         with self._lock:
             try:
-                return self._issue(bound, grid, now_ms)
+                return self._issue(bound, grid, self.clock.now_ms())    # the time after the history and the lock
             except StoreUnavailable as e:
                 raise ServiceError(503, "StateUnavailable", f"the forecast journal failed: {e}") from e
 
@@ -162,20 +173,32 @@ class ForecastService:
                 if res is not None:
                     store.commit_outcome(iss.issuance_id, model, *res)
         state = self._recover(bound, policy)
-        existing = store.get_issuance(IssuanceKey(ek, t, t, window.window_end, bound.settings_sha256))
-        if existing is None:
-            bundle = self._build(bound, grid, state, policy, now_ms)
-        iss, created = store.get_or_issue(IssuanceKey(ek, t, t, window.window_end, bound.settings_sha256),
-                                          lambda iid: {**bundle, "issuance_id": iid},
-                                          models=tuple(sorted(bundle["candidates"])) if existing is None
-                                          else existing.models)
+        key = IssuanceKey(ek, t, t, window.window_end, bound.settings_sha256)
+        iss = store.get_issuance(key)
+        if iss is None:
+            self._refuse_late(bound, now_ms)
+            bundle = self._build(bound, grid, state, policy)
+            decided = store.write_checkpoint(ek, state, state["last_outcome_seq"])   # the trust transition, durably
+            issued_at = self.clock.now_ms()
+            self._refuse_late(bound, issued_at)
+            bundle.update(issued_at_ms=issued_at, checkpoint_sha256=decided.payload_sha256)
+            iss, _ = store.get_or_issue(key, lambda iid: {**bundle, "issuance_id": iid},
+                                        models=tuple(sorted(bundle["candidates"])))
         state = self._recover(bound, policy, state)
-        cp = store.write_checkpoint(ek, state, state["last_outcome_seq"])
+        store.write_checkpoint(ek, state, state["last_outcome_seq"])
         if self._compacted_s is None or now_s - self._compacted_s >= self.config.compact_every_seconds:
             store.compact(now_s)          # only checkpoint-covered, fully matured windows leave the journal
             self._compacted_s = now_s
         self._export(bound, state, grid, now_s)
-        return self._response(bound, iss.payload(), cp.payload_sha256)
+        return self._response(bound, iss.payload())
+
+    @staticmethod
+    def _refuse_late(bound: BoundRequest, now_ms: int) -> None:
+        """A new issuance must still be able to act: now + A before the first target (design C2, section 5)."""
+        first = bound.window.target_timestamps[0] * 1000
+        if now_ms + bound.lead.actuation_allowance_seconds * 1000 >= first:
+            raise ServiceError(503, "LeadInsufficient", "too late to issue for this decision origin; the next origin "
+                                                        "will be served")
 
     # --- state ----------------------------------------------------------------------------------------------------
 
@@ -229,18 +252,17 @@ class ForecastService:
     def _fit_for(self, bound: BoundRequest, series: Series, input_end: int, ks: KernelSettings):
         binding = Binding.for_signal(bound.signal, bound.settings, RECIPE_E1)
         try:
-            fit = self.artifacts.load(binding, ks, input_end=input_end)
-            sha = self.artifacts.current(binding)[0] if fit is not None else None
+            snap = self.artifacts.load_snapshot(binding, ks, input_end=input_end)   # one read: digest and bytes agree
         except ArtifactRefused:
-            fit, sha = None, None
+            snap = None
+        sha, fit = snap if snap is not None else (None, None)
         due = fit is None or input_end - fit.cutoff >= REFIT_SECONDS
         if due and input_end - series.start + ks.interval_seconds >= ks.min_history_days * DAY:
             if self.config.fit_mode == "inline":
                 try:
                     data = encode_e1(fit_e1(series, input_end, ks), binding)
                     self.artifacts.promote(binding, data, ks)
-                    fit = self.artifacts.load(binding, ks, input_end=input_end)
-                    sha = self.artifacts.current(binding)[0]
+                    sha, fit = self.artifacts.load_snapshot(binding, ks, input_end=input_end)
                 except (KernelUnavailable, ArtifactRefused, OSError):
                     pass
             elif self.config.fit_mode == "worker" and self.worker is not None:
@@ -251,7 +273,8 @@ class ForecastService:
                     pass
         return fit, sha
 
-    def _build(self, bound: BoundRequest, grid, state: Dict, policy, now_ms: int) -> Dict:
+    def _build(self, bound: BoundRequest, grid, state: Dict, policy) -> Dict:
+        now_ms = self.clock.now_ms()
         s, lead, window, t = bound.settings, bound.lead, bound.window, bound.decision_origin
         dt = s.sample_interval_seconds
         series = Series.from_grid(grid)
@@ -291,17 +314,19 @@ class ForecastService:
         pairs = state["pairs"] if "seasonal_naive" in points else {}   # paired evidence needs its naive baseline
         verdict, new_h = T.evaluate(inputs, state["trust"], g, s.trust, pairs=pairs, costs=None)
         state["trust"] = new_h
-        through = max(at for at, v in zip(grid.received_at_ms, grid.values) if v is not None)
-        return {"schema": "forecast-issuance/v1", "evidence_mode": "prospective", "forecast_contract": FORECAST_CONTRACT,
+        through = max(at for at, v in zip(grid.received_at_ms, grid.values) if v is not None)   # actual receipts
+        return {"schema": "forecast-issuance/v1", "evidence_mode": "prospective",
+                "forecast_contract": FORECAST_CONTRACT,
                 "evidence_key": bound.evidence_key, "settings_sha256": bound.settings_sha256,
                 "decision_origin": t, "window_start": window.window_start, "window_end": window.window_end,
                 "target_timestamps": list(targets), "sample_interval_seconds": dt,
                 "lead_seconds": lead.lead_seconds, "startup_delay_seconds": lead.startup_delay_seconds,
                 "actuation_allowance_seconds": lead.actuation_allowance_seconds,
-                "valid_until": window.valid_until(lead), "issued_at_ms": now_ms, "input_end": input_end,
-                "input_received_through_ms": min(through, now_ms), "nominal_miscoverage_bps": policy.nominal_bps,
+                "valid_until": window.valid_until(lead), "input_end": input_end,
+                "input_received_through_ms": through, "nominal_miscoverage_bps": policy.nominal_bps,
                 "candidates": cands, "selected": verdict.selected,
-                "verdict": {"phase": verdict.phase, "reason": verdict.reason, "prediction_ready": verdict.prediction_ready,
+                "verdict": {"phase": verdict.phase, "reason": verdict.reason,
+                            "prediction_ready": verdict.prediction_ready,
                             "candidates": {m: {"trusted": v.trusted, "phase": v.phase, "reason": v.reason,
                                                "coverage_gate": v.coverage_gate, "availability": v.availability,
                                                "prospective_gate_bounds": v.prospective_gate_bounds,
@@ -309,7 +334,7 @@ class ForecastService:
                                                    state["models"][m]["ledger"]["last_prospective_outcome_s"]}
                                            for m, v in verdict.candidates.items()}}}
 
-    def _response(self, bound: BoundRequest, b: Dict, checkpoint_sha: Optional[str]) -> Dict:
+    def _response(self, bound: BoundRequest, b: Dict) -> Dict:
         sig = bound.signal
         reported = b["selected"] or ("seasonal_naive" if "seasonal_naive" in b["candidates"] else "statistical")
         c, v = b["candidates"][reported], b["verdict"]
@@ -324,7 +349,7 @@ class ForecastService:
             issuance_id=b["issuance_id"], issued_at_ms=b["issued_at_ms"], input_end=b["input_end"],
             input_received_through_ms=b["input_received_through_ms"], fit_cutoff=c["fit_cutoff"],
             model_family=reported, model_recipe=c["recipe"], artifact_sha256=c["artifact_sha256"],
-            calibration_epoch=bound.evidence_key, checkpoint_sha256=checkpoint_sha,
+            calibration_epoch=bound.evidence_key, checkpoint_sha256=b["checkpoint_sha256"],
             decision_origin=b["decision_origin"], window_start=b["window_start"], window_end=b["window_end"],
             target_timestamps=tuple(b["target_timestamps"]), sample_interval_seconds=b["sample_interval_seconds"],
             lead_seconds=b["lead_seconds"], startup_delay_seconds=b["startup_delay_seconds"],
@@ -351,11 +376,8 @@ class ForecastService:
                                           nominal_miscoverage=bound.settings.risk.miscoverage_bps / 10_000,
                                           trusted=trusted.get(model, False), history_seconds=max(0, now_s - first),
                                           now_s=now_s, fit_failures=failures if model == "statistical" else None)
-        try:
-            self.metrics.update(bound.signal.namespace, bound.autoscaler_name, Snapshot(bound.signal.autoscaler_uid,
-                                                                                      models))
-        except RegistryFull:
-            pass
+        self.metrics.update(bound.signal.namespace, bound.autoscaler_name,
+                            Snapshot(bound.signal.autoscaler_uid, models))
 
     def forget(self, namespace: str, autoscaler: str) -> None:
         """After confirmed deletion: drop the autoscaler's series (its journal epoch simply stops growing)."""

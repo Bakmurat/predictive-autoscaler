@@ -56,11 +56,13 @@ def rps(ts):
 class Backend:
     """A Prometheus query_range answering from rps(); `down` simulates an outage; `gap_after` stops data."""
 
-    def __init__(self, value=None):
-        self.down, self.gap_after, self.calls, self.value = False, None, 0, value or rps
+    def __init__(self, value=None, on_fetch=None):
+        self.down, self.gap_after, self.calls, self.value, self.on_fetch = False, None, 0, value or rps, on_fetch
 
     def __call__(self, url, **kw):
         self.calls += 1
+        if self.on_fetch:
+            self.on_fetch()
         if self.down:
             from data.bounded_http import TransportFailure
             raise TransportFailure("connection refused")
@@ -256,3 +258,164 @@ def test_retention_keeps_the_journal_bounded_without_losing_evidence(tmp_path):
     summary = svc.store.retention_summary(ek)
     assert summary["issued"] + len(origins) == 72                          # every issuance counted, kept or retired
     assert out[-1].calibration_windows == max(r.calibration_windows for r in out)   # calibration lost nothing
+
+
+# --- Codex review on #25: timing, durable trust, one artifact read, atomic registration, readiness, maximum state ---
+
+def test_a_late_issuance_is_refused_never_backdated(tmp_path):
+    # Codex repro: a backend delayed 310 s still committed a forecast after its first target, stamped with the start time.
+    clock = ManualClock(T0 * 1000)
+    svc, _ = make(tmp_path, clock=clock, backend=Backend(on_fetch=lambda: clock.advance(310_000)))
+    with pytest.raises(ServiceError) as e:
+        ask(svc, clock, T0)
+    assert (e.value.status, e.value.reason) == (503, "LeadInsufficient") and svc.store.issuances() == []
+    clock2 = ManualClock(T0 * 1000)                       # 100 s late but still before first target - A: issued
+    slow, _ = make(tmp_path / "slow", clock=clock2, backend=Backend(on_fetch=lambda: clock2.advance(100_000)))
+    r = c.response_from_wire(ask(slow, clock2, T0))
+    assert r.issued_at_ms == (T0 + 110) * 1000 and r.input_received_through_ms == (T0 + 110) * 1000   # actual times
+
+
+def test_a_retry_is_identical_even_after_another_window_matured(tmp_path):
+    svc, clock = make(tmp_path)
+    run(svc, clock, 12)
+    origin = T0 + 12 * DT
+    first = ask(svc, clock, origin)                        # at origin + 10 s
+    ek = c.response_from_wire(first).calibration_epoch
+    matured = len(svc.store.outcomes_after(ek, 0))
+    clock.set((origin + 250) * 1000)                       # a window closes at origin + 120 s in between
+    again = svc.predict(body(origin))
+    assert len(svc.store.outcomes_after(ek, 0)) > matured and again == first
+
+
+class Crash(Exception):
+    pass
+
+
+@pytest.mark.parametrize("boundary", ["before_issuance", "after_issuance"])
+def test_a_crash_at_either_boundary_recovers_exactly(tmp_path, monkeypatch, boundary):
+    whole, wclock = make(tmp_path / "whole", store_id="journal-1")
+    expected = run(whole, wclock, 40)
+    svc, clock = make(tmp_path / "crash", store_id="journal-1")
+    got = run(svc, clock, 20)
+    if boundary == "before_issuance":                      # the trust checkpoint is written, the issuance is not
+        monkeypatch.setattr(svc.store, "get_or_issue", lambda *a, **k: (_ for _ in ()).throw(Crash()))
+    else:                                                  # the issuance is committed, the final checkpoint is not
+        calls, real = [], svc.store.write_checkpoint
+
+        def flaky(*a, **k):
+            calls.append(1)
+            if len(calls) == 2:
+                raise Crash()
+            return real(*a, **k)
+        monkeypatch.setattr(svc.store, "write_checkpoint", flaky)
+    with pytest.raises(Crash):
+        ask(svc, clock, T0 + 20 * DT)
+    ek = c.response_from_wire(got[-1]).calibration_epoch
+    trust = svc.store.latest_checkpoint(ek).state["trust"]
+    assert trust and set(trust) >= {"seasonal_naive"}       # the trust transition was durable before the issuance
+    restarted, _ = make(tmp_path / "crash", clock=clock, store_id="journal-1")     # a new process on the same volume
+    got += run(restarted, clock, 20, start=T0 + 20 * DT)    # the crashed origin is retried first
+    assert got == expected
+    assert restarted.store.latest_checkpoint(ek).state == whole.store.latest_checkpoint(ek).state
+
+
+def test_concurrent_new_autoscalers_cannot_exceed_the_limit(tmp_path):
+    # Codex repro: with max_autoscalers=1, two new autoscalers both committed issuances.
+    import threading
+    barrier = threading.Barrier(2, timeout=10)
+
+    class TwoPAs:
+        def get(self, path):
+            name = path.rsplit("/", 1)[1]
+            if "predictiveautoscalers" in path:
+                barrier.wait()                             # both requests pass identity together
+                return pa_object(uid="pa-1" if name == "web-pa" else "pa-2")
+            return {"metadata": {"uid": "dep-uid"}}
+
+    svc, clock = make(tmp_path, reader=TwoPAs(), max_autoscalers=1)
+    clock.set(T0 * 1000 + 10_000)
+    results = {}
+
+    def go(name, uid):
+        try:
+            results[name] = svc.predict(dict(body(T0), autoscaler_name=name, autoscaler_uid=uid))
+        except ServiceError as e:
+            results[name] = e.status
+    threads = [threading.Thread(target=go, args=a) for a in (("web-pa", "pa-1"), ("api-pa", "pa-2"))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    assert sorted(isinstance(v, dict) for v in results.values()) == [False, True]
+    assert 503 in results.values() and len(svc.store.issuances()) == 1 and len(svc.metrics.registered()) == 1
+
+
+def test_the_forecast_and_its_digest_come_from_one_artifact_read(tmp_path, monkeypatch):
+    from forecasting.artifacts import ArtifactStore
+    monkeypatch.setattr(ArtifactStore, "load", lambda *a, **k: (_ for _ in ()).throw(AssertionError("split read")))
+    pred = dict(PREDICTION, historyDays=8)
+    clock = ManualClock((T0 + 6 * DAY) * 1000)
+    noisy = lambda t: round(rps(t) + ((t * 2654435761) % 997) / 997 - 0.5, 6)   # noqa: E731
+    svc = ForecastService(ServiceConfig(prometheus_url="http://prom", state_dir=str(tmp_path), fit_mode="inline"),
+                          reader=Reader(pa_object(prediction=pred)), fetch=Backend(noisy), clock=clock)
+    origin = T0 + 6 * DAY
+    clock.set(origin * 1000 + 10_000)
+    request = body(origin, c.resolve_settings(pa_object(prediction=pred)).fingerprint())
+    svc.predict(request)
+    stat = svc.store.issuances()[0].payload()["candidates"]["statistical"]
+    from forecasting.artifacts import Binding
+    bound = c.bind_request(request, Reader(pa_object(prediction=pred)), now_ms=clock.now_ms())
+    sha, cutoff, data = svc.artifacts.current(Binding.for_signal(bound.signal, bound.settings, "e1-product/v1"))
+    assert stat["artifact_sha256"] == sha == hashlib.sha256(data).hexdigest() and stat["fit_cutoff"] == cutoff
+
+
+def test_readiness_follows_the_journal(tmp_path):
+    svc, clock = make(tmp_path)
+    assert svc.ready()
+    ask(svc, clock, T0)
+    svc.store._fail("disk full")
+    assert not svc.ready() and svc.health()["state"] == "unavailable"
+
+
+def test_the_maximum_retained_state_fits_one_checkpoint(tmp_path):
+    """Three models at a 1-minute cadence with a full 7-day ledger, a full day of pending issuances, full calibration
+    buffers and paired evidence: the largest state the profile keeps still fits a checkpoint."""
+    from forecasting import trust as T
+    from forecasting.calibration import CalibrationPolicy, initial
+    from forecasting.store import MAX_CHECKPOINT_BYTES, ForecastStore
+    ek = "e" * 64
+    now = T0 + 7 * DAY
+    models = {}
+    for m in ("seasonal_naive", "statistical", "lstm"):
+        led = T.new_ledger(ek, m, f"{m}/v1", 60)
+        for h in range(169):
+            b = T._bucket(led, now - h * 3600)
+            for f in b:
+                b[f] = 59.123456789012345 if isinstance(b[f], float) else 60
+        led["pending"] = {f"iss-{i:032x}": [now - i * 60, now - i * 60 + 720] for i in range(1440)}
+        led["recent"] = [1] * 32
+        cal = initial(CalibrationPolicy(3600), ek, m, f"{m}/v1")
+        cal["scores"] = [[now - i * 3600, -1.234567890123456] for i in range(512)]
+        models[m] = {"recipe": f"{m}/v1", "calibration": cal, "ledger": led}
+    pairs = T.new_pairs(ek, "statistical", "statistical/v1", "seasonal_naive/v1")
+    pairs["buckets"] = {str(now // 3600 - h): {"n": 60, "chal": 12.3456789, "base": 13.456789, "first": now,
+                                                "last": now} for h in range(169)}
+    pairs["pending"] = {f"iss-{i:032x}": ["statistical", 0.123456789, now] for i in range(1440)}
+    state = {"schema": "statistical-service-state/v1", "epoch": ek, "last_outcome_seq": 10 ** 7,
+             "last_issuance_seq": 10 ** 7, "models": models, "pairs": {"statistical": pairs},
+             "trust": {m: T.new_hysteresis(f"{m}/v1", ek) for m in models}}
+    size = len(c.canonical_json(state))
+    assert size < MAX_CHECKPOINT_BYTES, size
+    store = ForecastStore(str(tmp_path / "j.sqlite"), clock=ManualClock(now * 1000))
+    assert store.write_checkpoint(ek, state, 10 ** 7).state == state
+
+
+def test_a_one_minute_sixty_step_bundle_fits(tmp_path):
+    pred = {"horizonMinutes": 60, "sampleIntervalSeconds": 60, "historyDays": 2,
+            "calibration": {"minWindows": 16, "maxScores": 64, "minMiscoverageBps": 600}}
+    pa = pa_object(prediction=pred)
+    pa["status"]["prediction"]["lead"]["seconds"] = 3600
+    svc, clock = make(tmp_path, reader=Reader(pa))
+    clock.set(T0 * 1000 + 10_000)
+    r = c.response_from_wire(svc.predict(body(T0, c.resolve_settings(pa).fingerprint())))
+    assert len(r.point_rps) == 60 and len(svc.store.issuances()[0].bundle) < 8 << 10

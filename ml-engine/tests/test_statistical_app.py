@@ -17,9 +17,12 @@ OPERATOR = "system:serviceaccount:pa-system:pa-operator"
 
 
 class FakeService:
-    def __init__(self, answer=None, error=None):
+    def __init__(self, answer=None, error=None, ready=True):
         self.answer, self.error, self.calls, self.closed = answer or {"ok": True}, error, [], False
-        self.metrics = ForecastMetrics()
+        self.metrics, self._ready = ForecastMetrics(), ready
+
+    def ready(self):
+        return self._ready
 
     def predict(self, body):
         self.calls.append(body)
@@ -139,3 +142,12 @@ def test_the_entrypoint_keeps_tls_and_rotation_for_the_statistical_app(tmp_path,
     serve.main(["statistical"])
     assert seen == {"app": "api.statistical:app", "ssl": (str(cert), str(key)), "ran": True}
     assert started == [[str(cert), str(key)]]                     # the rotation watcher watches both files
+
+
+def test_readiness_follows_the_journal_and_liveness_stays_up():
+    c, _ = client(svc=FakeService(ready=False))
+    with c:
+        assert c.get("/ready").status_code == 503 and c.get("/health").status_code == 200
+    c, _ = client(svc=FakeService(ready=True))
+    with c:
+        assert c.get("/ready").status_code == 200

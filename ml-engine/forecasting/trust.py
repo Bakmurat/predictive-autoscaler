@@ -132,7 +132,8 @@ def _prune(ledger: dict, now_s: int, retention_s: int) -> None:
     ledger["newest_s"] = newest
     floor = (newest - retention_s) // HOUR
     ledger["buckets"] = {k: v for k, v in ledger["buckets"].items() if int(k) > floor}
-    ledger["pending"] = {k: v for k, v in ledger["pending"].items() if v[0] > newest - retention_s}
+    # Pending issuances matter only to the last day's availability: older ones are dropped (bounded state).
+    ledger["pending"] = {k: v for k, v in ledger["pending"].items() if v[0] > newest - DAY}
 
 
 def _copy(ledger: dict) -> dict:

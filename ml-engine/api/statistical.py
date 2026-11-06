@@ -1,8 +1,9 @@
 """The statistical forecasting service's app (forecast contract v2, C2.6): TensorFlow-free, never imports api.main.
 
-Endpoints: POST /v2/predict (forecasting.service), GET /health (always answers; reports the journal's state), GET /ready
-(the service started), GET /metrics (the bounded forecast-quality series and process metrics). Nothing else: no legacy
-/predict, no /train, no /models, no benchmark route.
+Endpoints: POST /v2/predict (forecasting.service), GET /health (liveness: always answers; reports the journal's state),
+GET /ready (503 until started and while the journal cannot support issuance), GET /metrics (the bounded
+forecast-quality series and process metrics). Nothing else: no legacy /predict, no /train, no /models, no benchmark
+route.
 
 It reuses the legacy service's contracts unchanged: caller authentication (api/auth.py: TokenReview over TLS, every
 path but the open ones protected, the token checked before the body is read), identity (api/identity.py via
@@ -101,8 +102,11 @@ def create_app(env: Mapping[str, str] = os.environ, service_factory: Optional[Ca
 
     @app.get("/ready")
     async def ready():
-        if holder["service"] is None:
+        svc = holder["service"]
+        if svc is None:
             return error(503, "Starting", "the service is not started")
+        if not svc.ready():                  # liveness (/health) stays separate: the process itself is fine
+            return error(503, "StateUnavailable", "the forecast journal cannot support issuance")
         return {"status": "ready"}
 
     @app.get("/metrics")

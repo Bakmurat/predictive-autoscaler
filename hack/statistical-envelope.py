@@ -13,7 +13,8 @@ container_memory_working_set_bytes, container_cpu_usage_seconds_total and the st
 (docs/helm.md, "Statistical forecaster profile").
 
 Usage: hack/statistical-envelope.py [--pas 8] [--interval 60] [--hours 6] [--history-days 2] [--fit-mode off|worker]
-                                    [--state-dir DIR] [--check]
+                                    [--state-dir DIR] [--check] [--cgroup-peak]
+In the image with fitting on, under the profile's limits: hack/statistical-container-envelope.sh (needs docker).
 """
 
 from __future__ import annotations
@@ -30,7 +31,8 @@ import time
 import urllib.parse
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ml-engine"))
+_HERE = Path(__file__).resolve().parents[1] / "ml-engine"
+sys.path.insert(0, str(_HERE) if _HERE.is_dir() else "/app")        # the checkout, or inside the image
 os.environ["KUBECONFIG"] = "/dev/null"
 
 from api.identity import CONTRACT  # noqa: E402
@@ -39,7 +41,7 @@ from forecasting.clock import ManualClock  # noqa: E402
 from forecasting.service import ForecastService, ServiceConfig  # noqa: E402
 
 DAY = 86400
-BUDGET = {"peak_rss_mib": 384, "p95_seconds": 2.0}
+BUDGET = {"peak_rss_mib": 384, "p95_seconds": 2.0, "cgroup_memory_peak_mib": 384}
 
 
 def query_for(i):
@@ -93,7 +95,18 @@ def peak_rss_mib() -> float:
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
 
 
-def run(pas=8, interval=60, hours=6.0, history_days=2, fit_mode="off", state_dir=None):
+def cgroup_peak_mib():
+    """The container's memory high-water mark (cgroup v2, every process: the service AND its fit workers)."""
+    for path in ("/sys/fs/cgroup/memory.peak", "/sys/fs/cgroup/memory/memory.max_usage_in_bytes"):
+        try:
+            with open(path) as fh:
+                return round(int(fh.read().strip()) / (1 << 20), 1)
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def run(pas=8, interval=60, hours=6.0, history_days=2, fit_mode="off", state_dir=None, cgroup=False):
     lead = max(2 * interval, -(-(300 + interval + 30 + interval) // interval) * interval)
     objects = {f"web-{i}-pa": pa_object(i, interval, lead, history_days) for i in range(pas)}
     start = 1_793_923_200 - 1_793_923_200 % DAY + 3 * DAY
@@ -135,6 +148,7 @@ def run(pas=8, interval=60, hours=6.0, history_days=2, fit_mode="off", state_dir
     return {"autoscalers": pas, "interval_seconds": interval, "hours": hours, "requests": len(latencies),
             "failures": failures, "peak_rss_mib": round(peak_rss_mib(), 1),
             "cpu_seconds": round(time.process_time() - cpu0, 3), "journal_bytes": journal,
+            "cgroup_memory_peak_mib": cgroup_peak_mib() if cgroup else None,
             "p50_seconds": q(0.50), "p95_seconds": q(0.95), "max_seconds": latencies[-1] if latencies else None}
 
 
@@ -147,8 +161,10 @@ def main(argv=None) -> int:
     ap.add_argument("--fit-mode", choices=("off", "worker"), default="off")
     ap.add_argument("--state-dir")
     ap.add_argument("--check", action="store_true")
+    ap.add_argument("--cgroup-peak", action="store_true", help="report the container cgroup's memory peak (run "
+                                                                 "inside the container: it includes the fit workers)")
     a = ap.parse_args(argv)
-    out = run(a.pas, a.interval, a.hours, a.history_days, a.fit_mode, a.state_dir)
+    out = run(a.pas, a.interval, a.hours, a.history_days, a.fit_mode, a.state_dir, a.cgroup_peak)
     breaches = [k for k, limit in BUDGET.items() if out[k] is not None and out[k] > limit]
     if out["failures"]:
         breaches.append("failures")
