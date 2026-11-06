@@ -27,7 +27,7 @@ import math
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Mapping, Optional, Tuple
+from typing import Dict, Mapping, Optional, Tuple
 
 from api.identity import API_GROUP, API_VERSION, CONTRACT as SIGNAL_CONTRACT, KubeReader, ResolvedSignal, \
     resolve_signal
