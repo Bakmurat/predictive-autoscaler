@@ -134,3 +134,26 @@ def test_real_worker_fits_reach_the_issuances():
     assert p.returncode == 0, p.stdout + p.stderr
     out = json.loads(p.stdout)
     assert out["fit_failures"] == {} and out["statistical_issuances"] > 0 and out["breaches"] == []
+
+
+def test_inherited_blas_threads_are_overridden_for_fit_processes():
+    # Codex repro: OPENBLAS/OMP/MKL_NUM_THREADS=8 inherited by the fit processes gave fit timeouts and no fitted
+    # forecasts (the harness's main module loads NumPy in the child before _child() could reset them).
+    env = {**clean_env(), "OPENBLAS_NUM_THREADS": "8", "OMP_NUM_THREADS": "8", "MKL_NUM_THREADS": "8"}
+    p = subprocess.run([sys.executable, str(ROOT / "hack" / "statistical-envelope.py"), "--pas", "1", "--interval",
+                        "300", "--hours", "2", "--history-days", "8", "--fit-mode", "worker", "--check"],
+                       capture_output=True, text=True, timeout=300, env=env)
+    assert p.returncode == 0, p.stdout + p.stderr
+    out = json.loads(p.stdout)
+    assert out["fit_failures"] == {} and out["statistical_issuances"] > 0
+
+
+def test_the_spawn_environment_is_forced_and_then_restored(monkeypatch):
+    from forecasting import worker as W
+    monkeypatch.setenv("OPENBLAS_NUM_THREADS", "8")
+    monkeypatch.setenv("OMP_NUM_THREADS", "8")
+    monkeypatch.delenv("MKL_NUM_THREADS", raising=False)
+    with W._one_thread_environment():
+        assert [os.environ[n] for n in W._THREAD_ENV] == ["1", "1", "1"]
+    assert os.environ["OPENBLAS_NUM_THREADS"] == "8" and os.environ["OMP_NUM_THREADS"] == "8"
+    assert "MKL_NUM_THREADS" not in os.environ

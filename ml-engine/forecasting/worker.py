@@ -31,6 +31,7 @@ import os
 import resource
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable, Deque, Dict, Optional
 
@@ -73,6 +74,27 @@ class Ticket:
     payload: Dict
     done: threading.Event = field(default_factory=threading.Event)
     result: Optional[FitResult] = None
+
+
+_ENV_LOCK = threading.Lock()
+
+
+@contextmanager
+def _one_thread_environment():
+    """Force one BLAS/OpenMP thread in the environment a spawned fit process starts with (overriding any inherited
+    value), then restore the parent's own values. Spawning copies the environment synchronously inside start()."""
+    with _ENV_LOCK:
+        saved = {name: os.environ.get(name) for name in _THREAD_ENV}
+        try:
+            for name in _THREAD_ENV:
+                os.environ[name] = "1"
+            yield
+        finally:
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
 
 
 def _child(conn, ref: str, payload: Dict, memory_bytes: int) -> None:
@@ -208,9 +230,8 @@ class FitWorker:
                 return self._closed_result(t, "before the fit started")
             started = self.clock()
             deadline = time.monotonic() + self.deadline_s
-            for name in _THREAD_ENV:          # inherited by the child before it imports anything (a main module
-                os.environ.setdefault(name, "1")   # that loads NumPy would otherwise start its BLAS threads first)
-            p.start()
+            with _one_thread_environment():   # the child inherits it before importing anything (a main module
+                p.start()                     # that loads NumPy would otherwise start inherited BLAS threads)
             self._running[t.signal_key] = p
         send.close()
         expired = threading.Event()
