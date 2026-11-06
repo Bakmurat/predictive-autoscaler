@@ -19,8 +19,10 @@ A replay can be interrupted anywhere and resumed with the same arguments: it res
 checkpointed one, and every step of a tick is idempotent (duplicate observations, committed outcomes and issuances are
 returned, not rewritten), so the finished journal is identical to an uninterrupted run.
 
-The forecasters here (last_value, daily_naive) are skeleton stand-ins with fixed recipes; the statistical kernels
-arrive in C2.3 and calibration (upper bounds) in C2.4. Until then every issuance carries upper_window_max_rps = null.
+The forecasters here (last_value, daily_naive) are simple stand-ins with fixed recipes (the statistical kernels are in
+forecasting.statistical). Each issuance carries the window bound from forecasting.calibration, computed at issue time
+from the cohort scores that had matured by then (null until enough exist); each outcome is folded into the
+calibration state exactly once, through the journal, so the level moves only for bounds actually issued.
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ from types import MappingProxyType
 from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from evaluation.datasets import Dataset
+from forecasting import calibration as cal
 from forecasting.clock import ManualClock
 from forecasting.contracts import FORECAST_CONTRACT, canonical_json, sha256_hex
 from forecasting.history import watermark
@@ -55,6 +58,18 @@ class ReplayConfig:
     outcome_grace_seconds: int = 600
     model_family: str = "seasonal_naive"
     model_recipe: str = "replay-skeleton/daily-naive/v1"
+    miscoverage_bps: int = 1000
+    eta_bps: int = 50
+    min_miscoverage_bps: int = 100
+    max_miscoverage_bps: int = 2500
+    min_windows: int = 128
+    max_scores: int = 512
+    retention_seconds: int = 7 * 86400
+
+    def policy(self) -> cal.CalibrationPolicy:
+        return cal.CalibrationPolicy(self.lead_seconds, self.miscoverage_bps, self.eta_bps, self.min_miscoverage_bps,
+                                     self.max_miscoverage_bps, self.min_windows, self.max_scores,
+                                     self.retention_seconds)
 
     def check(self, interval: int) -> None:
         for name in ("first_origin", "last_origin", "lead_seconds"):
@@ -136,12 +151,14 @@ class ReplayResult:
 
 
 def _issue(store: ForecastStore, ek: str, settings_sha: str, dataset: Dataset, config: ReplayConfig,
-           view: VisibleHistory, t: int, targets: Tuple[int, ...], points: Sequence[float]) -> int:
+           view: VisibleHistory, t: int, targets: Tuple[int, ...], points: Sequence[float], state: dict) -> int:
     points = [float(x) for x in points]
     if len(points) != len(targets) or not all(math.isfinite(x) and x >= 0 for x in points):
         raise ReplayError(f"the forecaster returned an invalid trajectory at {t}")
     key = IssuanceKey(ek, t, t, targets[-1], settings_sha)
     input_end, through = view.latest(), view.received_through_ms()
+    base = max(points)
+    upper, info = cal.upper_bound(state["calibration"], config.policy(), base, t)
 
     def build(issuance_id: str) -> dict:
         return {"schema": ISSUANCE_SCHEMA, "evidence_mode": "replay", "forecast_contract": FORECAST_CONTRACT,
@@ -149,21 +166,24 @@ def _issue(store: ForecastStore, ek: str, settings_sha: str, dataset: Dataset, c
                 "dataset_sha256": dataset.manifest_sha256, "model_family": config.model_family,
                 "model_recipe": config.model_recipe, "decision_origin": t, "window_start": t,
                 "window_end": targets[-1], "target_timestamps": list(targets),
-                "sample_interval_seconds": view.interval, "point_rps": points, "base_window_max_rps": max(points),
-                "upper_window_max_rps": None, "issued_at_ms": view.now_ms, "input_end": input_end,
-                "input_received_through_ms": through}
+                "sample_interval_seconds": view.interval, "point_rps": points, "base_window_max_rps": base,
+                "upper_window_max_rps": upper, "nominal_miscoverage_bps": config.miscoverage_bps,
+                "calibration": {**info, "in_cohort": cal.in_cohort(t, config.lead_seconds)},
+                "issued_at_ms": view.now_ms, "input_end": input_end, "input_received_through_ms": through}
     _, created = store.get_or_issue(key, build, models=(config.model_family,))
     return int(created)
 
 
-def initial_state() -> dict:
-    return {"scored": 0, "unscorable": 0, "excluded": 0, "missing_truth": 0, "covered": 0, "missed": 0, "unbounded": 0, "abs_error_sum_rps": 0.0,
-            "last_window_end": None}
+def initial_state(epoch: str, policy: cal.CalibrationPolicy) -> dict:
+    return {"scored": 0, "unscorable": 0, "excluded": 0, "missing_truth": 0, "covered": 0, "missed": 0,
+            "unbounded": 0, "abs_error_sum_rps": 0.0, "last_window_end": None,
+            "calibration": cal.initial(policy, epoch)}
 
 
-def fold(state: dict, o: Outcome) -> dict:
-    """The checkpoint fold: counters over terminal outcomes, in journal order. Pure."""
+def fold(state: dict, o: Outcome, issuance, policy: cal.CalibrationPolicy) -> dict:
+    """The checkpoint fold: counters over terminal outcomes and the calibration update, in journal order. Pure."""
     s, p = dict(state), o.payload()
+    s["calibration"] = cal.apply(state["calibration"], cal.CalibrationRecord.from_journal(issuance, o), policy)
     s["last_window_end"] = o.window_end
     if o.status == "unscorable":
         s["unscorable"] += 1
@@ -193,6 +213,7 @@ def run_replay(dataset: Dataset, config: ReplayConfig, store: ForecastStore, *,
                forecaster: Forecaster = daily_naive) -> ReplayResult:
     dt = dataset.interval_seconds
     config.check(dt)
+    policy = config.policy()
     ek, settings_sha = replay_keys(dataset, config)
     series = "replay:" + dataset.manifest_sha256
     source = dataset.manifest["data_sha256"]
@@ -228,7 +249,9 @@ def run_replay(dataset: Dataset, config: ReplayConfig, store: ForecastStore, *,
             if res is not None:
                 store.commit_outcome(iss.issuance_id, config.model_family, *res)
         # 3. fold the new outcomes in exactly once (calibration, C2.4, will read this state before issuing)
-        state, last, _ = store.recover(ek, fold, initial_state)
+        state, last, _ = store.recover(
+            ek, lambda st, o: fold(st, o, store.get_issuance_by_id(o.issuance_id), policy),
+            lambda: initial_state(ek, policy))
         # 4. forecast from what is visible now; 5. commit the issuance before anything later is revealed
         view = VisibleHistory(received, now_ms, dt, through=watermark(t, dt, config.settlement_seconds),
                               excluded=dataset.excluded)
@@ -237,12 +260,12 @@ def run_replay(dataset: Dataset, config: ReplayConfig, store: ForecastStore, *,
         if points is None:
             no_forecast += 1
         else:
-            issued += _issue(store, ek, settings_sha, dataset, config, view, t, targets, points)
+            issued += _issue(store, ek, settings_sha, dataset, config, view, t, targets, points, state)
         # 6. the tick is complete
         store.write_checkpoint(ek, {**state, "replay_tick": t}, last)
 
     cp = store.latest_checkpoint(ek)
-    totals = cp.state if cp else initial_state()
+    totals = cp.state if cp else initial_state(ek, policy)
     pending = len(store.open_issuances(ek, config.model_family, config.last_origin + config.lead_seconds))
     return ReplayResult(evidence_key=ek, settings_sha256=settings_sha, issued=issued, no_forecast=no_forecast,
                         scored=totals["scored"], unscorable=totals["unscorable"], excluded=totals["excluded"],

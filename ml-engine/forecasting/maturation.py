@@ -30,12 +30,22 @@ def truth_deadline_ms(window_end: int, settlement_s: int, grace_s: int) -> int:
     return (window_end + settlement_s + grace_s) * 1000
 
 
+def check_window(targets: Sequence[int]) -> None:
+    """The exact window: one or more grid times, strictly increasing at a constant step (no hole, no repeat)."""
+    if not targets or any(not isinstance(t, int) or isinstance(t, bool) for t in targets):
+        raise ValueError("a window has integer target times")
+    steps = {b - a for a, b in zip(targets, targets[1:])}
+    if len(steps) > 1 or (steps and min(steps) <= 0):
+        raise ValueError("window targets must be evenly spaced and increasing")
+
+
 def window_outcome(*, targets: Sequence[int], base_rps: float, upper_rps: Optional[float],
                    received: Mapping[int, Tuple[float, int]], now_ms: int, settlement_s: int, grace_s: int,
                    excluded: Optional[Callable[[int], Optional[str]]] = None) -> Optional[Tuple[str, dict]]:
     """None while the window is pending, else (status, payload) with status 'scored' or 'unscorable'.
 
     `received` maps event time -> (value RPS, first receipt ms); `excluded(t)` names the exclusion covering t, if any."""
+    check_window(targets)
     window_end = targets[-1]
     close_ms = (window_end + settlement_s) * 1000
     deadline_ms = truth_deadline_ms(window_end, settlement_s, grace_s)
@@ -61,7 +71,8 @@ def window_outcome(*, targets: Sequence[int], base_rps: float, upper_rps: Option
         return "unscorable", {"schema": OUTCOME_SCHEMA, "reason": "missing_truth", "missing_targets": len(missing),
                               "first_missing": missing[0], "deadline_ms": deadline_ms}
     y = max(values)
-    return "scored", {"schema": OUTCOME_SCHEMA, "y_window_max_rps": y, "base_window_max_rps": base_rps,
+    return "scored", {"schema": OUTCOME_SCHEMA, "y_window_max_rps": y, "targets": len(targets),
+                      "base_window_max_rps": base_rps,
                       "upper_window_max_rps": upper_rps,
                       "covered": None if upper_rps is None else y <= upper_rps,
                       "residual_rps": y - base_rps, "abs_error_rps": abs(y - base_rps),
