@@ -182,10 +182,11 @@ type PredictiveExtra struct {
 	MaxPercent *int32 `json:"maxPercent,omitempty"`
 }
 
-// StartupBehavior is the budget for a scale-out to become usable: scale request to Ready. The operator measures it
-// per target (pod creation to Ready, current pod template only) and uses the measurement once it has enough samples;
-// until then it uses FallbackDelaySeconds. Without either it chooses no predictive lead, and the autoscaler stays
-// reactive.
+// StartupBehavior is the budget for a scale-out to become usable. The operator measures pod creation to Ready for the
+// pods of the target's current ReplicaSet and uses the measurement once it has enough samples; the time from the scale
+// request to the pod's creation is not measured and is covered by ActuationAllowanceSeconds. Until then it uses
+// FallbackDelaySeconds (which should cover the whole scale request to Ready). Without either it chooses no predictive
+// lead, and the autoscaler stays reactive.
 type StartupBehavior struct {
 	// FallbackDelaySeconds is the conservative scale-out-to-Ready budget used until enough measurements exist (20
 	// completed starts of the current pod template in the last 7 days). Choose it from observed starts, including
@@ -201,7 +202,8 @@ type StartupBehavior struct {
 	// +optional
 	MinimumDelaySeconds *int32 `json:"minimumDelaySeconds,omitempty"`
 
-	// ActuationAllowanceSeconds covers the request to the forecasting service and the write to /scale (default 15).
+	// ActuationAllowanceSeconds covers the request to the forecasting service, the write to /scale and the ReplicaSet
+	// controller creating the pods (default 15).
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=300
 	// +optional
@@ -228,13 +230,17 @@ type PredictionLead struct {
 
 // StartupStatus is the operator's startup-delay measurement for the target.
 type StartupStatus struct {
+	// Measures names what a measured budget covers: podCreationToReady. It excludes the time from the scale request to
+	// the pod's creation, which actuationAllowanceSeconds covers.
+	// +optional
+	Measures string `json:"measures,omitempty"`
 	// DelaySeconds is the startup budget in use (absent when there is none).
 	// +optional
 	DelaySeconds *int32 `json:"delaySeconds,omitempty"`
 	// Method is configured, measured or none.
 	// +optional
 	Method string `json:"method,omitempty"`
-	// SampleCount is the number of completed starts of the current pod template in the last 7 days.
+	// SampleCount is the number of completed starts of the current ReplicaSet's pods in the last 7 days.
 	SampleCount int32 `json:"sampleCount"`
 	// MeasuredP90Seconds is the 90th percentile of those starts (absent with fewer than 20).
 	// +optional
@@ -243,7 +249,8 @@ type StartupStatus struct {
 	// start longer than the budget raises the budget.
 	// +optional
 	PendingSeconds *int32 `json:"pendingSeconds,omitempty"`
-	// Observable is false when the operator could not read the target's pods (the configured budget then applies).
+	// Observable is false when the operator could not read the target's ReplicaSets and pods, or could not identify the
+	// current ReplicaSet with certainty (the configured budget then applies).
 	Observable bool `json:"observable"`
 }
 

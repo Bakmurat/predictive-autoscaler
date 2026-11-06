@@ -101,9 +101,9 @@ spec:
                       lead is chosen from (engine statistical).
                     properties:
                       actuationAllowanceSeconds:
-                        description: ActuationAllowanceSeconds covers the request
-                          to the forecasting service and the write to /scale (default
-                          15).
+                        description: |-
+                          ActuationAllowanceSeconds covers the request to the forecasting service, the write to /scale and the ReplicaSet
+                          controller creating the pods (default 15).
                         format: int32
                         maximum: 300
                         minimum: 0
@@ -804,12 +804,18 @@ spec:
                           those starts (absent with fewer than 20).
                         format: int32
                         type: integer
+                      measures:
+                        description: |-
+                          Measures names what a measured budget covers: podCreationToReady. It excludes the time from the scale request to
+                          the pod's creation, which actuationAllowanceSeconds covers.
+                        type: string
                       method:
                         description: Method is configured, measured or none.
                         type: string
                       observable:
-                        description: Observable is false when the operator could not
-                          read the target's pods (the configured budget then applies).
+                        description: |-
+                          Observable is false when the operator could not read the target's ReplicaSets and pods, or could not identify the
+                          current ReplicaSet with certainty (the configured budget then applies).
                         type: boolean
                       pendingSeconds:
                         description: |-
@@ -819,7 +825,7 @@ spec:
                         type: integer
                       sampleCount:
                         description: SampleCount is the number of completed starts
-                          of the current pod template in the last 7 days.
+                          of the current ReplicaSet's pods in the last 7 days.
                         format: int32
                         type: integer
                     required:

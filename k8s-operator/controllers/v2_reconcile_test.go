@@ -16,9 +16,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -45,6 +47,7 @@ type v2Stub struct {
 	requests atomic.Int32
 	mu       sync.Mutex
 	last     v2Request
+	after    func() // runs after each answer (a test moving the clock while the request is in flight)
 }
 
 func (s *v2Stub) set(kind string, upper float64) { s.mode.Store(v2Mode{kind, upper}) }
@@ -144,6 +147,12 @@ func startV2Stub(t *testing.T, reader client.Reader, clock func() time.Time) *v2
 			return
 		}
 		_ = json.NewEncoder(w).Encode(v2Wire(body, &pa, mode, clock()))
+		stub.mu.Lock()
+		after := stub.after
+		stub.mu.Unlock()
+		if after != nil {
+			after()
+		}
 	}))
 	t.Cleanup(srv.Close)
 	t.Setenv("ML_API_URL", srv.URL)
@@ -488,8 +497,12 @@ func TestV2LeadIsFrozenAndNeedsABudget(t *testing.T) {
 	if err := f.r.Update(context.Background(), a); err != nil {
 		t.Fatal(err)
 	}
+	serveCurrentReplicaSet(t, f)
 	f.reconcile(t)
 	tr := f.r.startupTrackers[f.req.NamespacedName.String()]
+	if tr.rsUID == "" {
+		t.Fatal("precondition: the current ReplicaSet is resolved")
+	}
 	for i := 0; i < startupMinSamples; i++ {
 		tr.samples[types.UID(fmt.Sprintf("pod-%d", i))] = startupSample{created: f.now.Add(-time.Hour), seconds: 600}
 	}
@@ -551,4 +564,147 @@ func TestV2LeavingTheEngineClearsItsState(t *testing.T) {
 func testGauge(t *testing.T, g *prometheus.GaugeVec, labels ...string) float64 {
 	t.Helper()
 	return testutil.ToFloat64(g.WithLabelValues(labels...))
+}
+
+// Codex #26 repro: the forecast's deadline is 12:04:45; the decision is made at 12:04:44, but the scale read finishes
+// at 12:04:46. The write must not happen on the expired forecast: abort, retry soon, decide again without it.
+func TestV2AnExpiredForecastNeverAuthorizesTheWrite(t *testing.T) {
+	f := v2Harness(t, autoscalerv1alpha1.ModeActive, "3000") // R = 5, an eligible bound of 1000 rps gives 7
+	f.stub.set("eligible", 1000)
+	f.at(284)
+	wrapClient(f.r, interceptor.Funcs{SubResourceGet: func(ctx context.Context, c client.Client, sub string, obj client.Object, out client.Object, opts ...client.SubResourceGetOption) error {
+		if sub == "scale" {
+			f.at(286) // the slow read
+		}
+		return c.SubResource(sub).Get(ctx, obj, out, opts...)
+	}})
+	res := reconcileOnce(t, f.r, f.req)
+	d := lastDecision(t, f.path)
+	var dep appsv1.Deployment
+	if err := f.r.Get(context.Background(), f.req.NamespacedName, &dep); err != nil {
+		t.Fatal(err)
+	}
+	if d.Action != "guard_abort" || *dep.Spec.Replicas != 1 || d.V2.Accepted || d.V2.Verdict != "DeadlinePassed" ||
+		res.RequeueAfter != staleDecisionRetry {
+		t.Fatalf("an expired forecast was written: %+v / %+v, replicas %d, requeue %v", d, d.V2, *dep.Spec.Replicas, res.RequeueAfter)
+	}
+	if c := f.cond(t, "ScalingActive"); c.Reason != "GuardAborted" || !strings.Contains(c.Message, "forecast expired") {
+		t.Fatalf("ScalingActive: %+v", c)
+	}
+	if p := f.pa(t).Status.Prediction; p.Eligible {
+		t.Fatalf("status.prediction still eligible: %+v", p)
+	}
+	f.at(287) // the retry: past the deadline, the decision is reactive and is written
+	if d := f.reconcile(t); d.AppliedReplicas != 5 || d.V2.Accepted {
+		t.Fatalf("retry: %+v", d)
+	}
+}
+
+// The verdict uses the clock after the request: a forecast that expired while it was being fetched is not used.
+func TestV2VerdictUsesTheTimeAfterTheRequest(t *testing.T) {
+	f := v2Harness(t, autoscalerv1alpha1.ModeActive, "3000")
+	f.stub.set("eligible", 1000)
+	f.at(284)
+	f.stub.after = func() { f.at(286) }
+	if d := f.reconcile(t); d.AppliedReplicas != 5 || d.V2.Accepted || d.V2.Verdict != "DeadlinePassed" {
+		t.Fatalf("decision: %+v / %+v", d, d.V2)
+	}
+}
+
+// v2 decisions are anchored to grid origins: the next one is C after this decision's origin (plus the 1 s offset), net
+// of the time the decision took, and a reconcile triggered in between (a status update) decides nothing.
+func TestV2SchedulingIsAnchoredToTheDecisionOrigin(t *testing.T) {
+	for _, c := range []struct {
+		name     string
+		interval int32 // spec.prediction.sampleIntervalSeconds
+		start    int   // seconds after the origin
+		took     int
+		wait     time.Duration
+	}{
+		{"60 s grid, 2 s of work (Codex #26)", 60, 1, 2, 58 * time.Second},
+		{"300 s grid, 60 s reconcile interval", 300, 1, 2, 298 * time.Second},
+		{"started late in the interval", 300, 40, 5, 256 * time.Second},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := v2Harness(t, autoscalerv1alpha1.ModeRecommend, "3000")
+			a := f.pa(t)
+			dt := c.interval
+			a.Spec.Prediction.SampleIntervalSeconds = &dt
+			if err := f.r.Update(context.Background(), a); err != nil {
+				t.Fatal(err)
+			}
+			f.stub.set("eligible", 100)
+			f.at(c.start)
+			f.stub.after = func() { f.at(c.start + c.took) }
+			delete(f.r.lastReconcileMap, f.req.NamespacedName.String())
+			res, err := f.r.Reconcile(context.Background(), f.req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.RequeueAfter != c.wait {
+				t.Fatalf("requeue after %v, want %v", res.RequeueAfter, c.wait)
+			}
+			f.stub.after = nil
+			// A status-triggered reconcile 20 s later: no decision, no request, the same next start.
+			requests := f.stub.requests.Load()
+			f.at(c.start + c.took + 20)
+			res, err = f.r.Reconcile(context.Background(), f.req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.RequeueAfter != c.wait-20*time.Second || f.stub.requests.Load() != requests {
+				t.Fatalf("an in-between reconcile: requeue %v (want %v), requests %d -> %d", res.RequeueAfter, c.wait-20*time.Second,
+					requests, f.stub.requests.Load())
+			}
+			// At the scheduled start, the next decision runs for the next origin.
+			f.at(int(dt) + 1)
+			if _, err := f.r.Reconcile(context.Background(), f.req); err != nil {
+				t.Fatal(err)
+			}
+			if f.stub.requests.Load() != requests+1 || f.stub.last.DecisionOrigin != v2FormatTS(v2Origin.Unix()+int64(dt)) {
+				t.Fatalf("the scheduled decision: requests %d, origin %s", f.stub.requests.Load(), f.stub.last.DecisionOrigin)
+			}
+		})
+	}
+}
+
+// The lead covers the decision interval the scheduler actually keeps: C plus the start offset and jitter.
+func TestV2LeadCoversTheScheduledDecisionInterval(t *testing.T) {
+	for _, c := range []struct {
+		interval time.Duration
+		dt, want int64
+	}{{60 * time.Second, 60, 65}, {60 * time.Second, 300, 305}, {90 * time.Second, 60, 125}, {300 * time.Second, 300, 305}} {
+		if got := v2LeadDecisionInterval(c.interval, c.dt); got != c.want {
+			t.Errorf("%+v: %d", c, got)
+		}
+	}
+}
+
+// serveCurrentReplicaSet answers the target's ReplicaSet and pod lists: one current ReplicaSet, no pods.
+func serveCurrentReplicaSet(t *testing.T, f *v2Fixture) {
+	t.Helper()
+	var dep appsv1.Deployment
+	if err := f.r.Get(context.Background(), f.req.NamespacedName, &dep); err != nil {
+		t.Fatal(err)
+	}
+	dep.Spec.Selector = &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}}
+	if err := f.r.Update(context.Background(), &dep); err != nil {
+		t.Fatal(err)
+	}
+	ctrlTrue := true
+	rs := appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: dep.Name + "-h", Namespace: dep.Namespace, UID: "rs-current",
+		OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "Deployment", Name: dep.Name, UID: dep.UID, Controller: &ctrlTrue}}},
+		Spec: appsv1.ReplicaSetSpec{Template: *dep.Spec.Template.DeepCopy()}}
+	rs.Spec.Template.Labels = map[string]string{podTemplateHashLabel: "h"}
+	wrapClient(f.r, interceptor.Funcs{List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+		switch l := list.(type) {
+		case *appsv1.ReplicaSetList:
+			l.Items = []appsv1.ReplicaSet{rs}
+			return nil
+		case *corev1.PodList:
+			l.Items = nil
+			return nil
+		}
+		return c.List(ctx, list, opts...)
+	}})
 }

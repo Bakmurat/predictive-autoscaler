@@ -8,8 +8,10 @@ waits, unready, on an older one). Autoscalers without `engine: statistical` beha
 
 An autoscaler switched to `engine: statistical` needs a startup budget for its forecasts to count: set
 `spec.behavior.startup.fallbackDelaySeconds` to a conservative scale-out-to-Ready time, or let the operator measure 20
-starts. It also reads the target's pods to measure starts and to report `ScaleOutBlocked`; where its role may not read
-pods, it reports `PodsUnreadable` and uses only the configured budget. Switching back (`engine: legacyLstm` or no
+starts. It also reads the target's ReplicaSets and pods (`get`/`list`) to measure starts and to report
+`ScaleOutBlocked`. The chart grants these with a new role, `<release>-operator-targets`, bound like the write role (only
+in `operator.watchNamespaces` when set); the plain manifests in `k8s-manifests/` grant them cluster-wide. Where they are
+not granted it reports `PodsUnreadable` and uses only the configured budget. Switching back (`engine: legacyLstm` or no
 engine) returns to the v1 path; `status.prediction` and `PredictionReady` are removed.
 
 ## capacityPerReplica replaces the hidden defaults

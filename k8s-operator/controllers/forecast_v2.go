@@ -684,6 +684,10 @@ func decodeV2Response(body []byte) (*v2Response, error) {
 	if err := json.Unmarshal(d.raw["target_timestamps"], &targets); err != nil || targets == nil {
 		d.fail("target_timestamps is not an array of times")
 	}
+	if len(targets) > v2MaxSteps {
+		d.fail("target_timestamps holds more than %d steps", v2MaxSteps)
+		targets = nil
+	}
 	for _, t := range targets {
 		v, err := v2ParseTS(t, "target timestamp")
 		if err != nil {
@@ -694,6 +698,10 @@ func decodeV2Response(body []byte) (*v2Response, error) {
 	var points []json.RawMessage
 	if err := json.Unmarshal(d.raw["point_rps"], &points); err != nil || points == nil {
 		d.fail("point_rps is not an array")
+	}
+	if len(points) > v2MaxSteps {
+		d.fail("point_rps holds more than %d steps", v2MaxSteps)
+		points = nil
 	}
 	for _, p := range points {
 		v, ok := v2Number(p)
@@ -743,6 +751,11 @@ func (r *v2Response) coherent() error {
 	}
 	if !allowed || r.DecisionOrigin%dt != 0 || r.LeadSeconds%dt != 0 || r.LeadSeconds < dt {
 		return fmt.Errorf("the window is not on an admitted grid")
+	}
+	// Bounded before any allocation or timestamp arithmetic: the v2 contract allows at most a 60-minute, 60-step window.
+	if r.LeadSeconds > v2MaxHorizonSeconds || r.LeadSeconds/dt > v2MaxSteps || r.StartupDelaySeconds > v2MaxHorizonSeconds ||
+		r.ActuationAllowanceSeconds > v2MaxHorizonSeconds || len(r.TargetTimestamps) > v2MaxSteps || len(r.PointRPS) > v2MaxSteps {
+		return fmt.Errorf("the window exceeds the contract's %d s / %d steps", v2MaxHorizonSeconds, v2MaxSteps)
 	}
 	w := v2Window{r.DecisionOrigin, dt, r.LeadSeconds}
 	want := w.targets()
@@ -815,6 +828,9 @@ func (r *v2Response) bound(b v2Binding) error {
 		r.SampleIntervalSeconds != b.Settings.SampleIntervalSeconds || r.NominalMiscoverageBps != b.Settings.MiscoverageBps {
 		return fmt.Errorf("%w: the answer does not echo the request's identity, settings and origin", errV2Refused)
 	}
+	if r.LeadSeconds > b.Settings.HorizonSeconds {
+		return fmt.Errorf("%w: the answer's lead exceeds the autoscaler's horizon", errV2Refused)
+	}
 	if r.LeadSeconds != int64(b.Lead.Seconds) || r.StartupDelaySeconds != int64(b.Lead.StartupDelaySeconds) ||
 		r.ActuationAllowanceSeconds != int64(b.Lead.ActuationAllowanceSeconds) {
 		return fmt.Errorf("%w: the answer's lead differs from the autoscaler's", errV2Refused)
@@ -863,6 +879,12 @@ func (r *v2Response) verdict(s v2Settings, now time.Time) v2Verdict {
 		return v2Verdict{Reason: "DeadlinePassed", Detail: "valid until " + v2FormatTS(r.ValidUntil)}
 	}
 	return v2Verdict{Eligible: true, Reason: "Ready"}
+}
+
+// actionable reports whether the answer's own window can still be acted on at now (never extended or slid).
+func (r *v2Response) actionable(now time.Time) bool {
+	w := v2Window{r.DecisionOrigin, r.SampleIntervalSeconds, r.LeadSeconds}
+	return w.actionableAt(now.UnixMilli(), r.StartupDelaySeconds, r.ActuationAllowanceSeconds)
 }
 
 // --- decision -------------------------------------------------------------------------------------------------

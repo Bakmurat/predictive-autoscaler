@@ -24,8 +24,17 @@ func (r *PredictiveAutoscalerReconciler) now() time.Time {
 	return time.Now()
 }
 
-// v2DecisionInterval is C: the longest gap between two v2 decisions. Reconciles are aligned to grid origins
-// (v2Requeue), so it is the reconcile interval rounded up to the cadence, and at least one cadence.
+const (
+	// v2ScheduleOffset: a v2 decision starts this long after its grid origin (tolerates clock skew with the service).
+	v2ScheduleOffset = time.Second
+	// v2ScheduleSlackSeconds is added to C in the lead: the start offset plus queueing jitter.
+	v2ScheduleSlackSeconds = 5
+	// v2MinWait is the shortest requeue (a decision that overran its interval is followed at once).
+	v2MinWait = 100 * time.Millisecond
+)
+
+// v2DecisionInterval is the decision period on the grid: the reconcile interval rounded up to the cadence, and at least
+// one cadence. Decisions are anchored to grid origins (Reconcile), so two decisions are C apart.
 func v2DecisionInterval(reconcileInterval time.Duration, dt int64) int64 {
 	c := int64(math.Ceil(reconcileInterval.Seconds()))
 	c = (c + dt - 1) / dt * dt
@@ -35,16 +44,32 @@ func v2DecisionInterval(reconcileInterval time.Duration, dt int64) int64 {
 	return c
 }
 
-// v2Requeue is when the next v2 decision should run: one second after the first grid origin at least one reconcile
-// interval away, so every decision is made early in its origin's interval, while its window is still actionable.
-func v2Requeue(now time.Time, reconcileInterval time.Duration, dt int64) time.Duration {
-	earliest := now.Add(reconcileInterval).Unix() - 1
-	next := (earliest + dt - 1) / dt * dt
-	at := time.Unix(next+1, 0)
-	if d := at.Sub(now); d >= reconcileInterval {
+// v2LeadDecisionInterval is the C used in the lead: the decision period plus the start offset and queueing jitter, the
+// longest gap between two decisions when the operator keeps up.
+func v2LeadDecisionInterval(reconcileInterval time.Duration, dt int64) int64 {
+	return v2DecisionInterval(reconcileInterval, dt) + v2ScheduleSlackSeconds
+}
+
+// v2ScheduleOf is the grid origin of a decision started at now, and the decision period, for an autoscaler on the v2
+// path with valid settings (ok false otherwise: the ordinary throttle applies).
+func v2ScheduleOf(a *autoscalerv1alpha1.PredictiveAutoscaler, reconcileInterval time.Duration, now time.Time) (origin, c int64, ok bool) {
+	if !v2Selected(a) {
+		return 0, 0, false
+	}
+	s, err := resolveV2Settings(a.Spec)
+	if err != nil {
+		return 0, 0, false
+	}
+	dt := s.SampleIntervalSeconds
+	return now.Unix() / dt * dt, v2DecisionInterval(reconcileInterval, dt), true
+}
+
+// v2Wait is the requeue delay to the next decision: v2ScheduleOffset after the grid origin next, net of now.
+func v2Wait(now time.Time, next int64) time.Duration {
+	if d := time.Unix(next, 0).Add(v2ScheduleOffset).Sub(now); d > v2MinWait {
 		return d
 	}
-	return reconcileInterval
+	return v2MinWait
 }
 
 // prepareV2 resolves what a v2 request needs and publishes status.prediction.{engine, settingsSHA256, lead, leadBasis,
@@ -61,7 +86,7 @@ func (r *PredictiveAutoscalerReconciler) prepareV2(ctx context.Context, a *autos
 	if out.SettingsErr == nil {
 		s := out.Settings
 		want.SettingsSHA256 = s.fingerprint()
-		c := v2DecisionInterval(reconcileInterval, s.SampleIntervalSeconds)
+		c := v2LeadDecisionInterval(reconcileInterval, s.SampleIntervalSeconds)
 		fallback := int64(-1)
 		if cfg.Fallback != nil {
 			fallback = *cfg.Fallback
@@ -149,7 +174,8 @@ func (r *PredictiveAutoscalerReconciler) runV2(ctx context.Context, key string, 
 		}
 		return
 	}
-	out.Verdict = out.Response.verdict(s, now)
+	// The verdict uses the clock after the request, not the reconcile's start: the request takes time.
+	out.Verdict = out.Response.verdict(s, r.now())
 }
 
 // forecastStatus is the decision record's forecast status (and the ForecastAvailable reason) for the v2 path.

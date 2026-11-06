@@ -226,7 +226,7 @@ current generation, and a calculated replica count. The Deployment does not chan
 | `ConflictDetected` | Another replica writer targets the Deployment. | `NoConflict` (False); `ReplicaWriter` (True: an HPA, an unpaused KEDA ScaledObject, another Active PredictiveAutoscaler or a legacy-group autoscaler); `CheckFailed` (status `Unknown`: the check could not finish, which blocks writes like a conflict). |
 | `VPAInterference` | A VerticalPodAutoscaler changes the pods' requests. | `None` (False); `VPAUpdatesPods` (True: a VPA in any mode except `Off`; scaling continues, but per-pod capacity may drift); `CheckFailed` (status `Unknown`). |
 | `PredictionReady` | Engine `statistical` only: the operator verified the last forecast as usable now (ready to activate; Recommend still makes no writes). | `Ready` (True). False with the forecasting service's reason (`HistoryInsufficient`, `CalibrationInsufficient`, `ShadowInsufficient`, `CoverageLow`, `DataUnavailable`, `IdentityMismatch`, `StateUnavailable`, `LeadInsufficient`, `ReplayGateMissing`) or the operator's own: `SettingsInvalid`, `CapacityMissing`, `RequestRefused` (the service refused the request), `ForecastRejected` (the answer failed the operator's checks), `NotEligible`, `EvidenceInsufficient`, `EvidenceStale`, `IssuedInFuture`, `DeadlinePassed`. Collecting evidence is normal: decisions are reactive meanwhile. |
-| `ScaleOutBlocked` | A scale-out cannot complete. | `Unschedulable` (a pod the scheduler cannot place), `QuotaExceeded` or `FailedCreate` (the ReplicaSet cannot create pods) (True); `None` (False); `PodsUnreadable` (status `Unknown`: the operator may not read the target's pods). |
+| `ScaleOutBlocked` | A scale-out cannot complete. | `Unschedulable` (a pod the scheduler cannot place), `QuotaExceeded` or `FailedCreate` (the ReplicaSet cannot create pods) (True); `None` (False); `PodsUnreadable` (status `Unknown`: the operator may not read the target's ReplicaSets or pods); `OwnershipUnresolved` (status `Unknown`: the Deployment's current ReplicaSet could not be identified with certainty). Only the current ReplicaSet's pods count. |
 | `ScaleDownHeadroom` | A scale-down is held to keep headroom. | `Holding` (True); `NotHolding` (headroom is not blocking a scale-down; it says nothing about how much spare capacity exists); `RecommendMode`. Informational: never affects `Ready` or `ScalingActive`. |
 
 ### Events
@@ -453,10 +453,11 @@ up to an hour shorter). "Ready" here means ready to activate: Recommend mode sti
 forecast windows is not a latency or error-rate guarantee.
 
 **What the operator does with it** (`spec.prediction.engine: statistical`). It never takes the service's word for a
-write. It publishes the lead it needs (the scale-out-to-Ready budget, measured from the target's own pod starts or
-`spec.behavior.startup.fallbackDelaySeconds` until 20 starts are measured, plus a decision interval and an allowance),
-asks for the window starting at the current grid time, and checks the answer itself: identity, settings, window, an
-upper bound backed by enough evidence, and enough time left in the window. Only then does the bound count:
+write. It publishes the lead it needs: a startup budget (pod creation to Ready of the current ReplicaSet's pods once 20
+starts are measured, otherwise `spec.behavior.startup.fallbackDelaySeconds`), plus a decision interval and an allowance
+that also covers the time from the scale request to the pod's creation. It asks for the window starting at the current
+grid time and checks the answer itself: identity, settings, window, an upper bound backed by enough evidence, and enough
+time left in the window, checked again right before the write. Only then does the bound count:
 `ceil(bound / capacityPerReplica)` replicas, but never more than `spec.prediction.predictiveExtra` above the reactive need
 (2 replicas or 50 % by default). Everything else stays as described here: the reactive need, the hold on missing
 telemetry, headroom, stabilization and every write check; Recommend never writes. `kubectl get pa -o yaml` shows it in

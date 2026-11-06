@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -395,16 +396,24 @@ func TestV2SelectionNeedsTheStatisticalEngine(t *testing.T) {
 	}
 }
 
-func TestV2RequeueLandsEarlyInAGridInterval(t *testing.T) {
-	now := time.Unix(1762430400+137, 0) // 2026-11-06T12:02:17Z
-	for _, c := range []struct {
-		interval time.Duration
-		dt       int64
-	}{{60 * time.Second, 300}, {300 * time.Second, 300}, {60 * time.Second, 60}, {90 * time.Second, 60}} {
-		d := v2Requeue(now, c.interval, c.dt)
-		at := now.Add(d).Unix()
-		if d < c.interval || (at-1)%c.dt != 0 {
-			t.Errorf("%+v: requeue %v lands at %d (offset %d)", c, d, at, at%c.dt)
+// A grid-aligned but huge lead must be refused before anything is allocated (Codex #26: makeslice panic).
+func TestV2HugeLeadIsRefusedWithoutAllocating(t *testing.T) {
+	f := loadV2Fixtures(t)
+	var wire map[string]interface{}
+	if err := json.Unmarshal(f.Responses.Valid[0].Wire, &wire); err != nil {
+		t.Fatal(err)
+	}
+	for _, lead := range []float64{300 * 1e12, 3900, 300 * 61} {
+		wire["lead_seconds"] = lead
+		raw, _ := json.Marshal(wire)
+		if _, err := decodeV2Response(raw); err == nil || !strings.Contains(err.Error(), "refused") {
+			t.Fatalf("lead %v: %v", lead, err)
 		}
+	}
+	wire["lead_seconds"] = 1200
+	wire["target_timestamps"] = make([]string, 100000)
+	raw, _ := json.Marshal(wire)
+	if _, err := decodeV2Response(raw); err == nil {
+		t.Fatal("a huge target list must be refused")
 	}
 }

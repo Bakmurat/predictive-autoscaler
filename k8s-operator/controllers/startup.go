@@ -2,9 +2,6 @@ package controllers
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
@@ -13,7 +10,9 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -21,16 +20,20 @@ import (
 )
 
 // Startup delay (plan item 4, minimum version; design C2 section 5): how long a scale-out takes to become usable, per
-// target. The operator reads the target's pods (uncached) and records, once per pod, creation to Ready for pods of the
-// current pod template that became Ready without a restart; only Ready pods count as serving. With at least
-// startupMinSamples such starts in the last 7 days the budget is their 90th percentile plus startupMarginPercent;
-// otherwise the configured spec.behavior.startup.fallbackDelaySeconds, and without that there is no budget (and so no
-// predictive lead). A pod still not Ready is a censored start: when it is already older than the budget, its age becomes
-// the budget, so a slow scale-out can never make the lead look shorter than it is. A pod-template change discards the
-// samples (per-replica startup may have changed with it).
+// target. The operator resolves the target's current ReplicaSet (owned by the Deployment, at the Deployment's revision,
+// with the Deployment's pod template) and reads, uncached, only the pods that ReplicaSet controls. Once per pod it
+// records pod creation to Ready for pods that became Ready without a restart; only Ready pods count as serving. This is
+// not the whole startup: the time from the scale request to the pod's creation (the ReplicaSet controller's work) is not
+// in it, and the actuation allowance covers it. With at least startupMinSamples such starts in the last 7 days the
+// budget is their 90th percentile plus startupMarginPercent; otherwise the configured
+// spec.behavior.startup.fallbackDelaySeconds, and without that there is no budget (and so no predictive lead). A pod
+// still not Ready is a censored start: when it is already older than the budget, its age becomes the budget. A new
+// current ReplicaSet (a rollout, a rollback) discards the samples. When the current ReplicaSet cannot be identified with
+// certainty, nothing is measured and nothing is attributed: the configured budget applies.
 //
-// The same observation surfaces scale-outs that cannot complete: pods the scheduler cannot place (Unschedulable) and
-// pods the ReplicaSet cannot create (the Deployment's ReplicaFailure condition, for example an exceeded quota).
+// The same observation surfaces scale-outs that cannot complete: pods of the current ReplicaSet the scheduler cannot
+// place (Unschedulable) and pods the ReplicaSet cannot create (the Deployment's ReplicaFailure condition, for example an
+// exceeded quota).
 
 const (
 	startupMinSamples    = 20
@@ -39,9 +42,10 @@ const (
 	startupPercentile    = 90
 	startupMarginPercent = 25
 	podTemplateHashLabel = "pod-template-hash"
+	revisionAnnotation   = "deployment.kubernetes.io/revision"
 )
 
-// startupListTimeout bounds the pod read: a stalled API server must not stall the decision.
+// startupListTimeout bounds each read: a stalled API server must not stall the decision.
 var startupListTimeout = 3 * time.Second
 
 type startupSample struct {
@@ -51,27 +55,21 @@ type startupSample struct {
 
 // startupTracker holds one target's samples in memory (an operator restart starts again from the configured budget).
 type startupTracker struct {
-	targetUID     types.UID
-	templateSHA   string
-	templateSince time.Time // when a template change was seen; zero when the operator started with the template
-	samples       map[types.UID]startupSample
+	targetUID types.UID
+	rsUID     types.UID // the current ReplicaSet the samples belong to
+	samples   map[types.UID]startupSample
 }
 
 // startupObservation is one reconcile's view of the target's startup and of blocked scale-outs.
 type startupObservation struct {
-	Observable  bool   // the pods could be read
+	Observable  bool   // the current ReplicaSet was identified and its pods read
 	ReadError   string // why not
+	Unresolved  bool   // the reads worked, but the current ReplicaSet could not be identified with certainty
 	SampleCount int
 	P90         *int64 // seconds, with at least startupMinSamples samples
-	Pending     *int64 // age of the oldest current-template pod not yet Ready, seconds
+	Pending     *int64 // age of the oldest pod of the current ReplicaSet not yet Ready, seconds
 	Blocked     string // Unschedulable, QuotaExceeded, FailedCreate or ""
 	BlockedMsg  string
-}
-
-func templateSHA(dep *appsv1.Deployment) string {
-	raw, _ := json.Marshal(dep.Spec.Template)
-	sum := sha256.Sum256(raw)
-	return hex.EncodeToString(sum[:])
 }
 
 func podCondition(p *corev1.Pod, t corev1.PodConditionType) *corev1.PodCondition {
@@ -91,19 +89,66 @@ func podRestarts(p *corev1.Pod) int32 {
 	return n
 }
 
-// observeStartup updates the target's samples from its pods and reports the startup budget inputs and blockers.
+// controlledBy reports whether obj's controller owner reference is the object with this UID.
+func controlledBy(obj metav1.Object, uid types.UID) bool {
+	ref := metav1.GetControllerOf(obj)
+	return ref != nil && ref.UID == uid
+}
+
+// sameTemplate compares a ReplicaSet's pod template with the Deployment's, ignoring the pod-template-hash label the
+// Deployment controller adds to the ReplicaSet's copy.
+func sameTemplate(rs *appsv1.ReplicaSet, dep *appsv1.Deployment) bool {
+	t := rs.Spec.Template.DeepCopy()
+	delete(t.Labels, podTemplateHashLabel)
+	if len(t.Labels) == 0 {
+		t.Labels = nil
+	}
+	d := dep.Spec.Template.DeepCopy()
+	if len(d.Labels) == 0 {
+		d.Labels = nil
+	}
+	return apiequality.Semantic.DeepEqual(*t, *d)
+}
+
+// currentReplicaSet is the Deployment's ReplicaSet for its current template: controlled by the Deployment, at the
+// Deployment's revision (when it records one) and with the Deployment's pod template. Exactly one must match; otherwise
+// the answer is nil (uncertain).
+func (r *PredictiveAutoscalerReconciler) currentReplicaSet(ctx context.Context, dep *appsv1.Deployment, sel labels.Selector) (*appsv1.ReplicaSet, error) {
+	var list appsv1.ReplicaSetList
+	lctx, cancel := context.WithTimeout(ctx, startupListTimeout)
+	err := r.reader().List(lctx, &list, client.InNamespace(dep.Namespace), client.MatchingLabelsSelector{Selector: sel})
+	cancel()
+	if err != nil {
+		return nil, err
+	}
+	revision := dep.Annotations[revisionAnnotation]
+	var found *appsv1.ReplicaSet
+	for i := range list.Items {
+		rs := &list.Items[i]
+		if rs.DeletionTimestamp != nil || !controlledBy(rs, dep.UID) || !sameTemplate(rs, dep) {
+			continue
+		}
+		if revision != "" && rs.Annotations[revisionAnnotation] != revision {
+			continue
+		}
+		if found != nil {
+			return nil, nil // two candidates: uncertain
+		}
+		found = rs
+	}
+	return found, nil
+}
+
+// observeStartup updates the target's samples from its current ReplicaSet's pods and reports the startup budget inputs
+// and blockers.
 func (r *PredictiveAutoscalerReconciler) observeStartup(ctx context.Context, key string, dep *appsv1.Deployment, now time.Time) startupObservation {
 	if r.startupTrackers == nil {
 		r.startupTrackers = map[string]*startupTracker{}
 	}
 	tr := r.startupTrackers[key]
-	sha := templateSHA(dep)
-	switch {
-	case tr == nil || tr.targetUID != dep.UID:
-		tr = &startupTracker{targetUID: dep.UID, templateSHA: sha, samples: map[types.UID]startupSample{}}
+	if tr == nil || tr.targetUID != dep.UID {
+		tr = &startupTracker{targetUID: dep.UID, samples: map[types.UID]startupSample{}}
 		r.startupTrackers[key] = tr
-	case tr.templateSHA != sha:
-		tr.templateSHA, tr.templateSince, tr.samples = sha, now, map[types.UID]startupSample{}
 	}
 	var obs startupObservation
 	for _, c := range dep.Status.Conditions {
@@ -118,17 +163,28 @@ func (r *PredictiveAutoscalerReconciler) observeStartup(ctx context.Context, key
 	if err == nil && sel.Empty() {
 		err = fmt.Errorf("the Deployment has an empty selector")
 	}
-	var pods corev1.PodList
+	var rs *appsv1.ReplicaSet
 	if err == nil {
+		rs, err = r.currentReplicaSet(ctx, dep, sel)
+	}
+	var pods corev1.PodList
+	if err == nil && rs != nil {
 		lctx, cancel := context.WithTimeout(ctx, startupListTimeout)
 		err = r.reader().List(lctx, &pods, client.InNamespace(dep.Namespace), client.MatchingLabelsSelector{Selector: sel})
 		cancel()
 	}
-	if err != nil {
+	switch {
+	case err != nil:
 		obs.ReadError = err.Error()
-	} else {
+	case rs == nil:
+		obs.Unresolved = true
+		obs.ReadError = "the Deployment's current ReplicaSet could not be identified (none or several at its revision and template)"
+	default:
 		obs.Observable = true
-		r.recordStartups(tr, pods.Items, now, &obs)
+		if tr.rsUID != rs.UID { // a rollout or rollback: per-replica startup may have changed with the template
+			tr.rsUID, tr.samples = rs.UID, map[types.UID]startupSample{}
+		}
+		r.recordStartups(tr, rs.UID, pods.Items, now, &obs)
 	}
 	for uid, s := range tr.samples {
 		if now.Sub(s.created) > startupWindow {
@@ -145,6 +201,10 @@ func (r *PredictiveAutoscalerReconciler) observeStartup(ctx context.Context, key
 		delete(tr.samples, oldest)
 	}
 	obs.SampleCount = len(tr.samples)
+	if !obs.Observable {
+		obs.SampleCount = 0 // nothing attributable this time: the configured budget applies
+		return obs
+	}
 	if obs.SampleCount >= startupMinSamples {
 		vals := make([]int64, 0, len(tr.samples))
 		for _, s := range tr.samples {
@@ -157,29 +217,13 @@ func (r *PredictiveAutoscalerReconciler) observeStartup(ctx context.Context, key
 	return obs
 }
 
-// recordStartups adds the completed starts of the current pod template and finds pending pods and unschedulable ones.
-func (r *PredictiveAutoscalerReconciler) recordStartups(tr *startupTracker, pods []corev1.Pod, now time.Time, obs *startupObservation) {
-	// The current template is the newest live pod's; pods of an older template are leaving and say nothing about it.
-	var newest *corev1.Pod
-	for i := range pods {
-		p := &pods[i]
-		if p.DeletionTimestamp != nil || p.Labels[podTemplateHashLabel] == "" {
-			continue
-		}
-		if newest == nil || newest.CreationTimestamp.Before(&p.CreationTimestamp) ||
-			(newest.CreationTimestamp.Equal(&p.CreationTimestamp) && p.UID > newest.UID) {
-			newest = p
-		}
-	}
-	if newest == nil {
-		return
-	}
-	hash := newest.Labels[podTemplateHashLabel]
+// recordStartups adds the completed starts of the current ReplicaSet's pods and finds its pending and unschedulable pods.
+// Pods of other owners that share the selector, and of older ReplicaSets, are ignored.
+func (r *PredictiveAutoscalerReconciler) recordStartups(tr *startupTracker, rsUID types.UID, pods []corev1.Pod, now time.Time, obs *startupObservation) {
 	for i := range pods {
 		p := &pods[i]
 		created := p.CreationTimestamp.Time
-		if p.DeletionTimestamp != nil || p.Labels[podTemplateHashLabel] != hash || created.IsZero() ||
-			(!tr.templateSince.IsZero() && created.Before(tr.templateSince)) || now.Sub(created) > startupWindow {
+		if p.DeletionTimestamp != nil || !controlledBy(p, rsUID) || created.IsZero() || now.Sub(created) > startupWindow {
 			continue
 		}
 		ready := podCondition(p, corev1.PodReady)
@@ -264,7 +308,8 @@ func int32Ptr(v int64) *int32 {
 
 // status is the startup part of status.prediction.
 func (obs startupObservation) status(delay int64, method string, ok bool) *autoscalerv1alpha1.StartupStatus {
-	st := &autoscalerv1alpha1.StartupStatus{Method: method, SampleCount: int32(obs.SampleCount), Observable: obs.Observable}
+	st := &autoscalerv1alpha1.StartupStatus{Method: method, SampleCount: int32(obs.SampleCount), Observable: obs.Observable,
+		Measures: "podCreationToReady"}
 	if ok {
 		st.DelaySeconds = int32Ptr(delay)
 	}

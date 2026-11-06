@@ -116,6 +116,7 @@ type PredictiveAutoscalerReconciler struct {
 	// Clock is the time source of the forecast v2 path and the startup measurement (nil: time.Now); tests inject one.
 	Clock           func() time.Time
 	v2Cache         map[string]*v2CachedForecast
+	v2LastOrigin    map[string]int64 // the grid origin of the last v2 decision (scheduling, see Reconcile)
 	startupTrackers map[string]*startupTracker
 }
 
@@ -233,6 +234,7 @@ type VMInstantQueryResponse struct {
 //+kubebuilder:rbac:groups=apps,resources=deployments/scale,verbs=get;update
 //+kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+//+kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get;list
 //+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 //+kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch
 //+kubebuilder:rbac:groups=keda.sh,resources=scaledobjects,verbs=get;list;watch
@@ -280,7 +282,21 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	if reconcileInterval < time.Duration(minReconcileSeconds)*time.Second {
 		reconcileInterval = time.Duration(minReconcileSeconds) * time.Second
 	}
-	if lastTime, ok := r.lastReconcileMap[key]; ok {
+	// Forecast v2 decisions are anchored to grid origins: at most one decision per decision interval C (the reconcile
+	// interval rounded up to the grid), started one second after its origin, whatever triggers the reconcile (a status
+	// update, a watch event) and however long the previous one took. Deleting the throttle entry (a fast retry) releases it.
+	v2Origin, v2C, v2Scheduled := v2ScheduleOf(&autoscaler, reconcileInterval, r.now())
+	if v2Scheduled {
+		if last, seen := r.v2LastOrigin[key]; seen && v2Origin < last+v2C {
+			if _, throttled := r.lastReconcileMap[key]; throttled {
+				return ctrl.Result{RequeueAfter: v2Wait(r.now(), last+v2C)}, nil
+			}
+		}
+		if r.v2LastOrigin == nil {
+			r.v2LastOrigin = map[string]int64{}
+		}
+		r.v2LastOrigin[key] = v2Origin
+	} else if lastTime, ok := r.lastReconcileMap[key]; ok {
 		if elapsed := time.Since(lastTime); elapsed < reconcileInterval {
 			return ctrl.Result{RequeueAfter: reconcileInterval - elapsed}, nil
 		}
@@ -624,6 +640,17 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 			r.recordDecision(dec, "guard_abort", currentReplicas)
 			return false, nil
 		}
+		// A decision that used a v2 forecast is written only while that forecast's window is still actionable, checked
+		// on the clock now, after the slow reads: an expired forecast never authorizes a write. The next reconcile, in
+		// seconds, decides again without it (or with the next window).
+		if v2pol != nil && !v2out.Response.actionable(r.now()) {
+			guard, retrySoon = "the forecast expired before the write (valid until "+v2FormatTS(v2out.Response.ValidUntil)+")", true
+			v2out.Verdict = v2Verdict{Reason: "DeadlinePassed", Detail: guard}
+			dec.V2.Accepted, dec.V2.Verdict, dec.V2.VerdictDetail = false, "DeadlinePassed", guard
+			log.Info("Not scaling: the forecast expired before the write", "guard", guard)
+			r.recordDecision(dec, "guard_abort", currentReplicas)
+			return false, nil
+		}
 		if err := r.writeScale(wctx, deployment, scale, to); err != nil {
 			if errors.IsConflict(err) {
 				return stale(err)
@@ -754,9 +781,9 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		delete(r.lastReconcileMap, key)
 		return ctrl.Result{RequeueAfter: staleDecisionRetry}, nil
 	}
-	if useV2 && v2out.SettingsErr == nil {
-		// Early in a grid origin's interval, while that origin's window is still actionable.
-		return ctrl.Result{RequeueAfter: v2Requeue(r.now(), reconcileInterval, v2out.Settings.SampleIntervalSeconds)}, nil
+	if v2Scheduled {
+		// The next decision: one decision interval after this decision's origin, net of the time this one took.
+		return ctrl.Result{RequeueAfter: v2Wait(r.now(), v2Origin+v2C)}, nil
 	}
 	return ctrl.Result{RequeueAfter: reconcileInterval}, nil
 }
@@ -1624,6 +1651,8 @@ func (r *PredictiveAutoscalerReconciler) updateStatus(ctx context.Context, autos
 	switch {
 	case in.startup.Blocked != "":
 		setStatus("ScaleOutBlocked", metav1.ConditionTrue, in.startup.Blocked, in.startup.BlockedMsg)
+	case in.startup.Unresolved:
+		setStatus("ScaleOutBlocked", metav1.ConditionUnknown, "OwnershipUnresolved", in.startup.ReadError)
 	case !in.startup.Observable:
 		setStatus("ScaleOutBlocked", metav1.ConditionUnknown, "PodsUnreadable", "the target's pods could not be read: "+in.startup.ReadError)
 	default:
