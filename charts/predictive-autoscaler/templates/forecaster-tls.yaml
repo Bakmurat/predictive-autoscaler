@@ -3,7 +3,7 @@
 {{- if .Values.forecaster.auth.enabled }}
 {{- $tls := .Values.forecaster.tls }}
 {{- $svc := printf "%s-forecaster" (include "pa.fullname" .) }}
-{{- $dns := list $svc (printf "%s.%s" $svc .Release.Namespace) (printf "%s.%s.svc" $svc .Release.Namespace) (printf "%s.%s.svc.cluster.local" $svc .Release.Namespace) }}
+{{- $dns := concat (list $svc (printf "%s.%s" $svc .Release.Namespace) (printf "%s.%s.svc" $svc .Release.Namespace) (printf "%s.%s.svc.cluster.local" $svc .Release.Namespace)) $tls.extraDNSNames }}
 {{- if eq $tls.source "selfSigned" }}
 {{- /* Kept across upgrades with lookup. Under Argo CD (no lookup) every render would make a new certificate: use
        certManager or existingSecret there (docs/helm.md). */}}

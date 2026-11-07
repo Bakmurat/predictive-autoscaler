@@ -71,6 +71,9 @@ if [ "$run_go" = 1 ]; then
     status_line "go vet" "$rc" | tee -a "$LOG"; [ "$rc" -eq 0 ] || overall=1
     ( cd k8s-operator && "$GO" test -race -count=1 ./... ) 2>&1 | tee -a "$LOG"; rc=${PIPESTATUS[0]}
     status_line "go test -race" "$rc" | tee -a "$LOG"; [ "$rc" -eq 0 ] || overall=1
+    # The C2.8 evaluation fixture (its own module, standard library only).
+    ( cd deploy/eval-c28/fixture && "$GO" vet ./... && "$GO" test -race -count=1 ./... ) 2>&1 | tee -a "$LOG"; rc=${PIPESTATUS[0]}
+    status_line "c28 fixture" "$rc" | tee -a "$LOG"; [ "$rc" -eq 0 ] || overall=1
     # The CRD and deepcopy code must be exactly what the API types' markers generate.
     scripts/gen-manifests.sh check 2>&1 | tee -a "$LOG"; rc=${PIPESTATUS[0]}
     status_line "generated code" "$rc" | tee -a "$LOG"; [ "$rc" -eq 0 ] || overall=1
@@ -81,6 +84,11 @@ if [ "$run_py" = 1 ]; then
   # shellcheck disable=SC2086
   ( cd ml-engine && "$PYTHON" -m pytest -q $PYTEST_ARGS tests ) 2>&1 | tee -a "$LOG"; rc=${PIPESTATUS[0]}
   status_line "pytest" "$rc" | tee -a "$LOG"; [ "$rc" -eq 0 ] || overall=1
+  # The C2.8 evaluation harness (manifests, plans, run-lock, collector, scorer) on synthetic data, and its offline smoke.
+  ( cd deploy/eval-c28/harness && "$PYTHON" -m pytest -q -p no:cacheprovider tests ) 2>&1 | tee -a "$LOG"; rc=${PIPESTATUS[0]}
+  status_line "c28 harness" "$rc" | tee -a "$LOG"; [ "$rc" -eq 0 ] || overall=1
+  PYTHON="$PYTHON" deploy/eval-c28/smoke/kind.sh --render-only 2>&1 | tee -a "$LOG"; rc=${PIPESTATUS[0]}
+  status_line "c28 render-only smoke" "$rc" | tee -a "$LOG"; [ "$rc" -eq 0 ] || overall=1
   # The operator's forecast contract v2 fixtures must be what ml-engine/forecasting/contracts.py generates now.
   "$PYTHON" k8s-operator/hack/gen_v2_fixtures.py check 2>&1 | tee -a "$LOG"; rc=${PIPESTATUS[0]}
   status_line "v2 contract fixtures" "$rc" | tee -a "$LOG"; [ "$rc" -eq 0 ] || overall=1
