@@ -1,0 +1,16 @@
+# The statistical forecaster in a C2.8 lab evaluation: a reviewed lab qualification mounted from a ConfigMap (the
+# image must be the evaluation build of the source tree it names, or the forecaster refuses to start).
+prometheus:
+  url: http://prometheus:9090
+forecaster:
+  engine: statistical
+  statistical:
+    labQualification:
+      configMap: pa-lab-qualification
+networkPolicy:
+  prometheus:
+    namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: monitoring}}
+images:
+  statisticalForecaster:
+    repository: ghcr.io/bakmurat/predictive-autoscaler-forecaster-statistical
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000

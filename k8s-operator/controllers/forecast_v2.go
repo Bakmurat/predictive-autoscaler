@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"time"
 
@@ -88,7 +89,11 @@ type v2Settings struct {
 	Trust                 [15]int64
 	ExtraMaxReplicas      int64
 	ExtraMaxPercent       int64
+	Families              []string // sorted; seasonalNaive always present
 }
+
+// v2Families are the forecast families spec.prediction.families may list.
+var v2Families = []string{"seasonalNaive", "statistical"}
 
 var v2CalibrationKeys = [6]string{"min_windows", "max_scores", "retention_days", "eta_bps", "min_miscoverage_bps",
 	"max_miscoverage_bps"}
@@ -127,7 +132,7 @@ func v2Default() v2Settings {
 		HistoryDays: 14, HorizonSeconds: 3600, SettlementSeconds: 120, OutcomeGraceSeconds: 600, MiscoverageBps: 1000,
 		Calibration:      [6]int64{128, 512, 7, 50, 100, 2500},
 		Trust:            [15]int64{48, 64, 500, 24, 9500, 5, 32, 24, 32, 64, 48, 9500, 10000, 10200, 12},
-		ExtraMaxReplicas: 2, ExtraMaxPercent: 50}
+		ExtraMaxReplicas: 2, ExtraMaxPercent: 50, Families: []string{"seasonalNaive", "statistical"}}
 }
 
 type v2Bound struct {
@@ -251,6 +256,24 @@ func resolveV2Settings(spec autoscalerv1alpha1.PredictiveAutoscalerSpec) (v2Sett
 			return s, err
 		}
 	}
+	if p.Families != nil { // [] is refused (the CRD needs one item); absent keeps both families
+		if len(p.Families) == 0 {
+			return s, fmt.Errorf("spec.prediction.families must not be empty")
+		}
+		seen := map[string]bool{}
+		for _, f := range p.Families {
+			if !v2In(f, v2Families) || seen[f] {
+				return s, fmt.Errorf("spec.prediction.families must list distinct families of %v, got %v", v2Families, p.Families)
+			}
+			seen[f] = true
+		}
+		if !seen["seasonalNaive"] {
+			return s, fmt.Errorf("spec.prediction.families must include seasonalNaive (the statistical family is selected " +
+				"only over a trusted seasonal-naive forecast)")
+		}
+		s.Families = append([]string(nil), p.Families...)
+		sort.Strings(s.Families)
+	}
 	return s, s.feasible()
 }
 
@@ -308,6 +331,7 @@ func (s v2Settings) canonical() map[string]interface{} {
 		"outcome_grace_seconds": s.OutcomeGraceSeconds, "risk": s.riskMap(), "calibration": s.calibrationMap(),
 		"trust":            s.group(v2TrustKeys[:], s.Trust[:]),
 		"predictive_extra": map[string]interface{}{"max_replicas": s.ExtraMaxReplicas, "max_percent": s.ExtraMaxPercent},
+		"families":         s.Families,
 	}}
 }
 

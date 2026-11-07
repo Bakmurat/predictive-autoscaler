@@ -21,6 +21,7 @@ Refusals are ContractRefused (HTTP 422); identity refusals and lookup failures k
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -180,6 +181,7 @@ class ForecastSettings:
     calibration: CalibrationSettings = field(default_factory=CalibrationSettings)
     trust: TrustSettings = field(default_factory=TrustSettings)
     predictive_extra: PredictiveExtraSettings = field(default_factory=PredictiveExtraSettings)
+    families: Tuple[str, ...] = ("seasonalNaive", "statistical")   # sorted; seasonalNaive always present
 
     @property
     def freshness_seconds(self) -> int:
@@ -219,7 +221,9 @@ _TRUST = (("minShadowHours", "min_shadow_hours", 1, 24 * 28), ("minProspectiveWi
           ("maxFitAgeHours", "max_fit_age_hours", 1, 24))
 _EXTRA = (("maxReplicas", "max_replicas", 0, 1000), ("maxPercent", "max_percent", 0, 1000))
 _TOP = ("engine", "sampleIntervalSeconds", "seasonality", "historyDays", "settlementSeconds", "outcomeGraceSeconds",
-        "risk", "calibration", "trust", "predictiveExtra")
+        "risk", "calibration", "trust", "predictiveExtra", "families")
+FAMILIES = ("seasonalNaive", "statistical")
+FAMILY_MODELS = {"seasonalNaive": "seasonal_naive", "statistical": "statistical"}   # spec name -> model family
 
 
 def _object(parent: Mapping, key: str, where: str) -> Mapping:
@@ -297,9 +301,19 @@ def resolve_settings(pa: Mapping) -> ForecastSettings:
     trust = _int_group(_object(pred, "trust", "spec.prediction"), _TRUST, TrustSettings, "spec.prediction.trust")
     extra = _int_group(_object(pred, "predictiveExtra", "spec.prediction"), _EXTRA, PredictiveExtraSettings,
                        "spec.prediction.predictiveExtra")
+    families = pred.get("families", None)
+    if families is None:
+        families = list(d.families)
+    if not isinstance(families, list) or not families or len(set(families)) != len(families) or \
+            any(f not in FAMILIES for f in families):
+        raise ContractRefused(f"spec.prediction.families must list distinct families of {FAMILIES}, got {families!r}")
+    if "seasonalNaive" not in families:
+        raise ContractRefused("spec.prediction.families must include seasonalNaive (the statistical family is selected "
+                              "only over a trusted seasonal-naive forecast)")
     s = ForecastSettings(engine=engine, sample_interval_seconds=interval, seasonality=seasonality,
                          history_days=history_days, horizon_seconds=horizon, settlement_seconds=settle,
-                         outcome_grace_seconds=grace, risk=risk, calibration=cal, trust=trust, predictive_extra=extra)
+                         outcome_grace_seconds=grace, risk=risk, calibration=cal, trust=trust, predictive_extra=extra,
+                         families=tuple(sorted(families)))
     _check_feasible(s)
     return s
 
@@ -495,6 +509,7 @@ class BoundRequest:
     decision_origin: int
     lead: Optional[LeadSelection]
     lead_problem: str             # why lead is None ("" when it is set)
+    spec: Mapping = field(default_factory=dict)    # the same object's spec (policy inputs: capacity, bounds, holds)
 
     @property
     def window(self) -> Optional[ForecastWindow]:
@@ -528,7 +543,7 @@ def bind_request(body, reader: KubeReader, *, now_ms: int) -> BoundRequest:
     lead, why = resolve_lead(pa, settings, sig.generation)
     return BoundRequest(autoscaler_namespace=req.identity["autoscaler_namespace"],
                         autoscaler_name=req.identity["autoscaler_name"], signal=sig, settings=settings, settings_sha256=sha, decision_origin=req.decision_origin,
-                        lead=lead, lead_problem=why)
+                        lead=lead, lead_problem=why, spec=copy.deepcopy(pa.get("spec") or {}))
 
 
 # --- response ---------------------------------------------------------------------------------------------------

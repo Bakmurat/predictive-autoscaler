@@ -559,6 +559,10 @@ hand a capacity-only object back to an older Active operator
 the statistical engine, set `spec.behavior.startup.fallbackDelaySeconds` too (or wait for 20 measured starts): without a
 startup budget there is no lead, and decisions stay reactive.
 
+**Forecast families (CRD revision 5).** `spec.prediction.families` restricts the statistical forecaster's candidates;
+`[seasonalNaive]` never forecasts or selects E1-product. Apply the CRD before the operator
+([upgrading.md](upgrading.md#forecast-families-crd-revision-5)).
+
 **From the legacy API group.** Before v0.1.0 the group was `autoscaler.example.com`; it is now
 `autoscaling.devkuban.com`. Objects are not converted; each one is re-created in the new group, in steps that never
 let two operators scale one Deployment: install the new version side by side, then `hack/migrate-api-group.py` `plan`,

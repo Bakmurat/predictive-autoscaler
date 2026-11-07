@@ -56,6 +56,14 @@ forecaster:
       size: 2Gi
       retain: true
     stateQuota: 1536Mi       # the journal's own budget inside the volume (database + WAL)
+    # C2.8 lab evaluation ONLY: a reviewed lab-qualification/v1 file (docs/helm.md) in a ConfigMap you create. The
+    # image must be the EVALUATION build of exactly the source tree the file names, or the forecaster does not start
+    # (a release image never honours it); it stands in for the release gate for the named cluster UID, namespaces and
+    # target UIDs only, and every runtime trust gate still applies. Also lets the forecaster read the kube-system
+    # Namespace (the cluster UID). Empty: off.
+    labQualification:
+      configMap: ""
+      key: lab-qualification.json
   # Only the operator may call the forecasting service: its projected service account token, checked with TokenReview,
   # over TLS. Off: plain HTTP, and the NetworkPolicies are the only boundary.
   auth:

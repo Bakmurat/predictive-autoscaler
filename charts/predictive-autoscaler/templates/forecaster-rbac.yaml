@@ -40,3 +40,31 @@ subjects:
     namespace: {{ $.Release.Namespace }}
 ---
 {{- end }}
+{{- if include "pa.labQualification" . }}
+# C2.8 lab evaluation only: the forecaster reads the cluster's identity (the kube-system Namespace UID) to check a lab
+# qualification's scope. One named object, get only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "pa.fullname" . }}-forecaster-cluster-identity
+  labels: {{- include "pa.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    resourceNames: ["kube-system"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "pa.fullname" . }}-forecaster-cluster-identity
+  labels: {{- include "pa.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "pa.fullname" . }}-forecaster-cluster-identity
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "pa.fullname" . }}-forecaster
+    namespace: {{ .Release.Namespace }}
+{{- end }}

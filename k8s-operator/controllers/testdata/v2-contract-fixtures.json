@@ -795,7 +795,7 @@
    "metric_query_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
    "nominal_miscoverage_bps": 1000,
    "sample_interval_seconds": 300,
-   "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+   "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
    "target_name": "web",
    "target_namespace": "shop",
    "target_uid": "dep-uid"
@@ -844,7 +844,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -906,7 +906,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -967,7 +967,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -1029,7 +1029,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -1091,7 +1091,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -1153,7 +1153,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -1214,7 +1214,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -1275,7 +1275,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -1337,7 +1337,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -1399,7 +1399,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -1461,7 +1461,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -1523,7 +1523,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -1585,7 +1585,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -1647,7 +1647,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -1709,7 +1709,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -1771,7 +1771,7 @@
      "reason": "CoverageLow",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -1833,7 +1833,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -1895,7 +1895,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -1957,7 +1957,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -2019,7 +2019,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -2081,7 +2081,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -2143,7 +2143,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -2205,7 +2205,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "other",
@@ -2267,7 +2267,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -2391,7 +2391,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -2453,7 +2453,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -2515,7 +2515,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -2577,7 +2577,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -2639,7 +2639,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -2701,7 +2701,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -2825,7 +2825,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -2887,7 +2887,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -2949,7 +2949,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -3011,7 +3011,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 300,
      "target_name": "web",
      "target_namespace": "shop",
@@ -3044,7 +3044,7 @@
    "metric_query_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
    "metric_type": "requests",
    "namespace": "shop",
-   "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+   "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
    "target_uid": "dep-uid"
   },
   "valid": [
@@ -3088,7 +3088,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -3148,7 +3148,7 @@
      "reason": "ShadowInsufficient",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -3208,7 +3208,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -3268,7 +3268,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+     "settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -3292,15 +3292,15 @@
  },
  "settings": [
   {
-   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7},\"engine\":\"statistical\",\"history_days\":14,\"horizon_seconds\":3600,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":300,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":32,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"coverage_tolerance_bps\":500,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"repromotion_hours\":24,\"repromotion_windows\":32,\"worst_day_min_outcomes\":24}}}",
-   "fingerprint": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":14,\"horizon_seconds\":3600,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":300,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":32,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"coverage_tolerance_bps\":500,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"repromotion_hours\":24,\"repromotion_windows\":32,\"worst_day_min_outcomes\":24}}}",
+   "fingerprint": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
    "name": "absent",
    "prediction": null,
    "steps": 12
   },
   {
-   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7},\"engine\":\"statistical\",\"history_days\":14,\"horizon_seconds\":3600,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":300,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":32,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"coverage_tolerance_bps\":500,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"repromotion_hours\":24,\"repromotion_windows\":32,\"worst_day_min_outcomes\":24}}}",
-   "fingerprint": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":14,\"horizon_seconds\":3600,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":300,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":32,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"coverage_tolerance_bps\":500,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"repromotion_hours\":24,\"repromotion_windows\":32,\"worst_day_min_outcomes\":24}}}",
+   "fingerprint": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
    "name": "crd-defaults",
    "prediction": {
     "enabled": true,
@@ -3311,8 +3311,8 @@
    "steps": 12
   },
   {
-   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7},\"engine\":\"statistical\",\"history_days\":14,\"horizon_seconds\":3600,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":300,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":32,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"coverage_tolerance_bps\":500,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"repromotion_hours\":24,\"repromotion_windows\":32,\"worst_day_min_outcomes\":24}}}",
-   "fingerprint": "c5de18bae78560f62b2d924e8d87583d14c2a503e5fcd4b234fae43917fe6ad1",
+   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":14,\"horizon_seconds\":3600,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":300,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":32,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"coverage_tolerance_bps\":500,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"repromotion_hours\":24,\"repromotion_windows\":32,\"worst_day_min_outcomes\":24}}}",
+   "fingerprint": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
    "name": "statistical",
    "prediction": {
     "enabled": true,
@@ -3324,8 +3324,8 @@
    "steps": 12
   },
   {
-   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7},\"engine\":\"statistical\",\"history_days\":14,\"horizon_seconds\":3600,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":60,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":32,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"coverage_tolerance_bps\":500,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"repromotion_hours\":24,\"repromotion_windows\":32,\"worst_day_min_outcomes\":24}}}",
-   "fingerprint": "b22bffb5949da09c0a503baf501d68b9b0f7be662387ceccc1b53f8d07e536c8",
+   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":14,\"horizon_seconds\":3600,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":60,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":32,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"coverage_tolerance_bps\":500,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"repromotion_hours\":24,\"repromotion_windows\":32,\"worst_day_min_outcomes\":24}}}",
+   "fingerprint": "e2113bf0da5d0d7cd71245c1d32adb45d6c52d773c04077e58b2ad9f89e95b68",
    "name": "one-minute-grid",
    "prediction": {
     "enabled": true,
@@ -3338,8 +3338,8 @@
    "steps": 60
   },
   {
-   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7},\"engine\":\"statistical\",\"history_days\":14,\"horizon_seconds\":3000,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":600,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":32,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"coverage_tolerance_bps\":500,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"repromotion_hours\":24,\"repromotion_windows\":32,\"worst_day_min_outcomes\":24}}}",
-   "fingerprint": "923efdf945eb054faa5397d1c9d4fbe64aa8d7c6d61b39c0e3b8224f4dba77ec",
+   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":14,\"horizon_seconds\":3000,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":600,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":32,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"coverage_tolerance_bps\":500,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"repromotion_hours\":24,\"repromotion_windows\":32,\"worst_day_min_outcomes\":24}}}",
+   "fingerprint": "213d230bf65be25819cc59870a65e5a9593f223acf2fd46cc3782df2515292a2",
    "name": "ten-minute-grid-50min",
    "prediction": {
     "enabled": true,
@@ -3352,8 +3352,8 @@
    "steps": 5
   },
   {
-   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7},\"engine\":\"statistical\",\"history_days\":14,\"horizon_seconds\":3360,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":480,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":32,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"coverage_tolerance_bps\":500,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"repromotion_hours\":24,\"repromotion_windows\":32,\"worst_day_min_outcomes\":24}}}",
-   "fingerprint": "494853142834d1c6a72e50ca5ab564c496bfb70a4325d0cb35f5dc6a1bb073f9",
+   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":14,\"horizon_seconds\":3360,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":480,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":32,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"coverage_tolerance_bps\":500,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"repromotion_hours\":24,\"repromotion_windows\":32,\"worst_day_min_outcomes\":24}}}",
+   "fingerprint": "bbceef3182d98f1135846c516f38d59765c1fedb73a5b1c5df8aba23f7497e4b",
    "name": "eight-minute-grid-56min",
    "prediction": {
     "enabled": true,
@@ -3366,8 +3366,8 @@
    "steps": 7
   },
   {
-   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7},\"engine\":\"legacyLstm\",\"history_days\":14,\"horizon_seconds\":3600,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":600,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":32,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"coverage_tolerance_bps\":500,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"repromotion_hours\":24,\"repromotion_windows\":32,\"worst_day_min_outcomes\":24}}}",
-   "fingerprint": "ef4d69af14903abc500d354a7141b53126ebf78334be2af45f08be96891c377e",
+   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7},\"engine\":\"legacyLstm\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":14,\"horizon_seconds\":3600,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":600,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":32,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"coverage_tolerance_bps\":500,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"repromotion_hours\":24,\"repromotion_windows\":32,\"worst_day_min_outcomes\":24}}}",
+   "fingerprint": "0107d5851c39aaa21dd5ceb4c1006fcf0a2921175fa260bca38214fb7b095509",
    "name": "legacy-lstm",
    "prediction": {
     "enabled": true,
@@ -3380,8 +3380,8 @@
    "steps": 6
   },
   {
-   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":25,\"max_miscoverage_bps\":2000,\"max_scores\":600,\"min_miscoverage_bps\":50,\"min_windows\":200,\"retention_days\":10},\"engine\":\"statistical\",\"history_days\":21,\"horizon_seconds\":2400,\"outcome_grace_seconds\":900,\"predictive_extra\":{\"max_percent\":25,\"max_replicas\":0},\"risk\":{\"miscoverage_bps\":500},\"sample_interval_seconds\":120,\"seasonality\":\"daily\",\"settlement_seconds\":90,\"trust\":{\"acute_consecutive_misses\":4,\"acute_recent_windows\":40,\"challenger_cost_ratio_bps\":10100,\"challenger_exit_loss_ratio_bps\":10500,\"challenger_loss_ratio_bps\":9000,\"challenger_min_hours\":60,\"challenger_min_pairs\":70,\"coverage_tolerance_bps\":300,\"max_fit_age_hours\":6,\"min_availability_bps\":9000,\"min_prospective_windows\":80,\"min_shadow_hours\":72,\"repromotion_hours\":12,\"repromotion_windows\":20,\"worst_day_min_outcomes\":30}}}",
-   "fingerprint": "a00f02aab719cbe217eb860939da0a5c1db8d946d5214f2995c9a59bf5e499ce",
+   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":25,\"max_miscoverage_bps\":2000,\"max_scores\":600,\"min_miscoverage_bps\":50,\"min_windows\":200,\"retention_days\":10},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":21,\"horizon_seconds\":2400,\"outcome_grace_seconds\":900,\"predictive_extra\":{\"max_percent\":25,\"max_replicas\":0},\"risk\":{\"miscoverage_bps\":500},\"sample_interval_seconds\":120,\"seasonality\":\"daily\",\"settlement_seconds\":90,\"trust\":{\"acute_consecutive_misses\":4,\"acute_recent_windows\":40,\"challenger_cost_ratio_bps\":10100,\"challenger_exit_loss_ratio_bps\":10500,\"challenger_loss_ratio_bps\":9000,\"challenger_min_hours\":60,\"challenger_min_pairs\":70,\"coverage_tolerance_bps\":300,\"max_fit_age_hours\":6,\"min_availability_bps\":9000,\"min_prospective_windows\":80,\"min_shadow_hours\":72,\"repromotion_hours\":12,\"repromotion_windows\":20,\"worst_day_min_outcomes\":30}}}",
+   "fingerprint": "0293bb3dfe64c9e4ccdfce1a45e88c09d86186e3736e9ffd2cf86157461e9293",
    "name": "everything",
    "prediction": {
     "calibration": {
@@ -3430,6 +3430,39 @@
    "steps": 20
   },
   {
+   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\"],\"history_days\":14,\"horizon_seconds\":3600,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":300,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":32,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"coverage_tolerance_bps\":500,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"repromotion_hours\":24,\"repromotion_windows\":32,\"worst_day_min_outcomes\":24}}}",
+   "fingerprint": "5eb5fd44cb901d350b02bad405f351e200e6b187654262cfff91c98ece17e0fb",
+   "name": "naive-only",
+   "prediction": {
+    "enabled": true,
+    "engine": "statistical",
+    "families": [
+     "seasonalNaive"
+    ],
+    "horizonMinutes": 60,
+    "leadTimeMinutes": 15,
+    "updateIntervalSeconds": 300
+   },
+   "steps": 12
+  },
+  {
+   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":14,\"horizon_seconds\":3600,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":300,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":32,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"coverage_tolerance_bps\":500,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"repromotion_hours\":24,\"repromotion_windows\":32,\"worst_day_min_outcomes\":24}}}",
+   "fingerprint": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
+   "name": "families-reordered",
+   "prediction": {
+    "enabled": true,
+    "engine": "statistical",
+    "families": [
+     "statistical",
+     "seasonalNaive"
+    ],
+    "horizonMinutes": 60,
+    "leadTimeMinutes": 15,
+    "updateIntervalSeconds": 300
+   },
+   "steps": 12
+  },
+  {
    "name": "disabled",
    "prediction": {
     "enabled": false,
@@ -3439,6 +3472,62 @@
     "updateIntervalSeconds": 300
    },
    "refused": "forecasting is disabled for this autoscaler (spec.prediction.enabled)"
+  },
+  {
+   "name": "families-without-naive",
+   "prediction": {
+    "enabled": true,
+    "engine": "statistical",
+    "families": [
+     "statistical"
+    ],
+    "horizonMinutes": 60,
+    "leadTimeMinutes": 15,
+    "updateIntervalSeconds": 300
+   },
+   "refused": "spec.prediction.families must include seasonalNaive (the statistical family is selected only over a trusted seasonal-naive forecast)"
+  },
+  {
+   "name": "families-duplicate",
+   "prediction": {
+    "enabled": true,
+    "engine": "statistical",
+    "families": [
+     "seasonalNaive",
+     "seasonalNaive"
+    ],
+    "horizonMinutes": 60,
+    "leadTimeMinutes": 15,
+    "updateIntervalSeconds": 300
+   },
+   "refused": "spec.prediction.families must list distinct families of ('seasonalNaive', 'statistical'), got ['seasonalNaive', 'seasonalNaive']"
+  },
+  {
+   "name": "families-unknown",
+   "prediction": {
+    "enabled": true,
+    "engine": "statistical",
+    "families": [
+     "seasonalNaive",
+     "lstm"
+    ],
+    "horizonMinutes": 60,
+    "leadTimeMinutes": 15,
+    "updateIntervalSeconds": 300
+   },
+   "refused": "spec.prediction.families must list distinct families of ('seasonalNaive', 'statistical'), got ['seasonalNaive', 'lstm']"
+  },
+  {
+   "name": "families-empty",
+   "prediction": {
+    "enabled": true,
+    "engine": "statistical",
+    "families": [],
+    "horizonMinutes": 60,
+    "leadTimeMinutes": 15,
+    "updateIntervalSeconds": 300
+   },
+   "refused": "spec.prediction.families must list distinct families of ('seasonalNaive', 'statistical'), got []"
   },
   {
    "name": "seven-minute-grid",

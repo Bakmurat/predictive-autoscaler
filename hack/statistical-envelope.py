@@ -13,7 +13,11 @@ container_memory_working_set_bytes, container_cpu_usage_seconds_total and the st
 (docs/helm.md, "Statistical forecaster profile").
 
 Usage: hack/statistical-envelope.py [--pas 8] [--interval 60] [--hours 6] [--history-days 2] [--fit-mode off|worker]
-                                    [--state-dir DIR] [--check] [--cgroup-peak]
+                                    [--state-dir DIR] [--check] [--cgroup-peak] [--cost-replay]
+--cost-replay gives every autoscaler a capacity and replica bounds (so it has a v2 policy) and low evidence bars
+(16 calibration windows, 1 shadow hour, 4 paired windows over 1 hour), so the same-policy cost replay (C2.8a) runs
+within the compressed run; it needs --fit-mode worker and >= 8 history days (both families). It reports the number of
+replays and the time of one full 7-day replay at the run's cadence; with --check, no replay at all is a breach.
 In the image with fitting on, under the profile's limits: hack/statistical-container-envelope.sh (needs docker).
 """
 
@@ -48,12 +52,20 @@ def query_for(i):
     return f'sum(rate(istio_requests_total{{destination_workload="web-{i}",destination_workload_namespace="shop"}}[5m]))'
 
 
-def pa_object(i, interval, lead, history_days):
+COST_REPLAY_TRUST = {"minShadowHours": 1, "minProspectiveWindows": 4, "worstDayMinOutcomes": 1,
+                     "repromotionWindows": 4, "challengerMinPairs": 4, "challengerMinHours": 1}
+
+
+def pa_object(i, interval, lead, history_days, cost_replay=False):
     q = query_for(i)
+    prediction = {"sampleIntervalSeconds": interval, "historyDays": history_days, "horizonMinutes": 60}
+    spec = {"targetDeployment": {"name": f"web-{i}", "namespace": "shop"}, "prediction": prediction}
+    if cost_replay:
+        prediction.update(calibration={"minWindows": 16, "maxScores": 64, "minMiscoverageBps": 600},
+                          trust=COST_REPLAY_TRUST)
+        spec.update(minReplicas=1, maxReplicas=12, metrics={"requests": {"capacityPerReplica": "5"}})
     return {"metadata": {"uid": f"pa-{i}", "generation": 1},
-            "spec": {"targetDeployment": {"name": f"web-{i}", "namespace": "shop"},
-                     "prediction": {"sampleIntervalSeconds": interval, "historyDays": history_days,
-                                    "horizonMinutes": 60}},
+            "spec": spec,
             "status": {"metricSource": {"query": q, "sha256": hashlib.sha256(q.encode()).hexdigest(),
                                         "observedGeneration": 1, "targetUID": f"dep-{i}", "contract": CONTRACT},
                        "prediction": {"lead": {"seconds": lead, "startupDelaySeconds": 300,
@@ -114,9 +126,25 @@ def wait_for_fits(svc, limit_s=60.0) -> None:
         time.sleep(0.05)
 
 
-def run(pas=8, interval=60, hours=6.0, history_days=2, fit_mode="off", state_dir=None, cgroup=False, fits=None):
+def full_replay_seconds(interval: int) -> float:
+    """One same-policy cost replay over 7 days of decisions at this cadence (both families), as the service runs it."""
+    from forecasting import policy_sim as P
+    n = 7 * DAY // interval
+    truth = {k * interval: 30 + 15 * math.sin(k * interval * 2 * math.pi / DAY) for k in range(n + 2)}
+    params = P.PolicyParams(1, 12, 300.0, 10, 2, 50, 300, interval)
+    t0 = time.perf_counter()
+    P.paired_costs(epoch="e" * 64, challenger=("statistical", "e1"), baseline=("seasonal_naive", "naive"),
+                   params=params, truth_rps=truth, controller_rps=truth,
+                   challenger_upper={t: v * 1.1 for t, v in truth.items()},
+                   baseline_upper={t: v * 1.2 for t, v in truth.items()}, start=0, end=(n - 1) * interval,
+                   interval=interval)
+    return round(time.perf_counter() - t0, 4)
+
+
+def run(pas=8, interval=60, hours=6.0, history_days=2, fit_mode="off", state_dir=None, cgroup=False, fits=None,
+        cost_replay=False):
     lead = max(2 * interval, -(-(300 + interval + 30 + interval) // interval) * interval)
-    objects = {f"web-{i}-pa": pa_object(i, interval, lead, history_days) for i in range(pas)}
+    objects = {f"web-{i}-pa": pa_object(i, interval, lead, history_days, cost_replay) for i in range(pas)}
     start = 1_793_923_200 - 1_793_923_200 % DAY + 3 * DAY
     clock = ManualClock(start * 1000)
     tmp = None
@@ -130,7 +158,7 @@ def run(pas=8, interval=60, hours=6.0, history_days=2, fit_mode="off", state_dir
         from forecasting.worker import FitWorker
         svc.worker.close()
         svc.worker = FitWorker(svc.artifacts, fits=fits)
-    latencies, failures = [], 0
+    latencies, failures, replays = [], 0, 0
     fit_failures, statistical = {}, 0
     cpu0 = time.process_time()
     try:
@@ -153,6 +181,7 @@ def run(pas=8, interval=60, hours=6.0, history_days=2, fit_mode="off", state_dir
                     failures += 1
                 latencies.append(time.perf_counter() - t0)
         journal = svc.store.usage_bytes() if svc.store else None
+        replays = svc.cost_replays
         wait_for_fits(svc)
         fit_failures = {k: v for k, v in (svc.worker.failures if svc.worker else {}).items() if v}
         statistical = sum(1 for i in (svc.store.issuances() if svc.store else [])
@@ -168,7 +197,9 @@ def run(pas=8, interval=60, hours=6.0, history_days=2, fit_mode="off", state_dir
             "cpu_seconds": round(time.process_time() - cpu0, 3), "journal_bytes": journal,
             "cgroup_memory_peak_mib": cgroup_peak_mib() if cgroup else None,
             "fit_mode": fit_mode, "fit_failures": fit_failures, "statistical_issuances": statistical,
-            "p50_seconds": q(0.50), "p95_seconds": q(0.95), "max_seconds": latencies[-1] if latencies else None}
+            "p50_seconds": q(0.50), "p95_seconds": q(0.95), "max_seconds": latencies[-1] if latencies else None,
+            "cost_replay": cost_replay, "cost_replays": replays,
+            "full_7d_cost_replay_seconds": full_replay_seconds(interval) if cost_replay else None}
 
 
 def breaches(out, cgroup=False):
@@ -185,6 +216,8 @@ def breaches(out, cgroup=False):
             found.append("no_statistical_issuances")
     if cgroup and out["cgroup_memory_peak_mib"] is None:
         found.append("cgroup_unavailable")
+    if out.get("cost_replay") and not out.get("cost_replays"):
+        found.append("no_cost_replays")
     return found
 
 
@@ -199,8 +232,10 @@ def main(argv=None) -> int:
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--cgroup-peak", action="store_true", help="report the container cgroup's memory peak (run "
                                                                  "inside the container: it includes the fit workers)")
+    ap.add_argument("--cost-replay", action="store_true", help="exercise the same-policy cost replay (see above)")
     a = ap.parse_args(argv)
-    out = run(a.pas, a.interval, a.hours, a.history_days, a.fit_mode, a.state_dir, a.cgroup_peak)
+    out = run(a.pas, a.interval, a.hours, a.history_days, a.fit_mode, a.state_dir, a.cgroup_peak,
+              cost_replay=a.cost_replay)
     out["breaches"] = breaches(out, cgroup=a.cgroup_peak)
     print(json.dumps(out, indent=2))
     return 1 if a.check and out["breaches"] else 0
