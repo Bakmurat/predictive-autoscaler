@@ -53,7 +53,7 @@ from forecasting import trust as T
 from forecasting.artifacts import ArtifactRefused, ArtifactStore, Binding, encode_e1, fit_payload
 from forecasting.clock import ReceiptClock
 from forecasting.contracts import FAMILY_MODELS, FORECAST_CONTRACT, UNIT, BoundRequest, ContractRefused, V2Response, \
-    bind_request, check_response
+    bind_request, canonical_json, check_response, sha256_hex
 from forecasting.history import HistoryRefused, HistoryUnavailable, read_rps_history
 from forecasting.maturation import candidate, issued_outcome
 from forecasting.metrics import ForecastMetrics, RegistryFull, Snapshot, model_samples
@@ -464,9 +464,10 @@ class ForecastService:
         return {"passed": ok, "basis": "lab" if ok else None, "lab_qualification_sha256": q.sha256}
 
     def _issued_uppers(self, bound: BoundRequest, lo: int) -> Dict[int, tuple]:
-        """{decision origin: (naive bound, E1 bound, input_end)} of the epoch's issuances, folded incrementally from the
-        journal (rebuilt from it after a restart) and kept for COST_HISTORY_SECONDS. input_end is the newest observation
-        the issuance was computed from: what the forecaster had received at that decision."""
+        """{decision origin: (naive bound, E1 bound, input_end, seq)} of the epoch's issuances, folded incrementally from
+        the journal and kept for COST_HISTORY_SECONDS. input_end is the newest observation the issuance was computed
+        from: what the forecaster had received at that decision. Callers use only the entries the journal still holds
+        (_retained), so a long-running process and a restarted one replay exactly the same inputs."""
         scope, ek = (bound.autoscaler_namespace, bound.autoscaler_name), bound.evidence_key
         u = self._uppers.get(scope)
         if u is None or u["epoch"] != ek:
@@ -475,7 +476,7 @@ class ForecastService:
             b = iss.payload()
             pick = {m: candidate(b, m).get("upper_window_max_rps") for m in iss.models}
             u["by_origin"][iss.key.decision_origin] = (pick.get("seasonal_naive"), pick.get("statistical"),
-                                                       b.get("input_end"))
+                                                       b.get("input_end"), iss.seq)
             u["seq"] = iss.seq
         u["by_origin"] = {o: v for o, v in u["by_origin"].items() if o >= lo}
         return u["by_origin"]
@@ -496,26 +497,31 @@ class ForecastService:
         if ps["n"] < t.challenger_min_pairs or ps["span"] < t.challenger_min_hours * 3600:
             return sha, {}
         scope, ek = (bound.autoscaler_namespace, bound.autoscaler_name), bound.evidence_key
-        key = (ek, sha, ps["first"], ps["last"], ps["n"])            # changed evidence or policy: replay again
-        cached = self._costs.get(scope)
-        if cached is not None and cached[0] == key:
-            return sha, cached[1]
         offset = bound.window.window_end - bound.decision_origin
         c, dt = params.decision_interval_seconds, bound.settings.sample_interval_seconds
         start, end = ps["first"] - offset, ps["last"] - offset
-        uppers = self._issued_uppers(bound, now_s - COST_HISTORY_SECONDS)
-        lo = min([start] + [u[2] for o, u in uppers.items() if start <= o <= end and u[2] is not None])
+        cached_uppers = self._issued_uppers(bound, now_s - COST_HISTORY_SECONDS)
+        retained = self.store.issuance_seqs(ek, start, end)
+        uppers = {o: u for o, u in cached_uppers.items() if retained.get(o) == u[3]}   # what the journal holds now
+        lo = min([start] + [u[2] for u in uppers.values() if u[2] is not None])
         obs = {ts: v for ts, v, _at in self.store.observations("signal:" + ek, lo, end + c)}   # first receipts
         # The controller's input at decision o: the newest observation the issuance at o was computed from (it had
         # been received by then); no issuance, no measurement (the operator holds). The truth only scores.
-        controller = {o: obs[u[2]] for o, u in uppers.items() if start <= o <= end and u[2] in obs}
+        controller = {o: obs[u[2]] for o, u in uppers.items() if u[2] in obs}
         truth = {ts: v for ts, v in obs.items() if ts >= start}
+        inputs = {"challenger_upper": {o: u[1] for o, u in uppers.items() if u[1] is not None},
+                  "baseline_upper": {o: u[0] for o, u in uppers.items() if u[0] is not None},
+                  "controller_rps": controller, "truth_rps": truth}
+        # The cache is bound to EVERY replay input (bounds, controller inputs, truth, policy, window), so a late truth
+        # receipt, a compaction or a restart can never leave stale costs: equal inputs give equal costs.
+        digest = sha256_hex(canonical_json({k: sorted(v.items()) for k, v in inputs.items()}))
+        key = (ek, sha, start, end, offset, digest)
+        cached = self._costs.get(scope)
+        if cached is not None and cached[0] == key:
+            return sha, cached[1]
         costs = {"statistical": P.paired_costs(
             epoch=ek, challenger=("statistical", RECIPE_E1), baseline=("seasonal_naive", RECIPE_NAIVE), params=params,
-            truth_rps=truth, controller_rps=controller,
-            challenger_upper={o: u[1] for o, u in uppers.items() if u[1] is not None},
-            baseline_upper={o: u[0] for o, u in uppers.items() if u[0] is not None}, start=start, end=end,
-            interval=dt, window_offset=offset)}
+            start=start, end=end, interval=dt, window_offset=offset, **inputs)}
         self.cost_replays += 1
         self._costs[scope] = (key, costs)
         return sha, costs

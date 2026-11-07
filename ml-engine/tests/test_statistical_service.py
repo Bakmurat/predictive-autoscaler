@@ -58,6 +58,7 @@ class Backend:
 
     def __init__(self, value=None, on_fetch=None):
         self.down, self.gap_after, self.calls, self.value, self.on_fetch = False, None, 0, value or rps, on_fetch
+        self.missing = set()                     # timestamps not (yet) delivered: a late receipt once removed
 
     def __call__(self, url, **kw):
         self.calls += 1
@@ -70,7 +71,7 @@ class Backend:
         assert q["query"] == QUERY
         step = int(q["step"].rstrip("s"))
         vals = [[t, str(self.value(t))] for t in range(int(q["start"]), int(q["end"]) + 1, step)
-                if self.gap_after is None or t <= self.gap_after]
+                if (self.gap_after is None or t <= self.gap_after) and t not in self.missing]
         res = [{"metric": {}, "values": vals}] if vals else []
         return 200, json.dumps({"status": "success", "data": {"resultType": "matrix", "result": res}}).encode()
 
@@ -459,13 +460,13 @@ def policy_pa(capacity="5", **pred):
     return pa
 
 
-def drive(tmp_path, pa, n, *, fit_mode="inline", reader=None, until=None, **cfg):
+def drive(tmp_path, pa, n, *, fit_mode="inline", reader=None, until=None, backend=None, **cfg):
     """n requests on the 5-minute grid from six days into the history; stops early once until(bundle) holds."""
     start = T0 + 6 * DAY
     clock = ManualClock(start * 1000)
     svc = ForecastService(ServiceConfig(prometheus_url="http://prom", state_dir=str(tmp_path), fit_mode=fit_mode,
                                         store_id="journal-1", **cfg),
-                          reader=reader or Reader(pa), fetch=Backend(NOISY), clock=clock)
+                          reader=reader or Reader(pa), fetch=backend or Backend(NOISY), clock=clock)
     settings, out = c.resolve_settings(pa).fingerprint(), []
     for i in range(n):
         o = start + i * DT
@@ -681,3 +682,41 @@ def test_a_lab_answer_never_outlives_its_qualification(tmp_path):
     assert c.response_from_wire(wires[-1]).predictive_eligible is False
     earlier = svc.store.issuances()[-2].payload()            # the previous origin's answer ends before the expiry
     assert earlier["valid_until"] <= last + 200 and earlier["release_gate"]["passed"] is True
+
+
+def test_costs_follow_late_truth_receipts_and_survive_a_restart(tmp_path, monkeypatch):
+    # Codex r2 on #27: the cost cache must be bound to every replay input, not just the pair count and span.
+    pa = policy_pa()
+    svc, out = drive(tmp_path, pa, 130, until=lambda b: bool(b["costs"]))
+    last = out[-1][1]
+    assert last["costs"], "the run reached the cost replay"
+    o = last["decision_origin"]
+    bound = c.bind_request(body(o, c.resolve_settings(pa).fingerprint()), Reader(pa), now_ms=o * 1000 + 10_000)
+    state = svc.store.latest_checkpoint(last["evidence_key"]).state
+    both = {"seasonal_naive": None, "statistical": None}
+    lo, _hi = svc._costs[("shop", "web-pa")][1]["statistical"]["binding"]["window"]
+    start = lo - (last["window_end"] - o)
+    late = {start + 3 * DT, start + 4 * DT}                  # two truth samples not received yet
+    real = svc.store.observations
+    monkeypatch.setattr(svc.store, "observations", lambda series, a, b: [r for r in real(series, a, b)
+                                                                         if r[0] not in late])
+    sha, before = svc._policy_costs(bound, state, o, both)
+    assert before["statistical"]["unknown_truth_seconds"] == 2 * DT
+    replays = svc.cost_replays
+    assert svc._policy_costs(bound, state, o, both)[1] == before and svc.cost_replays == replays   # cached
+    monkeypatch.setattr(svc.store, "observations", real)    # they arrive; pairs, span and policy are unchanged
+    _sha, after = svc._policy_costs(bound, state, o, both)
+    assert svc.cost_replays == replays + 1 and after["statistical"]["unknown_truth_seconds"] == 0
+    assert after != before
+    # An issuance the journal no longer holds (compacted) is not replayed from memory either.
+    seqs = svc.store.issuance_seqs
+    monkeypatch.setattr(svc.store, "issuance_seqs", lambda ek, a, b: {k: v for k, v in seqs(ek, a, b).items()
+                                                                      if k != start})
+    assert svc._policy_costs(bound, state, o, both)[1] != after and svc.cost_replays == replays + 2
+    monkeypatch.setattr(svc.store, "issuance_seqs", seqs)
+    # A restarted service on the same journal computes exactly the same evidence from nothing.
+    svc.close()
+    again = ForecastService(ServiceConfig(prometheus_url="http://prom", state_dir=str(tmp_path), fit_mode="off",
+                                          store_id="journal-1"), reader=Reader(pa), fetch=Backend(NOISY),
+                            clock=ManualClock((o + 40) * 1000))
+    assert again._policy_costs(bound, state, o, both) == (sha, after)

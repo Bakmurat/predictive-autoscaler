@@ -214,7 +214,10 @@ def test_an_evaluation_context_is_the_commit_and_nothing_else(tmp_path):
     for name, change in (("forecasting/trust.py", lambda f: f.write_text(f.read_text() + "# edited\n")),
                          ("forecasting/extra.py", lambda f: f.write_text("x = 1\n")),
                          ("forecasting/store.py", lambda f: f.unlink()),
-                         ("Dockerfile.statistical", lambda f: f.write_text(f.read_text() + "# edited\n"))):
+                         ("Dockerfile.statistical", lambda f: f.write_text(f.read_text() + "# edited\n")),
+                         # Codex r2 on #27: a builder-stage input (a loosened pin) is checked like the modules.
+                         ("requirements-statistical.txt",
+                          lambda f: f.write_text(f.read_text().replace("numpy==", "numpy>=")))):
         bad = tmp_path / ("bad-" + name.replace("/", "-"))
         subprocess.run(["cp", "-a", str(ctx), str(bad)], check=True)
         change(bad / name)

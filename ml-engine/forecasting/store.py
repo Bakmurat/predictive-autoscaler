@@ -514,6 +514,14 @@ class ForecastStore:
                                     "ORDER BY seq", (evidence_key, after_seq)).fetchall()
             return [self._row_to_issuance(r) for r in rows]
 
+    def issuance_seqs(self, evidence_key: str, origin_lo: int, origin_hi: int) -> Dict[int, int]:
+        """{decision origin: seq} of an epoch's retained issuances with origins in [origin_lo, origin_hi] (no payloads:
+        a cheap check of what the journal still holds)."""
+        with self._lock, self._guard("read issuance seqs"):
+            rows = self._db.execute("SELECT decision_origin, seq FROM issuances WHERE evidence_key = ? AND "
+                                    "decision_origin BETWEEN ? AND ?", (evidence_key, origin_lo, origin_hi)).fetchall()
+            return {int(o): int(q) for o, q in rows}
+
     def issuances(self, evidence_key: Optional[str] = None) -> List[Issuance]:
         with self._lock, self._guard("read issuances"):
             q = f"SELECT {self._ISSUANCE_COLS} FROM issuances"

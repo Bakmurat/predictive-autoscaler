@@ -5,7 +5,8 @@ Usage (inside the build): python build_record.py <context dir> <SOURCE_TREE> <EV
 
 A release build (EVALUATION_BUILD=false) records its claimed source tree and evaluation_build false: it never honours a
 lab qualification, so nothing rests on that claim. An EVALUATION build (C2.8 lab qualification) must prove that every
-file the final stage copies is exactly the named commit's: the context must carry `source-manifest.txt` (written by
+file any stage copies from the context (the builder's pinned requirements as well as the final image's modules) is
+exactly the named commit's: the context must carry `source-manifest.txt` (written by
 hack/build-statistical-evaluation.sh from `git ls-tree -r <commit> -- ml-engine`, the context itself being
 `git archive <commit> ml-engine`), headed by that commit; every copied file's git blob hash must equal the manifest's,
 every manifest file under a copied directory must be present, nothing extra may be (a dirty or mismatched context
@@ -36,17 +37,15 @@ def blob_sha1(path: str) -> str:
     return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
 
 
-def final_stage_copies(dockerfile_text: str) -> list:
-    """The sources the final stage COPYs from the context (not --from another stage)."""
-    stages, current = [], []
+def context_copies(dockerfile_text: str) -> list:
+    """Every source any stage COPYs from the context (the builder's requirements included), except the verify stage's
+    own `COPY . /ctx`, which is what is being checked; --from copies come from other stages, not the context."""
+    out = []
     for raw in dockerfile_text.splitlines():
         line = raw.strip()
-        if line.startswith("FROM "):
-            current = []
-            stages.append(current)
-        elif line.startswith("COPY ") and "--from=" not in line:
-            current.extend(line.split()[1:-1])
-    return stages[-1] if stages else []
+        if line.startswith("COPY ") and "--from=" not in line and line != "COPY . /ctx":
+            out.extend(line.split()[1:-1])
+    return out
 
 
 def read_manifest(path: str, tree: str) -> dict:
@@ -71,7 +70,9 @@ def verify(ctx: str, tree: str) -> dict:
     manifest_path = os.path.join(ctx, MANIFEST)
     entries = read_manifest(manifest_path, tree)
     with open(os.path.join(ctx, DOCKERFILE)) as fh:
-        sources = final_stage_copies(fh.read())
+        sources = context_copies(fh.read())
+    if "." in sources or "./" in sources:
+        raise Refused("a stage copies the whole context into an image: only listed inputs can be verified")
     wanted = {DOCKERFILE, os.path.basename(__file__)}
     for src in sources:
         if src.endswith("/"):
