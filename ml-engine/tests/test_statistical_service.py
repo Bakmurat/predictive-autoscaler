@@ -495,6 +495,24 @@ def test_the_challenger_is_selected_only_on_bound_same_policy_costs(tmp_path, mo
     assert cost["paired_decisions"] > 0 and cost["unknown_truth_seconds"] == 0
     assert cost["replica_time"][0] > 1.02 * cost["replica_time"][1]   # E1 buys its bound with replica-time
     _key, full = svc._costs[("shop", "web-pa")]
+    # The controller saw, at each decision, the newest observation its issuance was computed from; the truth only
+    # scores. Recompute the replay from the journal with those inputs: the stored costs are exactly that.
+    obs = {ts: v for ts, v, _ in svc.store.observations("signal:" + last["evidence_key"], 0, 10 ** 10)}
+    by_origin = {i.key.decision_origin: i.payload() for i in svc.store.issuances(last["evidence_key"])}
+    lo, hi = (w - (last["window_end"] - last["decision_origin"]) for w in full["statistical"]["binding"]["window"])
+    controller = {o: obs[b["input_end"]] for o, b in by_origin.items() if lo <= o <= hi}
+    assert all(b["input_end"] < o for o, b in by_origin.items())                 # never the truth at o itself
+    recomputed = P.paired_costs(
+        epoch=last["evidence_key"], challenger=("statistical", "e1-product/v1"),
+        baseline=("seasonal_naive", by_origin[lo]["candidates"]["seasonal_naive"]["recipe"]), params=params,
+        truth_rps={t: v for t, v in obs.items() if t >= lo}, controller_rps=controller,
+        challenger_upper={o: b["candidates"]["statistical"]["upper_window_max_rps"] for o, b in by_origin.items()
+                          if "statistical" in b["candidates"] and
+                          b["candidates"]["statistical"]["upper_window_max_rps"] is not None},
+        baseline_upper={o: b["candidates"]["seasonal_naive"]["upper_window_max_rps"] for o, b in by_origin.items()
+                        if b["candidates"]["seasonal_naive"]["upper_window_max_rps"] is not None},
+        start=lo, end=hi, interval=DT, window_offset=last["window_end"] - last["decision_origin"])
+    assert recomputed == full["statistical"]
     state = svc.store.latest_checkpoint(last["evidence_key"]).state
     pairs = state["pairs"]["statistical"]
     now_s = last["decision_origin"]
@@ -530,18 +548,19 @@ def test_a_naive_only_autoscaler_never_forecasts_or_fits_e1(tmp_path):
 
 
 TREE = "a" * 40
+DIGEST = "sha256:" + "d" * 64
 
 
-def lab(target_uid="dep-uid", name="web"):
+def lab(target_uid="dep-uid", name="web", expires=T0 + 30 * DAY):
     from datetime import datetime, timezone
     from forecasting import qualification as Q
     ts = lambda s: datetime.fromtimestamp(s, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")   # noqa: E731
-    doc = {"schema": "lab-qualification/v1", "source_tree": TREE, "run_lock_sha256": "b" * 64,
+    doc = {"schema": "lab-qualification/v1", "source_tree": TREE, "image_digest": DIGEST, "run_lock_sha256": "b" * 64,
            "gates": {g: "pass" for g in ("G0", "G1", "G2", "G3", "G4")}, "reviewers": ["executor", "reviewer"],
-           "not_before": ts(T0 - DAY), "expires": ts(T0 + 30 * DAY),
+           "not_before": ts(T0 - DAY), "expires": ts(expires),
            "scope": {"cluster_uid": "cluster-uid", "namespaces": ["shop"],
                      "targets": [{"namespace": "shop", "name": name, "uid": target_uid}]}}
-    return Q.parse(json.dumps(doc).encode(), Q.BuildInfo(TREE, True), T0)
+    return Q.parse(json.dumps(doc).encode(), Q.BuildInfo(TREE, True), T0, DIGEST)
 
 
 class ClusterReader(Reader):
@@ -615,3 +634,50 @@ def test_a_lab_qualification_fails_closed(tmp_path):
     clock.set((T0 + 31 * DAY) * 1000 + 10_000)
     late.predict(body(T0 + 31 * DAY, c.resolve_settings(pa).fingerprint()))
     assert late.store.issuances()[-1].payload()["release_gate"]["passed"] is False
+
+
+def _lab_run(tmp_path, n, q, **cfg):
+    from forecasting import qualification as Q
+    pa = pa_object(prediction=dict(PREDICTION, trust=FAST_TRUST))
+    svc, clock = make(tmp_path, reader=ClusterReader(pa), store_id="journal-1", build=Q.BuildInfo(TREE, True),
+                      lab_qualification=q, **cfg)
+    settings = c.resolve_settings(pa).fingerprint()
+    wires = []
+    for i in range(n):
+        clock.set(max(clock.now_ms(), (T0 + i * DT) * 1000 + 10_000))
+        wires.append(svc.predict(body(T0 + i * DT, settings)))
+    return svc, clock, pa, settings, wires
+
+
+def test_eligibility_is_reauthorised_at_every_answer(tmp_path):
+    # Codex r1 on #27: a stored lab-qualified issuance must not stay eligible after expiry or removal.
+    last = T0 + 89 * DT                                     # the run's last origin; its valid_until is last + 270
+    svc, clock, pa, settings, wires = _lab_run(tmp_path / "s", 90, lab(expires=last + 280))
+    assert c.response_from_wire(wires[-1]).predictive_eligible is True
+    clock.set((last + 285) * 1000)                          # the qualification expired; the origin is still open
+    again = c.response_from_wire(svc.predict(body(last, settings)))
+    assert again.issuance_id == c.response_from_wire(wires[-1]).issuance_id and again.predictive_eligible is False
+    svc.close()
+    # The same journal reopened by a release (default) build without any qualification: the stored issuance says it
+    # passed under the lab basis, but nothing authorises it now.
+    plain, _ = make(tmp_path / "s", reader=ClusterReader(pa), store_id="journal-1", clock=ManualClock(
+        (last + 20) * 1000))
+    r = c.response_from_wire(plain.predict(body(last, settings)))
+    assert r.issuance_id == again.issuance_id and r.predictive_eligible is False
+    assert plain.store.issuances()[-1].payload()["release_gate"]["basis"] == "lab"       # the record stays true
+    # Another qualification (another digest) does not inherit the first one's issuances either.
+    from forecasting import qualification as Q
+    other, _ = make(tmp_path / "s", reader=ClusterReader(pa), store_id="journal-1",
+                    clock=ManualClock((last + 20) * 1000), build=Q.BuildInfo(TREE, True),
+                    lab_qualification=lab(expires=last + 290))
+    assert c.response_from_wire(other.predict(body(last, settings))).predictive_eligible is False
+
+
+def test_a_lab_answer_never_outlives_its_qualification(tmp_path):
+    last = T0 + 89 * DT
+    svc, _clock, _pa, _s, wires = _lab_run(tmp_path, 90, lab(expires=last + 200))   # expires before valid_until
+    b = svc.store.issuances()[-1].payload()
+    assert b["valid_until"] > last + 200 and b["release_gate"]["passed"] is False
+    assert c.response_from_wire(wires[-1]).predictive_eligible is False
+    earlier = svc.store.issuances()[-2].payload()            # the previous origin's answer ends before the expiry
+    assert earlier["valid_until"] <= last + 200 and earlier["release_gate"]["passed"] is True

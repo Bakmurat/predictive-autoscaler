@@ -39,8 +39,11 @@ prospective gate bounds whose retained window ends SPAN >= challenger_min_hours,
 challenger_loss_ratio x the naive's, and the same-policy replay costs (shortage, replica-time, from
 forecasting.policy_sim) each <= challenger_cost_ratio x the naive's. Costs count only when their binding matches: the
 same epoch, both models and recipes of the paired evidence, the policy fingerprint the caller expects (capacity, bounds,
-caps, headroom, startup delay, decision interval) and a window covering the retained pairs. A zero naive loss keeps the
-naive. Without matching costs nothing is promoted.
+caps, headroom, startup delay, decision interval) and a window covering the retained pairs. They count only on
+adequate evidence too (cost_evidence_ok): >= challenger_min_pairs decisions where both forecasts had a bound, which are
+>= min_availability of the replayed decisions, and seconds without a truth measurement <= (1 - min_availability) of
+the integrated time (the explicit missing-truth limit; 5% by default). A zero naive loss keeps the naive. Without
+matching, adequate costs nothing is promoted.
 
 Selection (fallback order lstm -> statistical -> seasonal_naive -> reactive-only) has its own hysteresis: a safety
 failure (the selected candidate, or the naive it was compared with, not trusted) falls back at once; a challenger is
@@ -495,12 +498,27 @@ def costs_bound(costs: Optional[Mapping], pairs: dict, ps: Mapping, policy_sha25
         window[0] <= ps["first"] and window[1] >= ps["last"]
 
 
+def cost_evidence_ok(costs: Mapping, t: TrustSettings) -> bool:
+    """Enough matched decisions and enough truth behind the costs (module docstring); anything malformed fails."""
+    try:
+        paired, decisions = costs["paired_decisions"], costs["decisions"]
+        unknown, seconds = float(costs["unknown_truth_seconds"]), float(costs["seconds"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not all(isinstance(v, int) and not isinstance(v, bool) for v in (paired, decisions)):
+        return False
+    floor = t.min_availability_bps / 10_000
+    return (math.isfinite(unknown) and math.isfinite(seconds) and seconds > 0 and 0 < decisions
+            and t.challenger_min_pairs <= paired <= decisions and paired >= floor * decisions
+            and 0 <= unknown <= (1.0 - floor) * seconds)
+
+
 def _paired_ok(pairs: Optional[dict], now_s: int, t: TrustSettings, costs: Optional[Mapping], loss_ratio_bps: int,
                policy_sha256: Optional[str]) -> bool:
     if pairs is None or costs is None:
         return False
     ps = pair_sums(pairs, now_s)
-    if not costs_bound(costs, pairs, ps, policy_sha256):
+    if not costs_bound(costs, pairs, ps, policy_sha256) or not cost_evidence_ok(costs, t):
         return False
     if ps["n"] < t.challenger_min_pairs or ps["span"] < t.challenger_min_hours * HOUR:
         return False

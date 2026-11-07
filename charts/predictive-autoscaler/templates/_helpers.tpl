@@ -75,6 +75,7 @@ app.kubernetes.io/component: {{ index . 1 }}
 {{- define "pa.labQualification" -}}
 {{- if .Values.forecaster.statistical.labQualification.configMap -}}
 {{- if not (include "pa.statistical" .) }}{{ fail "forecaster.statistical.labQualification needs forecaster.engine: statistical" }}{{ end -}}
+{{- if not .Values.images.statisticalForecaster.digest }}{{ fail "forecaster.statistical.labQualification needs images.statisticalForecaster.digest (the evaluation image the qualification names)" }}{{ end -}}
 true
 {{- end -}}
 {{- end -}}

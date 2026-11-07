@@ -333,9 +333,11 @@ def pairs_for(challenger, chal_loss, base_loss, n=200, hours=96, start=START - 2
 
 
 def bound_costs(challenger="statistical", shortage=(1.0, 1.0), replica_time=(100.0, 100.0), epoch=EPOCH, recipe="r",
-                policy=POLICY, window=(START - 30 * DAY, START + 30 * DAY)):
+                policy=POLICY, window=(START - 30 * DAY, START + 30 * DAY), paired=1000, decisions=1000,
+                unknown=0.0, seconds=60_000.0):
     """Same-policy costs as forecasting.policy_sim reports them, bound to the paired evidence and the policy."""
-    return {"shortage": shortage, "replica_time": replica_time,
+    return {"shortage": shortage, "replica_time": replica_time, "paired_decisions": paired, "decisions": decisions,
+            "unknown_truth_seconds": unknown, "seconds": seconds,
             "binding": {"epoch": epoch, "challenger": {"model": challenger, "recipe": recipe},
                         "baseline": {"model": "seasonal_naive", "recipe": "r"}, "policy_sha256": policy,
                         "window": list(window)}}
@@ -577,3 +579,27 @@ def test_costs_that_do_not_match_promote_nothing(bad):
     unbound = {k: v for k, v in COSTS.items() if k != "binding"}
     assert not T.challenger_promoted(pairs, NOW, TS, unbound, POLICY)
     assert not T.challenger_promoted(pairs, NOW, TS, COSTS, None)      # no expected policy: nothing to match
+
+
+@pytest.mark.parametrize("evidence", [
+    {"paired": 0, "unknown": 238_860.0, "shortage": (0.0, 0.0)},          # Codex r1 on #27: no matched decision
+    {"paired": 10},                                                        # fewer than challengerMinPairs
+    {"paired": 900},                                                       # matched on 90% < minAvailability 95%
+    {"unknown": 3_001.0},                                                  # > 5% of 60,000 s without truth
+    {"seconds": 0.0},
+    {"decisions": 0, "paired": 0},
+    {"paired": 1001},                                                      # more matched than replayed: malformed
+    {"unknown": float("nan")},
+])
+def test_inadequate_cost_evidence_withholds_promotion(evidence):
+    t = T.TrustSettings()
+    good = bound_costs()
+    assert T.cost_evidence_ok(good, t)
+    assert T.cost_evidence_ok(bound_costs(paired=950, unknown=3_000.0), t)             # exactly at the limits
+    bad = bound_costs(**evidence)
+    assert not T.cost_evidence_ok(bad, t)
+    for missing in ("paired_decisions", "decisions", "unknown_truth_seconds", "seconds"):
+        assert not T.cost_evidence_ok({k: v for k, v in good.items() if k != missing}, t)
+    pairs = pairs_for("statistical", 0.5, 1.0)
+    assert T.challenger_promoted(pairs, NOW, TS, good, POLICY)
+    assert not T.challenger_promoted(pairs, NOW, TS, bad, POLICY)

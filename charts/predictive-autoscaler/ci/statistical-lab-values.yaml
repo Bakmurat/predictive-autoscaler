@@ -10,3 +10,7 @@ forecaster:
 networkPolicy:
   prometheus:
     namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: monitoring}}
+images:
+  statisticalForecaster:
+    repository: ghcr.io/bakmurat/predictive-autoscaler-forecaster-statistical
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000

@@ -75,6 +75,8 @@ spec:
             {{- if include "pa.labQualification" . }}
             - name: FORECAST_LAB_QUALIFICATION
               value: /etc/predictive-autoscaler/lab-qualification/lab-qualification.json
+            - name: FORECAST_IMAGE_DIGEST
+              value: {{ .Values.images.statisticalForecaster.digest | quote }}
             {{- end }}
             {{- end }}
             {{- if .Values.forecaster.auth.enabled }}

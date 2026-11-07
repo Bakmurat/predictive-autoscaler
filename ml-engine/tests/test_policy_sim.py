@@ -60,7 +60,7 @@ def test_costs_are_exact_piecewise_integrals():
     c = P.window_costs(decisions, 1, truth, 60, 10.0, 120, 0, 300)
     assert c["replica_time"] == 4 * 300                               # requested, ready or not
     assert c["shortage"] == pytest.approx((3 - 1) * 120)             # only one ready replica until 120 s
-    assert c["unknown_truth_seconds"] == 0
+    assert c["unknown_truth_seconds"] == 0 and c["seconds"] == 300
     gap = P.window_costs(decisions, 1, {0: 30.0, 60: 30.0}, 60, 10.0, 120, 0, 300)
     assert gap["unknown_truth_seconds"] == 180                        # missing truth is unknown, never zero shortage
 
@@ -69,6 +69,42 @@ def test_a_scale_down_is_ready_immediately():
     decisions = [P.Decision(0, 6, 2, None, False, 2, 2)]
     c = P.window_costs(decisions, 6, {0: 20.0, 60: 20.0}, 60, 10.0, 300, 0, 120)
     assert c["replica_time"] == 2 * 120 and c["shortage"] == 0
+
+
+def test_a_scale_up_after_a_scale_down_waits_for_its_own_start():
+    # Codex r1 on #27: 4 -> 2 at 0, 2 -> 4 at 60, startup 120 s, demand 4 replicas: the two new replicas are ready
+    # only at 180, so the shortage is 2 x 60 + 2 x 120 = 360 replica-seconds (not 240: nothing comes back to life).
+    decisions = [P.Decision(0, 4, 2, None, False, 2, 2), P.Decision(60, 2, 4, None, False, 4, 4)]
+    truth = {t: 40.0 for t in range(0, 600, 60)}
+    c = P.window_costs(decisions, 4, truth, 60, 10.0, 120, 0, 180)
+    assert c["shortage"] == pytest.approx(360) and c["replica_time"] == 2 * 60 + 4 * 120
+    later = P.window_costs(decisions, 4, truth, 60, 10.0, 120, 0, 300)
+    assert later["shortage"] == pytest.approx(360)                     # ready from 180 on
+
+
+def test_a_scale_down_removes_starting_replicas_first():
+    # 2 ready; up to 5 at 0 (3 starting until 120); down to 3 at 60: two of the starting ones go, 2 ready + 1 starting.
+    decisions = [P.Decision(0, 2, 5, None, False, 5, 5), P.Decision(60, 5, 3, None, False, 3, 3)]
+    truth = {t: 50.0 for t in range(0, 600, 60)}                        # demand 5
+    c = P.window_costs(decisions, 2, truth, 60, 10.0, 120, 0, 240)
+    # [0,120): 2 ready -> 3 short; [120,240): 3 ready -> 2 short
+    assert c["shortage"] == pytest.approx(3 * 120 + 2 * 120)
+    assert c["replica_time"] == 5 * 60 + 3 * 180
+    # Down below the ready count: every starting replica goes, then ready ones.
+    deeper = [P.Decision(0, 2, 5, None, False, 5, 5), P.Decision(60, 5, 1, None, False, 1, 1)]
+    d = P.window_costs(deeper, 2, truth, 60, 10.0, 120, 0, 240)
+    assert d["shortage"] == pytest.approx(3 * 60 + 4 * 180)
+
+
+def test_repeated_reversals_keep_every_cohort_separate():
+    # 1 ready; +2 at 0 (ready 300), -1 at 60, +2 at 120 (ready 420), -2 at 180, +1 at 240 (ready 540), D = 300.
+    seq = [(0, 3), (60, 2), (120, 4), (180, 2), (240, 3)]
+    decisions = [P.Decision(t, 0, a, None, False, a, a) for t, a in seq]
+    truth = {t: 30.0 for t in range(0, 900, 60)}                        # demand 3
+    c = P.window_costs(decisions, 1, truth, 60, 10.0, 300, 0, 600)
+    # cohorts: A=2@300 -> 1@300 after -1; B=2@420; -2 at 180 removes B; C=1@540.
+    # ready: 1 until 300, 2 from 300, 3 from 540 -> shortage 2*300 + 1*240 + 0
+    assert c["shortage"] == pytest.approx(2 * 300 + 1 * 240)
 
 
 def test_paired_costs_differ_only_where_both_forecasts_existed():
@@ -173,3 +209,18 @@ def test_resolve_policy_reads_the_autoscalers_own_policy():
 def test_resolve_policy_refuses_what_the_operator_would_not_run(over, lead, why):
     p, reason = P.resolve_policy(spec(**over), settings(), lead)
     assert p is None and why in reason
+
+
+def test_the_controller_sees_only_what_it_had_and_the_truth_only_scores():
+    # Demand jumps at 600; the controller's input lags (what it had received), so both replays react late, and the
+    # shortage is scored against the real demand. Without any controller input the policy holds (missing telemetry).
+    truth = {t: (20.0 if t < 600 else 60.0) for t in range(0, 1800, 60)}
+    lagged = {t: truth.get(t - 180, 20.0) for t in truth}
+    kw = dict(epoch="e" * 64, challenger=("statistical", "e1"), baseline=("seasonal_naive", "n"), params=PARAMS,
+              truth_rps=truth, challenger_upper={}, baseline_upper={}, start=0, end=1740, interval=60)
+    hindsight = P.paired_costs(**kw)                                       # offline default: inputs = truth
+    contemporaneous = P.paired_costs(**kw, controller_rps=lagged)
+    blind = P.paired_costs(**kw, controller_rps={})
+    assert contemporaneous["shortage"][1] > hindsight["shortage"][1]       # reacting late costs shortage
+    assert blind["replica_time"][1] == 1 * 1800                            # held at minReplicas throughout
+    assert blind["shortage"][1] > contemporaneous["shortage"][1] and blind["unknown_truth_seconds"] == 0

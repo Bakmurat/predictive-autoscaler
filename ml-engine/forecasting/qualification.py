@@ -7,6 +7,8 @@ controlled Active experiments before that, so a LAB qualification may stand in f
   - only in an EVALUATION BUILD: the image records its source tree and evaluation flag at build time
     (/app/build-info.json from Dockerfile.statistical's SOURCE_TREE and EVALUATION_BUILD); a release image refuses to
     start with a lab qualification at all;
+  - only in the image it names: the image digest recorded in the file must equal the digest the pod was started from
+    (FORECAST_IMAGE_DIGEST, set by the chart from the digest-pinned image reference the kubelet verified);
   - only from a reviewed, hash-identified file (lab-qualification/v1) naming that exact source tree, the run-lock it
     belongs to, the G0-G4 results it rests on (each must be "pass"), at least two distinct reviewers (executor and
     reviewer), a validity window of at most 60 days, and its scope: one cluster UID (the kube-system namespace's UID,
@@ -35,8 +37,10 @@ GATES = ("G0", "G1", "G2", "G3", "G4")
 MAX_VALIDITY_SECONDS = 60 * 86400
 MAX_TARGETS = 16
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _TREE = re.compile(r"^[0-9a-f]{40}$")
-_KEYS = {"schema", "source_tree", "run_lock_sha256", "gates", "reviewers", "not_before", "expires", "scope"}
+_KEYS = {"schema", "source_tree", "image_digest", "run_lock_sha256", "gates", "reviewers", "not_before", "expires",
+         "scope"}
 
 
 class QualificationRefused(Exception):
@@ -66,6 +70,7 @@ def read_build_info(path: str = BUILD_INFO_PATH) -> BuildInfo:
 class LabQualification:
     sha256: str
     source_tree: str
+    image_digest: str
     run_lock_sha256: str
     cluster_uid: str
     namespaces: FrozenSet[str]
@@ -81,7 +86,8 @@ class LabQualification:
                 and (namespace, name, uid) in self.targets and self.not_before <= now_s < self.expires)
 
     def summary(self) -> dict:
-        return {"sha256": self.sha256, "run_lock_sha256": self.run_lock_sha256, "cluster_uid": self.cluster_uid,
+        return {"sha256": self.sha256, "image_digest": self.image_digest, "run_lock_sha256": self.run_lock_sha256,
+                "cluster_uid": self.cluster_uid,
                 "namespaces": sorted(self.namespaces), "targets": len(self.targets), "expires": self.expires}
 
 
@@ -94,11 +100,13 @@ def _ts(value, what: str) -> int:
         raise QualificationRefused(f"{what}: {e}") from e
 
 
-def parse(data: bytes, build: BuildInfo, now_s: int) -> LabQualification:
+def parse(data: bytes, build: BuildInfo, now_s: int, image_digest: Optional[str]) -> LabQualification:
     if not build.evaluation_build:
         raise QualificationRefused("this is a release build: it never honours a lab qualification")
     if not _TREE.match(build.source_tree):
         raise QualificationRefused("the evaluation build records no source tree")
+    if not (isinstance(image_digest, str) and _DIGEST.match(image_digest)):
+        raise QualificationRefused("the pod's image digest is unknown (run the image pinned by digest)")
     try:
         doc = json.loads(data)
     except ValueError as e:
@@ -107,6 +115,8 @@ def parse(data: bytes, build: BuildInfo, now_s: int) -> LabQualification:
         raise QualificationRefused(f"a {SCHEMA} document needs exactly the keys {sorted(_KEYS)}")
     if doc["source_tree"] != build.source_tree:
         raise QualificationRefused("the qualification names another source tree than this build")
+    if doc["image_digest"] != image_digest:
+        raise QualificationRefused("the qualification names another image digest than this pod runs")
     if not (isinstance(doc["run_lock_sha256"], str) and _SHA256.match(doc["run_lock_sha256"])):
         raise QualificationRefused("run_lock_sha256 must be a sha256")
     gates = doc["gates"]
@@ -136,12 +146,13 @@ def parse(data: bytes, build: BuildInfo, now_s: int) -> LabQualification:
                 not all(isinstance(t[k], str) and t[k] for k in t) or t["namespace"] not in namespaces:
             raise QualificationRefused(f"a target needs namespace (in scope), name and uid: {t!r}")
         out.add((t["namespace"], t["name"], t["uid"]))
-    return LabQualification(sha256=sha256_hex(data), source_tree=build.source_tree,
+    return LabQualification(sha256=sha256_hex(data), source_tree=build.source_tree, image_digest=image_digest,
                             run_lock_sha256=doc["run_lock_sha256"], cluster_uid=cluster,
                             namespaces=frozenset(namespaces), targets=frozenset(out), not_before=nb, expires=exp)
 
 
-def load(path: Optional[str], build: BuildInfo, now_s: int) -> Optional[LabQualification]:
+def load(path: Optional[str], build: BuildInfo, now_s: int,
+         image_digest: Optional[str] = None) -> Optional[LabQualification]:
     """None without a path; a verified qualification; or QualificationRefused."""
     if not path:
         return None
@@ -150,7 +161,7 @@ def load(path: Optional[str], build: BuildInfo, now_s: int) -> Optional[LabQuali
             data = fh.read(1 << 16)
     except OSError as e:
         raise QualificationRefused(f"unreadable: {e}") from e
-    return parse(data, build, now_s)
+    return parse(data, build, now_s, image_digest)
 
 
 def cluster_uid(reader) -> Optional[str]:

@@ -60,12 +60,23 @@ def check_dockerfile(text: str) -> list:
             or "--only-binary=:all:" not in installs[0]:
         problems.append(f"Dockerfile: exactly one pip install of requirements-statistical.txt with --no-deps and "
                         f"--only-binary=:all: is required, found {installs}")
-    for l in lines:
-        if l.startswith("COPY") and "--from=builder" not in l:
-            sources = l.split()[1:-1]
-            for src in sources:
-                if src not in ALLOWED_COPIES:
-                    problems.append(f"Dockerfile: COPY of {src!r} is outside the allowlist")
+    froms = [i for i, l in enumerate(lines) if l.startswith("FROM ")]
+    final = froms[-1] if froms else 0
+    for i, l in enumerate(lines):
+        if not l.startswith("COPY"):
+            continue
+        if i < final:                           # earlier stages: only the builder's requirements, the verify context
+            if not (l == "COPY requirements-statistical.txt ." or l == "COPY . /ctx"):
+                problems.append(f"Dockerfile: {l!r} in an earlier stage is outside the allowlist")
+            continue
+        if l.startswith("COPY --from="):        # the final image takes only the installed packages and the record
+            if l not in ("COPY --from=builder /usr/local /usr/local",
+                         "COPY --from=verify /build-info.json /app/build-info.json"):
+                problems.append(f"Dockerfile: {l!r} copies from another stage outside the allowlist")
+            continue
+        for src in l.split()[1:-1]:
+            if src not in ALLOWED_COPIES:
+                problems.append(f"Dockerfile: COPY of {src!r} is outside the allowlist")
         if "api/main.py" in l or "requirements.txt" in l.replace("requirements-statistical.txt", ""):
             problems.append(f"Dockerfile: {l!r} brings the legacy service or its dependencies")
     users = [l for l in lines if l.startswith("USER ")]

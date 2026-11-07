@@ -12,12 +12,16 @@ are measured by replaying the OPERATOR'S policy, not an approximation of it:
   here fails both test suites.
 
 paired_costs() replays the challenger and the baseline over the same decisions of one retained paired window: the same
-measured rates, the same bounds, capacity, caps, headroom and startup delay; at a decision where either forecast has
-no issued bound, both are reactive, so the costs differ only where both forecasts existed. From each replay:
+controller inputs, bounds, capacity, caps, headroom and startup delay; at a decision where either forecast has no
+issued bound, both are reactive, so the costs differ only where both forecasts existed. The controller's measured rate
+at a decision is what was AVAILABLE then (controller_rps: the newest observation the forecaster had received for that
+decision), never the later truth; the eventual measurement (truth_rps) only scores. From each replay:
   replica_time = integral of the replicas the policy requested (provisioned cost, ready or not), replica-seconds;
   shortage     = integral of max(n*(t) - ready(t), 0), replica-seconds, with n*(t) = measured RPS / capacity
-                 (fractional, unclipped) and ready(t) = min(applied(t), applied(t - D)): a scale-up becomes ready only
-                 after the startup delay D, a scale-down is immediate. Time without a measurement is excluded and
+                 (fractional, unclipped) and ready(t) the replicas that have finished starting: each scale-up starts a
+                 cohort that becomes ready D (the startup delay) later; a scale-down removes starting replicas first
+                 (newest first), then ready ones, as a ReplicaSet deletes unready pods first. So a scale-down followed
+                 by a scale-up within D does not resurrect ready capacity. Time without a measurement is excluded and
                  reported (unknown truth is not zero shortage).
 The result carries its binding (epoch, both models and recipes, the window, and the fingerprint of the policy:
 capacity, bounds, caps, headroom, startup delay, decision interval); trust uses it only when every part matches.
@@ -26,7 +30,6 @@ These are capacity proxies for comparing two forecasts under one policy, not ser
 
 from __future__ import annotations
 
-import bisect
 import math
 from dataclasses import asdict, dataclass
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
@@ -246,19 +249,42 @@ def resolve_policy(spec: Mapping, settings, lead) -> Tuple[Optional[PolicyParams
 
 # --- costs ------------------------------------------------------------------------------------------------------
 
+class _Pods:
+    """Replicas by state: `ready`, plus starting cohorts [ready_at, n] in start order."""
+
+    def __init__(self, ready: int):
+        self.ready, self.starting = ready, []
+
+    @property
+    def total(self) -> int:
+        return self.ready + sum(n for _, n in self.starting)
+
+    def promote(self, now: float) -> None:
+        while self.starting and self.starting[0][0] <= now:
+            self.ready += self.starting.pop(0)[1]
+
+    def scale(self, target: int, now: float, startup_delay: int) -> None:
+        diff = target - self.total
+        if diff > 0:
+            self.starting.append([now + startup_delay, diff])
+            self.promote(now)
+        while diff < 0 and self.starting:                 # starting replicas go first, the newest cohort first
+            take = min(-diff, self.starting[-1][1])
+            self.starting[-1][1] -= take
+            diff += take
+            if self.starting[-1][1] == 0:
+                self.starting.pop()
+        if diff < 0:
+            self.ready += diff
+
+
 def window_costs(decisions: Sequence[Decision], initial: int, truth_rps: Mapping[int, float], interval: int,
                  capacity_rps: float, startup_delay: int, start: int, end: int) -> Dict[str, float]:
-    """Exact piecewise integrals over [start, end): replica_time, shortage and the seconds without truth."""
-    times = [d.t for d in decisions]
-    applied = [d.applied for d in decisions]
-
-    def applied_at(tau: float) -> int:
-        i = bisect.bisect_right(times, tau) - 1
-        return applied[i] if i >= 0 else initial
-
+    """Exact piecewise integrals over [start, end): replica_time, shortage and the seconds without truth. `initial`
+    replicas are ready at the start; decisions apply at their own times (module docstring for ready(t))."""
     points = {start, end}
-    for t in times:
-        for b in (t, t + startup_delay):
+    for d in decisions:
+        for b in (d.t, d.t + startup_delay):
             if start < b < end:
                 points.add(b)
     first_slot = start - start % interval
@@ -266,32 +292,39 @@ def window_costs(decisions: Sequence[Decision], initial: int, truth_rps: Mapping
         if start < slot < end:
             points.add(slot)
     cuts = sorted(points)
+    pods, i = _Pods(initial), 0
     replica_time = shortage = unknown = 0.0
     for a, b in zip(cuts, cuts[1:]):
-        mid, width = (a + b) / 2, b - a
-        requested = applied_at(mid)
-        ready = min(requested, applied_at(mid - startup_delay))
-        replica_time += requested * width
-        rps = truth_rps.get(int(mid - mid % interval))
+        while i < len(decisions) and decisions[i].t <= a:  # every change happens at a cut: constant on [a, b)
+            pods.promote(decisions[i].t)
+            pods.scale(decisions[i].applied, decisions[i].t, startup_delay)
+            i += 1
+        pods.promote(a)
+        width = b - a
+        replica_time += pods.total * width
+        rps = truth_rps.get(int(a - a % interval))
         if rps is None:
             unknown += width
         else:
-            shortage += max(rps / capacity_rps - ready, 0.0) * width
-    return {"replica_time": replica_time, "shortage": shortage, "unknown_truth_seconds": unknown}
+            shortage += max(rps / capacity_rps - pods.ready, 0.0) * width
+    return {"replica_time": replica_time, "shortage": shortage, "unknown_truth_seconds": unknown,
+            "seconds": float(end - start)}
 
 
 def paired_costs(*, epoch: str, challenger: Tuple[str, str], baseline: Tuple[str, str], params: PolicyParams,
                  truth_rps: Mapping[int, float], challenger_upper: Mapping[int, float],
                  baseline_upper: Mapping[int, float], start: int, end: int, interval: int,
-                 window_offset: int = 0) -> Dict:
+                 window_offset: int = 0, controller_rps: Optional[Mapping[int, float]] = None) -> Dict:
     """Same-policy costs of the challenger and the baseline over the decisions start, start + C, ..., end (C the
     decision interval), integrated over [start, end + C). (model, recipe) pairs name the two forecasts. The binding's
     window is in the coordinate trust's retained pairs use, the issued WINDOW ENDS: [start, end] + window_offset (the
-    epoch's window end minus decision origin)."""
+    epoch's window end minus decision origin). controller_rps (default: truth_rps, for offline studies only) is the rate
+    the controller had at each decision; truth_rps scores."""
     c = params.decision_interval_seconds
+    inputs = truth_rps if controller_rps is None else controller_rps
     steps_c, steps_b, paired = [], [], 0
     for t in range(start, end + 1, c):
-        rps = truth_rps.get(t)
+        rps = inputs.get(t)
         rpm = None if rps is None else rps * 60
         uc, ub = challenger_upper.get(t), baseline_upper.get(t)
         if uc is None or ub is None:
@@ -314,4 +347,4 @@ def paired_costs(*, epoch: str, challenger: Tuple[str, str], baseline: Tuple[str
             "shortage": [out["challenger"]["shortage"], out["baseline"]["shortage"]],
             "replica_time": [out["challenger"]["replica_time"], out["baseline"]["replica_time"]],
             "paired_decisions": paired, "decisions": len(steps_c),
-            "unknown_truth_seconds": out["baseline"]["unknown_truth_seconds"]}
+            "unknown_truth_seconds": out["baseline"]["unknown_truth_seconds"], "seconds": out["baseline"]["seconds"]}

@@ -13,10 +13,10 @@ api/serve.py (`python -m api.serve statistical`), which also restarts it when th
 Configuration (environment): PROMETHEUS_URL (required), FORECAST_STATE_DIR (default /state: the journal and fit
 artifacts, a retained volume), FORECAST_STATE_QUOTA_BYTES, FORECAST_ADMISSION, FORECAST_FIT_MODE (worker | off) and
 the FORECASTER_AUTH* / FORECASTER_TLS_* settings of api/auth.py. FORECAST_LAB_QUALIFICATION names a reviewed
-lab-qualification/v1 file (forecasting.qualification): honoured only by the evaluation build it names; in any other
-image, or malformed, expired or for another source tree, the app does not start. The benchmark switches of the legacy service
-(ALLOW_BENCHMARK_EXPERIMENTS, SEASONAL_EXPERIMENT, ENSEMBLE_EXPERIMENT, ...) are REFUSED: present at all, the app does
-not start.
+lab-qualification/v1 file (forecasting.qualification): honoured only by the evaluation build and image digest
+(FORECAST_IMAGE_DIGEST) it names; in any other image, or malformed, expired or for another source tree, the app does
+not start. The benchmark switches of the legacy service (ALLOW_BENCHMARK_EXPERIMENTS, SEASONAL_EXPERIMENT,
+ENSEMBLE_EXPERIMENT, ...) are REFUSED: present at all, the app does not start.
 """
 
 from __future__ import annotations
@@ -61,7 +61,8 @@ def default_service(env: Mapping[str, str]):
     from forecasting import qualification as Q
     build = Q.read_build_info()
     try:
-        lab = Q.load(env.get("FORECAST_LAB_QUALIFICATION") or None, build, int(time.time()))
+        lab = Q.load(env.get("FORECAST_LAB_QUALIFICATION") or None, build, int(time.time()),
+                     env.get("FORECAST_IMAGE_DIGEST") or None)
     except Q.QualificationRefused as e:
         raise Refused(f"the lab qualification is refused: {e}") from e
     cfg = ServiceConfig(prometheus_url=url, state_dir=env.get("FORECAST_STATE_DIR", "/state"),

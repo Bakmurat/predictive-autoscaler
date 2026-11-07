@@ -14,7 +14,8 @@ For a request at decision origin t (all under one journal; nothing is wired to t
      the checkpoint it was computed from, stamped with the clock read just before the commit; an issuance that could no
      longer act before its first target is refused instead (never backdated);
   8. fold the issuance into the state, checkpoint again, and answer from the bundle alone (a retry at the same origin
-     returns the same bytes, whatever has matured since).
+     returns the same bytes, whatever has matured since, except predictive_eligible, which re-checks the release-gate
+     authorisation at every answer and can only turn false).
 Recovery is exact at every boundary: a crash before the issuance leaves the trust checkpoint (a retry re-decides from
 it); a crash after it leaves the issuance in the journal, folded in by the next request.
 
@@ -28,7 +29,10 @@ spec.prediction.families restricts what is forecast at all (seasonalNaive only: 
 This preview is shadow only: the release gates (G0-G5, C2.8) have not passed, so the verdict's PredictionReady and every
 response's predictive_eligible are false whatever the evidence says, except under a verified LAB qualification
 (forecasting.qualification) in an evaluation build, for the named cluster, namespaces and target UIDs only: it stands in
-for the release gate and nothing else, and every bundle records which basis (if any) it was issued under. A journal
+for the release gate and nothing else. Every bundle records the basis (if any) it was issued under, and every ANSWER
+re-checks it (a retry included): an expired, removed or changed qualification makes even a stored issuance
+ineligible, and a lab-qualified issuance is eligible only if its valid_until is not after the qualification's expiry,
+so a cached eligible answer never outlives it. A journal
 that cannot be opened or written answers 503 (StateUnavailable) and never issues; a lost journal starts empty, so trust
 has to be earned again from nothing.
 """
@@ -115,6 +119,7 @@ class ForecastService:
         self._cluster_uid: Optional[str] = None         # read once it succeeds (a pod never changes cluster)
         self._uppers: Dict = {}                         # (namespace, autoscaler) -> issued bounds of its epoch
         self._costs: Dict = {}                          # (namespace, autoscaler) -> (cache key, costs)
+        self.cost_replays = 0                           # cost simulations run (each one replays both families)
 
     # --- status -------------------------------------------------------------------------------------------------
 
@@ -339,7 +344,7 @@ class ForecastService:
             inputs.append(T.CandidateInputs(model, m["ledger"], upper is not None, info["n"], policy.min_windows,
                                             input_end - first_obs + dt, T.REQUIRED_HISTORY_SECONDS[model], True,
                                             None if p["fit_cutoff"] is None else input_end - p["fit_cutoff"]))
-        gate = self._release_gate(bound, now_ms // 1000)
+        gate = self._release_gate(bound, now_ms // 1000, window.valid_until(lead))
         policy_sha, costs = self._policy_costs(bound, state, now_ms // 1000, points)
         g = T.Global(now_s=now_ms // 1000, lead_seconds=lead.lead_seconds, nominal_miscoverage=policy.nominal_ratio,
                      identity_ok=True, store_healthy=self.store_healthy, replay_suite_passed=gate["passed"],
@@ -361,7 +366,8 @@ class ForecastService:
                 "policy_sha256": policy_sha,
                 "costs": {m: {"shortage": v["shortage"], "replica_time": v["replica_time"],
                               "window": v["binding"]["window"], "paired_decisions": v["paired_decisions"],
-                              "decisions": v["decisions"], "unknown_truth_seconds": v["unknown_truth_seconds"]}
+                              "decisions": v["decisions"], "unknown_truth_seconds": v["unknown_truth_seconds"],
+                              "seconds": v["seconds"]}
                           for m, v in costs.items()},
                 "verdict": {"phase": verdict.phase, "reason": verdict.reason,
                             "prediction_ready": verdict.prediction_ready,
@@ -371,6 +377,17 @@ class ForecastService:
                                                "evidence_cutoff":
                                                    state["models"][m]["ledger"]["last_prospective_outcome_s"]}
                                            for m, v in verdict.candidates.items()}}}
+
+    def _authorized(self, bound: BoundRequest, b: Dict) -> bool:
+        """The bundle's release-gate basis still holds NOW, for this request: the same basis and the same qualification
+        digest, re-checked on every answer (an issuance stored under a lab qualification is not eligible once it has
+        expired, been removed or replaced)."""
+        issued = b.get("release_gate") or {}
+        if issued.get("passed") is not True:
+            return False
+        now = self._release_gate(bound, self.clock.now_ms() // 1000, b["valid_until"])
+        return now["passed"] and (now["basis"], now["lab_qualification_sha256"]) == \
+            (issued.get("basis"), issued.get("lab_qualification_sha256"))
 
     def _response(self, bound: BoundRequest, b: Dict) -> Dict:
         sig = bound.signal
@@ -398,8 +415,8 @@ class ForecastService:
             calibration_windows=c["calibration"]["n"], prospective_windows=cv["prospective_gate_bounds"],
             gate_coverage_ratio=cv["coverage_gate"], missing_outcome_ratio=None if avail is None else 1.0 - avail,
             selected_candidate=reported, trust_state=state_phase, reason=v["reason"],
-            predictive_eligible=bool((b.get("release_gate") or {}).get("passed") is True and v["prediction_ready"]
-                                     and b["selected"] and c["upper_window_max_rps"] is not None),
+            predictive_eligible=bool(v["prediction_ready"] and b["selected"] and c["upper_window_max_rps"] is not None
+                                     and self._authorized(bound, b)),
             evidence_cutoff=cv["evidence_cutoff"])
         check_response(r, bound)
         return r.to_wire()
@@ -430,10 +447,10 @@ class ForecastService:
     def _models(bound: BoundRequest) -> tuple:
         return tuple(FAMILY_MODELS[f] for f in bound.settings.families)
 
-    def _release_gate(self, bound: BoundRequest, now_s: int) -> Dict:
+    def _release_gate(self, bound: BoundRequest, now_s: int, valid_until: int) -> Dict:
         """The release gate's basis for this request: the product release (RELEASE_GATES_PASSED), a lab qualification
-        whose scope covers the live cluster, namespace and target right now, or none. Only Global.replay_suite_passed
-        reads it; every runtime gate is evaluated as always."""
+        whose scope covers the live cluster, namespace and target right now and that is still valid at the answer's
+        valid_until, or none. Only Global.replay_suite_passed reads it; every runtime gate is evaluated as always."""
         q = self.config.lab_qualification
         if RELEASE_GATES_PASSED:
             return {"passed": True, "basis": "release", "lab_qualification_sha256": None}
@@ -442,12 +459,14 @@ class ForecastService:
         if self._cluster_uid is None:
             self._cluster_uid = Q.cluster_uid(self.reader)
         sig = bound.signal
-        ok = q.covers(self._cluster_uid, bound.autoscaler_namespace, sig.namespace, sig.name, sig.target_uid, now_s)
+        ok = q.covers(self._cluster_uid, bound.autoscaler_namespace, sig.namespace, sig.name, sig.target_uid, now_s) \
+            and valid_until <= q.expires
         return {"passed": ok, "basis": "lab" if ok else None, "lab_qualification_sha256": q.sha256}
 
     def _issued_uppers(self, bound: BoundRequest, lo: int) -> Dict[int, tuple]:
-        """{decision origin: (naive bound, E1 bound)} of the epoch's issuances, folded incrementally from the journal
-        (rebuilt from it after a restart) and kept for COST_HISTORY_SECONDS."""
+        """{decision origin: (naive bound, E1 bound, input_end)} of the epoch's issuances, folded incrementally from the
+        journal (rebuilt from it after a restart) and kept for COST_HISTORY_SECONDS. input_end is the newest observation
+        the issuance was computed from: what the forecaster had received at that decision."""
         scope, ek = (bound.autoscaler_namespace, bound.autoscaler_name), bound.evidence_key
         u = self._uppers.get(scope)
         if u is None or u["epoch"] != ek:
@@ -455,7 +474,8 @@ class ForecastService:
         for iss in self.store.issuances_after(ek, u["seq"]):
             b = iss.payload()
             pick = {m: candidate(b, m).get("upper_window_max_rps") for m in iss.models}
-            u["by_origin"][iss.key.decision_origin] = (pick.get("seasonal_naive"), pick.get("statistical"))
+            u["by_origin"][iss.key.decision_origin] = (pick.get("seasonal_naive"), pick.get("statistical"),
+                                                       b.get("input_end"))
             u["seq"] = iss.seq
         u["by_origin"] = {o: v for o, v in u["by_origin"].items() if o >= lo}
         return u["by_origin"]
@@ -476,7 +496,7 @@ class ForecastService:
         if ps["n"] < t.challenger_min_pairs or ps["span"] < t.challenger_min_hours * 3600:
             return sha, {}
         scope, ek = (bound.autoscaler_namespace, bound.autoscaler_name), bound.evidence_key
-        key = (ek, sha, ps["first"], ps["last"], pairs["last_seq"])
+        key = (ek, sha, ps["first"], ps["last"], ps["n"])            # changed evidence or policy: replay again
         cached = self._costs.get(scope)
         if cached is not None and cached[0] == key:
             return sha, cached[1]
@@ -484,12 +504,19 @@ class ForecastService:
         c, dt = params.decision_interval_seconds, bound.settings.sample_interval_seconds
         start, end = ps["first"] - offset, ps["last"] - offset
         uppers = self._issued_uppers(bound, now_s - COST_HISTORY_SECONDS)
-        truth = {ts: v for ts, v, _at in self.store.observations("signal:" + ek, start, end + c)}
+        lo = min([start] + [u[2] for o, u in uppers.items() if start <= o <= end and u[2] is not None])
+        obs = {ts: v for ts, v, _at in self.store.observations("signal:" + ek, lo, end + c)}   # first receipts
+        # The controller's input at decision o: the newest observation the issuance at o was computed from (it had
+        # been received by then); no issuance, no measurement (the operator holds). The truth only scores.
+        controller = {o: obs[u[2]] for o, u in uppers.items() if start <= o <= end and u[2] in obs}
+        truth = {ts: v for ts, v in obs.items() if ts >= start}
         costs = {"statistical": P.paired_costs(
             epoch=ek, challenger=("statistical", RECIPE_E1), baseline=("seasonal_naive", RECIPE_NAIVE), params=params,
-            truth_rps=truth, challenger_upper={o: u[1] for o, u in uppers.items() if u[1] is not None},
+            truth_rps=truth, controller_rps=controller,
+            challenger_upper={o: u[1] for o, u in uppers.items() if u[1] is not None},
             baseline_upper={o: u[0] for o, u in uppers.items() if u[0] is not None}, start=start, end=end,
             interval=dt, window_offset=offset)}
+        self.cost_replays += 1
         self._costs[scope] = (key, costs)
         return sha, costs
 
