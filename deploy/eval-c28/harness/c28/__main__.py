@@ -153,6 +153,18 @@ def check_bindings(study: dict, lock: dict, digest: str) -> None:
             raise BindingError(f"block {where}: the metrics differ from its re-derived reduction")
 
 
+def check_applicability(study: dict, lock: dict) -> None:
+    """Section 12: the study scores under exactly the run-lock's applicability declaration (the frozen one, bound to
+    the same manifest digest), and every PA block reports the family field the run-lock recorded for its arm."""
+    if study.get("applicability") != lock.get("applicability"):
+        raise BindingError("the study's applicability declaration is not the run-lock's")
+    for b in study.get("blocks", []):
+        rec = lock["arms"].get(f"{b.get('arm')}/{b.get('profile')}", {})
+        if b.get("families") is not None and b["families"] != rec.get("families"):
+            raise BindingError(f"block {b.get('arm')}/{b.get('profile')}/{b.get('seed')}: families differ from the "
+                               f"run-lock's")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="c28", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -233,6 +245,7 @@ def main(argv=None) -> int:
         digest, lock = _verified(args)
         study = _load(args.study)
         check_bindings(study, lock, digest)
+        check_applicability(study, lock)
         _write(_json(score.score(study)), args.out)
     elif args.cmd == "audit":
         params = _load(args.params)

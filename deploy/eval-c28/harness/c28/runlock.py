@@ -6,6 +6,12 @@ its canonical form; `verify` recomputes both and checks the manifest's own hash.
 unresolved (placeholders, tags instead of digests, "latest"), any credential material, frozen values that differ from
 the manifest (seeds, operating point, caps, bootstrap), and a session order other than the frozen one. Once a run has
 started, a changed input is a new run-lock and a new confirmation cohort, never an edit.
+
+Section 12 (manifest amendment of 2026-11-07): `applicability` must be exactly the frozen scenario-by-arm declaration
+(frozen.APPLICABILITY: H-CPU's CPU-metric outage not tested, the request-metric outage required for H-RPS, PA-R, PA-N,
+PA-E) bound to this run-lock's manifest digest, and both acknowledgments must predate the schedule's start (the cohort
+is locked before its first scored run). Each PA arm records its spec.prediction.families and the effective candidate
+set (frozen.PA_FAMILIES / PA_CANDIDATES); the HPA arms record neither.
 """
 
 from __future__ import annotations
@@ -34,6 +40,7 @@ REQUIRED = {
     "cpu_tuning": dict, "arms": dict, "operating_point": dict, "seeds": dict, "session_order": list, "startup": dict,
     "queries": list, "collection": dict, "schedule": dict, "admission": dict, "data_licenses": list,
     "retention": dict, "scorer": dict, "activation_scope": dict, "fault_scope": dict, "acknowledgments": dict,
+    "applicability": dict,
 }
 _RUN_LABEL = "c28.devkuban.com/run"
 
@@ -119,9 +126,23 @@ def problems(doc: Dict) -> List[str]:
     if doc["cpu_tuning"].get("selected_target_percent") not in F.HPA_CPU_CANDIDATES:
         out.append("cpu_tuning.selected_target_percent must be a tuning candidate")
     expected_arms = {f"{a}/{p}" for a in F.ARMS for p in F.PROFILES}
-    if set(doc["arms"]) != expected_arms or not all(_SHA.match(str(v.get("rendered_sha256", "")))
+    if set(doc["arms"]) != expected_arms or not all(isinstance(v, dict) and _SHA.match(str(v.get("rendered_sha256", "")))
                                                    for v in doc["arms"].values()):
         out.append("arms must list every arm/profile with its rendered manifest sha256")
+    else:
+        for k, v in doc["arms"].items():
+            arm = k.split("/")[0]
+            if arm in F.PA_ARMS:
+                if v.get("families") != list(F.PA_FAMILIES[arm]) or \
+                        v.get("effective_candidates") != list(F.PA_CANDIDATES[arm]):
+                    out.append(f"arms.{k} must record families {list(F.PA_FAMILIES[arm])} and effective_candidates "
+                               f"{list(F.PA_CANDIDATES[arm])}")
+            elif "families" in v or "effective_candidates" in v:
+                out.append(f"arms.{k}: {arm} has no forecast families")
+    app = doc["applicability"]
+    if app != {"declaration": F.APPLICABILITY, "manifest_sha256": doc["manifest"].get("sha256")}:
+        out.append("applicability must be exactly the frozen section 12 declaration bound to manifest.sha256 "
+                   "(no other waiver)")
     op = doc["operating_point"]
     if (op.get("capacity_ratio"), op.get("nominal_coverage_bps"), op.get("extra_max_replicas"),
             op.get("extra_max_percent"), op.get("pa_headroom_percent")) != (
@@ -204,6 +225,9 @@ def problems(doc: Dict) -> List[str]:
         a = ack.get(role, {})
         if not a.get("name") or not _TS.match(str(a.get("at", ""))):
             out.append(f"acknowledgments.{role} needs name and at")
+        elif _TS.match(str(sch.get("start_utc", ""))) and not a["at"] < sch["start_utc"]:
+            out.append(f"acknowledgments.{role} must predate schedule.start_utc (section 12: locked before the "
+                       f"first scored run)")
     return out
 
 

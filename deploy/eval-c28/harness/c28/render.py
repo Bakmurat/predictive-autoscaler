@@ -21,7 +21,6 @@ RUN_LABEL = "c28.devkuban.com/run"
 ARM_LABEL = "c28.devkuban.com/arm"
 PROFILE_LABEL = "c28.devkuban.com/profile"
 TARGET_LABEL = "c28.devkuban.com/target"
-FAMILY_RESTRICTION = "c28.devkuban.com/family-restriction"   # PA-N: needs the C2.8a mechanism (NOT READY without)
 
 _DNS = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
 _DIGEST_IMAGE = re.compile(r"^[a-z0-9][a-z0-9./:-]*@sha256:[0-9a-f]{64}$")
@@ -206,12 +205,11 @@ def _writer(p: Dict, arm: str, profile: str, target: str) -> Dict:
                                   "risk": {"miscoverageBps": F.MISCOVERAGE_BPS},
                                   "calibration": {"minWindows": F.CALIBRATION_MIN, "maxScores": F.CALIBRATION_MAX,
                                                   "retentionDays": F.RETENTION_DAYS},
-                                  "predictiveExtra": {"maxReplicas": extra[0], "maxPercent": extra[1]}},
+                                  "predictiveExtra": {"maxReplicas": extra[0], "maxPercent": extra[1]},
+                                  "families": list(F.PA_FAMILIES[arm])},
                    "behavior": {"scaleDown": {"headroomPercent": F.PA_HEADROOM_PERCENT},
                                 "startup": {"fallbackDelaySeconds": budget, "minimumDelaySeconds": budget,
                                             "actuationAllowanceSeconds": F.ACTUATION_ALLOWANCE_S}}}}
-    if arm == "PA-N":
-        pa["metadata"]["annotations"] = {FAMILY_RESTRICTION: "seasonal_naive"}
     return pa
 
 

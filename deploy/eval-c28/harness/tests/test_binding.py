@@ -26,6 +26,8 @@ def locked(tmp_path):
                        "blocks": {k: ["2026-11-20T00:00:00Z"] if k == "PA-N/s20/201" else
                                   [f"2026-11-{19 + int(k.rsplit('/', 1)[1]) - 200:02d}T00:00:00Z"]
                                   for k in doc["schedule"]["blocks"]}}
+    for role in ("executor", "reviewer"):                    # locked before the first scored run (section 12)
+        doc["acknowledgments"][role]["at"] = "2026-11-18T12:00:00Z"
     path = tmp_path / "runlock.json"
     path.write_text(json.dumps(doc))
     digest = runlock.lock(str(path))
@@ -127,3 +129,17 @@ def test_scoring_rederives_every_block_from_its_bundle(locked):
     for bad in ({"bundle": ""}, {"binding": {}}, {"profile": "s90"}):
         with pytest.raises(BindingError):
             check_bindings({"blocks": [dict(good, **bad)]}, doc, digest)
+
+
+def test_the_study_scores_under_the_runlocks_applicability(locked):
+    from c28.__main__ import check_applicability
+    doc, _digest, _bundle, _ = locked
+    blocks = [{"arm": "PA-N", "profile": "s20", "seed": 201, "families": ["seasonalNaive"]}]
+    check_applicability({"applicability": copy.deepcopy(doc["applicability"]), "blocks": blocks}, doc)
+    other = copy.deepcopy(doc["applicability"])
+    other["manifest_sha256"] = "9" * 64                       # another manifest version
+    with pytest.raises(BindingError, match="applicability"):
+        check_applicability({"applicability": other, "blocks": blocks}, doc)
+    with pytest.raises(BindingError, match="families differ"):
+        check_applicability({"applicability": copy.deepcopy(doc["applicability"]),
+                             "blocks": [dict(blocks[0], families=["seasonalNaive", "statistical"])]}, doc)
