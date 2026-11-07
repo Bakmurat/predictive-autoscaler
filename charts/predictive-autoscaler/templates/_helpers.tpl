@@ -48,7 +48,16 @@ app.kubernetes.io/component: {{ index . 1 }}
 {{- end -}}
 
 {{- define "pa.forecasterURL" -}}
-{{- printf "%s://%s-forecaster.%s.svc:%s" (ternary "https" "http" .Values.forecaster.auth.enabled) (include "pa.fullname" .) .Release.Namespace (include "pa.forecasterPort" .) -}}
+{{- $scheme := ternary "https" "http" .Values.forecaster.auth.enabled -}}
+{{- with .Values.operator.forecasterAddress -}}
+{{- $host := index (splitList ":" .) 0 -}}
+{{- if and $.Values.forecaster.auth.enabled (not (has $host $.Values.forecaster.tls.extraDNSNames)) -}}
+{{- fail (printf "operator.forecasterAddress host %q must be in forecaster.tls.extraDNSNames (certificate verification stays on)" $host) -}}
+{{- end -}}
+{{- printf "%s://%s" $scheme . -}}
+{{- else -}}
+{{- printf "%s://%s-forecaster.%s.svc:%s" $scheme (include "pa.fullname" .) .Release.Namespace (include "pa.forecasterPort" .) -}}
+{{- end -}}
 {{- end -}}
 
 {{- define "pa.forecasterTLSSecret" -}}

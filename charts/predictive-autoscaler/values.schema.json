@@ -75,6 +75,7 @@
       "properties": {
         "replicas": {"type": "integer", "minimum": 1},
         "watchNamespaces": {"type": "array", "items": {"type": "string", "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"}},
+        "forecasterAddress": {"type": "string", "pattern": "^$|^[a-z0-9]([-a-z0-9.]*[a-z0-9])?:[0-9]{1,5}$"},
         "forecastLedger": {
           "type": "object",
           "additionalProperties": false,
@@ -145,7 +146,8 @@
                 "renewBefore": {"type": "string"}
               }
             },
-            "selfSigned": {"type": "object", "additionalProperties": false, "properties": {"validityDays": {"type": "integer", "minimum": 1, "maximum": 3650}}}
+            "selfSigned": {"type": "object", "additionalProperties": false, "properties": {"validityDays": {"type": "integer", "minimum": 1, "maximum": 3650}}},
+            "extraDNSNames": {"type": "array", "items": {"type": "string", "pattern": "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$"}}
           }
         },
         "resources": {"$ref": "#/definitions/resources"},

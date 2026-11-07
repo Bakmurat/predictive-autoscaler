@@ -267,6 +267,20 @@ When the certificate files change, the forecasting service restarts itself withi
 the operator reloads the CA. For those seconds the operator uses a recent cached forecast or the reactive rule. The
 smoke test runs a rotation.
 
+**Extra certificate names and routes.** `forecaster.tls.extraDNSNames` adds names to the certificate, so the operator
+can dial the forecaster through a named route (`operator.forecasterAddress`, for example the C2.8 evaluation's
+forecast route) with verification on. The chart refuses an address whose host is not in that list. With `selfSigned`,
+adding names does **not** change a certificate that already exists: `helm upgrade` keeps the stored Secret (`lookup`),
+so the new names are absent until you rotate. To rotate:
+
+1. Delete the Secret `<release>-predictive-autoscaler-forecaster-tls`.
+2. Run `helm upgrade` with the new names.
+3. Wait for the forecasting service to reload, and the operator its CA (about a minute).
+4. Check the served certificate's SANs, for example with `openssl s_client -connect <route>:8443 -servername <route>`.
+
+During those seconds the operator falls back as described above. With `certManager`, the Certificate's `dnsNames`
+change on upgrade and cert-manager reissues it. With `existingSecret`, you issue the names yourself.
+
 `forecaster.auth.enabled: false` goes back to plain HTTP on port 8000, with the network policies as the only boundary.
 
 ## Not in the chart (yet)

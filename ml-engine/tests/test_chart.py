@@ -458,6 +458,25 @@ def test_authentication_is_on_by_default_with_tls(render):
     assert vols["forecaster-ca"]["secret"]["items"] == [{"key": "ca.crt", "path": "ca.crt"}]   # never the private key
 
 
+def test_a_forecaster_route_keeps_certificate_verification(render):
+    """C2.8: the operator may dial an evaluation-owned route in front of the forecaster; its host must be a name in the
+    certificate (verification stays on), or the render fails."""
+    route = "c28-forecast-route.pa-eval-system.svc"
+    docs = render({"operator": {"forecasterAddress": f"{route}:8443"}, "forecaster": {"tls": {"extraDNSNames": [route]}}})
+    op = next(d for d in by_kind(docs, "Deployment") if d["metadata"]["name"] == "pa-predictive-autoscaler-operator")
+    env = {e["name"]: e.get("value") for e in op["spec"]["template"]["spec"]["containers"][0]["env"]}
+    assert env["ML_API_URL"] == f"https://{route}:8443"
+    secret = next(d for d in by_kind(docs, "Secret") if d["metadata"]["name"] == "pa-predictive-autoscaler-forecaster-tls")
+    import base64
+    cert = base64.b64decode(secret["data"]["tls.crt"]).decode()
+    check = subprocess.run(["openssl", "x509", "-noout", "-ext", "subjectAltName"], input=cert, capture_output=True, text=True)
+    if check.returncode == 0:
+        assert route in check.stdout and f"pa-predictive-autoscaler-forecaster.{NS}.svc" in check.stdout
+    bad = render({"operator": {"forecasterAddress": f"{route}:8443"}}, check=False)
+    assert bad.returncode != 0 and "extraDNSNames" in bad.stderr
+    assert render({"operator": {"forecasterAddress": "https://x:1"}}, check=False).returncode != 0   # schema: host:port
+
+
 def test_the_self_signed_certificate_covers_the_service_names(render):
     secret = next(d for d in by_kind(render(), "Secret") if d["metadata"]["name"] == "pa-predictive-autoscaler-forecaster-tls")
     assert secret["type"] == "kubernetes.io/tls" and set(secret["data"]) == {"tls.crt", "tls.key", "ca.crt"}
