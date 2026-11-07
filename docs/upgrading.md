@@ -1,5 +1,13 @@
 # Upgrading
 
+## Forecast families (CRD revision 5)
+
+Revision 5 adds `spec.prediction.families`: the forecast families the statistical forecaster issues and may select
+(`[seasonalNaive, statistical]` when unset; `[seasonalNaive]` removes E1-product as a candidate; seasonal-naive is always
+required). Apply the CRD before the operator, as for every revision: an older CRD would prune the field and silently
+widen a naive-only autoscaler, so the operator waits, unready, until revision 5 is installed. Nothing changes for an
+autoscaler that does not set it.
+
 ## Forecast contract v2 settings (CRD revision 4)
 
 Revision 4 adds the statistical engine's settings (`spec.prediction.engine` and the keys after it), the startup budget

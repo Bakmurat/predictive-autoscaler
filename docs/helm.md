@@ -162,6 +162,28 @@ The forecasting service and the trainer share the model volume.
   or a missing cgroup measurement: the gate for the 384 MiB fit limit and these resources.
 - **Readiness:** `/ready` answers 503 while the journal cannot support issuance (and before start-up); `/health`
   stays the liveness probe. Young history or untrusted models do not make the service unready.
+- **Families and the challenger:** `spec.prediction.families` (`[seasonalNaive, statistical]` by default) lists what
+  is forecast; `[seasonalNaive]` removes E1-product entirely (no fit, no candidate), and seasonal-naive is always
+  required (CRD revision 5). E1 is selected over a trusted seasonal-naive only on bound **same-policy costs**: once the
+  retained paired evidence meets `challengerMinPairs` and `challengerMinHours`, both forecasts' issued bounds are
+  replayed through the operator's own v2 policy for that autoscaler (`ml-engine/forecasting/policy_sim.py`, held
+  decision for decision to the Go replay by `k8s-operator/controllers/testdata/v2-policy-parity.json`), and E1's
+  shortage and replica-time must each be at most `challengerCostRatioBps` of seasonal-naive's. The costs carry their
+  epoch, models, recipes, window and policy fingerprint (capacity, bounds, caps, headroom, startup delay, decision
+  interval) and count only when all of them match; an autoscaler without `capacityPerReplica` (or `targetRPS`) has no
+  policy, so E1 is never promoted for it. Each issuance records the policy fingerprint and the costs it used.
+- **Lab qualification (C2.8 evaluation only):** `forecaster.statistical.labQualification.configMap` mounts a reviewed
+  `lab-qualification/v1` file (`ml-engine/forecasting/qualification.py`) and lets the forecaster read the
+  `kube-system` Namespace (the cluster UID). It is honoured only by an image built with
+  `--build-arg EVALUATION_BUILD=true --build-arg SOURCE_TREE=<commit>` for exactly the commit the file names; a
+  release image, a malformed, expired or over-wide file, or another tree stops the forecaster from starting. The file
+  names the run-lock digest, G0-G4 as `pass`, at least two reviewers, a validity window of at most 60 days, and its
+  scope: one cluster UID, namespaces and every target Deployment by namespace, name and UID. For a request whose live
+  cluster, namespaces and target are all in that scope while it is valid, it stands in for the release gate and
+  nothing else: identity, settings, calibration, coverage, availability, prospective evidence, selection, the issuance
+  deadline, caps, telemetry and the operator's write guards apply as always, so an untrusted forecast stays
+  ineligible. Every issuance records `release_gate` (`passed`, `basis`, the qualification's digest); `/health` shows
+  the build and the qualification.
 
 ## Monitoring
 

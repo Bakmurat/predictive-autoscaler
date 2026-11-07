@@ -62,6 +62,16 @@ type ForecastV2Settings struct {
 	Trust *ForecastTrust `json:"trust,omitempty"`
 	// +optional
 	PredictiveExtra *PredictiveExtra `json:"predictiveExtra,omitempty"`
+
+	// Families restricts the forecast families the service issues and may select (default both). [seasonalNaive]
+	// removes E1-product as a candidate (for example a naive-only evaluation arm). seasonalNaive is always required:
+	// the statistical family is selected only over a trusted seasonal-naive forecast.
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=2
+	// +kubebuilder:validation:items:Enum=seasonalNaive;statistical
+	// +listType=set
+	// +optional
+	Families []string `json:"families,omitempty"`
 }
 
 // ForecastRisk is the nominal risk of the upper bound.

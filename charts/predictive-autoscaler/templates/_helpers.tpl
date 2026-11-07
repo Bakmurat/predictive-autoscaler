@@ -71,6 +71,14 @@ app.kubernetes.io/component: {{ index . 1 }}
 {{- if eq .Values.forecaster.engine "statistical" }}true{{ end -}}
 {{- end -}}
 
+{{/* "true" when a lab qualification is mounted (C2.8 lab evaluation only); it exists only for the statistical engine. */}}
+{{- define "pa.labQualification" -}}
+{{- if .Values.forecaster.statistical.labQualification.configMap -}}
+{{- if not (include "pa.statistical" .) }}{{ fail "forecaster.statistical.labQualification needs forecaster.engine: statistical" }}{{ end -}}
+true
+{{- end -}}
+{{- end -}}
+
 {{/* The statistical journal's byte budget from forecaster.statistical.stateQuota (Mi or Gi). */}}
 {{- define "pa.stateQuotaBytes" -}}
 {{- $q := .Values.forecaster.statistical.stateQuota -}}

@@ -36,9 +36,11 @@ prospective gate bounds have matured since the demotion; never in the same evalu
 Challenger promotion (paired, against the trusted daily naive; the paired evidence must belong to the candidates'
 epoch, name the challenger and the naive, and carry both recipes): >= challenger_min_pairs paired
 prospective gate bounds whose retained window ends SPAN >= challenger_min_hours, mean pinball loss <=
-challenger_loss_ratio x the naive's, and the same-policy replay costs (shortage, replica-time, from the policy
-simulator) each <= challenger_cost_ratio x the naive's. A zero naive loss keeps the naive. Without the costs nothing
-is promoted.
+challenger_loss_ratio x the naive's, and the same-policy replay costs (shortage, replica-time, from
+forecasting.policy_sim) each <= challenger_cost_ratio x the naive's. Costs count only when their binding matches: the
+same epoch, both models and recipes of the paired evidence, the policy fingerprint the caller expects (capacity, bounds,
+caps, headroom, startup delay, decision interval) and a window covering the retained pairs. A zero naive loss keeps the
+naive. Without matching costs nothing is promoted.
 
 Selection (fallback order lstm -> statistical -> seasonal_naive -> reactive-only) has its own hysteresis: a safety
 failure (the selected candidate, or the naive it was compared with, not trusted) falls back at once; a challenger is
@@ -372,6 +374,7 @@ class Global:
     store_healthy: bool = True
     replay_suite_passed: bool = False
     startup_budget_valid: bool = False
+    policy_sha256: Optional[str] = None       # the policy the costs must have been simulated under
 
 
 @dataclass(frozen=True)
@@ -477,11 +480,28 @@ def step(hyst: dict, gates_ok: bool, ledger: dict, now_s: int, t: TrustSettings)
     return h
 
 
-def _paired_ok(pairs: Optional[dict], now_s: int, t: TrustSettings,
-               costs: Optional[Mapping[str, Tuple[float, float]]], loss_ratio_bps: int) -> bool:
+def costs_bound(costs: Optional[Mapping], pairs: dict, ps: Mapping, policy_sha256: Optional[str]) -> bool:
+    """The costs were simulated for these forecasts under this policy, over (at least) the retained pairs."""
+    b = (costs or {}).get("binding")
+    if not isinstance(b, Mapping) or policy_sha256 is None or ps["first"] is None:
+        return False
+    rec = pairs["recipes"]
+    want = {"epoch": pairs["epoch"],
+            "challenger": {"model": pairs["challenger"], "recipe": rec.get(pairs["challenger"])},
+            "baseline": {"model": pairs["baseline"], "recipe": rec.get(pairs["baseline"])},
+            "policy_sha256": policy_sha256}
+    window = b.get("window")
+    return {k: b.get(k) for k in want} == want and isinstance(window, (list, tuple)) and len(window) == 2 and \
+        window[0] <= ps["first"] and window[1] >= ps["last"]
+
+
+def _paired_ok(pairs: Optional[dict], now_s: int, t: TrustSettings, costs: Optional[Mapping], loss_ratio_bps: int,
+               policy_sha256: Optional[str]) -> bool:
     if pairs is None or costs is None:
         return False
     ps = pair_sums(pairs, now_s)
+    if not costs_bound(costs, pairs, ps, policy_sha256):
+        return False
     if ps["n"] < t.challenger_min_pairs or ps["span"] < t.challenger_min_hours * HOUR:
         return False
     if ps["base"] <= 0:
@@ -497,18 +517,19 @@ def _paired_ok(pairs: Optional[dict], now_s: int, t: TrustSettings,
     return True
 
 
-def challenger_promoted(pairs, now_s, t, costs) -> bool:
+def challenger_promoted(pairs, now_s, t, costs, policy_sha256=None) -> bool:
     """The entry test of a challenger over the naive (module docstring)."""
-    return _paired_ok(pairs, now_s, t, costs, t.challenger_loss_ratio_bps)
+    return _paired_ok(pairs, now_s, t, costs, t.challenger_loss_ratio_bps, policy_sha256)
 
 
-def challenger_retained(pairs, now_s, t, costs) -> bool:
+def challenger_retained(pairs, now_s, t, costs, policy_sha256=None) -> bool:
     """The exit band: a selected challenger is kept while its loss is not worse than the exit ratio."""
-    return _paired_ok(pairs, now_s, t, costs, t.challenger_exit_loss_ratio_bps)
+    return _paired_ok(pairs, now_s, t, costs, t.challenger_exit_loss_ratio_bps, policy_sha256)
 
 
 def select(sel: dict, verdicts: Mapping[str, CandidateVerdict], pairs: Mapping[str, dict],
-           costs: Mapping[str, Mapping[str, Tuple[float, float]]], now_s: int, t: TrustSettings) -> Tuple[dict, dict]:
+           costs: Mapping[str, Mapping], now_s: int, t: TrustSettings,
+           policy_sha256: Optional[str] = None) -> Tuple[dict, dict]:
     """(new selection state, entry flags) with selection hysteresis (module docstring)."""
     s = {**sel, "entry_since": dict(sel["entry_since"])}
     naive_ok = NAIVE in verdicts and verdicts[NAIVE].trusted
@@ -516,7 +537,7 @@ def select(sel: dict, verdicts: Mapping[str, CandidateVerdict], pairs: Mapping[s
     for m in verdicts:
         if m == NAIVE:
             continue
-        ok = naive_ok and challenger_promoted(pairs.get(m), now_s, t, costs.get(m))
+        ok = naive_ok and challenger_promoted(pairs.get(m), now_s, t, costs.get(m), policy_sha256)
         entry[m] = ok
         key = f"{m}:{verdicts[m].recipe}"
         if ok:
@@ -527,7 +548,7 @@ def select(sel: dict, verdicts: Mapping[str, CandidateVerdict], pairs: Mapping[s
     if current is not None:
         v = verdicts.get(current)
         safe = v is not None and v.trusted and v.recipe == s["recipe"] and (current == NAIVE or naive_ok)
-        kept = current == NAIVE or challenger_retained(pairs.get(current), now_s, t, costs.get(current))
+        kept = current == NAIVE or challenger_retained(pairs.get(current), now_s, t, costs.get(current), policy_sha256)
         if not (safe and kept):
             current = None                                # safety (or the exit band): fall back at once
     target = None
@@ -594,7 +615,7 @@ def evaluate(cands: Sequence[CandidateInputs], hyst: Mapping[str, dict], g: Glob
     prior = hyst.get(SELECTION)
     if prior is None or prior.get("epoch") != epoch:          # a new epoch: no selection carries over
         prior = new_selection(epoch)
-    sel, promoted = select(prior, verdicts, pairs or {}, costs or {}, g.now_s, t)
+    sel, promoted = select(prior, verdicts, pairs or {}, costs or {}, g.now_s, t, g.policy_sha256)
     new_h[SELECTION] = sel
     selected = sel["selected"]
     if selected is None:                                  # report the candidate furthest along, in fallback order on ties

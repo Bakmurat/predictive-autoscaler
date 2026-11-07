@@ -333,7 +333,7 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		// now, independent of the persisted status. Scale-up is not affected. Forecast-dependent state (cache,
 		// overestimate tracking, ramp reference) also starts again, so forecast decisions may still differ.
 		if mode == autoscalerv1alpha1.ModeActive {
-			now := time.Now()
+			now := r.now()
 			st.lastScaleUp, st.lastScaleDown = now, now
 		}
 	}
@@ -689,7 +689,7 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 			r.recordDecision(dec, "scale_up", desiredReplicas)
 			stabilized, applied = desiredReplicas, desiredReplicas
 			r.event(&autoscaler, "Normal", "ScaledUp", fmt.Sprintf("Scaled %s from %d to %d", deployment.Name, currentReplicas, desiredReplicas))
-			state.lastScaleUp = time.Now()
+			state.lastScaleUp = r.now()
 			state.belowCurrentSince = time.Time{} // reset scale-down timer
 			log.Info("Scaled deployment", "from", currentReplicas, "to", desiredReplicas)
 		}
@@ -729,7 +729,7 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 				r.recordDecision(dec, "scale_down", target)
 				stabilized, applied = target, target
 				r.event(&autoscaler, "Normal", "ScaledDown", fmt.Sprintf("Scaled %s from %d to %d (calculated %d)", deployment.Name, currentReplicas, target, desiredReplicas))
-				state.lastScaleDown = time.Now()
+				state.lastScaleDown = r.now()
 				state.overrideActive = false // clear override after scale-down completes (per D-12)
 				log.Info("Scaled deployment", "from", currentReplicas, "to", target)
 			}
@@ -737,7 +737,7 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 			// Still in stabilization or cooldown
 			reason := "stabilizing"
 			if !state.belowCurrentSince.IsZero() {
-				elapsed := time.Since(state.belowCurrentSince)
+				elapsed := r.now().Sub(state.belowCurrentSince)
 				if elapsed >= scaleDownStabilization {
 					reason = "cooldown"
 				}
@@ -1312,7 +1312,7 @@ func (r *PredictiveAutoscalerReconciler) calculateScaleDownTarget(
 	state *scaleState,
 	current, desired int32,
 ) int32 {
-	now := time.Now()
+	now := r.now() // the wall clock in production; an injected clock in replay and tests
 
 	if !state.overrideActive {
 		// Rule 1: Block scale-down within stabilization window of a scale-up

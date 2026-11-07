@@ -443,3 +443,175 @@ def test_a_one_minute_sixty_step_bundle_fits(tmp_path):
     clock.set(T0 * 1000 + 10_000)
     r = c.response_from_wire(svc.predict(body(T0, c.resolve_settings(pa).fingerprint())))
     assert len(r.point_rps) == 60 and len(svc.store.issuances()[0].bundle) < 8 << 10
+
+
+# --- C2.8a: same-policy costs, families and the lab qualification ---------------------------------------------------
+
+FAST_TRUST = {"minShadowHours": 1, "minProspectiveWindows": 4, "worstDayMinOutcomes": 1, "repromotionWindows": 4,
+              "challengerMinPairs": 4, "challengerMinHours": 1, "repromotionHours": 0, "challengerLossRatioBps": 10000}
+NOISY = lambda t: round(rps(t) + ((t * 2654435761) % 997) / 997 - 0.5, 6)   # noqa: E731  (E1 refuses a smooth AR)
+
+
+def policy_pa(capacity="5", **pred):
+    pa = pa_object(prediction=dict(PREDICTION, historyDays=8, trust=FAST_TRUST, **pred))
+    if capacity is not None:
+        pa["spec"].update(minReplicas=1, maxReplicas=12, metrics={"requests": {"capacityPerReplica": capacity}})
+    return pa
+
+
+def drive(tmp_path, pa, n, *, fit_mode="inline", reader=None, until=None, **cfg):
+    """n requests on the 5-minute grid from six days into the history; stops early once until(bundle) holds."""
+    start = T0 + 6 * DAY
+    clock = ManualClock(start * 1000)
+    svc = ForecastService(ServiceConfig(prometheus_url="http://prom", state_dir=str(tmp_path), fit_mode=fit_mode,
+                                        store_id="journal-1", **cfg),
+                          reader=reader or Reader(pa), fetch=Backend(NOISY), clock=clock)
+    settings, out = c.resolve_settings(pa).fingerprint(), []
+    for i in range(n):
+        o = start + i * DT
+        clock.set(max(clock.now_ms(), o * 1000 + 10_000))
+        wire = svc.predict(body(o, settings))
+        out.append((wire, svc.store.issuances()[-1].payload()))
+        if until is not None and until(out[-1][1]):
+            break
+    return svc, out
+
+
+def test_the_challenger_is_selected_only_on_bound_same_policy_costs(tmp_path, monkeypatch):
+    from forecasting import policy_sim as P
+    from forecasting import trust as T
+    pa = policy_pa()
+    svc, out = drive(tmp_path / "real", pa, 130)
+    bundles = [b for _, b in out]
+    assert not any(b["selected"] == "statistical" for b in bundles)
+    last = bundles[-1]
+    assert last["selected"] == "seasonal_naive" and {v["phase"] for v in last["verdict"]["candidates"].values()} == \
+        {"Trusted"}                                                    # both trusted: only the costs keep E1 out
+    o = last["decision_origin"]
+    bound = c.bind_request(body(o, c.resolve_settings(pa).fingerprint()), Reader(pa), now_ms=o * 1000 + 10_000)
+    params, _ = P.resolve_policy(bound.spec, bound.settings, bound.lead)
+    assert last["policy_sha256"] == params.fingerprint()
+    cost = last["costs"]["statistical"]
+    assert cost["paired_decisions"] > 0 and cost["unknown_truth_seconds"] == 0
+    assert cost["replica_time"][0] > 1.02 * cost["replica_time"][1]   # E1 buys its bound with replica-time
+    _key, full = svc._costs[("shop", "web-pa")]
+    state = svc.store.latest_checkpoint(last["evidence_key"]).state
+    pairs = state["pairs"]["statistical"]
+    now_s = last["decision_origin"]
+    assert T.costs_bound(full["statistical"], pairs, T.pair_sums(pairs, now_s), last["policy_sha256"])
+    assert full["statistical"]["binding"]["window"] == cost["window"]
+
+    real = P.paired_costs                                              # the same evidence, costs that pass
+
+    def passing(**kw):
+        r = real(**kw)
+        return dict(r, shortage=[0.0, r["shortage"][1]], replica_time=[r["replica_time"][1]] * 2)
+    monkeypatch.setattr(P, "paired_costs", passing)
+    _svc, out = drive(tmp_path / "passing", pa, 130, until=lambda b: b["selected"] == "statistical")
+    b = out[-1][1]
+    assert b["selected"] == "statistical" and b["verdict"]["reason"] == "ReplayGateMissing"   # shadow: never eligible
+    assert c.response_from_wire(out[-1][0]).predictive_eligible is False
+
+
+def test_without_a_known_policy_the_challenger_is_never_promoted(tmp_path, monkeypatch):
+    from forecasting import policy_sim as P
+    monkeypatch.setattr(P, "paired_costs", lambda **kw: pytest.fail("no policy: costs are never simulated"))
+    _svc, out = drive(tmp_path, policy_pa(capacity=None), 110)
+    assert all(b["policy_sha256"] is None and b["costs"] == {} and b["selected"] != "statistical" for _, b in out)
+
+
+def test_a_naive_only_autoscaler_never_forecasts_or_fits_e1(tmp_path):
+    pa = policy_pa(families=["seasonalNaive"])
+    svc, out = drive(tmp_path, pa, 3)
+    assert all(iss.models == ("seasonal_naive",) for iss in svc.store.issuances())
+    assert all(set(b["candidates"]) == {"seasonal_naive"} and b["costs"] == {} for _, b in out)
+    art = tmp_path / "artifacts"
+    assert not art.exists() or not any(p.is_file() for p in art.rglob("*"))   # no fit was even attempted
+
+
+TREE = "a" * 40
+
+
+def lab(target_uid="dep-uid", name="web"):
+    from datetime import datetime, timezone
+    from forecasting import qualification as Q
+    ts = lambda s: datetime.fromtimestamp(s, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")   # noqa: E731
+    doc = {"schema": "lab-qualification/v1", "source_tree": TREE, "run_lock_sha256": "b" * 64,
+           "gates": {g: "pass" for g in ("G0", "G1", "G2", "G3", "G4")}, "reviewers": ["executor", "reviewer"],
+           "not_before": ts(T0 - DAY), "expires": ts(T0 + 30 * DAY),
+           "scope": {"cluster_uid": "cluster-uid", "namespaces": ["shop"],
+                     "targets": [{"namespace": "shop", "name": name, "uid": target_uid}]}}
+    return Q.parse(json.dumps(doc).encode(), Q.BuildInfo(TREE, True), T0)
+
+
+class ClusterReader(Reader):
+    def __init__(self, pa, cluster="cluster-uid"):
+        super().__init__(pa)
+        self.cluster = cluster
+
+    def get(self, path):
+        if path == "/api/v1/namespaces/kube-system":
+            if isinstance(self.cluster, Exception):
+                raise self.cluster
+            return {"metadata": {"uid": self.cluster}}
+        return super().get(path)
+
+
+def test_a_lab_qualification_stands_in_for_the_release_gate_and_nothing_else(tmp_path):
+    from forecasting import qualification as Q
+    pa = pa_object(prediction=dict(PREDICTION, trust=FAST_TRUST))
+    build = Q.BuildInfo(TREE, True)
+    runs = {"plain": {}, "lab": {"build": build, "lab_qualification": lab()},
+            "other-target": {"build": build, "lab_qualification": lab(target_uid="recreated")},
+            "other-name": {"build": build, "lab_qualification": lab(name="api")}}
+    got = {}
+    for name, cfg in runs.items():
+        svc, clock = make(tmp_path / name, reader=ClusterReader(pa), store_id="journal-1", **cfg)
+        settings = c.resolve_settings(pa).fingerprint()
+        wires = []
+        for i in range(90):
+            clock.set(max(clock.now_ms(), (T0 + i * DT) * 1000 + 10_000))
+            wires.append(svc.predict(body(T0 + i * DT, settings)))
+        got[name] = (wires, [iss.payload() for iss in svc.store.issuances()])
+    sha = lab().sha256
+
+    def strip(b):                       # what the release gate may change: its record, the final reason and readiness
+        v = {**b["verdict"], "reason": None, "prediction_ready": None}
+        return {**{k: x for k, x in b.items() if k != "release_gate"}, "verdict": v}
+    plain = [strip(b) for b in got["plain"][1]]
+    for name in runs:                   # identical evidence, calibration, bounds, trust and selection in every run
+        assert [strip(b) for b in got[name][1]] == plain, name
+    assert got["plain"][1][-1]["selected"] == "seasonal_naive"            # naive trusted within the run
+    assert got["plain"][1][-1]["release_gate"] == {"passed": False, "basis": None, "lab_qualification_sha256": None}
+    assert got["lab"][1][-1]["release_gate"] == {"passed": True, "basis": "lab", "lab_qualification_sha256": sha}
+    for name in ("other-target", "other-name"):
+        assert got[name][1][-1]["release_gate"]["passed"] is False
+    eligible = {name: c.response_from_wire(w[-1]).predictive_eligible for name, (w, _) in got.items()}
+    assert eligible == {"plain": False, "lab": True, "other-target": False, "other-name": False}
+    assert c.response_from_wire(got["lab"][0][-1]).reason == "Ready"
+    assert c.response_from_wire(got["plain"][0][-1]).reason == "ReplayGateMissing"
+    # Before trust was earned the lab run answered exactly as the plain one: never eligible, same reasons.
+    first_ready = next(i for i, b in enumerate(got["lab"][1]) if b["verdict"]["prediction_ready"])
+    assert first_ready > 0 and all(not c.response_from_wire(w).predictive_eligible for w in got["lab"][0][:first_ready])
+    assert all(a["verdict"]["reason"] == b["verdict"]["reason"]
+               for a, b in zip(got["lab"][1][:first_ready], got["plain"][1][:first_ready]))
+
+
+def test_a_lab_qualification_fails_closed(tmp_path):
+    from forecasting import qualification as Q
+    pa = pa_object(prediction=dict(PREDICTION, trust=FAST_TRUST))
+    with pytest.raises(Q.QualificationRefused):                      # a release build never takes one
+        make(tmp_path / "release", lab_qualification=lab(), build=Q.BuildInfo(TREE, False))
+    with pytest.raises(Q.QualificationRefused):                      # nor another tree's evaluation build
+        make(tmp_path / "tree", lab_qualification=lab(), build=Q.BuildInfo("c" * 40, True))
+    for name, cluster in (("other-cluster", "another-cluster"), ("unreadable", LookupFailed("forbidden"))):
+        svc, clock = make(tmp_path / name, reader=ClusterReader(pa, cluster), lab_qualification=lab(),
+                          build=Q.BuildInfo(TREE, True))
+        clock.set(T0 * 1000 + 10_000)
+        svc.predict(body(T0, c.resolve_settings(pa).fingerprint()))
+        assert svc.store.issuances()[-1].payload()["release_gate"]["passed"] is False, name
+    late, clock = make(tmp_path / "expired", reader=ClusterReader(pa), lab_qualification=lab(),
+                       build=Q.BuildInfo(TREE, True), clock=ManualClock((T0 + 31 * DAY) * 1000))
+    clock.set((T0 + 31 * DAY) * 1000 + 10_000)
+    late.predict(body(T0 + 31 * DAY, c.resolve_settings(pa).fingerprint()))
+    assert late.store.issuances()[-1].payload()["release_gate"]["passed"] is False

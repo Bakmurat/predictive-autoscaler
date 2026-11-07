@@ -72,6 +72,10 @@ spec:
               value: /state
             - name: FORECAST_STATE_QUOTA_BYTES
               value: {{ include "pa.stateQuotaBytes" . | quote }}
+            {{- if include "pa.labQualification" . }}
+            - name: FORECAST_LAB_QUALIFICATION
+              value: /etc/predictive-autoscaler/lab-qualification/lab-qualification.json
+            {{- end }}
             {{- end }}
             {{- if .Values.forecaster.auth.enabled }}
             - name: FORECASTER_AUTH
@@ -113,6 +117,9 @@ spec:
             {{- if .Values.forecaster.auth.enabled }}
             - {name: tls, mountPath: /etc/predictive-autoscaler/tls, readOnly: true}
             {{- end }}
+            {{- if include "pa.labQualification" . }}
+            - {name: lab-qualification, mountPath: /etc/predictive-autoscaler/lab-qualification, readOnly: true}
+            {{- end }}
       volumes:
         {{- if $stat }}
         - name: state
@@ -128,6 +135,12 @@ spec:
           secret:
             secretName: {{ include "pa.forecasterTLSSecret" . }}
             items: [{key: tls.crt, path: tls.crt}, {key: tls.key, path: tls.key}]
+        {{- end }}
+        {{- if include "pa.labQualification" . }}
+        - name: lab-qualification
+          configMap:
+            name: {{ .Values.forecaster.statistical.labQualification.configMap | quote }}
+            items: [{key: {{ .Values.forecaster.statistical.labQualification.key | quote }}, path: lab-qualification.json}]
         {{- end }}
       {{- with .Values.forecaster.nodeSelector }}
       nodeSelector: {{- toYaml . | nindent 8 }}

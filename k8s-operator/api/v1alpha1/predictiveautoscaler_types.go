@@ -344,7 +344,7 @@ type PredictiveAutoscalerStatus struct {
 //+kubebuilder:object:root=true
 //+kubebuilder:subresource:status
 //+kubebuilder:resource:shortName=pa
-//+kubebuilder:metadata:labels="autoscaling.devkuban.com/crd-revision=4"
+//+kubebuilder:metadata:labels="autoscaling.devkuban.com/crd-revision=5"
 //+kubebuilder:metadata:annotations="argocd.argoproj.io/sync-options=Prune=false,Delete=false,ServerSideApply=true"
 //+kubebuilder:metadata:annotations="argocd.argoproj.io/sync-wave=-1"
 //+kubebuilder:printcolumn:name="Target",type="string",JSONPath=".spec.targetDeployment.name"

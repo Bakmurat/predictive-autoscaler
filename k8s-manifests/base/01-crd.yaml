@@ -9,7 +9,7 @@ metadata:
     argocd.argoproj.io/sync-wave: "-1"
     controller-gen.kubebuilder.io/version: v0.20.1
   labels:
-    autoscaling.devkuban.com/crd-revision: "4"
+    autoscaling.devkuban.com/crd-revision: "5"
   name: predictiveautoscalers.autoscaling.devkuban.com
 spec:
   group: autoscaling.devkuban.com
@@ -291,6 +291,20 @@ spec:
                     - statistical
                     - legacyLstm
                     type: string
+                  families:
+                    description: |-
+                      Families restricts the forecast families the service issues and may select (default both). [seasonalNaive]
+                      removes E1-product as a candidate (for example a naive-only evaluation arm). seasonalNaive is always required:
+                      the statistical family is selected only over a trusted seasonal-naive forecast.
+                    items:
+                      enum:
+                      - seasonalNaive
+                      - statistical
+                      type: string
+                    maxItems: 2
+                    minItems: 1
+                    type: array
+                    x-kubernetes-list-type: set
                   historyDays:
                     description: HistoryDays is the history the models learn from
                       (default 14).

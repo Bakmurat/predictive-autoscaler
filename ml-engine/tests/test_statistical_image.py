@@ -157,3 +157,22 @@ def test_the_spawn_environment_is_forced_and_then_restored(monkeypatch):
         assert [os.environ[n] for n in W._THREAD_ENV] == ["1", "1", "1"]
     assert os.environ["OPENBLAS_NUM_THREADS"] == "8" and os.environ["OMP_NUM_THREADS"] == "8"
     assert "MKL_NUM_THREADS" not in os.environ
+
+
+@pytest.mark.parametrize("tree,flag,ok,evaluation", [("a" * 40, "true", True, True), ("unknown", "false", True, False),
+                                                     ("a" * 40, "false", True, False), ("unknown", "true", False, None),
+                                                     ("a" * 40, "yes", False, None)])
+def test_the_build_record_marks_only_a_pinned_evaluation_build(tmp_path, tree, flag, ok, evaluation):
+    # C2.8a: the Dockerfile's build-info step (run here as written, with the output path redirected).
+    import re
+    text = (ML / "Dockerfile.statistical").read_text()
+    m = re.search(r'RUN python -c "(.*?)" \\\n\s+"\$SOURCE_TREE" "\$EVALUATION_BUILD"', text, re.S)
+    assert m, "the Dockerfile writes /app/build-info.json from SOURCE_TREE and EVALUATION_BUILD"
+    code = m.group(1).replace("\\\n", "").replace("/app/build-info.json", str(tmp_path / "build-info.json"))
+    p = subprocess.run([sys.executable, "-c", code, tree, flag], capture_output=True, text=True, env=clean_env())
+    assert (p.returncode == 0) == ok, p.stderr
+    if ok:
+        from forecasting import qualification as Q
+        info = Q.read_build_info(str(tmp_path / "build-info.json"))
+        assert info == Q.BuildInfo(tree, evaluation)
+    assert "chmod 0444 /app/build-info.json" in text and "chown root:root /app/build-info.json" in text

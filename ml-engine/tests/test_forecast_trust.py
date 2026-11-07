@@ -63,9 +63,13 @@ def inputs(feed, *, history=30 * DAY, bound=True, fresh=True, fit_age=None, cal_
                              T.REQUIRED_HISTORY_SECONDS.get(feed.model, 7 * DAY), fresh, fit_age)
 
 
+POLICY = "p" * 64
+
+
 def glob(now, **kw):
     return T.Global(now_s=now, lead_seconds=L, nominal_miscoverage=NOMINAL, **{"replay_suite_passed": True,
-                                                                               "startup_budget_valid": True, **kw})
+                                                                               "startup_budget_valid": True,
+                                                                               "policy_sha256": POLICY, **kw})
 
 
 def mostly(t, every=10):
@@ -328,7 +332,17 @@ def pairs_for(challenger, chal_loss, base_loss, n=200, hours=96, start=START - 2
     return p
 
 
-COSTS = {"shortage": (1.0, 1.0), "replica_time": (100.0, 100.0)}
+def bound_costs(challenger="statistical", shortage=(1.0, 1.0), replica_time=(100.0, 100.0), epoch=EPOCH, recipe="r",
+                policy=POLICY, window=(START - 30 * DAY, START + 30 * DAY)):
+    """Same-policy costs as forecasting.policy_sim reports them, bound to the paired evidence and the policy."""
+    return {"shortage": shortage, "replica_time": replica_time,
+            "binding": {"epoch": epoch, "challenger": {"model": challenger, "recipe": recipe},
+                        "baseline": {"model": "seasonal_naive", "recipe": "r"}, "policy_sha256": policy,
+                        "window": list(window)}}
+
+
+COSTS = bound_costs()
+LSTM_COSTS = bound_costs("lstm")
 
 
 def settled(cands, pairs, costs, now=NOW):
@@ -352,12 +366,12 @@ def settled(cands, pairs, costs, now=NOW):
 def test_every_fallback_rung(case, expected):
     naive, stat, lstm = good(), good("statistical"), good("lstm")
     pairs = {"statistical": pairs_for("statistical", 0.5, 1.0), "lstm": pairs_for("lstm", 0.4, 1.0)}
-    costs = {"statistical": COSTS, "lstm": COSTS}
+    costs = {"statistical": COSTS, "lstm": LSTM_COSTS}
     cands = [inputs(naive), inputs(stat)]
     if case == "no_costs":
         costs = {}
     elif case == "costs_worse":
-        costs = {"statistical": {"shortage": (1.03, 1.0), "replica_time": (100.0, 100.0)}}
+        costs = {"statistical": bound_costs(shortage=(1.03, 1.0))}
     elif case == "loss_not_better":
         pairs["statistical"] = pairs_for("statistical", 0.96, 1.0)
     elif case == "zero_baseline":
@@ -376,12 +390,12 @@ def test_every_fallback_rung(case, expected):
 
 
 def test_the_paired_gate_measures_the_span_of_retained_pairs():
-    assert not T.challenger_promoted(pairs_for("statistical", 0.5, 1.0, n=63), NOW, TS, COSTS)
-    assert T.challenger_promoted(pairs_for("statistical", 0.5, 1.0), NOW, TS, COSTS)
+    assert not T.challenger_promoted(pairs_for("statistical", 0.5, 1.0, n=63), NOW, TS, COSTS, POLICY)
+    assert T.challenger_promoted(pairs_for("statistical", 0.5, 1.0), NOW, TS, COSTS, POLICY)
     # Codex repro: 64 pairs spanning 12 h qualified after waiting until hour 72. The span decides, not the wait.
     short = pairs_for("statistical", 0.5, 1.0, n=64, hours=12, start=START)
     assert T.pair_sums(short, START + 72 * H)["span"] < 12 * H
-    assert not T.challenger_promoted(short, START + 72 * H, TS, COSTS)
+    assert not T.challenger_promoted(short, START + 72 * H, TS, COSTS, POLICY)
     # An expired first pair does not establish the duration either.
     old = pairs_for("statistical", 0.5, 1.0, n=1, hours=1, start=START)
     for i in range(64):
@@ -392,7 +406,7 @@ def test_the_paired_gate_measures_the_span_of_retained_pairs():
             old = T.note_pair(old, T.EvidenceRecord(r, "prospective", 0, None), lead_s=L, nominal_miscoverage=NOMINAL)
     now = START + 7 * DAY + 70 * L
     ps = T.pair_sums(old, now)
-    assert ps["n"] == 64 and ps["span"] < 48 * H and not T.challenger_promoted(old, now, TS, COSTS)
+    assert ps["n"] == 64 and ps["span"] < 48 * H and not T.challenger_promoted(old, now, TS, COSTS, POLICY)
 
 
 def test_pairs_need_both_models_at_the_same_origin():
@@ -541,9 +555,25 @@ def test_an_epoch_change_resets_hysteresis_and_selection():
     assert h[T.SELECTION]["selected"] == "statistical" and h["statistical"]["trusted"]
     fresh = [inputs(good(epoch=OTHER)), inputs(good("statistical", epoch=OTHER))]
     fresh_pairs = {"statistical": pairs_for("statistical", 0.5, 1.0, epoch=OTHER)}
-    v, h2 = T.evaluate(fresh, h, glob(NOW + 1), TS, pairs=fresh_pairs, costs=costs)
+    v, h2 = T.evaluate(fresh, h, glob(NOW + 1), TS, pairs=fresh_pairs,
+                       costs={"statistical": bound_costs(epoch=OTHER)})
     assert h2[T.SELECTION]["epoch"] == OTHER and h2[T.SELECTION]["entry_since"] == {"statistical:r": NOW + 1}
     assert v.selected == "seasonal_naive"                                  # the old epoch's selection did not carry
     assert all(h2[m]["epoch"] == OTHER for m in ("seasonal_naive", "statistical"))
     demoted = T.step({**h["statistical"], "trusted": True, "ever_trusted": True}, False, fresh[1].ledger, NOW, TS)
     assert demoted["epoch"] == OTHER and not demoted["ever_trusted"]       # old hysteresis never applies
+
+
+# --- costs must be bound to the paired evidence and the policy (C2.8a) ---------------------------------------------
+
+@pytest.mark.parametrize("bad", [
+    dict(epoch="f" * 64), dict(recipe="other"), dict(challenger="lstm"), dict(policy="q" * 64),
+    dict(window=(START + DAY, START + 30 * DAY)),                  # does not cover the retained pairs
+])
+def test_costs_that_do_not_match_promote_nothing(bad):
+    pairs = pairs_for("statistical", 0.5, 1.0)
+    assert T.challenger_promoted(pairs, NOW, TS, COSTS, POLICY)
+    assert not T.challenger_promoted(pairs, NOW, TS, bound_costs(**bad), POLICY)
+    unbound = {k: v for k, v in COSTS.items() if k != "binding"}
+    assert not T.challenger_promoted(pairs, NOW, TS, unbound, POLICY)
+    assert not T.challenger_promoted(pairs, NOW, TS, COSTS, None)      # no expected policy: nothing to match

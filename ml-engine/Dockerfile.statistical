@@ -1,6 +1,8 @@
 ############################
 # The statistical forecasting service (forecast contract v2): no TensorFlow, Keras or CUDA, and no api/main.py.
-# Build from ml-engine/: docker build -f Dockerfile.statistical -t <ref> .
+# Build from ml-engine/: docker build -f Dockerfile.statistical --build-arg SOURCE_TREE=$(git rev-parse HEAD) -t <ref> .
+# A lab EVALUATION build (C2.8; the only kind that honours a lab qualification) adds --build-arg EVALUATION_BUILD=true
+# and gets its own tag; a release image is built with the default (false) and refuses every lab qualification.
 # Check: python3 ../hack/sbom-check-statistical.py --image <ref>
 ############################
 FROM python:3.12-slim AS builder
@@ -17,6 +19,15 @@ COPY data/bounded_http.py data/history.py ./data/
 COPY forecasting/ ./forecasting/
 # A fixed numeric non-root user (the chart runs it as 10001 with a read-only root filesystem; writable: /state, /tmp).
 RUN useradd --uid 10001 --user-group --create-home --shell /usr/sbin/nologin app && chown -R 10001:10001 /app
+# The build record (root-owned, read-only): which source tree, and whether this is a lab evaluation build.
+ARG SOURCE_TREE=unknown
+ARG EVALUATION_BUILD=false
+RUN python -c "import json, re, sys; t, e = sys.argv[1], sys.argv[2]; \
+e in ('true', 'false') or sys.exit('EVALUATION_BUILD must be true or false'); \
+e == 'false' or re.fullmatch('[0-9a-f]{40}', t) or sys.exit('an evaluation build needs SOURCE_TREE=<40-hex commit>'); \
+json.dump({'source_tree': t, 'evaluation_build': e == 'true'}, open('/app/build-info.json', 'w'))" \
+    "$SOURCE_TREE" "$EVALUATION_BUILD" && chown root:root /app/build-info.json && chmod 0444 /app/build-info.json
+LABEL org.opencontainers.image.revision=$SOURCE_TREE io.devkuban.predictive-autoscaler.evaluation-build=$EVALUATION_BUILD
 USER 10001:10001
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/app \
     OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
