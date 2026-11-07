@@ -11,7 +11,9 @@ differences d_i = A_i - B_i are resampled as whole days: one index matrix of 10,
 random.Random(2808) for the number of paired days, applied to every comparison (all arm data of a day move together).
 The two-sided 95 % interval is the 2.5th/97.5th percentile of the resampled means (nearest rank). The bootstrap p value
 of "no difference" is min(1, 2 min((#{m <= 0} + 1)/(R + 1), (#{m >= 0} + 1)/(R + 1))). Superiority claims against
-more than one comparator are Holm-adjusted at family-wise 0.05 across (comparator x startup profile).
+more than one comparator are Holm-adjusted at family-wise 0.05 across (candidate x comparator x startup profile): one
+family of eight tests, so "either candidate passes" is controlled too. The G5 absolute bar on ordinary windows is the
+99 % aggregate share of observed SLO-compliant minutes per profile, not any single minute.
 
 Classification precedence (a decision of this implementation, recorded here and in the report):
   1. FAIL      an observed safety/contract/resource breach, a product-caused validity failure, or a failed fallback,
@@ -81,6 +83,97 @@ def interval_at(means: List[float], level: float) -> List[float]:
     return [means[max(0, math.floor(a * r))], means[min(r - 1, math.ceil((1 - a) * r) - 1)]]
 
 
+# --- input validation -------------------------------------------------------------------------------------------
+
+class StudyError(ValueError):
+    """The study is malformed: it is refused, never scored."""
+
+
+_WINDOW_COUNTS = ("minutes", "observed_minutes", "slo_violation_minutes", "slo_ok_minutes", "requests", "failures",
+                  "surplus_replica_seconds", "provisioned_replica_seconds")
+
+
+def _num(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v >= 0
+
+
+def validate_study(study: Dict) -> List[str]:
+    """Every structural problem: the complete prerequisite schema with strict booleans, gate values, finite bounded
+    measurements, consistent counts, and unique (arm, profile, seed) records."""
+    p: List[str] = []
+    if not isinstance(study, dict) or study.get("schema") != "c28-study/v1":
+        return ["schema must be c28-study/v1"]
+    pre = study.get("prerequisites")
+    if not isinstance(pre, dict) or set(pre) != set(F.PREREQUISITES):
+        p.append(f"prerequisites must record exactly {list(F.PREREQUISITES)}")
+    elif not all(isinstance(v, bool) for v in pre.values()):
+        p.append("prerequisites must be strict booleans")
+    for k in ("artifacts_complete", "cleanup_verified"):
+        if not isinstance(study.get(k), bool):
+            p.append(f"{k} must be a boolean")
+    for k in ("safety_breaches", "contract_failures"):
+        if not isinstance(study.get(k), list) or not all(isinstance(x, str) for x in study[k]):
+            p.append(f"{k} must be a list of strings")
+    res = study.get("resources")
+    if not isinstance(res, dict) or (res.get("g3_pass") is not None and not isinstance(res.get("g3_pass"), bool)):
+        p.append("resources.g3_pass must be true, false or null")
+    gates = study.get("gates")
+    if not isinstance(gates, dict) or set(gates) != set(F.CANDIDATE_ARMS):
+        p.append(f"gates must cover exactly {list(F.CANDIDATE_ARMS)}")
+    else:
+        for arm, g in gates.items():
+            if not isinstance(g, dict) or not set(g) <= set(F.GATES) or \
+                    not all(v is None or isinstance(v, bool) for v in g.values()):
+                p.append(f"gates.{arm} must hold only {list(F.GATES)} as true, false or null")
+    blocks = study.get("blocks")
+    if not isinstance(blocks, list):
+        return p + ["blocks must be a list"]
+    seen = set()
+    for i, b in enumerate(blocks):
+        where = f"blocks[{i}]"
+        key = (b.get("arm"), b.get("profile"), b.get("seed")) if isinstance(b, dict) else None
+        if key is None or key[0] not in F.ARMS or key[1] not in F.PROFILES or key[2] not in F.CONFIRMATION_SEEDS:
+            p.append(f"{where}: unknown arm/profile/seed {key}")
+            continue
+        if key in seen:
+            p.append(f"{where}: duplicate record {key}")
+        seen.add(key)
+        if b.get("invalid_cause") not in (None, "external", "product"):
+            p.append(f"{where}: invalid_cause must be null, external or product")
+        v = b.get("validity", {})
+        for name, hi in (("recorder_coverage", 1), ("dispatch_fraction_min", 1), ("max_transition_gap_s", None),
+                         ("timestamp_skew_s", None)):
+            x = v.get(name)
+            if not _num(x) or (hi is not None and x > hi):
+                p.append(f"{where}: validity.{name} must be a finite number{' in 0..1' if hi else ' >= 0'}")
+        if not isinstance(v.get("reconciled"), bool):
+            p.append(f"{where}: validity.reconciled must be a boolean")
+        ws = b.get("windows")
+        if not isinstance(ws, dict) or set(ws) != {w for w, *_ in F.WINDOWS}:
+            p.append(f"{where}: windows must be exactly the frozen windows")
+            continue
+        total = {k: 0.0 for k in _WINDOW_COUNTS}
+        for wid, s0, e0, _ in F.WINDOWS:
+            w = ws[wid]
+            if not all(_num(w.get(k)) for k in _WINDOW_COUNTS):
+                p.append(f"{where}.{wid}: every count must be a finite number >= 0")
+                continue
+            if w["minutes"] != (e0 - s0) * 60 or w["observed_minutes"] > w["minutes"] or \
+                    w["slo_violation_minutes"] + w["slo_ok_minutes"] != w["observed_minutes"] or w["failures"] > w["requests"]:
+                p.append(f"{where}.{wid}: inconsistent counts")
+            for k in _WINDOW_COUNTS:
+                total[k] += w[k]
+        day = b.get("day", {})
+        if not all(_num(day.get(k)) for k in _WINDOW_COUNTS) or \
+                any(abs(day[k] - total[k]) > 1e-6 * max(1.0, total[k]) for k in _WINDOW_COUNTS):
+            p.append(f"{where}: day must be the sum of the windows")
+        for k in ("eligible_fraction", "e1_selected_fraction"):
+            x = b.get(k)
+            if x is not None and (not _num(x) or x > 1):
+                p.append(f"{where}: {k} must be null or within 0..1")
+    return p
+
+
 # --- block access -----------------------------------------------------------------------------------------------
 
 def _valid(block: Dict) -> Tuple[bool, str]:
@@ -97,6 +190,8 @@ def _valid(block: Dict) -> Tuple[bool, str]:
         misses.append("dispatch")
     if v.get("timestamp_skew_s", math.inf) > F.VALIDITY["timestamp_skew_s"]:
         misses.append("timestamp skew")
+    if v.get("reconciled") is not True:
+        misses.append("arrival reconciliation")
     return (not misses), ", ".join(misses)
 
 
@@ -121,6 +216,9 @@ def _pairs(blocks: List[Dict], a: str, b: str, profile: str) -> Dict[int, Tuple[
 def compare(blocks, a, b, profile, key, windows=None) -> Dict:
     pairs = _pairs(blocks, a, b, profile)
     seeds = sorted(pairs)
+    if not seeds:
+        return {"arm": a, "comparator": b, "profile": profile, "key": key, "windows": windows, "seeds": [],
+                "error": "no paired valid days"}
     da = [_metric(pairs[s][0], windows, key) for s in seeds]
     db = [_metric(pairs[s][1], windows, key) for s in seeds]
     if any(v is None for v in da + db):
@@ -148,7 +246,23 @@ def _margin(c: Dict, margin: float) -> str:
 
 # --- classification ---------------------------------------------------------------------------------------------
 
-def classify_candidate(study: Dict, arm: str) -> Dict:
+def benefit_comparisons(blocks: List[Dict], arm: str) -> Dict[str, Dict]:
+    """Route A (>= 20 % fewer violation minutes on predictable windows) or, when the comparator had none there, route B
+    (>= 10 % fewer provisioned replica-seconds), per comparator and profile."""
+    out = {}
+    for profile in F.PROFILES:
+        for comp in F.BENEFIT_COMPARATORS:
+            c = compare(blocks, arm, comp, profile, "slo_violation_minutes", F.PREDICTABLE_WINDOWS)
+            route, threshold = "A", F.BENEFIT_SLO_REDUCTION
+            if "error" not in c and c["comparator_mean"] == 0:
+                c = compare(blocks, arm, comp, profile, "provisioned_replica_seconds")
+                route, threshold = "B", F.BENEFIT_REPLICA_SECONDS_REDUCTION
+            c["gate"], c["route"], c["threshold"] = "useful benefit", route, threshold
+            out[f"{arm}|{comp}/{profile}"] = c
+    return out
+
+
+def classify_candidate(study: Dict, arm: str, benefit: Dict[str, Dict] = None) -> Dict:
     blocks = study.get("blocks", [])
     reasons: Dict[str, List[str]] = {k: [] for k in ("FAIL", "NOT READY", "INCOMPLETE", "FAIL-STAT", "INCONCLUSIVE")}
     comparisons: List[Dict] = []
@@ -173,8 +287,6 @@ def classify_candidate(study: Dict, arm: str) -> Dict:
     for name, ok in study.get("prerequisites", {}).items():
         if ok is not True:
             reasons["NOT READY"].append(f"prerequisite not met: {name}")
-    if not study.get("prerequisites"):
-        reasons["NOT READY"].append("prerequisites not recorded")
     if arm == "PA-N" and study.get("prerequisites", {}).get("family_restriction") is not True:
         reasons["NOT READY"].append("PA-N needs the family-restriction mechanism (section 1, prerequisite 4)")
     if arm == "PA-E" and study.get("prerequisites", {}).get("policy_cost_binding") is not True:
@@ -259,35 +371,19 @@ def classify_candidate(study: Dict, arm: str) -> Dict:
             if not any((x.get(key) or 0) > 0 for x in own):
                 reasons["INCONCLUSIVE"].append(f"{profile}: no eligible use ({key} is zero in every block)")
 
-        # Useful benefit: route A (>= 20 % fewer violation minutes on predictable windows) or, when the comparator
-        # had none, route B (>= 10 % fewer provisioned replica-seconds); Holm across comparators x profiles.
-        tests, info = {}, {}
-        for profile in F.PROFILES:
-            for comp in F.BENEFIT_COMPARATORS:
-                c = compare(blocks, arm, comp, profile, "slo_violation_minutes", F.PREDICTABLE_WINDOWS)
-                route, threshold = "A", F.BENEFIT_SLO_REDUCTION
-                if "error" not in c and c["comparator_mean"] == 0:
-                    c = compare(blocks, arm, comp, profile, "provisioned_replica_seconds")
-                    route, threshold = "B", F.BENEFIT_REPLICA_SECONDS_REDUCTION
-                c["gate"], c["route"], c["threshold"] = "useful benefit", route, threshold
-                comparisons.append(c)
-                if "error" in c:
-                    continue
-                k = f"{comp}/{profile}"
-                tests[k] = c["p"]
-                info[k] = c
-        h = holm(tests) if tests else {}
+        # Useful benefit, Holm-adjusted across every candidate x comparator x profile (score()).
         passed = []
-        for k, c in info.items():
+        for k, c in (benefit or {}).items():
+            comparisons.append(c)
+            if "error" in c or "p_holm" not in c:
+                continue
             reduction = (c["comparator_mean"] - c["arm_mean"]) / c["comparator_mean"] if c["comparator_mean"] else 0.0
             c["reduction"] = reduction
-            c.update({"p_holm": h[k]["p_holm"], "holm_reject": h[k]["reject"],
-                      "ci_holm": interval_at(c["_means"], h[k]["level"])})
-            ok = reduction >= c["threshold"] and h[k]["reject"] and c["mean"] < 0 and c["surplus_matched"] \
-                if c["route"] == "A" else reduction >= c["threshold"] and h[k]["reject"] and c["mean"] < 0
+            ok = reduction >= c["threshold"] and c["holm_reject"] and c["mean"] < 0 and \
+                (c["surplus_matched"] or c["route"] == "B")
             c["verdict"] = "pass" if ok else "not established"
             if ok:
-                passed.append(f"route {c['route']} vs {k}")
+                passed.append(f"route {c['route']} vs {k.split('|', 1)[1]}")
         if not passed:
             reasons["INCONCLUSIVE"].append("no useful-benefit route passed")
     for c in comparisons:
@@ -310,20 +406,28 @@ def classify_candidate(study: Dict, arm: str) -> Dict:
 
 
 def score(study: Dict) -> Dict:
-    """Per-candidate classifications and the study outcome. PASS claims only the passing family/configuration."""
-    if study.get("schema") != "c28-study/v1":
-        raise ValueError("schema must be c28-study/v1")
-    cands = {arm: classify_candidate(study, arm) for arm in F.CANDIDATE_ARMS}
+    """Per-candidate classifications and the study outcome. PASS claims only the passing family/configuration; the
+    benefit tests of both candidates form one Holm family, so a claim that either candidate passes stays controlled."""
+    problems = validate_study(study)
+    if problems:
+        raise StudyError("; ".join(problems))
+    blocks = study["blocks"]
+    benefit = {arm: benefit_comparisons(blocks, arm) for arm in F.CANDIDATE_ARMS}
+    tests = {k: c["p"] for arm in benefit for k, c in benefit[arm].items() if "error" not in c}
+    h = holm(tests) if tests else {}
+    for arm in benefit:
+        for k, c in benefit[arm].items():
+            if k in h:
+                c.update({"p_holm": h[k]["p_holm"], "holm_reject": h[k]["reject"], "holm_family": len(h),
+                          "ci_holm": interval_at(c["_means"], h[k]["level"])})
+    cands = {arm: classify_candidate(study, arm, benefit[arm]) for arm in F.CANDIDATE_ARMS}
     outcomes = {a: c["outcome"] for a, c in cands.items()}
     if any(c["reasons"].get("FAIL") for c in cands.values()):
         overall = "FAIL"                         # an observed breach fails the study, whatever passed
     elif "PASS" in outcomes.values():
         overall = "PASS"
     else:
-        for o in ("NOT READY", "INCOMPLETE", "FAIL", "INCONCLUSIVE"):
-            if o in outcomes.values():
-                overall = o
-                break
+        overall = next(o for o in ("NOT READY", "INCOMPLETE", "FAIL", "INCONCLUSIVE") if o in outcomes.values())
     return {"schema": "c28-score/v1", "outcome": overall,
             "claims": [a for a, o in outcomes.items() if o == "PASS"], "candidates": cands,
             "bootstrap": {"seed": F.BOOTSTRAP_SEED, "resamples": F.BOOTSTRAP_RESAMPLES}}

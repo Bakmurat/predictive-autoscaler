@@ -24,7 +24,7 @@ def block(arm, profile, seed, viol=None, err=0.0, surplus=1.0, pods=6.0, eligibl
     day = window_metrics(1440, sum(w["slo_violation_minutes"] for w in ws.values()), err, surplus, pods)
     b = {"arm": arm, "profile": profile, "seed": seed, "invalid_cause": None, "windows": ws, "day": day,
          "validity": {"recorder_coverage": 0.999, "max_transition_gap_s": 10, "dispatch_fraction_min": 0.999,
-                      "timestamp_skew_s": 0.2},
+                      "timestamp_skew_s": 0.2, "reconciled": True},
          "eligible_fraction": eligible if arm in F.CANDIDATE_ARMS else None,
          "e1_selected_fraction": e1 if arm == "PA-E" else None}
     b.update(extra)
@@ -45,15 +45,22 @@ def study(blocks_fn=None):
                 blocks.append(block(arm, p, s, viol={"w06-ramp": max(ramp, 0)}, e1=0.0 if arm == "PA-E" else 0.3))
     st = {"schema": "c28-study/v1", "blocks": blocks, "safety_breaches": [], "contract_failures": [],
           "resources": {"g3_pass": True},
-          "prerequisites": {"pinned_tree": True, "replay_simulator": True, "lab_qualification": True,
-                            "family_restriction": True, "policy_cost_binding": True, "envelope_and_soak": True,
-                            "recorder_frozen": True},
+          "prerequisites": {k: True for k in F.PREREQUISITES},
           "artifacts_complete": True, "cleanup_verified": True,
           "gates": {a: {"fallback": True, "blocked_slow_startup": True, "quota_guards": True, "quota_observable": True,
                         "quota_resumed": True, "g4_qualified": True} for a in F.CANDIDATE_ARMS}}
     if blocks_fn:
         blocks_fn(st)
+    for b in st["blocks"]:
+        resum(b)
     return st
+
+
+def resum(b):
+    """Recompute the day from the windows (a study's day must be their sum)."""
+    for k in ("minutes", "observed_minutes", "slo_violation_minutes", "slo_ok_minutes", "requests", "failures",
+              "surplus_replica_seconds", "provisioned_replica_seconds"):
+        b["day"][k] = sum(w[k] for w in b["windows"].values())
 
 
 def edit_blocks(st, arm, fn, profile=None):
@@ -101,6 +108,9 @@ def test_unmet_prerequisites_are_not_ready():
     st["prerequisites"]["lab_qualification"] = False
     assert S.score(st)["outcome"] == "NOT READY"
     st = study()
+    st["prerequisites"]["cpu_metric_fault"] = False       # no evaluation-scoped CPU-metric outage for H-CPU yet
+    assert S.score(st)["outcome"] == "NOT READY"
+    st = study()
     st["prerequisites"]["family_restriction"] = False
     out = S.score(st)
     assert out["candidates"]["PA-N"]["outcome"] == "NOT READY"
@@ -137,8 +147,7 @@ def test_product_failures_and_failed_gates_fail():
 def test_a_statistically_supported_margin_violation_fails():
     # PA-N adds 30 violation minutes a day in the ordinary 18:00-20:00 window on every paired day.
     st = study(lambda s: edit_blocks(s, "PA-N", lambda b: b["windows"]["w18-high"].update(
-        slo_violation_minutes=30, slo_ok_minutes=90) or b["day"].update(
-        slo_violation_minutes=b["day"]["slo_violation_minutes"] + 30)))
+        slo_violation_minutes=30, slo_ok_minutes=90)))
     out = S.score(st)["candidates"]["PA-N"]
     assert out["outcome"] == "FAIL"
     assert any("G5 slo_violation_minutes" in r for r in out["reasons"]["FAIL-STAT"])
@@ -150,6 +159,7 @@ def test_an_interval_crossing_a_margin_is_inconclusive():
         for b in s["blocks"]:
             if b["arm"] == "PA-N" and b["seed"] == 205:
                 b["windows"]["w01-step"]["slo_violation_minutes"] += 6       # robustness margin: 2 min for 2 h
+                b["windows"]["w01-step"]["slo_ok_minutes"] -= 6
     out = S.score(study(one_bad_day))["candidates"]["PA-N"]
     assert out["outcome"] == "INCONCLUSIVE"
     assert any("robustness w01-step slo_violation_minutes" in r for r in out["reasons"]["INCONCLUSIVE"])
@@ -196,3 +206,37 @@ def test_pa_e_needs_g4_evidence_and_a_qualified_e1():
     st["gates"]["PA-E"].pop("g4_qualified")
     assert S.score(st)["candidates"]["PA-E"]["outcome"] == "INCOMPLETE"
     assert S.score(st)["candidates"]["PA-N"]["outcome"] == "PASS"     # E1's evidence never invalidates naive
+
+
+@pytest.mark.parametrize("change, message", [
+    (lambda st: st.update(prerequisites={"family_restriction": True}), "prerequisites must record exactly"),
+    (lambda st: st["prerequisites"].update(pinned_tree=1), "strict booleans"),
+    (lambda st: st["prerequisites"].update(pinned_tree="true"), "strict booleans"),
+    (lambda st: st["blocks"][0]["windows"]["w06-ramp"].update(slo_violation_minutes=float("nan")), "finite"),
+    (lambda st: st["blocks"][0]["validity"].update(recorder_coverage=float("nan")), "validity.recorder_coverage"),
+    (lambda st: st["blocks"][0]["windows"]["w06-ramp"].update(failures=1e12), "inconsistent counts"),
+    (lambda st: st["blocks"][0]["windows"]["w06-ramp"].update(slo_ok_minutes=1), "inconsistent counts"),
+    (lambda st: st["blocks"].append(copy.deepcopy(st["blocks"][0])), "duplicate record"),
+    (lambda st: st["blocks"][0].update(seed=299), "unknown arm/profile/seed"),
+    (lambda st: st["blocks"][0]["day"].update(requests=1.0), "day must be the sum"),
+    (lambda st: st["blocks"][0]["windows"].pop("w03-low"), "frozen windows"),
+    (lambda st: st["gates"]["PA-N"].update(fallback="yes"), "gates.PA-N"),
+    (lambda st: st["resources"].update(g3_pass=1), "g3_pass"),
+    (lambda st: st.update(cleanup_verified=None), "cleanup_verified"),
+])
+def test_malformed_studies_are_refused_not_scored(change, message):
+    st = study()
+    change(st)
+    with pytest.raises(S.StudyError, match=message):
+        S.score(st)
+
+
+def test_an_unreconciled_block_is_incomplete():
+    st = study(lambda s: edit_blocks(s, "PA-R", lambda b: b["validity"].update(reconciled=False) if b["seed"] == 204 else None))
+    assert S.score(st)["candidates"]["PA-N"]["outcome"] == "INCOMPLETE"
+
+
+def test_the_benefit_family_spans_both_candidates():
+    out = S.score(study())
+    benefit = [c for a in F.CANDIDATE_ARMS for c in out["candidates"][a]["comparisons"] if c["gate"] == "useful benefit"]
+    assert len(benefit) == 8 and {c["holm_family"] for c in benefit} == {8}

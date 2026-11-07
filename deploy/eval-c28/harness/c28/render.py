@@ -27,8 +27,9 @@ _DNS = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
 _DIGEST_IMAGE = re.compile(r"^[a-z0-9][a-z0-9./:-]*@sha256:[0-9a-f]{64}$")
 _QUANTITY = re.compile(r"^[0-9]+(\.[0-9]+)?(m|Mi|Gi|Ki)?$")
 
-REQUIRED = ("schema", "run_id", "namespace", "control_namespace", "image", "c0_rps", "nodes", "reservation", "fixture",
-            "ingress", "proxy", "hpa_cpu_target_percent", "keda", "routes", "priority_class", "quota", "scrape")
+REQUIRED = ("schema", "run_id", "namespace", "control_namespace", "release", "image", "c0_rps", "nodes", "reservation",
+            "fixture", "ingress", "proxy", "hpa_cpu_target_percent", "keda", "routes", "priority_class", "quota",
+            "scrape", "release_network_policies")
 
 
 class ParamsError(ValueError):
@@ -69,6 +70,52 @@ def validate(p: Dict) -> None:
         raise ParamsError(f"hpa_cpu_target_percent must be one of the tuning candidates {F.HPA_CPU_CANDIDATES}")
     if p["scrape"] not in ("PodMonitor", "VMPodScrape", "annotations"):
         raise ParamsError("scrape must be PodMonitor, VMPodScrape or annotations")
+    if not _DNS.match(str(p["release"])):
+        raise ParamsError("release must be the evaluation Helm release name")
+    if not isinstance(p["release_network_policies"], bool):
+        raise ParamsError("release_network_policies must say whether the evaluation release enforces NetworkPolicies")
+    route = f"http://{route_host(p, 'metrics')}:8481"
+    if not (str(p["keda"]["server_address"]) == route or str(p["keda"]["server_address"]).startswith(route + "/")):
+        raise ParamsError(f"keda.server_address must go through the evaluation metrics route ({route}), so the RPS "
+                          "outage reaches H-RPS")
+
+
+def route_host(p: Dict, kind: str) -> str:
+    """The in-cluster name of an evaluation-owned route (also the TLS name for the forecast route)."""
+    return f"c28-{kind}-route.{p['control_namespace']}.svc"
+
+
+def eval_release_values(p: Dict) -> Dict:
+    """The evaluation release's chart values that bind it to the routes: metrics through the metrics route, the
+    forecaster through the forecast route with the route's name in the certificate (verification stays on)."""
+    validate(p)
+    fr = route_host(p, "forecast")
+    return {"prometheus": {"url": f"http://{route_host(p, 'metrics')}:8481"},
+            "operator": {"watchNamespaces": [p["namespace"]], "forecasterAddress": f"{fr}:8443"},
+            "forecaster": {"engine": "statistical", "tls": {"extraDNSNames": [fr]}}}
+
+
+def _route_policies(p: Dict) -> List[Dict]:
+    """Additive NetworkPolicies for a release that enforces them: its operator and forecaster may reach the routes, and
+    the forecaster accepts the forecast route (the release's own policies admit only the operator)."""
+    ns, labels = p["control_namespace"], _labels(p)
+    release = {"app.kubernetes.io/name": "predictive-autoscaler", "app.kubernetes.io/instance": p["release"]}
+    routes = {"matchLabels": {RUN_LABEL: p["run_id"]}, "matchExpressions": [
+        {"key": "app.kubernetes.io/name", "operator": "In", "values": ["c28-metrics-route", "c28-forecast-route"]}]}
+    return [
+        {"apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
+         "metadata": {"name": "c28-release-to-routes", "namespace": ns, "labels": labels},
+         "spec": {"podSelector": {"matchLabels": release}, "policyTypes": ["Egress"],
+                  "egress": [{"to": [{"podSelector": routes}],
+                              "ports": [{"protocol": "TCP", "port": 8481}, {"protocol": "TCP", "port": 8443}]}]}},
+        {"apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
+         "metadata": {"name": "c28-forecast-route-to-forecaster", "namespace": ns, "labels": labels},
+         "spec": {"podSelector": {"matchLabels": {**release, "app.kubernetes.io/component": "forecaster"}},
+                  "policyTypes": ["Ingress"],
+                  "ingress": [{"from": [{"podSelector": {"matchLabels": {RUN_LABEL: p["run_id"],
+                                                                        "app.kubernetes.io/name": "c28-forecast-route"}}}],
+                               "ports": [{"protocol": "TCP", "port": 8443}]}]}},
+    ]
 
 
 def target_name(arm: str, profile: str) -> str:
@@ -269,6 +316,8 @@ def render_common(p: Dict) -> List[Dict]:
     out = [pc, quota, ingress, isvc]
     out += _proxy(p, "c28-metrics-route", p["routes"]["metrics_upstream"], 8481)
     out += _proxy(p, "c28-forecast-route", p["routes"]["forecast_upstream"], 8443)
+    if p["release_network_policies"]:
+        out += _route_policies(p)
     if p["scrape"] != "annotations":
         group = "monitoring.coreos.com/v1" if p["scrape"] == "PodMonitor" else "operator.victoriametrics.com/v1beta1"
         endpoints_key = "podMetricsEndpoints"

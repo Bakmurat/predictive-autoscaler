@@ -7,6 +7,7 @@ import os
 
 import pytest
 
+from c28 import collect
 from c28 import frozen as F
 from c28 import runlock
 from c28.schedule import session_order
@@ -28,7 +29,7 @@ def valid_doc(manifest_path):
         "infrastructure": {"nodes": [{"name": "w", "uid": UID, "role": "workload"},
                                      {"name": "s", "uid": UID, "role": "support"}]},
         "slo": {"p95_seconds": 0.2, "p99_seconds": 0.5, "error_fraction": 0.001, "timeout_seconds": 2},
-        "workload": {"programs_sha256": "f" * 64},
+        "workload": {"programs_sha256": "f" * 64, "plans": {"scored/201/c28-pa-n-s20": "3" * 64}},
         "capacity": {"c0_rps": 40, "c_rps": "35"},
         "cpu_tuning": {"selected_target_percent": 60},
         "arms": {f"{a}/{p}": {"rendered_sha256": "1" * 64} for a in F.ARMS for p in F.PROFILES},
@@ -39,7 +40,10 @@ def valid_doc(manifest_path):
         "session_order": session_order(),
         "startup": {"s20": {"creation_to_ready_p90_s": 24.0, "samples": 30, "frozen_lead_seconds": 180},
                     "s90": {"creation_to_ready_p90_s": 101.0, "samples": 31, "frozen_lead_seconds": 300}},
-        "queries": {"offered_rps": 'sum(rate(c28_ingress_requests_total{target="x"}[60s]))'},
+        "queries": copy.deepcopy(collect.DEFAULT_QUERIES),
+        "collection": {"query_api": "http://observer.example:8428", "namespace": "demo"},
+        "fault_scope": {"namespace": "demo", "quota_name": "c28-fixture-quota", "quota_uid": UID,
+                        "run_label": "c28.devkuban.com/run=c28-r1", "priority_class": "c28-fixture"},
         "schedule": {"start_utc": "2026-11-20T00:00:00Z", "end_utc": "2026-12-20T00:00:00Z"},
         "admission": {"evidence": "receipts/admission.json"}, "data_licenses": [],
         "retention": {"days": 90}, "scorer": {"sha256": "2" * 64, "bootstrap_seed": 2808},
@@ -66,7 +70,7 @@ def test_a_complete_runlock_locks_once_and_verifies(setup):
     assert runlock.verify(str(path), str(root)) == digest
     with pytest.raises(runlock.RunLockError, match="locked once"):
         runlock.lock(str(path))
-    changed = dict(doc, run_id="c28-r2")
+    changed = dict(doc, retention={"days": 30})
     path.write_text(json.dumps(changed))
     with pytest.raises(runlock.RunLockError, match="changed after it was locked"):
         runlock.verify(str(path), str(root))
@@ -96,6 +100,17 @@ def test_a_changed_manifest_breaks_verification(setup):
     (lambda d: d["activation_scope"].update(cluster_uid="1" * 8 + "-1111-1111-1111-" + "1" * 12), "kubeconfig's cluster"),
     (lambda d: d["acknowledgments"].pop("reviewer"), "reviewer"),
     (lambda d: d.pop("scorer"), "missing scorer"),
+    (lambda d: d.update(queries=[]), "queries lack"),
+    (lambda d: d.update(admission={}), "admission must not be empty"),
+    (lambda d: d.update(retention={}), "retention must not be empty"),
+    (lambda d: d.update(workload={}), "workload must not be empty"),
+    (lambda d: d["workload"].update(plans={}), "workload.plans"),
+    (lambda d: d.update(queries=[q for q in d["queries"] if q["name"] != "k6_dropped_per_minute"]), "k6_dropped_per_minute"),
+    (lambda d: d["queries"].append(dict(d["queries"][0])), "uniquely named"),
+    (lambda d: d["queries"][0].update(expr="sum(up)"), "{target}"),
+    (lambda d: d["collection"].update(query_api="http://user:pw@o:1"), "no credentials"),
+    (lambda d: d["fault_scope"].update(run_label="c28.devkuban.com/run=other"), "fault_scope must be"),
+    (lambda d: d["fault_scope"].update(namespace="other"), "fault_scope.namespace"),
 ])
 def test_incomplete_or_altered_runlocks_are_refused(setup, change, message):
     _, doc, _ = setup

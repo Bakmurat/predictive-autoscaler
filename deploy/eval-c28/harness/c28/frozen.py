@@ -46,10 +46,12 @@ PERTURBATION = 0.05
 MAX_DEMAND_U = 10                                                       # except the capacity-blocked scenario
 
 # Scored-day windows (section 5): id, start hour, end hour, kind. Kinds: ordinary, step, ramp, holiday,
-# metric_outage, forecast_outage, quota, slow_start.
+# metric_outage, forecast_outage, quota, slow_start. The manifest's table omits 03:00-06:00; it is the ordinary 2c low
+# load with no injection, so it is an explicit ordinary window here and the windows tile the whole day.
 WINDOWS = (
     ("w00-low", 0, 1, "ordinary"),
     ("w01-step", 1, 3, "step"),
+    ("w03-low", 3, 6, "ordinary"),
     ("w06-ramp", 6, 9, "ramp"),
     ("w09-holiday", 9, 12, "holiday"),
     ("w12-metric-outage", 12, 14, "metric_outage"),
@@ -59,8 +61,8 @@ WINDOWS = (
     ("w20-slow-start", 20, 22, "slow_start"),
     ("w22-decline", 22, 24, "ordinary"),
 )
-PREDICTABLE_WINDOWS = ("w06-ramp", "w00-low", "w18-high", "w22-decline")   # "predictable ramp/daily windows"
-ORDINARY_WINDOWS = ("w00-low", "w18-high", "w22-decline")                  # non-injected (G5 absolute SLO)
+PREDICTABLE_WINDOWS = ("w06-ramp", "w00-low", "w03-low", "w18-high", "w22-decline")   # "predictable ramp/daily windows"
+ORDINARY_WINDOWS = ("w00-low", "w03-low", "w18-high", "w22-decline")    # non-injected (G5 absolute SLO, 99 % aggregate)
 ROBUSTNESS_WINDOWS = ("w01-step", "w09-holiday", "w12-metric-outage", "w14-forecast-outage", "w20-slow-start")
 QUOTA_WINDOW = "w16-quota"
 
@@ -82,6 +84,19 @@ MIN_SCORED_DAYS = 5                                                     # per ar
 MAX_INFRA_REPLACEMENTS = 2
 
 OUTCOMES = ("PASS", "FAIL", "INCONCLUSIVE", "INCOMPLETE", "NOT READY")
+
+# The section 1 prerequisites the study must record, every one a strict boolean. cpu_metric_fault: an evaluation-scoped
+# CPU-metric outage for H-CPU that leaves the shared metrics-server alone, independently verified. None is implemented
+# (CPU HPA reads the resource-metrics API, not the evaluation-owned query route), so the full matrix stays NOT READY
+# until one exists (Codex review of #28).
+PREREQUISITES = ("pinned_tree", "replay_simulator", "lab_qualification", "family_restriction", "policy_cost_binding",
+                 "envelope_and_soak", "recorder_frozen", "cpu_metric_fault")
+GATES = ("fallback", "blocked_slow_startup", "quota_guards", "quota_observable", "quota_resumed", "g4_qualified")
+
+# The queries reduce needs (the run-lock must define each; the collector runs exactly the locked definitions).
+REQUIRED_QUERIES = ("offered_rps", "responses_per_minute", "latency_buckets_per_minute", "ready_replicas",
+                    "pod_replicas", "ingress_admitted_per_minute", "k6_requests_per_minute", "k6_dropped_per_minute")
+RECONCILE_TOLERANCE = 0.01          # per-window |scheduled - (dropped + dispatched)| / scheduled before a window is flagged
 
 
 def window_hours(window_id: str) -> float:

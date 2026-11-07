@@ -5,16 +5,53 @@
  "control_namespace": "pa-eval-system",
  "image": "localhost/c28-fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000",
  "c0_rps": 8,
- "nodes": {"workload": "pa-c28-smoke-worker", "support": "pa-c28-smoke-worker2"},
- "reservation": {"taint_key": "c28.devkuban.com/reserved", "taint_value": "c28-smoke", "role_label": "c28.devkuban.com/role"},
- "fixture": {"work_iterations": 2000, "response_bytes": 512, "max_inflight": 2, "max_queue": 32, "queue_timeout_seconds": 1.5,
-             "cpu_request": "100m", "cpu_limit": "100m", "memory_request": "32Mi", "memory_limit": "32Mi"},
- "ingress": {"cpu_request": "100m", "cpu_limit": "500m", "memory_request": "64Mi", "memory_limit": "64Mi"},
- "proxy": {"cpu_request": "20m", "cpu_limit": "100m", "memory_request": "16Mi", "memory_limit": "32Mi"},
+ "nodes": {
+  "workload": "pa-c28-smoke-worker",
+  "support": "pa-c28-smoke-worker2"
+ },
+ "reservation": {
+  "taint_key": "c28.devkuban.com/reserved",
+  "taint_value": "c28-smoke",
+  "role_label": "c28.devkuban.com/role"
+ },
+ "fixture": {
+  "work_iterations": 2000,
+  "response_bytes": 512,
+  "max_inflight": 2,
+  "max_queue": 32,
+  "queue_timeout_seconds": 1.5,
+  "cpu_request": "100m",
+  "cpu_limit": "100m",
+  "memory_request": "32Mi",
+  "memory_limit": "32Mi"
+ },
+ "ingress": {
+  "cpu_request": "100m",
+  "cpu_limit": "500m",
+  "memory_request": "64Mi",
+  "memory_limit": "64Mi"
+ },
+ "proxy": {
+  "cpu_request": "20m",
+  "cpu_limit": "100m",
+  "memory_request": "16Mi",
+  "memory_limit": "32Mi"
+ },
  "hpa_cpu_target_percent": 60,
- "keda": {"server_address": "http://c28-metrics-route.pa-eval-system.svc:8481", "polling_interval_seconds": 15},
- "routes": {"metrics_upstream": "vm.monitoring.svc:8428", "forecast_upstream": "pa-predictive-autoscaler-statistical.pa-eval-system.svc:8443"},
+ "keda": {
+  "server_address": "http://c28-metrics-route.pa-eval-system.svc:8481",
+  "polling_interval_seconds": 15
+ },
+ "routes": {
+  "metrics_upstream": "vm.monitoring.svc:8428",
+  "forecast_upstream": "pa-eval-predictive-autoscaler-forecaster.pa-eval-system.svc:8443"
+ },
  "priority_class": "c28-fixture",
- "quota": {"name": "c28-fixture-quota", "pods_normal": 64},
- "scrape": "annotations"
+ "quota": {
+  "name": "c28-fixture-quota",
+  "pods_normal": 64
+ },
+ "scrape": "annotations",
+ "release": "pa-eval",
+ "release_network_policies": false
 }

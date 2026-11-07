@@ -18,19 +18,35 @@ python -m c28 render --params ../params/kind-smoke.json --out /tmp/c28.yaml
 python -m c28 plan --kind scored --seed 201 --capacity 35 --target c28-pa-n-s20 --out plan.json
 python -m c28 order
 python -m c28 runlock lock runlock.json && python -m c28 runlock verify runlock.json --manifest-root <dir>
-python -m c28 collect --runlock runlock.json --query-api http://<observer> --namespace demo --targets c28-pa-n-s20 \
-  --start 2026-11-20T00:00:00Z --end 2026-11-21T00:00:00Z --out bundle/ --file ledgers=decisions.jsonl
-python -m c28 reduce --bundle bundle/ --target c28-pa-n-s20 --block-start 2026-11-20T00:00:00Z --capacity 35
-python -m c28 score --study study.json
+python -m c28 release-values --params P --out release-values.yaml   # the evaluation release's routes and TLS name
+python -m c28 collect --runlock runlock.json --targets c28-pa-n-s20 --start 2026-11-20T00:00:00Z \
+  --end 2026-11-21T00:00:00Z --out bundle/ --file plan=plan-201-c28-pa-n-s20.json --file ledgers=decisions.jsonl
+python -m c28 reduce --runlock runlock.json --bundle bundle/ --target c28-pa-n-s20 --block-start 2026-11-20T00:00:00Z
+python -m c28 score --runlock runlock.json --study study.json
 ```
+
+Frozen inputs are enforced, not just recorded.
+
+- **collect:** runs exactly the run-lock's query definitions against its query API and namespace, for its targets and inside its schedule.
+- **reduce:** works only on a bundle whose hashes verify, that was collected under that run-lock, with the locked queries and a locked confirmation plan. Capacity comes from the run-lock, and the output carries its binding.
+- **score:** accepts only blocks bound to the run-lock. It refuses malformed studies outright: an incomplete prerequisite schema, non-boolean flags, non-finite or inconsistent counts, or duplicate records.
+
+The error endpoint's denominator is the plan's **scheduled** arrivals.
+
+- Every scheduled arrival has one client-side terminal outcome: dropped by k6, failed (including timeouts and no response), or succeeded.
+- Arrivals with no observed outcome count as failures.
+- Each window reconciles scheduled = dropped + dispatched within 1 %. An unreconciled block makes the result INCOMPLETE.
+- Dispatched minus admitted at the ingress gives the pre-ingress failures. They are reported and never counted twice.
+
+The windows tile the day: the manifest's omitted 03:00–06:00 is an explicit ordinary window.
 
 Arms. Every arm runs as its own Deployment (`c28-<arm>-<s20|s90>`, so each has a new UID) and has exactly one writer:
 
 - **H-CPU:** an autoscaling/v2 HPA on CPU utilization.
 - **H-RPS:** a KEDA ScaledObject on the target's offered RPS, `AverageValue` = c, `ignoreNullValues=false`. Its generated HPA is the writer.
 - **PA-R, PA-N, PA-E:** PredictiveAutoscalers on the statistical engine with capacity c, scale-down headroom 0, the frozen calibration and caps, and the profile's startup budget.
-  - PA-R sets the predictive extra to 0, so it is reactive on the same Go policy and grid.
-  - PA-N carries the `c28.devkuban.com/family-restriction: seasonal_naive` annotation. It needs the C2.8a mechanism, and the scorer reports NOT READY without it.
+  - PA-R sets the predictive extra to 0, so it is reactive on the same Go policy, grid and scheduling. Its forecasting keeps running, with its overhead (shadow issuances); the forecasts just never add replicas.
+  - PA-N carries the `c28.devkuban.com/family-restriction: seasonal_naive` annotation as scaffolding only. Confirmation must verify C2.8a's actual `spec.prediction.families` field and the effective candidate set (PR #27); the scorer reports NOT READY until then.
 
 All PredictiveAutoscalers render in Recommend mode; activation is the executor's gated step. HPA and KEDA keep their native cadence on prodcluster (section 11.3).
 
@@ -40,8 +56,13 @@ Faults are scheduled. A ConfigMap written before each block lists absolute UTC w
 - **Slow start:** decided by each server process at start.
 - **Quota block:** the one live mutation. The `quota` command patches the PriorityClass-scoped ResourceQuota after checking the cluster UID; without `--apply` it is a dry run.
 
-Open items before a confirmation run (also in the PR):
+Faults and their limits.
 
-- The forecast route is a TCP pass-through. With forecaster TLS on, the operator's forecaster URL must be a name in the certificate.
-- Kubernetes object traces (kube-state-metrics series) and resource/cgroup samples are queried with the default query set. Adjust the queries to the observer and freeze them in the run-lock.
-- The family restriction (PA-N), the E1 policy-cost binding and the lab-qualification mechanism are prerequisites owned elsewhere (C2.8a, manifest section 1).
+- **Forecast route:** a TCP pass-through. The evaluation release dials it by name (`operator.forecasterAddress`), and that name is in the forecaster's certificate (`forecaster.tls.extraDNSNames`), so TLS verification stays on. The chart refuses an address whose host is not in the certificate. The fixture tests verify through the proxy; the smoke checks a forecast answer over the route.
+- **H-CPU's metric outage is not implemented.** CPU HPA reads the resource-metrics API through the shared metrics-server, not the evaluation-owned query route. No evaluation-scoped CPU-metric fault exists, so the `cpu_metric_fault` prerequisite keeps the full matrix NOT READY until one is built and independently verified. The metrics route is never a substitute for it.
+- **Quota fault:** the injector binds to the locked cluster UID, quota UID, run label and PriorityClass scope before patching (the patch carries the UID). It counts only the run's pods with the run's PriorityClass, so the ingress is never counted.
+
+Other open items:
+
+- The default queries are a starting point. They must be adapted to the observer (k6 remote-write series, kube-state-metrics) and frozen in the run-lock, and the collector then uses exactly those.
+- The E1 policy-cost binding and the lab-qualification mechanism are prerequisites owned by C2.8a (manifest section 1).

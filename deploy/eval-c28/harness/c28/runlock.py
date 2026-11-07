@@ -32,9 +32,10 @@ REQUIRED = {
     "schema": str, "run_id": str, "manifest": dict, "source": dict, "images": dict, "chart_sha256": str,
     "crd_sha256": str, "kubeconfig": dict, "infrastructure": dict, "slo": dict, "workload": dict, "capacity": dict,
     "cpu_tuning": dict, "arms": dict, "operating_point": dict, "seeds": dict, "session_order": list, "startup": dict,
-    "queries": dict, "schedule": dict, "admission": dict, "data_licenses": list, "retention": dict, "scorer": dict,
-    "activation_scope": dict, "acknowledgments": dict,
+    "queries": list, "collection": dict, "schedule": dict, "admission": dict, "data_licenses": list,
+    "retention": dict, "scorer": dict, "activation_scope": dict, "fault_scope": dict, "acknowledgments": dict,
 }
+_RUN_LABEL = "c28.devkuban.com/run"
 
 
 class RunLockError(ValueError):
@@ -142,6 +143,33 @@ def problems(doc: Dict) -> List[str]:
             out.append(f"startup.{p}: at least 30 measured starts")
         if not isinstance(st.get("frozen_lead_seconds"), int) or st["frozen_lead_seconds"] % F.SAMPLE_INTERVAL_S:
             out.append(f"startup.{p}: frozen_lead_seconds must be a multiple of the 60 s grid")
+    for k in ("admission", "retention", "workload"):
+        if not doc[k]:
+            out.append(f"{k} must not be empty")
+    plans = doc["workload"].get("plans")
+    if not isinstance(plans, dict) or not plans or not all(_SHA.match(str(v)) for v in plans.values()):
+        out.append("workload.plans must map every k6 plan to its digest")
+    if not _SHA.match(str(doc["workload"].get("programs_sha256", ""))):
+        out.append("workload.programs_sha256 must be a sha256")
+    names = [q.get("name") for q in doc["queries"] if isinstance(q, dict)]
+    if len(names) != len(doc["queries"]) or len(set(names)) != len(names):
+        out.append("queries must be a list of uniquely named {name, expr, step}")
+    for q in doc["queries"]:
+        if not isinstance(q, dict) or set(q) != {"name", "expr", "step"} or "{target}" not in str(q.get("expr", "")) \
+                or q.get("step") not in (5, 15, 60):
+            out.append(f"query {q!r} must be {{name, expr with {{target}}, step 5|15|60}}")
+    missing_q = sorted(set(F.REQUIRED_QUERIES) - set(names))
+    if missing_q:
+        out.append(f"queries lack {', '.join(missing_q)}")
+    col = doc["collection"]
+    if set(col) != {"query_api", "namespace"} or not re.match(r"^https?://[^@/\s]+(/\S*)?$", str(col.get("query_api", ""))):
+        out.append("collection must be {query_api (http(s), no credentials), namespace}")
+    fs = doc["fault_scope"]
+    if set(fs) != {"namespace", "quota_name", "quota_uid", "run_label", "priority_class"} or \
+            not _UUID.match(str(fs.get("quota_uid", ""))) or fs.get("run_label") != f"{_RUN_LABEL}={doc['run_id']}":
+        out.append("fault_scope must be {namespace, quota_name, quota_uid, run_label=<run label>=<run_id>, priority_class}")
+    if not (fs.get("namespace") == col.get("namespace") and fs.get("namespace") in doc["activation_scope"].get("namespaces", [])):
+        out.append("fault_scope.namespace must be the collection namespace and inside the activation scope")
     sch = doc["schedule"]
     for k in ("start_utc", "end_utc"):
         if not _TS.match(str(sch.get(k, ""))):
@@ -200,3 +228,16 @@ def verify(path: str, manifest_root: str = "") -> str:
     if not os.path.exists(mpath):
         raise RunLockError(f"the manifest {mpath} is not available to verify")
     return digest
+
+
+def locked_targets(doc: Dict) -> List[str]:
+    """The fixture target (Deployment) names the run-lock covers."""
+    from .render import target_name
+    return sorted(target_name(*k.split("/")) for k in doc["arms"])
+
+
+def load_verified(path: str, manifest_root: str = "") -> tuple:
+    """(digest, document) of a verified run-lock."""
+    digest = verify(path, manifest_root)
+    with open(path) as fh:
+        return digest, json.load(fh)

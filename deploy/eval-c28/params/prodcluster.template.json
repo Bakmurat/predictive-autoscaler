@@ -5,17 +5,53 @@
  "control_namespace": "pa-eval-system",
  "image": "<registry>/c28-fixture@sha256:<digest of the pushed image>",
  "c0_rps": "<measured c0 (section 3), a number>",
- "nodes": {"workload": "<W node name from the fresh inventory>", "support": "<S node name>"},
- "reservation": {"taint_key": "c28.devkuban.com/reserved", "taint_value": "<run id>", "role_label": "c28.devkuban.com/role"},
- "fixture": {"work_iterations": "<tuned once so twelve replicas fit W>", "response_bytes": 512, "max_inflight": "<bounded>",
-             "max_queue": "<bounded>", "queue_timeout_seconds": 1.5,
-             "cpu_request": "<identical for every arm>", "cpu_limit": "<same>", "memory_request": "<same>", "memory_limit": "<same>"},
- "ingress": {"cpu_request": "<sized for 120 % of maximum planned arrivals>", "cpu_limit": "<>", "memory_request": "<>", "memory_limit": "<>"},
- "proxy": {"cpu_request": "50m", "cpu_limit": "200m", "memory_request": "32Mi", "memory_limit": "64Mi"},
+ "nodes": {
+  "workload": "<W node name from the fresh inventory>",
+  "support": "<S node name>"
+ },
+ "reservation": {
+  "taint_key": "c28.devkuban.com/reserved",
+  "taint_value": "<run id>",
+  "role_label": "c28.devkuban.com/role"
+ },
+ "fixture": {
+  "work_iterations": "<tuned once so twelve replicas fit W>",
+  "response_bytes": 512,
+  "max_inflight": "<bounded>",
+  "max_queue": "<bounded>",
+  "queue_timeout_seconds": 1.5,
+  "cpu_request": "<identical for every arm>",
+  "cpu_limit": "<same>",
+  "memory_request": "<same>",
+  "memory_limit": "<same>"
+ },
+ "ingress": {
+  "cpu_request": "<sized for 120 % of maximum planned arrivals>",
+  "cpu_limit": "<>",
+  "memory_request": "<>",
+  "memory_limit": "<>"
+ },
+ "proxy": {
+  "cpu_request": "50m",
+  "cpu_limit": "200m",
+  "memory_request": "32Mi",
+  "memory_limit": "64Mi"
+ },
  "hpa_cpu_target_percent": "<selected on development traces, seeds 101-105>",
- "keda": {"server_address": "http://c28-metrics-route.pa-eval-system.svc:8481/<query path of the observer>", "polling_interval_seconds": 15},
- "routes": {"metrics_upstream": "<host:port of the query API>", "forecast_upstream": "<host:port of the evaluation forecaster>"},
+ "keda": {
+  "server_address": "http://c28-metrics-route.pa-eval-system.svc:8481/<query path of the observer>",
+  "polling_interval_seconds": 15
+ },
+ "routes": {
+  "metrics_upstream": "<host:port of the query API>",
+  "forecast_upstream": "<host:port of the evaluation forecaster>"
+ },
  "priority_class": "c28-fixture",
- "quota": {"name": "c28-fixture-quota", "pods_normal": 64},
- "scrape": "<VMPodScrape | PodMonitor | annotations, per the observer>"
+ "quota": {
+  "name": "c28-fixture-quota",
+  "pods_normal": 64
+ },
+ "scrape": "<VMPodScrape | PodMonitor | annotations, per the observer>",
+ "release": "<evaluation Helm release name, e.g. pa-eval>",
+ "release_network_policies": "<true when the release enforces NetworkPolicies>"
 }

@@ -1,7 +1,14 @@
 package main
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -222,5 +229,64 @@ func TestAMalformedScheduleIsAnError(t *testing.T) {
 	}
 	if s, err := loadSchedule(filepath.Join(t.TempDir(), "absent.json")); err != nil || len(s.Outages) != 0 {
 		t.Fatal("an absent schedule means no faults")
+	}
+}
+
+// The forecast route is a TCP pass-through: TLS terminates at the forecaster, and the operator verifies the certificate
+// against the route's hostname. With the route name among the certificate's SANs verification passes through the
+// proxy; any other name fails (verification is never switched off).
+func TestTheForecastRoutePassesTLSThroughWithVerificationOn(t *testing.T) {
+	const route = "c28-forecast-route.pa-eval-system.svc"
+	caKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	caTmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "test-ca"}, IsCA: true,
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), BasicConstraintsValid: true,
+		KeyUsage: x509.KeyUsageCertSign}
+	caDER, _ := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
+	ca, _ := x509.ParseCertificate(caDER)
+	srvKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	srvTmpl := &x509.Certificate{SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: "forecaster"},
+		DNSNames:  []string{"pa-predictive-autoscaler-forecaster.pa-eval-system.svc", route},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+	srvDER, _ := x509.CreateCertificate(rand.Reader, srvTmpl, ca, &srvKey.PublicKey, caKey)
+	cert := tls.Certificate{Certificate: [][]byte{srvDER}, PrivateKey: srvKey}
+	up, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer up.Close()
+	go func() {
+		for {
+			c, err := up.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) { defer c.Close(); _, _ = io.Copy(c, c) }(c)
+		}
+	}()
+	p := &tcpProxy{upstream: up.Addr().String(), now: time.Now, conns: map[net.Conn]struct{}{},
+		faults: &cachedSchedule{path: filepath.Join(t.TempDir(), "none.json"), refresh: time.Hour}}
+	l, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer l.Close()
+	go func() { _ = p.serve(l) }()
+	pool := x509.NewCertPool()
+	pool.AddCert(ca)
+	dial := func(name string) error {
+		c, err := tls.Dial("tcp", l.Addr().String(), &tls.Config{RootCAs: pool, ServerName: name, MinVersion: tls.VersionTLS12})
+		if err != nil {
+			return err
+		}
+		defer c.Close()
+		if _, err := c.Write([]byte("ok")); err != nil {
+			return err
+		}
+		buf := make([]byte, 2)
+		_, err = io.ReadFull(c, buf)
+		return err
+	}
+	if err := dial(route); err != nil {
+		t.Fatalf("the route's own name must verify through the proxy: %v", err)
+	}
+	if err := dial("unlisted.example"); err == nil {
+		t.Fatal("a name outside the certificate must fail verification")
 	}
 }

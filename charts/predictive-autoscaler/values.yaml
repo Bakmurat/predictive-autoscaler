@@ -24,6 +24,10 @@ prometheus:
 operator:
   replicas: 1                # more replicas only add standby leaders (leader election is always on)
   watchNamespaces: []        # empty: every namespace
+  # host:port the operator dials instead of the forecaster Service (empty: the Service). For an evaluation-owned route
+  # in front of the forecaster (C2.8's scheduled forecast outages). With authentication on, the host must be listed in
+  # forecaster.tls.extraDNSNames, so certificate verification stays on.
+  forecasterAddress: ""
   forecastLedger:            # the append-only forecast/decision evidence log; off by default
     enabled: false
     persistence:
@@ -66,6 +70,7 @@ forecaster:
       renewBefore: 360h
     selfSigned:
       validityDays: 365      # renewal: delete the Secret, then helm upgrade
+    extraDNSNames: []        # more names in the certificate (selfSigned, certManager), e.g. operator.forecasterAddress's host
   resources:
     requests: {cpu: 500m, memory: 1Gi}
     limits: {memory: 4Gi}

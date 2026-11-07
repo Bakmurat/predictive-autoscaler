@@ -175,3 +175,19 @@ def test_fault_configmaps_carry_the_block_schedule(params):
     assert set(cms) == {"c28-metrics-route-faults", "c28-forecast-route-faults", "c28-pa-n-s20-faults"}
     assert cms["c28-metrics-route-faults"]["outages"] == [{"start": "2026-11-20T12:15:00Z", "end": "2026-11-20T12:30:00Z"}]
     assert cms["c28-pa-n-s20-faults"]["slow_starts"][0]["extra_startup_seconds"] == 120
+
+
+def test_h_rps_queries_through_the_evaluation_route(params):
+    params["keda"]["server_address"] = "http://vm.monitoring.svc:8428"
+    with pytest.raises(render.ParamsError, match="metrics route"):
+        render.render_all(params)
+
+
+def test_route_policies_are_rendered_only_for_an_enforcing_release(params):
+    assert not [o for o in render.render_all(params) if o["kind"] == "NetworkPolicy"]
+    params["release_network_policies"] = True
+    pols = {o["metadata"]["name"]: o for o in render.render_all(params) if o["kind"] == "NetworkPolicy"}
+    assert set(pols) == {"c28-release-to-routes", "c28-forecast-route-to-forecaster"}
+    assert pols["c28-forecast-route-to-forecaster"]["spec"]["podSelector"]["matchLabels"] == {
+        "app.kubernetes.io/name": "predictive-autoscaler", "app.kubernetes.io/instance": "pa-eval",
+        "app.kubernetes.io/component": "forecaster"}

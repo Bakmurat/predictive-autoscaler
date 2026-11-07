@@ -44,7 +44,10 @@ PY
 fi
 
 CLUSTER="${CLUSTER:-pa-c28-smoke}"
-WORK="${WORK:-$(mktemp -d)}"
+# Ownership: only what this run created is ever removed. A supplied WORK is never deleted; a pre-existing cluster or
+# registry container of the same name makes the smoke refuse to start.
+OWN_WORK=0 OWN_CLUSTER=0 OWN_REG=0
+if [ -z "${WORK:-}" ]; then WORK="$(mktemp -d)"; OWN_WORK=1; fi
 KCFG="$WORK/kubeconfig"
 KIND="${KIND:-kind}"
 NS=demo
@@ -93,15 +96,18 @@ cleanup() {
     log "kept: KUBECONFIG=$KCFG kubectl get pods -A ; delete with: $KIND delete cluster --name $CLUSTER"
     return
   fi
-  "$KIND" delete cluster --name "$CLUSTER" --kubeconfig "$KCFG" >/dev/null 2>&1 || true
-  docker rm -f "$REG_NAME" >/dev/null 2>&1 || true
-  rm -rf "$WORK"
+  [ "$OWN_CLUSTER" = 1 ] && "$KIND" delete cluster --name "$CLUSTER" --kubeconfig "$KCFG" >/dev/null 2>&1 || true
+  [ "$OWN_REG" = 1 ] && docker rm -f "$REG_NAME" >/dev/null 2>&1 || true
+  if [ "$OWN_WORK" = 1 ] && [ -d "$WORK" ]; then rm -rf -- "${WORK:?}"; fi
 }
 trap cleanup EXIT
 for tool in docker "$KIND" kubectl helm "$PY"; do command -v "$tool" >/dev/null || die "missing tool: $tool"; done
+if docker container inspect "$REG_NAME" >/dev/null 2>&1; then die "a container named $REG_NAME already exists; refusing"; fi
+if "$KIND" get clusters 2>/dev/null | grep -qx "$CLUSTER"; then die "a kind cluster named $CLUSTER already exists; refusing"; fi
 
 # --- images and a local registry (so every manifest pins a real digest) ---------------------------------------------
 docker run -d --restart=no --name "$REG_NAME" -p "127.0.0.1:$REG_PORT:5000" "$REGISTRY_IMAGE" >/dev/null
+OWN_REG=1
 docker build -q -t "localhost:$REG_PORT/c28-fixture:smoke" "$ROOT/deploy/eval-c28/fixture" >/dev/null
 docker push -q "localhost:$REG_PORT/c28-fixture:smoke" >/dev/null
 FIXTURE_DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "localhost:$REG_PORT/c28-fixture:smoke")"
@@ -130,6 +136,7 @@ containerdConfigPatches:
     [plugins."io.containerd.grpc.v1.cri".registry.mirrors."localhost:$REG_PORT"]
       endpoint = ["http://$REG_NAME:5000"]
 EOF
+OWN_CLUSTER=1   # set before create: a half-created cluster of this name is ours (its absence was checked above)
 "$KIND" create cluster --name "$CLUSTER" --image "$NODE_IMAGE" --config "$WORK/kind.yaml" --kubeconfig "$KCFG" --wait 120s >/dev/null
 docker network connect kind "$REG_NAME" 2>/dev/null || true
 guard
@@ -189,29 +196,7 @@ EOF
 wait_for 180 "the metrics backend is ready" k -n monitoring rollout status deploy/vm --timeout=5s
 pass "metrics-server, KEDA $KEDA_CHART_VERSION and the metrics backend"
 
-# --- the evaluation release (statistical engine, metrics through the evaluation-owned route) --------------------------
-cat > "$WORK/values.yaml" <<EOF
-images:
-  operator: {repository: ${OPERATOR_IMAGE%:*}, tag: ${OPERATOR_IMAGE##*:}}
-  statisticalForecaster: {repository: ${FORECASTER_IMAGE%:*}, tag: ${FORECASTER_IMAGE##*:}}
-  pullPolicy: Never
-prometheus: {url: "http://c28-metrics-route.$CTRL.svc:8481"}
-operator:
-  watchNamespaces: [$NS]
-  tolerations: [{key: c28.devkuban.com/reserved, operator: Equal, value: c28-smoke, effect: NoSchedule}]
-  nodeSelector: {c28.devkuban.com/role: support}
-forecaster:
-  engine: statistical
-  tolerations: [{key: c28.devkuban.com/reserved, operator: Equal, value: c28-smoke, effect: NoSchedule}]
-  nodeSelector: {c28.devkuban.com/role: support}
-networkPolicy: {enabled: false}
-EOF
-guard
-h install pa-eval "$ROOT/charts/predictive-autoscaler" -n "$CTRL" -f "$WORK/values.yaml" --wait --timeout 8m >/dev/null \
-  || die "evaluation release install"
-pass "evaluation release in $CTRL watching $NS only"
-
-# --- the fixture and the five arms (both profiles) --------------------------------------------------------------------
+# --- the evaluation release (statistical engine; metrics and forecasts through the evaluation-owned routes) ----------
 jq_params="$WORK/params.json"
 "$PY" - "$PARAMS" "$jq_params" "localhost:$REG_PORT/c28-fixture@$FIXTURE_DIGEST" <<'PY'
 import json, sys
@@ -219,6 +204,27 @@ p = json.load(open(sys.argv[1]))
 p["image"] = sys.argv[3]
 json.dump(p, open(sys.argv[2], "w"))
 PY
+c28 release-values --params "$jq_params" --out "$WORK/release-values.yaml"   # routes, and the route's TLS name
+cat > "$WORK/values.yaml" <<EOF
+images:
+  operator: {repository: ${OPERATOR_IMAGE%:*}, tag: ${OPERATOR_IMAGE##*:}}
+  statisticalForecaster: {repository: ${FORECASTER_IMAGE%:*}, tag: ${FORECASTER_IMAGE##*:}}
+  pullPolicy: Never
+operator:
+  tolerations: [{key: c28.devkuban.com/reserved, operator: Equal, value: c28-smoke, effect: NoSchedule}]
+  nodeSelector: {c28.devkuban.com/role: support}
+forecaster:
+  tolerations: [{key: c28.devkuban.com/reserved, operator: Equal, value: c28-smoke, effect: NoSchedule}]
+  nodeSelector: {c28.devkuban.com/role: support}
+networkPolicy: {enabled: false}
+EOF
+guard
+h install pa-eval "$ROOT/charts/predictive-autoscaler" -n "$CTRL" -f "$WORK/release-values.yaml" -f "$WORK/values.yaml" \
+  --wait --timeout 8m >/dev/null \
+  || die "evaluation release install"
+pass "evaluation release in $CTRL watching $NS only"
+
+# --- the fixture and the five arms (both profiles) --------------------------------------------------------------------
 c28 render --params "$jq_params" --out "$WORK/all.yaml"
 guard
 k apply -f "$WORK/all.yaml" >/dev/null
@@ -312,7 +318,11 @@ pass "5. the metrics route refuses during its scheduled outage (the ingress coun
 
 # --- 6. the scoped quota -------------------------------------------------------------------------------------------------
 guard
-current="$(k -n "$NS" get pods -l c28.devkuban.com/run=c28-smoke --field-selector=status.phase=Running -o name | grep -c . || true)"
+# Only the pods the quota counts: the run's pods with the run's PriorityClass (the ingress has none), not terminal.
+current="$(k -n "$NS" get pods -l c28.devkuban.com/run=c28-smoke -o json | "$PY" -c '
+import json, sys
+print(sum(1 for p in json.load(sys.stdin)["items"] if p["spec"].get("priorityClassName") == "c28-fixture"
+          and p["status"].get("phase") not in ("Succeeded", "Failed")))')"
 k -n "$NS" patch resourcequota c28-fixture-quota --type merge -p "{\"spec\":{\"hard\":{\"pods\":\"$current\"}}}" >/dev/null
 k -n "$NS" scale deploy c28-pa-r-s20 --replicas 3 >/dev/null   # a manual scale of a Recommend arm (it never writes)
 wait_for 120 "the quota denies the new fixture pod" sh -c "kubectl --kubeconfig '$KCFG' --context 'kind-$CLUSTER' -n $NS get deploy c28-pa-r-s20 -o jsonpath='{.status.conditions[?(@.type==\"ReplicaFailure\")].status}' | grep -q True"
@@ -322,4 +332,17 @@ k -n "$NS" run c28-not-fixture --image=registry.k8s.io/pause:3.10 --restart=Neve
   || die "a non-fixture pod was denied by the scoped quota"
 k -n "$NS" patch resourcequota c28-fixture-quota --type merge -p '{"spec":{"hard":{"pods":"64"}}}' >/dev/null
 pass "6. the scoped quota denies fixture pods only; ScaleOutBlocked=QuotaExceeded"
+
+# --- 7. the forecast route keeps TLS verification -------------------------------------------------------------------------
+# The operator dials https://c28-forecast-route...:8443 (a TCP pass-through) and verifies the forecaster's certificate
+# against that name (forecaster.tls.extraDNSNames). A service answer (any trust reason) proves the verified path; a TLS
+# failure would show as DataUnavailable.
+service_reason() {
+  local r
+  r="$(k -n "$NS" get pa c28-pa-n-s20 -o jsonpath='{.status.conditions[?(@.type=="PredictionReady")].reason}')"
+  case "$r" in HistoryInsufficient|CalibrationInsufficient|ShadowInsufficient|CoverageLow|LeadInsufficient|Ready) return 0 ;; esac
+  return 1
+}
+wait_for 300 "a forecast answer through the verified route" service_reason
+pass "7. forecasts reach the operator through the route with certificate verification on"
 log "smoke complete (accelerated, engineering only: no C2.8 evidence)"

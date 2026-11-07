@@ -15,16 +15,29 @@ T = "c28-pa-n-s20"
 BUCKETS = ["0.05", "0.1", "0.2", "0.3", "0.4", "0.5", "2", "+Inf"]
 
 
+def scheduled():
+    """The plan's scheduled arrivals matching synthetic_fetch: 8,400 a minute, 100 more in minutes 100-109 (the
+    failures) and 50 more in minute 400 (the generator's drops)."""
+    return [8400.0 + (100 if 100 <= k <= 109 else 0) + (50 if k == 400 else 0) for k in range(1440)]
+
+
 def synthetic_fetch(base, expr, a, b, step, timeout):
-    """A Prometheus-shaped answer for each default query: 140 rps offered, 5 ready, 6 pods; errors in minutes
-    100-109, slow successes in minutes 200-204, no data for minutes 300-301."""
+    """A Prometheus-shaped answer for each default query: 140 rps offered, 5 ready, 6 pods; client failures in minutes
+    100-109, slow successes in minutes 200-204, no data for minutes 300-301, 50 dropped iterations in minute 400."""
     ts = list(range(a, b + 1, step))
     def series(metric, fn):
         return {"metric": metric, "values": [[t, str(v)] for t in ts if (v := fn(t)) is not None]}
     minute = lambda t: (t - B) // 60 - 1  # noqa: E731
     gap = lambda t: 300 <= minute(t) <= 301  # noqa: E731
     result = []
-    if "c28_ingress_requests_total" in expr:
+    if "k6_http_reqs_total" in expr:
+        result = [series({"status": "200"}, lambda t: None if gap(t) else 8400.0),
+                  series({"status": "0"}, lambda t: None if gap(t) else (100.0 if 100 <= minute(t) <= 109 else 0.0))]
+    elif "k6_dropped_iterations_total" in expr:
+        result = [series({}, lambda t: None if gap(t) else (50.0 if minute(t) == 400 else 0.0))]
+    elif "increase(c28_ingress_requests_total" in expr:
+        result = [series({}, lambda t: None if gap(t) else (8400.0 + (60 if 100 <= minute(t) <= 109 else 0)))]
+    elif "c28_ingress_requests_total" in expr:
         result = [series({}, lambda t: 140.0)]
     elif "c28_ingress_responses_total" in expr:
         result = [series({"code": "200"}, lambda t: None if gap(t) else 8400.0),
@@ -133,14 +146,15 @@ def test_quantiles_merge_bucket_counts():
 
 def test_reduction_counts_violations_unknowns_and_capacity(bundle):
     out, _ = bundle
-    bins = reduce.minute_bins(out, T, B)
-    assert bins[0]["status"] == "ok" and bins[0]["requests"] == 8400
+    bins = reduce.minute_bins(out, T, B, scheduled())
+    assert bins[0]["status"] == "ok" and bins[0]["scheduled"] == 8400 and bins[0]["dispatched"] == 8400
     assert bins[100]["status"] == "violation" and bins[100]["violations"] == ["errors"]
+    assert bins[400]["status"] == "violation" and bins[400]["dropped"] == 50     # drops are failures of scheduled arrivals
     assert bins[200]["status"] == "violation" and "p95" in bins[200]["violations"]
     assert bins[300]["status"] == "unknown" and bins[301]["status"] == "unknown"
-    m = reduce.block_metrics(out, T, B, 35.0)
+    m = reduce.block_metrics(out, T, B, 35.0, scheduled())
     day = m["day"]
-    assert day["slo_violation_minutes"] == 15 and day["observed_minutes"] == 1440 - 2
+    assert day["slo_violation_minutes"] == 16 and day["observed_minutes"] == 1440 - 2
     assert day["surplus_replica_seconds"] == pytest.approx(86400 * 1.0, rel=1e-3)        # ready 5, n* = 4
     assert day["shortage_replica_seconds"] == 0
     assert day["provisioned_replica_seconds"] == pytest.approx(86400 * 6, rel=1e-3)
@@ -148,3 +162,21 @@ def test_reduction_counts_violations_unknowns_and_capacity(bundle):
     assert w["slo_violation_minutes"] == 0 and w["error_fraction"] == 0
     assert m["windows"]["w01-step"]["slo_violation_minutes"] == 10   # minutes 100-109; 200-204 are after 03:00
     assert m["recorder_coverage"] < 1
+    step = m["windows"]["w01-step"]
+    # 100 client failures in minutes 100-109 (40 never reached the ingress); nothing double-counted.
+    assert step["failures"] == 1000 and step["client_failures"] == 1000 and step["pre_ingress_failures"] == 400
+    assert step["requests"] == step["scheduled"] == 120 * 8400 + 1000 and step["reconciled"]
+    # The two minutes without client data leave their scheduled arrivals without an outcome: failures, unreconciled.
+    w = m["windows"]["w03-low"]
+    assert w["unaccounted"] == 2 * 8400 and w["failures"] == 2 * 8400 and not w["reconciled"]
+    assert not m["reconciled"] and m["dispatch_fraction_min"] < 0.995
+
+
+def test_the_error_denominator_is_scheduled_arrivals(bundle):
+    out, _ = bundle
+    more = [x * 1.02 for x in scheduled()]          # 2 % of the scheduled arrivals never dispatched nor dropped
+    m = reduce.block_metrics(out, T, B, 35.0, more)
+    w = m["windows"]["w22-decline"]
+    assert w["error_fraction"] == pytest.approx(0.02 / 1.02, rel=1e-6) and not w["reconciled"]
+    with pytest.raises(ValueError):
+        reduce.minute_bins(out, T, B, [1.0] * 10)

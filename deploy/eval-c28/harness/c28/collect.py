@@ -26,7 +26,8 @@ from typing import Callable, Dict, List, Optional
 
 MAX_POINTS = 10_000          # per range request (Prometheus refuses more than 11,000)
 
-# The default query set. {target} and {namespace} are filled per target. Steps in seconds.
+# The default query set, a starting point for the run-lock's "queries" (the collector runs only the locked
+# definitions). {target} and {namespace} are filled per target. Steps in seconds.
 DEFAULT_QUERIES = [
     {"name": "offered_rps", "step": 15,
      "expr": 'sum(rate(c28_ingress_requests_total{{target="{target}"}}[60s]))'},
@@ -40,6 +41,14 @@ DEFAULT_QUERIES = [
      "expr": 'max(kube_deployment_spec_replicas{{namespace="{namespace}",deployment="{target}"}})'},
     {"name": "pod_replicas", "step": 5,
      "expr": 'max(kube_deployment_status_replicas{{namespace="{namespace}",deployment="{target}"}})'},
+    {"name": "ingress_admitted_per_minute", "step": 60,
+     "expr": 'sum(increase(c28_ingress_requests_total{{target="{target}"}}[1m]))'},
+    # k6 through the Prometheus remote-write output (its tags become labels): client-side terminal outcomes per minute
+    # (status 0 = no HTTP response: connection failure or the 2 s timeout) and dropped scheduled iterations.
+    {"name": "k6_requests_per_minute", "step": 60,
+     "expr": 'sum by (status) (increase(k6_http_reqs_total{{c28_target="{target}"}}[1m]))'},
+    {"name": "k6_dropped_per_minute", "step": 60,
+     "expr": 'sum(increase(k6_dropped_iterations_total{{c28_target="{target}"}}[1m]))'},
     {"name": "requested_cpu_cores", "step": 5,
      "expr": 'sum(kube_pod_container_resource_requests{{namespace="{namespace}",resource="cpu",pod=~"{target}-.*"}})'},
 ]
