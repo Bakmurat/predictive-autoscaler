@@ -10,6 +10,7 @@ import pytest
 from c28 import collect
 from c28 import frozen as F
 from c28 import runlock
+from c28.render import target_name
 from c28.schedule import session_order
 
 UID = "0b6c1a52-4f0e-4c1e-9a77-3d1f0a2b9c10"
@@ -29,7 +30,9 @@ def valid_doc(manifest_path):
         "infrastructure": {"nodes": [{"name": "w", "uid": UID, "role": "workload"},
                                      {"name": "s", "uid": UID, "role": "support"}]},
         "slo": {"p95_seconds": 0.2, "p99_seconds": 0.5, "error_fraction": 0.001, "timeout_seconds": 2},
-        "workload": {"programs_sha256": "f" * 64, "plans": {"scored/201/c28-pa-n-s20": "3" * 64}},
+        "workload": {"programs_sha256": "f" * 64,
+                     "plans": {f"scored/{s}/{target_name(a, p)}": "3" * 64 for a in F.ARMS for p in F.PROFILES
+                               for s in F.CONFIRMATION_SEEDS}},
         "capacity": {"c0_rps": 40, "c_rps": "35"},
         "cpu_tuning": {"selected_target_percent": 60},
         "arms": {f"{a}/{p}": {"rendered_sha256": "1" * 64} for a in F.ARMS for p in F.PROFILES},
@@ -43,8 +46,11 @@ def valid_doc(manifest_path):
         "queries": copy.deepcopy(collect.DEFAULT_QUERIES),
         "collection": {"query_api": "http://observer.example:8428", "namespace": "demo"},
         "fault_scope": {"namespace": "demo", "quota_name": "c28-fixture-quota", "quota_uid": UID,
-                        "run_label": "c28.devkuban.com/run=c28-r1", "priority_class": "c28-fixture"},
-        "schedule": {"start_utc": "2026-11-20T00:00:00Z", "end_utc": "2026-12-20T00:00:00Z"},
+                        "run_label": "c28.devkuban.com/run=c28-r1", "priority_class": "c28-fixture",
+                        "pods_normal": 64},
+        "schedule": {"start_utc": "2026-11-20T00:00:00Z", "end_utc": "2026-12-20T00:00:00Z",
+                     "blocks": {f"{a}/{p}/{s}": [f"2026-11-{20 + s - 201:02d}T00:00:00Z"] for a in F.ARMS
+                                for p in F.PROFILES for s in F.CONFIRMATION_SEEDS}},
         "admission": {"evidence": "receipts/admission.json"}, "data_licenses": [],
         "retention": {"days": 90}, "scorer": {"sha256": "2" * 64, "bootstrap_seed": 2808},
         "activation_scope": {"cluster_uid": UID, "namespaces": ["demo"], "target_uids": [UID]},
@@ -111,6 +117,10 @@ def test_a_changed_manifest_breaks_verification(setup):
     (lambda d: d["collection"].update(query_api="http://user:pw@o:1"), "no credentials"),
     (lambda d: d["fault_scope"].update(run_label="c28.devkuban.com/run=other"), "fault_scope must be"),
     (lambda d: d["fault_scope"].update(namespace="other"), "fault_scope.namespace"),
+    (lambda d: d["fault_scope"].pop("pods_normal"), "pods_normal"),
+    (lambda d: d["workload"]["plans"].pop("scored/205/c28-h-cpu-s90"), "confirmation plans"),
+    (lambda d: d["schedule"]["blocks"].pop("PA-N/s20/203"), "schedule.blocks"),
+    (lambda d: d["schedule"]["blocks"].update({"PA-N/s20/203": ["2026-11-22T06:00:00Z"]}), "schedule.blocks"),
 ])
 def test_incomplete_or_altered_runlocks_are_refused(setup, change, message):
     _, doc, _ = setup

@@ -149,6 +149,13 @@ def problems(doc: Dict) -> List[str]:
     plans = doc["workload"].get("plans")
     if not isinstance(plans, dict) or not plans or not all(_SHA.match(str(v)) for v in plans.values()):
         out.append("workload.plans must map every k6 plan to its digest")
+    else:
+        from .render import target_name
+        want = {f"scored/{s}/{target_name(*k.split('/'))}" for k in doc["arms"] if "/" in k
+                for s in F.CONFIRMATION_SEEDS} if set(doc["arms"]) == {f"{a}/{p}" for a in F.ARMS for p in F.PROFILES} else set()
+        missing = sorted(want - set(plans))
+        if missing:
+            out.append(f"workload.plans lacks the confirmation plans {missing[:3]}{' ...' if len(missing) > 3 else ''}")
     if not _SHA.match(str(doc["workload"].get("programs_sha256", ""))):
         out.append("workload.programs_sha256 must be a sha256")
     names = [q.get("name") for q in doc["queries"] if isinstance(q, dict)]
@@ -165,15 +172,25 @@ def problems(doc: Dict) -> List[str]:
     if set(col) != {"query_api", "namespace"} or not re.match(r"^https?://[^@/\s]+(/\S*)?$", str(col.get("query_api", ""))):
         out.append("collection must be {query_api (http(s), no credentials), namespace}")
     fs = doc["fault_scope"]
-    if set(fs) != {"namespace", "quota_name", "quota_uid", "run_label", "priority_class"} or \
-            not _UUID.match(str(fs.get("quota_uid", ""))) or fs.get("run_label") != f"{_RUN_LABEL}={doc['run_id']}":
-        out.append("fault_scope must be {namespace, quota_name, quota_uid, run_label=<run label>=<run_id>, priority_class}")
+    if set(fs) != {"namespace", "quota_name", "quota_uid", "run_label", "priority_class", "pods_normal"} or \
+            not _UUID.match(str(fs.get("quota_uid", ""))) or fs.get("run_label") != f"{_RUN_LABEL}={doc['run_id']}" or \
+            not isinstance(fs.get("pods_normal"), int) or isinstance(fs.get("pods_normal"), bool) or fs["pods_normal"] < 1:
+        out.append("fault_scope must be {namespace, quota_name, quota_uid, run_label=<run label>=<run_id>, priority_class, "
+                   "pods_normal (the approved original limit)}")
     if not (fs.get("namespace") == col.get("namespace") and fs.get("namespace") in doc["activation_scope"].get("namespaces", [])):
         out.append("fault_scope.namespace must be the collection namespace and inside the activation scope")
     sch = doc["schedule"]
     for k in ("start_utc", "end_utc"):
         if not _TS.match(str(sch.get(k, ""))):
             out.append(f"schedule.{k} must be an RFC 3339 UTC time")
+    blocks = sch.get("blocks")
+    want_blocks = {f"{a}/{p}/{s}" for a in F.ARMS for p in F.PROFILES for s in F.CONFIRMATION_SEEDS}
+    if not isinstance(blocks, dict) or set(blocks) != want_blocks or not all(
+            isinstance(v, list) and v and all(isinstance(t, str) and t.endswith("T00:00:00Z") and _TS.match(t)
+                                              and sch.get("start_utc", "") <= t < sch.get("end_utc", "") for t in v)
+            for v in blocks.values()):
+        out.append("schedule.blocks must give every arm/profile/seed its permitted UTC-midnight start dates "
+                   "(planned, then predeclared replacement slots), inside the schedule")
     if not _SHA.match(str(doc["scorer"].get("sha256", ""))) or doc["scorer"].get("bootstrap_seed") != F.BOOTSTRAP_SEED:
         out.append("scorer needs its code sha256 and bootstrap_seed 2808")
     scope = doc["activation_scope"]

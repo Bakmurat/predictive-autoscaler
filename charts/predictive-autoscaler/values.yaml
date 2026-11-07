@@ -70,7 +70,9 @@ forecaster:
       renewBefore: 360h
     selfSigned:
       validityDays: 365      # renewal: delete the Secret, then helm upgrade
-    extraDNSNames: []        # more names in the certificate (selfSigned, certManager), e.g. operator.forecasterAddress's host
+    # More names in the certificate (selfSigned, certManager), e.g. operator.forecasterAddress's host. selfSigned keeps an
+    # existing Secret on upgrade, so new names need a rotation: delete the Secret, then helm upgrade (docs/helm.md).
+    extraDNSNames: []
   resources:
     requests: {cpu: 500m, memory: 1Gi}
     limits: {memory: 4Gi}

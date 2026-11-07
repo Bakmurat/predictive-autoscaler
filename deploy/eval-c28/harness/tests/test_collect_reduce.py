@@ -172,6 +172,27 @@ def test_reduction_counts_violations_unknowns_and_capacity(bundle):
     assert not m["reconciled"] and m["dispatch_fraction_min"] < 0.995
 
 
+def test_missing_outcomes_never_leave_minutes_healthy(tmp_path):
+    """Codex repro: 996 terminal outcomes per 1,000 scheduled arrivals each minute (0.4 % missing) must not give 1,440
+    healthy minutes."""
+    def fetch(base, expr, a, b, step, timeout):
+        ts = list(range(a, b + 1, step))
+        if "k6_http_reqs_total" in expr:
+            res = [{"metric": {"status": "200"}, "values": [[t, "996"] for t in ts]}]
+        elif "duration_seconds_bucket" in expr:
+            res = [{"metric": {"le": le, "outcome": "success"}, "values": [[t, "996"] for t in ts]} for le in ("0.1", "+Inf")]
+        else:
+            res = []
+        return {"status": "success", "data": {"result": res}}
+    out = str(tmp_path / "b")
+    collect.collect(out, "http://o:1", [T], "demo", B, B + 86400, "r" * 64, fetch=fetch)
+    bins = reduce.minute_bins(out, T, B, [1000.0] * 1440)
+    assert sum(1 for b in bins if b["status"] == "ok") < 20
+    assert all(b["status"] == "unknown" for b in bins[30:])
+    m = reduce.block_metrics(out, T, B, 35.0, [1000.0] * 1440)
+    assert m["day"]["error_fraction"] == pytest.approx(0.004, rel=0.01) and m["recorder_coverage"] < 0.02
+
+
 def test_the_error_denominator_is_scheduled_arrivals(bundle):
     out, _ = bundle
     more = [x * 1.02 for x in scheduled()]          # 2 % of the scheduled arrivals never dispatched nor dropped

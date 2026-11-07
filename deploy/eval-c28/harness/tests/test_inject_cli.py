@@ -14,7 +14,8 @@ UID = "0b6c1a52-4f0e-4c1e-9a77-3d1f0a2b9c10"
 QUID = "11111111-2222-3333-4444-555555555555"
 LOCK = {"kubeconfig": {"path": "/tmp/kc", "context": "kind-pa-c28-smoke", "cluster_uid": UID},
         "fault_scope": {"namespace": "demo", "quota_name": "c28-fixture-quota", "quota_uid": QUID,
-                        "run_label": "c28.devkuban.com/run=c28-smoke", "priority_class": "c28-fixture"}}
+                        "run_label": "c28.devkuban.com/run=c28-smoke", "priority_class": "c28-fixture",
+                        "pods_normal": 64}}
 QUOTA = {"metadata": {"name": "c28-fixture-quota", "namespace": "demo", "uid": QUID,
                       "labels": {"c28.devkuban.com/run": "c28-smoke"}},
          "spec": {"hard": {"pods": "64"}, "scopeSelector": {"matchExpressions": [
@@ -80,6 +81,10 @@ def test_parameters_must_match_the_locked_scope():
     p = params()
     p["priority_class"] = "other"
     with pytest.raises(inject.InjectError, match="fault scope"):
+        inject.apply(LOCK, p, "restore")
+    p = params()
+    p["quota"]["pods_normal"] = 999999          # restore only to the approved original limit in the run-lock
+    with pytest.raises(inject.InjectError, match="pods_normal"):
         inject.apply(LOCK, p, "restore")
 
 

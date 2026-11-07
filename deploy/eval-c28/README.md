@@ -29,13 +29,14 @@ Frozen inputs are enforced, not just recorded.
 
 - **collect:** runs exactly the run-lock's query definitions against its query API and namespace, for its targets and inside its schedule.
 - **reduce:** works only on a bundle whose hashes verify, that was collected under that run-lock, with the locked queries and a locked confirmation plan. Capacity comes from the run-lock, and the output carries its binding.
-- **score:** accepts only blocks bound to the run-lock. It refuses malformed studies outright: an incomplete prerequisite schema, non-boolean flags, non-finite or inconsistent counts, or duplicate records.
+- **score:** re-derives every block from the bundle it names: the seed's locked plan, a date the run-lock permits for that arm/profile/seed, an identical binding, windows, day and measured validity. Evidence reused for another block, or an edited derived metric, is refused. It refuses malformed studies outright: an incomplete prerequisite schema, non-boolean flags, non-finite or inconsistent counts, or duplicate records.
 
 The error endpoint's denominator is the plan's **scheduled** arrivals.
 
 - Every scheduled arrival has one client-side terminal outcome: dropped by k6, failed (including timeouts and no response), or succeeded.
 - Arrivals with no observed outcome count as failures.
 - Each window reconciles scheduled = dropped + dispatched within 1 %. An unreconciled block makes the result INCOMPLETE.
+- Per minute, the running balance of scheduled minus terminal outcomes may only be what is still in flight. Beyond that, the minute is unknown, never healthy.
 - Dispatched minus admitted at the ingress gives the pre-ingress failures. They are reported and never counted twice.
 
 The windows tile the day: the manifest's omitted 03:00–06:00 is an explicit ordinary window.
@@ -60,7 +61,8 @@ Faults and their limits.
 
 - **Forecast route:** a TCP pass-through. The evaluation release dials it by name (`operator.forecasterAddress`), and that name is in the forecaster's certificate (`forecaster.tls.extraDNSNames`), so TLS verification stays on. The chart refuses an address whose host is not in the certificate. The fixture tests verify through the proxy; the smoke checks a forecast answer over the route.
 - **H-CPU's metric outage is not implemented.** CPU HPA reads the resource-metrics API through the shared metrics-server, not the evaluation-owned query route. No evaluation-scoped CPU-metric fault exists, so the `cpu_metric_fault` prerequisite keeps the full matrix NOT READY until one is built and independently verified. The metrics route is never a substitute for it.
-- **Quota fault:** the injector binds to the locked cluster UID, quota UID, run label and PriorityClass scope before patching (the patch carries the UID). It counts only the run's pods with the run's PriorityClass, so the ingress is never counted.
+- **Quota fault:** the injector binds to the locked cluster UID, quota UID, run label and PriorityClass scope before patching (the patch carries the UID). It counts only the run's pods with the run's PriorityClass, so the ingress is never counted. Restore uses only the approved original limit recorded in the run-lock (`fault_scope.pods_normal`).
+- **New certificate names need a rotation.** Adding `forecaster.tls.extraDNSNames` does not renew an existing self-signed certificate on upgrade: delete the forecaster TLS Secret and `helm upgrade` (docs/helm.md).
 
 Other open items:
 

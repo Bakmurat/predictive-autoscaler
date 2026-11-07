@@ -33,7 +33,8 @@ def kubectl(lock: Dict, *args: str) -> List[str]:
 def _bind_params(lock: Dict, params: Dict) -> Dict:
     fs = lock["fault_scope"]
     expected = {"namespace": params["namespace"], "quota_name": params["quota"]["name"],
-                "run_label": f"{RUN_LABEL}={params['run_id']}", "priority_class": params["priority_class"]}
+                "run_label": f"{RUN_LABEL}={params['run_id']}", "priority_class": params["priority_class"],
+                "pods_normal": params["quota"]["pods_normal"]}
     diff = {k: (fs.get(k), v) for k, v in expected.items() if fs.get(k) != v}
     if diff:
         raise InjectError(f"the parameters differ from the run-lock's fault scope: {diff}")
@@ -82,7 +83,7 @@ def quota_commands(lock: Dict, params: Dict, action: str, current_pods: int = 0)
     if action == "deny_new_pods":
         hard = current_pods
     elif action == "restore":
-        hard = params["quota"]["pods_normal"]
+        hard = fs["pods_normal"]                 # only the approved original limit recorded in the run-lock
     else:
         raise InjectError(f"unknown action {action!r}")
     patch = json.dumps({"metadata": {"uid": fs["quota_uid"]}, "spec": {"hard": {"pods": str(hard)}}}, sort_keys=True)

@@ -4,8 +4,8 @@ Per one-minute bin: the scheduled arrivals of the locked k6 plan (the denominato
 outcomes (k6: dropped iterations, failures including timeouts and no-response, successes), the ingress's admitted count
 and successful-request p95/p99 from the merged bucket counts of that minute (never an average of percentiles). A bin
 is an SLO-violation minute when p95 > 200 ms, p99 > 500 ms or (dropped + failed) / scheduled > 0.1 %; a bin with
-failures and no success violates; a bin without client data, or with successes but no latency record, is unknown,
-never healthy. Per window, scheduled = dropped + dispatched is reconciled (1 % tolerance); scheduled arrivals with no
+failures and no success violates; a bin without client data, with successes but no latency record, or whose running
+balance of scheduled arrivals minus terminal outcomes exceeds what can still be in flight, is unknown, never healthy. Per window, scheduled = dropped + dispatched is reconciled (1 % tolerance); scheduled arrivals with no
 observed outcome count as failures; dispatched minus admitted are the pre-ingress failures (reported, never counted
 twice). Capacity proxies use
 n*(t) = offered_RPS(t) / c at 5 s resolution: surplus = integral max(Ready - n*, 0), shortage = integral max(n* - Ready,
@@ -109,6 +109,7 @@ def minute_bins(bundle: str, target: str, block_start: int, scheduled: List[floa
             if 0 <= k < 1440 and not math.isnan(le):
                 succ_buckets[k][le] = succ_buckets[k].get(le, 0.0) + v
     bins = []
+    cum_sched = cum_terminal = 0.0
     for k in range(1440):
         codes = k6.get(k)
         disp = sum(codes.values()) if codes else 0.0
@@ -116,6 +117,19 @@ def minute_bins(bundle: str, target: str, block_start: int, scheduled: List[floa
         b = {"minute": k, "scheduled": scheduled[k], "dispatched": disp, "dropped": dropped.get(k, 0.0),
              "client_failures": fail, "admitted": admitted.get(k, 0.0), "p95": None, "p99": None, "status": "unknown",
              "violations": []}
+        # The same outcome accounting as the windows, cumulatively: arrivals scheduled so far minus those with a terminal
+        # outcome may only be the requests still in flight (at most timeout + jitter + a second of them). Beyond that,
+        # outcomes are missing: the minute is unresolved (unknown), never healthy. A minute without client data is
+        # left out of the running balance (its outcomes are unknown anyway).
+        if codes is not None:
+            cum_sched += scheduled[k]
+            cum_terminal += b["dropped"] + disp
+            allowance = scheduled[k] * (F.REQUEST_TIMEOUT_S + 1.1) / 60 + 2
+            b["outstanding"] = cum_sched - cum_terminal
+            if abs(b["outstanding"]) > allowance:
+                b["violations"] = ["unresolved_outcomes"]
+                bins.append(b)                       # status stays unknown
+                continue
         # k6 emits dropped_iterations only once an iteration is dropped: with client data present, no series means 0.
         if codes is not None and scheduled[k] > 0:
             frac = (b["dropped"] + fail) / scheduled[k]

@@ -9,9 +9,11 @@
   python -m c28 collect  --runlock FILE --targets T1,T2 --start S --end E --out DIR [--file LABEL=PATH ...]
                          (query API, namespace and query definitions come from the run-lock)
   python -m c28 verify-bundle DIR
-  python -m c28 reduce   --runlock FILE --bundle DIR --target T --block-start S [--out FILE]
-                         (verifies the bundle's hashes, run-lock, scope, queries and plan; capacity from the run-lock)
-  python -m c28 score    --runlock FILE --study FILE [--out FILE]   (every block must be bound to this run-lock)
+  python -m c28 reduce   --runlock FILE --bundle DIR --target T --seed S --block-start D [--out FILE]
+                         (verifies the bundle's hashes, run-lock, scope, queries, the seed's plan and a permitted
+                         date; capacity from the run-lock)
+  python -m c28 score    --runlock FILE --study FILE [--out FILE]
+                         (every block names its bundle and is re-derived from it; reused or edited evidence is refused)
   Commands that take --runlock also take --manifest-root DIR (default: the run-lock's directory).
   python -m c28 audit    --params P --live FILE                exclusive-writer check of live writer objects (JSON list)
   python -m c28 quota    --runlock FILE --params P deny_new_pods|restore [--apply]
@@ -67,9 +69,22 @@ def _within(lock, start: int, end: int) -> None:
         raise BindingError("the time range lies outside the run-lock's schedule")
 
 
-def reduce_bound(lock: dict, digest: str, bundle: str, target: str, block_start: int) -> dict:
-    """Reduce one block only from an intact bundle collected under this run-lock, with its locked queries, scope and
-    plan; the result carries its binding."""
+def _arm_profile(lock: dict, target: str):
+    for key in lock["arms"]:
+        arm, profile = key.split("/")
+        if render.target_name(arm, profile) == target:
+            return arm, profile
+    raise BindingError(f"{target} is not a target of the run-lock")
+
+
+def reduce_bound(lock: dict, digest: str, bundle: str, target: str, block_start: int, seed: int) -> dict:
+    """Reduce one scored block only from an intact bundle collected under this run-lock, with its locked queries and
+    scope, the locked plan of exactly this seed and target, on one of the block's permitted dates; the result carries
+    its binding."""
+    arm, profile = _arm_profile(lock, target)
+    start_text = datetime.fromtimestamp(block_start, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if start_text not in lock["schedule"]["blocks"].get(f"{arm}/{profile}/{seed}", []):
+        raise BindingError(f"{start_text} is not a permitted date for {arm}/{profile}/{seed}")
     probs = collect.verify_bundle(bundle)
     if probs:
         raise BindingError("the bundle's hashes do not verify: " + "; ".join(probs[:5]))
@@ -78,8 +93,6 @@ def reduce_bound(lock: dict, digest: str, bundle: str, target: str, block_start:
     col = lock["collection"]
     if index.get("runlock_sha256") != digest:
         raise BindingError("the bundle was collected under another run-lock")
-    if target not in runlock.locked_targets(lock):
-        raise BindingError(f"{target} is not a target of the run-lock")
     if index.get("namespace") != col["namespace"] or str(index.get("query_api", "")).rstrip("/") != col["query_api"].rstrip("/"):
         raise BindingError("the bundle's namespace or query API differs from the run-lock")
     entries = {q["name"]: q for q in index["queries"] if q["target"] == target}
@@ -91,36 +104,53 @@ def reduce_bound(lock: dict, digest: str, bundle: str, target: str, block_start:
         raise BindingError("the block lies outside the bundle's range")
     _within(lock, block_start, block_start + 86_400)
     capacity = lock["capacity"]["c_rps"]
-    plans = set(lock["workload"]["plans"].values())
+    want = lock["workload"]["plans"].get(f"scored/{seed}/{target}")
     plan = None
     for f in index["files"]:
         if f["label"] != "plan":
             continue
         with open(os.path.join(bundle, f["file"])) as fh:
             cand = json.load(fh)
-        if cand.get("target") == target and cand.get("digest") in plans and schedule.digest(cand) == cand.get("digest"):
+        if cand.get("digest") == want and schedule.digest(cand) == want:
             plan = cand
-    if plan is None or plan.get("accelerate") != 1 or plan.get("kind") != "scored" or \
-            float(plan.get("capacity_rps", -1)) != float(capacity):
-        raise BindingError("no locked confirmation plan for this target in the bundle (label plan)")
+    if want is None or plan is None or plan.get("target") != target or plan.get("seed") != seed or \
+            plan.get("accelerate") != 1 or plan.get("kind") != "scored" or float(plan.get("capacity_rps", -1)) != float(capacity):
+        raise BindingError(f"the bundle lacks the locked confirmation plan of seed {seed} for {target} (label plan)")
     out = reduce.block_metrics(bundle, target, block_start, float(capacity), plan["scheduled_per_minute"])
     with open(os.path.join(bundle, "SHA256SUMS"), "rb") as fh:
         sums = hashlib.sha256(fh.read()).hexdigest()
-    out["binding"] = {"runlock_sha256": digest, "bundle_sums_sha256": sums, "target": target,
-                      "block_start": datetime.fromtimestamp(block_start, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                      "capacity_rps": capacity, "plan_digest": plan["digest"]}
+    out["binding"] = {"runlock_sha256": digest, "bundle_sums_sha256": sums, "target": target, "seed": seed,
+                      "block_start": start_text, "capacity_rps": capacity, "plan_digest": want}
     return out
 
 
+_MEASURED = ("recorder_coverage", "dispatch_fraction_min", "reconciled")
+
+
 def check_bindings(study: dict, lock: dict, digest: str) -> None:
-    """Every scored block must come from a reduction bound to this run-lock, its own target and the locked capacity."""
+    """Every scored block is re-derived from its own bundle under this run-lock and must equal it: its seed's locked
+    plan, a permitted date, the same binding, windows, day and measured validity. No evidence serves two blocks."""
+    seen_evidence, seen_slots = set(), set()
     for b in study.get("blocks", []):
-        bind = b.get("binding") or {}
-        if bind.get("runlock_sha256") != digest or bind.get("capacity_rps") != lock["capacity"]["c_rps"] or \
-                bind.get("target") != render.target_name(b.get("arm"), b.get("profile")):
-            raise BindingError(f"block {b.get('arm')}/{b.get('profile')}/{b.get('seed')} is not bound to this run-lock")
+        where = f"{b.get('arm')}/{b.get('profile')}/{b.get('seed')}"
+        bind, bundle = b.get("binding") or {}, b.get("bundle")
+        if not bundle or not bind:
+            raise BindingError(f"block {where} has no bundle or binding")
+        target = render.target_name(b.get("arm"), b.get("profile"))
+        if bind.get("target") != target or bind.get("seed") != b.get("seed"):
+            raise BindingError(f"block {where} is bound to another target or seed")
         start = int(_utc(bind["block_start"]).timestamp())
-        _within(lock, start, start + 86_400)
+        evidence = (bind.get("bundle_sums_sha256"), target, bind["block_start"])
+        if evidence in seen_evidence or (target, bind["block_start"]) in seen_slots:
+            raise BindingError(f"block {where} reuses evidence of another block")
+        seen_evidence.add(evidence)
+        seen_slots.add((target, bind["block_start"]))
+        fresh = reduce_bound(lock, digest, bundle, target, start, b.get("seed"))
+        if fresh["binding"] != bind:
+            raise BindingError(f"block {where}: the binding differs from its re-derived reduction")
+        if fresh["windows"] != b.get("windows") or fresh["day"] != b.get("day") or \
+                any(fresh[k] != (b.get("validity") or {}).get(k) for k in _MEASURED):
+            raise BindingError(f"block {where}: the metrics differ from its re-derived reduction")
 
 
 def main(argv=None) -> int:
@@ -146,6 +176,7 @@ def main(argv=None) -> int:
     rd = sub.add_parser("reduce")
     rd.add_argument("--runlock", required=True); rd.add_argument("--bundle", required=True)
     rd.add_argument("--target", required=True); rd.add_argument("--block-start", required=True)
+    rd.add_argument("--seed", type=int, required=True)
     rd.add_argument("--out", default="")
     s = sub.add_parser("score"); s.add_argument("--runlock", required=True); s.add_argument("--study", required=True)
     s.add_argument("--out", default="")
@@ -196,8 +227,8 @@ def main(argv=None) -> int:
         return 1 if probs else 0
     elif args.cmd == "reduce":
         digest, lock = _verified(args)
-        _write(_json(reduce_bound(lock, digest, args.bundle, args.target, int(_utc(args.block_start).timestamp()))),
-               args.out)
+        _write(_json(reduce_bound(lock, digest, args.bundle, args.target, int(_utc(args.block_start).timestamp()),
+                                  args.seed)), args.out)
     elif args.cmd == "score":
         digest, lock = _verified(args)
         study = _load(args.study)
