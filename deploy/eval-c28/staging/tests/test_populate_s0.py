@@ -244,9 +244,11 @@ def fake_exec(vols, mutate=None):
         job = dict(job, mount=vols[pvc])
         if mutate:
             mutate(pvc, job)
+        tail = P.exec_argv(pod)[P.exec_argv(pod).index("--") + 1:]      # exactly what runs in the container
+        assert tail[0] == "python3"
         with open(out_path, "wb") as fh:
-            res = subprocess.run([sys.executable, "-B", "-c", P.READER], input=json.dumps(job).encode(),
-                                 stdout=fh, stderr=subprocess.PIPE, timeout=60)
+            res = subprocess.run([sys.executable] + tail[1:], input=P.exec_stdin(job), stdout=fh,
+                                 stderr=subprocess.PIPE, timeout=60)
         return res.returncode, res.stderr.decode()
     return exe
 
@@ -619,3 +621,108 @@ def test_git_ignores_an_ambient_hook_repository(env, monkeypatch, tmp_path):
     monkeypatch.setenv("GIT_INDEX_FILE", str(tmp_path / "elsewhere.index"))
     gen = P.generated_sources(env["record"], P.section(env["record"]))
     assert json.loads(gen["source/terminations.json"]) == {"pod-a": {"at": "x"}}
+
+
+
+# --- the live probe failure (2026-11-08 04:37Z): exec transport, sanitized failures, read access -----------------------
+
+def test_exec_command_line_is_short_and_carries_no_script():
+    """The live failure: the 12 KB script on the exec command line made a ~23 KB request URL, which the proxy in
+    front of the API refused; the script now travels on stdin."""
+    import urllib.parse
+    argv = P.exec_argv("c28-s0-forecast-log-abcdef0123")
+    tail = argv[argv.index("--") + 1:]
+    query = "&".join("command=" + urllib.parse.quote(a, safe="") for a in tail)
+    assert len(query) < 1024 and P.READER not in argv and P.READER_SHA256 in argv
+    assert json.loads(P.exec_stdin({"mode": "probe"}))["script"] == P.READER
+
+
+def test_a_script_other_than_the_reviewed_one_is_refused():
+    tail = P.exec_argv("x")[P.exec_argv("x").index("--") + 1:]
+    stdin = (json.dumps({"script": P.READER + "\n# edited", "job": {"mode": "probe", "mount": "/"}}) + "\n").encode()
+    res = subprocess.run([sys.executable] + tail[1:], input=stdin, capture_output=True, timeout=30)
+    assert res.returncode == 3
+    assert P.exec_failure(res.returncode, res.stdout.decode(), "") == \
+        "the reader failed: DigestMismatch (integrity) at reader line 0 (exit 3)"
+
+
+def test_kubectl_exec_failures_are_classified_not_echoed(env):
+    e = env
+    leak = "/very/secret/path?token=abc"
+
+    def refused(pod, job, out_path):
+        open(out_path, "wb").close()
+        return 1, f"error: unable to upgrade connection: 414 Request-URI Too Large {leak}"
+    e["exe"] = refused
+    p, d = reviewed(e["record"], P.probe_plan(e["record"], e["kube"]), P.PROBE, "probe-plan")
+    with pytest.raises(X.StagingError) as info:
+        P.probe(e["record"], e["kube"], p, d, e["exe"], e["clock"].sleep, e["clock"].now)
+    assert "kubectl exec failed (request-too-large, exit 1)" in str(info.value) and leak not in str(info.value)
+    assert P.leftover_readers(e["kube"], e["record"]) == []          # the cleanup was still proven
+
+
+needs_nonroot = pytest.mark.skipif(os.geteuid() == 0, reason="root reads anything; the permission cases need non-root")
+
+
+@needs_nonroot
+def test_unreadable_files_and_directories_are_reported_sanitized(env):
+    e = env
+    fc = os.path.join(e["vols"]["forecast-log-pvc"], "forecasts.jsonl")
+    tdir = os.path.join(e["vols"]["evidence-archive-pvc"], "logs/trainer")
+    os.chmod(fc, 0o000); os.chmod(tdir, 0o000)
+    try:
+        do_probe(e)
+        probs = "\n".join(P.plan(e["record"], e["kube"])["problems"])
+    finally:
+        os.chmod(fc, 0o644); os.chmod(tdir, 0o755)
+    assert "forecast-log-pvc: rule jsonl_prefix forecasts.jsonl: PermissionError (permission) at reader line" in probs
+    assert "is not readable (permission)" in probs                                   # not "missing"
+    assert "evidence-archive-pvc: 1 directories are unreadable (permission)" in probs
+    assert "Errno" not in probs and e["vols"]["forecast-log-pvc"] not in probs        # no message, no host path
+
+
+@needs_nonroot
+def test_a_reader_crash_reports_class_line_and_category_only(env):
+    e = env
+    do_probe(e)
+    path = os.path.join(e["vols"]["load-evidence-pvc"], "load-20261101T2300Z.json")
+    os.chmod(path, 0o000)
+    try:
+        with pytest.raises(X.StagingError) as info:
+            do_export(e)
+    finally:
+        os.chmod(path, 0o644)
+    msg = str(info.value)
+    assert "the reader failed: PermissionError (permission) at reader line" in msg and "(exit 3)" in msg
+    assert path not in msg and "Errno" not in msg
+    assert P.leftover_readers(e["kube"], e["record"]) == []
+
+
+def test_read_access_modes():
+    sc, caps = P.reader_security({"read_access": "nonroot", "supplemental_groups": [1000]})
+    assert (sc["runAsNonRoot"], sc["runAsUser"], sc["supplementalGroups"], caps) == (True, 65534, [1000],
+                                                                                   {"drop": ["ALL"]})
+    assert "fsGroup" not in sc
+    sc, caps = P.reader_security({"read_access": "dac-read-search"})
+    assert (sc["runAsNonRoot"], sc["runAsUser"]) == (False, 0)
+    assert caps == {"drop": ["ALL"], "add": ["DAC_READ_SEARCH"]}
+
+
+def test_dac_read_search_pod_keeps_every_other_restriction(env):
+    e = env
+    doc = json.load(open(e["path"]))
+    doc["populate"]["reader"]["read_access"] = "dac-read-search"
+    write(e["path"], json.dumps(doc))
+    record = X.load_record(e["path"], ("populate", "archive"))
+    binding = P.claim_binding(e["kube"], "ml-models-pvc", UIDS["ml-models-pvc"])
+    spec = P.reader_pod(record, P.section(record), "ml-models-pvc", binding, "n1")["spec"]
+    c = spec["containers"][0]
+    assert spec["automountServiceAccountToken"] is False and c["securityContext"]["readOnlyRootFilesystem"] is True
+    assert c["securityContext"]["allowPrivilegeEscalation"] is False
+    assert c["securityContext"]["capabilities"] == {"drop": ["ALL"], "add": ["DAC_READ_SEARCH"]}
+    assert spec["volumes"][0]["persistentVolumeClaim"]["readOnly"] is True
+    assert P.probe_plan(record, e["kube"])["reader_security"]["capabilities"]["add"] == ["DAC_READ_SEARCH"]
+    doc["populate"]["reader"]["read_access"] = "root"
+    write(e["path"], json.dumps(doc))
+    with pytest.raises(X.StagingError, match="read_access must be one of"):
+        P.section(X.load_record(e["path"], ("populate", "archive")))
