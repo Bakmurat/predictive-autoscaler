@@ -86,11 +86,17 @@ class FakeApi:
         if o is None:
             return None
         if sub == "scale":
-            m = o["metadata"]
-            return {"kind": "Scale", "metadata": {"name": m["name"], "namespace": m["namespace"], "uid": m["uid"],
-                                                  "resourceVersion": m["resourceVersion"]},
-                    "spec": {"replicas": o["spec"].get("replicas")}}
+            return self._scale_of(o)
         return copy.deepcopy(o)
+
+    @staticmethod
+    def _scale_of(o):
+        """An autoscaling/v1 Scale as the API server serializes it: spec.replicas is omitempty, so 0 is left out."""
+        m, n = o["metadata"], o["spec"].get("replicas")
+        return {"apiVersion": "autoscaling/v1", "kind": "Scale",
+                "metadata": {"name": m["name"], "namespace": m["namespace"], "uid": m["uid"],
+                             "resourceVersion": m["resourceVersion"]},
+                "spec": {"replicas": n} if n else {}}
 
     def replace(self, path, body):
         self.calls.append(("replace", path))
@@ -109,10 +115,11 @@ class FakeApi:
             o["spec"]["replicas"] = body["spec"]["replicas"]
             if self.instant_pods:
                 self.sync_pods(o)
-        else:
-            if body.get("spec") != o.get("spec"):
-                o["metadata"]["generation"] += 1
-            o["spec"] = copy.deepcopy(body["spec"])
+            o["metadata"]["resourceVersion"] = self._next_rv()
+            return self._scale_of(o)
+        if body.get("spec") != o.get("spec"):
+            o["metadata"]["generation"] += 1
+        o["spec"] = copy.deepcopy(body["spec"])
         o["metadata"]["resourceVersion"] = self._next_rv()
         return copy.deepcopy(o)
 

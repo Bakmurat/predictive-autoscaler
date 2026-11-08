@@ -1431,3 +1431,25 @@ def test_verify_runs_one_observation_of_the_requested_length(tmp_path):
     v2 = LG.verify(api, rec, 600, clock.sleep, clock, clock)
     assert v2["retired"] is False and len(v2["problems"]) == 1 and v2["observed_seconds"] == 0
     assert clock.t - t1 <= 100 + LG.SAMPLE_SECONDS                           # stopped at the failure, no second run
+
+
+@pytest.mark.parametrize("resp, replicas, ok", [
+    ({"apiVersion": "autoscaling/v1", "kind": "Scale", "metadata": {"uid": "u"}, "spec": {}}, 0, True),
+    ({"apiVersion": "autoscaling/v1", "kind": "Scale", "metadata": {"uid": "u"}, "spec": {}}, 2, False),
+    ({"apiVersion": "autoscaling/v1", "kind": "Scale", "metadata": {"uid": "u"}, "spec": {"replicas": 2}}, 2, True),
+    ({"apiVersion": "autoscaling/v1", "kind": "Scale", "metadata": {"uid": "other"}, "spec": {}}, 0, False),
+    ({"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"uid": "u"}, "spec": {}}, 0, False),
+    ({}, 0, False),
+])
+def test_a_scale_response_omitting_zero_replicas_confirms_zero(resp, replicas, ok):
+    # Live 2026-11-08: the API server's Scale response omits spec.replicas when it is 0 (omitempty).
+    class Api:
+        def replace(self, path, body):
+            return dict(resp, metadata=dict(resp.get("metadata") or {}, resourceVersion="2"))
+    pre = {"metadata": {"uid": "u", "resourceVersion": "1", "generation": 4}, "spec": {"replicas": 1}}
+    call = LG._scale_call(Api(), {"namespace": "demo", "name": "k6-nginx-test"}, replicas)
+    if ok:
+        assert call(pre)[1]["replicas"] == replicas
+    else:
+        with pytest.raises(C.StagingError, match="does not confirm"):
+            call(pre)
