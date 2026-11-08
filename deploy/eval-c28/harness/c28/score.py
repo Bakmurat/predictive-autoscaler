@@ -2,8 +2,17 @@
 sections 7 and 8).
 
 Input (one JSON study): the prerequisites of section 1, observed safety/contract/resource breaches, artifact and
-cleanup status, the per-candidate fallback/startup/quota gate evidence, and the scored blocks: one per (arm, profile,
-seed) with its validity measurements and per-window metrics (reduce.block_metrics). Output: one classification per
+cleanup status, the per-candidate fallback/startup/quota gate evidence, the section 12 applicability declaration (it
+must be exactly the frozen one, frozen.APPLICABILITY, with the amended manifest's digest: no other waiver is
+accepted), and the scored blocks: one per (arm, profile, seed) with its validity measurements, per-window metrics
+(reduce.block_metrics), its metric-outage record (H-CPU: "not_tested", the only allowed value; every request-metric
+arm: "verified" or the block's outage evidence is missing/failed, which keeps the study INCOMPLETE) and, for a PA arm,
+the spec.prediction.families observed at confirmation and the candidate families its issuances actually carried
+(anything other than the arm's frozen set is a contract failure: FAIL).
+
+Section 12: H-CPU's 12:00-14:00 window is an unperturbed control; it stays in every total. H-CPU is in no
+inferential comparison (the eight-test Holm family {PA-N, PA-E} x {H-RPS, PA-R} x {s20, s90} is unchanged), and the
+report carries the frozen disclosure (frozen.CPU_OUTAGE_DISCLOSURE). Output: one classification per
 candidate arm (PA-N, PA-E) and for the study, with every comparison, interval and reason.
 
 Statistics. Blocks are paired by (profile, seed). For a comparison of arm A with comparator B the paired daily
@@ -93,6 +102,10 @@ _WINDOW_COUNTS = ("minutes", "observed_minutes", "slo_violation_minutes", "slo_o
                   "surplus_replica_seconds", "provisioned_replica_seconds")
 
 
+def _is_sha(v) -> bool:
+    return isinstance(v, str) and len(v) == 64 and all(ch in "0123456789abcdef" for ch in v)
+
+
 def _num(v) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v >= 0
 
@@ -125,6 +138,10 @@ def validate_study(study: Dict) -> List[str]:
             if not isinstance(g, dict) or not set(g) <= set(F.GATES) or \
                     not all(v is None or isinstance(v, bool) for v in g.values()):
                 p.append(f"gates.{arm} must hold only {list(F.GATES)} as true, false or null")
+    app = study.get("applicability")
+    if not isinstance(app, dict) or set(app) != {"declaration", "manifest_sha256"} or \
+            app.get("declaration") != F.APPLICABILITY or not _is_sha(app.get("manifest_sha256")):
+        p.append("applicability must be exactly the frozen section 12 declaration with the manifest sha256")
     blocks = study.get("blocks")
     if not isinstance(blocks, list):
         return p + ["blocks must be a list"]
@@ -138,6 +155,20 @@ def validate_study(study: Dict) -> List[str]:
         if key in seen:
             p.append(f"{where}: duplicate record {key}")
         seen.add(key)
+        mo = b.get("metric_outage")
+        if F.METRIC_OUTAGE_APPLICABILITY[key[0]] == "not_tested":
+            if mo != "not_tested":
+                p.append(f"{where}: metric_outage must be not_tested for {key[0]} (section 12: never a fabricated "
+                         f"outage result)")
+        elif mo not in F.METRIC_OUTAGE_EVIDENCE:
+            p.append(f"{where}: metric_outage must be one of {list(F.METRIC_OUTAGE_EVIDENCE)} (required for {key[0]})")
+        if key[0] in F.PA_ARMS:
+            for k in ("families", "candidates_seen"):
+                x = b.get(k)
+                if x is not None and (not isinstance(x, list) or not all(isinstance(v, str) for v in x)):
+                    p.append(f"{where}: {k} must be null or a list of strings")
+        elif b.get("families") is not None or b.get("candidates_seen") is not None:
+            p.append(f"{where}: {key[0]} has no forecast families")
         if b.get("invalid_cause") not in (None, "external", "product"):
             p.append(f"{where}: invalid_cause must be null, external or product")
         v = b.get("validity", {})
@@ -282,6 +313,16 @@ def classify_candidate(study: Dict, arm: str, benefit: Dict[str, Dict] = None) -
     for x in blocks:
         if x.get("invalid_cause") == "product":
             reasons["FAIL"].append(f"product-caused invalid block {x['arm']}/{x['profile']}/{x['seed']}")
+    for x in blocks:                             # the family field and effective candidate set (C2.8a), observed
+        if x["arm"] not in F.PA_ARMS:
+            continue
+        where = f"{x['arm']}/{x['profile']}/{x['seed']}"
+        # Each observation on its own: a known violation is FAIL even when the other observation is missing.
+        if x.get("families") is not None and list(x["families"]) != list(F.PA_FAMILIES[x["arm"]]):
+            reasons["FAIL"].append(f"contract failure: {where} ran with spec.prediction.families {x['families']}")
+        if x.get("candidates_seen") is not None and not set(x["candidates_seen"]) <= set(F.PA_CANDIDATES[x["arm"]]):
+            reasons["FAIL"].append(f"contract failure: {where} issued candidates {sorted(x['candidates_seen'])} "
+                                   f"outside {list(F.PA_CANDIDATES[x['arm']])}")
 
     # 2. Prerequisites.
     for name, ok in study.get("prerequisites", {}).items():
@@ -289,6 +330,9 @@ def classify_candidate(study: Dict, arm: str, benefit: Dict[str, Dict] = None) -
             reasons["NOT READY"].append(f"prerequisite not met: {name}")
     if arm == "PA-N" and study.get("prerequisites", {}).get("family_restriction") is not True:
         reasons["NOT READY"].append("PA-N needs the family-restriction mechanism (section 1, prerequisite 4)")
+    if study.get("prerequisites", {}).get("rps_metric_fault") is not True:
+        reasons["NOT READY"].append("the request-metric outage for H-RPS and the PA arms is not implemented and "
+                                    "verified (section 12.1)")
     if arm == "PA-E" and study.get("prerequisites", {}).get("policy_cost_binding") is not True:
         reasons["NOT READY"].append("PA-E needs the same-policy cost binding for E1 selection (G4)")
 
@@ -304,6 +348,13 @@ def classify_candidate(study: Dict, arm: str, benefit: Dict[str, Dict] = None) -
             reasons["INCOMPLETE"].append(f"{g} gate evidence missing")
     if arm == "PA-E" and gates.get("g4_qualified") is None:
         reasons["INCOMPLETE"].append("G4 E1 qualification evidence missing (independent recomputation from the journal)")
+    for x in blocks:                             # section 12.1: a request-metric arm's outage is required evidence
+        if F.METRIC_OUTAGE_APPLICABILITY[x["arm"]] == "required" and x.get("metric_outage") != "verified":
+            reasons["INCOMPLETE"].append(f"{x['arm']}/{x['profile']}/{x['seed']}: request-metric outage "
+                                         f"{x.get('metric_outage')}, not verified")
+        if x["arm"] in F.PA_ARMS and (x.get("families") is None or x.get("candidates_seen") is None):
+            reasons["INCOMPLETE"].append(f"{x['arm']}/{x['profile']}/{x['seed']}: spec.prediction.families or the "
+                                         f"effective candidate set not verified at confirmation")
     needed = set(F.ARMS)                         # the primary matrix: five blocks per arm per profile (section 5)
     for x in blocks:
         ok, why = _valid(x)
@@ -430,4 +481,5 @@ def score(study: Dict) -> Dict:
         overall = next(o for o in ("NOT READY", "INCOMPLETE", "FAIL", "INCONCLUSIVE") if o in outcomes.values())
     return {"schema": "c28-score/v1", "outcome": overall,
             "claims": [a for a, o in outcomes.items() if o == "PASS"], "candidates": cands,
+            "applicability": study["applicability"], "disclosures": [F.CPU_OUTAGE_DISCLOSURE],
             "bootstrap": {"seed": F.BOOTSTRAP_SEED, "resamples": F.BOOTSTRAP_RESAMPLES}}

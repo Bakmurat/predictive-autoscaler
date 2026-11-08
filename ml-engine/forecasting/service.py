@@ -14,13 +14,27 @@ For a request at decision origin t (all under one journal; nothing is wired to t
      the checkpoint it was computed from, stamped with the clock read just before the commit; an issuance that could no
      longer act before its first target is refused instead (never backdated);
   8. fold the issuance into the state, checkpoint again, and answer from the bundle alone (a retry at the same origin
-     returns the same bytes, whatever has matured since).
+     returns the same bytes, whatever has matured since, except predictive_eligible, which re-checks the release-gate
+     authorisation at every answer and can only turn false).
 Recovery is exact at every boundary: a crash before the issuance leaves the trust checkpoint (a retry re-decides from
 it); a crash after it leaves the issuance in the journal, folded in by the next request.
 
+The challenger (E1-product) is selected over seasonal-naive only on bound same-policy costs (forecasting.policy_sim):
+once the retained paired evidence is large and long enough, both forecasts are replayed through the operator's own v2
+policy for this autoscaler (capacity, bounds, caps, headroom, startup delay, decision interval) over the decisions of
+those pairs, with the issued bounds from the journal and the measured rates as truth; the result names its epoch,
+models, recipes, window and policy fingerprint, and trust uses it only when all of them match.
+spec.prediction.families restricts what is forecast at all (seasonalNaive only: E1 is never a candidate).
+
 This preview is shadow only: the release gates (G0-G5, C2.8) have not passed, so the verdict's PredictionReady and every
-response's predictive_eligible are false whatever the evidence says. A journal that cannot be opened or written answers
-503 (StateUnavailable) and never issues; a lost journal starts empty, so trust has to be earned again from nothing.
+response's predictive_eligible are false whatever the evidence says, except under a verified LAB qualification
+(forecasting.qualification) in an evaluation build, for the named cluster, namespaces and target UIDs only: it stands in
+for the release gate and nothing else. Every bundle records the basis (if any) it was issued under, and every ANSWER
+re-checks it (a retry included): an expired, removed or changed qualification makes even a stored issuance
+ineligible, and a lab-qualified issuance is eligible only if its valid_until is not after the qualification's expiry,
+so a cached eligible answer never outlives it. A journal
+that cannot be opened or written answers 503 (StateUnavailable) and never issues; a lost journal starts empty, so trust
+has to be earned again from nothing.
 """
 
 from __future__ import annotations
@@ -28,16 +42,18 @@ from __future__ import annotations
 import os
 import threading
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Mapping, Optional, Tuple
 
 from api.identity import LookupFailed, ProvenanceRefused
 from data.bounded_http import bounded_get
 from forecasting import calibration as cal
+from forecasting import policy_sim as P
+from forecasting import qualification as Q
 from forecasting import trust as T
 from forecasting.artifacts import ArtifactRefused, ArtifactStore, Binding, encode_e1, fit_payload
 from forecasting.clock import ReceiptClock
-from forecasting.contracts import FORECAST_CONTRACT, UNIT, BoundRequest, ContractRefused, V2Response, bind_request, \
-    check_response
+from forecasting.contracts import FAMILY_MODELS, FORECAST_CONTRACT, UNIT, BoundRequest, ContractRefused, V2Response, \
+    bind_request, canonical_json, check_response, sha256_hex
 from forecasting.history import HistoryRefused, HistoryUnavailable, read_rps_history
 from forecasting.maturation import candidate, issued_outcome
 from forecasting.metrics import ForecastMetrics, RegistryFull, Snapshot, model_samples
@@ -50,6 +66,7 @@ DAY = 86400
 REFIT_SECONDS = 6 * 3600
 RECIPES = {"seasonal_naive": RECIPE_NAIVE, "statistical": RECIPE_E1}
 RELEASE_GATES_PASSED = False        # C2.8: until the G0-G5 evidence exists, nothing is PredictionReady
+COST_HISTORY_SECONDS = 8 * DAY      # issued bounds kept in memory for cost replays (paired evidence: 7 days)
 
 
 class ServiceError(Exception):
@@ -68,12 +85,17 @@ class ServiceConfig:
     store_id: Optional[str] = None       # a fixed journal identity (deterministic tests); None: random at creation
     retention_seconds: int = 7 * DAY     # issuances and outcomes kept online (observations: 28 days)
     compact_every_seconds: int = 3600
+    build: Q.BuildInfo = Q.BuildInfo("unknown", False)               # the image's build record
+    lab_qualification: Optional[Q.LabQualification] = None          # verified by forecasting.qualification.load
 
 
 class ForecastService:
     def __init__(self, config: ServiceConfig, *, reader, fetch: Callable = bounded_get, clock=None, worker=None):
         if config.fit_mode not in ("worker", "inline", "off"):
             raise ValueError(f"unknown fit mode {config.fit_mode!r}")
+        q = config.lab_qualification
+        if q is not None and not (config.build.evaluation_build and q.source_tree == config.build.source_tree):
+            raise Q.QualificationRefused("a lab qualification is honoured only by the evaluation build it names")
         self.config, self.reader, self.fetch = config, reader, fetch
         self.clock = clock or ReceiptClock()
         os.makedirs(config.state_dir, exist_ok=True)
@@ -94,6 +116,10 @@ class ForecastService:
         self.metrics = ForecastMetrics(max_autoscalers=config.max_autoscalers)
         self._lock = threading.Lock()                   # one writer of the journal and the epoch states
         self._compacted_s: Optional[int] = None
+        self._cluster_uid: Optional[str] = None         # read once it succeeds (a pod never changes cluster)
+        self._uppers: Dict = {}                         # (namespace, autoscaler) -> issued bounds of its epoch
+        self._costs: Dict = {}                          # (namespace, autoscaler) -> (cache key, costs)
+        self.cost_replays = 0                           # cost simulations run (each one replays both families)
 
     # --- status -------------------------------------------------------------------------------------------------
 
@@ -107,9 +133,13 @@ class ForecastService:
 
     def health(self) -> Dict:
         problem = self.store_problem or (self.store.problem if self.store is not None else None)
+        q = self.config.lab_qualification
         return {"status": "healthy", "state": "healthy" if self.store_healthy else "unavailable",
                 "state_problem": problem, "forecast_contract": FORECAST_CONTRACT,
-                "release_gates_passed": RELEASE_GATES_PASSED}
+                "release_gates_passed": RELEASE_GATES_PASSED,
+                "build": {"source_tree": self.config.build.source_tree,
+                          "evaluation_build": self.config.build.evaluation_build},
+                "lab_qualification": None if q is None else q.summary()}
 
     def close(self) -> None:
         if self.worker is not None:
@@ -291,7 +321,9 @@ class ForecastService:
                                         "fit_cutoff": None, "artifact_sha256": None}
         except KernelUnavailable:
             pass
-        fit, sha = self._fit_for(bound, series, input_end, ks)
+        fit, sha = (None, None)
+        if "statistical" in self._models(bound):        # families: seasonalNaive only never fits or offers E1
+            fit, sha = self._fit_for(bound, series, input_end, ks)
         if fit is not None:
             try:
                 points["statistical"] = {"point_rps": forecast_e1(fit, series, input_end, targets, ks)["points"],
@@ -312,11 +344,13 @@ class ForecastService:
             inputs.append(T.CandidateInputs(model, m["ledger"], upper is not None, info["n"], policy.min_windows,
                                             input_end - first_obs + dt, T.REQUIRED_HISTORY_SECONDS[model], True,
                                             None if p["fit_cutoff"] is None else input_end - p["fit_cutoff"]))
+        gate = self._release_gate(bound, now_ms // 1000, window.valid_until(lead))
+        policy_sha, costs = self._policy_costs(bound, state, now_ms // 1000, points)
         g = T.Global(now_s=now_ms // 1000, lead_seconds=lead.lead_seconds, nominal_miscoverage=policy.nominal_ratio,
-                     identity_ok=True, store_healthy=self.store_healthy, replay_suite_passed=RELEASE_GATES_PASSED,
-                     startup_budget_valid=True)
+                     identity_ok=True, store_healthy=self.store_healthy, replay_suite_passed=gate["passed"],
+                     startup_budget_valid=True, policy_sha256=policy_sha)
         pairs = state["pairs"] if "seasonal_naive" in points else {}   # paired evidence needs its naive baseline
-        verdict, new_h = T.evaluate(inputs, state["trust"], g, s.trust, pairs=pairs, costs=None)
+        verdict, new_h = T.evaluate(inputs, state["trust"], g, s.trust, pairs=pairs, costs=costs)
         state["trust"] = new_h
         through = max(at for at, v in zip(grid.received_at_ms, grid.values) if v is not None)   # actual receipts
         return {"schema": "forecast-issuance/v1", "evidence_mode": "prospective",
@@ -328,7 +362,13 @@ class ForecastService:
                 "actuation_allowance_seconds": lead.actuation_allowance_seconds,
                 "valid_until": window.valid_until(lead), "input_end": input_end,
                 "input_received_through_ms": through, "nominal_miscoverage_bps": policy.nominal_bps,
-                "candidates": cands, "selected": verdict.selected,
+                "candidates": cands, "selected": verdict.selected, "release_gate": gate,
+                "policy_sha256": policy_sha,
+                "costs": {m: {"shortage": v["shortage"], "replica_time": v["replica_time"],
+                              "window": v["binding"]["window"], "paired_decisions": v["paired_decisions"],
+                              "decisions": v["decisions"], "unknown_truth_seconds": v["unknown_truth_seconds"],
+                              "seconds": v["seconds"]}
+                          for m, v in costs.items()},
                 "verdict": {"phase": verdict.phase, "reason": verdict.reason,
                             "prediction_ready": verdict.prediction_ready,
                             "candidates": {m: {"trusted": v.trusted, "phase": v.phase, "reason": v.reason,
@@ -337,6 +377,17 @@ class ForecastService:
                                                "evidence_cutoff":
                                                    state["models"][m]["ledger"]["last_prospective_outcome_s"]}
                                            for m, v in verdict.candidates.items()}}}
+
+    def _authorized(self, bound: BoundRequest, b: Dict) -> bool:
+        """The bundle's release-gate basis still holds NOW, for this request: the same basis and the same qualification
+        digest, re-checked on every answer (an issuance stored under a lab qualification is not eligible once it has
+        expired, been removed or replaced)."""
+        issued = b.get("release_gate") or {}
+        if issued.get("passed") is not True:
+            return False
+        now = self._release_gate(bound, self.clock.now_ms() // 1000, b["valid_until"])
+        return now["passed"] and (now["basis"], now["lab_qualification_sha256"]) == \
+            (issued.get("basis"), issued.get("lab_qualification_sha256"))
 
     def _response(self, bound: BoundRequest, b: Dict) -> Dict:
         sig = bound.signal
@@ -364,8 +415,8 @@ class ForecastService:
             calibration_windows=c["calibration"]["n"], prospective_windows=cv["prospective_gate_bounds"],
             gate_coverage_ratio=cv["coverage_gate"], missing_outcome_ratio=None if avail is None else 1.0 - avail,
             selected_candidate=reported, trust_state=state_phase, reason=v["reason"],
-            predictive_eligible=bool(RELEASE_GATES_PASSED and v["prediction_ready"] and b["selected"]
-                                     and c["upper_window_max_rps"] is not None),
+            predictive_eligible=bool(v["prediction_ready"] and b["selected"] and c["upper_window_max_rps"] is not None
+                                     and self._authorized(bound, b)),
             evidence_cutoff=cv["evidence_cutoff"])
         check_response(r, bound)
         return r.to_wire()
@@ -386,4 +437,92 @@ class ForecastService:
     def forget(self, namespace: str, autoscaler: str) -> None:
         """After confirmed deletion: drop the autoscaler's series (its journal epoch simply stops growing)."""
         self.metrics.remove(namespace, autoscaler)
+        with self._lock:
+            self._uppers.pop((namespace, autoscaler), None)
+            self._costs.pop((namespace, autoscaler), None)
+
+    # --- families, the release gate and same-policy costs -------------------------------------------------------------
+
+    @staticmethod
+    def _models(bound: BoundRequest) -> tuple:
+        return tuple(FAMILY_MODELS[f] for f in bound.settings.families)
+
+    def _release_gate(self, bound: BoundRequest, now_s: int, valid_until: int) -> Dict:
+        """The release gate's basis for this request: the product release (RELEASE_GATES_PASSED), a lab qualification
+        whose scope covers the live cluster, namespace and target right now and that is still valid at the answer's
+        valid_until, or none. Only Global.replay_suite_passed reads it; every runtime gate is evaluated as always."""
+        q = self.config.lab_qualification
+        if RELEASE_GATES_PASSED:
+            return {"passed": True, "basis": "release", "lab_qualification_sha256": None}
+        if q is None:
+            return {"passed": False, "basis": None, "lab_qualification_sha256": None}
+        if self._cluster_uid is None:
+            self._cluster_uid = Q.cluster_uid(self.reader)
+        sig = bound.signal
+        ok = q.covers(self._cluster_uid, bound.autoscaler_namespace, sig.namespace, sig.name, sig.target_uid, now_s) \
+            and valid_until <= q.expires
+        return {"passed": ok, "basis": "lab" if ok else None, "lab_qualification_sha256": q.sha256}
+
+    def _issued_uppers(self, bound: BoundRequest, lo: int) -> Dict[int, tuple]:
+        """{decision origin: (naive bound, E1 bound, input_end, seq)} of the epoch's issuances, folded incrementally from
+        the journal and kept for COST_HISTORY_SECONDS. input_end is the newest observation the issuance was computed
+        from: what the forecaster had received at that decision. Callers use only the entries the journal still holds
+        (_retained), so a long-running process and a restarted one replay exactly the same inputs."""
+        scope, ek = (bound.autoscaler_namespace, bound.autoscaler_name), bound.evidence_key
+        u = self._uppers.get(scope)
+        if u is None or u["epoch"] != ek:
+            u = self._uppers[scope] = {"epoch": ek, "seq": 0, "by_origin": {}}
+        for iss in self.store.issuances_after(ek, u["seq"]):
+            b = iss.payload()
+            pick = {m: candidate(b, m).get("upper_window_max_rps") for m in iss.models}
+            u["by_origin"][iss.key.decision_origin] = (pick.get("seasonal_naive"), pick.get("statistical"),
+                                                       b.get("input_end"), iss.seq)
+            u["seq"] = iss.seq
+        u["by_origin"] = {o: v for o, v in u["by_origin"].items() if o >= lo}
+        return u["by_origin"]
+
+    def _policy_costs(self, bound: BoundRequest, state: Dict, now_s: int,
+                      points: Mapping) -> Tuple[Optional[str], Dict]:
+        """(the fingerprint of this autoscaler's v2 policy or None, {"statistical": bound paired costs} or {}).
+        Costs are computed only when they can matter: both families forecast now and the retained pairs already meet
+        the count and span the promotion test requires. Missing capacity or bounds: no policy, so no promotion."""
+        params, _why = P.resolve_policy(bound.spec, bound.settings, bound.lead)
+        if params is None:
+            return None, {}
+        sha = params.fingerprint()
+        t, pairs = bound.settings.trust, state["pairs"]["statistical"]
+        if not {"seasonal_naive", "statistical"} <= set(points):
+            return sha, {}
+        ps = T.pair_sums(pairs, now_s)
+        if ps["n"] < t.challenger_min_pairs or ps["span"] < t.challenger_min_hours * 3600:
+            return sha, {}
+        scope, ek = (bound.autoscaler_namespace, bound.autoscaler_name), bound.evidence_key
+        offset = bound.window.window_end - bound.decision_origin
+        c, dt = params.decision_interval_seconds, bound.settings.sample_interval_seconds
+        start, end = ps["first"] - offset, ps["last"] - offset
+        cached_uppers = self._issued_uppers(bound, now_s - COST_HISTORY_SECONDS)
+        retained = self.store.issuance_seqs(ek, start, end)
+        uppers = {o: u for o, u in cached_uppers.items() if retained.get(o) == u[3]}   # what the journal holds now
+        lo = min([start] + [u[2] for u in uppers.values() if u[2] is not None])
+        obs = {ts: v for ts, v, _at in self.store.observations("signal:" + ek, lo, end + c)}   # first receipts
+        # The controller's input at decision o: the newest observation the issuance at o was computed from (it had
+        # been received by then); no issuance, no measurement (the operator holds). The truth only scores.
+        controller = {o: obs[u[2]] for o, u in uppers.items() if u[2] in obs}
+        truth = {ts: v for ts, v in obs.items() if ts >= start}
+        inputs = {"challenger_upper": {o: u[1] for o, u in uppers.items() if u[1] is not None},
+                  "baseline_upper": {o: u[0] for o, u in uppers.items() if u[0] is not None},
+                  "controller_rps": controller, "truth_rps": truth}
+        # The cache is bound to EVERY replay input (bounds, controller inputs, truth, policy, window), so a late truth
+        # receipt, a compaction or a restart can never leave stale costs: equal inputs give equal costs.
+        digest = sha256_hex(canonical_json({k: sorted(v.items()) for k, v in inputs.items()}))
+        key = (ek, sha, start, end, offset, digest)
+        cached = self._costs.get(scope)
+        if cached is not None and cached[0] == key:
+            return sha, cached[1]
+        costs = {"statistical": P.paired_costs(
+            epoch=ek, challenger=("statistical", RECIPE_E1), baseline=("seasonal_naive", RECIPE_NAIVE), params=params,
+            start=start, end=end, interval=dt, window_offset=offset, **inputs)}
+        self.cost_replays += 1
+        self._costs[scope] = (key, costs)
+        return sha, costs
 

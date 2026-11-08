@@ -153,6 +153,15 @@ def check_bindings(study: dict, lock: dict, digest: str) -> None:
             raise BindingError(f"block {where}: the metrics differ from its re-derived reduction")
 
 
+def check_applicability(study: dict, lock: dict) -> None:
+    """Section 12: the study scores under exactly the run-lock's applicability declaration (the frozen one, bound to
+    the same manifest digest); otherwise the binding is malformed and the study is refused. An observed family field
+    or candidate set that differs from the run-lock's is NOT a binding error: it is a recorded runtime violation, and
+    the scorer classifies it as a contract FAIL."""
+    if study.get("applicability") != lock.get("applicability"):
+        raise BindingError("the study's applicability declaration is not the run-lock's")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="c28", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -233,6 +242,7 @@ def main(argv=None) -> int:
         digest, lock = _verified(args)
         study = _load(args.study)
         check_bindings(study, lock, digest)
+        check_applicability(study, lock)
         _write(_json(score.score(study)), args.out)
     elif args.cmd == "audit":
         params = _load(args.params)

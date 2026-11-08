@@ -162,6 +162,39 @@ The forecasting service and the trainer share the model volume.
   or a missing cgroup measurement: the gate for the 384 MiB fit limit and these resources.
 - **Readiness:** `/ready` answers 503 while the journal cannot support issuance (and before start-up); `/health`
   stays the liveness probe. Young history or untrusted models do not make the service unready.
+- **Families and the challenger:** `spec.prediction.families` (`[seasonalNaive, statistical]` by default) lists what
+  is forecast; `[seasonalNaive]` removes E1-product entirely (no fit, no candidate), and seasonal-naive is always
+  required (CRD revision 5). E1 is selected over a trusted seasonal-naive only on bound **same-policy costs**: once the
+  retained paired evidence meets `challengerMinPairs` and `challengerMinHours`, both forecasts' issued bounds are
+  replayed through the operator's own v2 policy for that autoscaler (`ml-engine/forecasting/policy_sim.py`, held
+  decision for decision to the Go replay by `k8s-operator/controllers/testdata/v2-policy-parity.json`), and E1's
+  shortage and replica-time must each be at most `challengerCostRatioBps` of seasonal-naive's. The controller input at
+  each decision is the newest observation that decision's issuance was computed from (what was available then); the
+  eventual measurement only scores. Startup is modelled per cohort: a scale-up is ready only after the startup delay,
+  and a scale-down removes starting replicas first, so a quick down-then-up does not count as ready capacity. Costs
+  need adequate evidence: at least `challengerMinPairs` matched decisions, at least `minAvailabilityBps` of the
+  replayed ones, and at most `1 - minAvailabilityBps` of the time without a measurement (5% by default). The replay
+  runs again only when the paired evidence or the policy changed. The costs carry their
+  epoch, models, recipes, window and policy fingerprint (capacity, bounds, caps, headroom, startup delay, decision
+  interval) and count only when all of them match; an autoscaler without `capacityPerReplica` (or `targetRPS`) has no
+  policy, so E1 is never promoted for it. Each issuance records the policy fingerprint and the costs it used.
+- **Lab qualification (C2.8 evaluation only):** `forecaster.statistical.labQualification.configMap` mounts a reviewed
+  `lab-qualification/v1` file (`ml-engine/forecasting/qualification.py`) and lets the forecaster read the
+  `kube-system` Namespace (the cluster UID). It is honoured only by the evaluation image of a pushed commit, built
+  with `hack/build-statistical-evaluation.sh --push <commit> <ref>` (the context is `git archive` of the commit,
+  verified file by file in the image's verify stage; a dirty or mismatched context fails the build), and only when the
+  chart runs that image by digest (`images.statisticalForecaster.digest`, required with this option): the file names
+  both the commit and the image digest. A release image, a malformed, expired or over-wide file, another tree or
+  another image stops the forecaster from starting. The file also names the run-lock digest, G0-G4 as `pass`, at
+  least two reviewers, a validity window of at most 60 days, and its
+  scope: one cluster UID, namespaces and every target Deployment by namespace, name and UID. For a request whose live
+  cluster, namespaces and target are all in that scope while it is valid, it stands in for the release gate and
+  nothing else: identity, settings, calibration, coverage, availability, prospective evidence, selection, the issuance
+  deadline, caps, telemetry and the operator's write guards apply as always, so an untrusted forecast stays
+  ineligible. Every issuance records `release_gate` (`passed`, `basis`, the qualification's digest), and every answer,
+  a retry included, re-checks it: once the qualification has expired or been removed or replaced, even a stored
+  issuance is not eligible, and a lab-qualified answer whose `valid_until` falls after the expiry is never eligible.
+  `/health` shows the build and the qualification.
 
 ## Monitoring
 

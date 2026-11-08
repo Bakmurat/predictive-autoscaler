@@ -57,6 +57,9 @@ GOOD_DOCKERFILE = (ML / "Dockerfile.statistical").read_text()
     (lambda s: s.replace("requirements-statistical.txt .", "requirements.txt .").replace(
         "-r requirements-statistical.txt", "-r requirements.txt"), "pip install"),
     (lambda s: s.replace('"statistical"]', '"legacy"]'), "CMD"),
+    (lambda s: s.replace("COPY --from=verify /build-info.json /app/build-info.json",
+                         "COPY --from=verify /ctx /app/ctx"), "another stage"),
+    (lambda s: s.replace("COPY . /ctx", "COPY . /ctx\nCOPY models/ /models/"), "earlier stage"),
 ])
 def test_dockerfile_problems_are_found(mutate, problem):
     assert sbom.check_dockerfile(GOOD_DOCKERFILE) == []
@@ -157,3 +160,89 @@ def test_the_spawn_environment_is_forced_and_then_restored(monkeypatch):
         assert [os.environ[n] for n in W._THREAD_ENV] == ["1", "1", "1"]
     assert os.environ["OPENBLAS_NUM_THREADS"] == "8" and os.environ["OMP_NUM_THREADS"] == "8"
     assert "MKL_NUM_THREADS" not in os.environ
+
+
+def git_free_env():
+    """clean_env() without any GIT_* variable: a commit hook exports GIT_DIR / GIT_INDEX_FILE, and a scratch repository
+    command must never reach the checkout under test."""
+    return {k: v for k, v in clean_env().items() if not k.startswith("GIT_")}
+
+
+def _scratch_repo(tmp_path):
+    """A git repository whose ml-engine/ holds exactly the files the image copies, the Dockerfile and the recorder."""
+    repo = tmp_path / "repo"
+    (repo / "ml-engine").mkdir(parents=True)
+    names = ["Dockerfile.statistical", "build_record.py", "requirements-statistical.txt", ".dockerignore"] + \
+        [s for s in sbom.ALLOWED_COPIES if s.endswith(".py")]
+    for n in names:
+        dst = repo / "ml-engine" / n
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes((ML / n).read_bytes())
+    for f in sorted((ML / "forecasting").glob("*.py")):
+        dst = repo / "ml-engine" / "forecasting" / f.name
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(f.read_bytes())
+    git = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True, text=True,  # noqa
+                                    env=git_free_env())
+    git("init", "-q")
+    assert os.path.realpath(git("rev-parse", "--show-toplevel").stdout.strip()) == os.path.realpath(repo)
+    git("add", "-A")
+    git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "-m", "x")
+    return repo, git("rev-parse", "HEAD").stdout.strip()
+
+
+def _record(ctx, tree, flag, out):
+    return subprocess.run([sys.executable, str(ML / "build_record.py"), str(ctx), tree, flag, str(out)],
+                          capture_output=True, text=True, env=clean_env())
+
+
+def test_an_evaluation_context_is_the_commit_and_nothing_else(tmp_path):
+    # C2.8a (Codex r1 on #27): the evaluation image is built from `git archive <commit>` and verified file by file.
+    repo, commit = _scratch_repo(tmp_path)
+    env = {**git_free_env(), "EVAL_BUILD_REPO": str(repo)}
+    script = str(ROOT / "hack" / "build-statistical-evaluation.sh")
+    p = subprocess.run([script, "--context-only", str(tmp_path / "ctx"), commit], capture_output=True, text=True,
+                       env=env)
+    assert p.returncode == 0, p.stderr
+    rec = json.loads((tmp_path / "ctx" / "build-info.json").read_text())
+    assert rec["source_tree"] == commit and rec["evaluation_build"] is True and rec["verified_files"] > 10
+    from forecasting import qualification as Q
+    assert Q.read_build_info(str(tmp_path / "ctx" / "build-info.json")) == Q.BuildInfo(commit, True)
+    ctx = tmp_path / "ctx" / "ml-engine"
+    assert _record(ctx, commit, "true", tmp_path / "ok.json").returncode == 0
+    # Dirty: a changed copied file, an extra module, a missing module, a changed Dockerfile; or another commit.
+    for name, change in (("forecasting/trust.py", lambda f: f.write_text(f.read_text() + "# edited\n")),
+                         ("forecasting/extra.py", lambda f: f.write_text("x = 1\n")),
+                         ("forecasting/store.py", lambda f: f.unlink()),
+                         ("Dockerfile.statistical", lambda f: f.write_text(f.read_text() + "# edited\n")),
+                         # Codex r2 on #27: a builder-stage input (a loosened pin) is checked like the modules.
+                         ("requirements-statistical.txt",
+                          lambda f: f.write_text(f.read_text().replace("numpy==", "numpy>=")))):
+        bad = tmp_path / ("bad-" + name.replace("/", "-"))
+        subprocess.run(["cp", "-a", str(ctx), str(bad)], check=True)
+        change(bad / name)
+        r = _record(bad, commit, "true", tmp_path / "bad.json")
+        assert r.returncode == 1 and "refused" in r.stderr, name
+    assert _record(ctx, "b" * 40, "true", tmp_path / "other.json").returncode == 1      # manifest of another commit
+    nomani = tmp_path / "no-manifest"
+    subprocess.run(["cp", "-a", str(ctx), str(nomani)], check=True)
+    (nomani / "source-manifest.txt").unlink()
+    r = _record(nomani, commit, "true", tmp_path / "nm.json")                           # a working-tree context
+    assert r.returncode == 1 and "source-manifest.txt" in r.stderr
+    p = subprocess.run([script, "b" * 40, "x:y"], capture_output=True, text=True, env=env)
+    assert p.returncode == 1 and "not a commit" in p.stderr
+    p = subprocess.run([script, commit, "x:y"], capture_output=True, text=True, env=env)
+    assert p.returncode == 1 and "no pushed branch" in p.stderr                          # never an unpublished commit
+
+
+@pytest.mark.parametrize("tree,flag,ok", [("unknown", "false", True), ("a" * 40, "false", True),
+                                         ("unknown", "true", False), ("a" * 40, "yes", False)])
+def test_a_release_record_is_never_an_evaluation_build(tmp_path, tree, flag, ok):
+    p = _record(ML, tree, flag, tmp_path / "r.json")
+    assert (p.returncode == 0) == ok, p.stderr
+    if ok:
+        assert json.loads((tmp_path / "r.json").read_text()) == {"source_tree": tree, "evaluation_build": False}
+    text = (ML / "Dockerfile.statistical").read_text()
+    assert 'RUN python /ctx/build_record.py /ctx "$SOURCE_TREE" "$EVALUATION_BUILD" /build-info.json' in text
+    assert "COPY --from=verify /build-info.json /app/build-info.json" in text
+    assert "chown root:root /app/build-info.json && chmod 0444 /app/build-info.json" in text

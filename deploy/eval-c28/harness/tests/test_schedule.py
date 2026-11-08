@@ -57,6 +57,12 @@ def test_the_k6_plan_is_open_loop_and_records_the_scheduled_arrivals():
 def test_the_fault_timetable_is_absolute_and_starts_at_midnight():
     f = S.fault_timetable(datetime(2026, 11, 20, tzinfo=timezone.utc))
     assert f["metrics_route"]["outages"] == [{"start": "2026-11-20T12:15:00Z", "end": "2026-11-20T12:30:00Z"}]
+    assert f["metric_outage_applicability"] == {"H-CPU": "not_tested", "H-RPS": "required", "PA-R": "required",
+                                                "PA-N": "required", "PA-E": "required"}       # section 12
+    # The demand step of 12:20 stays in every arm's program, H-CPU's included (the full workload is kept).
+    for arm_target in ("c28-h-cpu-s20", "c28-pa-n-s20"):
+        plan = S.k6_plan("scored", 201, 35.0, arm_target)
+        assert plan["scheduled_per_minute"][12 * 60 + 21] > 1.5 * plan["scheduled_per_minute"][12 * 60 + 18]
     assert f["forecast_route"]["outages"] == [{"start": "2026-11-20T14:15:00Z", "end": "2026-11-20T14:35:00Z"}]
     assert f["slow_start"]["slow_starts"] == [{"start": "2026-11-20T20:00:00Z", "end": "2026-11-20T20:45:00Z",
                                                "extra_startup_seconds": 120}]

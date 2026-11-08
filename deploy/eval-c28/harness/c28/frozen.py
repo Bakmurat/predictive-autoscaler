@@ -85,12 +85,32 @@ MAX_INFRA_REPLACEMENTS = 2
 
 OUTCOMES = ("PASS", "FAIL", "INCONCLUSIVE", "INCOMPLETE", "NOT READY")
 
-# The section 1 prerequisites the study must record, every one a strict boolean. cpu_metric_fault: an evaluation-scoped
-# CPU-metric outage for H-CPU that leaves the shared metrics-server alone, independently verified. None is implemented
-# (CPU HPA reads the resource-metrics API, not the evaluation-owned query route), so the full matrix stays NOT READY
-# until one exists (Codex review of #28).
+# The section 1 prerequisites the study must record, every one a strict boolean. rps_metric_fault: the target-local
+# request-metric (RPS query) outage of 12:15-12:30 for H-RPS, PA-R, PA-N and PA-E, implemented and verified (section
+# 12.1: not covered by the H-CPU exception). The former cpu_metric_fault blocker is replaced by the section 12
+# applicability declaration below, never by a fabricated cpu_metric_fault=true.
 PREREQUISITES = ("pinned_tree", "replay_simulator", "lab_qualification", "family_restriction", "policy_cost_binding",
-                 "envelope_and_soak", "recorder_frozen", "cpu_metric_fault")
+                 "envelope_and_soak", "recorder_frozen", "rps_metric_fault")
+
+# Section 12 (amendment of 2026-11-07): scenario-by-arm applicability of the 12:15-12:30 metric outage. H-CPU's
+# CPU-metric outage is NOT TESTED (no shared metrics-server/kubelet/firewall intervention): H-CPU runs the full
+# 24-hour program with normal CPU telemetry, its 12:00-14:00 window an unperturbed control (kept, never zero-filled,
+# never counted as fault coverage). The four request-metric arms keep the outage as REQUIRED. The run-lock binds this
+# exact declaration to the amended manifest's digest; the study and the scorer accept nothing else (no waiver).
+METRIC_OUTAGE_APPLICABILITY = {"H-CPU": "not_tested", "H-RPS": "required", "PA-R": "required", "PA-N": "required",
+                               "PA-E": "required"}
+APPLICABILITY = {"amendment": "EVAL-C28-MANIFEST section 12 (2026-11-07)",
+                 "metric_outage": METRIC_OUTAGE_APPLICABILITY}
+METRIC_OUTAGE_EVIDENCE = ("verified", "failed", "missing")            # a required arm's per-block record
+CPU_OUTAGE_DISCLOSURE = ("CPU HPA metric-outage behavior was not tested; its corresponding interval retained normal "
+                         "CPU telemetry. Outage comparisons concern request-metric controllers only.")
+
+# spec.prediction.families per PA arm (C2.8a, PR #27) and the candidate set it permits: PA-N never forecasts or
+# selects E1-product; PA-R and PA-E carry both (PA-R's forecasts never add replicas: predictive extra 0).
+PA_FAMILIES = {"PA-R": ("seasonalNaive", "statistical"), "PA-N": ("seasonalNaive",),
+               "PA-E": ("seasonalNaive", "statistical")}
+PA_CANDIDATES = {"PA-R": ("seasonal_naive", "statistical"), "PA-N": ("seasonal_naive",),
+                 "PA-E": ("seasonal_naive", "statistical")}
 GATES = ("fallback", "blocked_slow_startup", "quota_guards", "quota_observable", "quota_resumed", "g4_qualified")
 
 # The queries reduce needs (the run-lock must define each; the collector runs exactly the locked definitions).

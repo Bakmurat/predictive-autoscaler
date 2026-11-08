@@ -32,7 +32,7 @@ set +e
 docker run --name "$name" --memory 512m --memory-swap 512m --cpus 1 --network none --read-only \
   --tmpfs /tmp:size=64m --tmpfs /state:size=2g -v "$ROOT/hack:/hack:ro" -e KUBECONFIG=/dev/null \
   --entrypoint python "$IMAGE" /hack/statistical-envelope.py --pas "$PAS" --interval "$INTERVAL" --hours "$HOURS" \
-  --history-days 8 --fit-mode worker --state-dir /state --check --cgroup-peak | tee "$out"
+  --history-days 8 --fit-mode worker --cost-replay --state-dir /state --check --cgroup-peak | tee "$out"
 rc=${PIPESTATUS[0]}
 set -e
 oom="$(docker inspect -f '{{.State.OOMKilled}}' "$name")"

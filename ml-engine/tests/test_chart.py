@@ -693,3 +693,32 @@ def test_switching_profiles_keeps_the_service_and_both_volumes(render):
                                  {"forecaster": {"statistical": {"replicas": 2}}}])
 def test_the_statistical_values_are_validated(render, bad):
     assert render(_merge(STAT, bad), check=False).returncode != 0
+
+
+def test_a_lab_qualification_is_opt_in_read_only_and_statistical_only(render):
+    # C2.8 lab evaluation only: off by default; when set, one read-only file and get on the kube-system Namespace.
+    assert not [r for r in by_kind(render(STAT), "ClusterRole") if r["metadata"]["name"].endswith("cluster-identity")]
+    lab = _merge(STAT, {"forecaster": {"statistical": {"labQualification": {"configMap": "pa-lab", "key": "q.json"}}}})
+    undigested = render(lab, check=False)                              # the evaluation image must be pinned by digest
+    assert undigested.returncode != 0 and "needs images.statisticalForecaster.digest" in undigested.stderr
+    digest = "sha256:" + "d" * 64
+    lab = _merge(lab, {"images": {"statisticalForecaster": {"digest": digest}}})
+    docs = render(lab)
+    assert rules_of(docs, "pa-predictive-autoscaler-forecaster-cluster-identity") == {
+        (("",), ("namespaces",), ("kube-system",), ("get",))}
+    (binding,) = [b for b in by_kind(docs, "ClusterRoleBinding") if b["metadata"]["name"].endswith("cluster-identity")]
+    assert binding["subjects"] == [{"kind": "ServiceAccount", "name": "pa-predictive-autoscaler-forecaster",
+                                    "namespace": NS}]
+    pod = forecaster_of(docs)["spec"]["template"]["spec"]
+    (c,) = pod["containers"]
+    env = {e["name"]: e.get("value") for e in c["env"]}
+    assert env["FORECAST_LAB_QUALIFICATION"] == "/etc/predictive-autoscaler/lab-qualification/lab-qualification.json"
+    assert env["FORECAST_IMAGE_DIGEST"] == digest and c["image"].endswith("@" + digest)
+    mounts = {m["mountPath"]: m.get("readOnly", False) for m in c["volumeMounts"]}
+    assert mounts["/etc/predictive-autoscaler/lab-qualification"] is True
+    vol = next(v for v in pod["volumes"] if v["name"] == "lab-qualification")
+    assert vol["configMap"] == {"name": "pa-lab", "items": [{"key": "q.json", "path": "lab-qualification.json"}]}
+    legacy = render({"forecaster": {"statistical": {"labQualification": {"configMap": "pa-lab"}}}}, check=False)
+    assert legacy.returncode != 0 and "needs forecaster.engine: statistical" in legacy.stderr
+    assert render(_merge(STAT, {"forecaster": {"statistical": {"labQualification": {"configMap": "Bad_Name"}}}}),
+                  check=False).returncode != 0

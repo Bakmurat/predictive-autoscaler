@@ -23,6 +23,10 @@ def block(arm, profile, seed, viol=None, err=0.0, surplus=1.0, pods=6.0, eligibl
     ws = {wid: window_metrics((e - s) * 60, viol.get(wid, 0), err, surplus, pods) for wid, s, e, _ in F.WINDOWS}
     day = window_metrics(1440, sum(w["slo_violation_minutes"] for w in ws.values()), err, surplus, pods)
     b = {"arm": arm, "profile": profile, "seed": seed, "invalid_cause": None, "windows": ws, "day": day,
+         "metric_outage": F.METRIC_OUTAGE_APPLICABILITY[arm] == "required" and "verified" or "not_tested",
+         "families": list(F.PA_FAMILIES[arm]) if arm in F.PA_ARMS else None,
+         "candidates_seen": list(F.PA_CANDIDATES[arm][:1] if arm == "PA-R" else F.PA_CANDIDATES[arm])
+         if arm in F.PA_ARMS else None,
          "validity": {"recorder_coverage": 0.999, "max_transition_gap_s": 10, "dispatch_fraction_min": 0.999,
                       "timestamp_skew_s": 0.2, "reconciled": True},
          "eligible_fraction": eligible if arm in F.CANDIDATE_ARMS else None,
@@ -47,6 +51,7 @@ def study(blocks_fn=None):
           "resources": {"g3_pass": True},
           "prerequisites": {k: True for k in F.PREREQUISITES},
           "artifacts_complete": True, "cleanup_verified": True,
+          "applicability": {"declaration": copy.deepcopy(F.APPLICABILITY), "manifest_sha256": "a" * 64},
           "gates": {a: {"fallback": True, "blocked_slow_startup": True, "quota_guards": True, "quota_observable": True,
                         "quota_resumed": True, "g4_qualified": True} for a in F.CANDIDATE_ARMS}}
     if blocks_fn:
@@ -108,8 +113,9 @@ def test_unmet_prerequisites_are_not_ready():
     st["prerequisites"]["lab_qualification"] = False
     assert S.score(st)["outcome"] == "NOT READY"
     st = study()
-    st["prerequisites"]["cpu_metric_fault"] = False       # no evaluation-scoped CPU-metric outage for H-CPU yet
-    assert S.score(st)["outcome"] == "NOT READY"
+    st["prerequisites"]["rps_metric_fault"] = False       # the request-metric outage stays a hard prerequisite
+    out = S.score(st)
+    assert out["outcome"] == "NOT READY" and all(c["outcome"] == "NOT READY" for c in out["candidates"].values())
     st = study()
     st["prerequisites"]["family_restriction"] = False
     out = S.score(st)
@@ -223,6 +229,16 @@ def test_pa_e_needs_g4_evidence_and_a_qualified_e1():
     (lambda st: st["gates"]["PA-N"].update(fallback="yes"), "gates.PA-N"),
     (lambda st: st["resources"].update(g3_pass=1), "g3_pass"),
     (lambda st: st.update(cleanup_verified=None), "cleanup_verified"),
+    # Section 12: only the frozen declaration; H-CPU never carries an outage result; no caller-supplied waiver.
+    (lambda st: st.pop("applicability"), "applicability"),
+    (lambda st: st["applicability"]["declaration"]["metric_outage"].update({"H-RPS": "not_tested"}), "applicability"),
+    (lambda st: st["applicability"].update(waivers=["rps"]), "applicability"),
+    (lambda st: st["applicability"].update(manifest_sha256="x"), "applicability"),
+    (lambda st: edit_blocks(st, "H-CPU", lambda b: b.update(metric_outage="verified")), "must be not_tested"),
+    (lambda st: edit_blocks(st, "H-CPU", lambda b: b.pop("metric_outage")), "must be not_tested"),
+    (lambda st: edit_blocks(st, "PA-R", lambda b: b.update(metric_outage="not_tested")), "required for PA-R"),
+    (lambda st: edit_blocks(st, "H-RPS", lambda b: b.update(families=["seasonalNaive"])), "no forecast families"),
+    (lambda st: edit_blocks(st, "PA-N", lambda b: b.update(families="seasonalNaive")), "families must be null"),
 ])
 def test_malformed_studies_are_refused_not_scored(change, message):
     st = study()
@@ -240,3 +256,59 @@ def test_the_benefit_family_spans_both_candidates():
     out = S.score(study())
     benefit = [c for a in F.CANDIDATE_ARMS for c in out["candidates"][a]["comparisons"] if c["gate"] == "useful benefit"]
     assert len(benefit) == 8 and {c["holm_family"] for c in benefit} == {8}
+
+
+def test_h_cpu_outage_is_not_tested_and_the_full_day_is_kept():
+    # Section 12: H-CPU is scored with its unperturbed 12:00-14:00 window in every total; the report discloses it;
+    # the eight-test Holm family is unchanged and contains no H-CPU comparison.
+    out = S.score(study())
+    assert out["outcome"] == "PASS" and out["disclosures"] == [F.CPU_OUTAGE_DISCLOSURE]
+    assert out["applicability"]["declaration"]["metric_outage"]["H-CPU"] == "not_tested"
+    comps = [c for a in F.CANDIDATE_ARMS for c in out["candidates"][a]["comparisons"]]
+    assert not any(c["comparator"] == "H-CPU" for c in comps)
+    benefit = [c for c in comps if c["gate"] == "useful benefit"]
+    assert len(benefit) == 8 and {(c["arm"], c["comparator"], c["profile"]) for c in benefit} == {
+        (a, b, p) for a in ("PA-N", "PA-E") for b in ("H-RPS", "PA-R") for p in ("s20", "s90")}
+    assert {c["holm_family"] for c in benefit} == {8}
+    robust = [c for c in comps if c["gate"] == "robustness w12-metric-outage"]
+    assert robust and {c["comparator"] for c in robust} == {"PA-R"}          # outage comparisons: request-metric only
+
+
+@pytest.mark.parametrize("arm, evidence", [("H-RPS", "missing"), ("PA-R", "failed"), ("PA-N", "missing"),
+                                           ("PA-E", "failed")])
+def test_a_missing_request_metric_outage_stays_blocked(arm, evidence):
+    st = study(lambda s: edit_blocks(s, arm, lambda b: b.update(metric_outage=evidence) if b["seed"] == 203 else None))
+    out = S.score(st)
+    assert out["outcome"] == "INCOMPLETE"
+    assert any("request-metric outage" in r for c in out["candidates"].values()
+               for r in c["reasons"].get("INCOMPLETE", []))
+
+
+def test_the_family_field_and_candidate_set_are_verified():
+    st = study(lambda s: edit_blocks(s, "PA-N", lambda b: b.update(families=None) if b["seed"] == 201 else None))
+    assert S.score(st)["outcome"] == "INCOMPLETE"                            # not verified at confirmation
+    st = study(lambda s: edit_blocks(s, "PA-N", lambda b: b.update(candidates_seen=None) if b["seed"] == 201 else None))
+    assert S.score(st)["outcome"] == "INCOMPLETE"
+    st = study(lambda s: edit_blocks(s, "PA-N", lambda b: b.update(candidates_seen=["seasonal_naive", "statistical"])
+                                     if b["seed"] == 202 else None))
+    out = S.score(st)
+    assert out["outcome"] == "FAIL" and any("issued candidates" in r for r in
+                                            out["candidates"]["PA-N"]["reasons"]["FAIL"])
+    st = study(lambda s: edit_blocks(s, "PA-N", lambda b: b.update(families=["seasonalNaive", "statistical"])))
+    out = S.score(st)
+    assert out["outcome"] == "FAIL" and any("spec.prediction.families" in r for r in
+                                            out["candidates"]["PA-N"]["reasons"]["FAIL"])
+
+
+@pytest.mark.parametrize("change, fail", [
+    ({"families": None, "candidates_seen": ["seasonal_naive", "statistical"]}, "issued candidates"),
+    ({"families": ["seasonalNaive", "statistical"], "candidates_seen": None}, "spec.prediction.families"),
+])
+def test_a_known_family_violation_fails_beside_missing_evidence(change, fail):
+    # Codex r1 on #30: each observation is checked on its own; the missing one adds INCOMPLETE, never hides the FAIL.
+    st = study(lambda s: edit_blocks(s, "PA-N", lambda b: b.update(change) if b["seed"] == 201 else None))
+    out = S.score(st)
+    pan = out["candidates"]["PA-N"]
+    assert out["outcome"] == "FAIL" and pan["outcome"] == "FAIL"
+    assert any(fail in r for r in pan["reasons"]["FAIL"])
+    assert any("not verified at confirmation" in r for r in pan["reasons"]["INCOMPLETE"])

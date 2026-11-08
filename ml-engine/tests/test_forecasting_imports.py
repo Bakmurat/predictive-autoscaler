@@ -48,7 +48,8 @@ def modules():
 
 def test_the_package_list_is_not_empty():
     assert {"forecasting.contracts", "forecasting.history", "forecasting.statistical", "forecasting.artifacts",
-            "forecasting.worker", "forecasting.service", "api.statistical"} <= set(modules())
+            "forecasting.worker", "forecasting.service", "forecasting.policy_sim", "forecasting.qualification",
+            "api.statistical"} <= set(modules())
 
 
 @pytest.mark.parametrize("module", modules())

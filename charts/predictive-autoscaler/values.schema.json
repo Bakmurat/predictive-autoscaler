@@ -111,7 +111,16 @@
                 "retain": {"type": "boolean"}
               }
             },
-            "stateQuota": {"type": "string", "pattern": "^[0-9]+(Mi|Gi)$"}
+            "stateQuota": {"type": "string", "pattern": "^[0-9]+(Mi|Gi)$"},
+            "labQualification": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "C2.8 lab evaluation only: a ConfigMap holding a reviewed lab-qualification/v1 file; empty configMap: off.",
+              "properties": {
+                "configMap": {"type": "string", "pattern": "^([a-z0-9]([-.a-z0-9]*[a-z0-9])?)?$", "maxLength": 253},
+                "key": {"type": "string", "pattern": "^[-._a-zA-Z0-9]+$", "maxLength": 253}
+              }
+            }
           }
         },
         "auth": {

@@ -35,7 +35,9 @@ def valid_doc(manifest_path):
                                for s in F.CONFIRMATION_SEEDS}},
         "capacity": {"c0_rps": 40, "c_rps": "35"},
         "cpu_tuning": {"selected_target_percent": 60},
-        "arms": {f"{a}/{p}": {"rendered_sha256": "1" * 64} for a in F.ARMS for p in F.PROFILES},
+        "arms": {f"{a}/{p}": ({"rendered_sha256": "1" * 64, "families": list(F.PA_FAMILIES[a]),
+                               "effective_candidates": list(F.PA_CANDIDATES[a])} if a in F.PA_ARMS
+                              else {"rendered_sha256": "1" * 64}) for a in F.ARMS for p in F.PROFILES},
         "operating_point": {"capacity_ratio": 0.875, "nominal_coverage_bps": 9000, "extra_max_replicas": 2,
                             "extra_max_percent": 50, "pa_headroom_percent": 0},
         "seeds": {"confirmation": list(F.CONFIRMATION_SEEDS), "tuning": list(F.TUNING_SEEDS), "order": 20261106,
@@ -56,6 +58,7 @@ def valid_doc(manifest_path):
         "activation_scope": {"cluster_uid": UID, "namespaces": ["demo"], "target_uids": [UID]},
         "acknowledgments": {"executor": {"name": "claude", "at": "2026-11-19T10:00:00Z"},
                             "reviewer": {"name": "codex", "at": "2026-11-19T11:00:00Z"}},
+        "applicability": {"declaration": copy.deepcopy(F.APPLICABILITY), "manifest_sha256": msha},
     }
 
 
@@ -121,6 +124,18 @@ def test_a_changed_manifest_breaks_verification(setup):
     (lambda d: d["workload"]["plans"].pop("scored/205/c28-h-cpu-s90"), "confirmation plans"),
     (lambda d: d["schedule"]["blocks"].pop("PA-N/s20/203"), "schedule.blocks"),
     (lambda d: d["schedule"]["blocks"].update({"PA-N/s20/203": ["2026-11-22T06:00:00Z"]}), "schedule.blocks"),
+    # Section 12: the exact applicability declaration, bound to this manifest, locked before the first scored run.
+    (lambda d: d.pop("applicability"), "missing applicability"),
+    (lambda d: d["applicability"]["declaration"]["metric_outage"].update({"PA-R": "not_tested"}), "applicability"),
+    (lambda d: d["applicability"]["declaration"]["metric_outage"].update({"H-CPU": "required"}), "applicability"),
+    (lambda d: d["applicability"].update(manifest_sha256="9" * 64), "applicability"),
+    (lambda d: d["applicability"].update(waiver="cpu_metric_fault"), "applicability"),
+    (lambda d: d["acknowledgments"]["reviewer"].update(at="2026-11-20T00:00:00Z"), "predate schedule.start_utc"),
+    # PA-N's real family field and every PA arm's effective candidate set.
+    (lambda d: d["arms"]["PA-N/s20"].update(families=["seasonalNaive", "statistical"]), "arms.PA-N/s20"),
+    (lambda d: d["arms"]["PA-N/s90"].update(effective_candidates=["seasonal_naive", "statistical"]), "arms.PA-N/s90"),
+    (lambda d: d["arms"]["PA-E/s20"].pop("families"), "arms.PA-E/s20"),
+    (lambda d: d["arms"]["H-CPU/s20"].update(families=["seasonalNaive"]), "no forecast families"),
 ])
 def test_incomplete_or_altered_runlocks_are_refused(setup, change, message):
     _, doc, _ = setup
