@@ -8,6 +8,7 @@ evidence by itself. The executor uses it under a locked run-lock and the change 
 |---|---|
 | `fixture/` | The HTTP fixture: one binary in three modes. `server` is the workload: fixed CPU work, a fixed response, a bounded queue, a measured startup delay and `/ready`, `/metrics`. `ingress` counts offered demand per target before the target can reject it, with a 2 s timeout and no retries. `tcpproxy` is the evaluation-owned metrics and forecast routes, with scheduled outages. `Dockerfile` builds a static, non-root image. |
 | `load/c28.js` | The k6 open-loop generator (ramping-arrival-rate, one request per iteration), driven by a plan from `python -m c28 plan`. |
+| `load/c28-calibrate.js` | The k6 script of the S5a capacity calibration (`staging/calibrate.py`): settle and measure scenarios at one constant arrival rate, per-scenario counts and latencies in the pod's termination message. |
 | `harness/c28/` | `render` (fixture, ingress, routes, quota and the five arms for both startup profiles, with an exclusive-writer audit, a sidecar-free audit and the residency budget), `schedule` (programs, k6 plans, fault timetable, the frozen session order), `runlock`, `collect` (hashed evidence bundle), `reduce` (per-window metrics), `score` (paired day-block bootstrap, Holm correction, the section 8 classification), `inject` (the guarded quota fault). `frozen.py` holds every value the manifest freezes. |
 | `params/` | `kind-smoke.json` for the kind smoke. `prodcluster.template.json` lists what the run-lock must resolve; it cannot be rendered until every placeholder is replaced (the calibrated fixture resources and the W/S residency inputs included). |
 | `smoke/kind.sh` | The aspire kind-bed smoke, on its own cluster and kubeconfig only. `--render-only` renders and audits offline; `scripts/verify.sh` runs that mode. |
@@ -117,10 +118,10 @@ placeholder anywhere in the file.
 Two gates read that verdict. `reserve.require_ready_for_experiment` needs the complete experiment parameters on a
 passing reservation: `prepare.py` requires it live in every phase's plan and again in apply's recomputation under the
 shared lock, so a reservation lost between review and apply creates nothing. It is NOT the calibration gate (it needs
-the calibrated values themselves, which would recreate the c0/HPA-target cycle). Capacity calibration on W will need
-`reserve.require_reservation_pass` (the reservation part alone) plus its own separately validated calibration
-configuration and admission checks; calibration is not implemented here. `residency` stays outside the reservation
-stage and mandatory for workload admission (`load_params`, prepare's residency audit).
+the calibrated values themselves, which would recreate the c0/HPA-target cycle). Capacity calibration on W
+(`staging/calibrate.py`, below) needs `reserve.require_reservation_pass` (the reservation part alone) plus its own
+separately validated calibration contract and admission checks. `residency` stays outside the reservation stage and
+mandatory for workload admission (`load_params`, prepare's residency audit).
 
 ## Fixture resources and the residency budget
 
@@ -212,3 +213,71 @@ A restore never touches a writer (mode, min/max bounds), a fault schedule, the q
 the PredictiveAutoscalers stay in Recommend and keep collecting their forecast and decision history, the ingress and
 recorder keep observing every target, and the receipts (`restore-begin`, the per-arm intent/step, `restore-closed`)
 record when and why a target's replica count changed, so the replica series around a restore stays attributable.
+
+## Capacity calibration (S5a): `staging/calibrate.py`
+
+```sh
+calibrate.py --record R [plan]                            # read-only: plan file + digest (objects, bounds, admission)
+calibrate.py --record R apply --plan F --plan-digest D    # create, select work_iterations, search c0, ceiling probe, close
+calibrate.py --record R status | verify                   # journal summary | live contract check (closed: offline recompute)
+calibrate.py --record R request-stop --reason TEXT        # ask the running executor to stop (arrivals first)
+calibrate.py --record R stop-plan | stop --plan F --plan-digest D       # after a crash or refusal
+calibrate.py --record R recover-plan | recover --plan F --plan-digest D
+calibrate.py reduce --bundle evidence/calibrate/<id>      # offline: recompute c0 from the evidence bundle alone
+```
+
+Manifest section 3's capacity calibration at fixed replicas with no autoscaler, never against a confirmation target.
+The record's `calibrate` section names a **calibration contract** (`c28-calibration-contract/v1`), frozen independently of
+the unfinished params (only their reservation stage is read): cluster and node UIDs, namespace, source commit and the
+hash of `load/c28-calibrate.js`, the S1 `images.json` with its fixture and generator digests (taken from the record,
+never hardcoded), the candidate (CPU/memory requests and limits, max_inflight, max_queue, queue timeout, GOMAXPROCS,
+response size, startup delay), the work_iterations selection, ingress and generator resources, the observer (query API,
+the evaluation's 15 s scrape cadence, staleness, scrape kind, the exact queries), the criteria (the manifest's numbers,
+which cannot be changed, the queue rule, the limit bounds, the 1.2 ceiling factor), the search bounds and limits
+(maximum trials, total deadline, seed, timeouts), the admission budget and the rollout guard. Placeholders, non-finite
+numbers and unknown fields are refused. The calibration ID is `c28cal-<10 hex of the contract digest>`: any change to
+the candidate is a new calibration, an ID is used once, and results are never combined across IDs.
+
+Stages, all inside one reviewed plan (it authorizes the algorithm and its limits, never an arbitrary load):
+
+1. **work_iterations selection.** Two fixture variants (`<id>-w0`, `<id>-w1`, one per predeclared value), each alone at
+   one replica: idle CPU over `idle_s`, then one trial at the declared rate below saturation. Cost = (fixture CPU in the
+   window - idle CPU) / successful requests per second. A value qualifies when its trial passes every criterion and its
+   cost is inside the declared range; the cost closest to the target wins, a tie goes to fewer iterations. If neither
+   qualifies the calibration stops NOT READY for a revised candidate. The choice is a receipt before any c0 trial, and
+   both measurements stay in the evidence.
+2. **c0 search** on the selected variant for 1, 2 and 4 replicas: three 15-minute measurements after 5 minutes of
+   settling per plateau, a bracket (factor `bracket_factor`) and bisection to <= 5 %, every choice a receipt. A pass at the
+   arrival ceiling is an unresolved lower bound, a fail at the floor no qualifying rate; any incomplete, limited or
+   stopped trial halts the calibration (never bisected across). c0 = min over counts and repetitions of Q/n, c = 0.875 c0,
+   and every repetition's 4-replica/1-replica linearity must be >= 0.90.
+3. **Ceiling probe**: one trial at 4 replicas at 1.2 x Q4, inside the authorized maximum, whose arrivals must be
+   uncensored (no generator drops beyond the bound, every dispatched arrival received by the ingress, generator and
+   ingress throttling within bounds). Generator drops are never attributed to the fixture.
+
+Every trial goes through a pinned calibration ingress on W (offered demand is counted before the fixture can reject
+it), one k6 Job on S (`load/c28-calibrate.js`: settle and measure scenarios, its summary in the pod's termination
+message, a finite `activeDeadlineSeconds`). Scheduled, dispatched, received and terminal outcomes are reconciled;
+missing outcomes are unknown (never successes), more arrivals at the ingress than the generator dispatched is
+incomplete evidence. **Queue rule:** with the window cut into 60 s bins, END = mean of the last `edge_bins` bins and
+INCREASE = END - mean of the first `edge_bins`, a repetition fails when END / replicas > `max_end_backlog_per_replica`, or
+when INCREASE > `max_increase` AND the least-squares slope > `max_slope_per_min`; bounded growth below those numbers
+passes.
+
+Before and during every trial: the reservation with this calibration's own objects recognized only through their
+journal-recorded UIDs (`reserve.verify(calibration=...)`: the pod's ReplicaSet must exist with exactly the referenced UID
+and belong to one of the journal's Deployment UIDs, or the pod's Job must be one of its Job UIDs; no name prefix), the
+calibration footprint plus every other live pod within 75 % of each node's live allocatable, no rollout in progress for
+any workload with a pod on W or S or for the contract's extra owners (capacity is never measured during platform
+rollouts), no writer of the fixture or ingress, the owned objects at their UIDs, no session or run generator active, no
+injected sidecar, a fresh observer, no stop request and the total deadline. A violation stops the trial: the Job is
+deleted and its pods proven gone before anything else is touched. Mutations hold the shared evaluation lock with
+intents and outcomes; an unknown outcome or an unproven cleanup keeps the lock until `recover`. An interrupted
+measurement is recorded as interrupted and never resumed.
+
+The evidence bundle (`evidence/calibrate/<id>/`) holds the contract, the rendered objects, per trial the Job, pod
+snapshots with their image identities, the raw observer responses and the derived result, then the manifest of hashes,
+the certificate (READY or NOT READY with every reason, curves with CPU and throttling, every unsuccessful trial) and the
+hash-chained journal. `reduce` recomputes everything from that bundle and refuses any difference. The certificate says
+what it does not cover: the CPU HPA target, the startup profiles, the twelve-replica layout and single-pod bursts are not
+qualified by it, and no prospective history or confirmation evidence starts during calibration.

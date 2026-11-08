@@ -20,8 +20,8 @@ legacy_allowlist names the legacy API group. This module only adds what part 2 n
     across HPA, KEDA (an HPA collapses into its ScaledObject only when the live ScaledObject's UID matches) and BOTH
     PredictiveAutoscaler API groups, with optional APIs skipped only when discovery shows them absent.
   * Durable intents on common_records' protocol: mutating() holds the ONE shared lock of the evaluation scope
-    (exclusive_lock(rec, "evaluation") in the record's lock_dir) for reserve, prepare and session; every create,
-    replace and delete goes through mutation_step (intent-<n> with the validated pre-state BEFORE the call, step-<n>
+    (exclusive_lock(rec, "evaluation") in the record's lock_dir) for reserve, prepare, session and calibrate; every
+    create, replace and delete goes through mutation_step (intent-<n> with the validated pre-state BEFORE the call, step-<n>
     after); an unknown outcome keeps the lock; recover() takes recovery_guard (owner proven terminated), writes
     reconciled-<n> for what it can decide from the live objects, and releases the stale lock only when nothing stays
     unresolved. What a helper owns is derived from this journal.
@@ -142,7 +142,7 @@ def load_record(path_: str, sections: Iterable[str] = ()) -> Record:
 LOCK_SCOPE = "evaluation"                 # ONE lock (common_records.exclusive_lock) for every part-2 helper's mutations
 INTENT_ANNOTATION = "c28.devkuban.com/intent"
 DEFINITIVE = (400, 401, 403, 404, 409, 422, 429)   # the API refused: nothing was applied
-PART2_HELPERS = ("reserve", "prepare", "session")
+PART2_HELPERS = ("reserve", "prepare", "session", "calibrate")   # journals under the shared evaluation lock
 
 
 def lock_file(record: "Record") -> str:
