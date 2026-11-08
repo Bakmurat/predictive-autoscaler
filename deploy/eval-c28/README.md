@@ -259,7 +259,7 @@ Stages, all inside one reviewed plan (it authorizes the algorithm and its limits
 Every trial goes through a pinned calibration ingress on W (offered demand is counted before the fixture can reject
 it), one k6 Job on S (`load/c28-calibrate.js`: settle and measure scenarios, its summary in the pod's termination
 message, a finite `activeDeadlineSeconds`). Scheduled, dispatched, received and terminal outcomes are reconciled;
-missing outcomes are unknown (never successes), more arrivals at the ingress than the generator dispatched is
+missing outcomes are unknown (never successes), any dropped arrival in either scenario is a limit, more arrivals at the ingress than the generator dispatched is
 incomplete evidence, and the dispatch reconciliation never hides a missing dispatch: k6's dropped + dispatched must be
 the scheduled count or k6's one boundary iteration more (zero dropped arrivals is the criterion; an absent
 `dropped_iterations` counts as zero only when every scheduled arrival was dispatched). The observer window is the
@@ -273,8 +273,9 @@ when INCREASE > `max_increase` AND the least-squares slope > `max_slope_per_min`
 passes.
 
 Before and during every trial, and once more before a completed trial is accepted: the measured configuration equal
-to the reviewed rendering (owned objects, the trial's Job, every admitted pod's containers, environment and
-resources; only the controlled replica count may differ), the observer queries proven to select exactly the live pods
+to the reviewed rendering, compared strictly (owned objects, the trial's Job, every admitted pod: every container and pod
+field, a field the rendering omits must be absent unless it is a listed API default, and admission may add only the
+not-ready/unreachable NoExecute 300 s tolerations; only the controlled replica count may differ), the observer queries proven to select exactly the live pods
 with fresh data, the interference stop, the reservation with this calibration's own objects recognized only through their
 journal-recorded UIDs (`reserve.verify(calibration=...)`: the pod's ReplicaSet must exist with exactly the referenced UID
 and belong to one of the journal's Deployment UIDs, or the pod's Job must be one of its Job UIDs; no name prefix), the

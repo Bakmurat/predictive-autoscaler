@@ -953,3 +953,104 @@ def test_k6_boundary_iteration_is_accepted_but_never_a_missing_dispatch(cal):
         assert K.evaluate_trial(ctx.con, r)["verdict"] == verdict, extra
     assert K.offered_ok(300, 300) and K.offered_ok(300, 301) and not K.offered_ok(300, 299) \
         and not K.offered_ok(300, 302)
+
+
+# --- Codex re-review of ef8436b ------------------------------------------------------------------------------------
+
+def _fixture_pod_and_template(ctx, api):
+    tmpl = K.render_fixture(ctx.con, ctx.cal, ctx.params, 0)[0]["spec"]["template"]
+    pod = {"metadata": {"name": "p", "labels": {**tmpl["metadata"]["labels"], "pod-template-hash": "abc"},
+                        "annotations": dict(tmpl["metadata"]["annotations"])},
+           "spec": CW.World._admit({**copy.deepcopy(tmpl["spec"]), "nodeName": "worker-w"})}
+    return tmpl, pod
+
+
+def test_r1_unrendered_container_fields_are_refused(cal, api):
+    """Codex repro: an added container command returned no problems."""
+    ctx = cal()
+    tmpl, pod = _fixture_pod_and_template(ctx, api)
+    assert K.pod_problems("p", tmpl, pod) == []
+    for path, value in ((("containers", 0, "command"), ["/bin/sh", "-c", "sleep 1; exec /fixture"]),
+                        (("containers", 0, "workingDir"), "/tmp"),
+                        (("containers", 0, "envFrom"), [{"configMapRef": {"name": "x"}}]),
+                        (("containers", 0, "lifecycle"), {"preStop": {"exec": {"command": ["sleep", "5"]}}}),
+                        (("containers", 0, "volumeMounts"), [{"name": "v", "mountPath": "/v"}]),
+                        (("containers", 0, "securityContext", "privileged"), True),
+                        (("containers", 0, "readinessProbe", "initialDelaySeconds"), 30),
+                        (("containers", 0, "imagePullPolicy"), "Always"),
+                        (("initContainers",), [{"name": "i", "image": "x"}]),
+                        (("hostNetwork",), True), (("priorityClassName",), "high")):
+        bad = copy.deepcopy(pod)
+        cur = bad["spec"]
+        for k in path[:-1]:
+            cur = cur[k]
+        cur[path[-1]] = value
+        assert K.pod_problems("p", tmpl, bad), path
+    extra = copy.deepcopy(pod)
+    extra["metadata"]["annotations"]["prometheus.io/path"] = "/other"
+    assert K.pod_problems("p", tmpl, extra)
+    # workload objects too: an unrendered field on the Deployment's container is refused before the first scale
+    dep = K.render_fixture(ctx.con, ctx.cal, ctx.params, 0)[0]
+    live = copy.deepcopy(dep)
+    live["spec"]["template"]["spec"]["containers"][0]["command"] = ["/bin/sh"]
+    assert K.object_problems("Deployment", dep, live)
+    live = copy.deepcopy(dep)
+    live["spec"]["progressDeadlineSeconds"] = 600
+    live["spec"]["template"]["spec"]["dnsPolicy"] = "ClusterFirst"
+    assert K.object_problems("Deployment", dep, live) == []                # API defaults only
+
+
+def test_r1_command_added_to_a_running_pod_stops_the_trial(cal, api):
+    ctx = cal()
+
+    def tamper(world, api_):
+        if any(k == "jobs" and n.endswith("t003") for (k, _, n) in api_.objects) and not world.__dict__.get("t"):
+            pod = next(o for (k, _, n), o in api_.objects.items() if k == "pods" and
+                       n.startswith(ctx.nm["variants"][0] + "-"))
+            pod["spec"]["containers"][0]["command"] = ["/bin/sh", "-c", "exec /fixture --slow"]
+            world.t = True
+    ctx.world.hooks.append(tamper)
+    out = run(ctx)
+    stopped = [e["data"] for e in ctx.entries() if e["event"] == "trial-stopped"]
+    assert out["verdict"] == "NOT READY" and "command" in stopped[0]["reason"]
+
+
+def test_r2_admission_default_tolerations_only(cal, api):
+    """Codex repro: the standard not-ready/unreachable NoExecute tolerations produced a refusal."""
+    ctx = cal()
+    tmpl, pod = _fixture_pod_and_template(ctx, api)
+    assert [t["key"] for t in pod["spec"]["tolerations"]][-2:] == ["node.kubernetes.io/not-ready",
+                                                                    "node.kubernetes.io/unreachable"]
+    assert K.pod_problems("p", tmpl, pod) == []
+    cases = [lambda t: t[-1].update(tolerationSeconds=600),                    # not the default
+             lambda t: t.append({"operator": "Exists"}),                         # a broad toleration
+             lambda t: t[0].update(value="someone-else"),                        # the reservation toleration changed
+             lambda t: t.pop(0),                                                 # the reservation toleration gone
+             lambda t: t.append(dict(t[-1]))]                                   # a default added twice
+    for mutate in cases:
+        bad = copy.deepcopy(pod)
+        mutate(bad["spec"]["tolerations"])
+        assert K.pod_problems("p", tmpl, bad), mutate
+    dep = K.render_fixture(ctx.con, ctx.cal, ctx.params, 0)[0]
+    live = copy.deepcopy(dep)
+    live["spec"]["template"]["spec"]["tolerations"] += list(K.ADMISSION_TOLERATIONS)
+    assert K.object_problems("Deployment", dep, live) == []
+
+
+def test_r3_a_settling_drop_is_censored(cal):
+    """Codex repro: settling 5,400 scheduled, 5,399 dispatched, 1 dropped returned PASS/uncensored."""
+    ctx = cal()
+    run(ctx)
+    raw = _raw(ctx, "t003")
+    t, sm = _summary(raw)
+    st = sm["scenarios"]["settle"]
+    st["iterations"]["count"] -= 1
+    st["http_reqs"]["count"] -= 1
+    st["http_req_failed"]["fails"] -= 1
+    st["dropped_iterations"] = {"count": 1, "rate": 1 / 300}
+    t["message"] = json.dumps(sm)
+    for side in ("requests", "responses"):
+        for v in raw["observations"]["ingress_after"][side]["response"]["data"]["result"][0]["values"]:
+            v[1] = str(float(v[1]) - 1)
+    r = K.evaluate_trial(ctx.con, raw)
+    assert r["verdict"] == "LIMIT" and r["delivery"] == "censored" and any(w.startswith("settle:") for w in r["limits"])

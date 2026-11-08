@@ -20,7 +20,11 @@ checks what the offline tests can only simulate:
      propagation) loses its pods within the bound; a Job whose activeDeadlineSeconds expires is Failed
      (DeadlineExceeded) and its pod gone, so a dead executor cannot leave traffic; the calibration objects are deleted
      and every labelled pod is proven gone;
-  7. image identity: every fixture/ingress/k6 container reports the reviewed digest in its imageID.
+  7. image identity: every fixture/ingress/k6 container reports the reviewed digest in its imageID;
+  8. the real admission gate: calibrate.pod_problems / object_problems find NO difference between the rendered and the
+     ADMITTED fixture, ingress and k6 pods and their Deployments, Services, ConfigMap and Job (the API server's
+     defaults and the DefaultTolerationSeconds not-ready/unreachable tolerations included, which must actually be
+     present), while copies with an added command or a changed default toleration are refused.
 
   calibrate_kind.py --kubeconfig K --context C --images images.json --workload W --support S --out report.json
 """
@@ -149,6 +153,7 @@ class Smoke:
                 p for p in self.pods() if any(r.get("uid") == uid for r in p["metadata"].get("ownerReferences") or [])],
                 120)
             return {"job": name, "uid": uid, "pods_gone_after_s": round(time.time() - t0, 1)}
+        job_live = self.kj("get", "job", "-n", NS, name)
         final = self.wait("the Job finishes", lambda: (lambda j: j if any(
             c.get("type") in ("Complete", "Failed") and c.get("status") == "True"
             for c in (j.get("status") or {}).get("conditions") or []) else None)(
@@ -156,7 +161,8 @@ class Smoke:
         pod = next((p for p in self.pods(f"job-name={name}")), None)
         time.sleep(K.REQUEST_TIMEOUT_S + 2)
         after = self.ingress_counts(target)
-        return {"job": name, "uid": uid, "final": final, "pod": pod, "before": before, "after": after, "meta": meta}
+        return {"job": name, "uid": uid, "final": final, "pod": pod, "before": before, "after": after, "meta": meta,
+                "job_rendered": job, "job_live": job_live}
 
     # --- the run ---------------------------------------------------------------------------------------------------
     def run(self):
@@ -183,9 +189,11 @@ class Smoke:
                     self.a.workload and not [c for c in p["spec"]["containers"] if c["name"].startswith("istio")],
                     {"pod": p["metadata"]["name"], "imageID": cs["imageID"], "node": p["spec"]["nodeName"]})
 
+        self.check_admission(objs, variant)
         # trial A: a sustainable rate, zero drops
         a = self.trial(1, variant, 300)
         self.check_summary("A", a, images, expect_drops=False)
+        self.check_job_admission(a)
         # trial B: starved VUs, drops
         b = self.trial(2, variant, 3000, vus=(1, 1))
         self.check_summary("B", b, images, expect_drops=True)
@@ -211,6 +219,43 @@ class Smoke:
             self.k("delete", o["kind"].lower(), "-n", NS, o["metadata"]["name"], "--wait=false")
         self.wait("calibration pods gone", lambda: not self.pods(f"{K.CAL_LABEL}={self.cal}"), 180)
         self.ok("6-cleanup", True, {"seconds": round(time.time() - t0, 1)})
+
+    def check_admission(self, objs, variant):
+        """The rendered objects and pod templates against what the API server actually admitted."""
+        rendered = {(o["kind"], o["metadata"]["name"]): o for o in objs}
+        for (kind, name), want in sorted(rendered.items()):
+            live = self.kj("get", kind.lower(), "-n", NS, name)
+            ignore = ("/spec/replicas",) if kind == "Deployment" and name in self.nm["variants"] else ()
+            diff = K.object_problems(kind, want, live, ignore)
+            self.ok("8-admitted-object-equals-rendering", diff == [], {"object": f"{kind}/{name}", "diff": diff[:5]})
+        for role, dep in ((variant, variant), ("ingress", self.nm["ingress"])):
+            tmpl = rendered[("Deployment", dep)]["spec"]["template"]
+            for pod in self.pods(f"{K.CAL_LABEL}={self.cal}"):
+                if not pod["metadata"]["name"].startswith(dep + "-") or \
+                        (dep == variant and pod["metadata"]["name"].startswith(self.nm["ingress"])):
+                    continue
+                self.pod_gate(pod["metadata"]["name"], tmpl, pod)
+
+    def pod_gate(self, name, tmpl, pod):
+        probs = K.pod_problems(name, tmpl, pod)
+        tols = pod["spec"].get("tolerations") or []
+        defaults_present = all(d in tols for d in K.ADMISSION_TOLERATIONS)
+        self.ok("8-admitted-pod-equals-template", probs == [] and defaults_present,
+                {"pod": name, "problems": probs[:3], "admission_default_tolerations_present": defaults_present,
+                 "tolerations": tols})
+        cmd = copy.deepcopy(pod)
+        cmd["spec"]["containers"][0]["command"] = ["/bin/sh", "-c", "exec true"]
+        tol = copy.deepcopy(pod)
+        for t in tol["spec"].get("tolerations") or []:
+            if t.get("key") == "node.kubernetes.io/unreachable":
+                t["tolerationSeconds"] = 600
+        self.ok("8-gate-refuses-tampered-copies", bool(K.pod_problems(name, tmpl, cmd)) and
+                bool(K.pod_problems(name, tmpl, tol)), {"pod": name})
+
+    def check_job_admission(self, t):
+        diff = K.object_problems("Job", t["job_rendered"], t["job_live"])
+        self.ok("8-admitted-job-equals-rendering", diff == [], {"job": t["job"], "diff": diff[:5]})
+        self.pod_gate(t["pod"]["metadata"]["name"], t["job_rendered"]["spec"]["template"], t["pod"])
 
     def check_summary(self, label, t, images, expect_drops):
         pod = t["pod"]

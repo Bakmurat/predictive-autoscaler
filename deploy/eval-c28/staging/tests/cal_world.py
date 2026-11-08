@@ -161,8 +161,10 @@ class World:
                     old = pod["metadata"]["name"]
                     pod["metadata"]["name"] = f"{dep['metadata']['name']}-7d9f8c6b5-{old[-5:]}"
                     renamed.append((old, pod))
-                    pod["metadata"]["labels"] = dict(tmpl["metadata"]["labels"])
+                    pod["metadata"]["labels"] = {**tmpl["metadata"]["labels"], "pod-template-hash": "7d9f8c6b5"}
+                    pod["metadata"]["annotations"] = dict(tmpl["metadata"].get("annotations") or {})
                     pod["spec"] = {**json.loads(json.dumps(tmpl["spec"])), "nodeName": "worker-w"}
+                    self._admit(pod["spec"])
                     pod["status"] = {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}],
                                      "containerStatuses": [{"name": tmpl["spec"]["containers"][0]["name"],
                                                             "imageID": FIXTURE, "restartCount": 0,
@@ -183,9 +185,11 @@ class World:
             if not pods and not job.get("status", {}).get("conditions"):
                 tmpl = job["spec"]["template"]
                 api.add("pods", {"kind": "Pod", "metadata": {
-                    "name": f"{name}-abcde", "namespace": ns, "labels": dict(tmpl["metadata"]["labels"]),
+                    "name": f"{name}-abcde", "namespace": ns,
+                    "labels": {**tmpl["metadata"]["labels"], "batch.kubernetes.io/job-name": name, "job-name": name},
+                    "annotations": dict(tmpl["metadata"].get("annotations") or {}),
                     "ownerReferences": [{"kind": "Job", "name": name, "uid": uid, "controller": True}]},
-                    "spec": {**json.loads(json.dumps(tmpl["spec"])), "nodeName": "worker-s"},
+                    "spec": self._admit({**json.loads(json.dumps(tmpl["spec"])), "nodeName": "worker-s"}),
                     "status": {"phase": "Running", "containerStatuses": [
                         {"name": "k6", "imageID": "docker.io/" + GENERATOR, "restartCount": 0,
                          "state": {"running": {"startedAt": K._ts(now)}}}]}})
@@ -199,6 +203,22 @@ class World:
             if now < started + self.init_delay + settle + measure + 5:
                 continue
             self._complete(api, job, pod, env, started)
+
+    @staticmethod
+    def _admit(spec):
+        """What the API server's defaulting and DefaultTolerationSeconds admission add to an admitted pod."""
+        spec.setdefault("dnsPolicy", "ClusterFirst")
+        spec.setdefault("schedulerName", "default-scheduler")
+        spec.setdefault("serviceAccountName", "default")
+        spec.setdefault("enableServiceLinks", True)
+        for c in spec.get("containers", []):
+            c.setdefault("terminationMessagePath", "/dev/termination-log")
+            c.setdefault("terminationMessagePolicy", "File")
+            c.setdefault("imagePullPolicy", "IfNotPresent")
+        spec["tolerations"] = list(spec.get("tolerations") or []) + [
+            {"key": k, "operator": "Exists", "effect": "NoExecute", "tolerationSeconds": 300}
+            for k in ("node.kubernetes.io/not-ready", "node.kubernetes.io/unreachable")]
+        return spec
 
     def _replicas_and_wi(self, api, target):
         dep = api.objects[("deployments", "demo", target)]

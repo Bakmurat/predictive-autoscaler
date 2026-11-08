@@ -153,6 +153,7 @@ trust or qualification evidence.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -1306,9 +1307,11 @@ def evaluate_trial(con: Dict, raw: Dict) -> Dict:
             failures.append(f"failure fraction {measured:.6f} > {cr['max_failure_fraction']}")
         elif bound > cr["max_failure_fraction"]:
             incomplete.append(f"{unknown:g} outcomes are unknown: the failure fraction is only bounded by {bound:.6f}")
-        if m["dropped"] > cr["max_dropped_arrivals"]:
-            limits.append(f"the generator dropped {m['dropped']:g} scheduled arrivals (zero-drop criterion: a "
-                          "generator limit; drops are never attributed to the fixture)")
+    for s in ("settle", "measure"):                  # the zero-drop criterion covers BOTH scenarios
+        d = counts[s]["dropped"]
+        if d is not None and d > cr["max_dropped_arrivals"]:
+            limits.append(f"{s}: the generator dropped {d:g} scheduled arrivals (zero-drop criterion: a generator "
+                          "limit; drops are never attributed to the fixture)")
     # observer series over the window (the evaluation's 15 s scrape cadence)
     obs_stats = {}
     named = [(name, window) for name in WINDOW_QUERIES]
@@ -1898,30 +1901,142 @@ def _rendered(ctx: Context) -> Dict[Tuple[str, str], Dict]:
     return ctx._rendered_cache
 
 
-def _template_problems(where: str, tmpl: Dict, pod: Dict) -> List[str]:
-    """An admitted pod against its reviewed template: the same containers (names, in order), each rendered field
-    (image, env, args, resources, probes, security) present and equal, and the template's pod labels, tolerations,
-    affinity and security context; fields the API server only adds are not differences."""
-    ts, ps = tmpl.get("spec") or {}, pod.get("spec") or {}
-    tc, pc = ts.get("containers") or [], ps.get("containers") or []
-    if [c.get("name") for c in tc] != [c.get("name") for c in pc] or ps.get("initContainers"):
-        return [f"{where}: containers {[c.get('name') for c in pc]} are not the reviewed {[c.get('name') for c in tc]}"]
-    diff = []
-    for a, b in zip(tc, pc):
-        diff += X.subset_diff(a, b, f"/containers/{a.get('name')}")
-    for k in ("tolerations", "affinity", "securityContext", "automountServiceAccountToken", "restartPolicy"):
-        if k in ts:
-            diff += X.subset_diff(ts[k], ps.get(k), f"/{k}")
-    diff += X.subset_diff((tmpl.get("metadata") or {}).get("labels") or {},
-                          (pod.get("metadata") or {}).get("labels") or {}, "/labels")
+# --- strict configuration comparison -----------------------------------------------------------------------------
+# A live object or admitted pod must equal its reviewed rendering on EVERY behavior-bearing field: a rendered field must
+# be present and equal, and a field the rendering does not set must be ABSENT, unless it is one of the narrowly listed
+# values the API server or its standard admission plugins fill in (ANY: a value only the system assigns, e.g. the
+# scheduled node, a Service's cluster IP, a Job's generated selector). Paths are relative, list indices written "*".
+ANY = object()
+_MISSING = object()
+_PROBE = {"timeoutSeconds": 1, "periodSeconds": 10, "successThreshold": 1, "failureThreshold": 3,
+          "httpGet/scheme": "HTTP"}
+POD_DEFAULTS = {
+    "dnsPolicy": "ClusterFirst", "schedulerName": "default-scheduler", "terminationGracePeriodSeconds": 30,
+    "restartPolicy": "Always", "serviceAccountName": "default", "serviceAccount": "default",
+    "enableServiceLinks": True, "preemptionPolicy": "PreemptLowerPriority", "priority": 0, "nodeName": ANY,
+    "containers/*/terminationMessagePath": "/dev/termination-log", "containers/*/terminationMessagePolicy": "File",
+    "containers/*/imagePullPolicy": "IfNotPresent", "containers/*/ports/*/protocol": "TCP",
+    "volumes/*/configMap/defaultMode": 420,
+    **{f"containers/*/{probe}/{k}": v for probe in ("readinessProbe", "livenessProbe", "startupProbe")
+       for k, v in _PROBE.items()},
+}
+OBJECT_DEFAULTS = {
+    "Deployment": {"progressDeadlineSeconds": 600, "revisionHistoryLimit": 10,
+                   "template/metadata/creationTimestamp": None,
+                   **{f"template/spec/{k}": v for k, v in POD_DEFAULTS.items() if k != "nodeName"}},
+    "Job": {"completions": 1, "parallelism": 1, "completionMode": "NonIndexed", "suspend": False,
+            "podReplacementPolicy": "TerminatingOrFailed", "manualSelector": False, "selector": ANY,
+            "template/metadata/creationTimestamp": None, "template/metadata/labels/controller-uid": ANY,
+            "template/metadata/labels/job-name": ANY,
+            "template/metadata/labels/batch.kubernetes.io/controller-uid": ANY,
+            "template/metadata/labels/batch.kubernetes.io/job-name": ANY,
+            **{f"template/spec/{k}": v for k, v in POD_DEFAULTS.items() if k not in ("nodeName", "restartPolicy")}},
+    "Service": {"type": "ClusterIP", "sessionAffinity": "None", "clusterIP": ANY, "clusterIPs": ANY,
+                "ipFamilies": ANY, "ipFamilyPolicy": "SingleStack", "internalTrafficPolicy": "Cluster",
+                "ports/*/protocol": "TCP"},
+}
+# Labels the controllers add to the pods they create (never behaviour of the workload itself).
+POD_LABEL_DEFAULTS = ("pod-template-hash", "controller-uid", "job-name", "batch.kubernetes.io/controller-uid",
+                      "batch.kubernetes.io/job-name")
+# The only tolerations admission may add (DefaultTolerationSeconds): anything else, the reservation's included, must be
+# exactly as rendered.
+ADMISSION_TOLERATIONS = tuple({"key": k, "operator": "Exists", "effect": "NoExecute", "tolerationSeconds": 300}
+                              for k in ("node.kubernetes.io/not-ready", "node.kubernetes.io/unreachable"))
+
+
+def _pattern(path: str) -> str:
+    return "/".join("*" if p.isdigit() else p for p in path.strip("/").split("/"))
+
+
+def _scalar_eq(a, b) -> bool:
+    return a == b or (isinstance(a, (int, float)) and not isinstance(a, bool) and str(a) == str(b))
+
+
+def strict_diff(want, live, path: str, defaults: Dict, ignore: Tuple = ()) -> List[str]:
+    """Paths where `live` differs from `want`: a rendered value missing or different, a list of another length, or a
+    field the rendering omits that is not an allowed default (with its allowed value)."""
+    if path in ignore:
+        return []
+    if isinstance(want, dict):
+        if not isinstance(live, dict):
+            return [path or "/"]
+        out = []
+        for k in sorted(set(want) | set(live), key=str):
+            p = f"{path}/{k}"
+            if k in want:
+                out += strict_diff(want[k], live.get(k, _MISSING), p, defaults, ignore)
+            elif p not in ignore:
+                allowed = defaults.get(_pattern(p), _MISSING)
+                if allowed is _MISSING or (allowed is not ANY and not _scalar_eq(allowed, live[k])):
+                    out.append(f"{p} (not in the reviewed rendering)")
+        return out
+    if isinstance(want, list):
+        if not isinstance(live, list) or len(live) != len(want):
+            return [path]
+        out = []
+        for i, (a, b) in enumerate(zip(want, live)):
+            out += strict_diff(a, b, f"{path}/{i}", defaults, ignore)
+        return out
+    return [] if _scalar_eq(want, live) else [path]
+
+
+def _pod_spec_diff(want: Dict, live: Dict) -> List[str]:
+    """A pod spec against its rendering: the admission-added default tolerations removed (each once, exactly), every
+    other toleration exactly as rendered, then strict_diff under POD_DEFAULTS."""
+    live = copy.deepcopy(live)
+    tol = list(live.get("tolerations") or [])
+    for d in ADMISSION_TOLERATIONS:
+        if d in tol and d not in (want.get("tolerations") or []):
+            tol.remove(d)
+    if tol or "tolerations" in want:
+        live["tolerations"] = tol
+    else:
+        live.pop("tolerations", None)
+    return strict_diff(want, live, "", POD_DEFAULTS)
+
+
+def pod_problems(where: str, tmpl: Dict, pod: Dict) -> List[str]:
+    """An admitted pod against its reviewed pod template: the spec strictly (every container field: command, args,
+    env, envFrom, workingDir, image, resources, probes, ports, volumeMounts, lifecycle, securityContext; pod fields
+    such as initContainers, volumes, hostNetwork, priorityClassName; absent in the rendering means absent), the
+    template's labels (plus only the controllers' own pod labels) and annotations exactly."""
+    diff = _pod_spec_diff(tmpl.get("spec") or {}, pod.get("spec") or {})
+    tl, pl = (tmpl.get("metadata") or {}).get("labels") or {}, (pod.get("metadata") or {}).get("labels") or {}
+    diff += [f"/labels/{k}" for k in sorted(set(tl) | set(pl))
+             if (k in tl and pl.get(k) != tl[k]) or (k not in tl and k not in POD_LABEL_DEFAULTS)]
+    ta, pa = (tmpl.get("metadata") or {}).get("annotations") or {}, (pod.get("metadata") or {}).get("annotations") or {}
+    diff += [f"/annotations/{k}" for k in sorted(set(ta) | set(pa)) if pa.get(k) != ta.get(k)]
     return [f"{where} differs from its reviewed template at {diff[:5]}"] if diff else []
 
 
+def object_problems(kind: str, want: Dict, live: Dict, ignore: Tuple = ()) -> List[str]:
+    """A live workload object against its rendering: labels (rendered ones equal), spec (strictly, OBJECT_DEFAULTS;
+    a pod template's tolerations with the admission defaults removed) and a ConfigMap's data exactly."""
+    diff = [f"/metadata/labels/{k}" for k, v in sorted((want["metadata"].get("labels") or {}).items())
+            if (live["metadata"].get("labels") or {}).get(k) != v]
+    if "spec" in want:
+        ls = copy.deepcopy(live.get("spec") or {})
+        tmpl = (ls.get("template") or {}).get("spec")
+        if isinstance(tmpl, dict):
+            wt = ((want["spec"].get("template") or {}).get("spec") or {}).get("tolerations") or []
+            tol = [t for t in tmpl.get("tolerations") or [] if not (t in ADMISSION_TOLERATIONS and t not in wt)]
+            if tol or "tolerations" in ((want["spec"].get("template") or {}).get("spec") or {}):
+                tmpl["tolerations"] = tol
+            else:
+                tmpl.pop("tolerations", None)
+        defaults = {f"spec/{k}": v for k, v in OBJECT_DEFAULTS.get(kind, {}).items()}
+        diff += strict_diff(want["spec"], ls, "/spec", defaults, ignore)
+    if "data" in want:
+        diff += [] if live.get("data") == want["data"] and not live.get("binaryData") else ["/data"]
+    return diff
+
+
 def config_problems(ctx: Context) -> List[str]:
-    """The measured configuration is the reviewed one, throughout: every owned live object equals its rendering on
-    every rendered field (a fixture variant's spec.replicas excepted: the one controlled field), every owned Job equals
-    the Job its trial recorded, and every admitted pod equals its reviewed pod template (resources, environment,
-    containers, routing labels)."""
+    """The measured configuration is the reviewed one, throughout, compared STRICTLY (object_problems, pod_problems):
+    every owned live object equals its rendering (a fixture variant's spec.replicas excepted: the one controlled
+    field), every owned Job equals the Job its trial recorded, every admitted pod equals its reviewed pod template; a
+    field the rendering omits must be absent unless it is a listed API default, and the only tolerations admission may
+    add are the not-ready/unreachable NoExecute 300 s defaults (the reservation toleration stays exact)."""
     out, rendered = [], _rendered(ctx)
     own = ctx.own()
     for o in own:
@@ -1940,10 +2055,8 @@ def config_problems(ctx: Context) -> List[str]:
         if want is None:
             out.append(f"owned {o['kind']}/{o['name']} has no reviewed rendering")
             continue
-        body = {"metadata": {"labels": want["metadata"].get("labels", {})}}
-        body.update({k: want[k] for k in ("spec", "data") if k in want})
-        ignore = ["/spec/replicas"] if o["kind"] == "Deployment" and o["role"] in ("w0", "w1") else []
-        diff = X.subset_diff(body, live, ignore=ignore)
+        ignore = ("/spec/replicas",) if o["kind"] == "Deployment" and o["role"] in ("w0", "w1") else ()
+        diff = object_problems(o["kind"], want, live, ignore)
         if diff:
             out.append(f"owned {o['kind']}/{o['name']} differs from its reviewed rendering at {diff[:5]}")
     templates = {}
@@ -1961,7 +2074,7 @@ def config_problems(ctx: Context) -> List[str]:
             else:
                 tmpl = templates.get(role)
             if tmpl:
-                out += _template_problems(f"pod {pod['metadata']['name']}", tmpl, pod)
+                out += pod_problems(f"pod {pod['metadata']['name']}", tmpl, pod)
     return out
 
 
