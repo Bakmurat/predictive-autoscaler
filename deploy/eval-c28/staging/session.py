@@ -40,7 +40,9 @@ or no attributed acknowledgment within it, stops the session and classifies the 
 The record's "session" section:
   {"id": "s-0001", "phase": "preparation"|"confirmation", "arm": "PA-N", "profile": "s20", "seed": 201,
    "plan": "<k6 plan file>", "block_start": "...Z" (confirmation), "runlock": "<file>" (confirmation),
-   "manifest_root": "<dir>", "generator_image": "<repo>@sha256:...", "generator_resources": {...},
+   "manifest_root": "<dir>", "generator_image": "<repo>@sha256:...", "generator_k6_version": "0.57.0",
+   "generator_output": {"remote_write_url": "<reviewed remote-write endpoint>", "push_interval_s": 5},
+   "generator_resources": {...},
    "generator_env": {non-secret k6 settings}, "arrival_budget": {"max_rps": N, "max_total_arrivals": N},
    "deadline_utc": "...", "itt_fallback": false, "quiesce_timeout_s": 300,
    "arrival_ack": {"ingress": {"metric": "c28_ingress_requests_total", "labels": {<attribution labels>}},
@@ -72,6 +74,8 @@ PRE_ROLL_S = 600
 _DIGEST_IMAGE = re.compile(r"^[a-z0-9][a-z0-9./:-]*@sha256:[0-9a-f]{64}$")
 _TS = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 WRITER_KIND = {"H-CPU": "HorizontalPodAutoscaler", "H-RPS": "ScaledObject"}
+K6_MIN_RW = (0, 42)                # first k6 release with the built-in experimental-prometheus-rw output
+K6_OUTPUT = "experimental-prometheus-rw"
 
 
 def _utc(text: str) -> int:
@@ -105,6 +109,14 @@ class Context:
             raise X.StagingError("session.seed must be an integer")
         if not _DIGEST_IMAGE.match(str(s.get("generator_image", ""))):
             raise X.StagingError("session.generator_image must be pinned by digest")
+        out = s.get("generator_output") or {}
+        if not re.match(r"^https?://[^@/\s]+/\S*$", str(out.get("remote_write_url", ""))):
+            raise X.StagingError("session.generator_output.remote_write_url must be the reviewed Prometheus "
+                                 "remote-write endpoint (http(s), no credentials)")
+        ver = re.match(r"^(\d+)\.(\d+)\.(\d+)$", str(s.get("generator_k6_version", "")))
+        if not ver or (int(ver.group(1)), int(ver.group(2))) < K6_MIN_RW:
+            raise X.StagingError(f"session.generator_k6_version must name the pinned k6 release, at least "
+                                 f"{K6_MIN_RW[0]}.{K6_MIN_RW[1]}.0 (built-in experimental-prometheus-rw output)")
         if not _TS.match(str(s.get("deadline_utc", ""))):
             raise X.StagingError("session.deadline_utc must be an RFC 3339 UTC time")
         b = s.get("arrival_budget") or {}
@@ -396,7 +408,9 @@ def generator_job(c: Context, active_deadline: int, suspend: bool) -> Dict:
     # Test-wide tags on every k6 sample, the session's included, so its metrics are attributable to THIS session.
     tags = {"c28_session": c.session_id, "c28_target": c.target, "c28_plan": c.plan["digest"],
             "c28_seed": str(c.plan["seed"]), "c28_label": c.plan["label"]}
-    env = ["run"] + [a for k, v in sorted(tags.items()) for a in ("--tag", f"{k}={v}")] + [
+    # The metrics leave k6 through its built-in remote-write OUTPUT (--out), configured by real process env (the
+    # container's env), never by script variables (-e).
+    env = ["run", "--out", K6_OUTPUT] + [a for k, v in sorted(tags.items()) for a in ("--tag", f"{k}={v}")] + [
            "-e", "C28_PLAN=/plan/plan.json", "-e", f"C28_BASE_URL=http://c28-ingress.{c.ns}.svc",
            "-e", "C28_SUMMARY=/tmp/summary.json"]
     for k, v in sorted((s.get("generator_env") or {}).items()):
@@ -418,6 +432,12 @@ def generator_job(c: Context, active_deadline: int, suspend: bool) -> Dict:
                                  {"key": "kubernetes.io/hostname", "operator": "In",
                                   "values": [c.params["nodes"]["support"]]}]}]}}},
                          "containers": [{"name": "k6", "image": s["generator_image"], "args": env + ["/plan/c28.js"],
+                                         "env": [{"name": "K6_PROMETHEUS_RW_SERVER_URL",
+                                                  "value": s["generator_output"]["remote_write_url"]},
+                                                 {"name": "K6_PROMETHEUS_RW_TREND_AS_NATIVE_HISTOGRAM",
+                                                  "value": "true"},
+                                                 {"name": "K6_PROMETHEUS_RW_PUSH_INTERVAL",
+                                                  "value": f"{int(s['generator_output'].get('push_interval_s', 5))}s"}],
                                          "resources": res,
                                          "securityContext": {"allowPrivilegeEscalation": False,
                                                              "capabilities": {"drop": ["ALL"]}},
@@ -951,6 +971,9 @@ def acknowledgment(c: Context, fetch: Callable[[str], Dict], begin: int, k6: str
     gs, why = _series(c, fetch, gsel, begin, step)
     if gs is None:
         return None, f"generator: {why}"
+    want = {"c28_session": c.session_id, "c28_target": c.target, "c28_plan": c.plan["digest"]}
+    if any((gs.get("metric") or {}).get(k) != v for k, v in want.items()):
+        return None, "generator: the series' session, target or plan labels are not this session's"
     gfirst, why = _first_rise(gs, begin, new_series=True)
     if gfirst is None:
         return None, f"generator: {why}"

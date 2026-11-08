@@ -31,7 +31,7 @@ INGRESS_LABELS = {"namespace": "demo", "c28_run": "c28-r1"}
 
 
 def observe(clock, arrivals_at=None, gen_at="same", gen_series=1, ingress_labels=None, ingress_series=1,
-            steal_value="1.0"):
+            steal_value="1.0", gen_labels=None):
     """A fake query API: fresh steal samples for both nodes; this session's tagged k6 iteration counter rising at
     `gen_at` (default: with the arrivals); the ingress counter for the target rising from 0 to 5 at `arrivals_at`."""
     import re
@@ -50,7 +50,8 @@ def observe(clock, arrivals_at=None, gen_at="same", gen_series=1, ingress_labels
         if query.startswith("k6_iterations_total"):
             if gen_at is None:
                 return {"data": {"result": []}}
-            return {"data": {"result": [{"metric": labels, "values": counter(start, end, step, gen_at, True)}
+            return {"data": {"result": [{"metric": dict(labels, **(gen_labels or {})),
+                                         "values": counter(start, end, step, gen_at, True)}
                                         for _ in range(gen_series)]}}
         if query.startswith("c28_ingress_requests_total"):
             metric = dict(ingress_labels if ingress_labels is not None else INGRESS_LABELS, target=labels["target"])
@@ -68,7 +69,9 @@ def write_plan(world, kind, seed, target, capacity=7.0, accelerate=1, name="plan
 
 def session_record(world, params=None, **over):
     s = {"id": "s-0001", "phase": "preparation", "arm": "H-CPU", "profile": "s20", "seed": 101,
-         "generator_image": GEN, "arrival_budget": {"max_rps": 200, "max_total_arrivals": 50_000_000},
+         "generator_image": GEN, "generator_k6_version": "0.57.0",
+         "generator_output": {"remote_write_url": "http://vminsert.monitoring.svc:8480/insert/0/prometheus/api/v1/write"},
+         "arrival_budget": {"max_rps": 200, "max_total_arrivals": 50_000_000},
          "deadline_utc": "2026-12-02T00:00:00Z", "quiesce_timeout_s": 60,
          "stops": {"steal_query": "max by (node) (steal)", "query_api": "http://vm.example:8481/select/0/prometheus",
                    "steal_percent": 5, "steal_bins": 5}}
@@ -669,6 +672,9 @@ def test_block_needs_owned_k6_evidence(world):
     ({"ingress_series": 2}, "ingress: 2 series"),
     ({"ingress_labels": {"namespace": "other", "c28_run": "c28-r1"}}, "labels do not match"),
     ({"gen_at": BLOCK_T + 40}, "rose before this session's generator started"),
+    ({"gen_labels": {"c28_session": "c-9999"}}, "not this session's"),          # a foreign session's series
+    ({"gen_labels": {"c28_target": "c28-pa-e-s20"}}, "not this session's"),
+    ({"gen_labels": {"c28_plan": "0" * 64}}, "not this session's"),
 ])
 def test_unattributable_series_keep_the_block_unacknowledged(world, obs_kw, why):
     """Codex #32 r3: exactly one series with the expected labels on both sides, ordered generator-first."""
@@ -689,8 +695,21 @@ def test_unattributable_series_keep_the_block_unacknowledged(world, obs_kw, why)
 def test_generator_carries_the_session_tag(world):
     record, target = confirmation_world(world)
     c, digest, started = start_session(world, record, now=BLOCK_T - 60)
-    args = world["api"].obj("Job", "c28-gen-c-0001", "demo")["spec"]["template"]["spec"]["containers"][0]["args"]
-    assert args[:3] == ["run", "--tag", "c28_label=confirmation"] and "c28_session=c-0001" in args
+    k6 = world["api"].obj("Job", "c28-gen-c-0001", "demo")["spec"]["template"]["spec"]["containers"][0]
+    args, env = k6["args"], {e["name"]: e["value"] for e in k6["env"]}
+    assert args[:3] == ["run", "--out", "experimental-prometheus-rw"]
+    assert "c28_session=c-0001" in args and args[args.index("c28_session=c-0001") - 1] == "--tag"
+    assert env["K6_PROMETHEUS_RW_SERVER_URL"] == \
+        "http://vminsert.monitoring.svc:8480/insert/0/prometheus/api/v1/write"
+    assert not any(a.startswith("K6_PROMETHEUS") for a in args)          # process env, never a script variable
+
+
+def test_generator_export_config_is_required_and_k6_must_support_it(world):
+    for over, why in (({"generator_output": {}}, "remote_write_url"),
+                      ({"generator_output": {"remote_write_url": "http://u:p@vm/write"}}, "remote_write_url"),
+                      ({"generator_k6_version": "0.41.0"}, "at least 0.42.0")):
+        with pytest.raises(X.StagingError, match=why):
+            ctx(world, session_record(world, **over))
 
 
 def test_pending_owner_moves_block_start_and_stop_sessions(world):
