@@ -1538,6 +1538,11 @@ def campaign_artifact_problems(s: Dict, pvcs: Dict[str, Dict]) -> List[str]:
     return out
 
 
+def identity_digest(t) -> str:
+    """An UNREVIEWED identity in a diagnosis: a digest of its values, never the values (they may be anything)."""
+    return hashlib.sha256(json.dumps(list(t)).encode()).hexdigest()[:12]
+
+
 def ensemble_generation_check(s: Dict, pvcs: Dict[str, Dict], inventory: set) -> Tuple[Dict, List[str]]:
     """The forecast log's identities against the REVIEWED ones: every artifact issuance is a reviewed artifact arm;
     every generation issuance is a reviewed ensemble arm (model_name, application, namespace, experiment) and its
@@ -1551,7 +1556,8 @@ def ensemble_generation_check(s: Dict, pvcs: Dict[str, Dict], inventory: set) ->
     ids = {tuple(x) for it in fl for x in it.get("artifact_identities") or []}
     arms_a = {tuple(a[k] for k in _IDENT_KEYS["artifact_arms"]) for a in fi["artifact_arms"]}
     for x in sorted(ids - arms_a):
-        out.append(f"ml-models-pvc: an artifact issuance identity {list(x)} is not a reviewed artifact arm")
+        out.append(f"ml-models-pvc: an artifact issuance identity (model_name, application, namespace; sha256 "
+                   f"{identity_digest(x)}) is not a reviewed artifact arm")
     arms_e = {tuple(a[k] for k in _IDENT_KEYS["ensemble_arms"]): a for a in fi["ensemble_arms"]}
     by_name = {a["model_name"]: [] for a in fi["ensemble_arms"]}
     for a in fi["ensemble_arms"]:
@@ -1565,7 +1571,8 @@ def ensemble_generation_check(s: Dict, pvcs: Dict[str, Dict], inventory: set) ->
         fp = g["fingerprint"]
         arm = (g["model_name"], g["application"], g["namespace"], g["experiment"])
         if arm not in arms_e:
-            out.append(f"ml-models-pvc: generation {fp} was issued by {list(arm)}, not a reviewed ensemble arm")
+            out.append(f"ml-models-pvc: generation {fp} was issued by an identity (model_name, application, namespace, "
+                       f"experiment; sha256 {identity_digest(arm)}) that is not a reviewed ensemble arm")
             continue
         r = reviewed.get(fp)
         if r is None:

@@ -1384,3 +1384,24 @@ def test_ref_classes_need_disjoint_prefixes(env):
     write(e["path"], json.dumps(doc))
     with pytest.raises(X.StagingError, match="disjoint"):
         P.effective_rules(P.section(X.load_record(e["path"], ("populate", "archive"))), "forecast-log-pvc")
+
+
+@pytest.mark.parametrize("extra, why", [
+    ({"issued_at": "2026-11-01T23:59:50Z", "forecasts": [], "model_name": "lstm_pm-marker-xyz_requests",
+      "application": "pm-marker-app", "namespace": "pm-marker-ns", "artifact_sha256": CAMPAIGN_ART},
+     "an artifact issuance identity (model_name, application, namespace; sha256 "),
+    ({"issued_at": "2026-11-01T23:59:50Z", "forecasts": [], "model_name": "ensemble_pm-marker-xyz_requests",
+      "application": "pm-marker-app", "namespace": "pm-marker-ns", "training_cutoff": "2026-11-01T18:00:00Z",
+      "model_version": "pm-marker-exp:1@" + FP1[:12], "artifact_sha256": FP1},
+     "was issued by an identity (model_name, application, namespace, experiment; sha256 "),
+])
+def test_unreviewed_identities_are_reported_by_digest_only(env, extra, why):
+    """Codex #38: a rejected identity is named by its field names and a digest, never its values."""
+    e = env
+    models_after_cutoff_only(e)
+    ensemble_log(e, [extra])
+    set_empty_by_design(e, ids=identities())
+    do_probe(e)
+    probs = P.plan(e["record"], e["kube"])["problems"]
+    assert any(why in x for x in probs), probs
+    assert not any("pm-marker" in x for x in probs), probs
