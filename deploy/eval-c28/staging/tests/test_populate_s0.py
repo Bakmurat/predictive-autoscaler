@@ -4,6 +4,7 @@ locally, a scratch git repository, and a small mandatory corpus. KUBECONFIG=/dev
 import hashlib
 import copy
 import json
+import re
 import os
 import subprocess
 import tarfile
@@ -57,7 +58,8 @@ def volumes(root):
     """The four claims as the campaign writers left them (deploy/eks-benchmark/instrumentation/archive.py,
     collect_load_evidence.py, the operator and trainer), plus post-cutoff and live material that must NOT be exported."""
     v = {p: os.path.join(root, "vol", p) for p in MOUNTS}
-    fc = [{"event": "decision", "at": "2026-11-01T23:58:00Z"}, {"issued_at": "2026-11-01T23:59:00Z", "forecasts": []},
+    fc = [{"event": "decision", "at": "2026-11-01T23:58:00Z", "artifact_sha256": None},
+          {"issued_at": "2026-11-01T23:59:00Z", "forecasts": [], "artifact_sha256": sha(b"pickled-model-v1")},
           {"event": "decision", "at": "2026-11-02T00:01:00Z"}]
     write(os.path.join(v["forecast-log-pvc"], "forecasts.jsonl"), jl(*fc) + '{"event": "decision", "at": "2026-11-0')
     a = v["evidence-archive-pvc"]
@@ -899,7 +901,7 @@ def test_trainings_are_classified_by_execution_not_collection(env):
     assert p["problems"] == [], p["problems"]
     sel = {it["path"]: it for it in p["pvcs"]["evidence-archive-pvc"]["selection"]}
     assert sel[late + ".trainer.log"]["collected_after_cutoff"] is True
-    assert sel[late + ".json"]["finished_at"] == "2026-11-01T18:20:00Z"
+    assert sel[late + ".trainer.log"]["finished_at"] == "2026-11-01T18:20:00Z" and late + ".json" in sel
     ex = {x["path"]: x["reason"] for x in p["pvcs"]["evidence-archive-pvc"]["rule_excluded"]}
     assert ex[post + ".json"] == ex[post + ".trainer.log"] == "post-campaign training (executed after the cutoff)"
     straddle = add_training(e, "ml-training-29850000", "85858585-0000", "2026-11-03T07:00:00Z",
@@ -924,6 +926,54 @@ def test_trainings_are_classified_by_execution_not_collection(env):
         {"job": "ml-training-29800000", "pod_uid": "8e8e8e8e-0000", "decision": "exclude", "reason": "no"}])
     do_probe(e)
     assert any("29800000" in x and "unambiguous" in x for x in P.plan(e["record"], e["kube"])["problems"])
+
+
+def test_previous_logs_are_classified_by_their_own_execution(env):
+    """Codex #36 r2 item 2: a restarted trainer whose CURRENT instance ran after the cutoff does not justify excluding
+    its .previous.log (whose times the writer never records): it blocks until reviewed; a previous log of an instance
+    that started at or before the cutoff is campaign evidence."""
+    e = env
+    a = e["vols"]["evidence-archive-pvc"]
+    log, prev = "current\n", "campaign-era instance\n"
+    rec = {"collected_at": "2026-11-03T06:35:00Z", "job": "ml-training-29700000", "pod_uid": "7a7a7a7a-0000",
+           "containers": [{"name": "trainer", "started_at": "2026-11-02T03:00:00Z",
+                           "finished_at": "2026-11-02T03:20:00Z", "restart_count": 1,
+                           "log_sha256": sha(log.encode()), "previous_log_saved": True}]}
+    with open(os.path.join(a, "logs/trainer-index.jsonl"), "a") as fh:
+        fh.write(jl(rec))
+    base = "logs/trainer/ml-training-29700000-7a7a7a7a"
+    write(os.path.join(a, base + ".json"), json.dumps(rec))
+    write(os.path.join(a, base + ".trainer.log"), log)
+    write(os.path.join(a, base + ".trainer.previous.log"), prev)
+    do_probe(e)
+    p = P.plan(e["record"], e["kube"])
+    assert any("29700000" in x and "trainer.previous.log: its previous instance's execution times are not recorded"
+               in x for x in p["problems"]), p["problems"]
+    assert base + ".trainer.previous.log" not in {x["path"] for x in p["pvcs"]["evidence-archive-pvc"]["rule_excluded"]}
+    set_trainer_reviewed(e, [{"job": "ml-training-29700000", "pod_uid": "7a7a7a7a-0000", "decision": "select",
+                              "reason": "the restart followed a campaign-era attempt"}])
+    do_probe(e)
+    p = P.plan(e["record"], e["kube"])
+    assert p["problems"] == [], p["problems"]
+    sel = {it["path"]: it for it in p["pvcs"]["evidence-archive-pvc"]["selection"]}
+    ex = {x["path"]: x["reason"] for x in p["pvcs"]["evidence-archive-pvc"]["rule_excluded"]}
+    assert sel[base + ".trainer.previous.log"]["reviewed"].startswith("reviewed: the restart")
+    assert base + ".json" in sel and ex[base + ".trainer.log"] == "post-campaign training (executed after the cutoff)"
+    # an instance that started before the cutoff: its previous instance ended before that, so it is selected
+    rec2 = dict(rec, job="ml-training-29710000", pod_uid="7b7b7b7b-0000", collected_at="2026-11-03T06:40:00Z",
+                containers=[dict(rec["containers"][0], started_at="2026-11-01T23:50:00Z",
+                                 finished_at="2026-11-01T23:59:00Z")])
+    with open(os.path.join(a, "logs/trainer-index.jsonl"), "a") as fh:
+        fh.write(jl(rec2))
+    base2 = "logs/trainer/ml-training-29710000-7b7b7b7b"
+    write(os.path.join(a, base2 + ".json"), json.dumps(rec2))
+    write(os.path.join(a, base2 + ".trainer.log"), log)
+    write(os.path.join(a, base2 + ".trainer.previous.log"), prev)
+    do_probe(e)
+    p = P.plan(e["record"], e["kube"])
+    assert p["problems"] == [], p["problems"]
+    sel = {it["path"] for it in p["pvcs"]["evidence-archive-pvc"]["selection"]}
+    assert {base2 + ".json", base2 + ".trainer.log", base2 + ".trainer.previous.log"} <= sel
 
 
 def test_post_campaign_trainings_are_excluded_by_the_index_pairing(env):
@@ -954,9 +1004,16 @@ def models_after_cutoff_only(e):
           json.dumps({"trained_at": "2026-11-08T00:20:00Z", "artifact_sha256": sha(art)}))
 
 
-def set_empty_by_design(e, pvc="ml-models-pvc", reason="the mutable model directory holds only post-campaign models"):
+CAMPAIGN_ART = sha(b"pickled-model-v1")
+
+
+def set_empty_by_design(e, pvc="ml-models-pvc", reason="the mutable model directory holds only post-campaign models",
+                        inventory=(CAMPAIGN_ART,)):
     doc = json.load(open(e["path"]))
     doc["populate"]["pvcs"][pvc]["empty_by_design"] = reason
+    if pvc == "ml-models-pvc":
+        doc["populate"]["pvcs"][pvc]["campaign_artifacts"] = [
+            {"artifact_sha256": d, "reason": "issued by the campaign / frozen identity"} for d in inventory]
     write(e["path"], json.dumps(doc))
     e["record"] = X.load_record(e["path"], ("populate", "archive"))
 
@@ -972,12 +1029,12 @@ def test_ml_models_may_be_empty_by_design_when_every_pair_is_post_cutoff(env):
     assert out["event"] == "export-complete" and P.verify(e["record"])["result"] == "PASS"
     root = e["record"].doc["archive"]["evidence"]["export_dir"]
     man = json.load(open(os.path.join(root, "pvc-exports/ml-models-pvc/manifest.json")))
-    assert man["files"] == [] and man["empty_by_design"]["files_trained_after_cutoff"][0]["trained_at"] > CUTOFF
+    assert man["files"] == [] and man["empty_by_design"]["current_pairs_trained_after_cutoff"][0]["trained_at"] > CUTOFF
     with tarfile.open(os.path.join(root, "pvc-exports/ml-models-pvc/campaign-export.tar")) as t:
         assert t.getmembers() == []
     cov = json.load(open(os.path.join(root, "storage/pvc-retention-and-export-coverage.json")))
     mc = next(c for c in cov["claims"] if c["claim"] == "ml-models-pvc")
-    assert mc["protected"]["empty_by_design"]["reason"].startswith("the mutable model directory")
+    assert mc["protected"]["empty_by_design"] is True and mc["protected"]["reason"].startswith("the mutable model directory")
 
 
 def test_empty_by_design_refuses_anything_campaign_relevant(env):
@@ -1019,6 +1076,59 @@ def test_empty_by_design_needs_every_pair_verified_before_its_time(env):
     forged = [{"path": "lstm_a.meta.json", "reason": "trained after the cutoff", "ts": "2026-11-08T00:00:00Z"}]
     _, eprobs = P.empty_by_design("ml-models-pvc", "r", [], forged, [], [{"cutoff": CUTOFF}])
     assert eprobs                                                     # an exclusion without pair_verified never counts
+
+
+def test_empty_by_design_resolves_the_reviewed_campaign_artifacts(env):
+    """Codex #36 r2 item 1: the reviewed campaign artifact inventory must cover every artifact the campaign issuances
+    reference, each digest must resolve to verified evidence-archive members, and the manifest and coverage file
+    carry those references plus the current pairs' hashes and byte counts."""
+    e = env
+    models_after_cutoff_only(e)
+    absent = "f" * 64
+    fl = os.path.join(e["vols"]["forecast-log-pvc"], "forecasts.jsonl")
+    write(fl, jl({"issued_at": "2026-11-01T23:00:00Z", "forecasts": [], "artifact_sha256": absent},
+                 {"issued_at": "2026-11-01T23:59:00Z", "forecasts": [], "artifact_sha256": CAMPAIGN_ART}))
+    set_empty_by_design(e)
+    do_probe(e)
+    probs = P.plan(e["record"], e["kube"])["problems"]
+    assert any(f"references artifact {absent} outside the reviewed campaign artifact inventory" in x for x in probs)
+    with pytest.raises(Exception):
+        do_export(e)
+    set_empty_by_design(e, inventory=(CAMPAIGN_ART, absent))
+    do_probe(e)
+    probs = P.plan(e["record"], e["kube"])["problems"]
+    assert any(f"campaign artifact {absent} does not resolve to a verified evidence-archive" in x for x in probs)
+    set_empty_by_design(e, inventory=())
+    with pytest.raises(X.StagingError, match="reviewed campaign artifact inventory"):
+        P.section(e["record"])
+    # the fixed state: only the archived campaign artifact is referenced
+    write(fl, jl({"issued_at": "2026-11-01T23:59:00Z", "forecasts": [], "artifact_sha256": CAMPAIGN_ART}))
+    set_empty_by_design(e)
+    do_probe(e)
+    out = do_export(e)
+    assert out["event"] == "export-complete" and P.verify(e["record"])["result"] == "PASS"
+    root = e["record"].doc["archive"]["evidence"]["export_dir"]
+    mpath = os.path.join(root, "pvc-exports/ml-models-pvc/manifest.json")
+    man = json.load(open(mpath))
+    ref, = man["empty_by_design"]["campaign_artifacts"]
+    ea = json.load(open(os.path.join(root, "pvc-exports/evidence-archive-pvc/manifest.json")))
+    members = {f["member"]: f for f in ea["files"]}
+    assert ref["artifact_sha256"] == CAMPAIGN_ART and members[ref["artifact_member"]]["sha256"] == CAMPAIGN_ART
+    assert ref["artifact_member"].endswith(".pkl") and members[ref["sidecar_member"]]["sha256"] == ref["sidecar_sha256"]
+    assert ref["export"]["tar_sha256"] == ea["tar"]["sha256"] and ref["referenced_by"] == ["forecast log",
+                                                                                           "training bundle"]
+    pair, = man["empty_by_design"]["current_pairs_trained_after_cutoff"]
+    assert pair["artifact_sha256"] == sha(b"current-model") and pair["artifact_bytes"] == len(b"current-model")
+    assert re.match(r"^[0-9a-f]{64}$", pair["sidecar_sha256"]) and pair["sidecar_bytes"] > 0
+    cov = json.load(open(os.path.join(root, "storage/pvc-retention-and-export-coverage.json")))
+    mc = next(c for c in cov["claims"] if c["claim"] == "ml-models-pvc")["protected"]
+    assert mc["campaign_artifacts"] == man["empty_by_design"]["campaign_artifacts"]
+    assert mc["manifest_sha256"] == sha(open(mpath, "rb").read()) and mc["files"] == 0
+    # a reference that no longer resolves in the exported evidence archive fails verify
+    os.chmod(mpath, 0o640)
+    write(mpath, json.dumps(dict(man, empty_by_design=dict(man["empty_by_design"], campaign_artifacts=[
+        dict(ref, artifact_member="archive/nope/lstm.pkl")]))))
+    assert any("artifact_member is not a verified member" in x for x in P.verify(e["record"])["problems"])
 
 
 def test_empty_by_design_only_for_ml_models(env):

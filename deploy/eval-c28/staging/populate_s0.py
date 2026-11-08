@@ -30,14 +30,15 @@ evidence archive selection holds its immutable archived copy (same artifact and 
 Rules (populate.pvcs.<pvc>.rules; cutoff "campaign" = populate.cutoff, "collection" = populate.collection_cutoff for
 the collectors' own post-stop files, or an explicit UTC time):
   {"type": "jsonl_prefix", "path": P, "ts_fields": [...] | "ts_by": {"field": F, "types": {T: [...]}},
-   "known_keys": [...], "order_tolerance_seconds": N, "order_tolerance_review": "..."}
+   "known_keys": [...], "collect_refs": [K], "order_tolerance_seconds": N, "order_tolerance_review": "..."}
         the prefix of an append-only JSONL file up to its LAST record at or before the cutoff; a record's time is the
         first present field of ts_fields, or of its own type's list (types keyed by the discriminator F; "" = without
         F). An unknown type or a record without a usable time fails the rule and is reported by its SHAPE only: the
         ALLOWLISTED key names it has (known_keys, the timestamp fields, F), a count and digest of any other keys, and
         F only when it is a known type (else its JSON type and a digest). Ordering is STRICT by default; a tolerance
         for interleaved writers is a per-rule exception that needs order_tolerance_review, and the plan and manifest
-        list it (order_tolerances); its overhang lines are counted apart (overshoot_lines), never campaign records
+        list it (order_tolerances); its overhang lines are counted apart (overshoot_lines), never campaign records.
+        collect_refs lists the sha256 values of fields K (e.g. artifact_sha256) in the records up to the cutoff
   {"type": "named", "glob": G, "ts_regex": R, "ts_format": F}  files whose NAME carries a time at or before the cutoff
   {"type": "bundles", "manifest_glob": G, "ts_field": T}       archive bundles by their manifest's T, every original
         hash verified; a sidecar variant's artifact_key must name a selected bundle
@@ -45,14 +46,19 @@ the collectors' own post-stop files, or an explicit UTC time):
         model sidecar + artifact; EVERY pair is verified first (the artifact's sha256 and size equal the sidecar's, else
         it is excluded as not matching), and only then is its time used
   {"type": "trainer_logs", "index": I, "dir": D, "reviewed": [{"job", "pod_uid", "decision", "reason"}]}
-        every trainer record of index I, classified by its containers' EXECUTION times (started_at/finished_at, never
-        collected_at) against the cutoff: finished at or before it = campaign evidence, selected with its files
-        (<job>-<pod uid[:8]>.json and each container's .log/.previous.log, log_sha256 verified) even when collected
-        later; started after it = excluded as "post-campaign training (executed after the cutoff)" by that pairing;
-        straddling or untimed = blocks unless reviewed (decision select | exclude). A file no record references blocks
+        every trainer record of index I; EACH log classified by its own container's EXECUTION times (never
+        collected_at) against the cutoff: finished at or before it = campaign evidence, selected (log_sha256
+        verified) even when collected later; started after it = excluded as "post-campaign training (executed after
+        the cutoff)"; a .previous.log is selected when the current instance started at or before the cutoff and is
+        otherwise ambiguous (the writer records no previous-instance times). Ambiguous logs block unless the record is
+        reviewed (decision select | exclude). <job>-<pod uid[:8]>.json goes with its logs. Unreferenced files block
 A reviewed "empty_by_design" reason is accepted for ml-models-pvc ONLY, and only when nothing is selected, nothing lies
-outside its rules and every model pair present is VERIFIED and was trained after the cutoff (its trained_at); the
-export is then an empty tar with that reason, and the coverage file says so.
+outside its rules and every model pair present is VERIFIED and was trained after the cutoff (its trained_at), and
+the reviewed campaign artifact inventory (populate.pvcs.ml-models-pvc.campaign_artifacts: [{artifact_sha256,
+reason}]) covers every artifact the campaign forecast records and training bundles (up to the cutoff) reference,
+each resolving to verified evidence-archive members (bundle manifest, artifact, sidecar). The export is then an
+empty tar whose manifest, like the coverage file, carries those member references (with the evidence-archive export's
+tar and manifest digests) and the current pairs' hashes and byte counts; verify re-resolves them.
 
 Reader pods (namespace ml-engine): the claim mounted read-only, no service-account token, non-root, read-only root
 filesystem, pinned to the node the RWO volume is attached to (VolumeAttachment), a deadline. Before EACH reader the
@@ -95,7 +101,7 @@ import subprocess
 import sys
 import tarfile
 import time
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -234,13 +240,16 @@ def record_ts(rec, rule):
             return t, None
     return None, "no timestamp for its type (%s)" % fields
 
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
 def scan(mount, rel, rule, cutoff, collect=False):
     """The prefix of an append-only JSONL file that ends at its LAST record at or before the cutoff. Records inside
     it but after the cutoff (interleaved writers) are allowed only within order_tolerance_seconds; a record at or
     before the cutoff that follows a later record by more is not append-ordered and fails. A record without a usable
     timestamp fails, reported by its shape only. Returns {offset, lines, overshoot, after, records?} and problems."""
     tol = datetime.timedelta(seconds=int(rule.get("order_tolerance_seconds", 0)))   # strict unless reviewed
-    out = {"offset": 0, "lines": 0, "overshoot": 0, "after": 0, "records": [], "after_records": []}
+    out = {"offset": 0, "lines": 0, "overshoot": 0, "after": 0, "records": [], "after_records": [], "refs": set()}
+    ref_fields = rule.get("collect_refs") or []
     pend_n, pend_max, pend_recs, pend_bytes, probs = 0, None, [], 0, []
     with open(safe(mount, rel), "rb") as fh:
         for n, raw in enumerate(fh, 1):
@@ -257,6 +266,16 @@ def scan(mount, rel, rule, cutoff, collect=False):
                 if pend_n and pend_max > cutoff + tol:
                     probs.append("%s: a record at or before the cutoff (line %d) follows a record more than %d s "
                                  "after it (not append-ordered)" % (rel, n, tol.total_seconds())); break
+                for f in ref_fields:
+                    v = rec.get(f)
+                    if v in (None, ""):
+                        continue
+                    if not (isinstance(v, str) and HEX64.match(v)):
+                        probs.append("a record of %s at line %d has a %s that is not a sha256: %s"
+                                     % (rel, n, f, shape(rec, rule))); break
+                    out["refs"].add(v)
+                if probs:
+                    break
                 out["offset"] += pend_bytes + len(raw)
                 out["lines"] += pend_n + 1
                 out["overshoot"] += pend_n
@@ -284,6 +303,8 @@ def jsonl_prefix(mount, rule, cutoff):
     if probs:
         return [], [], probs
     extra = {"overshoot_lines": res["overshoot"]}
+    if rule.get("collect_refs"):
+        extra["referenced_artifact_sha256"] = sorted(res["refs"])
     if res["overshoot"]:
         extra["overshoot_note"] = ("lines after the cutoff inside the prefix under the reviewed order tolerance: an "
                                    "overhang of interleaved writers, not campaign records")
@@ -368,10 +389,17 @@ def pairs(mount, rule, cutoff):
                 reason = "trained after the cutoff"
             else:
                 reason = None
+        if reason == "trained after the cutoff":
+            sh, sn = sha(os.path.join(mount, rel))
+            excl.append({"path": rel, "reason": reason, "ts": iso(ts), "pair_verified": True,
+                         "pair": {"sidecar": rel, "sidecar_bytes": sn, "sidecar_sha256": sh, "artifact": art,
+                                  "artifact_bytes": n, "artifact_sha256": h,
+                                  "sidecar_artifact_sha256": meta.get(rule["sha_field"]),
+                                  "sidecar_artifact_bytes": meta.get("artifact_bytes")}})
+            excl.append({"path": art, "reason": reason, "ts": iso(ts), "pair_verified": True, "pair_sidecar": rel})
+            continue
         if reason:
-            excl += [dict({"path": f, "reason": reason}, **({"ts": iso(ts), "pair_verified": True}
-                                                             if reason == "trained after the cutoff" else {}))
-                     for f in both]
+            excl += [{"path": f, "reason": reason} for f in both]
             continue
         sel.append(item(mount, rel, ts=iso(ts), artifact_sha256=meta.get(rule["sha_field"])))
         sel.append(item(mount, art, ts=iso(ts), verified="equals the sidecar's " + rule["sha_field"]))
@@ -379,33 +407,24 @@ def pairs(mount, rule, cutoff):
 
 FAR_FUTURE = datetime.datetime(9999, 1, 1, tzinfo=datetime.timezone.utc)
 
-def execution(rec):
-    """A trainer record's EXECUTION window from its containers' recorded started_at/finished_at (never collected_at,
-    which only says when the collector copied it): (first start, last finish), or None when any time is missing."""
-    cs = rec.get("containers") if isinstance(rec, dict) else None
-    if not isinstance(cs, list) or not cs:
-        return None
-    st = [utc(c.get("started_at")) if isinstance(c, dict) else None for c in cs]
-    fi = [utc(c.get("finished_at")) if isinstance(c, dict) else None for c in cs]
-    if None in st or None in fi:
-        return None
-    return min(st), max(fi)
-
-def trainer_refs(rule, rec):
-    base = "%s-%s" % (rec.get("job"), str(rec.get("pod_uid", ""))[:8])
-    meta = os.path.join(rule["dir"], base + ".json")
-    refs = [(meta, None)]
-    for c in rec.get("containers") or []:
-        refs.append((os.path.join(rule["dir"], "%s.%s.log" % (base, c.get("name"))), c.get("log_sha256")))
-        if c.get("previous_log_saved"):
-            refs.append((os.path.join(rule["dir"], "%s.%s.previous.log" % (base, c.get("name"))), None))
-    return base, refs
+def log_class(started, finished, cutoff):
+    """One log's class by ITS OWN execution times: select (finished at or before the cutoff), exclude (started after
+    it), or the reason it is ambiguous."""
+    if started is None or finished is None:
+        return "its execution times are missing"
+    if finished <= cutoff:
+        return "select"
+    if started > cutoff:
+        return "exclude"
+    return "its execution straddles the cutoff"
 
 def trainer_logs(mount, rule, cutoff):
-    """Trainer logs classified by EXECUTION time against the (campaign) cutoff, whatever their collected_at: a
-    training that finished at or before the cutoff is campaign evidence and selected even when collected later; one
-    that started after it is excluded by the index's own pairing (job, pod UID, container names); a training that
-    straddles the cutoff or lacks execution times needs an explicit per-record review (rule "reviewed")."""
+    """Trainer logs classified by EXECUTION time against the (campaign) cutoff, whatever their collected_at; each log
+    by its OWN container's times: a container's current log by its started_at/finished_at; its .previous.log (the
+    instance before a restart, whose times the writer does not record) is campaign evidence when the current instance
+    started at or before the cutoff (the previous one ended before that), otherwise ambiguous. A record's .json goes
+    with its logs (selected when any log is). Ambiguous logs block unless the record is reviewed (rule "reviewed":
+    decision select | exclude); a file no record references blocks."""
     sel, excl = [], []
     why = absent_why(safe(mount, rule["index"]))
     if why:
@@ -416,33 +435,54 @@ def trainer_logs(mount, rule, cutoff):
     reviewed = {(r["job"], r["pod_uid"]): r for r in rule.get("reviewed") or []}
     used = set()
     for rec, collected in res["records"]:
-        base, refs = trainer_refs(rule, rec)
-        win = execution(rec)
+        base = "%s-%s" % (rec.get("job"), str(rec.get("pod_uid", ""))[:8])
         key = (rec.get("job"), rec.get("pod_uid"))
-        if win and win[1] <= cutoff:
-            decision, reason = "select", None
-        elif win and win[0] > cutoff:
-            decision, reason = "exclude", "post-campaign training (executed after the cutoff)"
-        elif key in reviewed:
-            used.add(key)
-            decision, reason = reviewed[key]["decision"], "reviewed: " + reviewed[key]["reason"]
-        else:
-            probs.append("trainer record %s: %s; needs an explicit review" % (
-                base, "its execution straddles the cutoff" if win else "its execution times are missing"))
+        cs = [c for c in rec.get("containers") or [] if isinstance(c, dict)]
+        logs = []                                    # (path, log_sha256 or None, class, extra)
+        for c in cs:
+            st, fi = utc(c.get("started_at")), utc(c.get("finished_at"))
+            own = {"container": c.get("name"), "started_at": iso(st) if st else None,
+                   "finished_at": iso(fi) if fi else None}
+            logs.append((os.path.join(rule["dir"], "%s.%s.log" % (base, c.get("name"))), c.get("log_sha256"),
+                         log_class(st, fi, cutoff), own))
+            if c.get("previous_log_saved"):
+                prev = {"container": c.get("name"), "instance": "previous",
+                        "execution": "ended before the current instance started at %s" % (iso(st) if st else "?")}
+                logs.append((os.path.join(rule["dir"], "%s.%s.previous.log" % (base, c.get("name"))), None,
+                             "select" if st is not None and st <= cutoff
+                             else "its previous instance's execution times are not recorded", prev))
+        if not cs:
+            logs.append((None, None, "its execution times are missing", {}))
+        ambiguous = [x for x in logs if x[2] not in ("select", "exclude")]
+        if ambiguous and key not in reviewed:
+            for f, _, why, _ in ambiguous:
+                probs.append("trainer record %s: %s%s; needs an explicit review" % (
+                    base, (os.path.basename(f) + ": ") if f else "", why))
             continue
-        if key in reviewed and key not in used:
+        if not ambiguous and key in reviewed:
             probs.append("trainer record %s is reviewed but its execution is unambiguous" % base); continue
-        times = {"started_at": iso(win[0]), "finished_at": iso(win[1])} if win else {}
-        if decision == "exclude":
-            for f, _ in refs:
-                if absent_why(safe(mount, f)) is None:
-                    excl.append(dict({"path": f, "reason": reason}, **times))
-            continue
-        why = absent_why(safe(mount, refs[0][0]))
-        if why:
-            probs.append("trainer record %s: %s is %s" % (base, refs[0][0], why)); continue
+        rv = None
+        if ambiguous:
+            used.add(key)
+            rv = reviewed[key]
+        resolved = [(f, want, rv["decision"] if c not in ("select", "exclude") else c,
+                     dict(extra, reviewed="reviewed: " + rv["reason"]) if c not in ("select", "exclude") else extra)
+                    for f, want, c, extra in logs if f]
+        meta = os.path.join(rule["dir"], base + ".json")
+        keep = [x for x in resolved if x[2] == "select"]
         late = {"collected_after_cutoff": True} if collected > cutoff else {}
-        for f, want in refs:
+        for f, _, c, extra in resolved:
+            if c == "exclude" and absent_why(safe(mount, f)) is None:
+                excl.append(dict({"path": f, "reason": extra.get("reviewed")
+                                  or "post-campaign training (executed after the cutoff)"}, **extra))
+        if not keep:
+            if absent_why(safe(mount, meta)) is None:
+                excl.append({"path": meta, "reason": rv and "reviewed: " + rv["reason"]
+                             or "post-campaign training (executed after the cutoff)"})
+            continue
+        refs = [(meta, None, {"describes": [os.path.basename(f) for f, _, _, _ in keep]})] + \
+               [(f, want, extra) for f, want, _, extra in keep]
+        for f, want, extra in refs:
             p = safe(mount, f)
             why = absent_why(p)
             if why:
@@ -453,8 +493,7 @@ def trainer_logs(mount, rule, cutoff):
             if n == 0:
                 excl.append({"path": f, "reason": "empty (hash verified)"})
             else:
-                sel.append(item(mount, f, ts=times.get("finished_at"), trainer_record=base, **dict(times, **late),
-                                **({"reviewed": reason} if reason else {}),
+                sel.append(item(mount, f, ts=extra.get("finished_at"), trainer_record=base, **dict(extra, **late),
                                 **({"verified": "equals the index's log_sha256"} if want else {})))
     for key in set(reviewed) - used:
         if not any((r.get("job"), r.get("pod_uid")) == key for r, _ in res["records"]):
@@ -633,7 +672,7 @@ DEFAULT_RULES = {
                               "": ["issued_at"], "decision": ["at"], "sanity_rejected": ["rejected_at"],
                               "forecast_ledger_session": ["at"], "forecast_attempt_started": ["at"],
                               "forecast_attempt_completed": ["at"]}},
-                          "known_keys": FORECAST_KEYS_0472829}],
+                          "known_keys": FORECAST_KEYS_0472829, "collect_refs": ["artifact_sha256"]}],
     "evidence-archive-pvc": [{"type": "bundles", "manifest_glob": "archive/*/manifest.json", "ts_field": "copied_at",
                               "cutoff": "collection"}]
     + [{"type": "jsonl_prefix", "path": p, "ts_fields": f, "cutoff": "collection"} for p, f in COLLECTOR_LOGS]
@@ -655,8 +694,8 @@ DEFAULT_EXCLUDED = {
     "load-evidence-pvc": [{"glob": ".lock", "reason": "the collector's empty lock file"}],
     "ml-models-pvc": [],
 }
-RULE_KEYS = {"jsonl_prefix": {"type", "path", "ts_fields", "ts_by", "known_keys", "order_tolerance_seconds",
-                              "order_tolerance_review", "cutoff"},
+RULE_KEYS = {"jsonl_prefix": {"type", "path", "ts_fields", "ts_by", "known_keys", "collect_refs",
+                              "order_tolerance_seconds", "order_tolerance_review", "cutoff"},
              "named": {"type", "glob", "ts_regex", "ts_format", "cutoff"},
              "bundles": {"type", "manifest_glob", "ts_field", "cutoff"},
              "pairs": {"type", "sidecar_glob", "artifact_from", "artifact_to", "ts_field", "sha_field", "cutoff"},
@@ -700,6 +739,16 @@ def section(record: X.Record) -> Dict:
     for name, p in pvcs.items():
         if "empty_by_design" in p and (name != "ml-models-pvc" or not str(p["empty_by_design"]).strip()):
             probs.append(f"populate.pvcs.{name}.empty_by_design is allowed only for ml-models-pvc, with a reason")
+        ca = p.get("campaign_artifacts")
+        if "campaign_artifacts" in p and name != "ml-models-pvc":
+            probs.append(f"populate.pvcs.{name}.campaign_artifacts is for ml-models-pvc only")
+        if p.get("empty_by_design") and name == "ml-models-pvc":
+            ds = [a.get("artifact_sha256") for a in ca if isinstance(a, dict)] if isinstance(ca, list) else []
+            if not (ca and len(ds) == len(ca) == len(set(ds)) and all(
+                    set(a) == {"artifact_sha256", "reason"} and re.match(r"^[0-9a-f]{64}$", str(a["artifact_sha256"]))
+                    and str(a["reason"]).strip() for a in ca)):
+                probs.append("populate.pvcs.ml-models-pvc.campaign_artifacts must be the reviewed campaign artifact "
+                             "inventory: unique {artifact_sha256, reason} entries (required with empty_by_design)")
     retained = s.get("retained_pvcs") or []
     if len(retained) != 5 or not all(X._UUID.match(str(r.get("uid", ""))) for r in retained):
         probs.append("populate.retained_pvcs must list all five claims with UIDs")
@@ -728,6 +777,8 @@ def effective_rules(s: Dict, pvc: str) -> List[Dict]:
                 raise X.StagingError(f"{pvc}: jsonl_prefix needs ts_fields or ts_by {{field, types: {{type: [fields]}}}}")
             if not all(isinstance(k, str) for k in r.get("known_keys") or []):
                 raise X.StagingError(f"{pvc}: known_keys must be key names")
+            if not all(isinstance(k, str) and k in (r.get("known_keys") or []) for k in r.get("collect_refs") or []):
+                raise X.StagingError(f"{pvc}: collect_refs must name known_keys")
             tol = r.get("order_tolerance_seconds", 0)
             if not isinstance(tol, int) or isinstance(tol, bool) or tol < 0:
                 raise X.StagingError(f"{pvc}: order_tolerance_seconds must be a non-negative integer")
@@ -1263,10 +1314,76 @@ def empty_by_design(pvc: str, reason: str, selection: List[Dict], rule_excluded:
                 or not _TS.match(str(x.get("ts", ""))) or not x["ts"] > cutoff):
             probs.append(f"{pvc}: declared empty by design but {x.get('path')} is excluded as {x.get('reason')!r} "
                          f"(only pairs trained after the cutoff may be skipped)")
+        elif "pair" in x:
+            pairs_after.append(dict(x["pair"], trained_at=x["ts"]))
+    sidecars = {pr["sidecar"] for pr in pairs_after}
+    for x in rule_excluded:
+        if "pair" not in x and x.get("pair_sidecar") not in sidecars:
+            probs.append(f"{pvc}: declared empty by design but {x.get('path')} is not part of a verified pair")
+    return {"reason": reason, "cutoff": cutoff, "current_pairs_trained_after_cutoff": pairs_after,
+            "campaign_artifacts": []}, probs
+
+
+def resolve_artifact(d: str, ea: List[Dict]) -> Optional[Dict]:
+    """A campaign artifact digest resolved to VERIFIED evidence-archive members: a selected bundle manifest whose
+    original artifact_sha256 is d (its artifact and sidecar bytes verified by the reader against the manifest's
+    artifact_sha256/sidecar_sha256), the artifact member (in its own bundle, or in the bundle its artifact_key names)
+    with sha256 d, and the sidecar member with the manifest's sidecar_sha256. None when any piece is missing."""
+    by_dir: Dict[str, List[Dict]] = {}
+    for it in ea:
+        by_dir.setdefault(os.path.dirname(it["path"]), []).append(it)
+    mans = [m for m in ea if "sidecar_sha256" in m and m.get("artifact_sha256") == d]
+    for m in sorted(mans, key=lambda m: (bool(m.get("artifact_key")), m["path"])):
+        own = by_dir.get(os.path.dirname(m["path"]), [])
+        side = next((x for x in own if x is not m and x["sha256"] == m.get("sidecar_sha256")), None)
+        home = own
+        if m.get("artifact_key"):
+            tgt = next((t for t in ea if "sidecar_sha256" in t and t.get("bundle") == m["artifact_key"]), None)
+            home = by_dir.get(os.path.dirname(tgt["path"]), []) if tgt else []
+        art = next((x for x in home if "sidecar_sha256" not in x and x["sha256"] == d), None)
+        if side and art:
+            return {"artifact_sha256": d, "bundle": m.get("bundle"), "manifest_member": m["path"],
+                    "manifest_sha256": m["sha256"], "artifact_member": art["path"], "artifact_bytes": art["bytes"],
+                    "sidecar_member": side["path"], "sidecar_sha256": side["sha256"], "sidecar_bytes": side["bytes"],
+                    "verified": "artifact and sidecar bytes equal the original bundle manifest's artifact_sha256 / "
+                                "sidecar_sha256 and the sidecar's artifact_sha256 (reader); members re-verified in "
+                                "the evidence-archive export tar"}
+    return None
+
+
+def campaign_artifact_problems(s: Dict, pvcs: Dict[str, Dict]) -> List[str]:
+    """For an empty-by-design ml-models export: the reviewed campaign artifact inventory covers every artifact the
+    campaign forecast issuances/decisions reference and every training bundle copied up to the campaign cutoff, and
+    each inventory digest resolves to verified evidence-archive members (stored as references in the plan)."""
+    mm = pvcs.get("ml-models-pvc") or {}
+    if not mm.get("empty_by_design"):
+        return []
+    out, cutoff = [], s["cutoff"]
+    inv = [a["artifact_sha256"] for a in s["pvcs"]["ml-models-pvc"]["campaign_artifacts"]]
+    fl = pvcs.get("forecast-log-pvc", {}).get("selection", [])
+    referenced = {d for it in fl for d in it.get("referenced_artifact_sha256") or []}
+    if not any("referenced_artifact_sha256" in it for it in fl):
+        out.append("ml-models-pvc: empty by design needs the forecast log's referenced artifacts (collect_refs)")
+    ea = pvcs.get("evidence-archive-pvc", {}).get("selection", [])
+    trained = {m["artifact_sha256"] for m in ea if "sidecar_sha256" in m and m.get("artifact_sha256")
+               and str(m.get("ts", "")) <= cutoff}
+    for d in sorted(referenced - set(inv)):
+        out.append(f"ml-models-pvc: the campaign forecast log references artifact {d} outside the reviewed campaign "
+                   "artifact inventory")
+    for d in sorted(trained - set(inv)):
+        out.append(f"ml-models-pvc: the campaign training bundle artifact {d} is outside the reviewed campaign "
+                   "artifact inventory")
+    refs = []
+    for d in inv:
+        r = resolve_artifact(d, ea)
+        if r is None:
+            out.append(f"ml-models-pvc: campaign artifact {d} does not resolve to a verified evidence-archive bundle "
+                       "member (artifact and sidecar)")
         else:
-            pairs_after.append({"path": x["path"], "trained_at": x["ts"]})
-    return {"reason": reason, "cutoff": cutoff, "files_trained_after_cutoff": pairs_after,
-            "campaign_artifacts": "the immutable archived bundles of evidence-archive-pvc"}, probs
+            refs.append(dict(r, referenced_by=sorted(
+                (["forecast log"] if d in referenced else []) + (["training bundle"] if d in trained else []))))
+    mm["empty_by_design"]["campaign_artifacts"] = refs
+    return out
 
 
 def plan(record: X.Record, kube: X.Kube) -> Dict:
@@ -1328,6 +1445,7 @@ def plan(record: X.Record, kube: X.Kube) -> Dict:
                    "volume": r["result"]["volume"], "rule_excluded": rule_excluded, "reviewed_exclusions": exclusions,
                    "empty_by_design": empty}
     probs += archive_closure_problems(pvcs)
+    probs += campaign_artifact_problems(s, pvcs)
     if total > s["budget"]["max_total_bytes"]:
         probs.append(f"the PVC exports total {total} bytes, over the budget {s['budget']['max_total_bytes']}")
     export_dir = ev["export_dir"]
@@ -1387,14 +1505,14 @@ def verify_tar(path: str, selection: List[Dict], trailer: Dict) -> List[str]:
     return out
 
 
-def export_pvc(record, kube, lock, s, pvc, info, exe, sleep, now, digest) -> Dict:
+def export_pvc(record, kube, lock, s, pvc, info, exe, sleep, now, digest, done=None) -> Dict:
     d = os.path.join(evidence(record)["export_dir"], "pvc-exports", pvc)
     os.makedirs(d, exist_ok=True)
     tar_path = os.path.join(d, "campaign-export.tar")
     if os.path.exists(tar_path):
         raise X.StagingError(f"{tar_path} exists (a PVC export is produced once)")
     if info.get("empty_by_design"):
-        return export_empty(record, d, pvc, info, digest)
+        return export_empty(record, d, pvc, info, digest, done or {})
     job = {"mode": "export", "mount": s["pvcs"][pvc]["mount"], "selection": info["selection"]}
     rc, err, tmp = run_reader(record, kube, lock, HELPER, s, pvc, info["binding"], job, exe, sleep, now)
     try:
@@ -1435,10 +1553,57 @@ def export_pvc(record, kube, lock, s, pvc, info, exe, sleep, now, digest) -> Dic
     return manifest
 
 
-def export_empty(record: X.Record, d: str, pvc: str, info: Dict, digest: str) -> Dict:
-    """The reviewed empty-by-design export: an empty tar (no reader pod) and a manifest stating why and listing the
-    model files skipped as trained after the cutoff."""
+EA_DIR = "pvc-exports/evidence-archive-pvc"
+
+def archive_reference_problems(pvc: str, refs: List[Dict], root: str) -> List[str]:
+    """Every campaign artifact reference resolves in the EXPORTED evidence-archive manifest (member, sha256, bytes)
+    and names that export's tar and manifest digests; the tar's members are verified against the manifest
+    separately (verify_tar)."""
+    out = []
+    mpath = os.path.join(root, EA_DIR, "manifest.json")
+    if not os.path.isfile(mpath):
+        return [f"{pvc}: the evidence-archive export is missing, so no campaign artifact reference can resolve"]
+    m = json.load(open(mpath))
+    msha = C.sha256_file(mpath)
+    files = {f["member"]: f for f in m.get("files") or []}
+    if not refs:
+        out.append(f"{pvc}: empty by design without any verified campaign artifact reference")
+    for r in refs:
+        ex = r.get("export") or {}
+        if ex.get("tar_sha256") != m["tar"]["sha256"] or ex.get("manifest_sha256") != msha:
+            out.append(f"{pvc}: campaign artifact {r.get('artifact_sha256')} names another evidence-archive export")
+        for k, want, nbytes in (("artifact_member", r.get("artifact_sha256"), r.get("artifact_bytes")),
+                                ("sidecar_member", r.get("sidecar_sha256"), r.get("sidecar_bytes")),
+                                ("manifest_member", r.get("manifest_sha256"), None)):
+            f = files.get(r.get(k))
+            if not f or f["sha256"] != want or (nbytes is not None and f["bytes"] != nbytes):
+                out.append(f"{pvc}: campaign artifact {r.get('artifact_sha256')}: its {k} is not a verified member "
+                           "of the evidence-archive export")
+        man = files.get(r.get("manifest_member")) or {}
+        if man.get("artifact_sha256") != r.get("artifact_sha256") or \
+                man.get("sidecar_sha256") != r.get("sidecar_sha256"):
+            out.append(f"{pvc}: campaign artifact {r.get('artifact_sha256')}: the exported bundle manifest does not "
+                       "carry its original artifact/sidecar hashes")
+    return out
+
+
+def export_empty(record: X.Record, d: str, pvc: str, info: Dict, digest: str, done: Dict) -> Dict:
+    """The reviewed empty-by-design export: an empty tar (no reader pod) and a manifest with the reason, the current
+    (post-cutoff) pairs' hashes and byte counts, and every campaign artifact's verified evidence-archive member
+    references, checked against the evidence-archive export before sealing."""
     import io
+    root = evidence(record)["export_dir"]
+    if "evidence-archive-pvc" not in done:
+        raise X.StagingError(f"{pvc}: the evidence-archive export must precede an empty-by-design export")
+    ea_m = os.path.join(root, EA_DIR, "manifest.json")
+    ex = {"tar": f"{EA_DIR}/campaign-export.tar", "tar_sha256": done["evidence-archive-pvc"]["tar"]["sha256"],
+          "manifest": f"{EA_DIR}/manifest.json", "manifest_sha256": C.sha256_file(ea_m),
+          "source_pvc_uid": done["evidence-archive-pvc"]["pvc_uid"]}
+    ebd = copy.deepcopy(info["empty_by_design"])
+    ebd["campaign_artifacts"] = [dict(r, export=ex) for r in ebd["campaign_artifacts"]]
+    probs = archive_reference_problems(pvc, ebd["campaign_artifacts"], root)
+    if probs:
+        raise X.StagingError("; ".join(probs))
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT):
         pass
@@ -1451,7 +1616,7 @@ def export_empty(record: X.Record, d: str, pvc: str, info: Dict, digest: str) ->
                 "cutoffs": sorted({r["cutoff"] for r in info["rules"]}), "reader_sha256": READER_SHA256,
                 "order_tolerances": order_tolerances(info["rules"]),
                 "populator_sha256": C.sha256_file(os.path.abspath(__file__)), "plan_sha256": digest, "files": [],
-                "empty_by_design": info["empty_by_design"], "rule_excluded": info["rule_excluded"],
+                "empty_by_design": ebd, "rule_excluded": info["rule_excluded"],
                 "reviewed_exclusions": info["reviewed_exclusions"], "volume_totals_at_probe": info["volume"],
                 "tar": {"file": "campaign-export.tar", "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}}
     mtext = (json.dumps(manifest, indent=1, sort_keys=True) + "\n").encode()
@@ -1479,11 +1644,20 @@ def coverage(record: X.Record, s: Dict, p: Dict, manifests: Dict[str, Dict]) -> 
                  "required": (s.get("requirements") or {}).get(r["name"], "")}
         if r["name"] in manifests and manifests[r["name"]].get("empty_by_design"):
             m = manifests[r["name"]]
-            entry["protected"] = {"export": f"pvc-exports/{r['name']}/campaign-export.tar", "files": 0,
-                                  "empty_by_design": m["empty_by_design"],
-                                  "verified": "every model pair present was trained after the cutoff"}
+            e = m["empty_by_design"]
+            mpath = os.path.join(evidence(record)["export_dir"], "pvc-exports", r["name"], "manifest.json")
+            entry["protected"] = {
+                "empty_by_design": True, "reason": e["reason"], "cutoff": e["cutoff"], "files": 0,
+                "export": f"pvc-exports/{r['name']}/campaign-export.tar", "tar_sha256": m["tar"]["sha256"],
+                "manifest": f"pvc-exports/{r['name']}/manifest.json", "manifest_sha256": C.sha256_file(mpath),
+                "plan_sha256": m["plan_sha256"],
+                "current_pairs_trained_after_cutoff": e["current_pairs_trained_after_cutoff"],
+                "campaign_artifacts": e["campaign_artifacts"],
+                "statement": "the campaign model artifacts are protected by the listed VERIFIED evidence-archive "
+                             "members, not by this empty tar"}
             entry["residual_not_backed_up"] = {
-                "description": "the current (post-campaign) models are RETAINED on the claim but NOT backed up by S0",
+                "description": "the current (post-campaign) models are RETAINED on the claim but NOT backed up by S0; "
+                               "no PVC/PV data deletion, overwrite or live storage change is authorised",
                 "volume_files_at_probe": m["volume_totals_at_probe"]["files"],
                 "volume_bytes_at_probe": m["volume_totals_at_probe"]["bytes"]}
         elif r["name"] in manifests:
@@ -1554,7 +1728,8 @@ def export(record: X.Record, kube: X.Kube, reviewed: Dict, digest: str, exe=None
             _write_identical(os.path.join(root, k), v)
         manifests = {}
         for pvc in PVC_EXPORTS:
-            manifests[pvc] = export_pvc(record, kube, lock, s, pvc, live["pvcs"][pvc], exe, sleep, now, digest)
+            manifests[pvc] = export_pvc(record, kube, lock, s, pvc, live["pvcs"][pvc], exe, sleep, now, digest,
+                                        manifests)
         os.makedirs(os.path.join(root, "storage"), exist_ok=True)
         _write_identical(os.path.join(root, "storage", "pvc-retention-and-export-coverage.json"),
                          coverage(record, s, live, manifests))
@@ -1595,6 +1770,14 @@ def verify(record: X.Record) -> Dict:
             if m.get("empty_by_design"):
                 if files:
                     probs.append(f"{pvc}: declared empty by design but lists payloads")
+                probs += archive_reference_problems(pvc, m["empty_by_design"].get("campaign_artifacts") or [], root)
+                cov = json.load(open(os.path.join(root, "storage", "pvc-retention-and-export-coverage.json")))
+                c = next((c for c in cov.get("claims", []) if c.get("claim") == pvc), {}).get("protected") or {}
+                if c.get("campaign_artifacts") != m["empty_by_design"]["campaign_artifacts"] or \
+                        c.get("current_pairs_trained_after_cutoff") != \
+                        m["empty_by_design"]["current_pairs_trained_after_cutoff"] or \
+                        c.get("manifest_sha256") != C.sha256_file(os.path.join(d, "manifest.json")):
+                    probs.append(f"{pvc}: the coverage file does not carry the manifest's verified references")
             elif not files or any(f["bytes"] <= 0 for f in files):
                 probs.append(f"{pvc}: the export lists no or empty payloads")
     return {"helper": HELPER, "action": "verify", "export_dir": root, "files": len(have), "problems": probs,
