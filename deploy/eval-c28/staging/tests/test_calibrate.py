@@ -933,3 +933,23 @@ def test_certificate_states_the_pending_experiment_admission(cal):
     ctx = cal()
     run(ctx)
     assert any("maximum-arrival admission stays PENDING" in s for s in cert(ctx)["scope_limits"])
+
+
+def test_k6_boundary_iteration_is_accepted_but_never_a_missing_dispatch(cal):
+    """The kind smoke showed real k6 starting ONE iteration beyond rate x duration (300 -> 301, 1000 -> 1001)."""
+    ctx = cal()
+    run(ctx)
+    raw = _raw(ctx, "t003")
+    for extra, verdict in ((1, "PASS"), (2, "INCOMPLETE")):
+        r = copy.deepcopy(raw)
+        t, sm = _summary(r)
+        for k in ("iterations", "http_reqs"):
+            sm["scenarios"]["measure"][k]["count"] += extra
+        sm["scenarios"]["measure"]["http_req_failed"]["fails"] += extra
+        t["message"] = json.dumps(sm)
+        for v in r["observations"]["ingress_after"]["requests"]["response"]["data"]["result"][0]["values"] + \
+                r["observations"]["ingress_after"]["responses"]["response"]["data"]["result"][0]["values"]:
+            v[1] = str(float(v[1]) + extra)
+        assert K.evaluate_trial(ctx.con, r)["verdict"] == verdict, extra
+    assert K.offered_ok(300, 300) and K.offered_ok(300, 301) and not K.offered_ok(300, 299) \
+        and not K.offered_ok(300, 302)

@@ -12,6 +12,7 @@ evidence by itself. The executor uses it under a locked run-lock and the change 
 | `harness/c28/` | `render` (fixture, ingress, routes, quota and the five arms for both startup profiles, with an exclusive-writer audit, a sidecar-free audit and the residency budget), `schedule` (programs, k6 plans, fault timetable, the frozen session order), `runlock`, `collect` (hashed evidence bundle), `reduce` (per-window metrics), `score` (paired day-block bootstrap, Holm correction, the section 8 classification), `inject` (the guarded quota fault). `frozen.py` holds every value the manifest freezes. |
 | `params/` | `kind-smoke.json` for the kind smoke. `prodcluster.template.json` lists what the run-lock must resolve; it cannot be rendered until every placeholder is replaced (the calibrated fixture resources and the W/S residency inputs included). |
 | `smoke/kind.sh` | The aspire kind-bed smoke, on its own cluster and kubeconfig only. `--render-only` renders and audits offline; `scripts/verify.sh` runs that mode. |
+| `smoke/calibrate-kind.sh` | The kind smoke of the calibration path (`--images images.json --out report.json`, own cluster and kubeconfig only, reviewed digests pulled on the nodes): non-root summary delivery through the termination message, the actual scenario timing, zero drops reconciled against the ingress's own counters, reported drops with starved VUs, refusal of truncated or malformed summaries, UID-bound stop, `activeDeadlineSeconds` expiry, cleanup and image identity (`calibrate_kind.py`). Required before any prod calibration; not C2.8 evidence. |
 
 ```sh
 cd deploy/eval-c28/harness
@@ -259,7 +260,8 @@ Every trial goes through a pinned calibration ingress on W (offered demand is co
 it), one k6 Job on S (`load/c28-calibrate.js`: settle and measure scenarios, its summary in the pod's termination
 message, a finite `activeDeadlineSeconds`). Scheduled, dispatched, received and terminal outcomes are reconciled;
 missing outcomes are unknown (never successes), more arrivals at the ingress than the generator dispatched is
-incomplete evidence, and the dispatch reconciliation is exact (zero dropped arrivals is the criterion; an absent
+incomplete evidence, and the dispatch reconciliation never hides a missing dispatch: k6's dropped + dispatched must be
+the scheduled count or k6's one boundary iteration more (zero dropped arrivals is the criterion; an absent
 `dropped_iterations` counts as zero only when every scheduled arrival was dispatched). The observer window is the
 measure scenario's actual start as k6 recorded it, never the container start plus the nominal settling. Guest steal
 above 5 % for five consecutive one-minute bins on W or S, or a missing steal observation, stops the trial. The

@@ -90,8 +90,9 @@ Measurement (per trial, evaluate_trial, recomputed by the reducer from the raw f
     (exec.scenario.startTime, in the summary), + measure_s] at the 15 s cadence, never the container start plus the
     nominal settling: the fixture's WAITING queue, its in-flight gauge (recorded separately), fixture CPU and
     throttling, ingress and generator CPU and throttling, and per-node guest steal (one-minute steps).
-  Reconciliation: scheduled = rate * duration / 60 must equal dropped + dispatched EXACTLY (a tolerance never conceals
-  a missing dispatch; an absent dropped_iterations counts as zero only when dispatched == scheduled); dispatched -
+  Reconciliation: k6's offered arrivals (dropped + dispatched) must be scheduled = rate * duration / 60 or at most ONE
+  more (k6's boundary iteration, seen on the kind bed); never fewer, so no tolerance conceals a missing dispatch; an
+  absent dropped_iterations counts as zero only when dispatched satisfies that rule; dispatched -
   terminal = unknown outcomes (counted as failures for the bound; when only they push the fraction over the limit the
   result is INCOMPLETE, not a measured failure); received > dispatched + tolerance = UNACCOUNTED ARRIVALS
   (INCOMPLETE); dispatched > received + tolerance = arrivals lost before the ingress (LIMIT); ingress responses must
@@ -1031,6 +1032,16 @@ def _pod_identity(pods: List[Dict]) -> Dict[str, Tuple]:
     return out
 
 
+K6_BOUNDARY_EXTRA = 1       # constant-arrival-rate may start ONE iteration beyond rate x duration at the boundary
+
+
+def offered_ok(scheduled: float, offered: float) -> bool:
+    """k6's own count of offered arrivals (dropped + dispatched) against rate x duration: never fewer (a missing
+    dispatch is never concealed), at most K6_BOUNDARY_EXTRA more. Observed on the kind bed with the reviewed k6 digest
+    (smoke/calibrate-kind.sh): 300 scheduled gave 301, 1000 gave 1001, other scenarios exact."""
+    return scheduled <= offered <= scheduled + K6_BOUNDARY_EXTRA
+
+
 INIT_SLACK_S = 300          # the measure scenario may start at most this long after container start + settle
 
 
@@ -1221,15 +1232,16 @@ def evaluate_trial(con: Dict, raw: Dict) -> Dict:
         dropped = _metric(summary, s, "dropped_iterations", "count")
         terminal = _metric(summary, s, "http_reqs", "count")
         failed = _metric(summary, s, "http_req_failed", "passes")
-        if summary and dropped is None and dispatched is not None and dispatched == sched[s]:
-            dropped = 0          # absent means zero only when every scheduled arrival was dispatched, exactly
+        if summary and dropped is None and dispatched is not None and offered_ok(sched[s], dispatched):
+            dropped = 0          # absent means zero only when every scheduled arrival was dispatched
         counts[s] = {"scheduled": sched[s], "dispatched": dispatched, "dropped": dropped, "terminal": terminal,
-                     "failed": failed}
+                     "failed": failed, "offered": None if None in (dropped, dispatched) else dropped + dispatched}
         if summary and None in (dispatched, dropped, terminal, failed):
             incomplete.append(f"{s}: the k6 counts are incomplete")
         elif summary:
-            if sched[s] != dropped + dispatched:          # exact: a tolerance never conceals a missing dispatch
-                incomplete.append(f"{s}: scheduled {sched[s]:g} != dropped {dropped:g} + dispatched {dispatched:g}")
+            if not offered_ok(sched[s], dropped + dispatched):   # never a missing dispatch; at most k6's boundary one
+                incomplete.append(f"{s}: dropped {dropped:g} + dispatched {dispatched:g} is not the scheduled "
+                                  f"{sched[s]:g} (or k6's one boundary iteration more)")
             if terminal > dispatched + tol(dispatched):
                 incomplete.append(f"{s}: more terminal outcomes ({terminal:g}) than dispatched ({dispatched:g})")
     crit["arrivals"] = counts
@@ -1280,9 +1292,10 @@ def evaluate_trial(con: Dict, raw: Dict) -> Dict:
     succeeded = None
     if None not in (m["dispatched"], m["dropped"], m["terminal"], m["failed"]):
         unknown = max(0.0, m["dispatched"] - m["terminal"])
-        measured = (m["failed"] + m["dropped"]) / m["scheduled"]
-        bound = (m["failed"] + m["dropped"] + unknown) / m["scheduled"]
-        dropped_fraction = m["dropped"] / m["scheduled"]
+        offered = max(m["scheduled"], m["offered"])          # what k6 actually scheduled
+        measured = (m["failed"] + m["dropped"]) / offered
+        bound = (m["failed"] + m["dropped"] + unknown) / offered
+        dropped_fraction = m["dropped"] / offered
         succeeded = m["terminal"] - m["failed"]
         crit["failure_fraction"] = {"measured": measured, "upper_bound": bound, "unknown_outcomes": unknown,
                                     "limit": cr["max_failure_fraction"], "pass": bound <= cr["max_failure_fraction"]}
