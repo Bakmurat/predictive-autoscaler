@@ -625,3 +625,20 @@ def test_a_paused_scaled_object_does_not_hide_its_generated_hpa(tmp_path):
     census = LG.writer_census(api)
     assert census["nginx-test"] == ["horizontalpodautoscalers keda-hpa-nginx-test-keda-fallback"]   # not empty
     assert census["myapptwo"] == ["scaledobjects myapptwo-keda-fallback"]          # absorbed: verified, counted owner
+
+
+
+def test_recovery_needs_the_owning_runs_record(tmp_path):
+    # Codex r4 on #31: the lock names its run, record and receipt location; another record cannot release it.
+    api, rec, clock, lock = lost_delete(tmp_path)
+    crash_owner(lock)
+    sha = C.sha256_file(lock)
+    other_run = dict(rec, run_id="c28-r2", evidence_dir=str(tmp_path / "evidence-r2"))
+    same_run_elsewhere = dict(rec, evidence_dir=str(tmp_path / "evidence-copy"))
+    edited = dict(rec, legacy=dict(rec["legacy"], observe_seconds=300))
+    for wrong, field in ((other_run, "run_id"), (same_run_elsewhere, "receipts_dir"), (edited, "record_sha256")):
+        with pytest.raises(C.StagingError, match=f"another run or record.*{field}"):
+            LG.recover(api, wrong, sha, clock)
+        assert os.path.exists(lock)
+    assert not any(r["event"].startswith("reconciled-") for r in C.read_receipts(C.receipts_path(rec, "legacy")))
+    assert LG.recover(api, rec, sha, clock) and not os.path.exists(lock)
