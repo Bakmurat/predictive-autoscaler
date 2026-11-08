@@ -59,7 +59,7 @@ def volumes(root):
     collect_load_evidence.py, the operator and trainer), plus post-cutoff and live material that must NOT be exported."""
     v = {p: os.path.join(root, "vol", p) for p in MOUNTS}
     fc = [{"event": "decision", "at": "2026-11-01T23:58:00Z", "artifact_sha256": None},
-          {"issued_at": "2026-11-01T23:59:00Z", "forecasts": [], "artifact_sha256": sha(b"pickled-model-v1")},
+          {"issued_at": "2026-11-01T23:59:00Z", "forecasts": [], "model_name": "lstm_nginx-test_requests", "artifact_sha256": sha(b"pickled-model-v1")},
           {"event": "decision", "at": "2026-11-02T00:01:00Z"}]
     write(os.path.join(v["forecast-log-pvc"], "forecasts.jsonl"), jl(*fc) + '{"event": "decision", "at": "2026-11-0')
     a = v["evidence-archive-pvc"]
@@ -1086,8 +1086,8 @@ def test_empty_by_design_resolves_the_reviewed_campaign_artifacts(env):
     models_after_cutoff_only(e)
     absent = "f" * 64
     fl = os.path.join(e["vols"]["forecast-log-pvc"], "forecasts.jsonl")
-    write(fl, jl({"issued_at": "2026-11-01T23:00:00Z", "forecasts": [], "artifact_sha256": absent},
-                 {"issued_at": "2026-11-01T23:59:00Z", "forecasts": [], "artifact_sha256": CAMPAIGN_ART}))
+    write(fl, jl({"issued_at": "2026-11-01T23:00:00Z", "forecasts": [], "model_name": "lstm_nginx-test_requests", "artifact_sha256": absent},
+                 {"issued_at": "2026-11-01T23:59:00Z", "forecasts": [], "model_name": "lstm_nginx-test_requests", "artifact_sha256": CAMPAIGN_ART}))
     set_empty_by_design(e)
     do_probe(e)
     probs = P.plan(e["record"], e["kube"])["problems"]
@@ -1102,7 +1102,7 @@ def test_empty_by_design_resolves_the_reviewed_campaign_artifacts(env):
     with pytest.raises(X.StagingError, match="reviewed campaign artifact inventory"):
         P.section(e["record"])
     # the fixed state: only the archived campaign artifact is referenced
-    write(fl, jl({"issued_at": "2026-11-01T23:59:00Z", "forecasts": [], "artifact_sha256": CAMPAIGN_ART}))
+    write(fl, jl({"issued_at": "2026-11-01T23:59:00Z", "forecasts": [], "model_name": "lstm_nginx-test_requests", "artifact_sha256": CAMPAIGN_ART}))
     set_empty_by_design(e)
     do_probe(e)
     out = do_export(e)
@@ -1215,3 +1215,81 @@ def test_cutoff_boundary_keeps_nanoseconds_end_to_end(env, trained_at, after):
     else:
         probs = P.plan(e["record"], e["kube"])["problems"]
         assert any("declared empty by design but the rules select 2 files" in x for x in probs), probs
+
+
+def ensemble_log(e, extra=()):
+    fp1, fp2 = "e1" * 32, "e2" * 32
+    recs = [{"issued_at": "2026-11-01T18:06:00Z", "forecasts": [], "model_name": "ensemble_nginx-ensemble_requests",
+             "model_version": "seasonal-ensemble-q90-v1:891ca@" + fp1[:12], "artifact_sha256": fp1},
+            {"event": "decision", "at": "2026-11-01T18:07:00Z", "artifact_sha256": fp1, "model_version": "x"},
+            {"issued_at": "2026-11-01T23:59:00Z", "forecasts": [], "model_name": "lstm_nginx-test_requests",
+             "artifact_sha256": CAMPAIGN_ART},
+            {"event": "decision", "at": "2026-11-01T23:59:30Z", "artifact_sha256": CAMPAIGN_ART},
+            {"issued_at": "2026-11-01T23:59:40Z", "forecasts": [], "model_name": "ensemble_nginx-ensemble-q95_requests",
+             "artifact_sha256": fp2}] + list(extra)
+    write(os.path.join(e["vols"]["forecast-log-pvc"], "forecasts.jsonl"), jl(*recs))
+    return fp1, fp2
+
+
+def test_ensemble_generation_fingerprints_are_not_campaign_artifacts(env):
+    """The 2026-11-08 plan's 103 problems: ensemble_* issuances carry a generation data fingerprint as artifact_sha256
+    (no model file). They are classified by model_name and listed, not resolved; lstm_* digests (persisted
+    artifacts) are still checked like with like, and a missing one still blocks."""
+    e = env
+    models_after_cutoff_only(e)
+    fp1, fp2 = ensemble_log(e)
+    set_empty_by_design(e)
+    do_probe(e)
+    p = P.plan(e["record"], e["kube"])
+    assert p["problems"] == [], p["problems"]
+    it = p["pvcs"]["forecast-log-pvc"]["selection"][0]
+    assert it["referenced_artifact_sha256"] == [CAMPAIGN_ART]
+    assert it["referenced_generation_fingerprints"] == sorted([fp1, fp2])
+    gf = p["pvcs"]["ml-models-pvc"]["empty_by_design"]["generation_fingerprints_not_artifacts"]
+    assert gf["count"] == 2 and gf["sha256"] == sorted([fp1, fp2])
+    out = do_export(e)
+    assert out["event"] == "export-complete" and P.verify(e["record"])["result"] == "PASS"
+    root = e["record"].doc["archive"]["evidence"]["export_dir"]
+    cov = json.load(open(os.path.join(root, "storage/pvc-retention-and-export-coverage.json")))
+    mc = next(c for c in cov["claims"] if c["claim"] == "ml-models-pvc")["protected"]
+    assert mc["generation_fingerprints_not_artifacts"]["sha256"] == sorted([fp1, fp2])
+
+
+def test_a_missing_lstm_artifact_still_blocks_beside_ensembles(env):
+    e = env
+    models_after_cutoff_only(e)
+    absent = "a" * 64
+    ensemble_log(e, [{"issued_at": "2026-11-01T23:59:50Z", "forecasts": [], "model_name": "lstm_nginx-seasonal_requests",
+                      "artifact_sha256": absent}])
+    set_empty_by_design(e)
+    do_probe(e)
+    probs = P.plan(e["record"], e["kube"])["problems"]
+    assert [x for x in probs if "references artifact" in x] == [
+        f"ml-models-pvc: the campaign forecast log references artifact {absent} outside the reviewed campaign "
+        "artifact inventory"], probs
+
+
+@pytest.mark.parametrize("extra, why", [
+    ({"issued_at": "2026-11-01T23:59:50Z", "forecasts": [], "model_name": "pm-marker-xyz_model",
+      "artifact_sha256": "b" * 64}, "carries a artifact_sha256 but its model_name is of no declared class"),
+    ({"event": "decision", "at": "2026-11-01T23:59:50Z", "artifact_sha256": "c" * 64},
+     "1 artifact_sha256 values of forecasts.jsonl records without model_name match no classified record"),
+])
+def test_unclassified_forecast_digests_fail_closed(env, extra, why):
+    e = env
+    ensemble_log(e, [extra])
+    do_probe(e)
+    probs = P.plan(e["record"], e["kube"])["problems"]
+    assert any(why in x for x in probs), probs
+    assert not any("pm-marker-xyz" in x or "c" * 64 in x for x in probs)
+
+
+def test_ref_classes_need_disjoint_prefixes(env):
+    e = env
+    doc = json.load(open(e["path"]))
+    rule = copy.deepcopy(P.DEFAULT_RULES["forecast-log-pvc"][0])
+    rule["ref_classes"]["fingerprint_prefixes"] = ["lstm_nginx"]
+    doc["populate"]["pvcs"]["forecast-log-pvc"]["rules"] = [rule]
+    write(e["path"], json.dumps(doc))
+    with pytest.raises(X.StagingError, match="disjoint"):
+        P.effective_rules(P.section(X.load_record(e["path"], ("populate", "archive"))), "forecast-log-pvc")

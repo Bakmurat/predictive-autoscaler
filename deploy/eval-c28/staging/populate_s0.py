@@ -30,7 +30,7 @@ evidence archive selection holds its immutable archived copy (same artifact and 
 Rules (populate.pvcs.<pvc>.rules; cutoff "campaign" = populate.cutoff, "collection" = populate.collection_cutoff for
 the collectors' own post-stop files, or an explicit UTC time):
   {"type": "jsonl_prefix", "path": P, "ts_fields": [...] | "ts_by": {"field": F, "types": {T: [...]}},
-   "known_keys": [...], "collect_refs": [K], "order_tolerance_seconds": N, "order_tolerance_review": "..."}
+   "known_keys": [...], "ref_classes": {...}, "order_tolerance_seconds": N, "order_tolerance_review": "..."}
         the prefix of an append-only JSONL file up to its LAST record at or before the cutoff; a record's time is the
         first present field of ts_fields, or of its own type's list (types keyed by the discriminator F; "" = without
         F). An unknown type or a record without a usable time fails the rule and is reported by its SHAPE only: the
@@ -38,7 +38,9 @@ the collectors' own post-stop files, or an explicit UTC time):
         F only when it is a known type (else its JSON type and a digest). Ordering is STRICT by default; a tolerance
         for interleaved writers is a per-rule exception that needs order_tolerance_review, and the plan and manifest
         list it (order_tolerances); its overhang lines are counted apart (overshoot_lines), never campaign records.
-        collect_refs lists the sha256 values of fields K (e.g. artifact_sha256) in the records up to the cutoff
+        ref_classes {field, class_by, artifact_prefixes, fingerprint_prefixes} sorts the field's sha256 values in the
+        records up to the cutoff by the record's class_by (model_name): persisted artifacts vs generation fingerprints;
+        a value whose record lacks class_by must match a classified one, any other class fails
   {"type": "named", "glob": G, "ts_regex": R, "ts_format": F}  files whose NAME carries a time at or before the cutoff
   {"type": "bundles", "manifest_glob": G, "ts_field": T}       archive bundles by their manifest's T, every original
         hash verified; a sidecar variant's artifact_key must name a selected bundle
@@ -287,8 +289,9 @@ def scan(mount, rel, rule, cutoff, collect=False):
     before the cutoff that follows a later record by more is not append-ordered and fails. A record without a usable
     timestamp fails, reported by its shape only. Returns {offset, lines, overshoot, after, records?} and problems."""
     tol = int(rule.get("order_tolerance_seconds", 0)) * NS                            # strict unless reviewed
-    out = {"offset": 0, "lines": 0, "overshoot": 0, "after": 0, "records": [], "after_records": [], "refs": set()}
-    ref_fields = rule.get("collect_refs") or []
+    out = {"offset": 0, "lines": 0, "overshoot": 0, "after": 0, "records": [], "after_records": [],
+           "artifacts": set(), "fingerprints": set(), "unnamed": set()}
+    rc = rule.get("ref_classes")
     pend_n, pend_max, pend_recs, pend_bytes, probs = 0, None, [], 0, []
     with open(safe(mount, rel), "rb") as fh:
         for n, raw in enumerate(fh, 1):
@@ -305,16 +308,21 @@ def scan(mount, rel, rule, cutoff, collect=False):
                 if pend_n and pend_max > cutoff + tol:
                     probs.append("%s: a record at or before the cutoff (line %d) follows a record more than %d s "
                                  "after it (not append-ordered)" % (rel, n, tol // NS)); break
-                for f in ref_fields:
-                    v = rec.get(f)
-                    if v in (None, ""):
-                        continue
+                v = rec.get(rc["field"]) if rc else None
+                if v not in (None, ""):
                     if not (isinstance(v, str) and HEX64.match(v)):
                         probs.append("a record of %s at line %d has a %s that is not a sha256: %s"
-                                     % (rel, n, f, shape(rec, rule))); break
-                    out["refs"].add(v)
-                if probs:
-                    break
+                                     % (rel, n, rc["field"], shape(rec, rule))); break
+                    name = rec.get(rc["class_by"])
+                    if rc["class_by"] not in rec:
+                        out["unnamed"].add(v)        # e.g. a decision: it repeats the digest of an issuance
+                    elif isinstance(name, str) and name.startswith(tuple(rc["artifact_prefixes"])):
+                        out["artifacts"].add(v)
+                    elif isinstance(name, str) and name.startswith(tuple(rc["fingerprint_prefixes"])):
+                        out["fingerprints"].add(v)
+                    else:
+                        probs.append("a record of %s at line %d carries a %s but its %s is of no declared class: %s"
+                                     % (rel, n, rc["field"], rc["class_by"], shape(rec, rule))); break
                 out["offset"] += pend_bytes + len(raw)
                 out["lines"] += pend_n + 1
                 out["overshoot"] += pend_n
@@ -342,8 +350,15 @@ def jsonl_prefix(mount, rule, cutoff):
     if probs:
         return [], [], probs
     extra = {"overshoot_lines": res["overshoot"]}
-    if rule.get("collect_refs"):
-        extra["referenced_artifact_sha256"] = sorted(res["refs"])
+    rc = rule.get("ref_classes")
+    if rc:
+        stray = res["unnamed"] - res["artifacts"] - res["fingerprints"]
+        if stray:
+            return [], [], ["%d %s values of %s records without %s match no classified record up to the cutoff "
+                            "(sha256 of the sorted set %s)" % (len(stray), rc["field"], rule["path"], rc["class_by"],
+                                                               digest12(sorted(stray)))]
+        extra["referenced_artifact_sha256"] = sorted(res["artifacts"])
+        extra["referenced_generation_fingerprints"] = sorted(res["fingerprints"])
     if res["overshoot"]:
         extra["overshoot_note"] = ("lines after the cutoff inside the prefix under the reviewed order tolerance: an "
                                    "overhang of interleaved writers, not campaign records")
@@ -712,7 +727,13 @@ DEFAULT_RULES = {
                               "": ["issued_at"], "decision": ["at"], "sanity_rejected": ["rejected_at"],
                               "forecast_ledger_session": ["at"], "forecast_attempt_started": ["at"],
                               "forecast_attempt_completed": ["at"]}},
-                          "known_keys": FORECAST_KEYS_0472829, "collect_refs": ["artifact_sha256"]}],
+                          "known_keys": FORECAST_KEYS_0472829,
+                          # issuances name their model: lstm_* serve a persisted trainer artifact (artifact_sha256 =
+                          # the .pkl's sha256); ensemble_* serve an in-memory generation whose artifact_sha256 is the
+                          # generation's data fingerprint (ml-engine/models/seasonal_ensemble.py, api/main.py), never
+                          # a file; decisions carry no model_name and repeat an issuance's digest
+                          "ref_classes": {"field": "artifact_sha256", "class_by": "model_name",
+                                          "artifact_prefixes": ["lstm_"], "fingerprint_prefixes": ["ensemble_"]}}],
     "evidence-archive-pvc": [{"type": "bundles", "manifest_glob": "archive/*/manifest.json", "ts_field": "copied_at",
                               "cutoff": "collection"}]
     + [{"type": "jsonl_prefix", "path": p, "ts_fields": f, "cutoff": "collection"} for p, f in COLLECTOR_LOGS]
@@ -734,7 +755,7 @@ DEFAULT_EXCLUDED = {
     "load-evidence-pvc": [{"glob": ".lock", "reason": "the collector's empty lock file"}],
     "ml-models-pvc": [],
 }
-RULE_KEYS = {"jsonl_prefix": {"type", "path", "ts_fields", "ts_by", "known_keys", "collect_refs",
+RULE_KEYS = {"jsonl_prefix": {"type", "path", "ts_fields", "ts_by", "known_keys", "ref_classes",
                               "order_tolerance_seconds", "order_tolerance_review", "cutoff"},
              "named": {"type", "glob", "ts_regex", "ts_format", "cutoff"},
              "bundles": {"type", "manifest_glob", "ts_field", "cutoff"},
@@ -817,8 +838,19 @@ def effective_rules(s: Dict, pvc: str) -> List[Dict]:
                 raise X.StagingError(f"{pvc}: jsonl_prefix needs ts_fields or ts_by {{field, types: {{type: [fields]}}}}")
             if not all(isinstance(k, str) for k in r.get("known_keys") or []):
                 raise X.StagingError(f"{pvc}: known_keys must be key names")
-            if not all(isinstance(k, str) and k in (r.get("known_keys") or []) for k in r.get("collect_refs") or []):
-                raise X.StagingError(f"{pvc}: collect_refs must name known_keys")
+            rc = r.get("ref_classes")
+            if rc is not None:
+                rc = rc if isinstance(rc, dict) else {}
+                pre = lambda k: rc.get(k) if isinstance(rc.get(k), list) and rc.get(k) and all(
+                    isinstance(x, str) and x for x in rc[k]) else None
+                ap, fp = pre("artifact_prefixes"), pre("fingerprint_prefixes")
+                known = r.get("known_keys") or []
+                if not (set(rc) == {"field", "class_by", "artifact_prefixes",
+                                                             "fingerprint_prefixes"}
+                        and rc["field"] in known and rc["class_by"] in known and ap and fp
+                        and not any(a.startswith(f) or f.startswith(a) for a in ap for f in fp)):
+                    raise X.StagingError(f"{pvc}: ref_classes needs field and class_by among known_keys and disjoint "
+                                         f"non-empty artifact_prefixes / fingerprint_prefixes")
             tol = r.get("order_tolerance_seconds", 0)
             if not isinstance(tol, int) or isinstance(tol, bool) or tol < 0:
                 raise X.StagingError(f"{pvc}: order_tolerance_seconds must be a non-negative integer")
@@ -1403,7 +1435,10 @@ def campaign_artifact_problems(s: Dict, pvcs: Dict[str, Dict]) -> List[str]:
     fl = pvcs.get("forecast-log-pvc", {}).get("selection", [])
     referenced = {d for it in fl for d in it.get("referenced_artifact_sha256") or []}
     if not any("referenced_artifact_sha256" in it for it in fl):
-        out.append("ml-models-pvc: empty by design needs the forecast log's referenced artifacts (collect_refs)")
+        out.append("ml-models-pvc: empty by design needs the forecast log's referenced artifacts (ref_classes)")
+    fps = sorted({d for it in fl for d in it.get("referenced_generation_fingerprints") or []})
+    for d in sorted(set(fps) & set(inv)):
+        out.append(f"ml-models-pvc: {d} is both a generation fingerprint and a reviewed campaign artifact")
     ea = pvcs.get("evidence-archive-pvc", {}).get("selection", [])
     trained = {m["artifact_sha256"] for m in ea if "sidecar_sha256" in m and m.get("artifact_sha256")
                and ts_ns(m.get("ts")) is not None and ts_ns(m["ts"]) <= ts_ns(cutoff)}
@@ -1423,6 +1458,11 @@ def campaign_artifact_problems(s: Dict, pvcs: Dict[str, Dict]) -> List[str]:
             refs.append(dict(r, referenced_by=sorted(
                 (["forecast log"] if d in referenced else []) + (["training bundle"] if d in trained else []))))
     mm["empty_by_design"]["campaign_artifacts"] = refs
+    mm["empty_by_design"]["generation_fingerprints_not_artifacts"] = {
+        "count": len(fps), "sha256": fps,
+        "why": "ensemble_* issuances carry the in-memory generation's data fingerprint as artifact_sha256 "
+               "(ml-engine/models/seasonal_ensemble.py at 0472829); no model file exists, so there is nothing to "
+               "archive: listed, not resolved"}
     return out
 
 
@@ -1693,6 +1733,7 @@ def coverage(record: X.Record, s: Dict, p: Dict, manifests: Dict[str, Dict]) -> 
                 "plan_sha256": m["plan_sha256"],
                 "current_pairs_trained_after_cutoff": e["current_pairs_trained_after_cutoff"],
                 "campaign_artifacts": e["campaign_artifacts"],
+                "generation_fingerprints_not_artifacts": e.get("generation_fingerprints_not_artifacts"),
                 "statement": "the campaign model artifacts are protected by the listed VERIFIED evidence-archive "
                              "members, not by this empty tar"}
             entry["residual_not_backed_up"] = {
