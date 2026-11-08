@@ -15,7 +15,8 @@
 #
 #   deploy/eval-c28/smoke/kind.sh               build, create the cluster, run, delete it
 #   KEEP=1 deploy/eval-c28/smoke/kind.sh        keep the cluster for inspection
-#   deploy/eval-c28/smoke/kind.sh --render-only render and audit the manifests offline (no cluster, no docker)
+#   deploy/eval-c28/smoke/kind.sh --render-only render and audit the manifests offline and self-test check 7's
+#                                               classifier (no cluster, no docker; scripts/verify.sh runs it)
 # Needs: docker, kind, kubectl, helm, python3 with PyYAML. OPERATOR_IMAGE / FORECASTER_IMAGE (local tags) skip builds.
 set -euo pipefail
 
@@ -26,7 +27,43 @@ PY="${PYTHON:-python3}"
 case "$PY" in */*) PY="$(cd "$(dirname "$PY")" && pwd)/$(basename "$PY")" ;; esac
 c28() { (cd "$HARNESS" && KUBECONFIG=/dev/null "$PY" -m c28 "$@"); }
 
+# Check 7's classifier: does a PredictionReady (reason, message) prove an answer from the forecast API over the route?
+# Only what the operator derives from a response counts: the trust reasons it copies from the service's answer, a 422
+# refusal, Ready (a verified answer), and an HTTP error status ("ML API returned status", built only from a response read
+# over the verified connection). LeadInsufficient is decided by the operator before any request (v2_reconcile.go
+# readiness), so it proves nothing about the route; a TLS or dial failure is DataUnavailable with a transport error.
+forecast_api_answered() {
+  case "$1" in
+    HistoryInsufficient|CalibrationInsufficient|ShadowInsufficient|CoverageLow|RequestRefused|Ready) return 0 ;;
+    DataUnavailable) [[ "$2" == "ML API returned status "* ]] ;;
+    *) return 1 ;;
+  esac
+}
+classifier_self_test() {
+  local bad=0 want r m got
+  while IFS='|' read -r want r m; do
+    if forecast_api_answered "$r" "$m"; then got=yes; else got=no; fi
+    [ "$got" = "$want" ] || { echo "check-7 classifier: reason '$r' ($m) gave $got, want $want" >&2; bad=1; }
+  done <<'CASES'
+no|LeadInsufficient|no startup budget: set spec.behavior.startup.fallbackDelaySeconds until enough startups are observed
+no|DataUnavailable|Post "https://c28-forecast-route.pa-eval-system.svc:8443/v2/predict": tls: failed to verify certificate: x509: certificate is valid for pa-eval-predictive-autoscaler-forecaster.pa-eval-system.svc, not c28-forecast-route.pa-eval-system.svc
+no|DataUnavailable|Post "https://c28-forecast-route.pa-eval-system.svc:8443/v2/predict": dial tcp 10.96.12.34:8443: connect: connection refused
+no|DataUnavailable|no forecast
+no|CapacityMissing|no per-replica capacity: no forecast is requested
+no|SettingsInvalid|invalid settings
+no|EvidenceStale|no qualifying outcome within 900 s
+no||
+yes|DataUnavailable|ML API returned status 503: {"detail":{"error":"DataUnavailable","message":"the newest finalized observation is too old"}}
+yes|HistoryInsufficient|trust state Untrusted, reason HistoryInsufficient, service eligibility false
+yes|RequestRefused|forecast refused
+yes|Ready|ready to activate: the forecast passed every check; Recommend mode still makes no writes
+CASES
+  return "$bad"
+}
+
 if [ "${1:-}" = --render-only ]; then
+  classifier_self_test || { echo "render-only: check 7's classifier self-test failed" >&2; exit 1; }
+  echo "render-only: check 7's classifier accepts only answers from the forecast API"
   out="$(mktemp -d)"
   c28 render --params "$PARAMS" --out "$out/all.yaml"
   "$PY" - "$out/all.yaml" "$PARAMS" "$HARNESS" <<'PY'
@@ -44,9 +81,11 @@ PY
 fi
 
 CLUSTER="${CLUSTER:-pa-c28-smoke}"
-# Ownership: only what this run created is ever removed. A supplied WORK is never deleted; a pre-existing cluster or
-# registry container of the same name makes the smoke refuse to start.
+# Ownership: only what this run created is ever removed. A supplied WORK is never deleted; a pre-existing cluster,
+# registry container or image tag this run would build makes the smoke refuse to start. Image tags it builds and a
+# registry image it pulls are untagged at the end (never forced, so layers another tag uses stay).
 OWN_WORK=0 OWN_CLUSTER=0 OWN_REG=0
+OWN_IMAGES=()
 if [ -z "${WORK:-}" ]; then WORK="$(mktemp -d)"; OWN_WORK=1; fi
 KCFG="$WORK/kubeconfig"
 KIND="${KIND:-kind}"
@@ -98,19 +137,29 @@ cleanup() {
   fi
   [ "$OWN_CLUSTER" = 1 ] && "$KIND" delete cluster --name "$CLUSTER" --kubeconfig "$KCFG" >/dev/null 2>&1 || true
   [ "$OWN_REG" = 1 ] && docker rm -f "$REG_NAME" >/dev/null 2>&1 || true
+  for img in ${OWN_IMAGES[@]+"${OWN_IMAGES[@]}"}; do docker image rm "$img" >/dev/null 2>&1 || true; done
   if [ "$OWN_WORK" = 1 ] && [ -d "$WORK" ]; then rm -rf -- "${WORK:?}"; fi
 }
 trap cleanup EXIT
 for tool in docker "$KIND" kubectl helm "$PY"; do command -v "$tool" >/dev/null || die "missing tool: $tool"; done
 if docker container inspect "$REG_NAME" >/dev/null 2>&1; then die "a container named $REG_NAME already exists; refusing"; fi
 if "$KIND" get clusters 2>/dev/null | grep -qx "$CLUSTER"; then die "a kind cluster named $CLUSTER already exists; refusing"; fi
+FIXTURE_TAG="localhost:$REG_PORT/c28-fixture:smoke"
+BUILD_TAGS=("$FIXTURE_TAG")
+[ -n "$OPERATOR_IMAGE" ] || BUILD_TAGS+=(pa-operator:c28-smoke)
+[ -n "$FORECASTER_IMAGE" ] || BUILD_TAGS+=(pa-forecaster-statistical:c28-smoke)
+for img in "${BUILD_TAGS[@]}"; do
+  if docker image inspect "$img" >/dev/null 2>&1; then die "an image tagged $img already exists; refusing"; fi
+done
+docker image inspect "$REGISTRY_IMAGE" >/dev/null 2>&1 || OWN_IMAGES+=("$REGISTRY_IMAGE")
 
 # --- images and a local registry (so every manifest pins a real digest) ---------------------------------------------
+OWN_REG=1   # set before run: a half-started container of this name is ours (its absence was checked above)
 docker run -d --restart=no --name "$REG_NAME" -p "127.0.0.1:$REG_PORT:5000" "$REGISTRY_IMAGE" >/dev/null
-OWN_REG=1
-docker build -q -t "localhost:$REG_PORT/c28-fixture:smoke" "$ROOT/deploy/eval-c28/fixture" >/dev/null
-docker push -q "localhost:$REG_PORT/c28-fixture:smoke" >/dev/null
-FIXTURE_DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "localhost:$REG_PORT/c28-fixture:smoke")"
+OWN_IMAGES+=("${BUILD_TAGS[@]}")   # absent above, so every one of these tags is this run's
+docker build -q -t "$FIXTURE_TAG" "$ROOT/deploy/eval-c28/fixture" >/dev/null
+docker push -q "$FIXTURE_TAG" >/dev/null
+FIXTURE_DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "$FIXTURE_TAG")"
 FIXTURE_DIGEST="${FIXTURE_DIGEST#*@}"
 [[ "$FIXTURE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || die "no registry digest for the fixture image"
 if [ -z "$OPERATOR_IMAGE" ]; then
@@ -143,6 +192,9 @@ guard
 CLUSTER_UID="$(k get namespace kube-system -o jsonpath='{.metadata.uid}')"
 "$KIND" load docker-image "$OPERATOR_IMAGE" "$FORECASTER_IMAGE" --name "$CLUSTER" >/dev/null
 W="$CLUSTER-worker"; S="$CLUSTER-worker2"
+# Both workers carry the run taint, so the shared platform (metrics-server, KEDA, the metrics backend), which tolerates
+# nothing, runs on this throwaway cluster's control plane.
+k taint node "$CLUSTER-control-plane" node-role.kubernetes.io/control-plane:NoSchedule- >/dev/null
 k label node "$W" c28.devkuban.com/role=workload --overwrite >/dev/null
 k label node "$S" c28.devkuban.com/role=support --overwrite >/dev/null
 k taint node "$W" c28.devkuban.com/reserved=c28-smoke:NoSchedule --overwrite >/dev/null
@@ -318,12 +370,10 @@ pass "5. the metrics route refuses during its scheduled outage (the ingress coun
 
 # --- 6. the scoped quota -------------------------------------------------------------------------------------------------
 guard
-# Only the pods the quota counts: the run's pods with the run's PriorityClass (the ingress has none), not terminal.
-current="$(k -n "$NS" get pods -l c28.devkuban.com/run=c28-smoke -o json | "$PY" -c '
-import json, sys
-print(sum(1 for p in json.load(sys.stdin)["items"] if p["spec"].get("priorityClassName") == "c28-fixture"
-          and p["status"].get("phase") not in ("Succeeded", "Failed")))')"
-k -n "$NS" patch resourcequota c28-fixture-quota --type merge -p "{\"spec\":{\"hard\":{\"pods\":\"$current\"}}}" >/dev/null
+# A hard limit of 0 (below the pods already counted, which stay) denies every new fixture pod. A limit equal to the
+# current count would not hold: the active arms keep scaling, and one scale-down frees a slot (seen on aspire: an H-CPU
+# arm stepped down and the denied pod was created before the PA's next decision).
+k -n "$NS" patch resourcequota c28-fixture-quota --type merge -p '{"spec":{"hard":{"pods":"0"}}}' >/dev/null
 k -n "$NS" scale deploy c28-pa-r-s20 --replicas 3 >/dev/null   # a manual scale of a Recommend arm (it never writes)
 wait_for 120 "the quota denies the new fixture pod" sh -c "kubectl --kubeconfig '$KCFG' --context 'kind-$CLUSTER' -n $NS get deploy c28-pa-r-s20 -o jsonpath='{.status.conditions[?(@.type==\"ReplicaFailure\")].status}' | grep -q True"
 wait_for 180 "the PA arm reports ScaleOutBlocked" sh -c "kubectl --kubeconfig '$KCFG' --context 'kind-$CLUSTER' -n $NS get pa c28-pa-r-s20 -o jsonpath='{.status.conditions[?(@.type==\"ScaleOutBlocked\")].reason}' | grep -q QuotaExceeded"
@@ -335,14 +385,16 @@ pass "6. the scoped quota denies fixture pods only; ScaleOutBlocked=QuotaExceede
 
 # --- 7. the forecast route keeps TLS verification -------------------------------------------------------------------------
 # The operator dials https://c28-forecast-route...:8443 (a TCP pass-through) and verifies the forecaster's certificate
-# against that name (forecaster.tls.extraDNSNames). A service answer (any trust reason) proves the verified path; a TLS
-# failure would show as DataUnavailable.
+# against that name (forecaster.tls.extraDNSNames). Only an answer from the forecast API counts (forecast_api_answered,
+# above). The smoke's load reaches only the H-RPS arm, so the PA arms' series are empty and the usual answer here is the
+# service's 503.
 service_reason() {
-  local r
+  local r m
   r="$(k -n "$NS" get pa c28-pa-n-s20 -o jsonpath='{.status.conditions[?(@.type=="PredictionReady")].reason}')"
-  case "$r" in HistoryInsufficient|CalibrationInsufficient|ShadowInsufficient|CoverageLow|LeadInsufficient|Ready) return 0 ;; esac
-  return 1
+  m="$(k -n "$NS" get pa c28-pa-n-s20 -o jsonpath='{.status.conditions[?(@.type=="PredictionReady")].message}')"
+  forecast_api_answered "$r" "$m"
 }
 wait_for 300 "a forecast answer through the verified route" service_reason
-pass "7. forecasts reach the operator through the route with certificate verification on"
+log "check 7 saw PredictionReady $(k -n "$NS" get pa c28-pa-n-s20 -o jsonpath='{.status.conditions[?(@.type=="PredictionReady")].reason}: {.status.conditions[?(@.type=="PredictionReady")].message}' | cut -c1-160)"
+pass "7. forecast API reachable through the certificate-verified route"
 log "smoke complete (accelerated, engineering only: no C2.8 evidence)"
