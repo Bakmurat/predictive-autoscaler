@@ -60,7 +60,8 @@ The record's "populate" section:
    "inventory": "<inventory file name>", "retained_pvcs": [{"name", "uid"} x5],
    "p8": {"export": "campaign/final-20261102/p8-fetch-final-20261102.jsonl", "sha256": HEX},
    "requirements": {"<pvc>": "..."}, "reader": {"image": "<repo>@sha256:...", "deadline_seconds": N,
-   "exec_timeout_seconds": N}, "budget": {"max_total_bytes": N},
+   "exec_timeout_seconds": N, "read_access": "nonroot" | "dac-read-search", "supplemental_groups": [GID]},
+   "budget": {"max_total_bytes": N},
    "pvcs": {"<pvc>": {"uid": UID, "mount": "/data", "max_bytes": N, "rules": "default" | [...],
                       "excluded_reviewed": "default" | [{"glob": G, "reason": "..."}]}}}
 """
@@ -120,6 +121,33 @@ def utc(s):
 def iso(t):
     return t.strftime("%Y-%m-%dT%H:%M:%SZ")
 
+def category(e):
+    """A fixed category for an exception: never its message (paths, contents or values stay inside the pod)."""
+    for cls, cat in ((PermissionError, "permission"), (FileNotFoundError, "missing"), (NotADirectoryError, "missing"),
+                     (IsADirectoryError, "not-a-file"), (UnicodeDecodeError, "decode"), (ValueError, "malformed"),
+                     (MemoryError, "memory"), (OSError, "io")):
+        if isinstance(e, cls):
+            return cat
+    return "internal"
+
+def sanitized(e):
+    line, tb = 0, e.__traceback__
+    while tb is not None:
+        if tb.tb_frame.f_code.co_filename == "reader":
+            line = tb.tb_lineno
+        tb = tb.tb_next
+    return {"class": type(e).__name__, "line": line, "category": category(e)}
+
+def absent_why(p):
+    """None when p is a regular file; otherwise why not: missing or permission (an unsearchable directory)."""
+    try:
+        os.stat(p)
+    except PermissionError:
+        return "not readable (permission)"
+    except OSError:
+        return "missing"
+    return None if os.path.isfile(p) else "not a regular file"
+
 def safe(mount, rel):
     p = os.path.normpath(os.path.join(mount, rel))
     if not p.startswith(mount.rstrip("/") + "/") or os.path.islink(p):
@@ -173,8 +201,9 @@ def records_until(mount, rel, fields, cutoff):
     return offset, out, later, probs
 
 def jsonl_prefix(mount, rule, cutoff):
-    if not os.path.isfile(safe(mount, rule["path"])):
-        return [], [], ["the file " + rule["path"] + " does not exist"]
+    why = absent_why(safe(mount, rule["path"]))
+    if why:
+        return [], [], ["the file " + rule["path"] + " is " + why]
     offset, recs, later, probs = records_until(mount, rule["path"], rule["ts_fields"], cutoff)
     if not recs and not probs:
         probs.append("no record of " + rule["path"] + " is at or before the cutoff")
@@ -268,16 +297,18 @@ def pairs(mount, rule, cutoff):
 
 def trainer_logs(mount, rule, cutoff):
     sel, excl = [], []
-    if not os.path.isfile(safe(mount, rule["index"])):
-        return [], [], ["the trainer index " + rule["index"] + " does not exist"]
+    why = absent_why(safe(mount, rule["index"]))
+    if why:
+        return [], [], ["the trainer index " + rule["index"] + " is " + why]
     _, recs, _, probs = records_until(mount, rule["index"], ["collected_at"], cutoff)
     if probs:
         return [], [], probs
     for rec, ts in recs:
         base = "%s-%s" % (rec.get("job"), str(rec.get("pod_uid", ""))[:8])
         meta = os.path.join(rule["dir"], base + ".json")
-        if not os.path.isfile(safe(mount, meta)):
-            probs.append("trainer record %s: %s is missing" % (base, meta)); continue
+        why = absent_why(safe(mount, meta))
+        if why:
+            probs.append("trainer record %s: %s is %s" % (base, meta, why)); continue
         refs = [(meta, None)]
         for c in rec.get("containers") or []:
             refs.append((os.path.join(rule["dir"], "%s.%s.log" % (base, c.get("name"))), c.get("log_sha256")))
@@ -285,8 +316,9 @@ def trainer_logs(mount, rule, cutoff):
                 refs.append((os.path.join(rule["dir"], "%s.%s.previous.log" % (base, c.get("name"))), None))
         for f, want in refs:
             p = safe(mount, f)
-            if not os.path.isfile(p):
-                probs.append("trainer record %s: %s is missing" % (base, f)); continue
+            why = absent_why(p)
+            if why:
+                probs.append("trainer record %s: %s is %s" % (base, f, why)); continue
             h, n = sha(p)
             if want is not None and h != want:
                 probs.append("trainer record %s: %s does not match its log_sha256" % (base, f)); continue
@@ -323,7 +355,7 @@ class Limited(io.RawIOBase):
         return b
 
 def main():
-    job = json.load(sys.stdin)
+    job = globals().get("JOB") or json.load(sys.stdin)
     mount, mode = job["mount"], job["mode"]
     if mode == "probe":
         out = {"rules": [], "volume": {"files": 0, "bytes": 0}, "unconsidered": []}
@@ -332,12 +364,14 @@ def main():
             try:
                 sel, excl, probs = RULES[rule["type"]](mount, rule, utc(rule["cutoff"]))
             except Exception as e:
-                sel, excl, probs = [], [], ["%s: %s" % (type(e).__name__, e)]
+                x = sanitized(e)
+                sel, excl, probs = [], [], ["%(class)s (%(category)s) at reader line %(line)d" % x]
             if not sel and not probs:
                 probs.append("the rule selects nothing")
             considered |= {s["path"] for s in sel} | {x["path"] for x in excl}
             out["rules"].append({"rule": rule, "selected": sel, "excluded": excl, "problems": probs})
-        for d, _, names in os.walk(mount):
+        unreadable = []
+        for d, _, names in os.walk(mount, onerror=lambda e: unreadable.append(category(e))):
             for n in names:
                 p = os.path.join(d, n)
                 if os.path.isfile(p) and not os.path.islink(p):
@@ -345,6 +379,7 @@ def main():
                     out["volume"]["files"] += 1; out["volume"]["bytes"] += size
                     if rel not in considered:
                         out["unconsidered"].append({"path": rel, "bytes": size})
+        out["unreadable_directories"] = {"count": len(unreadable), "categories": sorted(set(unreadable))}
         sys.stdout.write(json.dumps(out, sort_keys=True))
         return 0
     out = Hashing(sys.stdout.buffer)
@@ -368,9 +403,78 @@ def main():
                                  "problems": probs}) + "\n")
     return 1 if probs else 0
 
-sys.exit(main())
+def run():
+    try:
+        return main()
+    except Exception as e:      # a sanitized failure, never a traceback with paths or values
+        err = json.dumps({"reader_error": sanitized(e)})
+        stream = sys.stderr if (globals().get("JOB") or {}).get("mode") == "export" else sys.stdout
+        stream.write(err + "\n")
+        return 3
+
+sys.exit(run())
 '''
 READER_SHA256 = hashlib.sha256(READER.encode()).hexdigest()
+# The exec command line stays short: kubectl puts the command in the request URL, and a proxy in front of the API
+# (Rancher's ingress) refuses a long one (the 12 KB script made a 23 KB URL). The script travels on stdin and runs
+# only if it hashes to the reviewed READER_SHA256 given on the command line.
+BOOT = ("import hashlib,json,sys\n"
+        "d=json.loads(sys.stdin.readline())\n"
+        "j=json.dumps(d['job'],sort_keys=True,separators=(',',':'))\n"
+        "if hashlib.sha256(d['script'].encode()).hexdigest()!=sys.argv[1] or "
+        "hashlib.sha256(j.encode()).hexdigest()!=sys.argv[2]:\n"
+        " sys.stdout.write(json.dumps({'reader_error':{'class':'DigestMismatch','line':0,'category':'integrity'}}))\n"
+        " sys.exit(3)\n"
+        "exec(compile(d['script'],'reader','exec'),{'__name__':'reader','JOB':json.loads(j)})\n")
+READ_ACCESS = ("nonroot", "dac-read-search")
+READER_LINES = READER.count("\n") + 1
+# What a reader error may say (anything else is reported as one fixed "unclassified" error, never echoed).
+ERROR_CATEGORIES = ("permission", "missing", "not-a-file", "decode", "malformed", "memory", "io", "internal", "integrity")
+ERROR_CLASSES = ("PermissionError", "FileNotFoundError", "NotADirectoryError", "IsADirectoryError",
+                 "UnicodeDecodeError", "JSONDecodeError", "ValueError", "MemoryError", "OSError", "KeyError",
+                 "TypeError", "IndexError", "AttributeError", "RuntimeError", "AssertionError", "TarError",
+                 "StreamError", "DigestMismatch", "Exception")
+
+
+def job_digest(job: Dict) -> str:
+    """The sha256 of the canonical job JSON: the mode, mount, rules and selection the reviewed plan authorised."""
+    return hashlib.sha256(json.dumps(job, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def exec_argv(pod: str, job: Dict) -> List[str]:
+    """The short exec command line: the bootstrap, the reviewed script's digest and the job's digest (the bootstrap
+    refuses a script or a job on stdin that does not hash to them)."""
+    return ["exec", "-i", pod, "-c", "reader", "--", "python3", "-B", "-c", BOOT, READER_SHA256, job_digest(job)]
+
+
+def exec_stdin(job: Dict) -> bytes:
+    return (json.dumps({"script": READER, "job": job}) + "\n").encode()
+
+
+def exec_failure(rc: int, stdout_text: str, stderr_text: str) -> str:
+    """A SANITIZED description of a failed reader run: the reader's own error (class, line, category) when it
+    reported one, else a fixed category of the kubectl failure. Neither stream's text is ever echoed."""
+    for text in (stdout_text, stderr_text):
+        for line in reversed([ln for ln in text.strip().splitlines() if ln.strip()][-3:]):
+            try:
+                e = json.loads(line).get("reader_error")
+            except (ValueError, AttributeError):
+                continue
+            if isinstance(e, dict):
+                ok = (set(e) == {"class", "line", "category"} and e["class"] in ERROR_CLASSES
+                      and e["category"] in ERROR_CATEGORIES and isinstance(e["line"], int)
+                      and not isinstance(e["line"], bool) and 0 <= e["line"] <= READER_LINES)
+                if not ok:
+                    return f"the reader failed: unclassified error (exit {rc})"
+                return f"the reader failed: {e['class']} ({e['category']}) at reader line {e['line']} (exit {rc})"
+    err = stderr_text or ""
+    for pat, cat in ((r"414|URI Too|too large|too long", "request-too-large"), (r"Forbidden|forbidden|403", "forbidden"),
+                     (r"Unauthorized|401", "unauthorized"), (r"upgrade|websocket|SPDY", "exec-upgrade-failed"),
+                     (r"not found|NotFound|404", "not-found"), (r"timeout|Timeout|deadline", "timeout"),
+                     (r"executable file not found|exec format", "no-python")):
+        if re.search(pat, err):
+            return f"kubectl exec failed ({cat}, exit {rc})"
+    return f"kubectl exec failed (unclassified, exit {rc})"
 
 COLLECTOR_LOGS = (("INDEX.jsonl", ["recovered_at", "copied_at", "at"]), ("REJECTS.jsonl", ["at"]),
                   ("RUNS.jsonl", ["finished_at"]), ("logs/api-ensemble.jsonl", ["collected_at"]),
@@ -427,6 +531,11 @@ def section(record: X.Record) -> Dict:
         probs.append("populate.legacy_source.operator_image must be the observed digest-pinned image")
     if not _DIGEST_IMAGE.match(str((s.get("reader") or {}).get("image", ""))):
         probs.append("populate.reader.image must be pinned by digest")
+    rd = s.get("reader") or {}
+    if rd.get("read_access", "nonroot") not in READ_ACCESS:
+        probs.append(f"populate.reader.read_access must be one of {READ_ACCESS}")
+    if not all(isinstance(g, int) and not isinstance(g, bool) and g > 0 for g in rd.get("supplemental_groups") or []):
+        probs.append("populate.reader.supplemental_groups must be positive integer GIDs")
     if not isinstance((s.get("budget") or {}).get("max_total_bytes"), int):
         probs.append("populate.budget.max_total_bytes is required")
     pvcs = s.get("pvcs") or {}
@@ -681,17 +790,39 @@ def leftover_readers(kube: X.Kube, record: X.Record) -> List[str]:
     return sorted(p["metadata"]["name"] for p in kube.list("Pod", NS, labels={READER_LABEL: record.run_id}))
 
 
+def reader_security(r: Dict) -> Tuple[Dict, Dict]:
+    """(pod securityContext, container capabilities) for populate.reader.read_access:
+      nonroot          UID/GID 65534, every capability dropped; reads what is world-readable, or group-readable with
+                       populate.reader.supplemental_groups (the files' group). fsGroup is never used: on many drivers
+                       it re-owns the volume (a write to evidence) and it cannot open owner-only (0600) files anyway.
+      dac-read-search  UID 0 with every capability dropped EXCEPT CAP_DAC_READ_SEARCH (needed for root-owned 0600
+                       files and 0700 directories). The capability bypasses read and directory-search permission checks
+                       and also permits open_by_handle_at(2) and some linkat(2) uses, so it is NOT what protects the
+                       evidence: write protection comes from the READ-ONLY claim mount (and the read-only root
+                       filesystem); seccomp RuntimeDefault, no privilege escalation, no other capability, no
+                       service-account token and the proven cleanup bound the rest. Select it explicitly, only for the
+                       evidence reader."""
+    mode = r.get("read_access", "nonroot")
+    groups = [int(g) for g in r.get("supplemental_groups") or []]
+    base = {"seccompProfile": {"type": "RuntimeDefault"}}
+    if groups:
+        base["supplementalGroups"] = groups
+    if mode == "dac-read-search":
+        return dict(base, runAsNonRoot=False, runAsUser=0, runAsGroup=0), {"drop": ["ALL"], "add": ["DAC_READ_SEARCH"]}
+    return dict(base, runAsNonRoot=True, runAsUser=65534, runAsGroup=65534), {"drop": ["ALL"]}
+
+
 def reader_pod(record: X.Record, s: Dict, pvc: str, binding: Dict, nonce: str) -> Dict:
     r = s["reader"]
     deadline = int(r.get("deadline_seconds", 1800))
+    pod_sc, caps = reader_security(r)
     spec = {"restartPolicy": "Never", "activeDeadlineSeconds": deadline,
             "automountServiceAccountToken": False, "enableServiceLinks": False,
-            "securityContext": {"runAsNonRoot": True, "runAsUser": 65534, "runAsGroup": 65534,
-                                "seccompProfile": {"type": "RuntimeDefault"}},
+            "securityContext": pod_sc,
             "containers": [{"name": "reader", "image": r["image"],
                             "command": ["python3", "-B", "-c", f"import time; time.sleep({deadline})"],
                             "securityContext": {"allowPrivilegeEscalation": False, "readOnlyRootFilesystem": True,
-                                                "capabilities": {"drop": ["ALL"]}},
+                                                "capabilities": caps},
                             "resources": {"requests": {"cpu": "50m", "memory": "64Mi"},
                                           "limits": {"cpu": "1", "memory": "256Mi"}},
                             "volumeMounts": [{"name": "data", "mountPath": s["pvcs"][pvc]["mount"],
@@ -719,11 +850,11 @@ class Exec:
         self.timeout, self.run = timeout, run
 
     def __call__(self, pod: str, job: Dict, out_path: str) -> Tuple[int, str]:
-        argv = self.base + ["exec", "-i", pod, "-c", "reader", "--", "python3", "-B", "-c", READER]
+        argv = self.base + exec_argv(pod, job)
         env = {k: v for k, v in os.environ.items() if k != "KUBECONFIG"}
         env["KUBECONFIG"] = self.base[2]
         with open(out_path, "wb") as fh:
-            res = self.run(argv, input=json.dumps(job).encode(), stdout=fh, stderr=subprocess.PIPE,
+            res = self.run(argv, input=exec_stdin(job), stdout=fh, stderr=subprocess.PIPE,
                            timeout=self.timeout, env=env)
         return res.returncode, (res.stderr or b"").decode("utf-8", errors="replace")
 
@@ -863,7 +994,10 @@ def probe_plan(record: X.Record, kube: X.Kube) -> Dict:
     bindings, probs = _pre_checks(record, kube, s)
     actions = [{"pvc": p, "binding": bindings[p], "mount": s["pvcs"][p]["mount"], "rules": effective_rules(s, p)}
                for p in PVC_EXPORTS]
+    pod_sc, caps = reader_security(s["reader"])
     return X.new_plan(PROBE, record, actions, reader_sha256=READER_SHA256, reader_image=s["reader"]["image"],
+                      reader_security={"pod": pod_sc, "capabilities": caps, "read_only_root_filesystem": True,
+                                       "service_account_token": False},
                       problems=probs, note="read-only reader pods: sizes, selections, original-hash checks, digests")
 
 
@@ -880,12 +1014,14 @@ def probe(record: X.Record, kube: X.Kube, reviewed: Dict, digest: str, exe=None,
         for a in live["actions"]:
             job = {"mode": "probe", "mount": a["mount"], "rules": a["rules"]}
             rc, err, tmp = run_reader(record, kube, lock, PROBE, s, a["pvc"], a["binding"], job, exe, sleep, now)
+            text = open(tmp, encoding="utf-8", errors="replace").read()
+            os.unlink(tmp)
             try:
-                out = json.load(open(tmp))
-            except ValueError as e:
-                raise X.StagingError(f"{a['pvc']}: the probe output is not JSON (exit {rc})") from e
-            finally:
-                os.unlink(tmp)
+                out = json.loads(text)
+            except ValueError:
+                out = None
+            if rc != 0 or not isinstance(out, dict) or "reader_error" in out:
+                raise X.StagingError(f"{a['pvc']}: {exec_failure(rc, text, err)}")
             X.receipt(record, PROBE, "probed", {"pvc": a["pvc"], "plan_sha256": digest, "binding": a["binding"],
                                                 "rules_sha256": C.digest(a["rules"]), "result": out})
         return X.receipt(record, PROBE, "probe-complete", {"plan_sha256": digest})
@@ -946,6 +1082,10 @@ def plan(record: X.Record, kube: X.Kube) -> Dict:
         selection = [it for rr in r["result"]["rules"] for it in rr["selected"]]
         for rr in r["result"]["rules"]:
             probs += [f"{p}: rule {_rule_label(rr['rule'])}: {x}" for x in rr["problems"]]
+        ud = r["result"].get("unreadable_directories") or {}
+        if ud.get("count"):
+            probs.append(f"{p}: {ud['count']} directories are unreadable ({', '.join(ud['categories'])}): the claim "
+                         "cannot be accounted for (see populate.reader.read_access)")
         paths = [it["path"] for it in selection]
         if len(set(paths)) != len(paths):
             probs.append(f"{p}: two rules select the same file")
@@ -1038,9 +1178,10 @@ def export_pvc(record, kube, lock, s, pvc, info, exe, sleep, now, digest) -> Dic
         trailer = json.loads(err.strip().splitlines()[-1]) if err.strip() else {}
     except ValueError:
         trailer = {}
-    if rc != 0 or not trailer or trailer.get("problems"):
+    if rc != 0 or not trailer or trailer.get("problems") or "reader_error" in trailer:
         os.unlink(tmp)
-        raise X.StagingError(f"{pvc}: the reader failed (exit {rc}): {(trailer.get('problems') or ['no trailer'])}")
+        why = trailer.get("problems") if trailer.get("problems") else exec_failure(rc, "", err)
+        raise X.StagingError(f"{pvc}: {why}")
     probs = verify_tar(tmp, info["selection"], trailer)
     if probs:
         os.rename(tmp, tmp + ".rejected")
