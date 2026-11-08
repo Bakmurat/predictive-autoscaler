@@ -220,12 +220,12 @@ def _ptr(role_label: str) -> str:
 
 
 def apply(record: X.Record, kube: X.Kube, reviewed: Dict, reviewed_digest: str) -> Dict:
-    live = plan(record, kube)
-    X.require_live(reviewed, reviewed_digest, HELPER, record, live)
-    if live["problems"]:
-        raise X.StagingError("the plan has conflicts: " + "; ".join(live["problems"]))
-    ptr = _ptr(live["role_label"])
     with X.mutating(record, kube, HELPER) as _:
+        live = plan(record, kube)                       # validated under the shared lock
+        X.require_live(reviewed, reviewed_digest, HELPER, record, live)
+        if live["problems"]:
+            raise X.StagingError("the plan has conflicts: " + "; ".join(live["problems"]))
+        ptr = _ptr(live["role_label"])
         X.receipt(record, HELPER, "apply-start", {"plan_sha256": reviewed_digest})
         for a in live["actions"]:
             if not (a["add_taint"] or a["add_label"]):
@@ -277,12 +277,12 @@ def rollback_plan(record: X.Record, kube: X.Kube) -> Dict:
 
 
 def rollback(record: X.Record, kube: X.Kube, reviewed: Dict, reviewed_digest: str) -> Dict:
-    live = rollback_plan(record, kube)
-    X.require_live(reviewed, reviewed_digest, ROLLBACK, record, live)
-    if live["problems"]:
-        raise X.StagingError("; ".join(live["problems"]))
-    ptr = _ptr(live["role_label"])
     with X.mutating(record, kube, HELPER):
+        live = rollback_plan(record, kube)              # validated under the shared lock
+        X.require_live(reviewed, reviewed_digest, ROLLBACK, record, live)
+        if live["problems"]:
+            raise X.StagingError("; ".join(live["problems"]))
+        ptr = _ptr(live["role_label"])
         for a in live["actions"]:
             if a.get("skip"):
                 continue

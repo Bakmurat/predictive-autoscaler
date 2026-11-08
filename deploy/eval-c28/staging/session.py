@@ -458,6 +458,7 @@ def plan_start(c: Context) -> Dict:
     readiness_problems, readiness = _readiness(c)
     problems += readiness_problems
     problems += _node_stops(c)
+    problems += _occupant_stops(c)                  # the reservation must verify before any session starts
     problems += _quota_problems(c)
     b, budget = _budget(c), c.s["arrival_budget"]
     if b["peak_rps"] > budget["max_rps"] or b["total_arrivals"] > budget["max_total_arrivals"]:
@@ -536,11 +537,12 @@ def _set_mode(expect: Optional[str], value: str):
 
 
 def start(c: Context, reviewed: Dict, reviewed_digest: str) -> Dict:
-    p = plan_start(c)
-    X.require_live(reviewed, reviewed_digest, HELPER, c.record, p)
-    if p["problems"]:
-        raise X.StagingError("the start plan has problems: " + "; ".join(p["problems"]))
     with X.mutating(c.record, c.kube, HELPER, {"session": c.session_id, "phase": "start"}) as lock:
+        # Validate UNDER the shared lock: no other executor can change the evaluation state in between.
+        p = plan_start(c)
+        X.require_live(reviewed, reviewed_digest, HELPER, c.record, p)
+        if p["problems"]:
+            raise X.StagingError("the start plan has problems: " + "; ".join(p["problems"]))
         X.receipt(c.record, HELPER, "start-begin", {"session": c.session_id, "plan_sha256": reviewed_digest,
                                                     "deadline_utc": c.s["deadline_utc"], "readiness": p["readiness"]})
         try:
@@ -660,6 +662,17 @@ def _run_steps(c: Context, steps: List[Dict]) -> List[str]:
     return errors
 
 
+def _stop_generation(c: Context, w: Dict) -> int:
+    """The generation our latest Recommend update produced (from its step's own response)."""
+    gen = 0
+    for it in X.applied_intents(X.receipts(c.record, HELPER)):
+        d = it["data"]
+        if d["op"] == "update" and d["kind"] == w["kind"] and d["name"] == w["name"] and \
+                ["/spec/mode", "Recommend"] in d.get("expect", []):
+            gen = int(d.get("result_generation") or 0)
+    return gen
+
+
 def quiesce(c: Context, owned: Dict) -> List[str]:
     """Wait until the session's generator pods are gone (terminating ones count as running), in-flight requests have
     timed out, and the writer is confirmed inactive. Returns what is still unresolved at the timeout."""
@@ -678,9 +691,14 @@ def quiesce(c: Context, owned: Dict) -> List[str]:
             pa = c.kube.get(w["kind"], w["name"], c.ns)
             if pa is None or pa["metadata"]["uid"] != w["uid"]:
                 left.append(f"{w['kind']}/{w['name']} is gone or replaced: shutdown unconfirmed")
-            elif pa["spec"].get("mode") != "Recommend" or (pa.get("status") or {}).get("mode") != "Recommend":
-                left.append(f"{w['kind']}/{w['name']}: the operator has not confirmed Recommend "
-                            f"(spec {pa['spec'].get('mode')}, observed {(pa.get('status') or {}).get('mode')})")
+            else:
+                st = pa.get("status") or {}
+                stop_gen = _stop_generation(c, w) or pa["metadata"].get("generation", 0)
+                if pa["spec"].get("mode") != "Recommend" or st.get("mode") != "Recommend" or \
+                        not isinstance(st.get("observedGeneration"), int) or st["observedGeneration"] < stop_gen:
+                    left.append(f"{w['kind']}/{w['name']}: the operator has not confirmed Recommend for generation "
+                                f"{stop_gen} (spec {pa['spec'].get('mode')}, observed {st.get('mode')} at generation "
+                                f"{st.get('observedGeneration')})")
         elif w:
             if c.kube.get(w["kind"], w["name"], c.ns) is not None:
                 left.append(f"{w['kind']}/{w['name']} still exists")
@@ -709,9 +727,9 @@ def _finish_stop(c: Context, steps: List[Dict], unresolved: List[str], authorise
 
 
 def stop(c: Context, reviewed: Dict, reviewed_digest: str, reason: str = "operator stop") -> Dict:
-    p = plan_stop(c)
-    X.require_live(reviewed, reviewed_digest, STOP, c.record, p)
     with X.mutating(c.record, c.kube, HELPER, {"session": c.session_id, "phase": "stop"}):
+        p = plan_stop(c)
+        X.require_live(reviewed, reviewed_digest, STOP, c.record, p)
         return _finish_stop(c, p["actions"], p["unresolved"], reviewed_digest, reason)
 
 
@@ -769,11 +787,14 @@ def steal_stop(c: Context, fetch: Callable[[str], Dict]) -> List[str]:
 
 
 def _occupant_stops(c: Context) -> List[str]:
+    """The full reservation verification (reserve.verify): the run taint and role labels, pressure, EVERY occupant
+    that is not allowed-system or evaluation (movable-pending-owner-move, unplanned, stateful), broad tolerations
+    and the rendered placement. Nothing is filtered by message text."""
     if not c.record.doc.get("reserve"):
-        return ["required observation missing: the record has no reserve section for the occupant check"]
+        return ["required observation missing: the record has no reserve section for the reservation check"]
     import reserve
     occ = reserve.verify(c.record, c.kube)
-    return [p for p in occ["problems"] if "unplanned" in p or "stateful" in p or "tolerates the run taint" in p]
+    return [f"reservation: {p}" for p in occ["problems"]]
 
 
 def _http_json(url: str) -> Dict:
@@ -807,15 +828,17 @@ def verify(c: Context, fetch: Callable[[str], Dict] = _http_json) -> Dict:
             "started": state["started"] is not None, "stops": stops, "result": "OK" if not stops else "STOP"}
 
 
-def _classify(c: Context, classification: str, lateness_s: Optional[int]) -> None:
+def _classify(c: Context, classification: str, lateness_s: Optional[int], k6: str = "") -> None:
     if not X.last(X.receipts(c.record, HELPER), "block-classified", session=c.session_id):
         X.receipt(c.record, HELPER, "block-classified", {"session": c.session_id, "block_start": c.s["block_start"],
-                                                         "classification": classification, "lateness_s": lateness_s})
+                                                         "classification": classification, "lateness_s": lateness_s,
+                                                         "k6_container": k6})
 
 
-def release(c: Context) -> List[str]:
-    """For a block: release the suspended generator at the block start, then classify the block by the generator's
-    actual start. Returns stop reasons (a release or a start later than the predeclared limit)."""
+def release(c: Context, fetch: Callable[[str], Dict] = None) -> List[str]:
+    """For a block: release the suspended generator at the block start, then classify the block by its schedule-start
+    acknowledgment (the first arrival the independent ingress counted for this target), never by a container start.
+    Returns stop reasons (a release or a first arrival later than the predeclared limit)."""
     if c.s["phase"] != "confirmation":
         return []
     begin = _utc(c.s["block_start"])
@@ -827,7 +850,7 @@ def release(c: Context) -> List[str]:
         return []
     if not X.last(entries, "generator-released", session=c.session_id):
         if now - begin > limit:
-            _classify(c, "late-replacement-slot", now - begin)
+            _classify(c, "late-replacement-slot", now - begin, "not released")
             return [f"the release window passed ({now - begin} s > {limit} s after the block start)"]
         j = owned["job"]
 
@@ -842,20 +865,55 @@ def release(c: Context) -> List[str]:
         return []
     if X.last(entries, "block-classified", session=c.session_id):
         return []
-    started = []
-    for p in c.kube.list("Pod", c.ns, labels={X.SESSION_LABEL: c.session_id}):
-        cs = ((p.get("status") or {}).get("containerStatuses") or [{}])[0]
-        at = ((cs.get("state") or {}).get("running") or {}).get("startedAt")
-        if at:
-            started.append(_utc(at))
-    if started:
-        lateness = min(started) - begin
-        _classify(c, "on-time" if lateness <= limit else "late-replacement-slot", lateness)
-        return [] if lateness <= limit else [f"the generator started {lateness} s after the block start (> {limit} s)"]
+    k6 = _k6_state(c, owned["job"]["uid"])
+    first = first_arrival(c, fetch, begin)
+    if first is not None:
+        lateness = first - begin
+        _classify(c, "on-time" if lateness <= limit else "late-replacement-slot", lateness, k6)
+        return [] if lateness <= limit else [f"the first scheduled arrival reached the ingress {lateness} s after the "
+                                             f"block start (> {limit} s)"]
     if now - begin > limit:
-        _classify(c, "late-replacement-slot", None)
-        return [f"the generator has not started within {limit} s of the block start"]
+        _classify(c, "late-replacement-slot", None, k6)
+        return [f"no arrival acknowledged at the ingress within {limit} s of the block start (k6: {k6})"]
     return []
+
+
+def _k6_state(c: Context, job_uid: str) -> str:
+    """The k6 container of the OWNED Job's pod (bound by the pod's controller reference to that Job UID): running,
+    waiting, terminated or absent. A diagnostic only: a started container is not a started arrival schedule."""
+    for p in c.kube.list("Pod", c.ns, labels={X.SESSION_LABEL: c.session_id}):
+        refs = [r for r in p["metadata"].get("ownerReferences", []) if r.get("controller")]
+        if not refs or refs[0].get("kind") != "Job" or refs[0].get("uid") != job_uid:
+            continue
+        for cs in (p.get("status") or {}).get("containerStatuses") or []:
+            if cs.get("name") == "k6":
+                return next(iter((cs.get("state") or {"absent": {}}).keys()))
+    return "absent"
+
+
+def first_arrival(c: Context, fetch: Callable[[str], Dict], begin: int) -> Optional[int]:
+    """The generator's schedule-start acknowledgment: the first scrape interval after the block start in which the
+    independent ingress counted an arrival for this target (its counter rose above its value at the block start).
+    None while nothing is acknowledged or the observation fails."""
+    st = c.s.get("stops") or {}
+    ack = c.s.get("arrival_ack") or {}
+    expr = ack.get("query", 'sum(c28_ingress_requests_total{target="{target}"})').replace("{target}", c.target)
+    step = int(ack.get("step_s", 5))
+    if not st.get("query_api"):
+        return None
+    q = urllib.parse.urlencode({"query": expr, "start": begin - 60, "end": c.now(), "step": step})
+    try:
+        doc = fetch(f"{st['query_api'].rstrip('/')}/api/v1/query_range?{q}")
+        values = [(int(float(t)), float(v)) for t, v in doc["data"]["result"][0]["values"]]
+    except Exception:           # noqa: BLE001 - not acknowledged (yet)
+        return None
+    base = [v for t, v in values if t <= begin]
+    if not base or not all(math.isfinite(v) for _, v in values):
+        return None
+    for t, v in values:
+        if t > begin and v > base[-1]:
+            return t
+    return None
 
 
 def watch(c: Context, start_digest: str, fetch: Callable[[str], Dict] = _http_json, interval: int = 30,
@@ -871,7 +929,7 @@ def watch(c: Context, start_digest: str, fetch: Callable[[str], Dict] = _http_js
             v = verify(c, fetch)
             if v["state"] != "open":
                 return {"helper": HELPER, "action": "watch", "session": c.session_id, "ended": "session closed"}
-            stops = v["stops"] or release(c)
+            stops = v["stops"] or release(c, fetch)
         except Exception as e:      # noqa: BLE001 - an API or observation failure is a stop, never a crash
             stops = [f"observation or API failure: {type(e).__name__}: {str(e)[:200]}"]
         if stops:

@@ -129,8 +129,10 @@ def plan_and_apply(mod, record, kube, *args, **kw):
 def operator_sync(api):
     """A fake operator: each PredictiveAutoscaler's observed mode follows its spec (as a reconcile would)."""
     for (k, _, _), o in list(api.objects.items()):
-        if k == "pa-new":
-            o.setdefault("status", {})["mode"] = o.get("spec", {}).get("mode")
+        if k == "pa-new" and not getattr(api, "operator_paused", False):
+            st = o.setdefault("status", {})
+            st["mode"] = o.get("spec", {}).get("mode")
+            st["observedGeneration"] = o["metadata"].get("generation", 1)
 
 
 class Clock:

@@ -27,6 +27,21 @@ def steal(clock, value="1.0", nodes=NODES, stale=0):
     return fetch
 
 
+def observe(clock, arrivals_at=None, steal_value="1.0"):
+    """A fake query API: fresh steal samples for both nodes, and the ingress counter for the target rising from 0 to
+    5 at `arrivals_at` (never when None)."""
+    import urllib.parse
+
+    def fetch(url):
+        q = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+        if "c28_ingress_requests_total" in q["query"][0]:
+            start, end, step = int(q["start"][0]), int(q["end"][0]), int(q["step"][0])
+            vals = [[t, "0" if arrivals_at is None or t < arrivals_at else "5"] for t in range(start, end + 1, step)]
+            return {"data": {"result": [{"metric": {}, "values": vals}]}}
+        return steal(clock, steal_value)(url)
+    return fetch
+
+
 def write_plan(world, kind, seed, target, capacity=7.0, accelerate=1, name="plan.json"):
     c28 = X.import_harness()
     (world["tmp"] / name).write_text(json.dumps(c28.schedule.k6_plan(kind, seed, capacity, target, accelerate)))
@@ -390,11 +405,18 @@ def confirmation_world(world, arm="PA-N", seed=201, block=BLOCK, sign_receipts=T
     return rec, target
 
 
-def generator_running(api, sid, at):
-    p = F.pod(f"c28-gen-{sid}-x", "demo", "worker-s", labels={X.SESSION_LABEL: sid, X.RUN_LABEL: "c28-r1"},
+def generator_pod(api, sid, statuses, job_uid=None, name=None):
+    """A generator pod bound (controller reference) to the owned Job, with the given container statuses."""
+    job = api.obj("Job", f"c28-gen-{sid}", "demo")
+    p = F.pod(name or f"c28-gen-{sid}-x", "demo", "worker-s", labels={X.SESSION_LABEL: sid, X.RUN_LABEL: "c28-r1"},
               phase="Running")
-    p["status"]["containerStatuses"] = [{"state": {"running": {"startedAt": at}}}]
+    p["metadata"]["ownerReferences"] = [{"kind": "Job", "name": f"c28-gen-{sid}", "controller": True,
+                                         "uid": job_uid or job["metadata"]["uid"]}]
+    p["status"]["containerStatuses"] = statuses
     api.put(p)
+
+
+K6_RUNNING = [{"name": "k6", "state": {"running": {"startedAt": "2026-12-10T00:00:03Z"}}}]
 
 
 def test_confirmation_pa_session(world):
@@ -410,10 +432,12 @@ def test_confirmation_pa_session(world):
     out = S.watch(c, digest, fetch=steal(c.clock), max_checks=1)
     assert out["ended"] == "check budget exhausted"
     assert api.obj("Job", "c28-gen-c-0001", "demo")["spec"]["suspend"] is False
-    generator_running(api, "c-0001", "2026-12-10T00:00:07Z")
-    S.watch(c, digest, fetch=steal(c.clock), max_checks=1)
+    generator_pod(api, "c-0001", K6_RUNNING)
+    c.clock.t = BLOCK_T + 30
+    S.watch(c, digest, fetch=observe(c.clock, arrivals_at=BLOCK_T + 7), max_checks=1)
     assert X.last(X.receipts(record, "session"), "block-classified")["data"] == {
-        "session": "c-0001", "block_start": BLOCK, "classification": "on-time", "lateness_s": 7}
+        "session": "c-0001", "block_start": BLOCK, "classification": "on-time", "lateness_s": 10,
+        "k6_container": "running"}
     del api.objects[("pods", "demo", "c28-gen-c-0001-x")]
     api.obj("Node", "worker-w")["status"]["conditions"][1]["status"] = "True"     # MemoryPressure
     api.obj("ResourceQuota", "c28-fixture-quota", "demo")["spec"]["hard"]["pods"] = "5"
@@ -445,10 +469,10 @@ def test_generator_starting_late_is_classified(world):
     c, digest, started = start_session(world, record, now=BLOCK_T - 60)
     c.clock.t = BLOCK_T + 1
     S.watch(c, digest, fetch=steal(c.clock), max_checks=1)                  # released
-    generator_running(api, "c-0001", "2026-12-10T00:03:00Z")
+    generator_pod(api, "c-0001", K6_RUNNING)
     c.clock.t = BLOCK_T + 200
-    out = S.watch(c, digest, fetch=steal(c.clock), max_checks=1)
-    assert out["ended"] in ("stopped", "unresolved") and "started 180 s after" in out["stops"][0]
+    out = S.watch(c, digest, fetch=observe(c.clock, arrivals_at=BLOCK_T + 178), max_checks=1)
+    assert out["ended"] in ("stopped", "unresolved") and "180 s after the block start" in out["stops"][0]
     assert X.last(X.receipts(record, "session"), "block-classified")["data"]["lateness_s"] == 180
 
 
@@ -525,3 +549,103 @@ def test_confirmation_refuses_an_unlocked_plan(world):
 def test_confirmation_too_early_is_refused(world):
     record, target = confirmation_world(world)
     assert "too early" in problems(world, record, BLOCK_T - 3600)
+
+
+
+def test_validation_happens_under_the_lock(world, monkeypatch):
+    """Codex #32 r2 item 1: a start validated, then overtaken by another start before taking the lock, must refuse."""
+    record_a = session_record(world)
+    record_b = session_record(world, id="s-0002", arm="H-RPS",
+                              plan=write_plan(world, "ordinary", 102, "c28-h-rps-s20", name="p2.json"))
+    ca, cb = ctx(world, record_a), ctx(world, record_b)
+    pa, da = review(record_a, S.plan_start(ca), "session", "start-a")
+    pb, db = review(record_b, S.plan_start(cb), "session", "start-b")     # both validated while nothing runs
+    real, raced = X.mutating, []
+
+    def racing(record, kube, helper, context=None):
+        m = real(record, kube, helper, context)
+        if (context or {}).get("session") == "s-0002" and not raced:
+            raced.append(True)
+            S.start(ca, pa, da)                     # A runs between B's validation and B's lock
+        return m
+    monkeypatch.setattr(X, "mutating", racing)
+    with pytest.raises(X.StagingError, match="changed since review"):
+        S.start(cb, pb, db)
+    assert world["api"].obj("Job", "c28-gen-s-0002", "demo") is None
+    assert world["api"].obj("Job", "c28-gen-s-0001", "demo") is not None
+
+
+def test_a_later_success_never_clears_an_earlier_unknown_outcome(world):
+    """Codex #32 r2 item 2: a lost Job-delete response, then a successful HPA delete: the lock stays."""
+    record = session_record(world)
+    api = world["api"]
+    c, digest, started = start_session(world, record)
+    real = api.delete
+
+    def lost_job_delete(path, uid, resource_version=None):
+        out = real(path, uid, resource_version)
+        if "/jobs/" in path:
+            raise C.ApiError("delete: failed (timeout)", 504)
+        return out
+    api.delete = lost_job_delete
+    out = stop_session(c)
+    api.delete = real
+    assert api.obj("HorizontalPodAutoscaler", "c28-h-cpu-s20", "demo") is None        # the later step succeeded
+    assert out["data"]["resolved"] is False
+    assert X.open_intents(X.receipts(record, "session")) and os.path.exists(lock_path(record))
+
+
+def test_shutdown_needs_the_operator_to_observe_the_stop_generation(world):
+    """Codex #32 r2 item 3: Recommend reported for an older generation is not a confirmation."""
+    record, target = confirmation_world(world)
+    api = world["api"]
+    c, digest, started = start_session(world, record, now=BLOCK_T - 120)
+    api.operator_paused = True
+    pa = api.obj("PredictiveAutoscaler", target, "demo")
+    pa["status"]["mode"] = "Recommend"                       # stale: observed before our stop
+    pa["status"]["observedGeneration"] = pa["metadata"]["generation"] - 1
+    out = stop_session(c)
+    assert out["data"]["resolved"] is False and "for generation" in out["data"]["unresolved"][0]
+    api.operator_paused = False
+    assert stop_session(c)["data"]["resolved"] is True
+
+
+def test_a_running_sidecar_or_container_start_is_not_an_arrival(world):
+    """Codex #32 r2 item 4: a running sidecar with a waiting k6, or a pod of another Job, never classifies on-time;
+    only the ingress-acknowledged first arrival does."""
+    record, target = confirmation_world(world)
+    api = world["api"]
+    c, digest, started = start_session(world, record, now=BLOCK_T - 60)
+    c.clock.t = BLOCK_T + 1
+    S.watch(c, digest, fetch=observe(c.clock), max_checks=1)                       # released
+    generator_pod(api, "c-0001", [{"name": "sidecar", "state": {"running": {"startedAt": "2026-12-10T00:00:02Z"}}},
+                                  {"name": "k6", "state": {"waiting": {"reason": "ContainerCreating"}}}])
+    generator_pod(api, "c-0001", K6_RUNNING, job_uid=F.new_uid(), name="impostor")
+    c.clock.t = BLOCK_T + 60
+    assert S.watch(c, digest, fetch=observe(c.clock), max_checks=1)["ended"] == "check budget exhausted"
+    assert X.last(X.receipts(record, "session"), "block-classified") is None
+    c.clock.t = BLOCK_T + 130
+    out = S.watch(c, digest, fetch=observe(c.clock), max_checks=1)
+    assert out["ended"] in ("stopped", "unresolved") and "no arrival acknowledged" in out["stops"][0]
+    cls = X.last(X.receipts(record, "session"), "block-classified")["data"]
+    assert cls["classification"] == "late-replacement-slot" and cls["k6_container"] == "waiting"
+
+
+def test_pending_owner_moves_block_start_and_stop_sessions(world):
+    """Codex #32 r2 item 5: every disallowed occupant class, movable-pending-owner-move included."""
+    api = world["api"]
+    extra = dict(world["extra"])
+    extra["reserve"] = dict(extra["reserve"], movable=[{"namespace": "argocd", "kind": "Deployment",
+                                                        "name": "argocd-repo", "uid": "u-argo"}])
+    world["extra"] = extra
+    api.put({"apiVersion": "apps/v1", "kind": "ReplicaSet", "metadata": {
+        "name": "argocd-repo-1", "namespace": "argocd",
+        "ownerReferences": [{"kind": "Deployment", "name": "argocd-repo", "controller": True, "uid": "u-argo"}]}})
+    api.put(F.pod("argocd-repo-1-x", "argocd", "worker-w", owner=("ReplicaSet", "argocd-repo-1")))
+    record = session_record(world)
+    assert "movable-pending-owner-move" in problems(world, record)
+    del api.objects[("pods", "argocd", "argocd-repo-1-x")]
+    c, digest, started = start_session(world, record)
+    api.put(F.pod("argocd-repo-1-y", "argocd", "worker-s", owner=("ReplicaSet", "argocd-repo-1")))
+    out = S.watch(c, digest, fetch=observe(c.clock), max_checks=1)
+    assert out["ended"] == "stopped" and any("movable-pending-owner-move" in s for s in out["stops"])

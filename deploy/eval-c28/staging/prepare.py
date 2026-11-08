@@ -253,36 +253,37 @@ def plan(record: X.Record, kube: X.Kube, phase: str) -> Dict:
 
 
 def apply(record: X.Record, kube: X.Kube, phase: str, reviewed: Dict, reviewed_digest: str) -> Dict:
-    p = plan(record, kube, phase)
-    X.require_live(reviewed, reviewed_digest, HELPER, record, p)
-    if p["problems"]:
-        raise X.StagingError("the plan has problems: " + "; ".join(p["problems"]))
-    if phase == "values":
-        text = yaml.safe_dump(p["values"], sort_keys=True)
-        sha = X.write_new(p["file"], text)
-        return X.receipt(record, HELPER, "values-written", {"phase": phase, "plan_sha256": reviewed_digest,
-                                                            "file": p["file"], "sha256": sha})
-    params = X.load_params(record)
-    s = _section(record)
-    objs = {(o["kind"], o["metadata"].get("namespace"), o["metadata"]["name"]): o
-            for o in _objects_for(phase, record, params, s, split(params))}
-    created = []
     with X.mutating(record, kube, HELPER, {"phase": phase}):
+        p = plan(record, kube, phase)                   # validated under the shared lock
+        X.require_live(reviewed, reviewed_digest, HELPER, record, p)
+        if p["problems"]:
+            raise X.StagingError("the plan has problems: " + "; ".join(p["problems"]))
+        if phase == "values":
+            text = yaml.safe_dump(p["values"], sort_keys=True)
+            sha = X.write_new(p["file"], text)
+            return X.receipt(record, HELPER, "values-written", {"phase": phase, "plan_sha256": reviewed_digest,
+                                                                "file": p["file"], "sha256": sha})
+        params = X.load_params(record)
+        s = _section(record)
+        objs = {(o["kind"], o["metadata"].get("namespace"), o["metadata"]["name"]): o
+                for o in _objects_for(phase, record, params, s, split(params))}
+        created = []
         for c in p["actions"]:
             o = objs[(c["create"], c["namespace"], c["name"])]
             if X.json_digest(o) != c["sha256"]:
                 raise X.StagingError(f"{c['create']}/{c['name']} rendered differently from the reviewed plan; "
                                      "refusing")
             created.append(X.object_ref(kube.create(o)))
-    if phase == "targets":
-        uids = {r["name"]: r["uid"] for (k, ns, n), r in created_objects(record).items()
-                if k == "Deployment" and ns == params["namespace"] and n.startswith("c28-") and n != "c28-ingress"}
-        X.write_new(os.path.join(record.evidence_dir, "targets.json"),
-                    json.dumps({"schema": "c28-targets/v1", "run_id": record.run_id,
-                                "cluster_uid": record.cluster_uid, "namespace": params["namespace"],
-                                "deployments": uids}, indent=1, sort_keys=True) + "\n")
-    return X.receipt(record, HELPER, "phase-complete", {"phase": phase, "plan_sha256": reviewed_digest,
-                                                        "created": created, "already_created": p["already_created_by_this_run"]})
+        if phase == "targets":
+            uids = {r["name"]: r["uid"] for (k, ns, n), r in created_objects(record).items()
+                    if k == "Deployment" and ns == params["namespace"] and n.startswith("c28-") and n != "c28-ingress"}
+            X.write_new(os.path.join(record.evidence_dir, "targets.json"),
+                        json.dumps({"schema": "c28-targets/v1", "run_id": record.run_id,
+                                    "cluster_uid": record.cluster_uid, "namespace": params["namespace"],
+                                    "deployments": uids}, indent=1, sort_keys=True) + "\n")
+        return X.receipt(record, HELPER, "phase-complete", {"phase": phase, "plan_sha256": reviewed_digest,
+                                                            "created": created,
+                                                            "already_created": p["already_created_by_this_run"]})
 
 
 def created_objects(record: X.Record) -> Dict[tuple, Dict]:

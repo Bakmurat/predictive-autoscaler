@@ -164,7 +164,8 @@ def applied_intents(entries: List[Dict]) -> List[Dict]:
         if done:
             uid = ((s["outcome"] or {}).get("post") or {}).get("uid") or (s["reconciled"] or {}).get("uid") \
                 or s["intent"].get("uid")
-            res.append({"step": n, "data": dict(s["intent"], result_uid=uid)})
+            gen = ((s["outcome"] or {}).get("post") or {}).get("generation")
+            res.append({"step": n, "data": dict(s["intent"], result_uid=uid, result_generation=gen)})
     return res
 
 
@@ -201,7 +202,8 @@ class Journal:
                     return "not-applied", {"status": e.status}
                 raise
             m = (out or {}).get("metadata") or {}
-            return "applied", {"uid": m.get("uid") or uid, "resourceVersion": m.get("resourceVersion")}
+            return "applied", {"uid": m.get("uid") or uid, "resourceVersion": m.get("resourceVersion"),
+                               "generation": m.get("generation")}
         C.mutation_step(self.record.doc, self.helper, self.lock, n, intent, call)
         if refused:
             raise refused[0]
@@ -431,8 +433,11 @@ class mutating:
         return self.lock
 
     def __exit__(self, exc_type, exc, tb):
+        """Release only when EVERY intent of the part-2 journals is resolved (an outcome or a reconciliation), not
+        merely the last call: a later successful step must never clear an earlier unknown outcome."""
         self.kube.journal = None
-        if self.lock.safe and os.path.exists(self.lock.path):
+        unresolved = [(h, it["step"]) for h in PART2_HELPERS for it in open_intents(receipts(self.record, h))]
+        if self.lock.safe and not unresolved and os.path.exists(self.lock.path):
             os.unlink(self.lock.path)
         return False
 
