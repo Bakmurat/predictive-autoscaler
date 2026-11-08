@@ -66,6 +66,7 @@ KIND_KEY = {
     "Namespace": "namespaces", "Node": "nodes", "Pod": "pods", "Service": "services",
     "PersistentVolumeClaim": "persistentvolumeclaims", "PersistentVolume": "persistentvolumes",
     "Deployment": "deployments", "StatefulSet": "statefulsets", "DaemonSet": "daemonsets", "Job": "jobs",
+    "CronJob": "cronjobs",
     "HorizontalPodAutoscaler": "horizontalpodautoscalers", "ScaledObject": "scaledobjects",
     "PredictiveAutoscaler": "pa-new", "LegacyPredictiveAutoscaler": "pa-legacy",
     "ConfigMap": "configmaps", "ResourceQuota": "resourcequotas", "ReplicaSet": "replicasets",

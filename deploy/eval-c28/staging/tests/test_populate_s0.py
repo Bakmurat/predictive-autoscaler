@@ -54,6 +54,11 @@ def jl(*recs):
     return "".join(json.dumps(r, sort_keys=True) + "\n" for r in recs)
 
 
+ROOT_UIDS = {"evidence-archive": "f8bd8280-7960-4fd4-a818-4e3ad7f60e39",
+             "load-evidence": "a78f9343-d178-4338-a432-0817c808d2de",
+             "ml-training": "5215b26a-368f-4711-89eb-5abbd559f827",
+             "ml-api": "765418af-6b95-4be4-a92d-61826b4c8be4",
+             "predictive-operator": "5b6e3be1-d076-4a75-862c-7a47c4fa0dfd"}
 FP1, FP2 = "e1" * 32, "e2" * 32
 E1 = {"model_name": "ensemble_nginx-ensemble_requests", "application": "nginx-ensemble", "namespace": "demo",
       "experiment": "seasonal-ensemble-q90-v1:891ca57abafe:seasonal-ensemble-1.2.0"}
@@ -225,6 +230,8 @@ def env(tmp_path):
                "reader": {"image": "public.ecr.aws/docker/library/python@sha256:" + "4" * 64,
                           "deadline_seconds": 900, "exec_timeout_seconds": 600},
                "budget": {"max_total_bytes": 10_000_000},
+               "writer_roots": [dict(r, uid=ROOT_UIDS[r["name"]]) for r in
+                                ({"kind": k, "name": n} for k, n in P.WRITER_ROOTS)],
                "pvcs": {p: {"uid": UIDS[p], "mount": MOUNTS[p], "max_bytes": 1_000_000, "rules": "default"}
                         for p in P.PVC_EXPORTS}}}
     path = os.path.join(root, "preparation.json")
@@ -241,10 +248,16 @@ def env(tmp_path):
                                   "spec": {"nodeName": "prodworker-ml", "source": {"persistentVolumeName":
                                                                                    "pv-ml-models-pvc"}},
                                   "status": {"attached": True}})
+    for k, n in P.WRITER_ROOTS:
+        api.add({"CronJob": "cronjobs", "Deployment": "deployments"}[k],
+                {"kind": k, "metadata": {"name": n, "namespace": "ml-engine", "uid": ROOT_UIDS[n]}})
+    api.add("replicasets", {"kind": "ReplicaSet", "metadata": {
+        "name": "ml-api-6fd467c54f", "namespace": "ml-engine", "uid": "rs-ml-api-uid",
+        "ownerReferences": [{"kind": "Deployment", "name": "ml-api", "uid": ROOT_UIDS["ml-api"], "controller": True}]}})
     api.add("pods", {"kind": "Pod", "metadata": {"name": "ml-api-6fd467c54f-9jrrw", "namespace": "ml-engine",
                                                  "uid": "pod-ml-api",
                                                  "ownerReferences": [{"kind": "ReplicaSet", "name": "ml-api-6fd467c54f",
-                                                                      "controller": True}]},
+                                                                      "uid": "rs-ml-api-uid", "controller": True}]},
                      "spec": {"nodeName": "prodworker-ml", "volumes": [
                          {"name": "m", "persistentVolumeClaim": {"claimName": "ml-models-pvc"}}]},
                      "status": {"phase": "Running"}})
@@ -1410,9 +1423,20 @@ def test_unreviewed_identities_are_reported_by_digest_only(env, extra, why):
     assert not any("pm-marker" in x for x in probs), probs
 
 
-def add_job_pod(e, job, pvc, n, node="prodworker-ml", phase="Succeeded", owner_kind="Job"):
+def add_job_pod(e, job, pvc, n, node="prodworker-ml", phase="Succeeded", owner_kind="Job", make_job=True,
+                cronjob=None, cronjob_uid=None, labels=None):
+    """A CronJob's Job pod as the cluster has it: Pod -> Job (controller) -> CronJob (controller), UIDs linked."""
+    juid = f"job-uid-{job}"
+    if make_job and owner_kind == "Job":
+        cj = cronjob or job.rsplit("-", 1)[0]
+        e["api"].add("jobs", {"kind": "Job", "metadata": {"name": job, "namespace": "ml-engine", "uid": juid,
+                                                          "ownerReferences": [{"kind": "CronJob", "name": cj,
+                                                                               "uid": cronjob_uid or ROOT_UIDS.get(cj, "x"),
+                                                                               "controller": True}]},
+                              "status": {}})
     e["api"].add("pods", {"kind": "Pod", "metadata": {"name": f"{job}-{n}", "namespace": "ml-engine", "uid": f"u-{n}",
-                                                      "ownerReferences": [{"kind": owner_kind, "name": job,
+                                                      "labels": labels or {},
+                                                      "ownerReferences": [{"kind": owner_kind, "name": job, "uid": juid,
                                                                            "controller": True}]},
                           "spec": {"nodeName": node, "volumes": [
                               {"name": "d", "persistentVolumeClaim": {"claimName": pvc}}]},
@@ -1443,7 +1467,7 @@ def test_consumer_churn_and_attachment_do_not_change_the_plan_digest(env):
     ea = next(x for x in pre if x["pvc"] == "evidence-archive-pvc")
     assert ea["attached_node"] == "prodworker-ml" and {c["pod"] for c in ea["consumers"]} == {
         "evidence-archive-29902130-a1b2c"}
-    assert all(c["owner"]["kind"] == "Job" for c in ea["consumers"])
+    assert all(c["owner_refs"][0]["kind"] == "Job" for c in ea["consumers"])
 
 
 @pytest.mark.parametrize("job, owner_kind", [("debug-shell", "Job"), ("evidence-archive-29902130", "StatefulSet"),
@@ -1455,12 +1479,12 @@ def test_an_unknown_consumer_kind_blocks(env, job, owner_kind):
     assert p1["problems"] == []
     p, d = reviewed(e["record"], p1, P.HELPER, "plan")
     add_job_pod(e, job, "evidence-archive-pvc", "zz9", phase="Running", owner_kind=owner_kind)
-    with pytest.raises(X.StagingError, match="unknown writer kind"):
+    with pytest.raises(X.StagingError, match="unknown writer kind|no single Job / ReplicaSet controller"):
         P.export(e["record"], e["kube"], p, d, e["exe"], e["clock"].sleep, e["clock"].now)
     assert not [o for (k, _, _), o in e["api"].objects.items()
                 if k == "pods" and P.READER_LABEL in (o["metadata"].get("labels") or {})]
     probs = P.plan(e["record"], e["kube"])["problems"]
-    assert any("unknown writer kind" in x for x in probs) and not any("pm-marker" in x for x in probs)
+    assert any("unknown writer kind" in x or "no single" in x for x in probs) and not any("pm-marker" in x for x in probs)
 
 
 def test_a_consumer_appearing_between_readers_blocks_the_next_reader(env):
@@ -1483,3 +1507,93 @@ def test_a_consumer_appearing_between_readers_blocks_the_next_reader(env):
     finally:
         P.revalidate = real
     assert calls[:2] == ["forecast-log-pvc", "evidence-archive-pvc"] and "load-evidence-pvc" in calls
+
+
+def blocked(e, why):
+    probs = P.plan(e["record"], e["kube"])["problems"]
+    assert any(why in x for x in probs), probs
+    return probs
+
+
+@pytest.mark.parametrize("setup, why", [
+    # Codex repro: a Running pod naming a NONEXISTENT evidence-archive Job
+    (lambda e: add_job_pod(e, "evidence-archive-29902130", "evidence-archive-pvc", "n1", phase="Running",
+                           make_job=False), "names a controller that does not exist with that UID"),
+    # a Job of a same-named CronJob with ANOTHER UID (not the reviewed root)
+    (lambda e: add_job_pod(e, "evidence-archive-29902131", "evidence-archive-pvc", "n2", phase="Running",
+                           cronjob_uid="00000000-0000-4000-8000-000000000000"), "unknown writer kind"),
+    # predictive-operator is a writer of forecast-log-pvc ONLY
+    (lambda e: e["api"].add("pods", {"kind": "Pod", "metadata": {
+        "name": "predictive-operator-c99b74b6b-x", "namespace": "ml-engine", "uid": "po",
+        "ownerReferences": [{"kind": "ReplicaSet", "name": "predictive-operator-c99b74b6b", "uid": "rs-po",
+                             "controller": True}]},
+        "spec": {"volumes": [{"name": "d", "persistentVolumeClaim": {"claimName": "ml-models-pvc"}}]}})
+     and e["api"].add("replicasets", {"kind": "ReplicaSet", "metadata": {
+         "name": "predictive-operator-c99b74b6b", "namespace": "ml-engine", "uid": "rs-po",
+         "ownerReferences": [{"kind": "Deployment", "name": "predictive-operator",
+                              "uid": ROOT_UIDS["predictive-operator"], "controller": True}]}}),
+     "ml-models-pvc: a pod of an unknown writer kind"),
+    # an owner reference that is not the controller
+    (lambda e: e["api"].add("pods", {"kind": "Pod", "metadata": {
+        "name": "x-1", "namespace": "ml-engine", "uid": "x1",
+        "ownerReferences": [{"kind": "Job", "name": "evidence-archive-1", "uid": "j", "controller": False}]},
+        "spec": {"volumes": [{"name": "d", "persistentVolumeClaim": {"claimName": "load-evidence-pvc"}}]}}),
+     "has no single Job / ReplicaSet controller"),
+    # a FOREIGN reader (another run's label) using the claim
+    (lambda e: add_job_pod(e, "c28-s0-other", "forecast-log-pvc", "r9", phase="Running", make_job=False,
+                           labels={P.READER_LABEL: "another-run", P.NONCE_LABEL: "abc"}),
+     "a reader pod not created by this operation uses the claim"),
+])
+def test_consumer_ownership_is_verified_to_reviewed_roots(env, setup, why):
+    """Codex #39: ownership is proven Pod -> Job -> CronJob / Pod -> ReplicaSet -> Deployment by UID up to the
+    reviewed root; reader pods are never invisible."""
+    e = env
+    do_probe(e)
+    setup(e)
+    blocked(e, why)
+
+
+def test_a_replaced_root_controller_blocks(env):
+    e = env
+    do_probe(e)
+    e["api"].objects[("cronjobs", "ml-engine", "evidence-archive")]["metadata"]["uid"] = "11111111-1111-4111-8111-111111111111"
+    add_job_pod(e, "evidence-archive-29902130", "evidence-archive-pvc", "n3")
+    blocked(e, "the reviewed CronJob evidence-archive no longer exists with its reviewed UID")
+
+
+def test_writer_roots_are_required_in_the_record(env):
+    e = env
+    doc = json.load(open(e["path"]))
+    doc["populate"]["writer_roots"] = doc["populate"]["writer_roots"][:-1]
+    write(e["path"], json.dumps(doc))
+    with pytest.raises(X.StagingError, match="writer_roots"):
+        P.section(X.load_record(e["path"], ("populate", "archive")))
+
+
+def test_reader_pod_affinity_follows_the_live_attachment(env):
+    """The attachment node is a live precondition: the reader pod is pinned to where the claim is attached NOW."""
+    e = env
+    do_probe(e)
+    p, d = reviewed(e["record"], P.plan(e["record"], e["kube"]), P.HELPER, "plan")
+    e["api"].add("volumeattachments", {"kind": "VolumeAttachment", "metadata": {"name": "va-9"},
+                                       "spec": {"nodeName": "prodworker-other", "source": {
+                                           "persistentVolumeName": "pv-load-evidence-pvc"}},
+                                       "status": {"attached": True}})
+    bodies = []
+    real = e["api"].create
+
+    def create(path, body):
+        bodies.append(copy.deepcopy(body))
+        return real(path, body)
+    e["api"].create = create
+    P.export(e["record"], e["kube"], p, d, e["exe"], e["clock"].sleep, e["clock"].now)
+    def node(pvc):
+        b = next(b for b in bodies if b["spec"]["volumes"][0]["persistentVolumeClaim"]["claimName"] == pvc)
+        aff = b["spec"].get("affinity")
+        return aff and aff["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"][0][
+            "matchExpressions"][0]["values"]
+    assert node("load-evidence-pvc") == ["prodworker-other"] and node("ml-models-pvc") == ["prodworker-ml"]
+    assert node("forecast-log-pvc") is None
+    pre = {r["data"]["pvc"]: r["data"]["attached_node"] for r in X.receipts(e["record"], P.HELPER)
+           if r["event"] == "reader-preconditions"}
+    assert pre["load-evidence-pvc"] == "prodworker-other"
