@@ -51,7 +51,7 @@ from __future__ import annotations
 import argparse
 import copy
 import sys
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import execlib as X
 
@@ -116,7 +116,47 @@ def _owner(kube: X.Kube, pod: Dict, cache: Dict) -> Dict:
     return out
 
 
-def classify(kube: X.Kube, record: X.Record, params: Dict, s: Dict, role: str, pod: Dict, cache: Dict) -> Dict:
+CALIBRATION_LABEL = "c28.devkuban.com/calibration"
+
+
+def calibration_owned(kube: X.Kube, pod: Dict, calibration: Optional[Dict], role: Optional[str], cache: Dict) -> bool:
+    """Whether a pod belongs to THIS calibration operation by verified ownership, never by name or label alone.
+
+    `calibration` (calibrate.py's ownership view of the open calibration, from its journal):
+      {"id", "namespace", "workload": {Deployment UIDs it created}, "support": {Job UIDs it created}}.
+    A pod on W (role "workload") qualifies only when it carries the calibration label with that id, sits in that
+    namespace, and its single controller is a ReplicaSet that exists with exactly the referenced UID and whose own
+    controller is one of the calibration's Deployment UIDs. A pod on S ("support") only when its single controller is
+    one of the calibration's generator Job UIDs. role None accepts either chain (pods not yet bound to a node).
+    Nothing is recognized when `calibration` is None (the default: every other caller, a session included, sees
+    calibration pods as unplanned occupants)."""
+    if not calibration:
+        return False
+    m = pod.get("metadata") or {}
+    ns = m.get("namespace")
+    if ns != calibration.get("namespace") or (m.get("labels") or {}).get(CALIBRATION_LABEL) != calibration.get("id"):
+        return False
+    refs = [r for r in m.get("ownerReferences") or [] if r.get("controller")]
+    if len(refs) != 1 or not refs[0].get("uid"):
+        return False
+    r = refs[0]
+    if r.get("kind") == "ReplicaSet" and role in (None, "workload"):
+        key = ("verified-rs", ns, r.get("name"))
+        if key not in cache:
+            cache[key] = kube.get("ReplicaSet", r.get("name"), ns)
+        rs = cache[key]
+        if rs is None or (rs.get("metadata") or {}).get("uid") != r["uid"]:
+            return False
+        rrefs = [x for x in (rs["metadata"].get("ownerReferences") or []) if x.get("controller")]
+        return len(rrefs) == 1 and rrefs[0].get("kind") == "Deployment" and \
+            rrefs[0].get("uid") in set(calibration.get("workload") or ())
+    if r.get("kind") == "Job" and role in (None, "support"):
+        return r["uid"] in set(calibration.get("support") or ())
+    return False
+
+
+def classify(kube: X.Kube, record: X.Record, params: Dict, s: Dict, role: str, pod: Dict, cache: Dict,
+             calibration: Optional[Dict] = None) -> Dict:
     m, spec = pod["metadata"], pod.get("spec", {})
     owner = _owner(kube, pod, cache)
     allowed = s.get("allowed") or {}
@@ -130,6 +170,8 @@ def classify(kube: X.Kube, record: X.Record, params: Dict, s: Dict, role: str, p
         entry["class"] = "allowed-system"
     elif labels.get(X.RUN_LABEL) == record.run_id:
         entry["class"] = "evaluation"
+    elif calibration_owned(kube, pod, calibration, role, cache):
+        entry["class"] = "calibration"
     elif role == "support" and m.get("namespace") == params["control_namespace"] and \
             labels.get("app.kubernetes.io/instance") == params["release"]:
         entry["class"] = "evaluation"
@@ -140,26 +182,31 @@ def classify(kube: X.Kube, record: X.Record, params: Dict, s: Dict, role: str, p
     return entry
 
 
-def _occupants(kube: X.Kube, record: X.Record, params: Dict, s: Dict) -> Dict[str, List[Dict]]:
+def _occupants(kube: X.Kube, record: X.Record, params: Dict, s: Dict,
+               calibration: Optional[Dict] = None) -> Dict[str, List[Dict]]:
     out, cache = {}, {}
     pods = kube.list("Pod")
     for role in ROLES:
         live = [p for p in pods if (p.get("spec") or {}).get("nodeName") == s["nodes"][role]["name"]
                 and p.get("status", {}).get("phase") not in ("Succeeded", "Failed")]
-        out[role] = sorted((classify(kube, record, params, s, role, p, cache) for p in live),
+        out[role] = sorted((classify(kube, record, params, s, role, p, cache, calibration) for p in live),
                            key=lambda e: (e["namespace"] or "", e["pod"]))
     return out
 
 
-def _broad_tolerations(kube: X.Kube, record: X.Record, s: Dict, taint: Dict) -> List[Dict]:
-    """Owners of pods anywhere that would tolerate the run taint, other than allowed DaemonSets, the run's own pods
-    and reviewed exceptions: they could land on W/S later."""
+def _broad_tolerations(kube: X.Kube, record: X.Record, s: Dict, taint: Dict,
+                       calibration: Optional[Dict] = None) -> List[Dict]:
+    """Owners of pods anywhere that would tolerate the run taint, other than allowed DaemonSets, the run's own pods,
+    the open calibration's verified own pods (calibration_owned) and reviewed exceptions: they could land on W/S
+    later."""
     allowed = s.get("allowed") or {}
     ds = {(d.get("namespace"), d.get("name")) for d in allowed.get("daemonsets", [])}
     ok = {(d.get("namespace"), d.get("kind"), d.get("name")) for d in allowed.get("broad_tolerations", [])}
     found, cache = {}, {}
     for p in kube.list("Pod"):
         if (p["metadata"].get("labels") or {}).get(X.RUN_LABEL) == record.run_id:
+            continue
+        if calibration_owned(kube, p, calibration, None, cache):
             continue
         if not any(_tolerates(t, taint) for t in p.get("spec", {}).get("tolerations", []) or []):
             continue
@@ -356,7 +403,10 @@ def rendered_placement_problems(params: Dict) -> List[str]:
     return out
 
 
-def verify(record: X.Record, kube: X.Kube) -> Dict:
+def verify(record: X.Record, kube: X.Kube, calibration: Optional[Dict] = None) -> Dict:
+    """`calibration`: only calibrate.py passes it (its open calibration's journal-derived ownership, see
+    calibration_owned); those pods then classify as "calibration" occupants, which the reservation accepts. Without it
+    (the CLI, prepare, session) a calibration pod is an unplanned occupant and the reservation fails."""
     params = X.load_params_stage(record, STAGE)
     s = _section(record, params)
     taint = _taint(s, record.run_id)
@@ -380,13 +430,13 @@ def verify(record: X.Record, kube: X.Kube) -> Dict:
             problems.append(f"{role} {n['metadata']['name']}: cordon state changed from {a['unschedulable']}")
         nodes.append({"role": role, "name": n["metadata"]["name"], "uid": n["metadata"]["uid"], "taints": taints,
                       "role_label": labels.get(s["role_label"]), "unschedulable": unsched, "conditions": conds})
-    occ = _occupants(kube, record, params, s)
+    occ = _occupants(kube, record, params, s, calibration)
     for role, entries in occ.items():
         for e in entries:
-            if e["class"] not in ("allowed-system", "evaluation"):
+            if e["class"] not in ("allowed-system", "evaluation", "calibration"):
                 problems.append(f"{role}: {e['namespace']}/{e['pod']} ({e['owner']['kind']} {e['owner']['name']}) is "
                                 f"{e['class']}")
-    broad = _broad_tolerations(kube, record, s, taint)
+    broad = _broad_tolerations(kube, record, s, taint, calibration)
     for b in broad:
         problems.append(f"{b['namespace']}/{b['kind']}/{b['name']} tolerates the run taint and is not allowlisted")
     incomplete = X.experiment_params_problems(params)
@@ -418,9 +468,10 @@ def verify(record: X.Record, kube: X.Kube) -> Dict:
 
 def require_reservation_pass(out: Dict) -> None:
     """The reservation part of reserve verify's verdict only (taint, role labels, cordon, pressure, occupants, broad
-    tolerations), whatever the experiment parameters. Capacity calibration on W will need this PLUS its own separately
-    validated calibration configuration and admission checks (not implemented here); it never needs complete experiment
-    parameters, which would recreate the c0/HPA-target dependency cycle."""
+    tolerations), whatever the experiment parameters. Capacity calibration on W (calibrate.py) needs this PLUS its own
+    separately validated calibration contract and admission checks, and passes its journal-verified own objects to
+    verify(calibration=...); it never needs complete experiment parameters, which would recreate the c0/HPA-target
+    dependency cycle."""
     if not (out.get("reservation") == "PASS" and out.get("reservation_problems") == []):
         raise X.StagingError(f"the reservation does not pass: {out.get('reservation')} "
                              f"({'; '.join(out.get('reservation_problems') or []) or 'no verdict'})")
