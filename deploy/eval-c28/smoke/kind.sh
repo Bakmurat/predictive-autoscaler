@@ -12,8 +12,9 @@
 #      leaves a non-fixture pod alone;
 #   7. the forecast API answers through the certificate-verified forecast route (a 503 DataUnavailable counts: this is
 #      reachability only; v2 acceptance with sufficient lead is NOT tested and is reported as PENDING);
-#   8. the image each operator, forecaster, fixture and k6 container runs (status.containerStatuses[].imageID) is
-#      recorded, and with --images it must be exactly the reviewed digest.
+#   8. every container of every pod of the deployed operator, forecaster, fixture and k6 workloads (enumerated from the
+#      rendered manifests, not by image) names its role's image, and its runtime identity
+#      (status.containerStatuses[].imageID) is recorded; with --images it must be exactly the reviewed digest.
 # It only ever talks to its own cluster: the kubeconfig in its work directory, checked (context and cluster UID) before
 # every step. Nothing here reads or writes a lab cluster, and no evidence produced here counts toward C2.8.
 #
@@ -155,11 +156,154 @@ CASES
   return "$bad"
 }
 
+# check8_classify <expected.json> <live.json> <out.json>: check 8's verdict. expected.json names the workloads the smoke
+# deployed (kind, namespace, name, role, container names: taken from the rendered manifests, never from an image) and
+# per role the image the specs must name plus, with reviewed=true, the reviewed digest the runtime must report.
+# live.json is a List of the Pods, Deployments and Jobs in the run's namespaces. Every pod a workload's selector picks
+# is examined, every container in it: an unexpected or missing container, a spec image other than the role's, or a
+# runtime imageID other than the reviewed digest is a HARD failure (exit 1); a container with no runtime identity yet
+# or fewer pods than the workload reports is SOFT (exit 3: the caller may look again, and fails if it persists). The
+# full inventory (every examined container with its spec image, imageID and verdict) goes to out.json.
+# A runtime that reports only a bare sha256:<id> is compared with the config digest docker verified for the digest
+# reference (docker image inspect .Id): the manifest names that config, and the config pins every layer by its
+# diff_id, so both identify the same image content.
+check8_classify() {
+  "$PY" - "$1" "$2" "$3" <<'PY'
+import json, sys
+exp, live, out = json.load(open(sys.argv[1])), json.load(open(sys.argv[2])), sys.argv[3]
+reviewed, roles = exp["reviewed"] is True, exp["roles"]
+def short(r):
+    r = r[len("docker.io/"):] if r.startswith("docker.io/") else r
+    return r[len("library/"):] if r.startswith("library/") else r
+items = live.get("items") or []
+objs = {(o["kind"], o["metadata"]["namespace"], o["metadata"]["name"]): o for o in items if o.get("kind") in ("Deployment", "Job")}
+pods = [o for o in items if o.get("kind") == "Pod"]
+rows, hard, soft, seen = [], [], [], []
+for w in exp["workloads"]:
+    wid = f'{w["kind"]} {w["namespace"]}/{w["name"]}'
+    o = objs.get((w["kind"], w["namespace"], w["name"]))
+    if o is None:
+        hard.append(f"{wid}: not found"); continue
+    sel = (o.get("spec") or {}).get("selector") or {}
+    if sel.get("matchExpressions") or not sel.get("matchLabels"):
+        hard.append(f"{wid}: selector is not plain matchLabels"); continue
+    st = o.get("status") or {}
+    want_pods = max(1, st.get("replicas") or 0) if w["kind"] == "Deployment" else \
+        max(1, (st.get("active") or 0) + (st.get("succeeded") or 0) + (st.get("failed") or 0))
+    mine = [p for p in pods if p["metadata"]["namespace"] == w["namespace"]
+            and all((p["metadata"].get("labels") or {}).get(k) == v for k, v in sel["matchLabels"].items())]
+    seen.append({"workload": wid, "role": w["role"], "pods": len(mine), "expected_pods": want_pods})
+    if len(mine) < want_pods:
+        soft.append(f"{wid}: {len(mine)} pods, expected at least {want_pods}")
+    want_image, want_id = roles[w["role"]]["image"], roles[w["role"]].get("id") or ""
+    for pod in mine:
+        pid = f'{pod["metadata"]["namespace"]}/{pod["metadata"]["name"]}'
+        spec = pod.get("spec") or {}
+        images = {c["name"]: c.get("image", "") for c in (spec.get("containers") or []) + (spec.get("initContainers") or [])}
+        status = pod.get("status") or {}
+        stats = {c["name"]: c for c in (status.get("containerStatuses") or []) + (status.get("initContainerStatuses") or [])}
+        for name in sorted(set(images) | set(w["containers"])):
+            got = (stats.get(name) or {}).get("imageID") or ""
+            row = {"role": w["role"], "workload": wid, "pod": pid, "container": name,
+                   "spec_image": images.get(name), "imageID": got}
+            if name not in w["containers"]:
+                row["verdict"] = "unexpected-container"; hard.append(f"{pid} {name}: not a container of {wid}")
+            elif name not in images:
+                row["verdict"] = "missing-container"; hard.append(f"{pid} {name}: missing from the pod spec")
+            elif images[name] != want_image:
+                row["verdict"] = "wrong-spec-image"; hard.append(f"{pid} {name}: spec image {images[name]} is not {want_image}")
+            elif not got:
+                row["verdict"] = "no-runtime-identity"; soft.append(f"{pid} {name}: no containerStatus imageID")
+            elif not reviewed:
+                row["verdict"] = "recorded"
+            elif "@" in got and short(got) == short(want_image):
+                row["verdict"] = "ok-repo-digest"
+            elif "@" not in got and want_id and got == want_id:
+                row["verdict"] = "ok-config-digest"
+            else:
+                row["verdict"] = "wrong-runtime-image"; hard.append(f"{pid} {name}: imageID {got} is not {want_image}")
+            rows.append(row)
+for role in roles:
+    if not any(r["role"] == role and r["verdict"].startswith(("ok", "recorded")) for r in rows):
+        soft.append(f"role {role}: no examined container")
+json.dump({"mode": "reviewed" if reviewed else "build", "workloads": seen, "containers": rows,
+           "hard": hard, "soft": soft}, open(out, "w"), indent=1)
+for m in hard + soft:
+    print(("HARD " if m in hard else "SOFT ") + m, file=sys.stderr)
+sys.exit(1 if hard else 3 if soft else 0)
+PY
+}
+check8_self_test() {
+  local dir bad=0 f want rc
+  dir="$(mktemp -d)"
+  "$PY" - "$dir" <<'PY'
+import copy, json, os, sys
+d = sys.argv[1]
+h = {r: c * 64 for r, c in (("operator", "a"), ("forecaster", "b"), ("fixture", "c"), ("generator", "d"))}
+img = {"operator": f"reg.example/op@sha256:{h['operator']}", "forecaster": f"reg.example/fc@sha256:{h['forecaster']}",
+       "fixture": f"reg.example/fx@sha256:{h['fixture']}", "generator": f"grafana/k6@sha256:{h['generator']}"}
+cfg = {r: "sha256:" + str(i) * 64 for i, r in enumerate(img, 1)}
+exp = {"reviewed": True, "roles": {r: {"image": img[r], "id": cfg[r]} for r in img}, "workloads": [
+    {"kind": "Deployment", "namespace": "ctl", "name": "op", "role": "operator", "containers": ["operator"]},
+    {"kind": "Deployment", "namespace": "ctl", "name": "fc", "role": "forecaster", "containers": ["forecaster"]},
+    {"kind": "Deployment", "namespace": "ctl", "name": "route", "role": "fixture", "containers": ["proxy"]},
+    {"kind": "Deployment", "namespace": "demo", "name": "arm", "role": "fixture", "containers": ["fixture"]},
+    {"kind": "Job", "namespace": "demo", "name": "k6", "role": "generator", "containers": ["k6"]}]}
+def workload(kind, ns, name, n):
+    st = {"replicas": n} if kind == "Deployment" else {"succeeded": n}
+    return {"kind": kind, "metadata": {"namespace": ns, "name": name},
+            "spec": {"selector": {"matchLabels": {"app": name}}}, "status": st}
+def pod(ns, owner, i, container, role, image_id=None):
+    return {"kind": "Pod", "metadata": {"namespace": ns, "name": f"{owner}-{i}", "labels": {"app": owner}},
+            "spec": {"containers": [{"name": container, "image": img[role]}]},
+            "status": {"containerStatuses": [{"name": container, "imageID": image_id or ("docker.io/" + img[role] if role == "generator" else img[role])}]}}
+good = {"kind": "List", "items": [workload("Deployment", "ctl", "op", 1), workload("Deployment", "ctl", "fc", 1),
+        workload("Deployment", "ctl", "route", 1), workload("Deployment", "demo", "arm", 2), workload("Job", "demo", "k6", 1),
+        pod("ctl", "op", 0, "operator", "operator"), pod("ctl", "fc", 0, "forecaster", "forecaster"),
+        pod("ctl", "route", 0, "proxy", "fixture"), pod("demo", "arm", 0, "fixture", "fixture"),
+        pod("demo", "arm", 1, "fixture", "fixture"), pod("demo", "k6", 0, "k6", "generator"),
+        {"kind": "Pod", "metadata": {"namespace": "demo", "name": "unrelated", "labels": {"app": "other"}},
+         "spec": {"containers": [{"name": "pause", "image": "registry.k8s.io/pause:3.10"}]}, "status": {}}]}
+def arm1(live):
+    return next(o for o in live["items"] if o["metadata"]["name"] == "arm-1")
+cases = {"0-all-correct": lambda live: None,
+         "0-config-digest": lambda live: arm1(live)["status"]["containerStatuses"][0].update(imageID=cfg["fixture"]),
+         "1-wrong-spec-image": lambda live: arm1(live)["spec"]["containers"][0].update(image=f"reg.example/fx@sha256:{'e' * 64}"),
+         "1-tag-spec-image": lambda live: arm1(live)["spec"]["containers"][0].update(image="reg.example/fx:latest"),
+         "1-wrong-runtime": lambda live: arm1(live)["status"]["containerStatuses"][0].update(imageID=f"reg.example/fx@sha256:{'e' * 64}"),
+         "1-wrong-config-digest": lambda live: arm1(live)["status"]["containerStatuses"][0].update(imageID="sha256:" + "9" * 64),
+         "3-missing-status": lambda live: arm1(live)["status"].update(containerStatuses=[]),
+         "3-empty-imageid": lambda live: arm1(live)["status"]["containerStatuses"][0].update(imageID=""),
+         "1-extra-container": lambda live: arm1(live)["spec"]["containers"].append({"name": "sidecar", "image": img["fixture"]}),
+         "1-extra-init-container": lambda live: arm1(live)["spec"].update(initContainers=[{"name": "init", "image": img["fixture"]}]),
+         "1-renamed-container": lambda live: arm1(live)["spec"]["containers"][0].update(name="other"),
+         "3-fewer-pods": lambda live: live["items"].remove(arm1(live)),
+         "1-missing-workload": lambda live: live["items"].pop(0)}
+for name, mutate in cases.items():
+    live = copy.deepcopy(good)
+    mutate(live)
+    json.dump(live, open(os.path.join(d, name + ".live.json"), "w"))
+json.dump(exp, open(os.path.join(d, "expected.json"), "w"))
+PY
+  for f in "$dir"/*.live.json; do
+    want="${f##*/}"; want="${want%%-*}"
+    rc=0; check8_classify "$dir/expected.json" "$f" "$dir/out.json" 2>/dev/null || rc=$?
+    [ "$rc" = "$want" ] || { echo "check-8 self-test: ${f##*/} gave exit $rc, want $want" >&2; bad=1; }
+  done
+  check8_classify "$dir/expected.json" "$dir/0-all-correct.live.json" "$dir/out.json"
+  "$PY" -c 'import json, sys; d = json.load(open(sys.argv[1])); assert len(d["containers"]) == 6 and len(d["workloads"]) == 5, d' \
+    "$dir/out.json" || { echo "check-8 self-test: the inventory is incomplete" >&2; bad=1; }
+  rm -rf -- "${dir:?}"
+  return "$bad"
+}
+
 if [ "$RENDER_ONLY" = 1 ]; then
   classifier_self_test || { echo "render-only: check 7's classifier self-test failed" >&2; exit 1; }
   echo "render-only: check 7's classifier accepts only answers from the forecast API"
   images_self_test || { echo "render-only: the --images validation self-test failed" >&2; exit 1; }
   echo "render-only: --images refuses tag refs, a wrong schema and an unverified file"
+  check8_self_test || { echo "render-only: check 8's classifier self-test failed" >&2; exit 1; }
+  echo "render-only: check 8 fails on a wrong spec image, a wrong runtime image, a missing status, an extra container and too few pods"
   if [ -n "$IMAGES_FILE" ]; then
     images_read "$IMAGES_FILE" | sed 's/^/render-only: reviewed image /'   # pipefail: a refusal exits here
   fi
@@ -507,7 +651,7 @@ pass "3. the six PredictiveAutoscaler arms are in Recommend and wrote nothing"
 # accelerate 120: each program minute lasts 0.5 s, the whole scored program 12 minutes (labelled accelerated-smoke).
 c28 plan --kind scored --seed 201 --capacity 7 --target c28-h-rps-s20 --accelerate 120 --out "$WORK/plan.json"
 k -n "$NS" create configmap c28-k6 --from-file=plan.json="$WORK/plan.json" --from-file=c28.js="$ROOT/deploy/eval-c28/load/c28.js" >/dev/null
-k apply -f - >/dev/null <<EOF
+cat > "$WORK/k6-job.yaml" <<EOF
 apiVersion: batch/v1
 kind: Job
 metadata: {name: c28-k6-smoke, namespace: $NS}
@@ -528,6 +672,7 @@ spec:
           volumeMounts: [{name: plan, mountPath: /plan}]
       volumes: [{name: plan, configMap: {name: c28-k6}}]
 EOF
+k apply -f "$WORK/k6-job.yaml" >/dev/null
 # fetch_matches <namespace> <resource> <local port> <remote port> <path> <pattern>: fetch through a short
 # port-forward (the images carry no tools) and match the answer.
 fetch_matches() {
@@ -584,52 +729,87 @@ pass "7. forecast API reachable through the certificate-verified route"
 log "v2-acceptance: PENDING (not tested by this smoke: check 7 proves route reachability only, a 503 DataUnavailable included; acceptance with sufficient lead is not exercised)"
 
 # --- 8. the images the pods run ----------------------------------------------------------------------------------------
-# Every container whose spec names one of the four images (the k6 pod may have completed; its status keeps the imageID).
-# With --images each must report imageID <repo>@sha256:<reviewed digest>. A runtime that reports only a bare
-# sha256:<id> is compared with the config digest docker verified for that digest reference instead (docker image
-# inspect .Id): the manifest names that config, and the config pins every layer by its diff_id, so the two identify
-# the same image content. Without --images the IDs are recorded only (there is no reviewed digest).
-expect="$("$PY" -c 'import json, sys; a = sys.argv[1:]; print(json.dumps([dict(zip(("role", "image", "id"), a[i:i + 3])) for i in range(0, len(a), 3)]))' \
-  operator "$OPERATOR_IMAGE" "${OPERATOR_ID:-}" forecaster "$FORECASTER_IMAGE" "${STATISTICAL_ID:-}" \
-  fixture "$FIXTURE_IMAGE" "${FIXTURE_ID:-}" generator "$K6_IMAGE" "${GENERATOR_ID:-}")"
-k get pods -n "$NS" -o json > "$WORK/pods-$NS.json"
-k get pods -n "$CTRL" -o json > "$WORK/pods-$CTRL.json"
-"$PY" - "$expect" "${IMAGES_FILE:+reviewed}" "$WORK/running-images.json" "$WORK/pods-$NS.json" "$WORK/pods-$CTRL.json" <<'PY' \
-  || die "8. a running image is not the reviewed digest (or a role runs nothing)"
-import json, sys
-expect, reviewed, out = json.loads(sys.argv[1]), sys.argv[2] == "reviewed", sys.argv[3]
-by_image = {e["image"]: e for e in expect}
-record, bad = [], []
-for path in sys.argv[4:]:
-    for pod in json.load(open(path))["items"]:
-        spec = {c["name"]: c["image"] for c in pod["spec"]["containers"]}
-        for cs in pod["status"].get("containerStatuses") or []:
-            e = by_image.get(spec.get(cs["name"]))
-            if e is None:
-                continue
-            got = cs.get("imageID", "")
-            row = {"role": e["role"], "pod": f'{pod["metadata"]["namespace"]}/{pod["metadata"]["name"]}',
-                   "container": cs["name"], "image": e["image"], "imageID": got}
-            if reviewed:
-                want = e["image"].split("@", 1)[1]
-                ok = got.endswith("@" + want) if "@" in got else got == e["id"]
-                row["match"] = "repo-digest" if "@" in got else "config-digest"
-                if not ok:
-                    bad.append(row)
-            record.append(row)
-            print(f'running-image {row["role"]} {row["pod"]} {row["container"]} imageID={got}')
-missing = sorted({e["role"] for e in expect} - {r["role"] for r in record})
-json.dump({"mode": "reviewed" if reviewed else "build", "containers": record, "missing": missing, "mismatched": bad},
-          open(out, "w"), indent=1)
-print("running-images " + json.dumps({"mode": "reviewed" if reviewed else "build", "missing": missing,
-                                      "mismatched": len(bad), "containers": len(record)}))
-for r in bad:
-    print(f'MISMATCH {r["role"]} {r["pod"]}: imageID {r["imageID"]} is not {r["image"]}', file=sys.stderr)
-sys.exit(1 if bad or missing else 0)
+# The expected set comes from what the smoke deployed, never from an image value: every Deployment of the rendered
+# fixture (arms, ingress, routes), the release's operator and forecaster Deployments (any other workload in the release
+# fails) and the k6 Job, each with its container names. Every pod those workloads' selectors pick and every container
+# in it is then checked by check8_classify (above): the spec must name the role's image and, with --images, the
+# runtime must report the reviewed digest. A container still starting (no imageID yet, or fewer pods than the
+# workload reports) is looked at again for up to 3 minutes; a hard failure stops at once. The inventory is
+# $WORK/running-images.json, and the pod/workload snapshot it was decided on (env values dropped) is
+# $WORK/running-images-pods.json.
+h get manifest pa-eval -n "$CTRL" > "$WORK/release-manifest.yaml"
+"$PY" - "$WORK/check8-expected.json" "${IMAGES_FILE:+reviewed}" "$WORK/all.yaml" "$WORK/release-manifest.yaml" \
+  "$WORK/k6-job.yaml" "$OPERATOR_IMAGE" "${OPERATOR_ID:-}" "$FORECASTER_IMAGE" "${STATISTICAL_ID:-}" \
+  "$FIXTURE_IMAGE" "${FIXTURE_ID:-}" "$K6_IMAGE" "${GENERATOR_ID:-}" <<'PY' || die "8. the expected workload set"
+import json, sys, yaml
+out, reviewed, fixture_f, release_f, k6_f = sys.argv[1], sys.argv[2] == "reviewed", *sys.argv[3:6]
+a = sys.argv[6:]
+roles = {r: {"image": a[2 * i], "id": a[2 * i + 1]} for i, r in enumerate(("operator", "forecaster", "fixture", "generator"))}
+WORKLOADS = ("Deployment", "Job", "CronJob", "StatefulSet", "DaemonSet", "ReplicaSet", "Pod")
+def load(path):
+    return [o for o in yaml.safe_load_all(open(path)) if o and o.get("kind") in WORKLOADS]
+def entry(o, role):
+    tpl = o["spec"]["template"]["spec"]
+    return {"kind": o["kind"], "namespace": o["metadata"]["namespace"], "name": o["metadata"]["name"], "role": role,
+            "containers": [c["name"] for c in tpl.get("containers", []) + tpl.get("initContainers", [])]}
+workloads = []
+for o in load(fixture_f):
+    assert o["kind"] == "Deployment", f"unexpected fixture workload {o['kind']} {o['metadata']['name']}"
+    workloads.append(entry(o, "fixture"))
+for o in load(release_f):
+    comp = o["spec"]["template"]["metadata"]["labels"].get("app.kubernetes.io/component") if o["kind"] == "Deployment" else None
+    assert comp in ("operator", "forecaster"), f"unexpected release workload {o['kind']} {o['metadata']['name']}"
+    workloads.append(entry(o, comp))
+for o in load(k6_f):
+    assert o["kind"] == "Job", o["kind"]
+    workloads.append(entry(o, "generator"))
+missing = {r for r in roles} - {w["role"] for w in workloads}
+assert not missing, f"no workload for {sorted(missing)}"
+json.dump({"reviewed": reviewed, "roles": roles, "workloads": workloads}, open(out, "w"), indent=1)
 PY
+check8_snapshot() {   # the run's Pods, Deployments and Jobs as one List, env values and managedFields dropped
+  local raw="$WORK/.check8-raw"
+  k get pods,deployments,jobs -n "$NS" -o json > "$raw-ns.json"
+  k get pods,deployments,jobs -n "$CTRL" -o json > "$raw-ctrl.json"
+  "$PY" - "$WORK/running-images-pods.json" "$raw-ns.json" "$raw-ctrl.json" <<'PY'
+import json, sys
+def clean(spec):
+    for c in (spec or {}).get("containers", []) + (spec or {}).get("initContainers", []):
+        c["env"] = [{"name": e.get("name")} for e in c.get("env") or []]
+items = []
+for path in sys.argv[2:]:
+    for o in json.load(open(path))["items"]:
+        o["metadata"].pop("managedFields", None)
+        (o["metadata"].get("annotations") or {}).pop("kubectl.kubernetes.io/last-applied-configuration", None)
+        clean(o.get("spec") if o["kind"] == "Pod" else ((o.get("spec") or {}).get("template") or {}).get("spec"))
+        items.append(o)
+json.dump({"apiVersion": "v1", "kind": "List", "items": items}, open(sys.argv[1], "w"), indent=1)
+PY
+  rm -f -- "$raw-ns.json" "$raw-ctrl.json"
+}
+attempt=0
+while :; do
+  attempt=$((attempt + 1))
+  guard
+  check8_snapshot
+  rc=0; check8_classify "$WORK/check8-expected.json" "$WORK/running-images-pods.json" "$WORK/running-images.json" || rc=$?
+  { [ "$rc" = 3 ] && [ "$attempt" -lt 18 ]; } || break
+  sleep 10
+done
+"$PY" - "$WORK/running-images.json" "$attempt" <<'PY'
+import collections, json, sys
+d = json.load(open(sys.argv[1]))
+for r in d["containers"]:
+    print(f'running-image {r["role"]} {r["pod"]} {r["container"]} verdict={r["verdict"]} spec={r["spec_image"]} imageID={r["imageID"]}')
+print("running-images " + json.dumps({"mode": d["mode"], "attempt": int(sys.argv[2]), "workloads": len(d["workloads"]),
+      "pods": sum(w["pods"] for w in d["workloads"]), "containers": len(d["containers"]),
+      "verdicts": dict(collections.Counter(r["verdict"] for r in d["containers"])),
+      "hard": len(d["hard"]), "soft": len(d["soft"])}))
+PY
+[ "$rc" = 0 ] || die "8. the running images are not exactly the expected ones (see $WORK/running-images.json)"
 if [ -n "$IMAGES_FILE" ]; then
-  pass "8. every operator, forecaster, fixture and k6 container runs exactly the reviewed digest ($WORK/running-images.json)"
+  pass "8. every container of every operator, forecaster, fixture and k6 pod names and runs exactly the reviewed digest ($WORK/running-images.json)"
 else
-  pass "8. running image IDs recorded (build mode: no reviewed digests to compare)"
+  pass "8. every expected container names its image; running image IDs recorded (build mode: no reviewed digests to compare)"
 fi
 log "smoke complete (accelerated, engineering only: no C2.8 evidence)"
