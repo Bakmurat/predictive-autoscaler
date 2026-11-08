@@ -32,11 +32,14 @@ Params stage: the reservation comes BEFORE capacity calibration on the reserved 
 therefore validates only the reservation stage of the params (execlib.load_params_stage / render.validate_stage):
 run_id, nodes.workload/support, reservation.taint_key/taint_value/role_label, and control_namespace + release (the
 evaluation release's pods on S classify as evaluation occupants), with the full validation's strictness; rollback
-needs nothing more. verify separates "reservation verified" from "ready for calibration/experiment":
+needs nothing more. verify separates "reservation verified" (require_reservation_pass: what calibration will build on,
+with its own calibration-configuration and admission checks) from "ready for the experiment" (complete parameters,
+require_ready_for_experiment; prepare.py enforces it live in every plan and again under the lock at apply):
   reservation: PASS|FAIL                 taint, role labels, cordon, pressure, occupants, broad tolerations
   placement:   PASS|FAIL|NOT READY       the rendered pods' tolerations and node affinity, checked only when the params
                                          validate fully (otherwise NOT READY, never PASS)
-  experiment_readiness: "READY" | "NOT READY: params incomplete (<missing/placeholder fields and the refusal>)"
+  experiment_readiness: "READY" | "NOT READY: " + every failing part with its reasons: "reservation FAIL (...)",
+                         "params incomplete (<missing/placeholder fields; refusal>)", "rendered placement FAIL (...)"
   ready_for_experiment: true only when reservation and placement both PASS
   problems: everything blocking the experiment, the NOT READY item included, so an empty list implies
             ready_for_experiment (callers still check ready_for_experiment, never an empty list alone)
@@ -389,17 +392,22 @@ def verify(record: X.Record, kube: X.Kube) -> Dict:
     incomplete = X.experiment_params_problems(params)
     if incomplete:
         placement, placement_problems = "NOT READY", []
-        readiness = f"NOT READY: params incomplete ({'; '.join(incomplete)})"
     else:
         try:
             placement_problems = rendered_placement_problems(params)
         except X.import_harness().render.ParamsError as e:
             placement_problems = [f"the params do not render: {e}"]
         placement = "PASS" if not placement_problems else "FAIL"
-        readiness = "READY" if placement == "PASS" else "NOT READY: rendered placement fails"
     reservation = "PASS" if not problems else "FAIL"
     ready = reservation == "PASS" and placement == "PASS"
-    blocking = problems + placement_problems + ([f"experiment readiness: {readiness}"] if incomplete else [])
+    # experiment_readiness comes from the COMBINED verdict, every failing part with its specific reasons
+    incomplete_item = f"params incomplete ({'; '.join(incomplete)})"
+    reasons = ([f"reservation FAIL ({'; '.join(problems)})"] if problems else []) + \
+        ([incomplete_item] if incomplete else []) + \
+        ([f"rendered placement FAIL ({'; '.join(placement_problems)})"] if placement_problems else [])
+    readiness = "READY" if ready else "NOT READY: " + " | ".join(reasons)
+    blocking = problems + placement_problems + ([f"experiment readiness: NOT READY: {incomplete_item}"]
+                                                if incomplete else [])
     result = "PASS" if ready else ("RESERVED-NOT-READY" if reservation == "PASS" and placement == "NOT READY"
                                    else "FAIL")
     return {"helper": HELPER, "action": "verify", "run_id": record.run_id, "nodes": nodes, "occupants": occ,
@@ -408,9 +416,20 @@ def verify(record: X.Record, kube: X.Kube) -> Dict:
             "ready_for_experiment": ready, "problems": blocking, "result": result}
 
 
+def require_reservation_pass(out: Dict) -> None:
+    """The reservation part of reserve verify's verdict only (taint, role labels, cordon, pressure, occupants, broad
+    tolerations), whatever the experiment parameters. Capacity calibration on W will need this PLUS its own separately
+    validated calibration configuration and admission checks (not implemented here); it never needs complete experiment
+    parameters, which would recreate the c0/HPA-target dependency cycle."""
+    if not (out.get("reservation") == "PASS" and out.get("reservation_problems") == []):
+        raise X.StagingError(f"the reservation does not pass: {out.get('reservation')} "
+                             f"({'; '.join(out.get('reservation_problems') or []) or 'no verdict'})")
+
+
 def require_ready_for_experiment(out: Dict) -> None:
-    """For a caller that needs the reserved nodes READY for calibration/experiment: reserve verify's explicit verdict
-    (reservation and placement PASS), never an empty problems list alone."""
+    """For callers that need the COMPLETE experiment parameters on a passing reservation (preparation, sessions):
+    reservation and rendered placement PASS, never an empty problems list alone. It is NOT the calibration gate:
+    it requires the calibrated parameters themselves (see require_reservation_pass)."""
     if not (out.get("ready_for_experiment") is True and out.get("reservation") == "PASS"
             and out.get("placement") == "PASS" and not out.get("problems")):
         raise X.StagingError(f"the reservation is not ready for the experiment: reservation {out.get('reservation')}, "

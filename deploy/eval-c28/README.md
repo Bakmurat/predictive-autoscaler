@@ -108,9 +108,19 @@ qualified label keys, the taint value equal to the run id); every other field ma
 Passing a stage validation says nothing about readiness: `render.full_validation_problems(params)` (and
 `execlib.experiment_params_problems`, which adds the residency requirement) list why the params are incomplete. `reserve.py
 verify` reports `reservation: PASS|FAIL`, `placement: PASS|FAIL|NOT READY` (the rendered placement is checked only
-on complete params), `experiment_readiness` and `ready_for_experiment` (exit 0 ready, 3 reserved but not ready, 1
-fail); its `problems` include the NOT READY item. `validate` (the full validation, used by `load_params` in prepare,
-freeze and session) includes the reservation stage and refuses any remaining placeholder anywhere in the file.
+on complete params), `ready_for_experiment` and `experiment_readiness`, which follows the combined verdict and names
+every failing part (`reservation FAIL (...)`, `params incomplete (...)`, `rendered placement FAIL (...)`); exit 0
+ready, 3 reserved but not ready, 1 fail; its `problems` include the NOT READY item. `validate` (the full validation,
+used by `load_params` in prepare, freeze and session) includes the reservation stage and refuses any remaining
+placeholder anywhere in the file.
+
+Two gates read that verdict. `reserve.require_ready_for_experiment` needs the complete experiment parameters on a
+passing reservation: `prepare.py` requires it live in every phase's plan and again in apply's recomputation under the
+shared lock, so a reservation lost between review and apply creates nothing. It is NOT the calibration gate (it needs
+the calibrated values themselves, which would recreate the c0/HPA-target cycle). Capacity calibration on W will need
+`reserve.require_reservation_pass` (the reservation part alone) plus its own separately validated calibration
+configuration and admission checks; calibration is not implemented here. `residency` stays outside the reservation
+stage and mandatory for workload admission (`load_params`, prepare's residency audit).
 
 ## Fixture resources and the residency budget
 

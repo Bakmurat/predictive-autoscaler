@@ -365,3 +365,44 @@ def test_session_reservation_stops_include_not_ready(api, make_record):
     ctx = type("Ctx", (), {"record": record, "kube": kube})()
     stops = session._occupant_stops(ctx)
     assert stops and any("NOT READY" in s for s in stops)
+
+
+# --- one coherent verdict (Codex #46 review, finding 2) and the calibration-side gate ---------------------------------
+
+def test_readiness_follows_the_combined_verdict(api, make_record):
+    """Complete params with a passing rendered placement but a FAILED reservation is NOT READY, with the reasons."""
+    record, kube = setup(api, make_record)
+    out = reserve.verify(record, kube)                          # nothing applied
+    assert out["placement"] == "PASS" and out["reservation"] == "FAIL" and out["ready_for_experiment"] is False
+    assert out["experiment_readiness"].startswith("NOT READY: reservation FAIL (")
+    assert "the run taint is not exactly" in out["experiment_readiness"]
+    assert out["experiment_readiness"] != "READY"
+
+
+def test_readiness_lists_every_failing_part(api, make_record):
+    record, kube = setup(api, make_record, params=stage_params())
+    out = reserve.verify(record, kube)                          # nothing applied, params incomplete
+    r = out["experiment_readiness"]
+    assert r.startswith("NOT READY: reservation FAIL (") and " | params incomplete (" in r and "c0_rps" in r
+
+
+def test_readiness_names_a_failing_rendered_placement(api, make_record, monkeypatch):
+    record, kube = setup(api, make_record)
+    do_apply(record, kube)
+    monkeypatch.setattr(reserve, "rendered_placement_problems", lambda p: ["c28-x: tolerations wrong"])
+    out = reserve.verify(record, kube)
+    assert out["reservation"] == "PASS" and out["placement"] == "FAIL" and out["result"] == "FAIL"
+    assert out["experiment_readiness"] == "NOT READY: rendered placement FAIL (c28-x: tolerations wrong)"
+    assert out["problems"] == ["c28-x: tolerations wrong"]
+
+
+def test_reservation_pass_gate_needs_no_experiment_params(api, make_record):
+    """What calibration will build on: the reservation part alone, never the complete experiment parameters."""
+    record, kube = setup(api, make_record, params=stage_params())
+    with pytest.raises(X.StagingError, match="does not pass"):
+        reserve.require_reservation_pass(reserve.verify(record, kube))
+    do_apply(record, kube)
+    out = reserve.verify(record, kube)
+    reserve.require_reservation_pass(out)
+    with pytest.raises(X.StagingError, match="not ready for the experiment"):
+        reserve.require_ready_for_experiment(out)
