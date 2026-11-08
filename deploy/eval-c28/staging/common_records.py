@@ -689,7 +689,8 @@ def api_for(rec: Mapping, run: Callable = subprocess.run) -> KubectlApi:
     return KubectlApi(rec["kubeconfig"], run=run)
 
 
-__all__ = ["exclusive_lock", "lock_path", "mutation_step", "unresolved_intents", "owner_terminated", "process_start", "recovery_guard",
+__all__ = ["exclusive_lock", "lock_path", "mutation_step", "unresolved_intents", "owner_terminated", "process_start",
+           "recovery_guard",
            "ApiError", "KINDS", "KubectlApi", "NotFound", "StagingError",
            "add_common_args",
            "api_for",
