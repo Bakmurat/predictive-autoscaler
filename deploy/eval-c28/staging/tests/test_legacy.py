@@ -187,9 +187,11 @@ def test_phase_a_binds_target_uids_only_and_never_parks(tmp_path):
     done = [r for r in C.read_receipts(C.receipts_path(rec, "legacy")) if r["event"] == "quiesce-complete"][-1]
     cap = {t["name"]: t for t in done["data"]["targets"]}
     d = api.objects[("deployments", "demo", "nginx-test")]
+    rep = cap["nginx-test"].pop("reporters")
     assert cap["nginx-test"] == {"namespace": "demo", "name": "nginx-test", "uid": d["metadata"]["uid"],
                                  "generation": d["metadata"]["generation"], "replicas": 3,
                                  "resourceVersion": d["metadata"]["resourceVersion"]}
+    assert rep == LG.pod_identities(api, "demo", d["metadata"]["uid"]) and len(rep["running"]) == 3
     assert done["data"]["observed_seconds"] == 600 and done["data"]["observed_receipt_sha256"]
     # A phase A plan edited to park a target is refused even with its digest.
     bad = copy.deepcopy(plan)
@@ -467,7 +469,7 @@ def test_surviving_pods_or_a_renewed_lease_block_parking_and_retirement(tmp_path
             lease3["spec"]["renewTime"] = "2026-11-09T00:00:00Z"
     api3.on_poll.append(renew_later)
     v = LG.verify(api3, rec3, 600, clock3.sleep, clock3, clock3)
-    assert v["retired"] is False and any("changed during the observation" in p for p in v["problems"])
+    assert v["retired"] is False and any("changed since the preserved baseline" in p for p in v["problems"])
 
 
 def test_restore_refuses_drift_after_quiesce(tmp_path):
@@ -1241,3 +1243,124 @@ def test_the_cli_runs_both_phases_and_verify(tmp_path, capsys):
     capsys.readouterr()
     assert LG.main(["--record", str(path), "verify"], api=api, sleep=clock.sleep, monotonic=clock, clock=clock) == 0
     assert json.loads(capsys.readouterr().out)["retired"] is True
+
+
+# --- C2.8n Codex review of #42: reporter identity, preserved baselines, recovered park writes -------------------------
+
+def replace_reporter(api, target="nginx-test"):
+    """Delete one Running pod of the target and add a new one (another name and UID) under the same ReplicaSet."""
+    rs = api.objects[("replicasets", "demo", f"{target}-rs")]["metadata"]["uid"]
+    old = next(k for k, v in sorted(api.objects.items(), key=lambda x: str(x[0])) if k[0] == "pods" and
+               any(r.get("uid") == rs for r in v["metadata"].get("ownerReferences") or []))
+    del api.objects[old]
+    api.add("pods", {"kind": "Pod", "metadata": {"name": f"{target}-replaced", "namespace": "demo",
+                                                 "ownerReferences": [{"kind": "ReplicaSet", "uid": rs,
+                                                                      "controller": True}]},
+                     "spec": {}, "status": {"phase": "Running"}})
+    return old[2]
+
+
+def test_a_late_reporter_replacement_fails_phase_a(tmp_path):
+    # Codex repro 1: a reporter replaced ten seconds before the observation ends, its old series still fresh.
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    start, done = {}, {}
+
+    def rate():
+        start.setdefault("t", clock.t)                                     # the first arrivals sample
+        return 0.0
+
+    def hook(a):
+        if "t" in start and clock.t >= start["t"] + 590 and not done:
+            done["old"] = replace_reporter(a)
+    api.on_poll.append(hook)
+    with pytest.raises(C.StagingError, match="reporter pods of nginx-test changed"):
+        quiesce(api, rec, clock, Metrics(rate_fn=rate))                    # AllFresh: every series stays fresh
+    assert done and not any(r["event"] == "quiesce-complete" for r in journal(rec))
+    with pytest.raises(C.StagingError, match="no phase A completion"):
+        LG.build_park_plan(api, rec)
+
+
+def test_a_reporter_replaced_before_parking_needs_a_new_phase_a(tmp_path):
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    quiesce(api, rec, clock)
+    replace_reporter(api, "nginx-ensemble")
+    with pytest.raises(C.StagingError, match="reporter pods of nginx-ensemble changed.*re-run phase A"):
+        LG.build_park_plan(api, rec)
+    quiesce(api, rec, clock)                                               # a new complete traffic observation
+    pplan = LG.build_park_plan(api, rec)
+    replace_reporter(api, "nginx-seasonal")                                # after the park plan was reviewed
+    with pytest.raises(C.StagingError, match="reporter pods of nginx-seasonal changed"):
+        LG.park(api, rec, pplan, C.plan_digest(pplan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    assert all(api.objects[("deployments", "demo", a)]["spec"]["replicas"] == 3 for a in LG.L.ARMS)
+    quiesce(api, rec, clock)
+    park(api, rec, clock)
+    assert LG.verify(api, rec, 600, clock.sleep, clock, clock)["retired"] is True
+
+
+def test_a_lease_created_between_park_and_verify_is_not_accepted(tmp_path):
+    # Codex repro 2: the Lease baseline is phase A's (through park-complete), never verify's first sample.
+    api, rec, clock = no_lease_cluster(), ready_record(tmp_path), Clock()
+    full(api, rec, clock)
+    api.add("leases", {"kind": "Lease", "metadata": {"name": "predictive-autoscaler-leader", "namespace": "ml-engine"},
+                       "spec": {"holderIdentity": "x", "renewTime": "2026-11-08T03:00:00Z"}})
+    v = LG.verify(api, rec, 600, clock.sleep, clock, clock)
+    assert v["retired"] is False and any("Lease appeared" in p for p in v["problems"]), v["problems"]
+    api2, rec2, clock2 = legacy_cluster(), ready_record(tmp_path / "b"), Clock()
+    full(api2, rec2, clock2)
+    api2.objects[("leases", "ml-engine", "predictive-autoscaler-leader")]["spec"]["renewTime"] = "2026-11-09T00:00:00Z"
+    v2 = LG.verify(api2, rec2, 600, clock2.sleep, clock2, clock2)
+    assert v2["retired"] is False and any("preserved baseline" in p for p in v2["problems"])
+
+
+def historical_job(api, name="ml-training-old"):
+    return api.add("jobs", {"kind": "Job", "metadata": {"name": name, "namespace": "ml-engine",
+                                                        "ownerReferences": [{"kind": "CronJob",
+                                                                             "name": "ml-training"}]},
+                            "status": {"succeeded": 1, "completionTime": "2026-11-07T00:00:00Z"}})
+
+
+def test_job_identities_are_preserved_across_phases(tmp_path):
+    # Codex repro 2b: a Job completed between park and verify is not silently accepted; deleting history is allowed.
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    historical_job(api)
+    full(api, rec, clock)
+    historical_job(api, "ml-training-new")                                 # appeared and finished after park
+    v = LG.verify(api, rec, 600, clock.sleep, clock, clock)
+    assert v["retired"] is False and any("legacy Jobs appeared ['ml-training-new']" in p for p in v["problems"])
+    del api.objects[("jobs", "ml-engine", "ml-training-new")]
+    del api.objects[("jobs", "ml-engine", "ml-training-old")]              # history cleanup: allowed
+    assert LG.verify(api, rec, 600, clock.sleep, clock, clock)["retired"] is True
+    api2, rec2, clock2 = legacy_cluster(), ready_record(tmp_path / "b"), Clock()
+    quiesce(api2, rec2, clock2)
+    historical_job(api2, "ml-training-between")                            # between phase A and park
+    with pytest.raises(C.StagingError, match="legacy Jobs appeared"):
+        LG.build_park_plan(api2, rec2)
+
+
+def test_a_committed_park_write_with_a_lost_response_resumes_after_recovery(tmp_path):
+    # Codex repro 3: the scale commits, the response is lost; recovery records it done; park-plan resumes.
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    quiesce(api, rec, clock)
+    pplan = LG.build_park_plan(api, rec)
+    real = api.replace
+
+    def lossy(path, body):
+        out = real(path, body)
+        if path.endswith("/deployments/myapptwo/scale"):
+            raise C.ApiError("replace: failed (timeout, exit 1)", 504)   # committed, response lost
+        return out
+    api.replace = lossy
+    with pytest.raises(C.ApiError):
+        LG.park(api, rec, pplan, C.plan_digest(pplan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    api.replace = real
+    assert api.objects[("deployments", "demo", "myapptwo")]["spec"]["replicas"] == 0
+    lock = C.lock_path(rec, "legacy")
+    crash_owner(lock)
+    assert list(LG.recover(api, rec, C.sha256_file(lock), clock).values()) == ["done"]
+    again = LG.build_park_plan(api, rec)
+    assert again["already_parked"] == ["nginx-test", "nginx-reactive", "myapptwo"]
+    assert "myapptwo" not in {a.get("name") for a in again["actions"]}
+    LG.park(api, rec, again, C.plan_digest(again), sleep=clock.sleep, monotonic=clock, clock=clock)
+    assert LG.verify(api, rec, 600, clock.sleep, clock, clock)["retired"] is True
+    rplan = LG.build_restore_plan(api, rec)                                 # the recovered write is undone too
+    assert "myapptwo" in [a.get("name") for a in rplan["actions"]]

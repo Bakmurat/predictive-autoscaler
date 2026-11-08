@@ -30,7 +30,10 @@ workload has a pod, no Job runs, the targets do not change, no writer or consume
 counters, read fresh from the metrics API through the reviewed legacy.arrivals queries, show zero requests: the
 summed rate is zero, the newest sample is fresh, and EVERY expected reporter (each target pod running when the
 observation starts, grouped by arrivals.pod_label) has its own fresh series; a missing observation blocks, it is never
-read as zero); finally CAPTURE the stable target state (UID, generation, resourceVersion, replicas). Phase A never
+read as zero). The reporters are bound by pod name AND UID: the running pod set must stay exactly that and no new pod
+may appear, throughout the observation and at the capture (a replaced reporter's old series can stay fresh for
+max_age_seconds, so a replacement voids the observation: re-run phase A). Finally CAPTURE the stable target state
+(UID, generation, resourceVersion, replicas, the bound reporters) and the legacy Job identities. Phase A never
 parks a target and never binds a target's generation or replicas (the old operator may change them until it has
 stopped): it binds the target UIDs only, and its completion receipt (quiesce-complete) carries the captured state and
 the hash of the arrivals-observation receipt.
@@ -38,8 +41,10 @@ the hash of the arrivals-observation receipt.
 Phase B ("park") is planned only from phase A's completion receipt: the latest quiesce-complete of this run in the
 verified hash chain, bound into the park plan by its sha256 together with the arrivals proof. park-plan re-reads every
 target and refuses one whose UID or generation changed after the captured state (re-run phase A to capture a new stable
-state), re-checks that the phase A post-conditions still hold, and plans: a live re-check right before parking (the
-stopped workloads, writers, consumers, Lease and one more fresh zero-arrivals sample from every running reporter); the
+state) or whose reporter pods (names/UIDs) differ from the bound ones (a new complete traffic observation is needed:
+re-run phase A), re-checks that the phase A post-conditions still hold (no legacy Job outside phase A's identities),
+and plans: a live re-check right before parking (the stopped workloads, writers, consumers, Lease, Jobs, the bound
+reporters and one more fresh zero-arrivals sample from each of them); the
 arm Deployments to the parked count (bound to the captured generation); their pods gone; active Jobs finished; the old
 API stopped. Legacy PAs, PVCs, the legacy CRD and the Lease are never touched, even by an edited plan; a phase A plan
 can only touch launchers and writers, a phase B plan only targets and the API.
@@ -49,7 +54,10 @@ verification. Parking the targets (and stopping the generators) removes their Is
 establish fresh zero traffic after parking; verify therefore does NOT query metrics and never reads an absent series as
 zero. It requires (i) phase A's completed arrivals observation (>= 600 s of fresh per-target, per-reporter zero
 rates; its receipt is bound into phase B's plan and park-complete receipt and re-verified through the hash chain) and
-(ii) a park-complete receipt bound to that phase A, and then observes for >= 600 s that the targets stay at the parked
+(ii) a park-complete receipt bound to that phase A, recording the post-park control state and Job identities (checked
+there against phase A's Lease and Jobs). verify compares every sample, from the first, against those PRESERVED
+baselines (never against its own first sample, so a Lease created or a Job finished between park and verify is
+caught; deleting historical Jobs is allowed), and observes for >= 600 s that the targets stay at the parked
 count with no pods and their captured UIDs, no generator/operator/API pod exists, the launcher CronJobs stay suspended
 and no Job of theirs appears or runs, no ScaledObject or generated HPA, HPA, new-group PA, legacy PA consumer or
 reconciler appears, the old Lease is not renewed or created, and nothing is recreated or rescaled.
@@ -63,7 +71,8 @@ after; an interrupted call leaves the lock and an intent that recover reconciles
 undoes only what was done, newest first across both phases, bound to the post-quiesce/post-park state (generation and
 value: a later change is drift and refused), checks that no foreign writer owns a target before it restores a writer,
 and that each target is ready with a single writer before it restarts the generators. It never overwrites an existing
-object and never restores a whole namespace.
+object and never restores a whole namespace. A park interrupted after its write committed resumes too: recover
+records the outcome (reconciled-done), and park-plan treats it as the park step it is.
 
 legacy.arrivals (record): query_api; rate_query, age_query and series_query, each with {target} and the SAME label
 selector, which must include destination_workload="{target}" and destination_workload_namespace="demo" (the targets'
@@ -446,6 +455,40 @@ def running_pods(api, ns: str, deploy_uid: str) -> List[str]:
                   if (p.get("status") or {}).get("phase") == "Running" and not p["metadata"].get("deletionTimestamp"))
 
 
+def pod_identities(api, ns: str, deploy_uid: str) -> Dict:
+    """{"running": {name: uid} of the Running, non-terminating pods (the request reporters), "owned": [uid] of every
+    owned pod}: the reporter membership is bound by name AND UID."""
+    pods = _owned_pod_objects(api, ns, deploy_uid)
+    running = {p["metadata"]["name"]: p["metadata"].get("uid") for p in pods
+               if (p.get("status") or {}).get("phase") == "Running" and not p["metadata"].get("deletionTimestamp")}
+    return {"running": running, "owned": sorted(p["metadata"].get("uid") for p in pods)}
+
+
+def reporter_problems(api, ns: str, n: str, uid: str, bound: Mapping) -> List[str]:
+    """The live pod set of a target against its bound reporters: the same running pods (names and UIDs) and no pod
+    that was not there when they were bound (a replaced reporter's old series can stay fresh for max_age_seconds, so
+    a replacement voids the traffic observation: re-run phase A). A non-reporter (terminating) pod may go."""
+    live, out = pod_identities(api, ns, uid), []
+    if live["running"] != bound["running"]:
+        out.append(f"the reporter pods of {n} changed (names/UIDs {sorted(bound['running'])} -> "
+                   f"{sorted(live['running'])}): a new complete traffic observation is needed")
+    new = sorted(set(live["owned"]) - set(bound["owned"]))
+    if new:
+        out.append(f"{n} has pods that were not bound with its reporters (UIDs {new})")
+    return out
+
+
+def job_uids(api) -> List[str]:
+    return sorted(j["metadata"].get("uid") for j in _legacy_jobs(api, _jobs_spec()))
+
+
+def new_job_problems(api, baseline_uids) -> List[str]:
+    """Legacy Jobs (any status) that are not in the preserved baseline; deleted historical Jobs are allowed."""
+    new = sorted(j["metadata"].get("name") for j in _legacy_jobs(api, _jobs_spec())
+                 if j["metadata"].get("uid") not in set(baseline_uids))
+    return [f"legacy Jobs appeared {new} (a launcher or reconciler is active)"] if new else []
+
+
 def _legacy_jobs(api, j: Mapping) -> List[Dict]:
     out = []
     for job in C.list_items(api, "jobs", j["namespace"]):
@@ -545,6 +588,8 @@ def quiet_problems(api, rec: Mapping, obs: Mapping, baseline: Mapping, metrics) 
         o = api.get(C.path_of("deployments", ns, n))
         if o is None or o["metadata"].get("uid") != uid or _state(o) != baseline["targets"].get(n):
             out.append(f"target {n} changed (a writer or arrivals are still active)")
+        out += reporter_problems(api, ns, n, uid, baseline["reporter_pods"][n])
+    out += new_job_problems(api, baseline["jobs"])
     return out + _stopped_problems(api, rec, obs["stopped"], obs["jobs"], [(ns, n) for ns, n, _ in obs["targets"]])
 
 
@@ -676,7 +721,8 @@ def quiesce(api, rec: Mapping, plan: Mapping, reviewed: str, sleep: Callable = t
             "phase": "quiesce", "plan_sha256": reviewed, "steps": len(done),
             "observed_receipt_sha256": observed["receipt"]["sha256"], "observed_seconds": observed["seconds"],
             "samples": observed["samples"], "captured_receipt_sha256": captured["sha256"],
-            "lease": observed["baseline"]["lease"], "targets": captured["data"]["targets"]}, clock)
+            "lease": observed["baseline"]["lease"], "jobs": captured["data"]["jobs"],
+            "targets": captured["data"]["targets"]}, clock)
     return done
 
 
@@ -689,14 +735,16 @@ def _observe_quiet(api, rec: Mapping, a: Mapping, metrics, sleep, monotonic, clo
                              "refusing")
     if a.get("lease") is None and lease is not None:
         raise C.StagingError("an old-operator leader Lease appeared since the plan (a live writer); refusing")
-    targets, reporters = {}, {}
+    targets, reporters, pods = {}, {}, {}
     for ns, n, uid in a["targets"]:
         o = api.get(C.path_of("deployments", ns, n))
         if o is None or o["metadata"].get("uid") != uid:
             raise C.StagingError(f"target {ns}/{n} disappeared or has another UID than the plan; refusing")
         targets[n] = _state(o)
-        reporters[n] = running_pods(api, ns, uid)        # the expected reporters, fixed at the observation start
-    baseline = {"lease": lease, "targets": targets, "reporters": reporters}
+        pods[n] = pod_identities(api, ns, uid)           # the expected reporters (names and UIDs), fixed now
+        reporters[n] = sorted(pods[n]["running"])
+    baseline = {"lease": lease, "targets": targets, "reporters": reporters, "reporter_pods": pods,
+                "jobs": job_uids(api)}
     n = _observe(lambda: quiet_problems(api, rec, a, baseline, metrics), a["seconds"], sleep, monotonic,
                  "the shutdown signals are not quiet")
     r = C.append_receipt(rec, HELPER, f"observed-{a['step']}", {
@@ -713,13 +761,21 @@ def _capture(api, rec: Mapping, a: Mapping, observed: Mapping, clock) -> Dict:
     out = []
     for ns, n, uid in a["targets"]:
         o = api.get(C.path_of("deployments", ns, n))
-        if o is None or o["metadata"].get("uid") != uid or _state(o) != observed["baseline"]["targets"][n]:
-            raise C.StagingError(f"target {ns}/{n} changed after the quiet observation; refusing to capture")
+        bound = observed["baseline"]["reporter_pods"][n]
+        if o is None or o["metadata"].get("uid") != uid or _state(o) != observed["baseline"]["targets"][n] or \
+                reporter_problems(api, ns, n, uid, bound):
+            raise C.StagingError(f"target {ns}/{n} or its reporter pods changed after the quiet observation; "
+                                 f"refusing to capture")
         m = o["metadata"]
         out.append({"namespace": ns, "name": n, "uid": uid, "generation": m.get("generation"),
-                    "resourceVersion": m.get("resourceVersion"), "replicas": (o.get("spec") or {}).get("replicas")})
+                    "resourceVersion": m.get("resourceVersion"), "replicas": (o.get("spec") or {}).get("replicas"),
+                    "reporters": bound})
+    jobs = new_job_problems(api, observed["baseline"]["jobs"])
+    if jobs:
+        raise C.StagingError("; ".join(jobs) + "; refusing to capture")
     return C.append_receipt(rec, HELPER, f"captured-{a['step']}", {
-        "targets": out, "observed_receipt_sha256": observed["receipt"]["sha256"]}, clock)
+        "targets": out, "jobs": observed["baseline"]["jobs"],
+        "observed_receipt_sha256": observed["receipt"]["sha256"]}, clock)
 
 
 # --- phase B: park ------------------------------------------------------------------------------------------------
@@ -741,6 +797,7 @@ def _phase_a(rec: Mapping, receipts: Optional[List[Dict]] = None) -> Dict:
         raise C.StagingError("the legacy journal holds receipts of another run or helper; refusing")
     if d.get("phase") != "quiesce" or obs is None or not obs["event"].startswith("observed-") or cap is None or \
             not cap["event"].startswith("captured-") or cap["data"].get("targets") != d.get("targets") or \
+            cap["data"].get("jobs") != d.get("jobs") or \
             cap["data"].get("observed_receipt_sha256") != obs["sha256"]:
         raise C.StagingError("the phase A completion receipt does not bind its observation and capture; refusing")
     return {"complete": q, "observed": obs, "captured": cap, "after": receipts[i + 1:]}
@@ -752,9 +809,11 @@ def _restore_since(rec: Mapping, since: str) -> bool:
 
 
 def _parked_by(after: List[Dict], target: Mapping, parked: int) -> Optional[Dict]:
-    """The completed park step (recorded after this phase A) that left `target` at the parked count, if any."""
+    """The completed park step (recorded after this phase A) that left `target` at the parked count, if any: a step
+    receipt, or a recovery's reconciled-done outcome (an interrupted write that committed), with its post-state."""
     for r in after:
-        if r["event"].startswith("step-"):
+        if r["event"].startswith("step-") or (r["event"].startswith("reconciled-") and
+                                              r["data"].get("observed") == "done"):
             a = r["data"]["action"]
             if (a.get("op"), a.get("namespace"), a.get("name"), a.get("uid"), a.get("after")) == \
                     ("scale", target["namespace"], target["name"], target["uid"], parked):
@@ -798,6 +857,7 @@ def build_park_plan(api, rec: Mapping) -> Dict:
     if not _archive_complete(rec):
         refusals.append("no archive-complete receipt matching legacy.archive_receipt_sha256")
     refusals += _quiesced_problems(api, rec, q["data"]["lease"])
+    refusals += new_job_problems(api, q["data"]["jobs"])
     plan_targets, already = [], []
     for t in q["data"]["targets"]:
         o = api.get(C.path_of("deployments", t["namespace"], t["name"]))
@@ -813,6 +873,10 @@ def build_park_plan(api, rec: Mapping) -> Dict:
             refusals.append(f"target {t['name']} changed after phase A's captured state (generation "
                             f"{t['generation']} -> {m.get('generation')}): re-run phase A to capture a stable state")
             continue
+        moved = reporter_problems(api, t["namespace"], t["name"], t["uid"], t["reporters"])
+        if moved:
+            refusals += [f"{p} (since phase A: re-run phase A)" for p in moved]
+            continue
         plan_targets.append(t)
     api_dep = [(ns, n, api.get(C.path_of("deployments", ns, n))) for _, ns, n, _r in L.entries("api")]
     api_dep = [(ns, n, o) for ns, n, o in api_dep if o]
@@ -826,7 +890,8 @@ def build_park_plan(api, rec: Mapping) -> Dict:
 
     jobs = _jobs_spec()
     add("recheck_quiesced", targets=[[t["namespace"], t["name"], t["uid"]] for t in plan_targets],
-        lease=q["data"]["lease"], jobs=jobs)
+        reporters={t["name"]: t["reporters"] for t in plan_targets}, lease=q["data"]["lease"],
+        jobs_baseline=q["data"]["jobs"], jobs=jobs)
     for t in plan_targets:
         add("scale", kind="deployments", namespace=t["namespace"], name=t["name"], uid=t["uid"],
             generation=t["generation"], before=t["replicas"], after=s["parked_replicas"])
@@ -868,14 +933,15 @@ def park(api, rec: Mapping, plan: Mapping, reviewed: str, sleep: Callable = time
         for a in plan["actions"]:
             C.require_cluster(api, rec["cluster_uid"])
             if a["op"] == "recheck_quiesced":
-                problems = _quiesced_problems(api, rec, a["lease"])
+                problems = _quiesced_problems(api, rec, a["lease"]) + new_job_problems(api, a["jobs_baseline"])
                 reporters = {}
                 for ns, n, uid in a["targets"]:
                     o = api.get(C.path_of("deployments", ns, n))
                     if o is None or o["metadata"].get("uid") != uid:
                         problems.append(f"target {n} disappeared or was recreated")
-                    else:
-                        reporters[n] = running_pods(api, ns, uid)
+                        continue
+                    problems += reporter_problems(api, ns, n, uid, a["reporters"][n])     # phase A's reporters
+                    reporters[n] = sorted(a["reporters"][n]["running"])
                 problems += arrival_problems(metrics, s["arrivals"], reporters)    # one fresh sample, pre-parking
                 if problems:
                     raise C.StagingError("not quiesced right before parking: " + "; ".join(problems))
@@ -884,8 +950,16 @@ def park(api, rec: Mapping, plan: Mapping, reviewed: str, sleep: Callable = time
             r = _run_common(api, rec, a, lock, clock, sleep, monotonic)
             if r is not None:
                 done.append(r)
+        uids = {t["name"]: t["uid"] for t in pa["complete"]["data"]["targets"]}
+        problems, state = _snapshot_problems(api, rec, s, uids)
+        problems += new_job_problems(api, pa["complete"]["data"]["jobs"])
+        if state["lease"] != pa["complete"]["data"]["lease"]:
+            problems.append("the old operator's Lease differs from phase A's (renewed, created or removed)")
+        if problems:
+            raise C.StagingError("the post-park control state is not clean: " + "; ".join(problems))
         C.append_receipt(rec, HELPER, "park-complete", {
-            "phase": "park", "plan_sha256": reviewed, "steps": len(done),
+            "phase": "park", "plan_sha256": reviewed, "steps": len(done), "state": state,
+            "jobs": job_uids(api),
             "quiesce_receipt_sha256": pa["complete"]["sha256"], "observed_receipt_sha256": pa["observed"]["sha256"],
             "targets": [[t["namespace"], t["name"], t["uid"]] for t in pa["complete"]["data"]["targets"]]}, clock)
     return done
@@ -946,7 +1020,9 @@ def _retirement_chain(rec: Mapping) -> Dict:
         return {"problem": "the park-complete receipt is not bound to the latest phase A"}
     return {"quiesce_receipt_sha256": pa["complete"]["sha256"], "observed_receipt_sha256": pa["observed"]["sha256"],
             "observed_seconds": pa["observed"]["data"]["seconds"], "park_receipt_sha256": p and p["sha256"],
-            "uids": {t["name"]: t["uid"] for t in pa["complete"]["data"]["targets"]}}
+            "uids": {t["name"]: t["uid"] for t in pa["complete"]["data"]["targets"]},
+            "lease": pa["complete"]["data"]["lease"], "jobs": pa["complete"]["data"]["jobs"],
+            "park_state": p and p["data"]["state"], "park_jobs": p and p["data"]["jobs"]}
 
 
 def verify(api, rec: Mapping, observe_seconds: int = 0, sleep: Callable = time.sleep,
@@ -960,20 +1036,26 @@ def verify(api, rec: Mapping, observe_seconds: int = 0, sleep: Callable = time.s
     C.require_cluster(api, rec["cluster_uid"])
     s = _settings(rec)
     chain = _retirement_chain(rec)
-    first_problems, baseline = _snapshot_problems(api, rec, s, chain.get("uids"))
-    jobs0 = {j["metadata"].get("uid") for j in _legacy_jobs(api, _jobs_spec())}
-    problems, samples = list(first_problems), 1
-    if not problems and observe_seconds > 0:
-        def sample():
-            p, st = _snapshot_problems(api, rec, s, chain.get("uids"))
-            new = sorted(j["metadata"].get("name") for j in _legacy_jobs(api, _jobs_spec())
-                         if j["metadata"].get("uid") not in jobs0)
-            if new:
-                p.append(f"legacy Jobs appeared {new} (a launcher or reconciler is active)")
-            if baseline.get("lease") is None and st.get("lease") is not None:
-                p.append("an old-operator leader Lease appeared (a live writer)")
-            return p + (["the state changed during the observation (Lease renewal, a scale or a recreated object)"]
-                        if st != baseline else [])
+    first_problems, live = _snapshot_problems(api, rec, s, chain.get("uids"))
+    # The baselines are the PRESERVED ones: the control state and Job identities park-complete recorded (itself
+    # checked against phase A's Lease and Jobs), never verify's own first sample. Without a park, the first sample
+    # (diagnostic only: no retirement without a park).
+    baseline = chain.get("park_state") or live
+    jobs0 = chain.get("park_jobs") if chain.get("park_state") else job_uids(api)
+    problems, samples = list(first_problems), 0
+
+    def sample():
+        p, st = _snapshot_problems(api, rec, s, chain.get("uids"))
+        p += new_job_problems(api, jobs0)
+        if baseline.get("lease") is None and st.get("lease") is not None:
+            p.append("an old-operator leader Lease appeared (a live writer)")
+        return p + (["the state changed since the preserved baseline (Lease renewal or creation, a scale or a "
+                     "recreated object)"] if st != baseline else [])
+    if not problems:
+        try:
+            samples = _observe(sample, max(observe_seconds, 0), sleep, monotonic, "not quiet")
+        except C.StagingError as e:
+            problems.append(str(e))
         try:
             samples = _observe(sample, observe_seconds, sleep, monotonic, "not quiet")
         except C.StagingError as e:
@@ -1048,7 +1130,8 @@ def recover(api, rec: Mapping, lock_sha: str, clock=None) -> Dict:
     """The recovery procedure for an ambiguous outcome. With the exact lock file's sha256 it takes the recovery guard
     (one recoverer; the lock's executor proven terminated: same host and boot, PID gone or reused), observes every
     unresolved intent of quiesce, park and restore against the live object and records decided outcomes as
-    reconciled-<n>. The stale lock is released only when every intent is decided; an unresolved one keeps it (fail closed)."""
+    reconciled-<n>. The stale lock is released only when every intent is decided; an unresolved one keeps it (fail
+    closed)."""
     with C.recovery_guard(rec, LOCK_SCOPE, lock_sha) as guard:
         C.require_cluster(api, rec["cluster_uid"])
         report, unresolved = {}, {}
