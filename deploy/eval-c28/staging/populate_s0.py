@@ -420,15 +420,31 @@ READER_SHA256 = hashlib.sha256(READER.encode()).hexdigest()
 # only if it hashes to the reviewed READER_SHA256 given on the command line.
 BOOT = ("import hashlib,json,sys\n"
         "d=json.loads(sys.stdin.readline())\n"
-        "if hashlib.sha256(d['script'].encode()).hexdigest()!=sys.argv[1]:\n"
+        "j=json.dumps(d['job'],sort_keys=True,separators=(',',':'))\n"
+        "if hashlib.sha256(d['script'].encode()).hexdigest()!=sys.argv[1] or "
+        "hashlib.sha256(j.encode()).hexdigest()!=sys.argv[2]:\n"
         " sys.stdout.write(json.dumps({'reader_error':{'class':'DigestMismatch','line':0,'category':'integrity'}}))\n"
         " sys.exit(3)\n"
-        "exec(compile(d['script'],'reader','exec'),{'__name__':'reader','JOB':d['job']})\n")
+        "exec(compile(d['script'],'reader','exec'),{'__name__':'reader','JOB':json.loads(j)})\n")
 READ_ACCESS = ("nonroot", "dac-read-search")
+READER_LINES = READER.count("\n") + 1
+# What a reader error may say (anything else is reported as one fixed "unclassified" error, never echoed).
+ERROR_CATEGORIES = ("permission", "missing", "not-a-file", "decode", "malformed", "memory", "io", "internal", "integrity")
+ERROR_CLASSES = ("PermissionError", "FileNotFoundError", "NotADirectoryError", "IsADirectoryError",
+                 "UnicodeDecodeError", "JSONDecodeError", "ValueError", "MemoryError", "OSError", "KeyError",
+                 "TypeError", "IndexError", "AttributeError", "RuntimeError", "AssertionError", "TarError",
+                 "StreamError", "DigestMismatch", "Exception")
 
 
-def exec_argv(pod: str) -> List[str]:
-    return ["exec", "-i", pod, "-c", "reader", "--", "python3", "-B", "-c", BOOT, READER_SHA256]
+def job_digest(job: Dict) -> str:
+    """The sha256 of the canonical job JSON: the mode, mount, rules and selection the reviewed plan authorised."""
+    return hashlib.sha256(json.dumps(job, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def exec_argv(pod: str, job: Dict) -> List[str]:
+    """The short exec command line: the bootstrap, the reviewed script's digest and the job's digest (the bootstrap
+    refuses a script or a job on stdin that does not hash to them)."""
+    return ["exec", "-i", pod, "-c", "reader", "--", "python3", "-B", "-c", BOOT, READER_SHA256, job_digest(job)]
 
 
 def exec_stdin(job: Dict) -> bytes:
@@ -445,8 +461,12 @@ def exec_failure(rc: int, stdout_text: str, stderr_text: str) -> str:
             except (ValueError, AttributeError):
                 continue
             if isinstance(e, dict):
-                return (f"the reader failed: {e.get('class')} ({e.get('category')}) at reader line {e.get('line')} "
-                        f"(exit {rc})")
+                ok = (set(e) == {"class", "line", "category"} and e["class"] in ERROR_CLASSES
+                      and e["category"] in ERROR_CATEGORIES and isinstance(e["line"], int)
+                      and not isinstance(e["line"], bool) and 0 <= e["line"] <= READER_LINES)
+                if not ok:
+                    return f"the reader failed: unclassified error (exit {rc})"
+                return f"the reader failed: {e['class']} ({e['category']}) at reader line {e['line']} (exit {rc})"
     err = stderr_text or ""
     for pat, cat in ((r"414|URI Too|too large|too long", "request-too-large"), (r"Forbidden|forbidden|403", "forbidden"),
                      (r"Unauthorized|401", "unauthorized"), (r"upgrade|websocket|SPDY", "exec-upgrade-failed"),
@@ -775,10 +795,13 @@ def reader_security(r: Dict) -> Tuple[Dict, Dict]:
       nonroot          UID/GID 65534, every capability dropped; reads what is world-readable, or group-readable with
                        populate.reader.supplemental_groups (the files' group). fsGroup is never used: on many drivers
                        it re-owns the volume (a write to evidence) and it cannot open owner-only (0600) files anyway.
-      dac-read-search  UID 0 with every capability dropped EXCEPT CAP_DAC_READ_SEARCH, which only bypasses read and
-                       directory-search permission checks (needed for root-owned 0600 files and 0700 directories). It
-                       cannot write (no CAP_DAC_OVERRIDE, a read-only claim mount, a read-only root filesystem), cannot
-                       chown or gain privileges, and has no service-account token."""
+      dac-read-search  UID 0 with every capability dropped EXCEPT CAP_DAC_READ_SEARCH (needed for root-owned 0600
+                       files and 0700 directories). The capability bypasses read and directory-search permission checks
+                       and also permits open_by_handle_at(2) and some linkat(2) uses, so it is NOT what protects the
+                       evidence: write protection comes from the READ-ONLY claim mount (and the read-only root
+                       filesystem); seccomp RuntimeDefault, no privilege escalation, no other capability, no
+                       service-account token and the proven cleanup bound the rest. Select it explicitly, only for the
+                       evidence reader."""
     mode = r.get("read_access", "nonroot")
     groups = [int(g) for g in r.get("supplemental_groups") or []]
     base = {"seccompProfile": {"type": "RuntimeDefault"}}
@@ -827,7 +850,7 @@ class Exec:
         self.timeout, self.run = timeout, run
 
     def __call__(self, pod: str, job: Dict, out_path: str) -> Tuple[int, str]:
-        argv = self.base + exec_argv(pod)
+        argv = self.base + exec_argv(pod, job)
         env = {k: v for k, v in os.environ.items() if k != "KUBECONFIG"}
         env["KUBECONFIG"] = self.base[2]
         with open(out_path, "wb") as fh:

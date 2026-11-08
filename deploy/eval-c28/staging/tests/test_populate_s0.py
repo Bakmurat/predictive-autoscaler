@@ -244,7 +244,8 @@ def fake_exec(vols, mutate=None):
         job = dict(job, mount=vols[pvc])
         if mutate:
             mutate(pvc, job)
-        tail = P.exec_argv(pod)[P.exec_argv(pod).index("--") + 1:]      # exactly what runs in the container
+        argv = P.exec_argv(pod, job)
+        tail = argv[argv.index("--") + 1:]                              # exactly what runs in the container
         assert tail[0] == "python3"
         with open(out_path, "wb") as fh:
             res = subprocess.run([sys.executable] + tail[1:], input=P.exec_stdin(job), stdout=fh,
@@ -630,16 +631,20 @@ def test_exec_command_line_is_short_and_carries_no_script():
     """The live failure: the 12 KB script on the exec command line made a ~23 KB request URL, which the proxy in
     front of the API refused; the script now travels on stdin."""
     import urllib.parse
-    argv = P.exec_argv("c28-s0-forecast-log-abcdef0123")
+    job = {"mode": "probe", "mount": "/data", "rules": [{"type": "jsonl_prefix", "path": "f", "ts_fields": ["at"],
+                                                         "cutoff": CUTOFF}]}
+    argv = P.exec_argv("c28-s0-forecast-log-abcdef0123", job)
     tail = argv[argv.index("--") + 1:]
     query = "&".join("command=" + urllib.parse.quote(a, safe="") for a in tail)
-    assert len(query) < 1024 and P.READER not in argv and P.READER_SHA256 in argv
+    assert len(query) < 1024 and P.READER not in argv and P.READER_SHA256 in argv and P.job_digest(job) in argv
     assert json.loads(P.exec_stdin({"mode": "probe"}))["script"] == P.READER
 
 
 def test_a_script_other_than_the_reviewed_one_is_refused():
-    tail = P.exec_argv("x")[P.exec_argv("x").index("--") + 1:]
-    stdin = (json.dumps({"script": P.READER + "\n# edited", "job": {"mode": "probe", "mount": "/"}}) + "\n").encode()
+    job = {"mode": "probe", "mount": "/"}
+    argv = P.exec_argv("x", job)
+    tail = argv[argv.index("--") + 1:]
+    stdin = (json.dumps({"script": P.READER + "\n# edited", "job": job}) + "\n").encode()
     res = subprocess.run([sys.executable] + tail[1:], input=stdin, capture_output=True, timeout=30)
     assert res.returncode == 3
     assert P.exec_failure(res.returncode, res.stdout.decode(), "") == \
@@ -726,3 +731,40 @@ def test_dac_read_search_pod_keeps_every_other_restriction(env):
     write(e["path"], json.dumps(doc))
     with pytest.raises(X.StagingError, match="read_access must be one of"):
         P.section(X.load_record(e["path"], ("populate", "archive")))
+
+
+
+@pytest.mark.parametrize("change", [
+    {"mode": "export", "selection": []},                  # a probe turned into an export
+    {"mount": "/"},                                       # another mount
+    {"selection": [{"path": "other.json", "kind": "file", "bytes": 1, "sha256": "0" * 64}]},
+])
+def test_a_job_other_than_the_reviewed_one_is_refused(env, change):
+    """Codex #35: the job is bound by its own digest on the command line; an altered job never runs (no tar)."""
+    reviewed_job = {"mode": "probe", "mount": env["vols"]["load-evidence-pvc"],
+                    "rules": P.effective_rules(P.section(env["record"]), "load-evidence-pvc"), "selection": []}
+    argv = P.exec_argv("c28-s0-load-evidence-x", reviewed_job)
+    tail = argv[argv.index("--") + 1:]
+    altered = dict(reviewed_job, **change)
+    res = subprocess.run([sys.executable] + tail[1:], input=P.exec_stdin(altered), capture_output=True, timeout=30)
+    assert res.returncode == 3 and b"ustar" not in res.stdout
+    assert P.exec_failure(res.returncode, res.stdout.decode(), "") == \
+        "the reader failed: DigestMismatch (integrity) at reader line 0 (exit 3)"
+    ok = subprocess.run([sys.executable] + tail[1:], input=P.exec_stdin(reviewed_job), capture_output=True, timeout=30)
+    assert ok.returncode == 0 and json.loads(ok.stdout)["rules"]
+
+
+@pytest.mark.parametrize("err", [
+    {"class": "EVIL<marker>", "line": 5, "category": "permission"},
+    {"class": "PermissionError", "line": 5, "category": "see /secret/path"},
+    {"class": "PermissionError", "line": 10 ** 9, "category": "permission"},
+    {"class": "PermissionError", "line": True, "category": "permission"},
+    {"class": "PermissionError", "line": 5, "category": "permission", "detail": "x"},
+])
+def test_forged_reader_errors_are_never_echoed(err):
+    """Codex #35: only allowlisted classes and categories and a bounded integer line are reported."""
+    msg = P.exec_failure(1, "", json.dumps({"reader_error": err}))
+    assert msg == "the reader failed: unclassified error (exit 1)"
+    good = P.exec_failure(3, json.dumps({"reader_error": {"class": "PermissionError", "line": 78,
+                                                          "category": "permission"}}), "")
+    assert good == "the reader failed: PermissionError (permission) at reader line 78 (exit 3)"
