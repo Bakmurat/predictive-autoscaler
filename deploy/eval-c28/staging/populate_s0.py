@@ -90,7 +90,9 @@ The record's "populate" section:
 from __future__ import annotations
 
 import argparse
+import calendar
 import copy
+import datetime
 import fnmatch
 import hashlib
 import json
@@ -121,6 +123,26 @@ LOCAL_TOPS = ("campaign/", "protocol/", "inventory/")
 BUSY_JOB_PREFIXES = ("load-evidence", "ml-training", "evidence-archive", "p8")
 _DIGEST_IMAGE = re.compile(r"^[a-z0-9][a-z0-9./:-]*@sha256:[0-9a-f]{64}$")
 _TS = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+_RFC3339 = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$")
+
+
+def ts_ns(s) -> Optional[int]:
+    """The host twin of the reader's utc(): an RFC 3339 / RFC3339Nano time as integer nanoseconds since the epoch,
+    or None. Host-side cutoff checks compare these integers, never strings."""
+    m = _RFC3339.match(s) if isinstance(s, str) else None
+    if not m:
+        return None
+    y, mo, d, h, mi, se, frac, tz = m.groups()
+    try:
+        t = datetime.datetime(int(y), int(mo), int(d), int(h), int(mi), int(se), tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return None
+    off = 0
+    if tz != "Z":
+        if int(tz[1:3]) > 23 or int(tz[4:6]) > 59:
+            return None
+        off = (int(tz[1:3]) * 3600 + int(tz[4:6]) * 60) * (1 if tz[0] == "+" else -1)
+    return (calendar.timegm(t.utctimetuple()) - off) * 10 ** 9 + int((frac or "").ljust(9, "0"))
 _COMMITISH = re.compile(r"^[0-9a-f]{7,40}$")
 
 # --- the in-pod reader (stdlib only; read-only; the job on stdin) ----------------------------------------------------
@@ -128,19 +150,36 @@ _COMMITISH = re.compile(r"^[0-9a-f]{7,40}$")
 READER = r'''
 import datetime, glob, hashlib, io, json, os, re, sys, tarfile
 
+RFC3339 = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$")
+EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+NS = 10 ** 9
+
 def utc(s):
-    if not isinstance(s, str):
+    """An RFC 3339 / Go time.RFC3339Nano time (fractional seconds of 1-9 digits; Z or a +-hh:mm offset) as INTEGER
+    NANOSECONDS since the epoch (UTC), or None for anything else. Every comparison uses these integers; nothing is
+    rounded or truncated."""
+    m = RFC3339.match(s.strip()) if isinstance(s, str) else None
+    if not m:
         return None
-    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f%z"):
-        try:
-            t = datetime.datetime.strptime(s.strip(), fmt)
-            return (t if t.tzinfo else t.replace(tzinfo=datetime.timezone.utc)).astimezone(datetime.timezone.utc)
-        except ValueError:
-            pass
-    return None
+    y, mo, d, h, mi, se, frac, tz = m.groups()
+    try:
+        t = datetime.datetime(int(y), int(mo), int(d), int(h), int(mi), int(se), tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return None
+    off = 0
+    if tz != "Z":
+        oh, om = int(tz[1:3]), int(tz[4:6])
+        if oh > 23 or om > 59:
+            return None
+        off = (oh * 3600 + om * 60) * (1 if tz[0] == "+" else -1)
+    secs = (t - EPOCH).days * 86400 + (t - EPOCH).seconds - off
+    return secs * NS + int((frac or "").ljust(9, "0"))
 
 def iso(t):
-    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+    """Integer nanoseconds as RFC 3339 UTC with the FULL fraction (trailing zeros dropped; none when whole)."""
+    sec, frac = divmod(t, NS)
+    out = (EPOCH + datetime.timedelta(seconds=sec)).strftime("%Y-%m-%dT%H:%M:%S")
+    return out + (("." + ("%09d" % frac).rstrip("0")) if frac else "") + "Z"
 
 def category(e):
     """A fixed category for an exception: never its message (paths, contents or values stay inside the pod)."""
@@ -247,7 +286,7 @@ def scan(mount, rel, rule, cutoff, collect=False):
     it but after the cutoff (interleaved writers) are allowed only within order_tolerance_seconds; a record at or
     before the cutoff that follows a later record by more is not append-ordered and fails. A record without a usable
     timestamp fails, reported by its shape only. Returns {offset, lines, overshoot, after, records?} and problems."""
-    tol = datetime.timedelta(seconds=int(rule.get("order_tolerance_seconds", 0)))   # strict unless reviewed
+    tol = int(rule.get("order_tolerance_seconds", 0)) * NS                            # strict unless reviewed
     out = {"offset": 0, "lines": 0, "overshoot": 0, "after": 0, "records": [], "after_records": [], "refs": set()}
     ref_fields = rule.get("collect_refs") or []
     pend_n, pend_max, pend_recs, pend_bytes, probs = 0, None, [], 0, []
@@ -265,7 +304,7 @@ def scan(mount, rel, rule, cutoff, collect=False):
             if ts <= cutoff:
                 if pend_n and pend_max > cutoff + tol:
                     probs.append("%s: a record at or before the cutoff (line %d) follows a record more than %d s "
-                                 "after it (not append-ordered)" % (rel, n, tol.total_seconds())); break
+                                 "after it (not append-ordered)" % (rel, n, tol // NS)); break
                 for f in ref_fields:
                     v = rec.get(f)
                     if v in (None, ""):
@@ -316,7 +355,8 @@ def named(mount, rule, cutoff):
     for rel in files_under(mount, rule["glob"]):
         m = rx.search(os.path.basename(rel))
         try:
-            ts = datetime.datetime.strptime(m.group(1), rule["ts_format"]).replace(tzinfo=datetime.timezone.utc)
+            dt = datetime.datetime.strptime(m.group(1), rule["ts_format"]).replace(tzinfo=datetime.timezone.utc)
+            ts = utc(dt.strftime("%Y-%m-%dT%H:%M:%SZ"))
         except (AttributeError, ValueError):
             excl.append({"path": rel, "reason": "no time in its name"}); continue
         if ts > cutoff:
@@ -405,7 +445,7 @@ def pairs(mount, rule, cutoff):
         sel.append(item(mount, art, ts=iso(ts), verified="equals the sidecar's " + rule["sha_field"]))
     return sel, excl, []
 
-FAR_FUTURE = datetime.datetime(9999, 1, 1, tzinfo=datetime.timezone.utc)
+FAR_FUTURE = utc("9999-01-01T00:00:00Z")
 
 def log_class(started, finished, cutoff):
     """One log's class by ITS OWN execution times: select (finished at or before the cutoff), exclude (started after
@@ -1311,7 +1351,7 @@ def empty_by_design(pvc: str, reason: str, selection: List[Dict], rule_excluded:
     for x in rule_excluded:
         # only a VERIFIED pair (artifact sha256 and size equal its sidecar's) may justify the empty export by its time
         if (x.get("reason") != "trained after the cutoff" or x.get("pair_verified") is not True
-                or not _TS.match(str(x.get("ts", ""))) or not x["ts"] > cutoff):
+                or ts_ns(x.get("ts")) is None or not ts_ns(x["ts"]) > ts_ns(cutoff)):
             probs.append(f"{pvc}: declared empty by design but {x.get('path')} is excluded as {x.get('reason')!r} "
                          f"(only pairs trained after the cutoff may be skipped)")
         elif "pair" in x:
@@ -1366,7 +1406,7 @@ def campaign_artifact_problems(s: Dict, pvcs: Dict[str, Dict]) -> List[str]:
         out.append("ml-models-pvc: empty by design needs the forecast log's referenced artifacts (collect_refs)")
     ea = pvcs.get("evidence-archive-pvc", {}).get("selection", [])
     trained = {m["artifact_sha256"] for m in ea if "sidecar_sha256" in m and m.get("artifact_sha256")
-               and str(m.get("ts", "")) <= cutoff}
+               and ts_ns(m.get("ts")) is not None and ts_ns(m["ts"]) <= ts_ns(cutoff)}
     for d in sorted(referenced - set(inv)):
         out.append(f"ml-models-pvc: the campaign forecast log references artifact {d} outside the reviewed campaign "
                    "artifact inventory")

@@ -1138,3 +1138,80 @@ def test_empty_by_design_only_for_ml_models(env):
     write(e["path"], json.dumps(doc))
     with pytest.raises(X.StagingError, match="allowed only for ml-models-pvc"):
         P.section(X.load_record(e["path"], ("populate", "archive")))
+
+
+def reader_ns():
+    ns = {"__name__": "reader_under_test"}
+    exec(compile(P.READER.replace("sys.exit(run())", ""), "reader", "exec"), ns)
+    return ns
+
+
+@pytest.mark.parametrize("text, want", [
+    ("2026-10-05T06:41:02Z", "2026-10-05T06:41:02Z"),
+    ("2026-10-05T06:41:02.5Z", "2026-10-05T06:41:02.5Z"),
+    ("2026-10-05T06:41:02.123456789Z", "2026-10-05T06:41:02.123456789Z"),        # Go RFC3339Nano, kept exactly
+    ("2026-10-05T06:41:02.123456000Z", "2026-10-05T06:41:02.123456Z"),
+    ("2026-10-05T08:41:02.1+02:00", "2026-10-05T06:41:02.1Z"),
+    ("2026-10-05T01:41:02-05:00", "2026-10-05T06:41:02Z"),
+    ("2026-11-01T23:59:59.999999999Z", "2026-11-01T23:59:59.999999999Z"),
+    ("2026-11-02T01:00:00.000000001+01:00", "2026-11-02T00:00:00.000000001Z"),
+])
+def test_reader_parses_go_rfc3339nano(text, want):
+    """The probe's forecast-log line 1 (forecast_ledger_session, Go time.RFC3339Nano) failed the old parser; the
+    reader keeps integer nanoseconds and serialises the full fraction; the host parser agrees exactly."""
+    r = reader_ns()
+    n = r["utc"](text)
+    assert r["iso"](n) == want and P.ts_ns(text) == n and P.ts_ns(want) == n
+
+
+@pytest.mark.parametrize("text", ["2026-10-05T06:41:02", "2026-10-05 06:41:02Z", "2026-10-05T06:41:02.Z",
+                                  "2026-10-05T06:41:02.1234567890Z", "2026-13-05T06:41:02Z", "2026-10-05T06:41:02+24:00",
+                                  "2026-10-05T06:41:02z", "1759646462", "", None, 1759646462])
+def test_reader_refuses_unparseable_times(text):
+    assert reader_ns()["utc"](text) is None and P.ts_ns(text) is None
+
+
+def test_nanosecond_times_never_round_into_the_cutoff(env):
+    """A record a nanosecond after the cutoff is after it; Go-format records before it are selected."""
+    e = env
+    recs = [{"event": "forecast_ledger_session", "at": "2026-10-05T06:41:02.123456789Z", "event_seq": 1,
+             "operator_run_id": "r1", "schema": "forecast-attempt-v1"},
+            {"issued_at": "2026-11-01T23:59:59.999999999+00:00", "forecasts": []},
+            {"event": "decision", "at": "2026-11-02T00:00:00.000000001Z"}]
+    write(os.path.join(e["vols"]["forecast-log-pvc"], "forecasts.jsonl"), jl(*recs))
+    do_probe(e)
+    p = P.plan(e["record"], e["kube"])
+    assert not any("forecast-log-pvc" in x for x in p["problems"]), p["problems"]
+    it = p["pvcs"]["forecast-log-pvc"]["selection"][0]
+    assert (it["lines"], it["lines_after_cutoff"]) == (2, 1)
+
+
+@pytest.mark.parametrize("trained_at, after", [
+    ("2026-11-02T00:00:00.000000001Z", True),
+    ("2026-11-02T01:00:00.000000001+01:00", True),
+    ("2026-11-01T19:00:00.000000001-05:00", True),
+    ("2026-11-02T00:00:00Z", False),
+    ("2026-11-02T00:00:00.000000000Z", False),
+    ("2026-11-02T01:00:00+01:00", False),
+])
+def test_cutoff_boundary_keeps_nanoseconds_end_to_end(env, trained_at, after):
+    """Codex #37: a verified model trained 1 ns after the cutoff stays after it through serialisation and the
+    host-side empty-by-design check (Z and offset forms); one trained exactly at the cutoff is campaign material."""
+    e = env
+    models_after_cutoff_only(e)
+    art = b"current-model"
+    write(os.path.join(e["vols"]["ml-models-pvc"], "lstm_nginx-test_requests.meta.json"),
+          json.dumps({"trained_at": trained_at, "artifact_sha256": sha(art)}))
+    set_empty_by_design(e)
+    do_probe(e)
+    if after:
+        out = do_export(e)
+        assert out["event"] == "export-complete" and P.verify(e["record"])["result"] == "PASS"
+        root = e["record"].doc["archive"]["evidence"]["export_dir"]
+        man = json.load(open(os.path.join(root, "pvc-exports/ml-models-pvc/manifest.json")))
+        pair, = man["empty_by_design"]["current_pairs_trained_after_cutoff"]
+        assert pair["trained_at"] == "2026-11-02T00:00:00.000000001Z"
+        assert P.ts_ns(pair["trained_at"]) == P.ts_ns(CUTOFF) + 1
+    else:
+        probs = P.plan(e["record"], e["kube"])["problems"]
+        assert any("declared empty by design but the rules select 2 files" in x for x in probs), probs
