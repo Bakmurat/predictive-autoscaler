@@ -29,16 +29,24 @@ evidence archive selection holds its immutable archived copy (same artifact and 
 
 Rules (populate.pvcs.<pvc>.rules; cutoff "campaign" = populate.cutoff, "collection" = populate.collection_cutoff for
 the collectors' own post-stop files, or an explicit UTC time):
-  {"type": "jsonl_prefix", "path": P, "ts_fields": [...]}     the longest prefix of an append-only JSONL file whose
-        records are at or before the cutoff (the first present field of ts_fields; a record without one, or an
-        earlier record after a later one, fails the rule)
+  {"type": "jsonl_prefix", "path": P, "ts_fields": [...] | "ts_by": {"field": F, "types": {T: [...]}},
+   "order_tolerance_seconds": 600}                            the prefix of an append-only JSONL file up to its LAST
+        record at or before the cutoff; a record's time is the first present field of ts_fields, or of its own type's
+        list (types keyed by the discriminator F; "" = without F). An unknown type or a record without a usable time
+        fails the rule and is reported by its SHAPE only (sorted key names and the discriminator); records after the
+        cutoff inside the prefix are allowed within the tolerance (interleaved writers), more fails
   {"type": "named", "glob": G, "ts_regex": R, "ts_format": F}  files whose NAME carries a time at or before the cutoff
   {"type": "bundles", "manifest_glob": G, "ts_field": T}       archive bundles by their manifest's T, every original
         hash verified; a sidecar variant's artifact_key must name a selected bundle
   {"type": "pairs", "sidecar_glob": G, "artifact_from": S, "artifact_to": A, "ts_field": T, "sha_field": H}
         model sidecar + artifact; the artifact's sha256 (and size) must equal the sidecar's, or the pair is excluded
   {"type": "trainer_logs", "index": I, "dir": D}               every trainer record of index I up to the cutoff with
-        its referenced files (<job>-<pod uid[:8]>.json and each container's .log/.previous.log, log_sha256 verified)
+        its referenced files (<job>-<pod uid[:8]>.json and each container's .log/.previous.log, log_sha256 verified);
+        the files the index's records AFTER the cutoff reference are excluded as "post-campaign training (after
+        cutoff)" by that pairing; a file no index record references stays unconsidered and blocks
+A reviewed "empty_by_design" reason is accepted for ml-models-pvc ONLY, and only when nothing is selected, nothing lies
+outside its rules and every model pair present was trained after the cutoff (checked against its trained_at); the
+export is then an empty tar with that reason, and the coverage file says so.
 
 Reader pods (namespace ml-engine): the claim mounted read-only, no service-account token, non-root, read-only root
 filesystem, pinned to the node the RWO volume is attached to (VolumeAttachment), a deadline. Before EACH reader the
@@ -63,7 +71,8 @@ The record's "populate" section:
    "exec_timeout_seconds": N, "read_access": "nonroot" | "dac-read-search", "supplemental_groups": [GID]},
    "budget": {"max_total_bytes": N},
    "pvcs": {"<pvc>": {"uid": UID, "mount": "/data", "max_bytes": N, "rules": "default" | [...],
-                      "excluded_reviewed": "default" | [{"glob": G, "reason": "..."}]}}}
+                      "excluded_reviewed": "default" | [{"glob": G, "reason": "..."}],
+                      "empty_by_design": "<reason>" (ml-models-pvc only)}}}
 """
 
 from __future__ import annotations
@@ -177,11 +186,44 @@ def item(mount, rel, kind="file", limit=None, **extra):
     d.update(extra)
     return d
 
-def records_until(mount, rel, fields, cutoff):
-    """(prefix bytes, [(record, ts)] at or before the cutoff, records after, problems) of an append-only JSONL file."""
-    p = safe(mount, rel)
-    out, offset, later, probs, seen_later = [], 0, 0, [], False
-    with open(p, "rb") as fh:
+IDENT = re.compile(r"^[A-Za-z0-9_.:-]{1,48}$")
+
+def shape(rec, field):
+    """A record's SHAPE for a diagnosis: its sorted top-level key names and its discriminator value when that is a
+    short identifier (never any other value)."""
+    keys = sorted(rec) if isinstance(rec, dict) else []
+    d = rec.get(field, "<absent>") if isinstance(rec, dict) else "<not an object>"
+    d = d if isinstance(d, str) and (d == "<absent>" or IDENT.match(d)) else "<not an identifier>"
+    return "keys %s, %s %s" % (keys, field, d)
+
+def record_ts(rec, rule):
+    """(timestamp, None) or (None, why): per-record-type fields when the rule has ts_by, else ts_fields."""
+    if not isinstance(rec, dict):
+        return None, "not a JSON object"
+    by = rule.get("ts_by")
+    if by:
+        kind = rec.get(by["field"], "")
+        fields = by["types"].get(kind) if isinstance(kind, str) else None
+        if fields is None:
+            return None, "an unknown record type"
+    else:
+        fields = rule["ts_fields"]
+    for f in fields:
+        t = utc(rec.get(f))
+        if t:
+            return t, None
+    return None, "no timestamp for its type (%s)" % fields
+
+def scan(mount, rel, rule, cutoff, collect=False):
+    """The prefix of an append-only JSONL file that ends at its LAST record at or before the cutoff. Records inside
+    it but after the cutoff (interleaved writers) are allowed only within order_tolerance_seconds; a record at or
+    before the cutoff that follows a later record by more is not append-ordered and fails. A record without a usable
+    timestamp fails, reported by its shape only. Returns {offset, lines, overshoot, after, records?} and problems."""
+    tol = datetime.timedelta(seconds=int(rule.get("order_tolerance_seconds", 600)))
+    field = (rule.get("ts_by") or {}).get("field", "event")
+    out = {"offset": 0, "lines": 0, "overshoot": 0, "after": 0, "records": [], "after_records": []}
+    pend_n, pend_max, pend_recs, pend_bytes, probs = 0, None, [], 0, []
+    with open(safe(mount, rel), "rb") as fh:
         for n, raw in enumerate(fh, 1):
             if not raw.endswith(b"\n"):
                 break                                  # a partially written last line is never exported
@@ -189,27 +231,41 @@ def records_until(mount, rel, fields, cutoff):
                 rec = json.loads(raw)
             except ValueError:
                 probs.append("malformed JSON at line %d of %s" % (n, rel)); break
-            ts = next((utc(rec.get(f)) for f in fields if isinstance(rec, dict) and utc(rec.get(f))), None)
+            ts, why = record_ts(rec, rule)
             if ts is None:
-                probs.append("a record of %s without any of %s at line %d" % (rel, fields, n)); break
+                probs.append("a record of %s at line %d has %s: %s" % (rel, n, why, shape(rec, field))); break
             if ts <= cutoff:
-                if seen_later:
-                    probs.append("%s: a record at or before the cutoff after a later one (line %d)" % (rel, n)); break
-                offset += len(raw); out.append((rec, ts))
+                if pend_n and pend_max > cutoff + tol:
+                    probs.append("%s: a record at or before the cutoff (line %d) follows a record more than %d s "
+                                 "after it (not append-ordered)" % (rel, n, tol.total_seconds())); break
+                out["offset"] += pend_bytes + len(raw)
+                out["lines"] += pend_n + 1
+                out["overshoot"] += pend_n
+                if collect:
+                    out["after_records"] += pend_recs
+                    out["records"].append((rec, ts))
+                pend_n, pend_max, pend_recs, pend_bytes = 0, None, [], 0
             else:
-                seen_later = True; later += 1
-    return offset, out, later, probs
+                pend_n += 1; pend_bytes += len(raw)
+                pend_max = ts if pend_max is None or ts > pend_max else pend_max
+                if collect:
+                    pend_recs.append((rec, ts))
+    out["after"] = pend_n
+    if collect:
+        out["after_records"] += pend_recs
+    return out, probs
 
 def jsonl_prefix(mount, rule, cutoff):
     why = absent_why(safe(mount, rule["path"]))
     if why:
         return [], [], ["the file " + rule["path"] + " is " + why]
-    offset, recs, later, probs = records_until(mount, rule["path"], rule["ts_fields"], cutoff)
-    if not recs and not probs:
+    res, probs = scan(mount, rule["path"], rule, cutoff)
+    if not res["lines"] and not probs:
         probs.append("no record of " + rule["path"] + " is at or before the cutoff")
     if probs:
         return [], [], probs
-    return [item(mount, rule["path"], "prefix", offset, lines=len(recs), lines_after_cutoff=later)], [], []
+    return [item(mount, rule["path"], "prefix", res["offset"], lines=res["lines"], lines_after_cutoff=res["after"],
+                 overshoot_lines=res["overshoot"])], [], []
 
 def named(mount, rule, cutoff):
     sel, excl, rx = [], [], re.compile(rule["ts_regex"])
@@ -289,7 +345,7 @@ def pairs(mount, rule, cutoff):
             else:
                 reason = None
         if reason:
-            excl += [{"path": f, "reason": reason} for f in both]
+            excl += [dict({"path": f, "reason": reason}, **({"ts": iso(ts)} if ts else {})) for f in both]
             continue
         sel.append(item(mount, rel, ts=iso(ts), artifact_sha256=meta.get(rule["sha_field"])))
         sel.append(item(mount, art, ts=iso(ts), verified="equals the sidecar's " + rule["sha_field"]))
@@ -300,10 +356,22 @@ def trainer_logs(mount, rule, cutoff):
     why = absent_why(safe(mount, rule["index"]))
     if why:
         return [], [], ["the trainer index " + rule["index"] + " is " + why]
-    _, recs, _, probs = records_until(mount, rule["index"], ["collected_at"], cutoff)
+    res, probs = scan(mount, rule["index"], {"ts_fields": ["collected_at"]}, cutoff, collect=True)
     if probs:
         return [], [], probs
-    for rec, ts in recs:
+    # files referenced by index records AFTER the cutoff (post-campaign trainings): excluded by the index's own
+    # pairing (job, pod UID, container names), never by a name heuristic; an unreferenced file stays unconsidered
+    for rec, ts in res["after_records"]:
+        base = "%s-%s" % (rec.get("job"), str(rec.get("pod_uid", ""))[:8])
+        refs = [os.path.join(rule["dir"], base + ".json")]
+        for c in rec.get("containers") or []:
+            refs.append(os.path.join(rule["dir"], "%s.%s.log" % (base, c.get("name"))))
+            if c.get("previous_log_saved"):
+                refs.append(os.path.join(rule["dir"], "%s.%s.previous.log" % (base, c.get("name"))))
+        for f in refs:
+            if absent_why(safe(mount, f)) is None:
+                excl.append({"path": f, "reason": "post-campaign training (after cutoff)", "ts": iso(ts)})
+    for rec, ts in res["records"]:
         base = "%s-%s" % (rec.get("job"), str(rec.get("pod_uid", ""))[:8])
         meta = os.path.join(rule["dir"], base + ".json")
         why = absent_why(safe(mount, meta))
@@ -481,8 +549,13 @@ COLLECTOR_LOGS = (("INDEX.jsonl", ["recovered_at", "copied_at", "at"]), ("REJECT
                   ("logs/api-reload.jsonl", ["collected_at"]), ("logs/api-coverage.jsonl", ["collected_at"]),
                   ("logs/trainer-index.jsonl", ["collected_at"]))
 DEFAULT_RULES = {
-    "forecast-log-pvc": [{"type": "jsonl_prefix", "path": "forecasts.jsonl", "ts_fields": ["at", "issued_at"],
-                          "cutoff": "campaign"}],
+    # The operator's record types at 0472829 (decision_record.go, forecast_attempt_record.go, the issuance and
+    # sanity-rejection writers in predictiveautoscaler_controller.go), keyed by "event"; any other type fails closed.
+    "forecast-log-pvc": [{"type": "jsonl_prefix", "path": "forecasts.jsonl", "cutoff": "campaign",
+                          "ts_by": {"field": "event", "types": {
+                              "": ["issued_at"], "decision": ["at"], "sanity_rejected": ["rejected_at"],
+                              "forecast_ledger_session": ["at"], "forecast_attempt_started": ["at"],
+                              "forecast_attempt_completed": ["at"]}}}],
     "evidence-archive-pvc": [{"type": "bundles", "manifest_glob": "archive/*/manifest.json", "ts_field": "copied_at",
                               "cutoff": "collection"}]
     + [{"type": "jsonl_prefix", "path": p, "ts_fields": f, "cutoff": "collection"} for p, f in COLLECTOR_LOGS]
@@ -504,7 +577,7 @@ DEFAULT_EXCLUDED = {
     "load-evidence-pvc": [{"glob": ".lock", "reason": "the collector's empty lock file"}],
     "ml-models-pvc": [],
 }
-RULE_KEYS = {"jsonl_prefix": {"type", "path", "ts_fields", "cutoff"},
+RULE_KEYS = {"jsonl_prefix": {"type", "path", "ts_fields", "ts_by", "order_tolerance_seconds", "cutoff"},
              "named": {"type", "glob", "ts_regex", "ts_format", "cutoff"},
              "bundles": {"type", "manifest_glob", "ts_field", "cutoff"},
              "pairs": {"type", "sidecar_glob", "artifact_from", "artifact_to", "ts_field", "sha_field", "cutoff"},
@@ -545,6 +618,9 @@ def section(record: X.Record) -> Dict:
         if not (X._UUID.match(str(p.get("uid", ""))) and str(p.get("mount", "")).startswith("/")
                 and isinstance(p.get("max_bytes"), int) and p["max_bytes"] > 0):
             probs.append(f"populate.pvcs.{name} needs uid, an absolute mount and max_bytes")
+    for name, p in pvcs.items():
+        if "empty_by_design" in p and (name != "ml-models-pvc" or not str(p["empty_by_design"]).strip()):
+            probs.append(f"populate.pvcs.{name}.empty_by_design is allowed only for ml-models-pvc, with a reason")
     retained = s.get("retained_pvcs") or []
     if len(retained) != 5 or not all(X._UUID.match(str(r.get("uid", ""))) for r in retained):
         probs.append("populate.retained_pvcs must list all five claims with UIDs")
@@ -563,6 +639,14 @@ def effective_rules(s: Dict, pvc: str) -> List[Dict]:
     for r in rules:
         if r.get("type") not in RULE_KEYS or not set(r) <= RULE_KEYS[r["type"]]:
             raise X.StagingError(f"{pvc}: unknown rule or field in {r}")
+        if r["type"] == "jsonl_prefix":
+            by = r.get("ts_by")
+            ok_by = by is None or (isinstance(by, dict) and set(by) == {"field", "types"} and isinstance(by["field"], str)
+                                   and isinstance(by["types"], dict) and by["types"] and all(
+                                       isinstance(v, list) and v and all(isinstance(f, str) for f in v)
+                                       for v in by["types"].values()))
+            if not ok_by or (by is None and not r.get("ts_fields")):
+                raise X.StagingError(f"{pvc}: jsonl_prefix needs ts_fields or ts_by {{field, types: {{type: [fields]}}}}")
         r["cutoff"] = named_cutoffs.get(r.get("cutoff", "campaign"), r.get("cutoff"))
         if not _TS.match(str(r["cutoff"])):
             raise X.StagingError(f"{pvc}: rule cutoff {r['cutoff']!r} is not an RFC 3339 UTC time")
@@ -1056,6 +1140,29 @@ def archive_closure_problems(pvcs: Dict[str, Dict]) -> List[str]:
     return out
 
 
+def empty_by_design(pvc: str, reason: str, selection: List[Dict], rule_excluded: List[Dict],
+                    unconsidered: List[Dict], rules: List[Dict]) -> Tuple[Dict, List[str]]:
+    """A reviewed EMPTY export (ml-models-pvc only): accepted only when nothing is selected, the volume holds nothing
+    outside the rules, and EVERY model pair present was excluded as trained after the cutoff (its trained_at checked
+    here against the cutoff), so nothing campaign-relevant is skipped. The campaign's artifacts are the archived
+    bundles of the evidence archive."""
+    probs = []
+    cutoff = max(r["cutoff"] for r in rules)
+    if selection:
+        probs.append(f"{pvc}: declared empty by design but the rules select {len(selection)} files")
+    if unconsidered:
+        probs.append(f"{pvc}: declared empty by design but {len(unconsidered)} files lie outside its rules")
+    pairs_after = []
+    for x in rule_excluded:
+        if x.get("reason") != "trained after the cutoff" or not _TS.match(str(x.get("ts", ""))) or not x["ts"] > cutoff:
+            probs.append(f"{pvc}: declared empty by design but {x.get('path')} is excluded as {x.get('reason')!r} "
+                         f"(only pairs trained after the cutoff may be skipped)")
+        else:
+            pairs_after.append({"path": x["path"], "trained_at": x["ts"]})
+    return {"reason": reason, "cutoff": cutoff, "files_trained_after_cutoff": pairs_after,
+            "campaign_artifacts": "the immutable archived bundles of evidence-archive-pvc"}, probs
+
+
 def plan(record: X.Record, kube: X.Kube) -> Dict:
     s = section(record)
     ev = evidence(record)
@@ -1080,8 +1187,10 @@ def plan(record: X.Record, kube: X.Kube) -> Dict:
             probs.append(f"{p}: the probe was for other rules or another binding: probe again")
             continue
         selection = [it for rr in r["result"]["rules"] for it in rr["selected"]]
+        ebd = s["pvcs"][p].get("empty_by_design")
         for rr in r["result"]["rules"]:
-            probs += [f"{p}: rule {_rule_label(rr['rule'])}: {x}" for x in rr["problems"]]
+            rprobs = [x for x in rr["problems"] if not (ebd and x == "the rule selects nothing")]
+            probs += [f"{p}: rule {_rule_label(rr['rule'])}: {x}" for x in rprobs]
         ud = r["result"].get("unreadable_directories") or {}
         if ud.get("count"):
             probs.append(f"{p}: {ud['count']} directories are unreadable ({', '.join(ud['categories'])}): the claim "
@@ -1102,10 +1211,15 @@ def plan(record: X.Record, kube: X.Kube) -> Dict:
         total += size
         if size > s["pvcs"][p]["max_bytes"]:
             probs.append(f"{p}: the selection is {size} bytes, over its budget {s['pvcs'][p]['max_bytes']}")
-        if not selection:
+        empty = None
+        if ebd:
+            empty, eprobs = empty_by_design(p, ebd, selection, rule_excluded, r["result"]["unconsidered"], rules)
+            probs += eprobs
+        elif not selection:
             probs.append(f"{p}: nothing selected (an empty export is never produced)")
         pvcs[p] = {"binding": bindings[p], "rules": rules, "selection": selection, "bytes": size,
-                   "volume": r["result"]["volume"], "rule_excluded": rule_excluded, "reviewed_exclusions": exclusions}
+                   "volume": r["result"]["volume"], "rule_excluded": rule_excluded, "reviewed_exclusions": exclusions,
+                   "empty_by_design": empty}
     probs += archive_closure_problems(pvcs)
     if total > s["budget"]["max_total_bytes"]:
         probs.append(f"the PVC exports total {total} bytes, over the budget {s['budget']['max_total_bytes']}")
@@ -1172,6 +1286,8 @@ def export_pvc(record, kube, lock, s, pvc, info, exe, sleep, now, digest) -> Dic
     tar_path = os.path.join(d, "campaign-export.tar")
     if os.path.exists(tar_path):
         raise X.StagingError(f"{tar_path} exists (a PVC export is produced once)")
+    if info.get("empty_by_design"):
+        return export_empty(record, d, pvc, info, digest)
     job = {"mode": "export", "mount": s["pvcs"][pvc]["mount"], "selection": info["selection"]}
     rc, err, tmp = run_reader(record, kube, lock, HELPER, s, pvc, info["binding"], job, exe, sleep, now)
     try:
@@ -1211,6 +1327,35 @@ def export_pvc(record, kube, lock, s, pvc, info, exe, sleep, now, digest) -> Dic
     return manifest
 
 
+def export_empty(record: X.Record, d: str, pvc: str, info: Dict, digest: str) -> Dict:
+    """The reviewed empty-by-design export: an empty tar (no reader pod) and a manifest stating why and listing the
+    model files skipped as trained after the cutoff."""
+    import io
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT):
+        pass
+    data = buf.getvalue()
+    tar_path = os.path.join(d, "campaign-export.tar")
+    _write_identical(tar_path, data)
+    manifest = {"schema": "c28-pvc-export/v1", "run_id": record.run_id, "cluster_uid": record.cluster_uid,
+                "pvc": pvc, "pvc_uid": info["binding"]["uid"], "pv": info["binding"]["pv"],
+                "pv_uid": info["binding"]["pv_uid"], "rules": info["rules"],
+                "cutoffs": sorted({r["cutoff"] for r in info["rules"]}), "reader_sha256": READER_SHA256,
+                "populator_sha256": C.sha256_file(os.path.abspath(__file__)), "plan_sha256": digest, "files": [],
+                "empty_by_design": info["empty_by_design"], "rule_excluded": info["rule_excluded"],
+                "reviewed_exclusions": info["reviewed_exclusions"], "volume_totals_at_probe": info["volume"],
+                "tar": {"file": "campaign-export.tar", "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}}
+    mtext = (json.dumps(manifest, indent=1, sort_keys=True) + "\n").encode()
+    C.assert_clean(mtext.decode())
+    _write_identical(os.path.join(d, "manifest.json"), mtext)
+    sums = (f"{manifest['tar']['sha256']}  campaign-export.tar\n"
+            f"{hashlib.sha256(mtext).hexdigest()}  manifest.json\n").encode()
+    _write_identical(os.path.join(d, "SHA256SUMS"), sums)
+    X.receipt(record, HELPER, "pvc-exported", {"pvc": pvc, "files": 0, "empty_by_design": True,
+                                               "tar_sha256": manifest["tar"]["sha256"]})
+    return manifest
+
+
 def coverage(record: X.Record, s: Dict, p: Dict, manifests: Dict[str, Dict]) -> bytes:
     inv = _inventory(record, s)
     pvs = {v["claim"]["uid"]: v for v in inv["objects"].get("persistentvolumes", []) if v.get("claim")}
@@ -1223,7 +1368,16 @@ def coverage(record: X.Record, s: Dict, p: Dict, manifests: Dict[str, Dict]) -> 
                  "pv_uid": pv.get("uid"), "reclaim_policy": pv.get("reclaim_policy"),
                  "storage_class": pv.get("storage_class"), "consumers_at_plan": p["consumers"].get(r["name"], []),
                  "required": (s.get("requirements") or {}).get(r["name"], "")}
-        if r["name"] in manifests:
+        if r["name"] in manifests and manifests[r["name"]].get("empty_by_design"):
+            m = manifests[r["name"]]
+            entry["protected"] = {"export": f"pvc-exports/{r['name']}/campaign-export.tar", "files": 0,
+                                  "empty_by_design": m["empty_by_design"],
+                                  "verified": "every model pair present was trained after the cutoff"}
+            entry["residual_not_backed_up"] = {
+                "description": "the current (post-campaign) models are RETAINED on the claim but NOT backed up by S0",
+                "volume_files_at_probe": m["volume_totals_at_probe"]["files"],
+                "volume_bytes_at_probe": m["volume_totals_at_probe"]["bytes"]}
+        elif r["name"] in manifests:
             m = manifests[r["name"]]
             entry["protected"] = {"export": f"pvc-exports/{r['name']}/campaign-export.tar",
                                   "manifest": f"pvc-exports/{r['name']}/manifest.json", "files": len(m["files"]),
@@ -1329,7 +1483,10 @@ def verify(record: X.Record) -> Dict:
             probs += [f"{pvc}: {x}" for x in verify_tar(os.path.join(d, "campaign-export.tar"), files,
                                                         {"trailer": {"bytes": m["tar"]["bytes"],
                                                                      "sha256": m["tar"]["sha256"]}, "files": files})]
-            if not files or any(f["bytes"] <= 0 for f in files):
+            if m.get("empty_by_design"):
+                if files:
+                    probs.append(f"{pvc}: declared empty by design but lists payloads")
+            elif not files or any(f["bytes"] <= 0 for f in files):
                 probs.append(f"{pvc}: the export lists no or empty payloads")
     return {"helper": HELPER, "action": "verify", "export_dir": root, "files": len(have), "problems": probs,
             "result": "PASS" if not probs else "FAIL"}
