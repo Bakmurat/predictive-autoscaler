@@ -54,12 +54,29 @@ def jl(*recs):
     return "".join(json.dumps(r, sort_keys=True) + "\n" for r in recs)
 
 
+FP1, FP2 = "e1" * 32, "e2" * 32
+E1 = {"model_name": "ensemble_nginx-ensemble_requests", "application": "nginx-ensemble", "namespace": "demo",
+      "experiment": "seasonal-ensemble-q90-v1:891ca57abafe:seasonal-ensemble-1.2.0"}
+E2 = {"model_name": "ensemble_nginx-ensemble-q95_requests", "application": "nginx-ensemble-q95", "namespace": "demo",
+      "experiment": "seasonal-ensemble-rq90-v1:cc1de643b6da:seasonal-ensemble-1.2.0"}
+
+
+def ensemble_lines(extra=()):
+    """logs/api-ensemble.jsonl as archive.py writes it (application, namespace, boundary, fingerprint, line_sha256)."""
+    base = {"pod": "ml-api-0", "pod_uid": "u", "restart_count": 0, "instance": "current", "line_sha256": "a" * 64}
+    return [dict(base, ts="2026-11-01T18:06:00Z", collected_at="2026-11-01T18:10:00Z", application="nginx-ensemble",
+                 namespace="demo", origin="2026-11-01T18:00:00Z", fingerprint=FP1, boundary="2026-11-01T18:00:00Z"),
+            dict(base, ts="2026-11-01T23:59:40Z", collected_at="2026-11-02T00:05:00Z", application="nginx-ensemble-q95",
+                 namespace="demo", origin="2026-11-01T23:50:00Z", fingerprint=FP2, boundary="2026-11-01T18:00:00Z")
+            ] + list(extra)
+
+
 def volumes(root):
     """The four claims as the campaign writers left them (deploy/eks-benchmark/instrumentation/archive.py,
     collect_load_evidence.py, the operator and trainer), plus post-cutoff and live material that must NOT be exported."""
     v = {p: os.path.join(root, "vol", p) for p in MOUNTS}
     fc = [{"event": "decision", "at": "2026-11-01T23:58:00Z", "artifact_sha256": None},
-          {"issued_at": "2026-11-01T23:59:00Z", "forecasts": [], "artifact_sha256": sha(b"pickled-model-v1")},
+          {"issued_at": "2026-11-01T23:59:00Z", "forecasts": [], "model_name": "lstm_nginx-test_requests", "application": "nginx-test", "namespace": "demo", "artifact_sha256": sha(b"pickled-model-v1")},
           {"event": "decision", "at": "2026-11-02T00:01:00Z"}]
     write(os.path.join(v["forecast-log-pvc"], "forecasts.jsonl"), jl(*fc) + '{"event": "decision", "at": "2026-11-0')
     a = v["evidence-archive-pvc"]
@@ -99,8 +116,7 @@ def volumes(root):
                                              "pair": {"result": "archived"}, "errors": []},
                                             {"started_at": "2026-11-02T09:00:00Z", "finished_at": "2026-11-02T09:00:02Z",
                                              "pair": {}, "errors": []}))
-    write(os.path.join(a, "logs/api-ensemble.jsonl"), jl({"ts": "2026-11-01T23:59:58Z", "collected_at": "2026-11-02T00:05:00Z",
-                                                          "line_sha256": "a" * 64}))
+    write(os.path.join(a, "logs/api-ensemble.jsonl"), jl(*ensemble_lines()))
     write(os.path.join(a, "logs/api-reload.jsonl"), jl({"ts": "2026-11-01T10:00:00Z", "collected_at": "2026-11-01T10:05:00Z",
                                                         "line": "reloaded"}))
     write(os.path.join(a, "logs/api-coverage.jsonl"), jl({"collected_at": "2026-11-01T10:05:00Z", "pod": "ml-api-0",
@@ -1007,11 +1023,23 @@ def models_after_cutoff_only(e):
 CAMPAIGN_ART = sha(b"pickled-model-v1")
 
 
+LSTM_ARM = {"model_name": "lstm_nginx-test_requests", "application": "nginx-test", "namespace": "demo"}
+
+
+def identities(ensembles=True, fps=None):
+    fps = [{"sha256": FP1, "boundary": "2026-11-01T18:00:00Z", "model_names": [E1["model_name"]], "source": "s:1"},
+           {"sha256": FP2, "boundary": "2026-11-01T18:00:00Z", "model_names": [E2["model_name"]], "source": "s:2"}
+           ] if fps is None else fps
+    return {"artifact_arms": [LSTM_ARM], "ensemble_arms": [E1, E2] if ensembles else [],
+            "generation_fingerprints": fps if ensembles else []}
+
+
 def set_empty_by_design(e, pvc="ml-models-pvc", reason="the mutable model directory holds only post-campaign models",
-                        inventory=(CAMPAIGN_ART,)):
+                        inventory=(CAMPAIGN_ART,), ids=None):
     doc = json.load(open(e["path"]))
     doc["populate"]["pvcs"][pvc]["empty_by_design"] = reason
     if pvc == "ml-models-pvc":
+        doc["populate"]["pvcs"][pvc]["forecast_identities"] = ids or identities(ensembles=False)
         doc["populate"]["pvcs"][pvc]["campaign_artifacts"] = [
             {"artifact_sha256": d, "reason": "issued by the campaign / frozen identity"} for d in inventory]
     write(e["path"], json.dumps(doc))
@@ -1086,8 +1114,8 @@ def test_empty_by_design_resolves_the_reviewed_campaign_artifacts(env):
     models_after_cutoff_only(e)
     absent = "f" * 64
     fl = os.path.join(e["vols"]["forecast-log-pvc"], "forecasts.jsonl")
-    write(fl, jl({"issued_at": "2026-11-01T23:00:00Z", "forecasts": [], "artifact_sha256": absent},
-                 {"issued_at": "2026-11-01T23:59:00Z", "forecasts": [], "artifact_sha256": CAMPAIGN_ART}))
+    write(fl, jl({"issued_at": "2026-11-01T23:00:00Z", "forecasts": [], "model_name": "lstm_nginx-test_requests", "application": "nginx-test", "namespace": "demo", "artifact_sha256": absent},
+                 {"issued_at": "2026-11-01T23:59:00Z", "forecasts": [], "model_name": "lstm_nginx-test_requests", "application": "nginx-test", "namespace": "demo", "artifact_sha256": CAMPAIGN_ART}))
     set_empty_by_design(e)
     do_probe(e)
     probs = P.plan(e["record"], e["kube"])["problems"]
@@ -1102,7 +1130,7 @@ def test_empty_by_design_resolves_the_reviewed_campaign_artifacts(env):
     with pytest.raises(X.StagingError, match="reviewed campaign artifact inventory"):
         P.section(e["record"])
     # the fixed state: only the archived campaign artifact is referenced
-    write(fl, jl({"issued_at": "2026-11-01T23:59:00Z", "forecasts": [], "artifact_sha256": CAMPAIGN_ART}))
+    write(fl, jl({"issued_at": "2026-11-01T23:59:00Z", "forecasts": [], "model_name": "lstm_nginx-test_requests", "application": "nginx-test", "namespace": "demo", "artifact_sha256": CAMPAIGN_ART}))
     set_empty_by_design(e)
     do_probe(e)
     out = do_export(e)
@@ -1215,3 +1243,165 @@ def test_cutoff_boundary_keeps_nanoseconds_end_to_end(env, trained_at, after):
     else:
         probs = P.plan(e["record"], e["kube"])["problems"]
         assert any("declared empty by design but the rules select 2 files" in x for x in probs), probs
+
+
+def ensemble_log(e, extra=()):
+    recs = [{"issued_at": "2026-11-01T18:06:00Z", "forecasts": [], "model_name": E1["model_name"],
+             "application": E1["application"], "namespace": "demo", "training_cutoff": "2026-11-01T18:00:00Z",
+             "model_version": E1["experiment"] + "@" + FP1[:12], "artifact_sha256": FP1},
+            {"event": "decision", "at": "2026-11-01T18:07:00Z", "application": E1["application"], "namespace": "demo",
+             "forecast_issued_at": "2026-11-01T18:06:00Z", "artifact_sha256": FP1},
+            {"issued_at": "2026-11-01T23:59:00Z", "forecasts": [], "model_name": "lstm_nginx-test_requests",
+             "application": "nginx-test", "namespace": "demo", "artifact_sha256": CAMPAIGN_ART},
+            {"event": "decision", "at": "2026-11-01T23:59:30Z", "application": "nginx-test", "namespace": "demo",
+             "forecast_issued_at": "2026-11-01T23:59:00Z", "artifact_sha256": CAMPAIGN_ART},
+            {"issued_at": "2026-11-01T23:59:40Z", "forecasts": [], "model_name": E2["model_name"],
+             "application": E2["application"], "namespace": "demo", "training_cutoff": "2026-11-01T18:00:00Z",
+             "model_version": E2["experiment"] + "@" + FP2[:12], "artifact_sha256": FP2}] + list(extra)
+    write(os.path.join(e["vols"]["forecast-log-pvc"], "forecasts.jsonl"), jl(*recs))
+
+
+def test_ensemble_generations_are_reviewed_corroborated_and_not_replayable(env):
+    """Codex #38: ensemble_* issuances carry a generation data fingerprint (no model file). Each must come from a
+    REVIEWED ensemble arm, be in the reviewed fingerprint map with its boundary, and be corroborated by an archived
+    ENSEMBLE_ISSUANCE record; the coverage file says replay is unavailable."""
+    e = env
+    models_after_cutoff_only(e)
+    ensemble_log(e)
+    set_empty_by_design(e, ids=identities())
+    do_probe(e)
+    p = P.plan(e["record"], e["kube"])
+    assert p["problems"] == [], p["problems"]
+    it = p["pvcs"]["forecast-log-pvc"]["selection"][0]
+    assert it["referenced_artifact_sha256"] == [CAMPAIGN_ART]
+    eg = p["pvcs"]["ml-models-pvc"]["empty_by_design"]["ensemble_generations"]
+    assert eg["count"] == 2 and [x["sha256"] for x in eg["entries"]] == sorted([FP1, FP2])
+    assert eg["entries"][0]["arms"] == [[E1["model_name"], E1["application"], "demo", E1["experiment"]]]
+    out = do_export(e)
+    assert out["event"] == "export-complete" and P.verify(e["record"])["result"] == "PASS"
+    root = e["record"].doc["archive"]["evidence"]["export_dir"]
+    cov = json.load(open(os.path.join(root, "storage/pvc-retention-and-export-coverage.json")))
+    mc = next(c for c in cov["claims"] if c["claim"] == "ml-models-pvc")["protected"]
+    assert mc["ensemble_generations"]["replay"] == "ensemble replay verification unavailable; fingerprints preserved, inputs not"
+    assert mc["ensemble_generations"]["entries"] == eg["entries"]
+
+
+@pytest.mark.parametrize("extra, why", [
+    ({"issued_at": "2026-11-01T23:59:50Z", "forecasts": [], "model_name": "ensemble_unreviewed_requests",
+      "application": "unreviewed", "namespace": "demo", "training_cutoff": "2026-11-01T18:00:00Z",
+      "model_version": "x-v1:abc:1@" + "d" * 12, "artifact_sha256": "d" * 64}, "not a reviewed ensemble arm"),
+    ({"issued_at": "2026-11-01T23:59:50Z", "forecasts": [], "model_name": E1["model_name"],
+      "application": E1["application"], "namespace": "demo", "training_cutoff": "2026-11-01T18:00:00Z",
+      "model_version": E1["experiment"] + "@" + "d" * 12, "artifact_sha256": "d" * 64},
+     "is not in the reviewed generation fingerprint map"),
+    ({"issued_at": "2026-11-01T23:59:50Z", "forecasts": [], "model_name": E1["model_name"],
+      "application": E1["application"], "namespace": "demo", "training_cutoff": "2026-11-01T12:00:00Z",
+      "model_version": E1["experiment"] + "@" + FP1[:12], "artifact_sha256": FP1},
+     "conflicts with its reviewed boundary/arms"),
+    ({"issued_at": "2026-11-01T23:59:50Z", "forecasts": [], "model_name": E1["model_name"],
+      "application": E1["application"], "namespace": "demo", "training_cutoff": "2026-11-01T18:00:00Z",
+      "model_version": "seasonal-ensemble-q95-v1:c73c7e1b53c4:seasonal-ensemble-1.2.0@" + FP1[:12],
+      "artifact_sha256": FP1}, "not a reviewed ensemble arm"),
+    ({"issued_at": "2026-11-01T23:59:50Z", "forecasts": [], "model_name": "lstm_nginx-seasonal_requests",
+      "application": "nginx-seasonal", "namespace": "demo", "artifact_sha256": CAMPAIGN_ART},
+     "is not a reviewed artifact arm"),
+])
+def test_unreviewed_or_conflicting_generations_block(env, extra, why):
+    """The Codex repro (an undeclared ensemble_unreviewed_requests issuance with an arbitrary digest passed) and its
+    relatives now block."""
+    e = env
+    models_after_cutoff_only(e)
+    ensemble_log(e, [extra])
+    set_empty_by_design(e, ids=identities())
+    do_probe(e)
+    probs = P.plan(e["record"], e["kube"])["problems"]
+    assert any(why in x for x in probs), probs
+
+
+def test_generations_need_an_archived_ensemble_issuance(env):
+    """A reviewed fingerprint the evidence archive's ENSEMBLE_ISSUANCE records do not carry (same application,
+    namespace, boundary) is not corroborated; a trainer artifact cannot stand in."""
+    e = env
+    models_after_cutoff_only(e)
+    ensemble_log(e)
+    lines = ensemble_lines()
+    lines[1]["boundary"] = "2026-11-01T12:00:00Z"
+    write(os.path.join(e["vols"]["evidence-archive-pvc"], "logs/api-ensemble.jsonl"), jl(*lines))
+    set_empty_by_design(e, ids=identities())
+    do_probe(e)
+    probs = P.plan(e["record"], e["kube"])["problems"]
+    assert any(f"generation {FP2}" in x and "not corroborated by an archived ENSEMBLE_ISSUANCE" in x
+               for x in probs), probs
+    set_empty_by_design(e, ids=identities(fps=[
+        {"sha256": FP1, "boundary": "2026-11-01T18:00:00Z", "model_names": [E1["model_name"]], "source": "s:1"},
+        {"sha256": FP2, "boundary": "2026-11-01T18:00:00Z", "model_names": [E2["model_name"]], "source": "s:2"},
+        {"sha256": "f" * 64, "boundary": "2026-11-01T18:00:00Z", "model_names": [E1["model_name"]], "source": "s:3"}]))
+    probs = P.plan(e["record"], e["kube"])["problems"]
+    assert any("reviewed generation fingerprint " + "f" * 64 + " is referenced by no campaign issuance" in x
+               for x in probs), probs
+
+
+def test_a_missing_lstm_artifact_still_blocks_beside_ensembles(env):
+    e = env
+    models_after_cutoff_only(e)
+    absent = "a" * 64
+    ensemble_log(e, [{"issued_at": "2026-11-01T23:59:50Z", "forecasts": [], "model_name": "lstm_nginx-test_requests",
+                      "application": "nginx-test", "namespace": "demo", "artifact_sha256": absent}])
+    set_empty_by_design(e, ids=identities())
+    do_probe(e)
+    probs = P.plan(e["record"], e["kube"])["problems"]
+    assert [x for x in probs if "references artifact" in x] == [
+        f"ml-models-pvc: the campaign forecast log references artifact {absent} outside the reviewed campaign "
+        "artifact inventory"], probs
+
+
+@pytest.mark.parametrize("extra, why", [
+    ({"issued_at": "2026-11-01T23:59:50Z", "forecasts": [], "model_name": "pm-marker-xyz_model",
+      "application": "a", "namespace": "demo", "artifact_sha256": "b" * 64},
+     "carries a artifact_sha256 but its model_name is of no declared class"),
+    ({"event": "decision", "at": "2026-11-01T23:59:50Z", "application": "nginx-test", "namespace": "demo",
+      "forecast_issued_at": "2026-11-01T23:59:00Z", "artifact_sha256": FP1},
+     "repeats no earlier issuance of its own workload"),                 # FP1 is another workload's digest
+    ({"event": "decision", "at": "2026-11-01T23:59:50Z", "application": "nginx-test", "namespace": "demo",
+      "forecast_issued_at": "2026-11-01T23:59:00Z", "artifact_sha256": "c" * 64},
+     "repeats no earlier issuance of its own workload"),
+])
+def test_unclassified_forecast_digests_fail_closed(env, extra, why):
+    e = env
+    ensemble_log(e, [extra])
+    do_probe(e)
+    probs = P.plan(e["record"], e["kube"])["problems"]
+    assert any(why in x for x in probs), probs
+    assert not any("pm-marker-xyz" in x or "c" * 64 in x for x in probs)
+
+
+def test_ref_classes_need_disjoint_prefixes(env):
+    e = env
+    doc = json.load(open(e["path"]))
+    rule = copy.deepcopy(P.DEFAULT_RULES["forecast-log-pvc"][0])
+    rule["ref_classes"]["fingerprint_prefixes"] = ["lstm_nginx"]
+    doc["populate"]["pvcs"]["forecast-log-pvc"]["rules"] = [rule]
+    write(e["path"], json.dumps(doc))
+    with pytest.raises(X.StagingError, match="disjoint"):
+        P.effective_rules(P.section(X.load_record(e["path"], ("populate", "archive"))), "forecast-log-pvc")
+
+
+@pytest.mark.parametrize("extra, why", [
+    ({"issued_at": "2026-11-01T23:59:50Z", "forecasts": [], "model_name": "lstm_pm-marker-xyz_requests",
+      "application": "pm-marker-app", "namespace": "pm-marker-ns", "artifact_sha256": CAMPAIGN_ART},
+     "an artifact issuance identity (model_name, application, namespace; sha256 "),
+    ({"issued_at": "2026-11-01T23:59:50Z", "forecasts": [], "model_name": "ensemble_pm-marker-xyz_requests",
+      "application": "pm-marker-app", "namespace": "pm-marker-ns", "training_cutoff": "2026-11-01T18:00:00Z",
+      "model_version": "pm-marker-exp:1@" + FP1[:12], "artifact_sha256": FP1},
+     "was issued by an identity (model_name, application, namespace, experiment; sha256 "),
+])
+def test_unreviewed_identities_are_reported_by_digest_only(env, extra, why):
+    """Codex #38: a rejected identity is named by its field names and a digest, never its values."""
+    e = env
+    models_after_cutoff_only(e)
+    ensemble_log(e, [extra])
+    set_empty_by_design(e, ids=identities())
+    do_probe(e)
+    probs = P.plan(e["record"], e["kube"])["problems"]
+    assert any(why in x for x in probs), probs
+    assert not any("pm-marker" in x for x in probs), probs

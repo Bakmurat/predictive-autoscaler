@@ -30,7 +30,7 @@ evidence archive selection holds its immutable archived copy (same artifact and 
 Rules (populate.pvcs.<pvc>.rules; cutoff "campaign" = populate.cutoff, "collection" = populate.collection_cutoff for
 the collectors' own post-stop files, or an explicit UTC time):
   {"type": "jsonl_prefix", "path": P, "ts_fields": [...] | "ts_by": {"field": F, "types": {T: [...]}},
-   "known_keys": [...], "collect_refs": [K], "order_tolerance_seconds": N, "order_tolerance_review": "..."}
+   "known_keys": [...], "ref_classes": {...}, "order_tolerance_seconds": N, "order_tolerance_review": "..."}
         the prefix of an append-only JSONL file up to its LAST record at or before the cutoff; a record's time is the
         first present field of ts_fields, or of its own type's list (types keyed by the discriminator F; "" = without
         F). An unknown type or a record without a usable time fails the rule and is reported by its SHAPE only: the
@@ -38,7 +38,9 @@ the collectors' own post-stop files, or an explicit UTC time):
         F only when it is a known type (else its JSON type and a digest). Ordering is STRICT by default; a tolerance
         for interleaved writers is a per-rule exception that needs order_tolerance_review, and the plan and manifest
         list it (order_tolerances); its overhang lines are counted apart (overshoot_lines), never campaign records.
-        collect_refs lists the sha256 values of fields K (e.g. artifact_sha256) in the records up to the cutoff
+        ref_classes {field, class_by, artifact_prefixes, fingerprint_prefixes} sorts the field's sha256 values in the
+        records up to the cutoff by the record's class_by (model_name): persisted artifacts vs generation fingerprints;
+        a value whose record lacks class_by must match a classified one, any other class fails
   {"type": "named", "glob": G, "ts_regex": R, "ts_format": F}  files whose NAME carries a time at or before the cutoff
   {"type": "bundles", "manifest_glob": G, "ts_field": T}       archive bundles by their manifest's T, every original
         hash verified; a sidecar variant's artifact_key must name a selected bundle
@@ -281,14 +283,70 @@ def record_ts(rec, rule):
 
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
+NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+
+def names_ok(*vs):
+    return all(isinstance(v, str) and NAME.match(v) for v in vs)
+
+def classify_ref(rec, rc, out):
+    """One forecast-log record's digest: an issuance (it has class_by, the model_name) is an ARTIFACT (its identity
+    model_name/application/namespace kept) or an ensemble GENERATION (model_name, application, namespace, experiment =
+    model_version before "@", boundary = training_cutoff, fingerprint; model_version must end in @fingerprint[:12]);
+    a record without class_by (a decision) must repeat the digest of an issuance OF ITS OWN WORKLOAD
+    (application, namespace, forecast_issued_at). Returns why it fails, or None."""
+    v = rec.get(rc["field"])
+    if v in (None, ""):
+        return None
+    if not (isinstance(v, str) and HEX64.match(v)):
+        return "has a %s that is not a sha256" % rc["field"]
+    app, ns = rec.get("application"), rec.get("namespace")
+    if rc["class_by"] not in rec:
+        if out["issuances"].get((app, ns, utc(rec.get("forecast_issued_at")))) != v:
+            return "repeats no earlier issuance of its own workload with that %s" % rc["field"]
+        return None
+    name = rec.get(rc["class_by"])
+    issued = utc(rec.get("issued_at"))
+    if not names_ok(name, app, ns) or issued is None:
+        return "is an issuance without a valid model_name, application, namespace and issued_at"
+    if (app, ns, issued) in out["issuances"] and out["issuances"][(app, ns, issued)] != v:
+        return "conflicts with an earlier issuance of its workload at the same issued_at"
+    out["issuances"][(app, ns, issued)] = v
+    if name.startswith(tuple(rc["artifact_prefixes"])):
+        out["artifacts"].add(v)
+        out["artifact_ids"].add((name, app, ns))
+        return None
+    if name.startswith(tuple(rc["fingerprint_prefixes"])):
+        mv, b = rec.get("model_version"), utc(rec.get("training_cutoff"))
+        if not (isinstance(mv, str) and mv.endswith("@" + v[:12]) and names_ok(mv.split("@")[0]) and b is not None):
+            return "is a generation issuance whose model_version / training_cutoff do not bind its fingerprint"
+        out["generations"].add((name, app, ns, mv.split("@")[0], iso(b), v))
+        return None
+    return "carries a %s but its %s is of no declared class" % (rc["field"], rc["class_by"])
+
+def archived_generation(rec, out):
+    """An archived ENSEMBLE_ISSUANCE record (archive.py: application, namespace, boundary, fingerprint; the raw line is
+    bound by line_sha256): kept as (application, namespace, boundary, fingerprint). A parse_error record counts as
+    unparsed."""
+    if "parse_error" in rec:
+        out["unparsed"] += 1
+        return None
+    fp, b = rec.get("fingerprint"), utc(rec.get("boundary"))
+    if not (isinstance(fp, str) and HEX64.match(fp) and b is not None
+            and names_ok(rec.get("application"), rec.get("namespace"))):
+        return "is not an ENSEMBLE_ISSUANCE record with application, namespace, boundary and fingerprint"
+    out["ensemble_lines"].add((rec["application"], rec["namespace"], iso(b), fp))
+    return None
+
 def scan(mount, rel, rule, cutoff, collect=False):
     """The prefix of an append-only JSONL file that ends at its LAST record at or before the cutoff. Records inside
     it but after the cutoff (interleaved writers) are allowed only within order_tolerance_seconds; a record at or
     before the cutoff that follows a later record by more is not append-ordered and fails. A record without a usable
     timestamp fails, reported by its shape only. Returns {offset, lines, overshoot, after, records?} and problems."""
     tol = int(rule.get("order_tolerance_seconds", 0)) * NS                            # strict unless reviewed
-    out = {"offset": 0, "lines": 0, "overshoot": 0, "after": 0, "records": [], "after_records": [], "refs": set()}
-    ref_fields = rule.get("collect_refs") or []
+    out = {"offset": 0, "lines": 0, "overshoot": 0, "after": 0, "records": [], "after_records": [],
+           "artifacts": set(), "artifact_ids": set(), "generations": set(), "issuances": {},
+           "ensemble_lines": set(), "unparsed": 0}
+    rc = rule.get("ref_classes")
     pend_n, pend_max, pend_recs, pend_bytes, probs = 0, None, [], 0, []
     with open(safe(mount, rel), "rb") as fh:
         for n, raw in enumerate(fh, 1):
@@ -305,16 +363,11 @@ def scan(mount, rel, rule, cutoff, collect=False):
                 if pend_n and pend_max > cutoff + tol:
                     probs.append("%s: a record at or before the cutoff (line %d) follows a record more than %d s "
                                  "after it (not append-ordered)" % (rel, n, tol // NS)); break
-                for f in ref_fields:
-                    v = rec.get(f)
-                    if v in (None, ""):
-                        continue
-                    if not (isinstance(v, str) and HEX64.match(v)):
-                        probs.append("a record of %s at line %d has a %s that is not a sha256: %s"
-                                     % (rel, n, f, shape(rec, rule))); break
-                    out["refs"].add(v)
-                if probs:
-                    break
+                why = classify_ref(rec, rc, out) if rc else None
+                if why is None and rule.get("collect_generations"):
+                    why = archived_generation(rec, out)
+                if why:
+                    probs.append("a record of %s at line %d %s: %s" % (rel, n, why, shape(rec, rule))); break
                 out["offset"] += pend_bytes + len(raw)
                 out["lines"] += pend_n + 1
                 out["overshoot"] += pend_n
@@ -342,8 +395,15 @@ def jsonl_prefix(mount, rule, cutoff):
     if probs:
         return [], [], probs
     extra = {"overshoot_lines": res["overshoot"]}
-    if rule.get("collect_refs"):
-        extra["referenced_artifact_sha256"] = sorted(res["refs"])
+    if rule.get("ref_classes"):
+        extra["referenced_artifact_sha256"] = sorted(res["artifacts"])
+        extra["artifact_identities"] = [list(x) for x in sorted(res["artifact_ids"])]
+        extra["referenced_generations"] = [dict(zip(("model_name", "application", "namespace", "experiment",
+                                                     "boundary", "fingerprint"), g)) for g in sorted(res["generations"])]
+    if rule.get("collect_generations"):
+        extra["archived_generations"] = [dict(zip(("application", "namespace", "boundary", "fingerprint"), g))
+                                         for g in sorted(res["ensemble_lines"])]
+        extra["unparsed_lines"] = res["unparsed"]
     if res["overshoot"]:
         extra["overshoot_note"] = ("lines after the cutoff inside the prefix under the reviewed order tolerance: an "
                                    "overhang of interleaved writers, not campaign records")
@@ -712,10 +772,17 @@ DEFAULT_RULES = {
                               "": ["issued_at"], "decision": ["at"], "sanity_rejected": ["rejected_at"],
                               "forecast_ledger_session": ["at"], "forecast_attempt_started": ["at"],
                               "forecast_attempt_completed": ["at"]}},
-                          "known_keys": FORECAST_KEYS_0472829, "collect_refs": ["artifact_sha256"]}],
+                          "known_keys": FORECAST_KEYS_0472829,
+                          # issuances name their model: lstm_* serve a persisted trainer artifact (artifact_sha256 =
+                          # the .pkl's sha256); ensemble_* serve an in-memory generation whose artifact_sha256 is the
+                          # generation's data fingerprint (ml-engine/models/seasonal_ensemble.py, api/main.py), never
+                          # a file; decisions carry no model_name and repeat an issuance's digest
+                          "ref_classes": {"field": "artifact_sha256", "class_by": "model_name",
+                                          "artifact_prefixes": ["lstm_"], "fingerprint_prefixes": ["ensemble_"]}}],
     "evidence-archive-pvc": [{"type": "bundles", "manifest_glob": "archive/*/manifest.json", "ts_field": "copied_at",
                               "cutoff": "collection"}]
-    + [{"type": "jsonl_prefix", "path": p, "ts_fields": f, "cutoff": "collection"} for p, f in COLLECTOR_LOGS]
+    + [dict({"type": "jsonl_prefix", "path": p, "ts_fields": f, "cutoff": "collection"},
+            **({"collect_generations": True} if p == "logs/api-ensemble.jsonl" else {})) for p, f in COLLECTOR_LOGS]
     + [{"type": "trainer_logs", "index": "logs/trainer-index.jsonl", "dir": "logs/trainer", "cutoff": "campaign"}],
     "load-evidence-pvc": [
         {"type": "named", "glob": "attempts/load-*.json", "ts_regex": r"^load-(\d{8}T\d{4})Z", "ts_format": "%Y%m%dT%H%M",
@@ -734,8 +801,8 @@ DEFAULT_EXCLUDED = {
     "load-evidence-pvc": [{"glob": ".lock", "reason": "the collector's empty lock file"}],
     "ml-models-pvc": [],
 }
-RULE_KEYS = {"jsonl_prefix": {"type", "path", "ts_fields", "ts_by", "known_keys", "collect_refs",
-                              "order_tolerance_seconds", "order_tolerance_review", "cutoff"},
+RULE_KEYS = {"jsonl_prefix": {"type", "path", "ts_fields", "ts_by", "known_keys", "ref_classes",
+                              "collect_generations", "order_tolerance_seconds", "order_tolerance_review", "cutoff"},
              "named": {"type", "glob", "ts_regex", "ts_format", "cutoff"},
              "bundles": {"type", "manifest_glob", "ts_field", "cutoff"},
              "pairs": {"type", "sidecar_glob", "artifact_from", "artifact_to", "ts_field", "sha_field", "cutoff"},
@@ -743,6 +810,36 @@ RULE_KEYS = {"jsonl_prefix": {"type", "path", "ts_fields", "ts_by", "known_keys"
 
 
 # --- the record -------------------------------------------------------------------------------------------------------
+
+_IDENT_KEYS = {"artifact_arms": ("model_name", "application", "namespace"),
+               "ensemble_arms": ("model_name", "application", "namespace", "experiment")}
+
+
+def forecast_identity_problems(fi) -> List[str]:
+    """The reviewed forecast identities (required with empty_by_design): the exact artifact arms
+    {model_name, application, namespace}, the exact ensemble arms {..., experiment} and the reviewed generation
+    fingerprint map [{sha256, boundary, model_names, source}], each entry bound to its source evidence."""
+    where = "populate.pvcs.ml-models-pvc.forecast_identities"
+    if not isinstance(fi, dict) or set(fi) != {"artifact_arms", "ensemble_arms", "generation_fingerprints"}:
+        return [f"{where} must hold artifact_arms, ensemble_arms and generation_fingerprints"]
+    probs = []
+    for k, keys in _IDENT_KEYS.items():
+        arms = fi[k]
+        if not (isinstance(arms, list) and all(isinstance(a, dict) and set(a) == set(keys) and all(
+                isinstance(a[x], str) and a[x] for x in keys) for a in arms)
+                and len({tuple(a[x] for x in keys) for a in arms}) == len(arms)):
+            probs.append(f"{where}.{k} must be unique {{{', '.join(keys)}}} entries")
+    names = {a.get("model_name") for a in fi["ensemble_arms"] if isinstance(a, dict)}
+    gf = fi["generation_fingerprints"]
+    if not (isinstance(gf, list) and all(
+            isinstance(g, dict) and set(g) == {"sha256", "boundary", "model_names", "source"}
+            and re.match(r"^[0-9a-f]{64}$", str(g["sha256"])) and _TS.match(str(g["boundary"]))
+            and isinstance(g["model_names"], list) and g["model_names"] and set(g["model_names"]) <= names
+            and str(g["source"]).strip() for g in gf) and len({g["sha256"] for g in gf}) == len(gf)):
+        probs.append(f"{where}.generation_fingerprints must be unique {{sha256, boundary, model_names (reviewed "
+                     f"ensemble arms), source}} entries")
+    return probs
+
 
 def section(record: X.Record) -> Dict:
     s = record.section("populate")
@@ -789,6 +886,7 @@ def section(record: X.Record) -> Dict:
                     and str(a["reason"]).strip() for a in ca)):
                 probs.append("populate.pvcs.ml-models-pvc.campaign_artifacts must be the reviewed campaign artifact "
                              "inventory: unique {artifact_sha256, reason} entries (required with empty_by_design)")
+            probs += forecast_identity_problems(p.get("forecast_identities"))
     retained = s.get("retained_pvcs") or []
     if len(retained) != 5 or not all(X._UUID.match(str(r.get("uid", ""))) for r in retained):
         probs.append("populate.retained_pvcs must list all five claims with UIDs")
@@ -817,8 +915,19 @@ def effective_rules(s: Dict, pvc: str) -> List[Dict]:
                 raise X.StagingError(f"{pvc}: jsonl_prefix needs ts_fields or ts_by {{field, types: {{type: [fields]}}}}")
             if not all(isinstance(k, str) for k in r.get("known_keys") or []):
                 raise X.StagingError(f"{pvc}: known_keys must be key names")
-            if not all(isinstance(k, str) and k in (r.get("known_keys") or []) for k in r.get("collect_refs") or []):
-                raise X.StagingError(f"{pvc}: collect_refs must name known_keys")
+            rc = r.get("ref_classes")
+            if rc is not None:
+                rc = rc if isinstance(rc, dict) else {}
+                pre = lambda k: rc.get(k) if isinstance(rc.get(k), list) and rc.get(k) and all(
+                    isinstance(x, str) and x for x in rc[k]) else None
+                ap, fp = pre("artifact_prefixes"), pre("fingerprint_prefixes")
+                known = r.get("known_keys") or []
+                if not (set(rc) == {"field", "class_by", "artifact_prefixes",
+                                                             "fingerprint_prefixes"}
+                        and rc["field"] in known and rc["class_by"] in known and ap and fp
+                        and not any(a.startswith(f) or f.startswith(a) for a in ap for f in fp)):
+                    raise X.StagingError(f"{pvc}: ref_classes needs field and class_by among known_keys and disjoint "
+                                         f"non-empty artifact_prefixes / fingerprint_prefixes")
             tol = r.get("order_tolerance_seconds", 0)
             if not isinstance(tol, int) or isinstance(tol, bool) or tol < 0:
                 raise X.StagingError(f"{pvc}: order_tolerance_seconds must be a non-negative integer")
@@ -1403,7 +1512,9 @@ def campaign_artifact_problems(s: Dict, pvcs: Dict[str, Dict]) -> List[str]:
     fl = pvcs.get("forecast-log-pvc", {}).get("selection", [])
     referenced = {d for it in fl for d in it.get("referenced_artifact_sha256") or []}
     if not any("referenced_artifact_sha256" in it for it in fl):
-        out.append("ml-models-pvc: empty by design needs the forecast log's referenced artifacts (collect_refs)")
+        out.append("ml-models-pvc: empty by design needs the forecast log's referenced artifacts (ref_classes)")
+    gens, gprobs = ensemble_generation_check(s, pvcs, set(inv))
+    out += gprobs
     ea = pvcs.get("evidence-archive-pvc", {}).get("selection", [])
     trained = {m["artifact_sha256"] for m in ea if "sidecar_sha256" in m and m.get("artifact_sha256")
                and ts_ns(m.get("ts")) is not None and ts_ns(m["ts"]) <= ts_ns(cutoff)}
@@ -1423,7 +1534,75 @@ def campaign_artifact_problems(s: Dict, pvcs: Dict[str, Dict]) -> List[str]:
             refs.append(dict(r, referenced_by=sorted(
                 (["forecast log"] if d in referenced else []) + (["training bundle"] if d in trained else []))))
     mm["empty_by_design"]["campaign_artifacts"] = refs
+    mm["empty_by_design"]["ensemble_generations"] = gens
     return out
+
+
+def identity_digest(t) -> str:
+    """An UNREVIEWED identity in a diagnosis: a digest of its values, never the values (they may be anything)."""
+    return hashlib.sha256(json.dumps(list(t)).encode()).hexdigest()[:12]
+
+
+def ensemble_generation_check(s: Dict, pvcs: Dict[str, Dict], inventory: set) -> Tuple[Dict, List[str]]:
+    """The forecast log's identities against the REVIEWED ones: every artifact issuance is a reviewed artifact arm;
+    every generation issuance is a reviewed ensemble arm (model_name, application, namespace, experiment) and its
+    fingerprint is in the reviewed map with the same boundary and arm; the map holds nothing unreferenced; and each
+    referenced generation is corroborated by an archived ENSEMBLE_ISSUANCE record of the evidence archive with the same
+    application, namespace, boundary and fingerprint (that record keeps no experiment; the issuance's model_version
+    binds it). The inputs of a generation are not retained, so it cannot be replayed."""
+    fi = s["pvcs"]["ml-models-pvc"]["forecast_identities"]
+    out = []
+    fl = pvcs.get("forecast-log-pvc", {}).get("selection", [])
+    ids = {tuple(x) for it in fl for x in it.get("artifact_identities") or []}
+    arms_a = {tuple(a[k] for k in _IDENT_KEYS["artifact_arms"]) for a in fi["artifact_arms"]}
+    for x in sorted(ids - arms_a):
+        out.append(f"ml-models-pvc: an artifact issuance identity (model_name, application, namespace; sha256 "
+                   f"{identity_digest(x)}) is not a reviewed artifact arm")
+    arms_e = {tuple(a[k] for k in _IDENT_KEYS["ensemble_arms"]): a for a in fi["ensemble_arms"]}
+    by_name = {a["model_name"]: [] for a in fi["ensemble_arms"]}
+    for a in fi["ensemble_arms"]:
+        by_name[a["model_name"]].append(a)
+    reviewed = {g["sha256"]: g for g in fi["generation_fingerprints"]}
+    archived = {(g["application"], g["namespace"], g["boundary"], g["fingerprint"])
+                for it in pvcs.get("evidence-archive-pvc", {}).get("selection", [])
+                for g in it.get("archived_generations") or []}
+    seen: Dict[str, Dict] = {}
+    for g in (g for it in fl for g in it.get("referenced_generations") or []):
+        fp = g["fingerprint"]
+        arm = (g["model_name"], g["application"], g["namespace"], g["experiment"])
+        if arm not in arms_e:
+            out.append(f"ml-models-pvc: generation {fp} was issued by an identity (model_name, application, namespace, "
+                       f"experiment; sha256 {identity_digest(arm)}) that is not a reviewed ensemble arm")
+            continue
+        r = reviewed.get(fp)
+        if r is None:
+            out.append(f"ml-models-pvc: generation {fp} is not in the reviewed generation fingerprint map")
+            continue
+        if r["boundary"] != g["boundary"] or g["model_name"] not in r["model_names"]:
+            out.append(f"ml-models-pvc: generation {fp} conflicts with its reviewed boundary/arms")
+            continue
+        if fp in inventory:
+            out.append(f"ml-models-pvc: {fp} is both a generation fingerprint and a reviewed campaign artifact")
+        if (g["application"], g["namespace"], g["boundary"], fp) not in archived:
+            out.append(f"ml-models-pvc: generation {fp} ({g['application']}, {g['boundary']}) is not corroborated by "
+                       "an archived ENSEMBLE_ISSUANCE record")
+            continue
+        e = seen.setdefault(fp, {"sha256": fp, "boundary": g["boundary"], "arms": [], "source": r["source"],
+                                 "corroborated_by": "logs/api-ensemble.jsonl (evidence-archive export)"})
+        if list(arm) not in e["arms"]:
+            e["arms"].append(list(arm))
+    for fp in sorted(set(reviewed) - {g["fingerprint"] for it in fl for g in it.get("referenced_generations") or []}):
+        out.append(f"ml-models-pvc: the reviewed generation fingerprint {fp} is referenced by no campaign issuance")
+    entries = [seen[k] for k in sorted(seen)]
+    for e in entries:
+        e["arms"].sort()
+    return {"count": len(entries), "entries": entries,
+            "experiment_note": "the archived ENSEMBLE_ISSUANCE record keeps application, namespace, boundary and "
+                               "fingerprint, not the experiment (archive.py at 0472829); the issuance's model_version "
+                               "binds the experiment",
+            "replay": "ensemble replay verification unavailable; fingerprints preserved, inputs not",
+            "why": "ensemble_* issuances carry the in-memory generation's data fingerprint as artifact_sha256 "
+                   "(ml-engine/models/seasonal_ensemble.py, api/main.py at 0472829); no model file exists"}, out
 
 
 def plan(record: X.Record, kube: X.Kube) -> Dict:
@@ -1693,6 +1872,7 @@ def coverage(record: X.Record, s: Dict, p: Dict, manifests: Dict[str, Dict]) -> 
                 "plan_sha256": m["plan_sha256"],
                 "current_pairs_trained_after_cutoff": e["current_pairs_trained_after_cutoff"],
                 "campaign_artifacts": e["campaign_artifacts"],
+                "ensemble_generations": e.get("ensemble_generations"),
                 "statement": "the campaign model artifacts are protected by the listed VERIFIED evidence-archive "
                              "members, not by this empty tar"}
             entry["residual_not_backed_up"] = {
