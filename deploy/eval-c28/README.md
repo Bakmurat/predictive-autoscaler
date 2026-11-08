@@ -76,14 +76,19 @@ Other open items:
 
 ## Sidecar-free evaluation
 
-The evaluation runs in prodcluster's `demo`, which has Istio sidecar injection enabled namespace-wide. That policy is
-not changed. Instead every Pod template rendered for the evaluation carries the pod annotation
-`sidecar.istio.io/inject: "false"` on the pod template's metadata (an annotation on the Deployment's own metadata does
-not reach the pods). That covers the ten fixture Deployments, the ingress, the two fault routes (`render`), the
-generator Jobs (`staging/session.py`) and the evaluation release's operator and forecaster (`podAnnotations` in
-`release-values` and in `prepare.py`'s staging overlay, which `values_problems` checks). `render` refuses a rendering
-in which any Pod template lacks the annotation (`audit_sidecar_free`), and `session.py` audits its generator Job the
-same way. A default sidecar (100m CPU / 128Mi requested per pod) would otherwise make the workload node unschedulable.
+The evaluation runs in prodcluster's `demo`, which has Istio sidecar injection enabled namespace-wide
+(`istio-injection=enabled`; the injector webhook's objectSelector is `sidecar.istio.io/inject NotIn [false]`). That
+policy is not changed. Instead every Pod template rendered for the evaluation carries `sidecar.istio.io/inject: "false"`
+both as a pod **label** (the webhook's objectSelector then excludes the pod, so the API server never calls the injector)
+and as a pod **annotation** (the injector's own per-pod opt-out), on the pod template's metadata, never only on the
+workload's own metadata or in a selector. That covers the ten fixture Deployments, the ingress, the two fault routes
+(`render`), the generator Jobs (`staging/session.py`) and the evaluation release's operator and forecaster (`podLabels`
+and `podAnnotations` in `release-values` and in `prepare.py`'s staging overlay, which `values_problems` checks; the
+chart gained `operator.podLabels` and `forecaster.podLabels`, which may never set its selector keys). `render` refuses a
+rendering in which any Pod template lacks the label or the annotation (`audit_sidecar_free`); `session.py` audits its
+generator Job the same way; `prepare.py verify` reports any admitted evaluation pod whose regular or init containers
+include `istio-proxy`/`istio-init` (`render.unexpected_injection`, reusable for the live checks). A default sidecar
+(100m CPU / 128Mi requested per pod) would otherwise make the workload node unschedulable.
 
 **Claim limit.** Results concern this sidecar-free fixture, not mesh-enabled workloads. They are not directly comparable
 with the old prodcluster benchmark, whose `demo` pods ran with sidecars.
@@ -98,14 +103,16 @@ own values.
 When the params carry a `residency` section, `render` computes the evaluation's maximum resident requests on each
 reserved node and refuses when evaluation plus node-system requests exceed **75 % of allocatable** (the manifest's
 >= 25 % headroom), CPU and memory checked separately, listing every contribution. The prodcluster staging helpers
-(`execlib.load_params`) require the section; the kind smoke may omit it.
+(`execlib.load_params`) require the section; the kind smoke may omit it. `prepare.py` runs the complete residency and
+sidecar audits over the whole evaluation (every phase's objects plus the staging overlay) before every phase's plan,
+and so again when `apply` recomputes the plan: no phase is prepared while the evaluation as a whole would be refused.
 
 | Field | Meaning |
 |---|---|
 | `residency.workload` / `residency.support` | `allocatable` {cpu, memory} from the fresh dated node inventory; `system_requests` {cpu, memory}: the summed requests of the node-level pods that stay on that node (DaemonSets, allowlisted agents). Required. |
 | `overlap_pods` | Extra pods of the loaded arm counted on W for startup/termination overlap. Default 2 (= the frozen scale-down step of two pods: terminating pods keep their requests on the node until gone while scale-up, stabilization 0, already creates replacements); at least 1. |
 | `idle_arm_replicas` | Replica count of every arm that is not loaded. Default 2, the fixed starting count every target is created and verified at (no parking). A higher, conservative value is allowed. A lower value is refused (see below). |
-| `operator`, `forecaster` | Requests budgeted on S. Defaults: the chart's operator request 100m/128Mi, the forecaster at 1 CPU/512Mi (its limit, STAGING S2). |
+| `operator`, `forecaster` | Declared budgets on S. Defaults: the chart's operator request 100m/128Mi; the forecaster at 1 CPU/512Mi, which is also its floor (STAGING S2). The evaluation release requests exactly these (`release-values` and the staging overlay set `operator.resources` and `forecaster.statistical.resources`; limits below a request are raised to it). The accounting reads what the final chart values (values.yaml merged with the overlay) request, and refuses a chart pod requesting less than its budget; a test checks that model against `helm template`. |
 | `generator` | `concurrent` generator Jobs (warm-up/history generators included) and the requests of each. Default one Job at 500m/256Mi (session.py's default). `session.py` refuses a generator that requests more. |
 | `support_extra` | Every other evaluation pod on S (recorder, adapters): `[{name, replicas, cpu_request, memory_request}]`, or `[]`. |
 
@@ -114,7 +121,8 @@ How it is computed, from the rendered pod templates (each pinned to its role by 
 - **W:** nine idle arms × `idle_arm_replicas` + the loaded arm × maxReplicas (12) + `overlap_pods` of the loaded arm
   (the arm with the largest per-pod request, so the worst case) + the ingress at its replicas + W's system requests.
   One arm is loaded at a time (confirmation is sequential; `session.py` refuses a second open session or generator).
-- **S:** the two fault routes + operator + forecaster + `concurrent` generators + `support_extra` + S's system requests.
+- **S:** the two fault routes + operator and forecaster (as the chart values request them) + `concurrent` generators +
+  `support_extra` + S's system requests.
 
 Example (W allocatable 4000m / 7.75Gi, system 400m / 512Mi, fixture 50m / 32Mi, ingress 100m / 64Mi, defaults):
 CPU 9 × 2 × 50 + 12 × 50 + 2 × 50 + 100 + 400 = 2100m = 52.5 % (limit 3000m); memory 32 × 32Mi + 64Mi + 512Mi =
@@ -124,5 +132,9 @@ CPU 9 × 2 × 50 + 12 × 50 + 2 × 50 + 100 + 400 = 2100m = 52.5 % (limit 3000m)
 writers stopped, the common starting count restored before each session, history collection preserved and the loaded
 arm's frozen bounds unchanged. Nothing in the harness or `session.py` does that (sessions never scale a target, and a
 stopped session leaves its target at whatever count its writer last set). So `idle_arm_replicas` below the starting
-count is refused, and `session.py` refuses to start while any other target sits above `idle_arm_replicas`: a target
-left scaled up by an earlier session must be restored (a reviewed step) before the next arm is loaded.
+count is refused. `session.py` admits a session only when every other target has converged to its idle residency: desired
+replicas at most `idle_arm_replicas`, status (observed generation, replicas, updated, ready, available) equal to it, and
+exactly that many Pods owned through its ReplicaSets (bound by controller UID to the Deployment's UID), terminating Pods
+included. A target left scaled up by an earlier session must be restored first. That restore (writer shutdown
+confirmed, a UID/resourceVersion-protected scale, waiting until the excess Pods are gone) is not implemented yet and is
+a hard prerequisite before S5.

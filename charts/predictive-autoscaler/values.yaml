@@ -35,6 +35,7 @@ operator:
   resources:
     requests: {cpu: 100m, memory: 128Mi}
     limits: {memory: 256Mi}
+  podLabels: {}             # extra pod labels, e.g. {sidecar.istio.io/inject: "false"}; never the selector keys
   podAnnotations: {}
   nodeSelector: {}
   tolerations: []
@@ -91,6 +92,7 @@ forecaster:
     accessMode: ReadWriteOnce  # ReadWriteMany removes the need to schedule the trainer next to the forecaster
     retain: true             # keep the chart-created claim when the release (or its Argo CD Application) is deleted
   tmpSizeLimit: 2Gi
+  podLabels: {}             # extra pod labels, e.g. {sidecar.istio.io/inject: "false"}; never the selector keys
   podAnnotations: {}
   nodeSelector: {}
   tolerations: []

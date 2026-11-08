@@ -4,6 +4,8 @@ node's allocatable, CPU and memory separately)."""
 import copy
 import json
 import os
+import shutil
+import subprocess
 
 import pytest
 
@@ -53,14 +55,18 @@ def test_every_rendered_pod_template_carries_the_sidecar_opt_out(params):
     assert len(templates) == 13 and "c28-ingress" in names and "c28-forecast-route" in names
     for o, t in templates:
         assert t["metadata"]["annotations"][render.SIDECAR_ANNOTATION] == "false", o["metadata"]["name"]
+        assert t["metadata"]["labels"][render.SIDECAR_LABEL] == "false", o["metadata"]["name"]
         assert render.SIDECAR_ANNOTATION not in (o["metadata"].get("annotations") or {})   # on the pod, not the owner
+        assert render.SIDECAR_LABEL not in o["metadata"]["labels"]
+        assert render.SIDECAR_LABEL not in o["spec"]["selector"].get("matchLabels", {})
     assert not any(o["kind"] == "Namespace" for o in objs)                                 # the namespace stays as is
 
 
 def test_the_release_values_keep_operator_and_forecaster_sidecar_free(params):
     v = render.eval_release_values(params)
-    assert v["operator"]["podAnnotations"] == {"sidecar.istio.io/inject": "false"}
-    assert v["forecaster"]["podAnnotations"] == {"sidecar.istio.io/inject": "false"}
+    for k in ("operator", "forecaster"):
+        assert v[k]["podAnnotations"] == {"sidecar.istio.io/inject": "false"}
+        assert v[k]["podLabels"] == {"sidecar.istio.io/inject": "false"}
 
 
 @pytest.mark.parametrize("victim", ["c28-pa-n-s90", "c28-ingress", "c28-metrics-route"])
@@ -79,12 +85,32 @@ def test_the_audit_refuses_a_pod_template_without_the_opt_out(params, victim):
         render.audit_sidecar_free(objs)
 
 
+def test_the_audit_needs_the_label_as_well_as_the_annotation(params):
+    objs = render.render_all(params)
+    dep = next(o for o in objs if o["kind"] == "Deployment" and o["metadata"]["name"] == "c28-h-rps-s20")
+    del dep["spec"]["template"]["metadata"]["labels"][render.SIDECAR_LABEL]       # the annotation is still there
+    with pytest.raises(render.ParamsError, match=r"Deployment/c28-h-rps-s20 \(labels\)"):
+        render.audit_sidecar_free(objs)
+
+
+def test_unexpected_injection_is_found_in_regular_and_init_containers():
+    def pod(name, containers, inits=()):
+        return {"metadata": {"name": name, "namespace": "demo"},
+                "spec": {"containers": [{"name": c} for c in containers],
+                         "initContainers": [{"name": c} for c in inits]}}
+    pods = [pod("clean", ["fixture"]), pod("proxied", ["fixture", "istio-proxy"]), pod("init", ["k6"], ["istio-init"])]
+    problems = render.unexpected_injection(pods)
+    assert len(problems) == 2 and "demo/proxied" in problems[0] and "istio-init" in problems[1]
+    assert render.unexpected_injection(pods[:1]) == []
+
+
 def test_the_audit_covers_jobs_cronjobs_and_pods():
     job = {"kind": "Job", "metadata": {"name": "gen"}, "spec": {"template": {"metadata": {}, "spec": {}}}}
     cron = {"kind": "CronJob", "metadata": {"name": "hist"},
             "spec": {"jobTemplate": {"spec": {"template": {"metadata": {"annotations": {}}, "spec": {}}}}}}
-    pod = {"kind": "Pod", "metadata": {"name": "p", "annotations": dict(render.SIDECAR_FREE)}, "spec": {}}
-    with pytest.raises(render.ParamsError, match="Job/gen, CronJob/hist"):
+    pod = {"kind": "Pod", "metadata": {"name": "p", "annotations": dict(render.SIDECAR_FREE),
+                                       "labels": dict(render.SIDECAR_FREE)}, "spec": {}}
+    with pytest.raises(render.ParamsError, match=r"Job/gen \(labels and annotations\), CronJob/hist"):
         render.audit_sidecar_free([job, cron, pod])
     render.audit_sidecar_free([pod])
 
@@ -149,8 +175,8 @@ def test_residency_passes_under_75_percent_and_reports_every_contribution(params
     s = rep["nodes"]["support"]
     # two routes 2 x 20m + operator 100m + forecaster 1000m + generator 500m + system 300m
     assert s["total"]["cpu_m"] == 1940
-    assert contribution(rep, "support", "forecaster")[0]["cpu_m"] == 1000            # 1 CPU / 512Mi budget
-    assert contribution(rep, "support", "forecaster")[0]["memory_bytes"] == 512 * MI
+    assert contribution(rep, "support", "forecaster (chart)")[0]["cpu_m"] == 1000    # 1 CPU / 512Mi, from the chart
+    assert contribution(rep, "support", "forecaster (chart)")[0]["memory_bytes"] == 512 * MI
     assert rep["problems"] == []
 
 
@@ -239,3 +265,59 @@ def test_residency_cli(params, tmp_path, capsys):
     nores.write_text(json.dumps(params))
     with pytest.raises(render.ParamsError, match="no residency section"):
         cli.main(["residency", "--params", str(nores)])
+
+
+# --- support pods are counted from the final chart values -----------------------------------------------------------
+
+@pytest.mark.parametrize("override, message", [
+    ({"operator": {"cpu_request": "0", "memory_request": "0Mi"}}, "residency.operator must request"),
+    ({"forecaster": {"cpu_request": "0", "memory_request": "0Mi"}}, "at least 1 CPU / 512Mi"),
+    ({"forecaster": {"cpu_request": "1", "memory_request": "256Mi"}}, "at least 1 CPU / 512Mi"),
+])
+def test_under_budgeted_support_components_are_refused(params, override, message):
+    with pytest.raises(render.ParamsError, match=message):
+        render.render_all(resident(params, **override))
+
+
+def test_the_release_requests_its_declared_budgets_and_accounting_reads_them(params):
+    p = resident(params, forecaster={"cpu_request": "2", "memory_request": "1Gi"},
+                 operator={"cpu_request": "200m", "memory_request": "300Mi"})
+    v = render.eval_release_values(p)
+    assert v["forecaster"]["statistical"]["resources"] == {"requests": {"cpu": "2", "memory": "1Gi"},
+                                                           "limits": {"cpu": "2", "memory": "1Gi"}}   # limits raised
+    assert v["operator"]["resources"] == {"requests": {"cpu": "200m", "memory": "300Mi"}, "limits": {"memory": "300Mi"}}
+    rep = render.residency_report(p)
+    assert contribution(rep, "support", "forecaster (chart)")[0]["cpu_m"] == 2000
+    assert contribution(rep, "support", "operator (chart)")[0]["memory_bytes"] == 300 * MI
+
+
+def test_chart_values_requesting_less_than_the_budget_are_refused(params):
+    p = resident(params)
+    smaller = {"forecaster": {"statistical": {"resources": {"requests": {"cpu": "250m", "memory": "256Mi"}}}}}
+    chart = render.chart_values(render.eval_release_values(p), smaller)      # e.g. an overlay that drops the request
+    rep = render.residency_report(p, chart=chart)
+    assert any("forecaster requests 250m/256Mi, below its declared budget 1000m/512Mi" in x for x in rep["problems"])
+    with pytest.raises(render.ParamsError, match="must not train"):
+        render.residency_report(p, chart=render.chart_values(render.eval_release_values(p),
+                                                             {"training": {"targets": [{"name": "x"}]}}))
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
+def test_the_chart_rendering_matches_the_accounting_and_is_sidecar_free(params, tmp_path):
+    p = resident(params, forecaster={"cpu_request": "1500m", "memory_request": "768Mi"})
+    overlay = render._merge(render.eval_release_values(p), {"networkPolicy": {"enabled": False}})
+    f = tmp_path / "values.yaml"
+    import yaml
+    f.write_text(yaml.safe_dump(overlay))
+    chart = os.path.dirname(render.CHART_VALUES)
+    out = subprocess.run(["helm", "template", "pa-eval", chart, "-n", "pa-eval-system", "-f", str(f)],
+                         capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0, out.stderr
+    docs = [d for d in yaml.safe_load_all(out.stdout) if d]
+    pods = [d for d in docs if render.pod_templates(d)]
+    assert sorted(d["metadata"]["name"].rsplit("-", 1)[1] for d in pods) == ["forecaster", "operator"]
+    render.audit_sidecar_free(pods)                             # label and annotation reach the chart's pods
+    rendered = {d["metadata"]["name"].rsplit("-", 1)[1]: (d["spec"].get("replicas", 1),
+                                                          *render._pod_requests(d["spec"]["template"])) for d in pods}
+    model = {name: (replicas, cpu, mem) for name, replicas, cpu, mem in render.chart_pods(render.chart_values(overlay))}
+    assert rendered == model and model["forecaster"][1:] == (1500, 768 * MI)

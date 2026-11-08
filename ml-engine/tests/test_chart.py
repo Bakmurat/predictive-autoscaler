@@ -722,3 +722,16 @@ def test_a_lab_qualification_is_opt_in_read_only_and_statistical_only(render):
     assert legacy.returncode != 0 and "needs forecaster.engine: statistical" in legacy.stderr
     assert render(_merge(STAT, {"forecaster": {"statistical": {"labQualification": {"configMap": "Bad_Name"}}}}),
                   check=False).returncode != 0
+
+
+def test_pod_labels_reach_the_pods_and_never_replace_the_selector(render):
+    opt_out = {"sidecar.istio.io/inject": "false"}
+    docs = render({"operator": {"podLabels": opt_out}, "forecaster": {"podLabels": opt_out}})
+    for d in by_kind(docs, "Deployment"):
+        labels = d["spec"]["template"]["metadata"]["labels"]
+        assert labels["sidecar.istio.io/inject"] == "false", d["metadata"]["name"]
+        assert all(labels[k] == v for k, v in d["spec"]["selector"]["matchLabels"].items())
+        assert "sidecar.istio.io/inject" not in d["spec"]["selector"]["matchLabels"]
+    for key in ("app.kubernetes.io/name", "app.kubernetes.io/instance", "app.kubernetes.io/component"):
+        p = render({"operator": {"podLabels": {key: "x"}}}, check=False)
+        assert p.returncode != 0 and "podLabels" in p.stderr, key

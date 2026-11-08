@@ -8,22 +8,28 @@ node. Every PredictiveAutoscaler is rendered in Recommend mode: switching an arm
 step (section 1, prerequisite 3), never a rendering default.
 
 Sidecar-free: the evaluation runs in prodcluster's `demo`, which injects Istio sidecars namespace-wide. Every Pod
-template rendered for the evaluation carries the pod annotation `sidecar.istio.io/inject: "false"` (the namespace policy
-is never changed), and audit_sidecar_free() refuses a rendering in which any Pod template lacks it. Results therefore
-concern this sidecar-free fixture, not mesh-enabled workloads.
+template rendered for the evaluation carries `sidecar.istio.io/inject: "false"` as a pod LABEL (the injector webhook's
+objectSelector excludes it, so the API server never calls the webhook) and as a pod ANNOTATION (the injector's own
+per-pod opt-out); the namespace policy is never changed. audit_sidecar_free() refuses a rendering in which any Pod
+template lacks either, and unexpected_injection() checks admitted pods for istio-proxy/istio-init containers. Results
+therefore concern this sidecar-free fixture, not mesh-enabled workloads.
 
 Residency: when the params carry a `residency` section (required by the prodcluster staging helpers, optional for the
 kind smoke), residency_report() computes the evaluation's maximum resident requests on W and S from the rendered pod
-templates plus the declared unrendered components, and render_all() refuses when evaluation plus node-system requests
+templates, the evaluation release's chart values (operator and forecaster) and the declared generators and extras, and
+render_all() refuses when evaluation plus node-system requests
 exceed 75 % of a node's allocatable, CPU and memory separately (frozen.RESIDENCY_LIMIT_FRACTION).
 """
 
 from __future__ import annotations
 
 import copy
+import os
 import re
 from decimal import Decimal, ROUND_HALF_EVEN
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
+
+import yaml
 
 from . import frozen as F
 
@@ -40,14 +46,20 @@ _MEMORY = re.compile(r"^([0-9]+(?:\.[0-9]+)?)(Ki|Mi|Gi|Ti|k|M|G|T)?$")
 _MEMORY_UNITS = {None: 1, "": 1, "Ki": 2**10, "Mi": 2**20, "Gi": 2**30, "Ti": 2**40, "k": 10**3, "M": 10**6,
                  "G": 10**9, "T": 10**12}
 
-# The pod annotation that keeps Istio's injector away from every evaluation pod (demo injects namespace-wide).
+# The pod label AND annotation that keep Istio's injector away from every evaluation pod (demo injects namespace-wide;
+# its webhook's objectSelector is `sidecar.istio.io/inject NotIn [false]`, a label selector).
 SIDECAR_ANNOTATION = "sidecar.istio.io/inject"
+SIDECAR_LABEL = SIDECAR_ANNOTATION
 SIDECAR_FREE = {SIDECAR_ANNOTATION: "false"}
-# Requests of the evaluation components the renderer does not render, used unless params.residency overrides them:
-# the operator at the chart's default request (charts/predictive-autoscaler values.yaml operator.resources) and one
-# generator Job at session.py's default generator_resources. The forecaster is frozen.FORECASTER_BUDGET.
+INJECTED_CONTAINERS = ("istio-proxy", "istio-init", "istio-validation")
+# Declared budgets of the evaluation release's pods, used unless params.residency overrides them. The release's chart
+# values are set FROM these (eval_release_values), and residency_report() counts what the final chart values request,
+# refusing a component that requests less than its budget. The operator at the chart's default request; the forecaster
+# at frozen.FORECASTER_BUDGET (a floor). One generator Job at session.py's default generator_resources.
 OPERATOR_BUDGET = {"cpu_request": "100m", "memory_request": "128Mi"}
 GENERATOR_BUDGET = {"concurrent": 1, "cpu_request": "500m", "memory_request": "256Mi"}
+CHART_VALUES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", "charts",
+                            "predictive-autoscaler", "values.yaml")
 
 FIXED_REPLICAS = 2          # every target's fixed replica count outside a session (the common starting count, section 5)
 
@@ -178,7 +190,9 @@ def residency_params(p: Dict) -> Dict:
           is not loaded. A value below the fixed starting count is idle-arm PARKING, which needs a parking mechanism
           (writers stopped, the starting count restored before each session, history preserved, the loaded arm's
           frozen bounds unchanged) that is not implemented: it is refused.
-      residency.operator (default the chart's request 100m/128Mi), residency.forecaster (default 1 CPU/512Mi),
+      residency.operator (default the chart's request 100m/128Mi), residency.forecaster (default and floor 1 CPU /
+          512Mi): the declared budgets; the evaluation release requests exactly these (eval_release_values), and the
+          accounting reads the final chart values, refusing a component that requests less than its budget,
       residency.generator ({"concurrent", "cpu_request", "memory_request"}, default one Job at 500m/256Mi; history and
           warm-up generators that may run at the same time count in "concurrent"),
       residency.support_extra (default []): [{"name", "replicas", "cpu_request", "memory_request"}] for every other
@@ -205,7 +219,14 @@ def residency_params(p: Dict) -> Dict:
                           "session, history preserved, frozen bounds unchanged) that is not implemented")
     out["idle_arm_replicas"] = idle
     out["operator"] = _component(r.get("operator", OPERATOR_BUDGET), "residency.operator")
+    if out["operator"][0] <= 0 or out["operator"][1] <= 0:
+        raise ParamsError("residency.operator must request CPU and memory")
     out["forecaster"] = _component(r.get("forecaster", F.FORECASTER_BUDGET), "residency.forecaster")
+    floor = (cpu_millicores(F.FORECASTER_BUDGET["cpu_request"]), memory_bytes(F.FORECASTER_BUDGET["memory_request"]))
+    if out["forecaster"][0] < floor[0] or out["forecaster"][1] < floor[1]:
+        raise ParamsError("residency.forecaster must reserve at least 1 CPU / 512Mi (STAGING S2)")
+    out["raw_operator"] = dict(r.get("operator", OPERATOR_BUDGET))
+    out["raw_forecaster"] = dict(r.get("forecaster", F.FORECASTER_BUDGET))
     g = r.get("generator", GENERATOR_BUDGET)
     out["generator"] = _component(g, "residency.generator")
     out["generator_concurrent"] = _count(g.get("concurrent", 1), "residency.generator.concurrent", 1, 20)
@@ -233,11 +254,62 @@ def eval_release_values(p: Dict) -> Dict:
     forecaster through the forecast route with the route's name in the certificate (verification stays on)."""
     validate(p)
     fr = route_host(p, "forecast")
-    return {"prometheus": {"url": f"http://{route_host(p, 'metrics')}:8481"},
-            "operator": {"watchNamespaces": [p["namespace"]], "forecasterAddress": f"{fr}:8443",
-                         "podAnnotations": dict(SIDECAR_FREE)},
-            "forecaster": {"engine": "statistical", "tls": {"extraDNSNames": [fr]},
-                           "podAnnotations": dict(SIDECAR_FREE)}}
+    out = {"prometheus": {"url": f"http://{route_host(p, 'metrics')}:8481"},
+           "operator": {"watchNamespaces": [p["namespace"]], "forecasterAddress": f"{fr}:8443",
+                        "podLabels": dict(SIDECAR_FREE), "podAnnotations": dict(SIDECAR_FREE)},
+           "forecaster": {"engine": "statistical", "tls": {"extraDNSNames": [fr]},
+                          "podLabels": dict(SIDECAR_FREE), "podAnnotations": dict(SIDECAR_FREE)}}
+    if "residency" in p:
+        r, chart = residency_params(p), chart_values()
+        out["operator"]["resources"] = _budget_resources(r["raw_operator"], chart["operator"]["resources"])
+        out["forecaster"]["statistical"] = {"resources": _budget_resources(
+            r["raw_forecaster"], chart["forecaster"]["statistical"]["resources"])}
+    return out
+
+
+def _budget_resources(budget: Dict, default: Dict) -> Dict:
+    """Chart resources requesting exactly the declared budget; each default limit is kept, raised to the request."""
+    req = {"cpu": str(budget["cpu_request"]), "memory": str(budget["memory_request"])}
+    lim = dict(default.get("limits") or {})
+    if "cpu" in lim and cpu_millicores(lim["cpu"]) < cpu_millicores(req["cpu"]):
+        lim["cpu"] = req["cpu"]
+    if "memory" in lim and memory_bytes(lim["memory"]) < memory_bytes(req["memory"]):
+        lim["memory"] = req["memory"]
+    return {"requests": req, "limits": lim}
+
+
+def _merge(a: Dict, b: Dict) -> Dict:
+    """Helm's values merge: maps merge key by key, anything else replaces."""
+    out = copy.deepcopy(a)
+    for k, v in (b or {}).items():
+        out[k] = _merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else copy.deepcopy(v)
+    return out
+
+
+def chart_values(*overlays: Dict) -> Dict:
+    """The final values of the evaluation release: the chart's values.yaml merged with each overlay in order."""
+    with open(CHART_VALUES) as fh:
+        out = yaml.safe_load(fh)
+    for o in overlays:
+        out = _merge(out, o)
+    return out
+
+
+def chart_pods(values: Dict) -> List[Tuple[str, int, Decimal, Decimal]]:
+    """(name, replicas, cpu, memory) of every long-running pod the chart renders with these final values, read from the
+    same paths its templates read (operator.yaml: operator.replicas, operator.resources; forecaster.yaml: one replica,
+    forecaster.statistical.resources for the statistical engine). Training CronJobs are refused: the evaluation release
+    trains nothing."""
+    if (values.get("training") or {}).get("targets"):
+        raise ParamsError("the evaluation release must not train (training.targets must be empty)")
+    stat = (values.get("forecaster") or {}).get("engine") == "statistical"
+    fres = values["forecaster"]["statistical"]["resources"] if stat else values["forecaster"]["resources"]
+
+    def req(res):
+        r = (res or {}).get("requests") or {}
+        return cpu_millicores(r.get("cpu", "0")), memory_bytes(r.get("memory", "0"))
+    return [("operator", int(values["operator"].get("replicas", 1)), *req(values["operator"]["resources"])),
+            ("forecaster", 1, *req(fres))]
 
 
 def _route_policies(p: Dict) -> List[Dict]:
@@ -375,7 +447,7 @@ def render_arm(p: Dict, arm: str, profile: str) -> List[Dict]:
            {"name": "QUEUE_TIMEOUT_SECONDS", "value": str(fx["queue_timeout_seconds"])},
            {"name": "STARTUP_DELAY_SECONDS", "value": str(F.PROFILES[profile])},
            {"name": "FAULT_FILE", "value": "/etc/c28/faults.json"}]
-    pod = {"metadata": {"labels": labels,
+    pod = {"metadata": {"labels": {**labels, **SIDECAR_FREE},
                         "annotations": {"prometheus.io/scrape": "true", "prometheus.io/port": "8080",
                                         **SIDECAR_FREE}},
            "spec": {"priorityClassName": p["priority_class"], "automountServiceAccountToken": False,
@@ -407,7 +479,8 @@ def _proxy(p: Dict, name: str, upstream: str, port: int) -> List[Dict]:
           "data": {"faults.json": "{}"}}
     dep = {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": name, "namespace": ns, "labels": labels},
            "spec": {"replicas": 1, "selector": {"matchLabels": {"app.kubernetes.io/name": name, RUN_LABEL: p["run_id"]}},
-                    "template": {"metadata": {"labels": labels, "annotations": dict(SIDECAR_FREE)}, "spec": {
+                    "template": {"metadata": {"labels": {**labels, **SIDECAR_FREE},
+                                              "annotations": dict(SIDECAR_FREE)}, "spec": {
                         "automountServiceAccountToken": False, "securityContext": _SECURITY, **_placement(p, "support"),
                         "containers": [{"name": "proxy", "image": p["image"],
                                         "env": [{"name": "MODE", "value": "tcpproxy"}, {"name": "UPSTREAM", "value": upstream},
@@ -443,7 +516,7 @@ def render_common(p: Dict) -> List[Dict]:
     ilabels = {**labels, "app.kubernetes.io/name": "c28-ingress"}
     ingress = {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "c28-ingress", "namespace": ns, "labels": ilabels},
                "spec": {"replicas": 1, "selector": {"matchLabels": {"app.kubernetes.io/name": "c28-ingress", RUN_LABEL: p["run_id"]}},
-                        "template": {"metadata": {"labels": ilabels,
+                        "template": {"metadata": {"labels": {**ilabels, **SIDECAR_FREE},
                                                   "annotations": {"prometheus.io/scrape": "true", "prometheus.io/port": "8080",
                                                                   **SIDECAR_FREE}},
                                      "spec": {"automountServiceAccountToken": False, "securityContext": _SECURITY,
@@ -499,13 +572,31 @@ def pod_templates(obj: Dict) -> List[Dict]:
 
 
 def audit_sidecar_free(objs: List[Dict]) -> None:
-    """Every rendered Pod template carries sidecar.istio.io/inject: "false" on the POD metadata (the namespace keeps
-    its injection policy; an annotation on the workload's own metadata does not reach the pods)."""
-    bad = [f"{o['kind']}/{o['metadata']['name']}" for o in objs for t in pod_templates(o)
-           if ((t.get("metadata") or {}).get("annotations") or {}).get(SIDECAR_ANNOTATION) != "false"]
+    """Every rendered Pod template carries sidecar.istio.io/inject: "false" as a label AND an annotation on the POD
+    metadata (the namespace keeps its injection policy; the workload's own metadata does not reach the pods)."""
+    bad = []
+    for o in objs:
+        for t in pod_templates(o):
+            md = t.get("metadata") or {}
+            missing = [part for part in ("labels", "annotations") if (md.get(part) or {}).get(SIDECAR_LABEL) != "false"]
+            if missing:
+                bad.append(f"{o['kind']}/{o['metadata']['name']} ({' and '.join(missing)})")
     if bad:
-        raise ParamsError(f"Pod templates without {SIDECAR_ANNOTATION}: \"false\" (the evaluation is sidecar-free): "
-                          f"{', '.join(bad)}")
+        raise ParamsError(f"Pod templates without the {SIDECAR_LABEL}: \"false\" label and annotation (the "
+                          f"evaluation is sidecar-free): {', '.join(bad)}")
+
+
+def unexpected_injection(pods: List[Dict]) -> List[str]:
+    """Admitted evaluation pods that nonetheless carry Istio's containers (regular or init): one problem per pod."""
+    out = []
+    for p in pods:
+        spec = p.get("spec") or {}
+        names = [c.get("name") for c in (spec.get("initContainers") or []) + (spec.get("containers") or [])]
+        hit = [n for n in names if n in INJECTED_CONTAINERS]
+        if hit:
+            m = p.get("metadata") or {}
+            out.append(f"Pod {m.get('namespace')}/{m.get('name')} has injected containers {hit} (unexpected injection)")
+    return out
 
 
 # --- residency budget -----------------------------------------------------------------------------------------------
@@ -545,13 +636,15 @@ def _m(cpu: Decimal) -> str:
     return f"{format(Decimal(cpu).normalize(), 'f')}m"
 
 
-def residency_report(p: Dict, objs: List[Dict] = None) -> Dict:
+def residency_report(p: Dict, objs: List[Dict] = None, chart: Optional[Dict] = None) -> Dict:
     """The evaluation's maximum resident requests on W and S against 75 % of each node's allocatable.
 
     W: the ten fixture arms, all but one at idle_arm_replicas, the loaded arm (the largest per-pod request, so the worst
        case) at maxReplicas plus overlap_pods, plus every other rendered pod pinned to W (the ingress) at its replicas.
-    S: every rendered pod pinned to S (the two fault routes) at its replicas, the operator, the forecaster, the
-       generator Jobs that may run at the same time, and support_extra.
+    S: every rendered pod pinned to S (the two fault routes) at its replicas, the operator and the forecaster as the
+       evaluation release's FINAL chart values request them (`chart`; default the chart's values.yaml merged with
+       eval_release_values), the generator Jobs that may run at the same time, and support_extra. A chart pod that
+       requests less than its declared budget is a problem: the budget never understates the deployed pods.
     Each node adds its system_requests. CPU and memory are checked separately; problems lists every exceedance."""
     r = residency_params(p)
     objs = render_all_unchecked(p) if objs is None else objs
@@ -586,13 +679,19 @@ def residency_report(p: Dict, objs: List[Dict] = None) -> Dict:
                 add("workload", f"{name} overlap", overlap, cpu, mem, "startup/termination overlap of the loaded arm")
             else:
                 add("workload", name, idle, cpu, mem, "idle arm")
-    add("support", "operator", 1, *r["operator"])
-    add("support", "forecaster", 1, *r["forecaster"])
+    chart = chart_values(eval_release_values(p)) if chart is None else chart
+    under = []
+    for name, replicas, cpu, mem in chart_pods(chart):
+        add("support", f"{name} (chart)", replicas, cpu, mem)
+        want = r[name]
+        if cpu < want[0] or mem < want[1]:
+            under.append(f"the evaluation release's {name} requests {_m(cpu)}/{_mi(mem)}, below its declared budget "
+                         f"{_m(want[0])}/{_mi(want[1])} (residency.{name}): the chart values must request it")
     add("support", "generator Jobs", r["generator_concurrent"], *r["generator"], "concurrent generators")
     for name, replicas, cpu, mem in r["support_extra"]:
         add("support", name, replicas, cpu, mem)
     out = {"limit_fraction": F.RESIDENCY_LIMIT_FRACTION, "idle_arm_replicas": r["idle_arm_replicas"],
-           "overlap_pods": r["overlap_pods"], "nodes": {}, "problems": []}
+           "overlap_pods": r["overlap_pods"], "nodes": {}, "problems": list(under)}
     limit = Decimal(str(F.RESIDENCY_LIMIT_FRACTION))
     for role in ("workload", "support"):
         alloc, system = r["nodes"][role]["allocatable"], r["nodes"][role]["system"]

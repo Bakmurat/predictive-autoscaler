@@ -160,6 +160,8 @@ def test_generator_is_sidecar_free_and_inside_the_residency_budget(world):
     start_session(world, record)
     job = world["api"].obj("Job", "c28-gen-s-0001", "demo")
     assert job["spec"]["template"]["metadata"]["annotations"] == {"sidecar.istio.io/inject": "false"}
+    assert job["spec"]["template"]["metadata"]["labels"]["sidecar.istio.io/inject"] == "false"
+    assert "sidecar.istio.io/inject" not in job["metadata"]["labels"]
 
 
 def test_generator_above_its_residency_budget_is_refused(world):
@@ -172,6 +174,38 @@ def test_other_targets_above_the_idle_count_block_a_session(world):
     world["api"].obj("Deployment", "c28-pa-e-s90", "demo")["spec"]["replicas"] = 7      # left over from a session
     probs = problems(world, session_record(world))
     assert "c28-pa-e-s90 has 7 replicas, above the residency budget's idle count 2" in probs
+
+
+def test_terminating_pods_of_an_idle_arm_block_a_session(world):
+    """Codex PR #43 repro 3: an idle arm specifies two replicas but still holds ten terminating Pods."""
+    api = world["api"]
+    dep = api.obj("Deployment", "c28-pa-r-s90", "demo")
+    rs = next(o for (k, ns, _), o in api.objects.items() if k == "replicasets" and ns == "demo" and
+              any(r["uid"] == dep["metadata"]["uid"] for r in o["metadata"].get("ownerReferences", [])))
+    for i in range(10):
+        api.put({"apiVersion": "v1", "kind": "Pod", "metadata": {
+            "name": f"c28-pa-r-s90-old{i}", "namespace": "demo", "deletionTimestamp": "2026-12-01T00:00:00Z",
+            "ownerReferences": [{"kind": "ReplicaSet", "name": rs["metadata"]["name"], "uid": rs["metadata"]["uid"],
+                                 "controller": True}]}, "spec": {}, "status": {"phase": "Running"}})
+    assert dep["spec"]["replicas"] == 2
+    assert "c28-pa-r-s90 owns 12 pods (10 terminating) for 2 desired" in problems(world, session_record(world))
+
+
+def test_an_unconverged_idle_arm_blocks_a_session(world):
+    dep = world["api"].obj("Deployment", "c28-h-rps-s90", "demo")
+    dep["status"]["availableReplicas"] = 1
+    dep["metadata"]["generation"] = dep["status"]["observedGeneration"] + 1
+    probs = problems(world, session_record(world))
+    assert "c28-h-rps-s90 has not converged (availableReplicas, observedGeneration differ" in probs
+
+
+def test_pods_of_another_deployment_are_not_counted(world):
+    api = world["api"]
+    api.put({"apiVersion": "v1", "kind": "Pod", "metadata": {
+        "name": "c28-pa-e-s20-foreign", "namespace": "demo", "labels": {"c28.devkuban.com/target": "c28-pa-e-s20"},
+        "ownerReferences": [{"kind": "ReplicaSet", "name": "other", "uid": F.new_uid(), "controller": True}]},
+        "spec": {}})
+    assert "owns" not in problems(world, session_record(world))
 
 
 def test_preparation_pa_session_never_activates(world):

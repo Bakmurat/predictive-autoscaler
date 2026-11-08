@@ -174,6 +174,17 @@ def ssh_keys(tmp_path_factory):
     return keys, "\n".join(signers) + "\n"
 
 
+def converge(api, namespace="demo"):
+    """What the Deployment controller does once a rollout settles: each Deployment owns exactly spec.replicas pods
+    through its ReplicaSet, and its status reports them updated, ready and available at the observed generation."""
+    for (kind, ns, _), dep in list(api.objects.items()):
+        if kind == "deployments" and ns == namespace:
+            api.sync_pods(dep)
+            want = dep["spec"].get("replicas") or 0
+            dep["status"].update(updatedReplicas=want, availableReplicas=want,
+                                 observedGeneration=dep["metadata"].get("generation", 1))
+
+
 @pytest.fixture
 def world(tmp_path, api, make_record, ssh_keys):
     """The fake cluster after reserve apply and every prepare phase, plus a freeze section and its inputs."""
@@ -206,6 +217,7 @@ def world(tmp_path, api, make_record, ssh_keys):
     plan_and_apply(reserve, record, kube)
     for ph in prepare.PHASES:
         plan_and_apply(prepare, record, kube, ph)
+    converge(api)
     images = {"schema": "c28-images/v1", "run_id": RUN, "source_commit": COMMIT, "verified": True,
               "images": {"operator": {"ref": "harbor.example/autoscaler/operator@sha256:" + "b" * 64},
                          "statistical": {"ref": "harbor.example/autoscaler/statistical-evaluation@sha256:" + "c" * 64},

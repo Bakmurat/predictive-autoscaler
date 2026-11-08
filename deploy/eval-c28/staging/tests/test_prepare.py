@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 
@@ -81,10 +82,62 @@ def test_values_overlay_keeps_the_release_pods_sidecar_free(api, make_record):
     v = prepare.staging_values(record, params, s)
     for k in ("operator", "forecaster"):
         assert v[k]["podAnnotations"] == {"sidecar.istio.io/inject": "false"}
+        assert v[k]["podLabels"] == {"sidecar.istio.io/inject": "false"}
+    assert v["forecaster"]["statistical"]["resources"]["requests"] == {"cpu": "1", "memory": "512Mi"}
+    assert v["operator"]["resources"]["requests"] == {"cpu": "100m", "memory": "128Mi"}
     assert prepare.values_problems(v, params) == []
     del v["forecaster"]["podAnnotations"]
-    assert prepare.values_problems(v, params) == ['forecaster.podAnnotations must carry sidecar.istio.io/inject: '
-                                                  '"false" (sidecar-free)']
+    del v["operator"]["podLabels"]
+    assert prepare.values_problems(v, params) == [
+        'operator.podLabels must carry sidecar.istio.io/inject: "false" (sidecar-free)',
+        'forecaster.podAnnotations must carry sidecar.istio.io/inject: "false" (sidecar-free)']
+
+
+def test_every_preparation_plan_runs_the_residency_gate(api, make_record):
+    """Codex PR #43 repro 1: with W at 87.5 % render_all refused, but prepare planned the targets without a problem."""
+    params = base_params()
+    params["residency"] = copy.deepcopy(params["residency"])
+    params["residency"]["workload"]["allocatable"]["cpu"] = "4"     # 3300m + 200m system = 87.5 % of W
+    s = prepare_section()
+    api.put({"apiVersion": "storage.k8s.io/v1", "kind": "StorageClass", "metadata": {"name": "retained-ssd"},
+             "reclaimPolicy": "Retain"})
+    record = X.load_record(make_record({"prepare": s}, params=params), ("prepare",))
+    kube = record.kube(api)
+    for ph in prepare.PHASES:
+        probs = prepare.plan(record, kube, ph)["problems"]
+        assert any(p.startswith("residency: workload node worker-w: CPU requests 3500m") for p in probs), (ph, probs)
+    run_phase_ok = copy.deepcopy(base_params())                   # the same run within budget plans cleanly
+    record2 = X.load_record(make_record({"prepare": s}, params=run_phase_ok), ("prepare",))
+    assert not any("residency" in p for p in prepare.plan(record2, record2.kube(api), "targets")["problems"])
+
+
+def test_apply_recomputes_the_residency_gate(api, make_record, tmp_path):
+    record, kube = setup(api, make_record)
+    plan, digest = reviewed(record, kube, "namespaces")
+    run_phase(record, kube, "namespaces")
+    plan, digest = reviewed(record, kube, "common")
+    params = json.load(open(tmp_path / "params.json"))
+    params["residency"]["workload"]["allocatable"]["cpu"] = "4"      # the budget changes after review
+    (tmp_path / "params.json").write_text(json.dumps(params))
+    with pytest.raises(X.StagingError):
+        prepare.apply(record, kube, "common", plan, digest)
+    assert not any(v == "create" and "resourcequotas" in p for v, p in api.mutations())
+
+
+def test_verify_reports_unexpected_injection(api, make_record):
+    record, kube = setup(api, make_record)
+    for ph in ("namespaces", "common", "targets", "pas"):
+        run_phase(record, kube, ph)
+    api.put({"apiVersion": "v1", "kind": "Pod",
+             "metadata": {"name": "c28-pa-n-s20-abcde", "namespace": "demo", "labels": {X.RUN_LABEL: RUN}},
+             "spec": {"initContainers": [{"name": "istio-init"}], "containers": [{"name": "fixture"},
+                                                                                 {"name": "istio-proxy"}]}})
+    api.put({"apiVersion": "v1", "kind": "Pod",
+             "metadata": {"name": "unrelated", "namespace": "demo", "labels": {}},
+             "spec": {"containers": [{"name": "istio-proxy"}]}})
+    text = "\n".join(prepare.verify(record, kube)["problems"])
+    assert "demo/c28-pa-n-s20-abcde has injected containers ['istio-init', 'istio-proxy']" in text
+    assert "unrelated" not in text
 
 
 def test_staging_requires_the_residency_section(api, make_record):

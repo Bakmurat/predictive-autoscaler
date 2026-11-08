@@ -41,6 +41,9 @@ spec:
   template:
     metadata:
       labels: {{- include "pa.selector" (list . "forecaster") | nindent 8 }}
+        {{- with .Values.forecaster.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       annotations:
         autoscaling.devkuban.com/forecaster-engine: {{ .Values.forecaster.engine }}
         {{- with .Values.forecaster.podAnnotations }}

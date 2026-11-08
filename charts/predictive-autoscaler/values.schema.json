@@ -85,6 +85,8 @@
           }
         },
         "resources": {"$ref": "#/definitions/resources"},
+        "podLabels": {"type": "object", "additionalProperties": {"type": "string"},
+                      "not": {"anyOf": [{"required": ["app.kubernetes.io/name"]}, {"required": ["app.kubernetes.io/instance"]}, {"required": ["app.kubernetes.io/component"]}]}},
         "podAnnotations": {"type": "object", "additionalProperties": {"type": "string"}},
         "nodeSelector": {"$ref": "#/definitions/scheduling/nodeSelector"},
         "tolerations": {"$ref": "#/definitions/scheduling/tolerations"},
@@ -163,6 +165,8 @@
           }
         },
         "tmpSizeLimit": {"type": "string", "pattern": "^[0-9]+(Mi|Gi)$"},
+        "podLabels": {"type": "object", "additionalProperties": {"type": "string"},
+                      "not": {"anyOf": [{"required": ["app.kubernetes.io/name"]}, {"required": ["app.kubernetes.io/instance"]}, {"required": ["app.kubernetes.io/component"]}]}},
         "podAnnotations": {"type": "object", "additionalProperties": {"type": "string"}},
         "nodeSelector": {"$ref": "#/definitions/scheduling/nodeSelector"},
         "tolerations": {"$ref": "#/definitions/scheduling/tolerations"},

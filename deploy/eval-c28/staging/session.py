@@ -420,7 +420,7 @@ def generator_job(c: Context, active_deadline: int, suspend: bool) -> Dict:
     return {"apiVersion": "batch/v1", "kind": "Job",
             "metadata": {"name": names["job"], "namespace": c.ns, "labels": c.labels()},
             "spec": {"backoffLimit": 0, "activeDeadlineSeconds": active_deadline, "suspend": suspend,
-                     "template": {"metadata": {"labels": c.labels(),
+                     "template": {"metadata": {"labels": {**c.labels(), **c.c28.render.SIDECAR_FREE},
                                                "annotations": dict(c.c28.render.SIDECAR_FREE)}, "spec": {
                          "restartPolicy": "Never", "automountServiceAccountToken": False,
                          "securityContext": {"runAsNonRoot": True, "runAsUser": 12345,
@@ -466,13 +466,46 @@ def _residency_problems(c: Context, job: Dict) -> List[str]:
     if cpu > r["generator"][0] or mem > r["generator"][1]:
         out.append(f"the generator requests ({req.get('cpu')}, {req.get('memory')}) exceed the residency budget's "
                    "generator (params residency.generator)")
+    rs_all, pods_all = c.kube.list("ReplicaSet", c.ns), c.kube.list("Pod", c.ns)
     for profile in c.c28.frozen.PROFILES:
         for arm in c.c28.frozen.ARMS:
             name = R.target_name(arm, profile)
             dep = c.kube.get("Deployment", name, c.ns) if name != c.target else None
-            if dep is not None and (dep["spec"].get("replicas") or 0) > r["idle_arm_replicas"]:
-                out.append(f"{name} has {dep['spec'].get('replicas')} replicas, above the residency budget's idle "
-                           f"count {r['idle_arm_replicas']}: restore it before loading another arm")
+            if dep is not None:
+                out += idle_residency_problems(dep, rs_all, pods_all, r["idle_arm_replicas"])
+    return out
+
+
+def _controller_uid(obj: Dict, kind: str) -> str:
+    for ref in (obj.get("metadata") or {}).get("ownerReferences") or []:
+        if ref.get("controller") and ref.get("kind") == kind:
+            return ref.get("uid", "")
+    return ""
+
+
+def idle_residency_problems(dep: Dict, replicasets: List[Dict], pods: List[Dict], idle: int) -> List[str]:
+    """An idle target is resident at no more than `idle` pods only when it has converged: its desired count is at most
+    `idle`, its status (observed generation, replicas, updated, ready, available) equals it, and exactly that many Pods
+    are owned through its ReplicaSets (bound by controller UID to the Deployment's UID), terminating ones included."""
+    name, uid = dep["metadata"]["name"], dep["metadata"]["uid"]
+    want = int(dep["spec"].get("replicas") or 0)
+    out = []
+    if want > idle:
+        out.append(f"{name} has {want} replicas, above the residency budget's idle count {idle}: restore it before "
+                   "loading another arm")
+    rs_uids = {rs["metadata"]["uid"] for rs in replicasets if _controller_uid(rs, "Deployment") == uid}
+    owned = [p for p in pods if _controller_uid(p, "ReplicaSet") in rs_uids]
+    terminating = sum(1 for p in owned if (p.get("metadata") or {}).get("deletionTimestamp"))
+    if len(owned) != want:
+        out.append(f"{name} owns {len(owned)} pods ({terminating} terminating) for {want} desired: not converged to "
+                   "its idle residency")
+    st = dep.get("status") or {}
+    lagging = [k for k in ("replicas", "updatedReplicas", "readyReplicas", "availableReplicas")
+               if int(st.get(k) or 0) != want]
+    if int(st.get("observedGeneration") or 0) < int(dep["metadata"].get("generation") or 0):
+        lagging.append("observedGeneration")
+    if lagging:
+        out.append(f"{name} has not converged ({', '.join(lagging)} differ from its {want} desired replicas)")
     return out
 
 
