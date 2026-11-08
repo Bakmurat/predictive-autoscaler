@@ -443,7 +443,9 @@ class exclusive_lock:
         self.safe = True
         self.path = lock_path(rec, scope)
         self.body = json.dumps({"scope": scope, "holder": holder or scope, "run_id": rec["run_id"],
-                                "cluster_uid": rec["cluster_uid"], "pid": os.getpid(),
+                                "cluster_uid": rec["cluster_uid"], "record_sha256": digest(rec),
+                                "receipts_dir": os.path.realpath(os.path.join(rec["evidence_dir"], "receipts")),
+                                "pid": os.getpid(),
                                 "pid_start": process_start(os.getpid()), "host": socket.gethostname(),
                                 "boot_id": _boot_id(), "at": utc_now(clock)}, sort_keys=True)
 
@@ -473,7 +475,7 @@ class recovery_guard:
     otherwise the stale lock stays."""
 
     def __init__(self, rec: Mapping, scope: str, lock_sha256: str):
-        self.path, self.sha = lock_path(rec, scope), lock_sha256
+        self.path, self.sha, self.rec = lock_path(rec, scope), lock_sha256, rec
         self.guard = self.path + ".recovery"
 
     def __enter__(self):
@@ -489,6 +491,14 @@ class recovery_guard:
                 raise StagingError("the lock file's sha256 differs from the one given; refusing")
             with open(self.path) as fh:
                 body = json.load(fh)
+            # The recovery must reconcile the OWNER's intents: the same run, record and receipt location.
+            mine = {"run_id": self.rec["run_id"], "cluster_uid": self.rec["cluster_uid"],
+                    "record_sha256": digest(self.rec),
+                    "receipts_dir": os.path.realpath(os.path.join(self.rec["evidence_dir"], "receipts"))}
+            diff = sorted(k for k, v in mine.items() if body.get(k) != v)
+            if diff:
+                raise StagingError(f"the lock belongs to another run or record (differs in {diff}); recover it with "
+                                   f"the owning run's record")
             gone, why = owner_terminated(body)
             if not gone:
                 raise StagingError(f"refusing to recover: {why}")
