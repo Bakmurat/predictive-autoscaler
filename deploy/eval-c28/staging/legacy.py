@@ -617,7 +617,9 @@ def _scale_call(api, a: Mapping, replicas: int):
                             "metadata": {"name": a["name"], "namespace": a["namespace"], "uid": m["uid"],
                                          "resourceVersion": m["resourceVersion"]},
                             "spec": {"replicas": replicas}})
-        got = ((resp or {}).get("spec") or {}).get("replicas")
+        spec = (resp or {}).get("spec") if (resp or {}).get("kind") == "Scale" else None
+        # autoscaling/v1 Scale declares spec.replicas omitempty: the API server leaves 0 out of the response.
+        got = spec.get("replicas", 0) if isinstance(spec, dict) else None
         if got != replicas or ((resp or {}).get("metadata") or {}).get("uid") not in (None, m["uid"]):
             raise C.StagingError(f"the scale response of {a['namespace']}/{a['name']} does not confirm {replicas}")
         # The Scale response has no generation: a spec change raises it by exactly one.
