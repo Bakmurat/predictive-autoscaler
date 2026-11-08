@@ -2,6 +2,8 @@
 
   python -m c28 render   --params P [--out FILE]               all fixture/arm manifests (multi-document YAML)
   python -m c28 release-values --params P [--out FILE]         the evaluation release's chart values (routes, TLS name)
+  python -m c28 residency --params P [--out FILE]              W/S maximum resident requests vs 75 % of allocatable
+                                                               (JSON; exit 1 when over budget)
   python -m c28 plan     --kind ordinary|scored --seed S --capacity C --target T [--accelerate N] [--out FILE]
   python -m c28 faults   --params P --block-start 2026-11-20T00:00:00Z --targets T1,T2 [--out FILE]
   python -m c28 order                                          the frozen arm-session order (JSON)
@@ -167,6 +169,7 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("render"); r.add_argument("--params", required=True); r.add_argument("--out", default="")
     rv = sub.add_parser("release-values"); rv.add_argument("--params", required=True); rv.add_argument("--out", default="")
+    rs = sub.add_parser("residency"); rs.add_argument("--params", required=True); rs.add_argument("--out", default="")
     p = sub.add_parser("plan")
     p.add_argument("--kind", required=True, choices=["ordinary", "scored"]); p.add_argument("--seed", type=int, required=True)
     p.add_argument("--capacity", type=float, required=True); p.add_argument("--target", required=True)
@@ -201,6 +204,14 @@ def main(argv=None) -> int:
         _write(yaml.safe_dump_all(render.render_all(_load(args.params)), sort_keys=True), args.out)
     elif args.cmd == "release-values":
         _write(yaml.safe_dump(render.eval_release_values(_load(args.params)), sort_keys=True), args.out)
+    elif args.cmd == "residency":
+        params = _load(args.params)
+        if "residency" not in params:
+            raise render.ParamsError("the params have no residency section (required for prodcluster)")
+        render.validate(params)
+        out = render.residency_report(params)
+        _write(_json(out), args.out)
+        return 1 if out["problems"] else 0
     elif args.cmd == "plan":
         _write(_json(schedule.k6_plan(args.kind, args.seed, args.capacity, args.target, args.accelerate)), args.out)
     elif args.cmd == "faults":

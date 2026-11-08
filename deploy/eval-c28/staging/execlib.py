@@ -533,6 +533,9 @@ def load_params(record: Record) -> Dict:
         raise StagingError("the record must name its params file (c28-params/v1)")
     with open(p) as fh:
         params = json.load(fh)
+    if "residency" not in params:
+        raise StagingError("params: the residency section (W/S allocatable and system requests) is required for the "
+                           "prodcluster staging helpers")
     try:
         c28.render.validate(params)
     except c28.render.ParamsError as e:
@@ -540,6 +543,24 @@ def load_params(record: Record) -> Dict:
     if params["run_id"] != record.run_id:
         raise StagingError("params.run_id differs from the record's run_id")
     return params
+
+
+def injection_problems(kube: "Kube", params: Dict, owner_uids: Optional[set] = None) -> List[str]:
+    """Admitted evaluation pods must carry no istio-proxy/istio-init container (render.unexpected_injection). The pods:
+    those with the run's label in the fixture and control namespaces, the evaluation release's pods, and any pod whose
+    controller is one of `owner_uids` (e.g. a session's generator Job, whatever its labels), replacements included."""
+    c28 = import_harness()
+    owner_uids = owner_uids or set()
+    pods = []
+    for ns in sorted({params["namespace"], params["control_namespace"]}):
+        for p in kube.list("Pod", ns):
+            m = p.get("metadata") or {}
+            ls = m.get("labels") or {}
+            owners = {r.get("uid") for r in m.get("ownerReferences") or [] if r.get("controller")}
+            if ls.get(RUN_LABEL) == params["run_id"] or ls.get("app.kubernetes.io/instance") == params["release"] \
+                    or owners & owner_uids:
+                pods.append(p)
+    return c28.render.unexpected_injection(pods)
 
 
 WRITER_KINDS = ("HorizontalPodAutoscaler", "ScaledObject", "PredictiveAutoscaler", "LegacyPredictiveAutoscaler")

@@ -112,12 +112,18 @@ def staging_values(record: X.Record, params: Dict, s: Dict) -> Dict:
         "operator": {"replicas": 1, "watchNamespaces": [params["namespace"]],
                      "forecasterAddress": routes["operator"]["forecasterAddress"],
                      "forecastLedger": {"enabled": True, "persistence": {"existingClaim": st["ledger_claim"]["name"]}},
+                     "podLabels": dict(routes["operator"]["podLabels"]),
+                     "podAnnotations": dict(routes["operator"]["podAnnotations"]),
+                     "resources": copy.deepcopy(routes["operator"]["resources"]),
                      **copy.deepcopy(support)},
         "forecaster": {"engine": "statistical",
                        "statistical": {"persistence": {"existingClaim": st["state_claim"]["name"], "retain": True},
-                                       "labQualification": {"configMap": ""}},
+                                       "labQualification": {"configMap": ""},
+                                       "resources": copy.deepcopy(routes["forecaster"]["statistical"]["resources"])},
                        "auth": {"enabled": True},
                        "tls": {"extraDNSNames": routes["forecaster"]["tls"]["extraDNSNames"]},
+                       "podLabels": dict(routes["forecaster"]["podLabels"]),
+                       "podAnnotations": dict(routes["forecaster"]["podAnnotations"]),
                        **copy.deepcopy(support)},
         "training": {"targets": []},
         "networkPolicy": copy.deepcopy(rel["network_policy"]),
@@ -144,10 +150,30 @@ def values_problems(v: Dict, params: Dict) -> List[str]:
         out.append("operator.forecasterAddress must be the forecast route")
     if v["networkPolicy"].get("enabled") is not True:
         out.append("NetworkPolicies stay enabled")
+    c28 = X.import_harness()
+    for k in ("operator", "forecaster"):
+        for part in ("podLabels", "podAnnotations"):
+            if (v[k].get(part) or {}).get(c28.render.SIDECAR_ANNOTATION) != "false":
+                out.append(f"{k}.{part} must carry {c28.render.SIDECAR_ANNOTATION}: \"false\" (sidecar-free)")
     for k in ("operator", "statisticalForecaster"):
         if not str(v["images"][k]["digest"]).startswith("sha256:"):
             out.append(f"images.{k} must be digest-pinned")
     return out
+
+
+def admission_problems(record: X.Record, params: Dict, s: Dict, parts: Dict) -> List[str]:
+    """The complete sidecar-free and residency audits of the whole evaluation (every phase's documents plus the release
+    overlay), run before every preparation plan and so again at apply time: a phase is never prepared on its own
+    while the evaluation as a whole would not be admitted."""
+    c28 = X.import_harness()
+    objs = parts["common"] + parts["targets"] + parts["pas"] + parts["writers"]
+    try:
+        c28.render.audit_sidecar_free(objs)
+        values = staging_values(record, params, s)
+        rep = c28.render.residency_report(params, objs, chart=c28.render.chart_values(values))
+    except c28.render.ParamsError as e:
+        return [str(e)]
+    return [f"residency: {p}" for p in rep["problems"]]
 
 
 def _exists(kube: X.Kube, obj: Dict) -> Optional[Dict]:
@@ -182,7 +208,7 @@ def plan(record: X.Record, kube: X.Kube, phase: str) -> Dict:
     params = X.load_params(record)
     s = _section(record)
     parts = split(params)
-    problems: List[str] = []
+    problems: List[str] = admission_problems(record, params, s, parts)
     out = {"phase": phase}
     if phase == "values":
         v = staging_values(record, params, s)
@@ -335,8 +361,15 @@ def verify(record: X.Record, kube: X.Kube) -> Dict:
         live = kube.get("Deployment", name, params["namespace"])
         if live and live["spec"].get("replicas") != 2:
             problems.append(f"{name} has {live['spec'].get('replicas')} replicas, not the fixed 2, outside a session")
+    problems += injection_problems(kube, params)
     return {"helper": HELPER, "action": "verify", "run_id": record.run_id, "objects": seen, "problems": problems,
             "result": "PASS" if not problems else "FAIL", "storage_class": s["storage"]["storage_class"]}
+
+
+def injection_problems(kube: X.Kube, params: Dict) -> List[str]:
+    """Admitted evaluation pods (the run's label in the fixture and control namespaces, and the evaluation release's
+    pods) must carry no istio-proxy/istio-init container: injection despite the opt-out is a problem."""
+    return X.injection_problems(kube, params)
 
 
 def main(argv=None, api=None) -> int:

@@ -420,7 +420,8 @@ def generator_job(c: Context, active_deadline: int, suspend: bool) -> Dict:
     return {"apiVersion": "batch/v1", "kind": "Job",
             "metadata": {"name": names["job"], "namespace": c.ns, "labels": c.labels()},
             "spec": {"backoffLimit": 0, "activeDeadlineSeconds": active_deadline, "suspend": suspend,
-                     "template": {"metadata": {"labels": c.labels()}, "spec": {
+                     "template": {"metadata": {"labels": {**c.labels(), **c.c28.render.SIDECAR_FREE},
+                                               "annotations": dict(c.c28.render.SIDECAR_FREE)}, "spec": {
                          "restartPolicy": "Never", "automountServiceAccountToken": False,
                          "securityContext": {"runAsNonRoot": True, "runAsUser": 12345,
                                              "seccompProfile": {"type": "RuntimeDefault"}},
@@ -443,6 +444,77 @@ def generator_job(c: Context, active_deadline: int, suspend: bool) -> Dict:
                                                              "capabilities": {"drop": ["ALL"]}},
                                          "volumeMounts": [{"name": "plan", "mountPath": "/plan", "readOnly": True}]}],
                          "volumes": [{"name": "plan", "configMap": {"name": names["plan_cm"]}}]}}}}
+
+
+def _residency_problems(c: Context, job: Dict) -> List[str]:
+    """The session stays inside the params' residency budget: its generator is sidecar-free and requests no more than
+    the budgeted generator, and every other fixture target sits at no more than the budgeted idle replica count (the
+    W computation assumes it; nothing here parks or restores replicas)."""
+    R, out = c.c28.render, []
+    try:
+        R.audit_sidecar_free([job])
+        r = R.residency_params(c.params)
+    except R.ParamsError as e:
+        return [str(e)]
+    req = (job["spec"]["template"]["spec"]["containers"][0].get("resources") or {}).get("requests") or {}
+    try:
+        cpu, mem = R.cpu_millicores(req.get("cpu", "0")), R.memory_bytes(req.get("memory", "0"))
+    except R.ParamsError as e:
+        return [f"session.generator_resources: {e}"]
+    if cpu <= 0 or mem <= 0:
+        out.append("session.generator_resources must set CPU and memory requests (the residency budget counts them)")
+    if cpu > r["generator"][0] or mem > r["generator"][1]:
+        out.append(f"the generator requests ({req.get('cpu')}, {req.get('memory')}) exceed the residency budget's "
+                   "generator (params residency.generator)")
+    rs_all, pods_all = c.kube.list("ReplicaSet", c.ns), c.kube.list("Pod", c.ns)
+    for profile in c.c28.frozen.PROFILES:
+        for arm in c.c28.frozen.ARMS:
+            name = R.target_name(arm, profile)
+            dep = c.kube.get("Deployment", name, c.ns) if name != c.target else None
+            if dep is not None:
+                out += idle_residency_problems(dep, rs_all, pods_all, r["idle_arm_replicas"])
+    return out
+
+
+def _controller_uid(obj: Dict, kind: str) -> str:
+    for ref in (obj.get("metadata") or {}).get("ownerReferences") or []:
+        if ref.get("controller") and ref.get("kind") == kind:
+            return ref.get("uid", "")
+    return ""
+
+
+def idle_residency_problems(dep: Dict, replicasets: List[Dict], pods: List[Dict], idle: int) -> List[str]:
+    """An idle target is resident at no more than `idle` pods only when it has converged: its desired count is at most
+    `idle`, its status (observed generation, replicas, updated, ready, available) equals it, and exactly that many Pods
+    are owned through its ReplicaSets (bound by controller UID to the Deployment's UID), terminating ones included."""
+    name, uid = dep["metadata"]["name"], dep["metadata"]["uid"]
+    want = int(dep["spec"].get("replicas") or 0)
+    out = []
+    if want > idle:
+        out.append(f"{name} has {want} replicas, above the residency budget's idle count {idle}: restore it before "
+                   "loading another arm")
+    rs_uids = {rs["metadata"]["uid"] for rs in replicasets if _controller_uid(rs, "Deployment") == uid}
+    owned = [p for p in pods if _controller_uid(p, "ReplicaSet") in rs_uids]
+    terminating = sum(1 for p in owned if (p.get("metadata") or {}).get("deletionTimestamp"))
+    if len(owned) != want:
+        out.append(f"{name} owns {len(owned)} pods ({terminating} terminating) for {want} desired: not converged to "
+                   "its idle residency")
+    if terminating:
+        out.append(f"{name} has {terminating} terminating pods: wait until they are gone")
+    unready = sorted(p["metadata"]["name"] for p in owned if not p["metadata"].get("deletionTimestamp") and not (
+        (p.get("status") or {}).get("phase") == "Running" and any(
+            cd.get("type") == "Ready" and cd.get("status") == "True"
+            for cd in (p.get("status") or {}).get("conditions") or [])))
+    if unready:
+        out.append(f"{name} has pods that are not Running and Ready: {unready}")
+    st = dep.get("status") or {}
+    lagging = [k for k in ("replicas", "updatedReplicas", "readyReplicas", "availableReplicas")
+               if int(st.get(k) or 0) != want]
+    if int(st.get("observedGeneration") or 0) < int(dep["metadata"].get("generation") or 0):
+        lagging.append("observedGeneration")
+    if lagging:
+        out.append(f"{name} has not converged ({', '.join(lagging)} differ from its {want} desired replicas)")
+    return out
 
 
 def _load_script() -> str:
@@ -487,6 +559,7 @@ def plan_start(c: Context) -> Dict:
     problems += readiness_problems
     problems += _node_stops(c)
     problems += _occupant_stops(c)                  # the reservation must verify before any session starts
+    problems += X.injection_problems(c.kube, c.params)   # no admitted evaluation pod carries Istio's containers
     problems += _quota_problems(c)
     b, budget = _budget(c), c.s["arrival_budget"]
     if b["peak_rps"] > budget["max_rps"] or b["total_arrivals"] > budget["max_total_arrivals"]:
@@ -536,6 +609,7 @@ def plan_start(c: Context) -> Dict:
         actions.append({"op": "activate", "kind": "PredictiveAutoscaler", "name": c.target, "uid": uid,
                         "from": "Recommend", "to": "Active"})
     job = generator_job(c, job_deadline(c, b), suspend=c.s["phase"] == "confirmation")
+    problems += _residency_problems(c, job)
     actions.append({"op": "create-plan-configmap", "name": names["plan_cm"], "script_sha256":
                     X.sha256_bytes(script.encode()), "plan_digest_k6": c.plan["digest"]})
     actions.append({"op": "create-generator", "name": names["job"], "sha256": X.json_digest(job),
@@ -843,6 +917,7 @@ def verify(c: Context, fetch: Callable[[str], Dict] = _http_json) -> Dict:
     stops += _node_stops(c)
     stops += steal_stop(c, fetch)
     stops += _occupant_stops(c)
+    stops += X.injection_problems(c.kube, c.params, {owned["job"]["uid"]} if owned.get("job") else set())
     if c.now() >= _utc(state["begin"]["data"]["deadline_utc"]):
         stops.append("the session deadline has passed")
     if owned.get("job"):
