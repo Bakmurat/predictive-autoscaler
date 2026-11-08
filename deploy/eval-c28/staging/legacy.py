@@ -437,6 +437,9 @@ def quiesce(api, rec: Mapping, plan: Mapping, reviewed: str, sleep: Callable = t
                                         for ns, n, _ in a["targets"]}}
                 if a.get("lease") and baseline["lease"] and baseline["lease"]["uid"] != a["lease"]["uid"]:
                     raise C.StagingError("the old operator's Lease was recreated; refusing")
+                if a.get("lease") is not None and baseline["lease"] is None:
+                    raise C.StagingError("the old operator's Lease planned present has disappeared before the "
+                                         "observation; refusing")
                 if a.get("lease") is None and baseline["lease"] is not None:
                     raise C.StagingError("an old-operator leader Lease appeared since the plan (a live writer); "
                                          "refusing")

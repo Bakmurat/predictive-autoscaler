@@ -199,3 +199,52 @@ def test_completeness_needs_the_mandatory_manifest_and_verified_chains(tmp_path,
     change(rec, tmp_path)
     with pytest.raises(C.StagingError, match=why):
         A.build_plan(api, rec)
+
+
+# --- C2.8f review: the reviewed missing set is bound exactly ------------------------------------------------------
+
+LEASE = {"kind": "leases", "namespace": "ml-engine", "name": "predictive-autoscaler-leader", "role": "lease",
+         "reason": "absent: 0472829 defaults --leader-elect=false"}
+
+
+@pytest.mark.parametrize("reviewed, ok", [
+    ([LEASE], True),
+    (None, False),                                                         # unreviewed
+    (True, False),                                                         # blanket boolean
+    ([LEASE, LEASE], False),                                               # duplicate
+    ([dict(LEASE, reason="  ")], False),                                   # no rationale
+    ([{k: v for k, v in LEASE.items() if k != "reason"}], False),
+    ([LEASE, {"kind": "deployments", "namespace": "demo", "name": "nginx-test", "role": "target",
+              "reason": "x"}], False),                                     # reviewed but present
+])
+def test_the_reviewed_missing_set_must_match_exactly(tmp_path, reviewed, ok):
+    api, rec = setup(tmp_path)
+    del api.objects[("leases", "ml-engine", "predictive-autoscaler-leader")]
+    if reviewed is not None:
+        rec["archive"]["unaccounted_reviewed"] = reviewed
+    if ok:
+        assert A.build_plan(api, rec)["unaccounted"][0]["name"] == "predictive-autoscaler-leader"
+    else:
+        with pytest.raises(C.StagingError, match="unaccounted_reviewed|missing set"):
+            A.build_plan(api, rec)
+
+
+def test_an_extra_missing_object_is_never_covered_by_an_earlier_review(tmp_path):
+    # Codex repro: only the Lease was reviewed, p8-evidence-pvc vanished too: no plan, no archive-complete.
+    api, rec = setup(tmp_path)
+    rec["archive"]["unaccounted_reviewed"] = [LEASE]
+    del api.objects[("leases", "ml-engine", "predictive-autoscaler-leader")]
+    plan, _ = run_all(api, rec)
+    complete_backup(api, rec)
+    A.velero_receipt(api, rec, plan)
+    assert A.verify(rec, plan)["event"] == "archive-complete"
+    api2, rec2 = setup(tmp_path / "b")
+    rec2["archive"]["unaccounted_reviewed"] = [LEASE]
+    del api2.objects[("leases", "ml-engine", "predictive-autoscaler-leader")]
+    del api2.objects[("persistentvolumeclaims", "ml-engine", "p8-evidence-pvc")]
+    with pytest.raises(C.StagingError, match="p8-evidence-pvc"):
+        A.build_plan(api2, rec2)
+    edited = dict(plan, unaccounted=plan["unaccounted"] + [{"kind": "persistentvolumeclaims", "namespace": "ml-engine",
+                                                            "name": "p8-evidence-pvc", "role": "retained"}])
+    with pytest.raises(C.StagingError, match="missing set"):
+        A.verify(rec, edited)

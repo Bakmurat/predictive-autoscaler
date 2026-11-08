@@ -708,3 +708,19 @@ def test_a_lease_appearing_after_planning_or_during_verify_blocks(tmp_path):
     appear_lease(api2, 150)                                                   # mid-observation
     v = LG.verify(api2, rec2, 600, clock2.sleep, clock2, clock2)
     assert v["retired"] is False and any("Lease appeared" in p for p in v["problems"])
+
+
+def test_a_planned_lease_disappearing_before_the_observation_blocks(tmp_path):
+    # C2.8f review: presence and UID are compared both ways when the baseline is set.
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    plan = LG.build_plan(api, rec)
+    assert next(a for a in plan["actions"] if a["op"] == "observe_quiet")["lease"] is not None
+    del api.objects[("leases", "ml-engine", "predictive-autoscaler-leader")]
+    with pytest.raises(C.StagingError, match="disappeared"):
+        LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    assert api.objects[("deployments", "demo", "nginx-test")]["spec"]["replicas"] == 3        # not parked
+    api2, rec2, clock2 = legacy_cluster(), ready_record(tmp_path / "b"), Clock()
+    plan2 = LG.build_plan(api2, rec2)
+    api2.objects[("leases", "ml-engine", "predictive-autoscaler-leader")]["spec"]["renewTime"] = "2026-11-08T01:00:00Z"
+    LG.quiesce(api2, rec2, plan2, C.plan_digest(plan2), sleep=clock2.sleep, monotonic=clock2, clock=clock2)
+    assert api2.objects[("deployments", "demo", "nginx-test")]["spec"]["replicas"] == 0       # renewal before: fine
