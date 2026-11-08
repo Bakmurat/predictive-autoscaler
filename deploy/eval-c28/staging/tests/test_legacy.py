@@ -1,5 +1,6 @@
-"""legacy.py: an exact, UID-bound S4 plan; execution only with the reviewed digest; evidence and archived objects
-untouched; verify and the ten quiet minutes; selective restore."""
+"""legacy.py: an exact, UID-bound S4 in two reviewed phases (quiesce, then park from phase A's receipt); execution only
+with the reviewed digest; evidence and archived objects untouched; the pre-parking arrivals proof, the post-parking
+control-state verification and the ten quiet minutes; selective restore across both phases."""
 
 import copy
 import json
@@ -15,18 +16,51 @@ T0 = 1_794_000_000
 REAL_PROM = LG.PromClient                                                    # before the autouse fixture patches it
 
 
-class Metrics:
-    """A fake metrics API: per-target request rate and data age (no network)."""
+class AllFresh(dict):
+    """A per-reporter series map in which every pod has a series of the given age."""
 
-    def __init__(self, rate=0.0, age=5.0, missing=()):
+    def __init__(self, age):
+        super().__init__()
+        self.age = age
+
+    def get(self, key, default=None):
+        return self.age
+
+
+class Metrics:
+    """A fake metrics API: per-target request rate and data age, and per-reporter series ages (no network). With an
+    api, the series are the target's running pods (one of them stale for the targets in `stale`)."""
+
+    def __init__(self, rate=0.0, age=5.0, missing=(), api=None, stale=(), rate_fn=None):
         self.rate, self.age, self.missing, self.queries = rate, age, set(missing), []
+        self.api, self.stale, self.rate_fn = api, set(stale), rate_fn
+
+    @staticmethod
+    def target(expr):
+        return expr.split('workload="')[1].split('"')[0]
 
     def __call__(self, expr):
         self.queries.append(expr)
-        target = expr.split('workload="')[1].split('"')[0]
-        if target in self.missing:
+        if self.target(expr) in self.missing:
             return None
-        return self.age if expr.startswith("time()") else self.rate
+        if expr.startswith("time()"):
+            return self.age
+        return self.rate_fn() if self.rate_fn else self.rate
+
+    def vector(self, expr, label):
+        self.queries.append(expr)
+        assert label == "pod" and "by (pod)" in expr
+        t = self.target(expr)
+        if t in self.missing:
+            return None
+        if self.api is None:
+            return AllFresh(self.age)
+        d = self.api.objects[("deployments", "demo", t)]
+        pods = LG.running_pods(self.api, "demo", d["metadata"]["uid"])
+        out = {p: self.age for p in pods}
+        if t in self.stale and pods:
+            out[pods[0]] = 900.0                                # one reporter stale; the newest stays fresh
+        return out
 
 
 @pytest.fixture(autouse=True)
@@ -36,11 +70,13 @@ def quiet_metrics(monkeypatch):
     return m
 
 
-ARRIVALS = {"query_api": "http://vmselect.monitoring.svc:8481/select/0/prometheus",
-            "rate_query": 'sum(rate(istio_requests_total{destination_workload="{target}",'
-                          'destination_workload_namespace="demo"}[1m]))',
-            "age_query": 'time() - max(timestamp(istio_requests_total{destination_workload="{target}"}))',
-            "max_age_seconds": 120}
+SEL = ('istio_requests_total{destination_workload="{target}",destination_workload_namespace="demo",'
+       'reporter="destination"}')
+ARRIVALS = {"query_api": "http://127.0.0.1:18481/select/0/prometheus",
+            "rate_query": f"sum(rate({SEL}[1m]))",
+            "age_query": f"time() - max(timestamp({SEL}))",
+            "series_query": f"time() - max by (pod) (timestamp({SEL}))",
+            "pod_label": "pod", "max_age_seconds": 120, "settle_seconds": 90}
 
 
 def crash_owner(lock_file):
@@ -55,7 +91,7 @@ def crash_owner(lock_file):
 
 def ready_record(tmp_path, **legacy):
     rec = record(tmp_path, legacy={"parked_replicas": 0, "job_deadline_seconds": 600, "wait_timeout_seconds": 60,
-                                   "arrivals": dict(ARRIVALS),
+                                   "observe_seconds": 600, "arrivals": dict(ARRIVALS),
                                    "external_launchers": ["pf-loop on the ops box"],
                                    "external_launchers_attested": True, **legacy})
     r = C.append_receipt(rec, "archive", "archive-complete", {"plan_sha256": "f" * 64}, clock=lambda: T0)
@@ -78,6 +114,24 @@ def snapshot_state(api):
     return copy.deepcopy(api.objects)
 
 
+def quiesce(api, rec, clock, metrics=None):
+    """Phase A: plan and execute it."""
+    plan = LG.build_plan(api, rec)
+    LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock, metrics=metrics)
+    return plan
+
+
+def park(api, rec, clock, metrics=None):
+    """Phase B: plan from phase A's receipt and execute it."""
+    pplan = LG.build_park_plan(api, rec)
+    LG.park(api, rec, pplan, C.plan_digest(pplan), sleep=clock.sleep, monotonic=clock, clock=clock, metrics=metrics)
+    return pplan
+
+
+def full(api, rec, clock, metrics=None):
+    return quiesce(api, rec, clock, metrics), park(api, rec, clock, metrics)
+
+
 def test_the_plan_is_exact_ordered_and_read_only(tmp_path):
     api = legacy_cluster()
     plan = LG.build_plan(api, ready_record(tmp_path))
@@ -87,8 +141,10 @@ def test_the_plan_is_exact_ordered_and_read_only(tmp_path):
         return next(i for i, (o, n) in enumerate(ops) if o == op and (name is None or n == name))
     assert ops[:3] == [("suspend", "ml-training"), ("suspend", "evidence-archive"), ("suspend", "load-evidence")]
     assert first("suspend") < first("wait_jobs") < first("scale", "k6-nginx-test") < \
-        first("scale", "predictive-operator") < first("delete") < first("verify_no_writers") < \
-        first("scale", "nginx-test") < first("scale", "ml-api")
+        first("scale", "predictive-operator") < first("delete") < first("verify_no_writers")
+    assert [o for o, _ in ops[-4:]] == ["verify_no_writers", "settle", "observe_quiet", "capture_targets"]
+    assert plan["actions"][-3]["seconds"] == 90 and plan["phase"] == "quiesce"
+    assert not any(n in ("nginx-test", "ml-api") for o, n in ops if o == "scale")          # phase A never parks
     touched = {(a.get("kind"), a.get("name")) for a in plan["actions"] if a.get("kind")}
     assert not any(k in ("persistentvolumeclaims", "pa-legacy", "customresourcedefinitions", "leases")
                    for k, _ in touched)                                  # evidence, archived PAs, CRD, Lease: never
@@ -99,6 +155,50 @@ def test_the_plan_is_exact_ordered_and_read_only(tmp_path):
     assert {a["name"] for a in deletes} == {"nginx-test-keda-fallback", "myapptwo-keda-fallback"}
     assert all(a["generated_hpa"]["name"] == f"keda-hpa-{a['name']}" for a in deletes)
     assert {r["name"] for r in plan["retained"] if r["role"] == "retained"} >= {"p8-evidence-pvc", "ml-models-pvc"}
+    clock = Clock()
+    rec = ready_record(tmp_path / "b")
+    api = legacy_cluster()
+    quiesce(api, rec, clock)
+    n0 = len(api.mutations())
+    pplan = LG.build_park_plan(api, rec)
+    assert len(api.mutations()) == n0                                       # park-plan is read-only too
+    pops = [(a["op"], a.get("name")) for a in pplan["actions"]]
+    assert pops[0][0] == "recheck_quiesced" and pplan["phase"] == "park" and pplan["helper"] == "legacy-park"
+    assert pops.index(("scale", "nginx-test")) < pops.index(("wait_jobs", None)) < pops.index(("scale", "ml-api"))
+    assert {n for o, n in pops if o == "scale"} == set(LG.L.ARMS) | {"ml-api"}
+    assert min(a["step"] for a in pplan["actions"]) > max(a["step"] for a in LG.build_plan(
+        legacy_cluster(), ready_record(tmp_path / "c"))["actions"])           # one journal, steps continue
+
+
+def test_phase_a_binds_target_uids_only_and_never_parks(tmp_path):
+    # Codex finding 1: the old operator may change the targets until it stops; phase A binds their UIDs only.
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    plan = LG.build_plan(api, rec)
+    arms = set(LG.L.ARMS)
+    assert not any(a.get("name") in arms for a in plan["actions"] if a.get("kind"))
+    for op in ("observe_quiet", "capture_targets"):
+        a = next(x for x in plan["actions"] if x["op"] == op)
+        assert {t[1] for t in a["targets"]} == arms and all(len(t) == 3 for t in a["targets"])
+    assert "generation" not in json.dumps([a for a in plan["actions"] if a["op"] in ("observe_quiet",
+                                                                                    "capture_targets")])
+    before = {a: api.objects[("deployments", "demo", a)]["spec"]["replicas"] for a in arms}
+    LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    assert {a: api.objects[("deployments", "demo", a)]["spec"]["replicas"] for a in arms} == before
+    done = [r for r in C.read_receipts(C.receipts_path(rec, "legacy")) if r["event"] == "quiesce-complete"][-1]
+    cap = {t["name"]: t for t in done["data"]["targets"]}
+    d = api.objects[("deployments", "demo", "nginx-test")]
+    rep = cap["nginx-test"].pop("reporters")
+    assert cap["nginx-test"] == {"namespace": "demo", "name": "nginx-test", "uid": d["metadata"]["uid"],
+                                 "generation": d["metadata"]["generation"], "replicas": 3,
+                                 "resourceVersion": d["metadata"]["resourceVersion"]}
+    assert rep == LG.pod_identities(api, "demo", d["metadata"]["uid"]) and len(rep["running"]) == 3
+    assert done["data"]["observed_seconds"] == 600 and done["data"]["observed_receipt_sha256"]
+    # A phase A plan edited to park a target is refused even with its digest.
+    bad = copy.deepcopy(plan)
+    bad["actions"].insert(0, {"step": 0, "op": "scale", "kind": "deployments", "namespace": "demo",
+                              "name": "nginx-test", "uid": d["metadata"]["uid"], "after": 0})
+    with pytest.raises(C.StagingError, match="this phase may not touch"):
+        LG.quiesce(api, rec, bad, C.plan_digest(bad), sleep=clock.sleep, monotonic=clock, clock=clock)
 
 
 @pytest.mark.parametrize("change, why", [
@@ -127,6 +227,14 @@ def test_quiesce_runs_only_the_reviewed_plan_and_keeps_evidence(tmp_path):
             if k[0] in ("persistentvolumeclaims", "persistentvolumes", "pa-legacy", "customresourcedefinitions",
                         "leases", "secrets", "services")}
     LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    pplan = LG.build_park_plan(api, rec)
+    for digest in (None, "0" * 64, C.plan_digest(plan)):
+        with pytest.raises(C.StagingError):
+            LG.park(api, rec, pplan, digest, sleep=clock.sleep, monotonic=clock, clock=clock)
+    with pytest.raises(C.StagingError, match="another helper"):
+        LG.quiesce(api, rec, pplan, C.plan_digest(pplan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    assert api.objects[("deployments", "demo", "nginx-test")]["spec"]["replicas"] == 3
+    LG.park(api, rec, pplan, C.plan_digest(pplan), sleep=clock.sleep, monotonic=clock, clock=clock)
     for k, v in keep.items():
         assert api.objects[k] == v, k                                   # byte-for-byte untouched
     deps = {k[2]: v for k, v in api.objects.items() if k[0] == "deployments"}
@@ -192,8 +300,11 @@ def test_verify_declares_retirement_only_after_ten_quiet_minutes(tmp_path):
     api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
     v0 = LG.verify(api, rec, 0, clock.sleep, clock, clock)
     assert v0["quiesced"] is False and v0["problems"]
-    plan = LG.build_plan(api, rec)
-    LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    quiesce(api, rec, clock)
+    va = LG.verify(api, rec, 600, clock.sleep, clock, clock)                 # phase A alone: targets not parked
+    assert va["quiesced"] is False and va["retired"] is False and va["parked"] is False
+    assert any("not at 0 replicas" in p for p in va["problems"])
+    park(api, rec, clock)
     v1 = LG.verify(api, rec, 0, clock.sleep, clock, clock)
     assert v1["quiesced"] and not v1["retired"] and v1["problems"] == []
     v2 = LG.verify(api, rec, 600, clock.sleep, clock, clock)
@@ -205,8 +316,7 @@ def test_restore_undoes_exactly_what_quiesce_did(tmp_path):
     api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
     before = {k: (v["spec"].get("replicas"), v["spec"].get("suspend")) for k, v in api.objects.items()
               if k[0] in ("deployments", "cronjobs")}
-    plan = LG.build_plan(api, rec)
-    LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    full(api, rec, clock)
     api.add("deployments", {"kind": "Deployment", "metadata": {"name": "c28-pa-n-s20", "namespace": "demo"},
                             "spec": {"replicas": 2}})                                    # the new fixture
     rplan = LG.build_restore_plan(api, rec)
@@ -228,8 +338,7 @@ def test_restore_undoes_exactly_what_quiesce_did(tmp_path):
 
 def test_restore_never_overwrites_and_refuses_recreated_targets(tmp_path):
     api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
-    plan = LG.build_plan(api, rec)
-    LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    full(api, rec, clock)
     api.add("scaledobjects", {"kind": "ScaledObject",
                               "metadata": {"name": "myapptwo-keda-fallback", "namespace": "demo"},
                               "spec": {}})
@@ -237,8 +346,7 @@ def test_restore_never_overwrites_and_refuses_recreated_targets(tmp_path):
     with pytest.raises(C.StagingError, match="exists"):
         LG.restore(api, rec, rplan, C.plan_digest(rplan), clock=clock)
     api2, rec2, clock2 = legacy_cluster(), ready_record(tmp_path / "b"), Clock()
-    plan2 = LG.build_plan(api2, rec2)
-    LG.quiesce(api2, rec2, plan2, C.plan_digest(plan2), sleep=clock2.sleep, monotonic=clock2, clock=clock2)
+    full(api2, rec2, clock2)
     old = api2.objects.pop(("deployments", "ml-engine", "ml-api"))
     api2.add("deployments", dict(old, metadata={k: v for k, v in old["metadata"].items() if k != "uid"}))
     rplan2 = LG.build_restore_plan(api2, rec2)
@@ -351,8 +459,7 @@ def test_surviving_pods_or_a_renewed_lease_block_parking_and_retirement(tmp_path
     assert api2.objects[("deployments", "demo", "nginx-test")]["spec"]["replicas"] == 3       # not parked
 
     api3, rec3, clock3 = legacy_cluster(), ready_record(tmp_path / "c"), Clock()
-    plan3 = LG.build_plan(api3, rec3)
-    LG.quiesce(api3, rec3, plan3, C.plan_digest(plan3), sleep=clock3.sleep, monotonic=clock3, clock=clock3)
+    full(api3, rec3, clock3)
     lease3 = api3.objects[("leases", "ml-engine", "predictive-autoscaler-leader")]
     n = {"i": 0}
 
@@ -362,14 +469,13 @@ def test_surviving_pods_or_a_renewed_lease_block_parking_and_retirement(tmp_path
             lease3["spec"]["renewTime"] = "2026-11-09T00:00:00Z"
     api3.on_poll.append(renew_later)
     v = LG.verify(api3, rec3, 600, clock3.sleep, clock3, clock3)
-    assert v["retired"] is False and any("changed during the observation" in p for p in v["problems"])
+    assert v["retired"] is False and any("changed since the preserved baseline" in p for p in v["problems"])
 
 
 def test_restore_refuses_drift_after_quiesce(tmp_path):
     # Finding 4: restore is bound to the post-quiesce generation and value.
     api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
-    plan = LG.build_plan(api, rec)
-    LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    full(api, rec, clock)
     rplan = LG.build_restore_plan(api, rec)
     d = api.objects[("deployments", "demo", "nginx-reactive")]
     d["spec"]["replicas"] = 5                                               # a newer owner decision, same UID
@@ -381,8 +487,7 @@ def test_restore_refuses_drift_after_quiesce(tmp_path):
 
 def test_restore_refuses_a_foreign_writer_before_restoring_writers(tmp_path):
     api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
-    plan = LG.build_plan(api, rec)
-    LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    full(api, rec, clock)
     api.add("pa-new", {"kind": "PredictiveAutoscaler", "metadata": {"name": "adopter", "namespace": "demo"},
                        "spec": {"targetDeployment": {"name": "nginx-test", "namespace": "demo"}}})
     rplan = LG.build_restore_plan(api, rec)
@@ -434,8 +539,7 @@ def test_a_lost_response_after_a_delete_stays_recoverable(tmp_path):
 def test_an_orphan_hpa_is_an_independent_writer_at_restore(tmp_path):
     # Finding 1: only a VERIFIED owner/target pair is one writer; an HPA with a dangling ScaledObject reference counts.
     api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
-    plan = LG.build_plan(api, rec)
-    LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    full(api, rec, clock)
     api.add("horizontalpodautoscalers", {"kind": "HorizontalPodAutoscaler", "metadata": {
         "name": "orphan", "namespace": "demo", "ownerReferences": [{"kind": "ScaledObject", "name": "gone",
                                                                     "uid": "dead-beef", "controller": True}]},
@@ -450,8 +554,7 @@ def test_an_orphan_hpa_is_an_independent_writer_at_restore(tmp_path):
 def test_a_change_after_validation_is_never_overwritten(tmp_path):
     # Finding 2: the PUT carries the validated object's resourceVersion; the post-state is the response's.
     api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
-    plan = LG.build_plan(api, rec)
-    LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    full(api, rec, clock)
     step = next(r for r in C.read_receipts(C.receipts_path(rec, "legacy"))
                 if r["event"].startswith("step-") and r["data"]["action"].get("name") == "nginx-reactive")
     d = api.objects[("deployments", "demo", "nginx-reactive")]
@@ -473,8 +576,7 @@ def test_a_change_after_validation_is_never_overwritten(tmp_path):
 def test_quiesce_and_restore_share_one_lock(tmp_path):
     # Finding 3: one mutation lock per cluster and scope, whichever helper holds it.
     api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
-    plan = LG.build_plan(api, rec)
-    LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    full(api, rec, clock)
     rplan = LG.build_restore_plan(api, rec)
     with C.exclusive_lock(rec, "legacy", holder="a concurrent quiesce"):
         with pytest.raises(C.StagingError, match="another execution"):
@@ -496,16 +598,83 @@ def test_arrivals_must_be_observed_zero_before_parking(tmp_path, quiet_metrics, 
     assert any('destination_workload="nginx-ensemble-q95"' in q for q in metrics.queries)
 
 
-def test_retirement_needs_fresh_zero_arrivals_throughout(tmp_path, quiet_metrics):
+def test_post_parking_verify_reads_no_metrics_and_never_takes_absence_for_zero(tmp_path, monkeypatch):
+    # Codex finding 2: parking removes the reporters; retirement = the pre-parking proof + post-parking control state.
     api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
-    plan = LG.build_plan(api, rec)
-    LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
-    assert LG.verify(api, rec, 600, clock.sleep, clock, clock)["retired"] is True
-    blind = Metrics(missing={"nginx-test"})
-    v = LG.verify(api, rec, 600, clock.sleep, clock, clock, metrics=blind)
-    assert v["retired"] is False and any("no fresh, finite request-counter observation" in p for p in v["problems"])
+    full(api, rec, clock)
+
+    def no_metrics(*a, **kw):
+        raise AssertionError("verify must not read metrics after parking")
+    monkeypatch.setattr(LG, "PromClient", no_metrics)
+    v = LG.verify(api, rec, 600, clock.sleep, clock, clock)
+    assert v["retired"] is True and "never a zero" in v["metrics_after_parking"]
+    q = [r for r in C.read_receipts(C.receipts_path(rec, "legacy")) if r["event"] == "quiesce-complete"][-1]
+    assert v["arrivals_proof"]["observed_receipt_sha256"] == q["data"]["observed_receipt_sha256"]
+    assert v["arrivals_proof"]["observed_seconds"] == 600
     with pytest.raises(C.StagingError, match="arrivals"):
         LG.build_plan(api, dict(rec, legacy={k: v for k, v in rec["legacy"].items() if k != "arrivals"}))
+
+
+def test_retirement_needs_the_ten_minute_pre_parking_proof(tmp_path):
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path, observe_seconds=120), Clock()
+    full(api, rec, clock)
+    v = LG.verify(api, rec, 600, clock.sleep, clock, clock)
+    assert v["quiesced"] is True and v["retired"] is False and v["arrivals_proof"]["observed_seconds"] == 120
+
+
+def _rs_uid(api, name):
+    return api.objects[("replicasets", "demo" if not name.startswith(("ml-", "predictive")) else "ml-engine",
+                        f"{name}-rs")]["metadata"]["uid"]
+
+
+@pytest.mark.parametrize("what, why", [
+    ("pod", "nginx-test still has pods"),
+    ("writer", "writer remains"),
+    ("job", "legacy Jobs appeared"),
+    ("scaledobject", "nginx-test-keda-fallback"),
+    ("unsuspend", "CronJob ml-training is not suspended"),
+])
+def test_post_parking_verify_fails_on_anything_coming_back(tmp_path, what, why):
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    full(api, rec, clock)
+    n = {"i": 0}
+
+    def hook(a):
+        n["i"] += 1
+        if n["i"] != 300:
+            return
+        if what == "pod":                           # a reconciler recreates a target pod
+            a.add("pods", {"kind": "Pod", "metadata": {"name": "nginx-test-back", "namespace": "demo",
+                                                       "ownerReferences": [{"kind": "ReplicaSet",
+                                                                            "uid": _rs_uid(a, "nginx-test")}]},
+                           "status": {"phase": "Running"}})
+        elif what == "writer":
+            a.add("horizontalpodautoscalers", {"kind": "HorizontalPodAutoscaler", "metadata": {
+                "name": "late", "namespace": "demo"}, "spec": {"scaleTargetRef": {"kind": "Deployment",
+                                                                                   "name": "nginx-test"}}})
+        elif what == "job":                         # even a Job that already finished is a recreation
+            a.add("jobs", {"kind": "Job", "metadata": {"name": "ml-training-late", "namespace": "ml-engine",
+                                                       "ownerReferences": [{"kind": "CronJob",
+                                                                            "name": "ml-training"}]},
+                           "status": {"succeeded": 1, "completionTime": "2026-11-08T01:00:00Z"}})
+        elif what == "scaledobject":
+            a.add("scaledobjects", {"kind": "ScaledObject", "metadata": {"name": "nginx-test-keda-fallback",
+                                                                         "namespace": "demo"},
+                                    "spec": {"scaleTargetRef": {"name": "nginx-test"}}})
+        else:
+            a.objects[("cronjobs", "ml-engine", "ml-training")]["spec"]["suspend"] = False
+    api.on_poll.append(hook)
+    v = LG.verify(api, rec, 600, clock.sleep, clock, clock)
+    assert v["retired"] is False and any(why in p for p in v["problems"]), v["problems"]
+
+
+def test_verify_refuses_a_recreated_target(tmp_path):
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    full(api, rec, clock)
+    old = api.objects.pop(("deployments", "demo", "nginx-seasonal"))
+    api.add("deployments", dict(old, metadata={k: v for k, v in old["metadata"].items() if k != "uid"}))
+    v = LG.verify(api, rec, 600, clock.sleep, clock, clock)
+    assert v["retired"] is False and any("not the Deployment phase A captured" in p for p in v["problems"])
 
 
 def test_the_metrics_client_returns_one_value_or_nothing():
@@ -613,9 +782,39 @@ def test_an_ambiguous_recreation_or_drifted_update_stays_unresolved(tmp_path):
                                        (float("inf"), 5.0), (0.0, 121.0), (1e-9, 5.0)])
 def test_the_arrival_gate_needs_finite_zero_rate_and_a_valid_age(rate, age):
     # Finding 3.
-    problems = LG.arrival_problems(lambda q: age if q.startswith("time()") else rate, ARRIVALS, ["nginx-test"])
+    problems = LG.arrival_problems(Stub(rate, age), ARRIVALS, {"nginx-test": ["p1"]})
     assert problems and "nginx-test" in problems[0]
-    assert LG.arrival_problems(lambda q: 0.0, ARRIVALS, ["nginx-test"]) == []
+    assert LG.arrival_problems(Stub(0.0, 0.0), ARRIVALS, {"nginx-test": ["p1"]}) == []
+
+
+class Stub:
+    def __init__(self, rate, age, series=None):
+        self.rate, self.age, self.series = rate, age, series
+
+    def __call__(self, q):
+        return self.age if q.startswith("time()") else self.rate
+
+    def vector(self, q, label):
+        return {"p1": self.age} if self.series is None else self.series
+
+
+@pytest.mark.parametrize("series, pods, ok", [
+    ({"p1": 5.0, "p2": 7.0}, ["p1", "p2"], True),
+    ({"p1": 5.0, "p2": 700.0}, ["p1", "p2"], False),            # one reporter stale, the newest fresh
+    ({"p1": 5.0}, ["p1", "p2"], False),                         # one expected reporter has no series at all
+    ({"p1": 5.0, "p2": -1.0}, ["p1", "p2"], False),             # from the future
+    ({"p1": 5.0, "p2": float("nan")}, ["p1", "p2"], False),
+    (None, ["p1"], False),                                      # no per-reporter observation: never a zero
+    ({"p1": 5.0}, [], False),                                   # no expected reporter: cannot be observed
+    ({"p1": 5.0, "other": 900.0}, ["p1"], True),                # a stale series of a pod not expected: irrelevant
+])
+def test_every_expected_reporter_must_be_fresh(series, pods, ok):
+    # Codex finding 3: max(timestamp(...)) proves only that the newest series is fresh.
+    stub = Stub(0.0, 5.0, series)
+    if series is None:
+        stub.vector = lambda q, label: None
+    problems = LG.arrival_problems(stub, ARRIVALS, {"nginx-test": pods})
+    assert (problems == []) is ok, problems
 
 
 def test_a_paused_scaled_object_does_not_hide_its_generated_hpa(tmp_path):
@@ -659,6 +858,7 @@ def test_an_absent_lease_that_stays_absent_is_quiet(tmp_path):
     obs = next(a for a in plan["actions"] if a["op"] == "observe_quiet")
     assert obs["lease"] is None
     LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    park(api, rec, clock)
     assert api.objects[("deployments", "demo", "nginx-test")]["spec"]["replicas"] == 0
     assert LG.verify(api, rec, 600, clock.sleep, clock, clock)["retired"] is True
 
@@ -703,8 +903,7 @@ def test_a_lease_appearing_after_planning_or_during_verify_blocks(tmp_path):
     with pytest.raises(C.StagingError, match="Lease appeared"):
         LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
     api2, rec2, clock2 = no_lease_cluster(), ready_record(tmp_path / "b"), Clock()
-    plan2 = LG.build_plan(api2, rec2)
-    LG.quiesce(api2, rec2, plan2, C.plan_digest(plan2), sleep=clock2.sleep, monotonic=clock2, clock=clock2)
+    full(api2, rec2, clock2)
     appear_lease(api2, 150)                                                   # mid-observation
     v = LG.verify(api2, rec2, 600, clock2.sleep, clock2, clock2)
     assert v["retired"] is False and any("Lease appeared" in p for p in v["problems"])
@@ -723,6 +922,7 @@ def test_a_planned_lease_disappearing_before_the_observation_blocks(tmp_path):
     plan2 = LG.build_plan(api2, rec2)
     api2.objects[("leases", "ml-engine", "predictive-autoscaler-leader")]["spec"]["renewTime"] = "2026-11-08T01:00:00Z"
     LG.quiesce(api2, rec2, plan2, C.plan_digest(plan2), sleep=clock2.sleep, monotonic=clock2, clock=clock2)
+    park(api2, rec2, clock2)
     assert api2.objects[("deployments", "demo", "nginx-test")]["spec"]["replicas"] == 0       # renewal before: fine
 
 
@@ -757,3 +957,477 @@ def test_unresolved_intents_spans_every_journal(tmp_path):
     C.append_receipt(rec, "populate-s0-probe", "intent-2", {}, lambda: 0)
     C.append_receipt(rec, "populate-s0-probe", "reconciled-2", {"observed": "not-done"}, lambda: 0)
     assert C.unresolved_intents(rec) == {"legacy-restore": ["12"]}
+
+
+# --- C2.8n: two reviewed phases (Codex review of plan-ec517af4a71d) ------------------------------------------------
+
+def journal(rec):
+    return C.read_receipts(C.receipts_path(rec, "legacy"))
+
+
+def test_park_plan_needs_phase_a_completion(tmp_path):
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    with pytest.raises(C.StagingError, match="no phase A completion receipt"):
+        LG.build_park_plan(api, rec)
+    # A failed phase A (arrivals still flowing) has no completion receipt either.
+    with pytest.raises(C.StagingError, match="still receives"):
+        quiesce(api, rec, clock, Metrics(rate=0.2))
+    with pytest.raises(C.StagingError, match="no phase A completion receipt"):
+        LG.build_park_plan(api, rec)
+    assert api.objects[("deployments", "demo", "nginx-test")]["spec"]["replicas"] == 3
+
+
+def test_park_plan_refuses_a_forged_foreign_or_broken_chain(tmp_path):
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    C.append_receipt(rec, "legacy", "quiesce-complete", {"phase": "quiesce", "targets": [],
+                                                         "observed_receipt_sha256": "0" * 64}, clock)
+    with pytest.raises(C.StagingError, match="does not bind its observation"):
+        LG.build_park_plan(api, rec)                                         # forged: no observation in the chain
+    api2, rec2, clock2 = legacy_cluster(), ready_record(tmp_path / "b"), Clock()
+    quiesce(api2, rec2, clock2)
+    C.append_receipt(dict(rec2, run_id="c28-other"), "legacy", "note", {}, clock2)    # another run's receipt
+    with pytest.raises(C.StagingError, match="another run"):
+        LG.build_park_plan(api2, rec2)
+    api3, rec3, clock3 = legacy_cluster(), ready_record(tmp_path / "c"), Clock()
+    quiesce(api3, rec3, clock3)
+    path = C.receipts_path(rec3, "legacy")
+    lines = open(path).read().splitlines()
+    tampered = json.loads(lines[-1])
+    tampered["data"]["targets"][0]["generation"] = 99                       # edit the captured state
+    lines[-1] = json.dumps(tampered, sort_keys=True)
+    open(path, "w").write("\n".join(lines) + "\n")
+    with pytest.raises(C.StagingError, match="breaks the hash chain"):
+        LG.build_park_plan(api3, rec3)
+    assert api3.objects[("deployments", "demo", "nginx-test")]["spec"]["replicas"] == 3
+
+
+def test_park_plan_refuses_a_target_changed_after_phase_a(tmp_path):
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    quiesce(api, rec, clock)
+    d = api.objects[("deployments", "demo", "nginx-reactive")]
+    d["spec"]["replicas"], d["metadata"]["generation"] = 5, d["metadata"]["generation"] + 1   # someone still writes
+    with pytest.raises(C.StagingError, match="nginx-reactive changed after phase A's captured state"):
+        LG.build_park_plan(api, rec)
+    # And a change after the park plan was reviewed is refused at execution, before that target is touched.
+    api2, rec2, clock2 = legacy_cluster(), ready_record(tmp_path / "b"), Clock()
+    quiesce(api2, rec2, clock2)
+    pplan = LG.build_park_plan(api2, rec2)
+    d2 = api2.objects[("deployments", "demo", "nginx-reactive")]
+    d2["metadata"]["generation"] += 1
+    with pytest.raises(C.StagingError, match="nginx-reactive changed"):
+        LG.park(api2, rec2, pplan, C.plan_digest(pplan), sleep=clock2.sleep, monotonic=clock2, clock=clock2)
+    assert d2["spec"]["replicas"] == 3
+    assert api2.objects[("deployments", "demo", "nginx-test")]["spec"]["replicas"] == 0       # parked before it
+    assert api2.objects[("deployments", "ml-engine", "ml-api")]["spec"]["replicas"] == 1
+
+
+def test_target_drift_before_the_operator_stops_no_longer_breaks_s4(tmp_path):
+    # The case that used to break: the old operator rescales a target during phase A, before it stops; the single
+    # plan's parking then refused the planned generation. Now phase A captures the stable state after the stop.
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    plan = LG.build_plan(api, rec)
+    d = api.objects[("deployments", "demo", "nginx-test")]
+    g0, writes = d["metadata"]["generation"], {"n": 0}
+
+    def operator_writes(a):
+        op = a.objects[("deployments", "ml-engine", "predictive-operator")]
+        if op["spec"]["replicas"] and a.objects[("deployments", "demo", "k6-nginx-test")]["spec"]["replicas"] == 0 \
+                and writes["n"] < 3:
+            writes["n"] += 1
+            d["spec"]["replicas"] += 1
+            d["metadata"]["generation"] += 1
+            d["metadata"]["resourceVersion"] = a._next_rv()
+            a.sync_pods(d)
+    api.on_poll.append(operator_writes)
+    LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    assert writes["n"] == 3 and d["metadata"]["generation"] == g0 + 3
+    cap = {t["name"]: t for t in journal(rec)[-1]["data"]["targets"]}
+    assert cap["nginx-test"]["generation"] == g0 + 3 and cap["nginx-test"]["replicas"] == 6
+    pplan = park(api, rec, clock)
+    scale = next(a for a in pplan["actions"] if a.get("name") == "nginx-test")
+    assert (scale["generation"], scale["before"]) == (g0 + 3, 6)
+    assert d["spec"]["replicas"] == 0
+    assert LG.verify(api, rec, 600, clock.sleep, clock, clock)["retired"] is True
+
+
+def test_park_rechecks_quiescence_and_arrivals_right_before_parking(tmp_path):
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    quiesce(api, rec, clock)
+    pplan = LG.build_park_plan(api, rec)
+    with pytest.raises(C.StagingError, match="still receives"):              # traffic resumed after phase A
+        LG.park(api, rec, pplan, C.plan_digest(pplan), sleep=clock.sleep, monotonic=clock, clock=clock,
+                metrics=Metrics(rate=1.0))
+    api.objects[("deployments", "demo", "k6-myapptwo")]["spec"]["replicas"] = 1   # a generator came back
+    with pytest.raises(C.StagingError, match="park plan refused.*k6-myapptwo is not stopped"):
+        LG.build_park_plan(api, rec)
+    assert all(api.objects[("deployments", "demo", a)]["spec"]["replicas"] == 3 for a in LG.L.ARMS)
+
+
+def test_a_partial_park_resumes_from_its_receipts(tmp_path):
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    quiesce(api, rec, clock)
+    pplan = LG.build_park_plan(api, rec)
+    real = api.replace
+
+    def racing(path, body):
+        if path.endswith("/deployments/myapptwo/scale"):                    # a status update races the PUT
+            api.objects[("deployments", "demo", "myapptwo")]["metadata"]["resourceVersion"] = api._next_rv()
+        return real(path, body)
+    api.replace = racing
+    with pytest.raises(C.ApiError, match="conflict"):
+        LG.park(api, rec, pplan, C.plan_digest(pplan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    api.replace = real
+    lock = C.lock_path(rec, "legacy")
+    crash_owner(lock)
+    assert list(LG.recover(api, rec, C.sha256_file(lock), clock).values()) == ["not-done"]
+    again = LG.build_park_plan(api, rec)
+    assert again["already_parked"] == ["nginx-test", "nginx-reactive"]
+    assert {a.get("name") for a in again["actions"] if a["op"] == "scale"} == \
+        {"myapptwo", "nginx-seasonal", "nginx-ensemble", "nginx-ensemble-q95", "ml-api"}
+    LG.park(api, rec, again, C.plan_digest(again), sleep=clock.sleep, monotonic=clock, clock=clock)
+    assert all(api.objects[("deployments", "demo", a)]["spec"]["replicas"] == 0 for a in LG.L.ARMS)
+    with pytest.raises(C.StagingError, match="already completed"):
+        LG.build_park_plan(api, rec)
+    assert LG.verify(api, rec, 600, clock.sleep, clock, clock)["retired"] is True
+
+
+def test_restore_undoes_both_phases_newest_first(tmp_path):
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    before = {k: (v["spec"].get("replicas"), v["spec"].get("suspend")) for k, v in api.objects.items()
+              if k[0] in ("deployments", "cronjobs")}
+    full(api, rec, clock)
+    rplan = LG.build_restore_plan(api, rec)
+    undo = [a["undoes"] for a in rplan["actions"] if "undoes" in a]
+    assert [int(u) for u in undo] == sorted((int(u) for u in undo), reverse=True)
+    names = [a.get("name") for a in rplan["actions"] if "undoes" in a]
+    assert names.index("ml-api") < names.index("nginx-test") < names.index("myapptwo-keda-fallback") < \
+        names.index("predictive-operator") < names.index("k6-nginx-test") < names.index("ml-training")
+    LG.restore(api, rec, rplan, C.plan_digest(rplan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    after = {k: (v["spec"].get("replicas"), v["spec"].get("suspend")) for k, v in api.objects.items()
+             if k[0] in ("deployments", "cronjobs")}
+    assert after == before
+    with pytest.raises(C.StagingError, match="park plan refused"):
+        LG.build_park_plan(api, rec)                                        # restored after phase A: re-run it
+
+
+def test_restore_after_phase_a_alone_touches_no_target(tmp_path):
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    quiesce(api, rec, clock)
+    rplan = LG.build_restore_plan(api, rec)
+    assert not any(a.get("name") in LG.L.ARMS + ("ml-api",) for a in rplan["actions"])
+    LG.restore(api, rec, rplan, C.plan_digest(rplan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    assert api.objects[("deployments", "demo", "k6-nginx-test")]["spec"]["replicas"] == 1
+    with pytest.raises(C.StagingError, match="a restore ran after phase A"):
+        LG.build_park_plan(api, rec)
+
+
+def test_a_stale_reporter_blocks_phase_a_even_when_the_newest_series_is_fresh(tmp_path):
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    m = Metrics(api=api, stale={"nginx-seasonal"})
+    with pytest.raises(C.StagingError, match="nginx-seasonal's reporter pods"):
+        quiesce(api, rec, clock, m)
+    assert any("by (pod)" in q and 'destination_workload="nginx-seasonal"' in q for q in m.queries)
+    api2, rec2, clock2 = legacy_cluster(), ready_record(tmp_path / "b"), Clock()
+    quiesce(api2, rec2, clock2, Metrics(api=api2))                          # every reporter fresh: passes
+    obs = next(r for r in journal(rec2) if r["event"].startswith("observed-"))
+    assert {t: len(p) for t, p in obs["data"]["baseline"]["reporters"].items()} == {a: 3 for a in LG.L.ARMS}
+
+
+def test_the_settle_period_precedes_an_uninterrupted_observation(tmp_path):
+    def run(tmp, settle, busy_for, late=None):
+        api, rec, clock = legacy_cluster(), ready_record(tmp, arrivals=dict(ARRIVALS, settle_seconds=settle)), Clock()
+        stop = {}
+        real_delete = api.delete
+
+        def delete(path, uid, rv=None):
+            stop["t"] = clock.t                                             # the last writer stops
+            return real_delete(path, uid, rv)
+        api.delete = delete
+
+        def rate():
+            since = clock.t - stop.get("t", float("inf"))
+            return 0.3 if since < busy_for or (late and late[0] <= since < late[1]) else 0.0
+        quiesce(api, rec, clock, Metrics(rate_fn=rate))
+        return rec
+    rec = run(tmp_path / "a", 90, 80)                                       # requests drain inside the settle
+    settled = next(r for r in journal(rec) if r["event"].startswith("settled-"))
+    assert settled["data"]["seconds"] == 90 and settled["data"]["waited"] >= 90
+    with pytest.raises(C.StagingError, match="still receives"):
+        run(tmp_path / "b", 60, 80)                                         # a shorter settle: inside the window
+    with pytest.raises(C.StagingError, match="still receives"):
+        run(tmp_path / "c", 90, 0, late=(400, 410))                         # a request mid-observation
+
+
+@pytest.mark.parametrize("change, why", [
+    (dict(age_query='time() - max(timestamp(istio_requests_total{destination_workload="{target}"}))'),
+     "destination_workload_namespace"),
+    (dict(age_query='time() - max(timestamp(istio_requests_total{destination_workload="{target}",'
+                    'destination_workload_namespace="shop",reporter="destination"}))'), "namespace"),
+    (dict(series_query='time() - max by (pod) (timestamp(istio_requests_total{destination_workload="{target}",'
+                       'destination_workload_namespace="demo"}))'), "same label selector"),
+    (dict(series_query=f"time() - max(timestamp({SEL}))"), "group by"),
+    (dict(series_query=f"time() - max by (instance) (timestamp({SEL}))"), "group by"),
+    (dict(pod_label=""), "pod_label"),
+    (dict(pod_label=None), "pod_label"),
+    (dict(settle_seconds=30), "settle_seconds"),
+    (dict(settle_seconds=601), "settle_seconds"),
+    (dict(settle_seconds=True), "settle_seconds"),
+    (dict(rate_query=f"sum(rate({SEL}[2m]))"), "settle_seconds"),             # 90 s < the 2-minute window
+    (dict(rate_query=f"sum({SEL})"), "range window"),
+    (dict(rate_query='sum(rate(istio_requests_total{destination_workload="{target}"}[1m]))'), "namespace"),
+])
+def test_the_arrivals_block_is_validated(change, why):
+    arr = {k: v for k, v in dict(ARRIVALS, **change).items() if v is not None}
+    with pytest.raises(C.StagingError, match=why):
+        LG._arrivals(arr)
+
+
+def test_the_real_record_block_validates():
+    # The block for c28-staging/record-s4-legacy.json (labels checked live on prodcluster 2026-11-08 ~14:20Z).
+    sel = ('istio_requests_total{destination_workload="{target}",destination_workload_namespace="demo",'
+           'reporter="destination"}')
+    real = {"query_api": "http://127.0.0.1:18481/select/0/prometheus",
+            "rate_query": f"sum(rate({sel}[1m]))",
+            "age_query": f"time() - max(timestamp({sel}))",
+            "series_query": f"time() - max by (pod) (timestamp({sel}))",
+            "pod_label": "pod", "max_age_seconds": 120, "settle_seconds": 90}
+    assert LG._arrivals(real)["settle_seconds"] == 90
+    assert LG._arrivals({k: v for k, v in real.items() if k != "settle_seconds"})["settle_seconds"] == 90
+
+
+def test_the_metrics_client_reads_one_series_per_reporter():
+    import io
+
+    class Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def client(result, status="success"):
+        body = {"status": status, "data": {"resultType": "vector", "result": result}}
+        return REAL_PROM("http://vm", opener=lambda url, timeout: Resp(json.dumps(body).encode()), now=lambda: 1000.0)
+
+    def s(pod, v, ts=1000):
+        return {"metric": {"pod": pod} if pod else {}, "value": [ts, str(v)]}
+    assert client([s("a", 3), s("b", 25)]).vector("q", "pod") == {"a": 3.0, "b": 25.0}
+    assert client([]).vector("q", "pod") == {}                               # no series: every reporter missing
+    assert client([s("a", 3), s("a", 4)]).vector("q", "pod") is None         # duplicated: ambiguous
+    assert client([s(None, 3)]).vector("q", "pod") is None                   # unlabelled
+    assert client([s("a", "NaN")]).vector("q", "pod") is None
+    assert client([s("a", 3, ts=100)]).vector("q", "pod") is None            # not evaluated now
+    assert client([s("a", 3)], status="error").vector("q", "pod") is None
+
+
+def test_the_cli_runs_both_phases_and_verify(tmp_path, capsys):
+    api, rec = legacy_cluster(), ready_record(tmp_path)
+    path = tmp_path / "rec.json"
+    path.write_text(json.dumps(rec))
+    clock = Clock()
+
+    def plan_of(cmd):
+        assert LG.main(["--record", str(path), cmd], api=api) == 0
+        out = capsys.readouterr().out
+        return out.split(f"{cmd}: ")[1].split("\n")[0], out.strip().split()[-1]
+    assert LG.main(["--record", str(path), "park-plan"], api=api) == 1         # no phase A yet
+    f, d = plan_of("plan")
+    assert LG.main(["--record", str(path), "quiesce", "--plan", f, "--plan-digest", d], api=api,
+                   sleep=clock.sleep, monotonic=clock, clock=clock) == 0
+    assert LG.main(["--record", str(path), "park", "--plan", f, "--plan-digest", d], api=api,
+                   sleep=clock.sleep, monotonic=clock, clock=clock) == 1      # a phase A plan is not a park plan
+    f2, d2 = plan_of("park-plan")
+    assert os.path.basename(f2).startswith("park-plan-")
+    assert LG.main(["--record", str(path), "park", "--plan", f2, "--plan-digest", d2], api=api,
+                   sleep=clock.sleep, monotonic=clock, clock=clock) == 0
+    capsys.readouterr()
+    assert LG.main(["--record", str(path), "verify"], api=api, sleep=clock.sleep, monotonic=clock, clock=clock) == 0
+    assert json.loads(capsys.readouterr().out)["retired"] is True
+
+
+# --- C2.8n Codex review of #42: reporter identity, preserved baselines, recovered park writes -------------------------
+
+def replace_reporter(api, target="nginx-test"):
+    """Delete one Running pod of the target and add a new one (another name and UID) under the same ReplicaSet."""
+    rs = api.objects[("replicasets", "demo", f"{target}-rs")]["metadata"]["uid"]
+    old = next(k for k, v in sorted(api.objects.items(), key=lambda x: str(x[0])) if k[0] == "pods" and
+               any(r.get("uid") == rs for r in v["metadata"].get("ownerReferences") or []))
+    del api.objects[old]
+    api.add("pods", {"kind": "Pod", "metadata": {"name": f"{target}-replaced", "namespace": "demo",
+                                                 "ownerReferences": [{"kind": "ReplicaSet", "uid": rs,
+                                                                      "controller": True}]},
+                     "spec": {}, "status": {"phase": "Running"}})
+    return old[2]
+
+
+def test_a_late_reporter_replacement_fails_phase_a(tmp_path):
+    # Codex repro 1: a reporter replaced ten seconds before the observation ends, its old series still fresh.
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    start, done = {}, {}
+
+    def rate():
+        start.setdefault("t", clock.t)                                     # the first arrivals sample
+        return 0.0
+
+    def hook(a):
+        if "t" in start and clock.t >= start["t"] + 590 and not done:
+            done["old"] = replace_reporter(a)
+    api.on_poll.append(hook)
+    with pytest.raises(C.StagingError, match="reporter pods of nginx-test changed"):
+        quiesce(api, rec, clock, Metrics(rate_fn=rate))                    # AllFresh: every series stays fresh
+    assert done and not any(r["event"] == "quiesce-complete" for r in journal(rec))
+    with pytest.raises(C.StagingError, match="no phase A completion"):
+        LG.build_park_plan(api, rec)
+
+
+def test_a_reporter_replaced_before_parking_needs_a_new_phase_a(tmp_path):
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    quiesce(api, rec, clock)
+    replace_reporter(api, "nginx-ensemble")
+    with pytest.raises(C.StagingError, match="reporter pods of nginx-ensemble changed.*re-run phase A"):
+        LG.build_park_plan(api, rec)
+    quiesce(api, rec, clock)                                               # a new complete traffic observation
+    pplan = LG.build_park_plan(api, rec)
+    replace_reporter(api, "nginx-seasonal")                                # after the park plan was reviewed
+    with pytest.raises(C.StagingError, match="reporter pods of nginx-seasonal changed"):
+        LG.park(api, rec, pplan, C.plan_digest(pplan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    assert all(api.objects[("deployments", "demo", a)]["spec"]["replicas"] == 3 for a in LG.L.ARMS)
+    quiesce(api, rec, clock)
+    park(api, rec, clock)
+    assert LG.verify(api, rec, 600, clock.sleep, clock, clock)["retired"] is True
+
+
+def test_a_lease_created_between_park_and_verify_is_not_accepted(tmp_path):
+    # Codex repro 2: the Lease baseline is phase A's (through park-complete), never verify's first sample.
+    api, rec, clock = no_lease_cluster(), ready_record(tmp_path), Clock()
+    full(api, rec, clock)
+    api.add("leases", {"kind": "Lease", "metadata": {"name": "predictive-autoscaler-leader", "namespace": "ml-engine"},
+                       "spec": {"holderIdentity": "x", "renewTime": "2026-11-08T03:00:00Z"}})
+    v = LG.verify(api, rec, 600, clock.sleep, clock, clock)
+    assert v["retired"] is False and any("Lease appeared" in p for p in v["problems"]), v["problems"]
+    api2, rec2, clock2 = legacy_cluster(), ready_record(tmp_path / "b"), Clock()
+    full(api2, rec2, clock2)
+    api2.objects[("leases", "ml-engine", "predictive-autoscaler-leader")]["spec"]["renewTime"] = "2026-11-09T00:00:00Z"
+    v2 = LG.verify(api2, rec2, 600, clock2.sleep, clock2, clock2)
+    assert v2["retired"] is False and any("preserved baseline" in p for p in v2["problems"])
+
+
+def historical_job(api, name="ml-training-old"):
+    return api.add("jobs", {"kind": "Job", "metadata": {"name": name, "namespace": "ml-engine",
+                                                        "ownerReferences": [{"kind": "CronJob",
+                                                                             "name": "ml-training"}]},
+                            "status": {"succeeded": 1, "completionTime": "2026-11-07T00:00:00Z"}})
+
+
+def test_job_identities_are_preserved_across_phases(tmp_path):
+    # Codex repro 2b: a Job completed between park and verify is not silently accepted; deleting history is allowed.
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    historical_job(api)
+    full(api, rec, clock)
+    historical_job(api, "ml-training-new")                                 # appeared and finished after park
+    v = LG.verify(api, rec, 600, clock.sleep, clock, clock)
+    assert v["retired"] is False and any("legacy Jobs appeared ['ml-training-new']" in p for p in v["problems"])
+    del api.objects[("jobs", "ml-engine", "ml-training-new")]
+    del api.objects[("jobs", "ml-engine", "ml-training-old")]              # history cleanup: allowed
+    assert LG.verify(api, rec, 600, clock.sleep, clock, clock)["retired"] is True
+    api2, rec2, clock2 = legacy_cluster(), ready_record(tmp_path / "b"), Clock()
+    quiesce(api2, rec2, clock2)
+    historical_job(api2, "ml-training-between")                            # between phase A and park
+    with pytest.raises(C.StagingError, match="legacy Jobs appeared"):
+        LG.build_park_plan(api2, rec2)
+
+
+def test_a_committed_park_write_with_a_lost_response_resumes_after_recovery(tmp_path):
+    # Codex repro 3: the scale commits, the response is lost; recovery records it done; park-plan resumes.
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    quiesce(api, rec, clock)
+    pplan = LG.build_park_plan(api, rec)
+    real = api.replace
+
+    def lossy(path, body):
+        out = real(path, body)
+        if path.endswith("/deployments/myapptwo/scale"):
+            raise C.ApiError("replace: failed (timeout, exit 1)", 504)   # committed, response lost
+        return out
+    api.replace = lossy
+    with pytest.raises(C.ApiError):
+        LG.park(api, rec, pplan, C.plan_digest(pplan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    api.replace = real
+    assert api.objects[("deployments", "demo", "myapptwo")]["spec"]["replicas"] == 0
+    lock = C.lock_path(rec, "legacy")
+    crash_owner(lock)
+    assert list(LG.recover(api, rec, C.sha256_file(lock), clock).values()) == ["done"]
+    again = LG.build_park_plan(api, rec)
+    assert again["already_parked"] == ["nginx-test", "nginx-reactive", "myapptwo"]
+    assert "myapptwo" not in {a.get("name") for a in again["actions"]}
+    LG.park(api, rec, again, C.plan_digest(again), sleep=clock.sleep, monotonic=clock, clock=clock)
+    assert LG.verify(api, rec, 600, clock.sleep, clock, clock)["retired"] is True
+    rplan = LG.build_restore_plan(api, rec)                                 # the recovered write is undone too
+    assert "myapptwo" in [a.get("name") for a in rplan["actions"]]
+
+
+# --- C2.8n Codex re-review of 81fdeef: one validated Job snapshot, one observation --------------------------------
+
+@pytest.mark.parametrize("after_reads", [1, 2, 3, 4])
+def test_a_job_slipping_in_after_parks_validation_never_becomes_baseline(tmp_path, after_reads):
+    # Codex repro 1: a completed legacy Job inserted between park's Job validation and a later read must not be
+    # adopted: either park refuses, or verify (phase A's Job set kept through retirement) does not retire.
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    quiesce(api, rec, clock)
+    pplan = LG.build_park_plan(api, rec)
+    real_get, real_replace, st = api.get, api.replace, {"armed": False, "reads": 0, "done": False}
+
+    def replace(path, body):
+        out = real_replace(path, body)
+        if path.endswith("/deployments/ml-api/scale"):                     # the last parking write
+            st["armed"] = True
+        return out
+
+    def get(path):
+        out = real_get(path)
+        if st["armed"] and not st["done"] and path.endswith("/namespaces/ml-engine/jobs"):
+            st["reads"] += 1
+            if st["reads"] == after_reads:
+                st["done"] = True
+                historical_job(api, "ml-training-slipped")
+        return out
+    api.replace, api.get = replace, get
+    try:
+        LG.park(api, rec, pplan, C.plan_digest(pplan), sleep=clock.sleep, monotonic=clock, clock=clock)
+        parked = True
+    except C.StagingError as e:
+        parked = False
+        assert "legacy Jobs appeared" in str(e)
+    api.replace, api.get = real_replace, real_get
+    assert st["done"] or after_reads > 1                                     # inserted, or park read fewer times
+    if not st["done"]:
+        historical_job(api, "ml-training-slipped")                           # then it appears right after park
+    if parked:
+        pc = [r for r in journal(rec) if r["event"] == "park-complete"][-1]
+        slipped = api.objects[("jobs", "ml-engine", "ml-training-slipped")]["metadata"]["uid"]
+        assert slipped not in pc["data"]["jobs"]                             # never adopted unchecked
+        v = LG.verify(api, rec, 600, clock.sleep, clock, clock)
+        assert v["retired"] is False and any("ml-training-slipped" in p for p in v["problems"]), v["problems"]
+
+
+def test_verify_runs_one_observation_of_the_requested_length(tmp_path):
+    # Codex repro 2: 600 s requested must take 600 s (not 1,200), and a failure must not start another observation.
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    full(api, rec, clock)
+    t0 = clock.t
+    v = LG.verify(api, rec, 600, clock.sleep, clock, clock)
+    assert v["retired"] is True and 600 <= clock.t - t0 < 600 + LG.SAMPLE_SECONDS
+    assert v["samples"] == 61 and v["observed_seconds"] == 600               # one sample per 10 s, both ends
+    t1, fired = clock.t, {}
+
+    def late_pod(a):
+        if clock.t >= t1 + 100 and not fired:
+            fired["at"] = clock.t
+            a.add("pods", {"kind": "Pod", "metadata": {"name": "nginx-test-back", "namespace": "demo",
+                                                       "ownerReferences": [{"kind": "ReplicaSet",
+                                                                            "uid": _rs_uid(a, "nginx-test")}]},
+                           "status": {"phase": "Running"}})
+    api.on_poll.append(late_pod)
+    v2 = LG.verify(api, rec, 600, clock.sleep, clock, clock)
+    assert v2["retired"] is False and len(v2["problems"]) == 1 and v2["observed_seconds"] == 0
+    assert clock.t - t1 <= 100 + LG.SAMPLE_SECONDS                           # stopped at the failure, no second run
