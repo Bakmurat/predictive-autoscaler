@@ -7,7 +7,8 @@ Each entry is (kind, namespace, name, role). Roles decide what S4 may do, in thi
   launcher   CronJobs that start training/evidence Jobs: suspend (their active Jobs finish within the deadline);
   generator  the k6 Deployments: scale to 0 (arrivals stop first);
   operator   the old operator Deployment: scale to 0 only when every legacy PA is one of these (no other consumer);
-  lease      the old operator's Lease: observed only (renewals must stop);
+  lease      the old operator's Lease: observed if present (0472829 defaults --leader-elect=false, so it may be
+             absent); renewals must stop, and a Lease appearing during the quiet interval is a live writer;
   keda       the benchmark ScaledObjects: deleted with a UID precondition after sources are stopped (the shared KEDA
              operator keeps running); their generated HPAs (keda-hpa-<name>) must disappear with them;
   pa         the legacy PredictiveAutoscalers: kept as archived objects (their operator is stopped);

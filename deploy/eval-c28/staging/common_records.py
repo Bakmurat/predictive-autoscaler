@@ -50,6 +50,8 @@ _RUN_ID = re.compile(r"^[a-z0-9]([-a-z0-9]{0,40}[a-z0-9])?$")
 _UNRESOLVED = re.compile(r"(<[^>]*>|\bTODO\b|\bTBD\b|CHANGEME|\$\{)", re.IGNORECASE)
 # Keys that may never appear in a record, a plan or an annotation (the harness run-lock's rule).
 SECRET_KEY = re.compile(r"(token|password|passwd|secret|client-key|client_key|private|credential|bearer)", re.I)
+# Record paths whose name matches SECRET_KEY but which are a helper's own boolean switch (exact path, bool only).
+SECRET_NAMED_BOOLEANS = frozenset({"archive.velero.exclude_secrets"})
 # Env names whose literal value is redacted (broader: a key, an auth string, a certificate).
 CREDENTIAL_NAME = re.compile(r"(token|passw|secret|credential|private|bearer|api[_-]?key|access[_-]?key|auth|"
                              r"client[_-]?key|cert|^key$|_key$|-key$)", re.IGNORECASE)
@@ -134,7 +136,8 @@ def record_problems(rec: Mapping, sections: Sequence[str] = ()) -> List[str]:
         if not isinstance(rec.get(s), dict):
             out.append(f"the {s} section is required")
     for path, key, v in _walk(rec):
-        if key is not None and SECRET_KEY.search(str(key)):
+        if key is not None and SECRET_KEY.search(str(key)) and \
+                not (path in SECRET_NAMED_BOOLEANS and isinstance(v, bool)):
             out.append(f"{path}: credential material is never recorded (reference its location)")
         if isinstance(v, str) and (_UNRESOLVED.search(v) or _LEAK.search(v)):
             out.append(f"{path}: unresolved or credential-bearing value")

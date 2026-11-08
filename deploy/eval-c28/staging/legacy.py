@@ -318,7 +318,9 @@ def quiet_problems(api, rec: Mapping, obs: Mapping, baseline: Mapping, metrics: 
     """The shutdown signals at one instant against their baseline (request counters included)."""
     out = arrival_problems(metrics, _settings(rec)["arrivals"], [n for _, n, _ in obs["targets"]])
     lease = _lease(api)
-    if obs.get("lease") and lease != baseline.get("lease"):
+    if baseline.get("lease") is None and lease is not None:
+        out.append("an old-operator leader Lease appeared (a live writer)")       # observed-if-present, never new
+    elif lease != baseline.get("lease"):
         out.append("the old operator's Lease was renewed or changed")
     for ns, n, uid in obs["stopped"]:
         pods = owned_pods(api, ns, uid)
@@ -435,6 +437,9 @@ def quiesce(api, rec: Mapping, plan: Mapping, reviewed: str, sleep: Callable = t
                                         for ns, n, _ in a["targets"]}}
                 if a.get("lease") and baseline["lease"] and baseline["lease"]["uid"] != a["lease"]["uid"]:
                     raise C.StagingError("the old operator's Lease was recreated; refusing")
+                if a.get("lease") is None and baseline["lease"] is not None:
+                    raise C.StagingError("an old-operator leader Lease appeared since the plan (a live writer); "
+                                         "refusing")
                 n = _observe(lambda a=a, b=baseline: quiet_problems(api, rec, a, b, metrics), a["seconds"], sleep,
                              monotonic,
                              "the shutdown signals are not quiet")
@@ -502,6 +507,8 @@ def verify(api, rec: Mapping, observe_seconds: int = 0, sleep: Callable = time.s
         def sample():
             p, st = _snapshot_problems(api, rec, s)
             p += arrival_problems(metrics, s["arrivals"], L.ARMS)
+            if baseline.get("lease") is None and st.get("lease") is not None:
+                p.append("an old-operator leader Lease appeared (a live writer)")
             return p + (["the state changed during the observation (Lease renewal, a scale or a recreated object)"]
                         if st != baseline else [])
         try:
