@@ -1,5 +1,6 @@
-"""archive.py: sanitized snapshots, source revisions from the commit, allowlisted evidence verified off-cluster, the
-reviewed Velero Backup and its receipt; any gap refuses the archive-complete receipt."""
+"""archive.py: sanitized snapshots, campaign source revisions from the reviewed commit, allowlisted evidence bound to its
+populate-s0 export and verified off-cluster, the reviewed Velero Backup and its receipt; any gap refuses the
+archive-complete receipt."""
 
 import json
 import os
@@ -43,14 +44,22 @@ def setup(tmp_path, **velero):
         (export / rel).write_text(body)
         sums.append(f"{hashlib.sha256(body.encode()).hexdigest()}  {rel}")
     (export / "SHA256SUMS").write_text("\n".join(sums) + "\n")
-    rec = record(tmp_path, source={"commit": commit, "repo_dir": repo}, archive={
-        "evidence": {"export_dir": str(export), "allowlist": ["p8/*", "freeze/*", "SHA256SUMS"],
-                     "mandatory": ["p8/run-1/result.json", "freeze/capture-v7.tar.gz", "SHA256SUMS"],
+    (export / "S0-SHA256SUMS").write_text("\n".join(sums) + "\n")
+    # source.commit stays the record default (the helper commit, absent from the repo): never what gets archived
+    rec = record(tmp_path, archive={
+        "source_revision": {"repo_dir": repo, "commit": commit},
+        "evidence": {"export_dir": str(export), "allowlist": ["p8/*", "freeze/*", "SHA256SUMS", "S0-SHA256SUMS"],
+                     "mandatory": ["p8/run-1/result.json", "freeze/capture-v7.tar.gz", "SHA256SUMS",
+                                   "S0-SHA256SUMS"],
                      "checksum_manifests": ["SHA256SUMS"],
                      "destination": str(tmp_path / "offcluster")},
         "velero": {"namespace": "velero", "backup_name": "c28-r1-legacy-20261108", "storage_location": "minio-default",
                    "ttl": "2160h0m0s", "metadata_only": True, "included_namespaces": ["demo", "ml-engine"],
                    "included_cluster_resources": ["customresourcedefinitions"], **velero}})
+    s0 = C.sha256_file(str(export / "S0-SHA256SUMS"))
+    done = C.append_receipt(rec, A.POPULATE, "export-complete", {"files": 4, "plan_sha256": "e" * 64,
+                                                                 "s0_sha256sums": s0}, lambda: T0)
+    rec["archive"]["evidence"]["export_receipt"] = {"sha256": done["sha256"], "s0_sha256sums": s0}
     return legacy_cluster(), rec
 
 
@@ -74,7 +83,7 @@ def test_a_complete_archive_earns_its_receipt_and_leaks_nothing(tmp_path):
     kinds = {s["kind"] for s in plan["snapshots"]}
     assert {"deployments", "cronjobs", "scaledobjects", "pa-legacy", "persistentvolumeclaims", "persistentvolumes",
             "horizontalpodautoscalers", "leases", "customresourcedefinitions"} <= kinds
-    assert set(plan["source"]["blobs"]) == {"deploy/prodcluster/demo/kustomization.yaml",
+    assert set(plan["campaign_source"]["blobs"]) == {"deploy/prodcluster/demo/kustomization.yaml",
                                             "deploy/eks-benchmark/demo/nginx-test.yaml",
                                             "k8s-manifests/base/09-operator-deployment.yaml"}
     backup = plan["velero"]
@@ -88,6 +97,11 @@ def test_a_complete_archive_earns_its_receipt_and_leaks_nothing(tmp_path):
     A.velero_receipt(api, rec, plan)
     r = A.verify(rec, plan)
     assert r["event"] == "archive-complete" and r["data"]["plan_sha256"] == d
+    campaign = rec["archive"]["source_revision"]["commit"]
+    assert plan["campaign_source"]["commit"] == campaign != plan["source_commit"] == rec["source"]["commit"]
+    assert r["data"]["campaign_commit"] == campaign and r["data"]["helper_commit"] == "a" * 40
+    assert r["data"]["export_receipt_sha256"] == rec["archive"]["evidence"]["export_receipt"]["sha256"]
+    assert "source_commit" not in r["data"]
     for f in (tmp_path / "evidence").rglob("*"):
         if f.is_file():
             text = f.read_text()
@@ -248,3 +262,68 @@ def test_an_extra_missing_object_is_never_covered_by_an_earlier_review(tmp_path)
                                                             "name": "p8-evidence-pvc", "role": "retained"}])
     with pytest.raises(C.StagingError, match="missing set"):
         A.verify(rec, edited)
+
+
+def _second_commit(repo, drop=None):
+    g = lambda *a: subprocess.run(["git", "-C", repo, *a], check=True, capture_output=True, text=True,  # noqa
+                                  env=git_free())
+    if drop:
+        g("rm", "-q", "-r", drop)
+    else:
+        with open(os.path.join(repo, "deploy/prodcluster/demo/later.yaml"), "w") as fh:
+            fh.write("# after the campaign\n")
+        g("add", "-A")
+    g("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "-m", "later")
+    return g("rev-parse", "HEAD").stdout.strip()
+
+
+def test_the_campaign_revision_is_archived_not_the_checkout_or_helper(tmp_path):
+    api, rec = setup(tmp_path)
+    repo, campaign = rec["archive"]["source_revision"]["repo_dir"], rec["archive"]["source_revision"]["commit"]
+    head = _second_commit(repo)                                  # the checkout moved on after the campaign
+    rec["source"]["commit"] = head                               # and the helper runs from it
+    plan = A.build_plan(api, rec)
+    assert plan["campaign_source"]["commit"] == campaign and plan["source_commit"] == head
+    assert "deploy/prodcluster/demo/later.yaml" not in plan["campaign_source"]["blobs"]
+
+
+@pytest.mark.parametrize("change, why", [
+    (lambda rec, repo: rec["archive"].pop("source_revision"), "source_revision"),
+    (lambda rec, repo: rec["archive"]["source_revision"].pop("repo_dir"), "source_revision"),
+    (lambda rec, repo: rec["archive"]["source_revision"].update(commit="75f4a2e"), "full git commit"),
+    (lambda rec, repo: rec["archive"]["source_revision"].update(commit="b" * 40), "is not a commit"),
+    (lambda rec, repo: rec["archive"]["source_revision"].update(
+        commit=subprocess.run(["git", "-C", repo, "rev-parse", "HEAD^{tree}"], check=True, capture_output=True,
+                              text=True, env=git_free()).stdout.strip()), "is not a commit"),
+    (lambda rec, repo: rec["archive"]["source_revision"].update(commit=_second_commit(repo, "k8s-manifests")),
+     "lacks k8s-manifests/base"),
+])
+def test_the_campaign_revision_must_be_explicit_and_complete(tmp_path, change, why):
+    api, rec = setup(tmp_path)
+    change(rec, rec["archive"]["source_revision"]["repo_dir"])
+    with pytest.raises(C.StagingError, match=why):
+        A.build_plan(api, rec)
+
+
+@pytest.mark.parametrize("change, why", [
+    (lambda rec, tmp: rec["archive"]["evidence"].pop("export_receipt"), "export_receipt"),
+    (lambda rec, tmp: rec["archive"]["evidence"]["export_receipt"].update(sha256="f" * 64), "names no populate-s0"),
+    (lambda rec, tmp: rec["archive"]["evidence"]["export_receipt"].update(s0_sha256sums="f" * 64),
+     "does not match the export-complete"),
+    (lambda rec, tmp: (tmp / "export" / "S0-SHA256SUMS").write_text("changed\n"), "does not match the export-complete"),
+])
+def test_the_evidence_is_bound_to_its_populate_export(tmp_path, change, why):
+    api, rec = setup(tmp_path)
+    change(rec, tmp_path)
+    with pytest.raises(C.StagingError, match=why):
+        A.build_plan(api, rec)
+
+
+def test_a_staged_export_changed_after_planning_refuses_the_receipt(tmp_path):
+    api, rec = setup(tmp_path)
+    plan, d = run_all(api, rec)
+    complete_backup(api, rec)
+    A.velero_receipt(api, rec, plan)
+    (tmp_path / "export" / "S0-SHA256SUMS").write_text("changed\n")
+    with pytest.raises(C.StagingError, match="S0-SHA256SUMS does not match"):
+        A.verify(rec, plan)
