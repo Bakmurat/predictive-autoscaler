@@ -1,5 +1,5 @@
-"""archive.py: sanitized snapshots, campaign source revisions from the reviewed commit, allowlisted evidence bound to its
-populate-s0 export and verified off-cluster, the reviewed Velero Backup and its receipt; any gap refuses the
+"""archive.py: sanitized snapshots, campaign source revisions from the reviewed commit, allowlisted evidence bound to
+its populate-s0 export and verified off-cluster, the reviewed Velero Backup and its receipt; any gap refuses the
 archive-complete receipt."""
 
 import json
@@ -44,7 +44,8 @@ def setup(tmp_path, **velero):
         (export / rel).write_text(body)
         sums.append(f"{hashlib.sha256(body.encode()).hexdigest()}  {rel}")
     (export / "SHA256SUMS").write_text("\n".join(sums) + "\n")
-    (export / "S0-SHA256SUMS").write_text("\n".join(sums) + "\n")
+    s0 = sums + [f"{hashlib.sha256((export / 'SHA256SUMS').read_bytes()).hexdigest()}  SHA256SUMS"]
+    (export / "S0-SHA256SUMS").write_text("\n".join(s0) + "\n")
     # source.commit stays the record default (the helper commit, absent from the repo): never what gets archived
     rec = record(tmp_path, archive={
         "source_revision": {"repo_dir": repo, "commit": commit},
@@ -327,3 +328,62 @@ def test_a_staged_export_changed_after_planning_refuses_the_receipt(tmp_path):
     (tmp_path / "export" / "S0-SHA256SUMS").write_text("changed\n")
     with pytest.raises(C.StagingError, match="S0-SHA256SUMS does not match"):
         A.verify(rec, plan)
+
+
+def _resum(tmp_path):
+    """What a careless or hostile re-stage does: regenerate the alternate SHA256SUMS, keep S0-SHA256SUMS and the
+    populate receipt as they were."""
+    import hashlib
+    export = tmp_path / "export"
+    lines = [f"{hashlib.sha256((export / rel).read_bytes()).hexdigest()}  {rel}"
+             for rel in ("p8/run-1/result.json", "freeze/capture-v7.tar.gz") if (export / rel).exists()]
+    (export / "SHA256SUMS").write_text("\n".join(lines) + "\n")
+
+
+@pytest.mark.parametrize("change, why", [
+    (lambda rec, tmp: ((tmp / "export" / "p8/run-1/result.json").write_text('{"ok": false}'), _resum(tmp)),
+     "p8/run-1/result.json does not match its recorded checksum"),
+    (lambda rec, tmp: ((tmp / "export" / "freeze/capture-v7.tar.gz").unlink(),
+                       rec["archive"]["evidence"]["mandatory"].remove("freeze/capture-v7.tar.gz"), _resum(tmp)),
+     "freeze/capture-v7.tar.gz is missing"),
+    (lambda rec, tmp: ((tmp / "export" / "p8/run-1/extra.json").write_text("{}"),
+                       rec["archive"]["evidence"]["mandatory"].append("p8/run-1/extra.json")),
+     "extra.json is archived but not certified"),
+])
+def test_the_certified_payload_is_verified_whatever_the_checksum_manifests_list(tmp_path, change, why):
+    # Codex #40: checksum_manifests omits S0-SHA256SUMS here; the original receipt and S0 manifest are unchanged.
+    api, rec = setup(tmp_path)
+    assert "S0-SHA256SUMS" not in rec["archive"]["evidence"]["checksum_manifests"]
+    change(rec, tmp_path)
+    with pytest.raises(C.StagingError, match=why):
+        A.build_plan(api, rec)
+
+
+def test_a_payload_altered_after_planning_refuses_the_receipt(tmp_path):
+    api, rec = setup(tmp_path)
+    plan, d = run_all(api, rec)
+    complete_backup(api, rec)
+    A.velero_receipt(api, rec, plan)
+    (tmp_path / "export" / "p8/run-1/result.json").write_text('{"ok": false}')
+    _resum(tmp_path)
+    with pytest.raises(C.StagingError, match="result.json does not match its recorded checksum"):
+        A.verify(rec, plan)
+
+
+def test_the_destination_s0_manifest_is_always_verified(tmp_path):
+    api, rec = setup(tmp_path)
+    plan, d = run_all(api, rec)
+    complete_backup(api, rec)
+    A.velero_receipt(api, rec, plan)
+    (tmp_path / "offcluster" / "S0-SHA256SUMS").write_text("0" * 64 + "  p8/run-1/result.json\n")
+    with pytest.raises(C.StagingError, match="S0-SHA256SUMS differs at the destination"):
+        A.verify(rec, plan)
+    # and with the planned copy intact but a certified file swapped at the destination
+    api2, rec2 = setup(tmp_path / "b")
+    plan2, _ = run_all(api2, rec2)
+    complete_backup(api2, rec2)
+    A.velero_receipt(api2, rec2, plan2)
+    plan2 = dict(plan2, evidence=[f for f in plan2["evidence"] if f["path"] != "p8/run-1/result.json"],
+                 mandatory=[m for m in plan2["mandatory"] if m != "p8/run-1/result.json"])
+    (tmp_path / "b" / "offcluster" / "p8/run-1/result.json").write_text("swapped")
+    assert any("S0-SHA256SUMS: p8/run-1/result.json does not match" in p for p in A.verify_destination(plan2))

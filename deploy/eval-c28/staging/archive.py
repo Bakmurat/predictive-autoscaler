@@ -13,8 +13,9 @@ The plan binds: the sanitized snapshots of every allowlisted legacy object and e
 the claims' PVs), the campaign source revisions (git ls-tree of archive.source_revision.commit, the reviewed
 benchmark revision, never the helper commit source.commit nor the working tree: blob ids of deploy/prodcluster,
 deploy/eks-benchmark and k8s-manifests/base, each required), the populate-s0 export-complete receipt the evidence
-comes from (archive.evidence.export_receipt, with the S0-SHA256SUMS digest it certified), the evidence files the
-approved export procedure staged locally (record archive.evidence.export_dir; only files matching
+comes from (archive.evidence.export_receipt, with the S0-SHA256SUMS digest it certified; every file S0-SHA256SUMS
+certifies is re-hashed here and at the destination, and the archived evidence is exactly those files plus the
+manifest, whatever checksum_manifests lists), the evidence files the approved export procedure staged locally (record archive.evidence.export_dir; only files matching
 archive.evidence.allowlist, never a live
 database file or WAL; every file of the explicit archive.evidence.mandatory manifest present; every checksum manifest
 in archive.evidence.checksum_manifests verified file by file, here and again at the destination), and the Velero
@@ -45,6 +46,7 @@ import legacy_allowlist as L  # noqa: E402
 
 HELPER = "archive"
 POPULATE = "populate-s0"
+S0_SUMS = "S0-SHA256SUMS"
 SOURCE_PATHS = ("deploy/prodcluster", "deploy/eks-benchmark", "k8s-manifests/base")
 LIVE_DB = ("*-wal", "*-shm", "*-journal", "*.sqlite", "*.sqlite3", "*.db")
 
@@ -78,9 +80,24 @@ def _campaign_source(rec: Mapping, run=subprocess.run) -> Dict:
     return {"commit": commit, "paths": list(SOURCE_PATHS), "blobs": blobs}
 
 
+def _s0_entries(root: str) -> Dict[str, str]:
+    """S0-SHA256SUMS as {path: sha256}, every entry verified against the file it certifies (always, whatever
+    archive.evidence.checksum_manifests lists)."""
+    problems = checksum_chain_problems(root, [S0_SUMS])
+    if problems:
+        raise C.StagingError(f"{S0_SUMS} does not verify: " + "; ".join(problems))
+    out = {}
+    for ln in open(os.path.join(root, S0_SUMS)).read().splitlines():
+        if ln.strip():
+            want, rel = ln.split(None, 1)
+            out[os.path.normpath(rel.lstrip("*").strip())] = want.lower()
+    return out
+
+
 def _export_binding(rec: Mapping) -> Dict:
     """The completed populate-s0 export this archive takes its evidence from: its export-complete receipt (by hash, in
-    the verified chain) and the S0-SHA256SUMS digest it certified, which must still match the staged file."""
+    the verified chain), the S0-SHA256SUMS digest it certified, which must still match the staged file, and every
+    file that manifest certifies, re-hashed."""
     ev = rec["archive"].get("evidence") or {}
     ref = ev.get("export_receipt")
     if not isinstance(ref, dict) or set(ref) != {"sha256", "s0_sha256sums"}:
@@ -89,12 +106,26 @@ def _export_binding(rec: Mapping) -> Dict:
     done = [r for r in C.read_receipts(C.receipts_path(rec, POPULATE)) if r["sha256"] == ref["sha256"]]
     if not done or done[0]["event"] != "export-complete" or done[0]["run_id"] != rec["run_id"]:
         raise C.StagingError("archive.evidence.export_receipt names no populate-s0 export-complete receipt of this run")
-    sums = os.path.join(ev.get("export_dir") or "", "S0-SHA256SUMS")
+    root = ev.get("export_dir") or ""
+    sums = os.path.join(root, S0_SUMS)
     if done[0]["data"].get("s0_sha256sums") != ref["s0_sha256sums"] or not os.path.isfile(sums) \
             or C.sha256_file(sums) != ref["s0_sha256sums"]:
-        raise C.StagingError("S0-SHA256SUMS does not match the export-complete receipt: the staged export changed")
+        raise C.StagingError(f"{S0_SUMS} does not match the export-complete receipt: the staged export changed")
+    entries = _s0_entries(root)
     return {"receipt_sha256": ref["sha256"], "s0_sha256sums": ref["s0_sha256sums"],
-            "plan_sha256": done[0]["data"].get("plan_sha256")}
+            "plan_sha256": done[0]["data"].get("plan_sha256"), "entries": len(entries),
+            "entries_sha256": C.digest(entries)}
+
+
+def _inventory_problems(evidence: List[Mapping], entries: Mapping[str, str]) -> List[str]:
+    """The archived evidence is exactly what S0-SHA256SUMS certifies, plus that manifest itself."""
+    have = {f["path"]: f["sha256"] for f in evidence if f["path"] != S0_SUMS}
+    out = [f"{p} is archived but not certified by {S0_SUMS}" for p in sorted(set(have) - set(entries))]
+    out += [f"{p} is certified by {S0_SUMS} but not archived" for p in sorted(set(entries) - set(have))]
+    out += [f"{p} differs from its {S0_SUMS} entry" for p in sorted(set(have) & set(entries)) if have[p] != entries[p]]
+    if not any(f["path"] == S0_SUMS for f in evidence):
+        out.append(f"{S0_SUMS} itself is not archived")
+    return out
 
 
 def _evidence_files(rec: Mapping) -> List[Dict]:
@@ -226,10 +257,15 @@ def build_plan(api, rec: Mapping, run=subprocess.run) -> Dict:
         raise C.StagingError("the velero.io API group is not served: no Velero backup is possible")
     if api.get(vpath) is not None:
         raise C.StagingError(f"a Velero Backup named {backup['metadata']['name']} exists: choose a unique name")
+    evidence = _evidence_files(rec)                  # its own chains first, then the populate export binding
+    binding = _export_binding(rec)
+    gaps = _inventory_problems(evidence, _s0_entries(rec["archive"]["evidence"]["export_dir"]))
+    if gaps:
+        raise C.StagingError("the evidence is not the certified populate-s0 export: " + "; ".join(gaps))
     return C.make_plan(HELPER, rec, [], inventory_sha256=C.digest(inv), snapshots=objs,
                        unaccounted=inv["legacy"]["missing"], blockers=inv["legacy"]["blockers"],
-                       campaign_source=_campaign_source(rec, run), export=_export_binding(rec),
-                       evidence=_evidence_files(rec), velero=backup,
+                       campaign_source=_campaign_source(rec, run), export=binding,
+                       evidence=evidence, velero=backup,
                        mandatory=sorted(rec["archive"]["evidence"]["mandatory"]),
                        checksum_manifests=sorted(rec["archive"]["evidence"].get("checksum_manifests") or []),
                        destination=rec["archive"]["evidence"].get("destination"))
@@ -289,9 +325,9 @@ def verify_destination(plan: Mapping) -> List[str]:
             out.append(f"{f['path']} missing at the destination")
         elif C.sha256_file(d) != f["sha256"]:
             out.append(f"{f['path']} differs at the destination")
-    if not out and plan.get("checksum_manifests"):
-        out += [f"at the destination: {p}" for p in checksum_chain_problems(plan["destination"],
-                                                                           plan["checksum_manifests"])]
+    if not out:
+        chains = sorted(set(plan.get("checksum_manifests") or []) | {S0_SUMS})
+        out += [f"at the destination: {p}" for p in checksum_chain_problems(plan["destination"], chains)]
     return out
 
 
