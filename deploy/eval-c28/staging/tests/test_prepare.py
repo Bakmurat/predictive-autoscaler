@@ -5,6 +5,7 @@ import pytest
 import yaml
 
 import execlib as X
+import part2_fixtures as PF
 import fake2 as F
 import prepare
 from part2_fixtures import RUN, api, base_params, make_record, prepare_section  # noqa: F401
@@ -101,7 +102,7 @@ def test_existing_writer_naming_a_target_is_rejected(api, make_record):
                           "metadata": {"name": "old", "namespace": "demo"},
                           "spec": {"targetDeployment": {"name": "c28-pa-n-s20", "namespace": "demo"}}})
     probs = prepare.plan(record, kube, "targets")["problems"]
-    assert any("LegacyPredictiveAutoscaler/old already writes demo/c28-pa-n-s20" in x for x in probs)
+    assert any("LegacyPredictiveAutoscaler/demo/old already writes demo/c28-pa-n-s20" in x for x in probs)
 
 
 def test_optional_api_absence_is_discovered(make_record):
@@ -147,7 +148,7 @@ def test_verify_detects_replacement_writers_and_dirty_faults(api, make_record):
     text = "\n".join(out["problems"])
     assert out["result"] == "FAIL"
     assert "c28-h-rps-s20-faults: fault schedule is not empty" in text
-    assert "c28-h-cpu-s20: writers ['HorizontalPodAutoscaler/stray']" in text
+    assert "c28-h-cpu-s20: writers ['HorizontalPodAutoscaler/demo/stray#" in text
     assert "c28-pa-r-s90 was replaced" in text
 
 
@@ -155,3 +156,38 @@ def test_cli_apply_needs_phase_and_plan(api, make_record):
     record, _ = setup(api, make_record)
     assert prepare.main(["--record", record.path, "apply", "--plan-digest", "0" * 64], api=api) == 1
     assert api.mutations() == []
+
+
+def test_lost_response_resumes_from_the_journal(api, make_record):
+    """Codex #32 item 2: a committed create whose response was lost holds the shared lock; after recovery the phase
+    resumes, counting the object as this run's (by its intent annotation), and targets.json lists all ten."""
+    import common_records as C
+    record, kube = setup(api, make_record)
+    for ph in ("namespaces", "common"):
+        run_phase(record, kube, ph)
+    plan, digest = reviewed(record, kube, "targets")
+    real = api.create
+    calls = {"n": 0}
+
+    def lost(path, body):
+        out = real(path, body)
+        calls["n"] += 1
+        if body["kind"] == "Deployment" and calls["n"] > 3:
+            raise C.ApiError("create: failed (timeout)", 504)
+        return out
+    api.create = lost
+    with pytest.raises(X.StagingError):
+        prepare.apply(record, kube, "targets", plan, digest)
+    api.create = real
+    lock = PF.lock_file(record)
+    assert os.path.exists(lock)
+    assert any("unknown outcomes" in p for p in prepare.plan(record, kube, "targets")["problems"])
+    PF.recover(record, kube)
+    assert not os.path.exists(lock)
+    p2, d2 = reviewed(record, kube, "targets")
+    assert p2["problems"] == [] and p2["already_created_by_this_run"]
+    prepare.apply(record, kube, "targets", p2, d2)
+    targets = json.load(open(os.path.join(record.evidence_dir, "targets.json")))
+    assert len(targets["deployments"]) == 10
+    for name, uid in targets["deployments"].items():
+        assert api.obj("Deployment", name, "demo")["metadata"]["uid"] == uid

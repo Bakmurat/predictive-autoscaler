@@ -33,6 +33,27 @@ def base_params():
     return p
 
 
+def lock_file(record):
+    return C.lock_path(record.doc, X.LOCK_SCOPE)
+
+
+def crash_owner(record):
+    """Make the held lock look left behind by a dead executor (a PID that has certainly exited), as recovery requires."""
+    p = subprocess.Popen(["true"])
+    p.wait()
+    path = lock_file(record)
+    body = json.load(open(path))
+    body["pid"] = p.pid
+    open(path, "w").write(json.dumps(body, sort_keys=True))
+
+
+def recover(record, kube, follow_up=None):
+    crash_owner(record)
+    rp = X.recover_plan(record, kube)
+    saved = X.save_plan(record, "recover", rp, "recover-plan")
+    return X.recover(record, kube, X.load_plan(saved["plan"]), saved["plan_digest"], follow_up)
+
+
 def mutations(api):
     return api.mutations()
 
@@ -48,7 +69,8 @@ def make_record(tmp_path):
         (tmp_path / "params.json").write_text(json.dumps(params or base_params()))
         doc = {"schema": C.RECORD_SCHEMA, "run_id": RUN, "cluster_uid": fake2.CLUSTER,
                "kubeconfig": {"path": "/home/ops/.kube/eval-prod.yaml", "context": "prodcluster"},
-               "evidence_dir": "evidence", "source": {"commit": COMMIT}, "params": "params.json"}
+               "evidence_dir": "evidence", "lock_dir": str(tmp_path / "shared-locks"),
+               "source": {"commit": COMMIT}, "params": "params.json"}
         doc.update(copy.deepcopy(extra or {}))
         path = tmp_path / "preparation.json"
         path.write_text(json.dumps(doc))
@@ -84,7 +106,8 @@ def freeze_inputs():
             "queries": [{"name": n, "expr": f'sum(x{{target="{{target}}",q="{n}"}})', "step": 15}
                         for n in Fz.REQUIRED_QUERIES],
             "collection": {"query_api": "http://vmselect.monitoring.svc:8481/select/0/prometheus", "namespace": "demo"},
-            "schedule": {"start_utc": START, "end_utc": END, "blocks": blocks},
+            "schedule": {"start_utc": START, "end_utc": END, "blocks": blocks,
+                         "qualification_deadline_utc": "2026-12-15T00:00:00Z", "max_release_lateness_s": 120},
             "admission": {"headroom": 0.25}, "data_licenses": [], "retention": {"days": 400},
             "acknowledgments": {"executor": {"name": "exec", "at": "2026-11-20T00:00:00Z"},
                                 "reviewer": {"name": "alice", "at": "2026-11-21T00:00:00Z"}}}
@@ -101,6 +124,26 @@ def plan_and_apply(mod, record, kube, *args, **kw):
     assert p.get("problems", []) == [], p.get("problems")
     saved = X.save_plan(record, p["helper"], p)
     return mod.apply(record, kube, *args, X.load_plan(saved["plan"]), saved["plan_digest"], **kw)
+
+
+def operator_sync(api):
+    """A fake operator: each PredictiveAutoscaler's observed mode follows its spec (as a reconcile would)."""
+    for (k, _, _), o in list(api.objects.items()):
+        if k == "pa-new":
+            o.setdefault("status", {})["mode"] = o.get("spec", {}).get("mode")
+
+
+class Clock:
+    """A test clock: sleep advances now."""
+
+    def __init__(self, t):
+        self.t = t
+
+    def now(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t += int(s)
 
 
 @pytest.fixture(scope="session")
@@ -135,11 +178,16 @@ def world(tmp_path, api, make_record, ssh_keys):
     (tmp_path / "allowed_signers").write_text(signers)
     (tmp_path / "receipts").mkdir()
     (tmp_path / "gates").mkdir()
+    (tmp_path / "quota-injection-plan.md").write_text("reviewed quota injection plan (test copy)\n")
+    api.on_poll.append(operator_sync)
     extra = {"reserve": reserve_section(), "prepare": prepare_section(),
              "freeze": {"inputs": "inputs.json", "source_dir": REPO, "images": "evidence/images.json",
                         "manifest_root": ".", "runlock": "evidence/runlock.json",
                         "allowed_signers": "allowed_signers", "reviewers": ["alice", "bob"],
                         "receipts_dir": "receipts", "gates_dir": "gates",
+                        "prerequisites": {"quota_injection_plan": {
+                            "path": "quota-injection-plan.md",
+                            "sha256": C.sha256_file(str(tmp_path / "quota-injection-plan.md"))}},
                         "qualification": {"not_before": "2026-11-25T00:00:00Z", "expires": "2027-01-24T00:00:00Z",
                                           "out": "evidence/lab-qualification.json"}}}
     record = X.load_record(make_record(extra))

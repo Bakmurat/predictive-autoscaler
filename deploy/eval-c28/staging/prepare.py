@@ -156,7 +156,7 @@ def _exists(kube: X.Kube, obj: Dict) -> Optional[Dict]:
 
 def _writer_refs(kube: X.Kube, namespace: str, names: List[str]) -> List[str]:
     inv = X.writer_inventory(kube, namespace, names)
-    return [f"{w} already writes {namespace}/{n}" for n, ws in sorted(inv.items()) for w in ws]
+    return [f"{X.ident_str(w)} already writes {namespace}/{n}" for n, ws in sorted(inv.items()) for w in ws]
 
 
 def _objects_for(phase: str, record: X.Record, params: Dict, s: Dict, parts: Dict) -> List[Dict]:
@@ -194,10 +194,20 @@ def plan(record: X.Record, kube: X.Kube, phase: str) -> Dict:
         out.update({"file": path, "values_sha256": X.sha256_bytes(text.encode()), "values": v})
         return X.new_plan(HELPER, record, [{"write": path, "sha256": out["values_sha256"]}], problems=problems, **out)
     objs = _objects_for(phase, record, params, s, parts)
-    create, existing = [], []
+    create, existing, ours = [], [], []
+    entries = X.receipts(record, HELPER)
+    mine = {e["data"]["mark"] for e in X.applied_intents(entries)}
+    unknown = X.open_intents(entries)
+    if unknown:
+        problems.append("the journal has intents with unknown outcomes: run recover first")
     for o in objs:
         m = o["metadata"]
         live = _exists(kube, o)
+        mark = ((live or {}).get("metadata", {}).get("annotations") or {}).get(X.INTENT_ANNOTATION)
+        if live is not None and mark in mine:          # created by this run's journalled create (e.g. before a crash)
+            ours.append({"kind": o["kind"], "namespace": m.get("namespace"), "name": m["name"],
+                         "uid": live["metadata"]["uid"]})
+            continue
         if phase == "namespaces":
             if live is not None:
                 if live.get("status", {}).get("phase") == "Terminating":
@@ -228,6 +238,7 @@ def plan(record: X.Record, kube: X.Kube, phase: str) -> Dict:
                 problems.append(f"namespace {ns} does not exist (phase namespaces first)")
     if phase == "targets":
         names = sorted(o["metadata"]["name"] for o in create if o["kind"] == "Deployment")
+        names += sorted(r["name"] for r in ours if r["kind"] == "Deployment")
         problems += _writer_refs(kube, params["namespace"], names)
         if os.path.exists(os.path.join(record.evidence_dir, "targets.json")):
             problems.append("targets.json exists: targets are created once per run")
@@ -237,7 +248,8 @@ def plan(record: X.Record, kube: X.Kube, phase: str) -> Dict:
             problems.append("the scoped quota must start at its approved normal limit")
     actions = [{"create": o["kind"], "namespace": o["metadata"].get("namespace"), "name": o["metadata"]["name"],
                 "sha256": X.json_digest(o)} for o in create]
-    return X.new_plan(HELPER, record, actions, existing=existing, problems=problems, **out)
+    return X.new_plan(HELPER, record, actions, existing=existing, already_created_by_this_run=ours,
+                      problems=problems, **out)
 
 
 def apply(record: X.Record, kube: X.Kube, phase: str, reviewed: Dict, reviewed_digest: str) -> Dict:
@@ -255,27 +267,33 @@ def apply(record: X.Record, kube: X.Kube, phase: str, reviewed: Dict, reviewed_d
     objs = {(o["kind"], o["metadata"].get("namespace"), o["metadata"]["name"]): o
             for o in _objects_for(phase, record, params, s, split(params))}
     created = []
-    for c in p["actions"]:
-        o = objs[(c["create"], c["namespace"], c["name"])]
-        if X.json_digest(o) != c["sha256"]:
-            raise X.StagingError(f"{c['create']}/{c['name']} rendered differently from the reviewed plan; refusing")
-        live = kube.create(o)
-        ref = X.object_ref(live)
-        created.append(ref)
-        X.receipt(record, HELPER, "created", {"phase": phase, "plan_sha256": reviewed_digest, "object": ref})
+    with X.mutating(record, kube, HELPER, {"phase": phase}):
+        for c in p["actions"]:
+            o = objs[(c["create"], c["namespace"], c["name"])]
+            if X.json_digest(o) != c["sha256"]:
+                raise X.StagingError(f"{c['create']}/{c['name']} rendered differently from the reviewed plan; "
+                                     "refusing")
+            created.append(X.object_ref(kube.create(o)))
     if phase == "targets":
-        uids = {r["name"]: r["uid"] for r in created if r["kind"] == "Deployment"}
+        uids = {r["name"]: r["uid"] for (k, ns, n), r in created_objects(record).items()
+                if k == "Deployment" and ns == params["namespace"] and n.startswith("c28-") and n != "c28-ingress"}
         X.write_new(os.path.join(record.evidence_dir, "targets.json"),
                     json.dumps({"schema": "c28-targets/v1", "run_id": record.run_id,
                                 "cluster_uid": record.cluster_uid, "namespace": params["namespace"],
                                 "deployments": uids}, indent=1, sort_keys=True) + "\n")
     return X.receipt(record, HELPER, "phase-complete", {"phase": phase, "plan_sha256": reviewed_digest,
-                                                        "created": created})
+                                                        "created": created, "already_created": p["already_created_by_this_run"]})
 
 
 def created_objects(record: X.Record) -> Dict[tuple, Dict]:
-    return {(e["data"]["object"]["kind"], e["data"]["object"]["namespace"], e["data"]["object"]["name"]):
-            e["data"]["object"] for e in X.receipts(record, HELPER) if e["event"] == "created"}
+    """Everything this run's prepare created, from its journal (applied creates, live or recovered)."""
+    out = {}
+    for it in X.applied_intents(X.receipts(record, HELPER)):
+        d = it["data"]
+        if d["op"] == "create":
+            out[(d["kind"], d["namespace"], d["name"])] = {"kind": d["kind"], "namespace": d["namespace"],
+                                                           "name": d["name"], "uid": d["result_uid"]}
+    return out
 
 
 def verify(record: X.Record, kube: X.Kube) -> Dict:
@@ -305,11 +323,14 @@ def verify(record: X.Record, kube: X.Kube) -> Dict:
                     problems.append(f"claim {name}: its volume {pv_name} does not reclaim with Retain")
     targets = sorted(r["name"] for r in seen if r["kind"] == "Deployment" and r["namespace"] == params["namespace"]
                      and r["name"] != "c28-ingress")
-    pas = {r["name"] for r in seen if r["kind"] == "PredictiveAutoscaler"}
+    pas = {r["name"]: r for r in seen if r["kind"] == "PredictiveAutoscaler"}
     for name, writers in sorted(X.writer_inventory(kube, params["namespace"], targets).items()):
-        want = [f"PredictiveAutoscaler/{name}"] if name in pas else []
+        want = [{"kind": "PredictiveAutoscaler", "namespace": params["namespace"], "name": name,
+                 "uid": pas[name]["uid"]}] if name in pas else []
         if writers != want:
-            problems.append(f"{name}: writers {writers or 'none'}, expected {want or 'none'} outside a session")
+            got = [f"{X.ident_str(w)}#{w['uid']}" for w in writers] or "none"
+            problems.append(f"{name}: writers {got}, expected {[X.ident_str(w) for w in want] or 'none'} "
+                            "outside a session")
         live = kube.get("Deployment", name, params["namespace"])
         if live and live["spec"].get("replicas") != 2:
             problems.append(f"{name} has {live['spec'].get('replicas')} replicas, not the fixed 2, outside a session")
@@ -321,7 +342,7 @@ def main(argv=None, api=None) -> int:
     ap = argparse.ArgumentParser(prog="prepare.py", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--record", required=True)
-    ap.add_argument("command", nargs="?", default="plan", choices=["plan", "apply", "verify"])
+    ap.add_argument("command", nargs="?", default="plan", choices=["plan", "apply", "verify", "recover-plan", "recover"])
     ap.add_argument("--phase", default="", choices=("",) + PHASES)
     ap.add_argument("--plan", default="")
     ap.add_argument("--plan-digest", default="")
@@ -329,7 +350,13 @@ def main(argv=None, api=None) -> int:
     try:
         record = X.load_record(args.record, ("prepare",))
         kube = record.kube(api)
-        if args.command == "plan":
+        if args.command == "recover-plan":
+            X.emit(X.cli_plan(record, "recover", X.recover_plan(record, kube), "recover-plan"))
+        elif args.command == "recover":
+            if not args.plan:
+                raise X.StagingError("recover needs --plan <the reviewed recover plan> and --plan-digest")
+            X.emit(X.recover(record, kube, X.load_plan(args.plan), args.plan_digest))
+        elif args.command == "plan":
             X.emit([X.cli_plan(record, HELPER, plan(record, kube, ph), f"plan-{ph}")
                     for ph in ([args.phase] if args.phase else PHASES)])
         elif args.command == "apply":

@@ -96,9 +96,11 @@ def test_prerequisite_hash_mismatch_is_a_problem(world, tmp_path):
 
 
 def test_unapplied_reservation_is_a_problem(world):
-    for e in X.receipts(world["record"], "reserve"):
-        if e["event"] == "node-reserved":
-            X.receipt(world["record"], "reserve", "node-restored", {"node": e["data"]["node"]})
+    import reserve
+    record = world["record"]
+    p = reserve.rollback_plan(record, world["kube"])
+    saved = X.save_plan(record, p["helper"], p, "rollback-plan")
+    reserve.rollback(record, world["kube"], X.load_plan(saved["plan"]), saved["plan_digest"])
     probs = freeze.plan(world["record"])["problems"]
     assert any("reservation is not applied" in x for x in probs)
 
@@ -189,3 +191,51 @@ def test_qualification_expiring_before_the_schedule_needs_a_successor(world):
     assemble(world)
     q = freeze.plan_qualification(record)
     assert "schedule and review a successor" in q["successor_required"]
+
+
+def test_qualification_derives_from_the_signed_lock_and_rejects_drift(world):
+    """Codex #32 item 1: changing the image digest or a target UID after signing must not qualify."""
+    needs_ssh(world)
+    assemble(world)
+    record = world["record"]
+    write_receipt(world, "alice"); write_receipt(world, "bob")
+    for g in freeze.QUAL_GATES:
+        write_gate(world, g, "alice"); write_gate(world, g, "bob")
+    q = freeze.plan_qualification(record)
+    assert q["problems"] == [] and q["document"]["scope"]["targets"][0]["uid"] == \
+        json.load(open(record.resolve("evidence/runlock.json")))["activation_scope"]["targets"]["c28-pa-e-s20"]
+    images_path = record.resolve("evidence/images.json")
+    images = json.load(open(images_path))
+    images["images"]["statistical"]["ref"] = "harbor.example/autoscaler/statistical-evaluation@sha256:" + "9" * 64
+    open(images_path, "w").write(json.dumps(images))
+    probs = freeze.plan_qualification(record)["problems"]
+    assert any("images.json differs from the signed run-lock" in p for p in probs)
+    images["images"]["statistical"]["ref"] = "harbor.example/autoscaler/statistical-evaluation@sha256:" + "c" * 64
+    open(images_path, "w").write(json.dumps(images))
+    targets_path = os.path.join(record.evidence_dir, "targets.json")
+    targets = json.load(open(targets_path))
+    targets["deployments"]["c28-pa-n-s20"] = "99999999-0000-4000-8000-000000000000"
+    open(targets_path, "w").write(json.dumps(targets))
+    probs = freeze.plan_qualification(record)["problems"]
+    assert any("targets.json differs from the signed run-lock" in p for p in probs)
+
+
+def test_assembly_requires_the_deadline_and_lateness_limit(world):
+    inputs = json.load(open(world["tmp"] / "inputs.json"))
+    del inputs["schedule"]["qualification_deadline_utc"]
+    inputs["schedule"]["max_release_lateness_s"] = 0
+    (world["tmp"] / "inputs.json").write_text(json.dumps(inputs))
+    probs = "\n".join(freeze.plan(world["record"])["problems"])
+    assert "qualification_deadline_utc" in probs and "max_release_lateness_s" in probs
+
+
+def test_cli_live_plan(world, capsys):
+    """Codex #32 item 6: the --live path lists Deployments by label (it used to raise TypeError)."""
+    record = world["record"]
+    assert freeze.main(["--record", record.path, "plan", "--live"], api=world["api"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["problems"] == []
+    world["api"].obj("ResourceQuota", "c28-fixture-quota", "demo")["metadata"]["uid"] = \
+        "99999999-0000-4000-8000-000000000001"
+    assert freeze.main(["--record", record.path, "plan", "--live"], api=world["api"]) == 0
+    assert any("quota's live UID differs" in p for p in json.loads(capsys.readouterr().out)["problems"])

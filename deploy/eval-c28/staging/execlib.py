@@ -16,8 +16,15 @@ legacy_allowlist names the legacy API group. This module only adds what part 2 n
   * Reviewed plans: `plan` writes the plan once (evidence/<helper>/<name>-<digest12>.json) and prints its digest; a
     mutation takes --plan <file> --plan-digest <digest>, checks it with require_reviewed, and ALSO recomputes the plan
     from the live state: if the live plan's digest differs, the state changed since review and nothing is done.
-  * writer_inventory: every replica writer of the fixture targets across HPA, KEDA and BOTH PredictiveAutoscaler API
-    groups, with optional APIs skipped only when discovery shows them absent.
+  * writer_inventory: every replica writer of the fixture targets, as FULL identities (kind, namespace, name, UID),
+    across HPA, KEDA (an HPA collapses into its ScaledObject only when the live ScaledObject's UID matches) and BOTH
+    PredictiveAutoscaler API groups, with optional APIs skipped only when discovery shows them absent.
+  * Durable intents on common_records' protocol: mutating() holds the ONE shared lock of the evaluation scope
+    (exclusive_lock(rec, "evaluation") in the record's lock_dir) for reserve, prepare and session; every create,
+    replace and delete goes through mutation_step (intent-<n> with the validated pre-state BEFORE the call, step-<n>
+    after); an unknown outcome keeps the lock; recover() takes recovery_guard (owner proven terminated), writes
+    reconciled-<n> for what it can decide from the live objects, and releases the stale lock only when nothing stays
+    unresolved. What a helper owns is derived from this journal.
 """
 
 from __future__ import annotations
@@ -124,15 +131,193 @@ def load_record(path_: str, sections: Iterable[str] = ()) -> Record:
     return Record(path_, C.load_record(path_, tuple(sections)))
 
 
+# --- the shared mutation lock and durable intents (common_records' protocol) ----------------------------------------
+
+LOCK_SCOPE = "evaluation"                 # ONE lock (common_records.exclusive_lock) for every part-2 helper's mutations
+INTENT_ANNOTATION = "c28.devkuban.com/intent"
+DEFINITIVE = (400, 401, 403, 404, 409, 422, 429)   # the API refused: nothing was applied
+PART2_HELPERS = ("reserve", "prepare", "session")
+
+
+def lock_file(record: "Record") -> str:
+    return C.lock_path(record.doc, LOCK_SCOPE)
+
+
+def _steps(entries: List[Dict]) -> Dict[str, Dict]:
+    """{n: {"intent": data, "outcome": step data | None, "reconciled": data | None}} of a helper's receipts."""
+    out: Dict[str, Dict] = {}
+    for e in entries:
+        ev = e["event"]
+        for prefix, key in (("intent-", "intent"), ("step-", "outcome"), ("reconciled-", "reconciled")):
+            if ev.startswith(prefix):
+                out.setdefault(ev[len(prefix):], {"intent": None, "outcome": None, "reconciled": None})[key] = e["data"]
+    return out
+
+
+def applied_intents(entries: List[Dict]) -> List[Dict]:
+    """Intents applied (step-<n> result applied, or reconciled-<n> observed done), in order, with data.result_uid."""
+    res = []
+    for n, s in sorted(_steps(entries).items(), key=lambda kv: int(kv[0])):
+        if s["intent"] is None:
+            continue
+        done = (s["outcome"] or {}).get("result") == "applied" or (s["reconciled"] or {}).get("observed") == "done"
+        if done:
+            uid = ((s["outcome"] or {}).get("post") or {}).get("uid") or (s["reconciled"] or {}).get("uid") \
+                or s["intent"].get("uid")
+            res.append({"step": n, "data": dict(s["intent"], result_uid=uid)})
+    return res
+
+
+def open_intents(entries: List[Dict]) -> List[Dict]:
+    """Intents with neither an outcome nor a reconciliation: UNRESOLVED (they keep the lock)."""
+    return [{"step": n, "data": s["intent"]} for n, s in sorted(_steps(entries).items(), key=lambda kv: int(kv[0]))
+            if s["intent"] is not None and s["outcome"] is None and s["reconciled"] is None]
+
+
+class Journal:
+    """Every mutation through common_records.mutation_step: intent-<n> (operation, target, validated pre-state, the
+    post-state it expects, the annotation a create carries) durable BEFORE the call, step-<n> after it with the
+    post-state from the call's own response. A definitive API refusal is recorded as step-<n> result not-applied (the
+    lock stays safe); any other failure leaves the intent unresolved and the lock held until `recover`."""
+
+    def __init__(self, record: "Record", helper: str, lock, context: Optional[Dict] = None):
+        self.record, self.helper, self.lock, self.context = record, helper, lock, dict(context or {})
+
+    def run(self, op: str, kind: str, namespace: Optional[str], name: str, fn: Callable[[str], Dict], uid: str = "",
+            pre: Optional[Dict] = None, expect: Optional[List] = None, body_sha256: str = "") -> Dict:
+        entries = receipts(self.record, self.helper)
+        n = str(max([int(k) for k in _steps(entries)] or [0]) + 1)
+        mark = f"{self.record.run_id}/{self.helper}/{n}"
+        intent = {"op": op, "kind": kind, "namespace": namespace, "name": name, "uid": uid, "pre": pre or {},
+                  "expect": expect or [], "body_sha256": body_sha256, "mark": mark, "context": self.context}
+        refused: List = []
+
+        def call():
+            try:
+                out = fn(mark)
+            except C.ApiError as e:
+                if getattr(e, "status", None) in DEFINITIVE:
+                    refused.append(e)
+                    return "not-applied", {"status": e.status}
+                raise
+            m = (out or {}).get("metadata") or {}
+            return "applied", {"uid": m.get("uid") or uid, "resourceVersion": m.get("resourceVersion")}
+        C.mutation_step(self.record.doc, self.helper, self.lock, n, intent, call)
+        if refused:
+            raise refused[0]
+        return {"mark": mark, "step": n}
+
+
+def pointer_get(obj, ptr: str):
+    cur = obj
+    for part in [p.replace("~1", "/").replace("~0", "~") for p in ptr.lstrip("/").split("/")]:
+        if isinstance(cur, list):
+            try:
+                cur = cur[int(part)]
+            except (ValueError, IndexError):
+                return None
+        elif isinstance(cur, dict):
+            cur = cur.get(part)
+        else:
+            return None
+        if cur is None:
+            return None
+    return cur
+
+
+def _expect_holds(obj: Dict, expect: List) -> bool:
+    for ptr, value in expect:
+        got = pointer_get(obj, ptr)
+        if isinstance(value, dict) and "contains" in value:
+            if value["contains"] not in (got or []):
+                return False
+        elif isinstance(value, dict) and "lacks" in value:
+            if value["lacks"] in (got or []):
+                return False
+        elif got != value:
+            return False
+    return True
+
+
+def reconcile(kube: "Kube", d: Dict) -> Dict:
+    """What an unresolved intent actually did, read live: {"observed": done | not-done | unresolved, ...}."""
+    live = kube.get(d["kind"], d["name"], d["namespace"])
+    if d["op"] == "create":
+        if live is None:
+            return {"observed": "not-done", "why": "absent"}
+        if (live["metadata"].get("annotations") or {}).get(INTENT_ANNOTATION) == d["mark"]:
+            return {"observed": "done", "uid": live["metadata"]["uid"]}
+        return {"observed": "unresolved", "why": "an object of that name exists without this intent's annotation"}
+    if d["op"] == "delete":
+        if live is None or live["metadata"].get("uid") != d["uid"]:
+            return {"observed": "done", "uid": d["uid"]}
+        return {"observed": "not-done", "uid": d["uid"]}
+    if live is None or live["metadata"].get("uid") != d["uid"]:
+        return {"observed": "unresolved", "why": "the object is gone or replaced"}
+    if _expect_holds(live, d["expect"]):
+        return {"observed": "done", "uid": d["uid"]}
+    if live["metadata"].get("resourceVersion") == d["pre"].get("resourceVersion"):
+        return {"observed": "not-done", "uid": d["uid"]}
+    return {"observed": "unresolved", "why": "changed since the intent, but not to the expected state"}
+
+
+def recover_plan(record: "Record", kube: "Kube") -> Dict:
+    """Read-only: the held lock (with its sha256, which recovery must be given) and every unresolved intent of the
+    part-2 helpers, observed against the live state."""
+    actions = []
+    for helper in PART2_HELPERS:
+        for it in open_intents(receipts(record, helper)):
+            d = it["data"]
+            actions.append({"helper": helper, "step": it["step"], "op": d["op"], "kind": d["kind"],
+                            "namespace": d["namespace"], "name": d["name"], "context": d.get("context", {}),
+                            **reconcile(kube, d)})
+    path_ = lock_file(record)
+    sha = C.sha256_file(path_) if os.path.exists(path_) else ""
+    return new_plan("recover", record, actions, lock=path_, lock_sha256=sha,
+                    unresolved=[a for a in actions if a["observed"] == "unresolved"])
+
+
+def recover(record: "Record", kube: "Kube", reviewed: Dict, reviewed_digest: str,
+            follow_up: Optional[Callable[[List[Dict]], None]] = None) -> Dict:
+    """common_records.recovery_guard (one recoverer, the lock's executor proven terminated), then reconciled-<n> for
+    every decided outcome; the stale lock is released only when nothing stays unresolved."""
+    live = recover_plan(record, kube)
+    require_live(reviewed, reviewed_digest, "recover", record, live)
+    with C.recovery_guard(record.doc, LOCK_SCOPE, live["lock_sha256"]) as guard:
+        C.require_cluster(kube.api, record.cluster_uid)
+        for a in live["actions"]:
+            if a["observed"] != "unresolved":
+                C.append_receipt(record.doc, a["helper"], f"reconciled-{a['step']}",
+                                 {k: a[k] for k in ("observed", "uid", "why", "context") if k in a})
+        if live["unresolved"]:
+            receipt(record, "recover", "recovery-unresolved", {"plan_sha256": reviewed_digest,
+                                                               "unresolved": live["unresolved"]})
+            raise StagingError(f"unresolved outcomes {[(a['helper'], a['step']) for a in live['unresolved']]}: "
+                               "the lock stays; reconcile them by hand")
+        if follow_up:
+            follow_up(live["actions"])
+        guard.release_stale()
+        return receipt(record, "recover", "lock-recovered", {"plan_sha256": reviewed_digest,
+                                                              "lock_sha256": live["lock_sha256"],
+                                                              "reconciled": len(live["actions"])})
+
+
 # --- typed API access -----------------------------------------------------------------------------------------------
 
 class Kube:
-    """Typed access over a common_records API (KubectlApi or a fake with the same methods)."""
+    """Typed access over a common_records API (KubectlApi or a fake with the same methods). Every mutation goes through
+    a Journal (intent before, outcome after) and checks the cluster identity first; without a journal it refuses."""
 
     def __init__(self, api, cluster_uid: str):
         self.api, self.cluster_uid = api, cluster_uid
         self.mutations: List[Dict] = []
+        self.journal: Optional[Journal] = None
         self._groups: Optional[Dict] = None
+
+    def _journal(self) -> Journal:
+        if self.journal is None:
+            raise StagingError("a mutation needs the shared lock and an intent journal")
+        return self.journal
 
     def identity(self) -> str:
         return C.cluster_uid(self.api)
@@ -166,18 +351,29 @@ class Kube:
         return out
 
     def create(self, obj: Dict) -> Dict:
+        j = self._journal()
         m = obj["metadata"]
         C.require_cluster(self.api, self.cluster_uid)
-        out = self.api.create(path(obj["kind"], m.get("namespace")), obj)
+        result: Dict = {}
+
+        def do(mark):
+            body = copy.deepcopy(obj)
+            body["metadata"].setdefault("annotations", {})[INTENT_ANNOTATION] = mark
+            result["out"] = self.api.create(path(obj["kind"], m.get("namespace")), body)
+            return result["out"]
+        j.run("create", obj["kind"], m.get("namespace"), m["name"], do, body_sha256=C.digest(obj))
+        out = result["out"]
         out.setdefault("kind", obj["kind"])
         self.mutations.append({"op": "create", **C.summary(out)})
         return out
 
     def update(self, kind: str, name: str, namespace: Optional[str], uid: str, mutate: Callable[[Dict], None],
-               attempts: int = 3) -> Dict:
+               expect: Optional[List] = None, pre_fields: Iterable[str] = (), attempts: int = 3) -> Dict:
         """Read, check the UID, apply `mutate` to a copy (it raises StagingError when the object is not as reviewed),
-        then replace with the read resourceVersion and UID. A concurrent edit is retried only by re-reading and
-        re-checking; a replaced object is refused."""
+        record the intent (pre-state resourceVersion, and `expect`: [json pointer, value | {"contains": x} |
+        {"lacks": x}] that hold after the change), then replace with the read resourceVersion and UID. A conflict is
+        retried by re-reading and re-checking; a replaced object is refused."""
+        j = self._journal()
         if not (isinstance(uid, str) and _UUID.match(uid)):
             raise StagingError(f"{kind}/{name}: an update needs the bound UID")
         last_err = None
@@ -190,10 +386,19 @@ class Kube:
             body["metadata"]["uid"] = uid
             body["metadata"]["resourceVersion"] = cur["metadata"]["resourceVersion"]
             C.require_cluster(self.api, self.cluster_uid)
+            pre = {"resourceVersion": cur["metadata"]["resourceVersion"],
+                   "fields": {f: pointer_get(cur, f) for f in pre_fields}}
             try:
-                out = self.api.replace(path(kind, namespace, name), body)
+                result: Dict = {}
+
+                def do(mark, body=body):
+                    result["out"] = self.api.replace(path(kind, namespace, name), body)
+                    return result["out"]
+                j.run("update", kind, namespace, name, do, uid=uid, pre=pre, expect=expect or [],
+                      body_sha256=C.digest(body))
+                out = result["out"]
             except C.ApiError as e:
-                if getattr(e, "status", None) == 409 or "conflict" in str(e).lower():
+                if getattr(e, "status", None) == 409:
                     last_err = e
                     continue
                 raise
@@ -203,11 +408,33 @@ class Kube:
         raise StagingError(f"{kind}/{name}: kept losing to concurrent updates ({last_err}); refusing")
 
     def delete(self, kind: str, name: str, namespace: Optional[str], uid: str) -> None:
+        j = self._journal()
         if not (isinstance(uid, str) and _UUID.match(uid)):
             raise StagingError(f"{kind}/{name}: a delete needs the bound UID")
         C.require_cluster(self.api, self.cluster_uid)
-        self.api.delete(path(kind, namespace, name), uid)
+        j.run("delete", kind, namespace, name, lambda mark: self.api.delete(path(kind, namespace, name), uid), uid=uid)
         self.mutations.append({"op": "delete", "kind": kind, "namespace": namespace, "name": name, "uid": uid})
+
+
+class mutating:
+    """`with X.mutating(record, kube, helper, context) as lock:` holds the run's shared evaluation lock
+    (common_records.exclusive_lock) and journals every call through mutation_step. The lock is released only when
+    every call's outcome is known (lock.safe), even if a caller swallowed the exception of an unknown outcome."""
+
+    def __init__(self, record: "Record", kube: Kube, helper: str, context: Optional[Dict] = None):
+        self.record, self.kube, self.helper, self.context = record, kube, helper, context
+        self.lock = C.exclusive_lock(record.doc, LOCK_SCOPE, holder=helper)
+
+    def __enter__(self):
+        self.lock.__enter__()
+        self.kube.journal = Journal(self.record, self.helper, self.lock, self.context)
+        return self.lock
+
+    def __exit__(self, exc_type, exc, tb):
+        self.kube.journal = None
+        if self.lock.safe and os.path.exists(self.lock.path):
+            os.unlink(self.lock.path)
+        return False
 
 
 def object_ref(obj: Dict) -> Dict:
@@ -312,32 +539,75 @@ WRITER_KINDS = ("HorizontalPodAutoscaler", "ScaledObject", "PredictiveAutoscaler
 OPTIONAL_WRITERS = ("ScaledObject", "LegacyPredictiveAutoscaler")
 
 
-def writer_inventory(kube: Kube, namespace: str, names: Iterable[str]) -> Dict[str, List[str]]:
-    """Every replica writer of each named Deployment: HPAs, ScaledObjects and PredictiveAutoscalers of BOTH API groups
-    (an optional API is skipped only when discovery shows it absent; the others are required). A KEDA-generated HPA
-    counts as its ScaledObject; PredictiveAutoscalers in other namespaces naming these targets are included."""
+def ident(kind: str, obj: Dict) -> Dict:
+    m = obj.get("metadata") or {}
+    return {"kind": kind, "namespace": m.get("namespace"), "name": m.get("name"), "uid": m.get("uid")}
+
+
+def ident_str(i: Dict) -> str:
+    return f"{i['kind']}/{i['namespace']}/{i['name']}"
+
+
+def writer_inventory(kube: Kube, namespace: str, names: Iterable[str]) -> Dict[str, List[Dict]]:
+    """Every replica writer of each named Deployment, as FULL identities {kind, namespace, name, uid}: HPAs,
+    ScaledObjects and PredictiveAutoscalers of BOTH API groups, from any namespace that can target these Deployments
+    (an optional API is skipped only when discovery shows it absent; the others are required). An HPA counts as a
+    ScaledObject only when its controller owner reference names a LIVE ScaledObject of that name in its namespace
+    with exactly that UID; any other HPA is its own writer."""
     c28 = import_harness()
     names = set(names)
-    found: Dict[str, List[str]] = {n: [] for n in names}
+    found: Dict[str, List[Dict]] = {n: [] for n in names}
+    scaled = {}
+    if kube.served("ScaledObject"):
+        scaled = {(o["metadata"].get("namespace"), o["metadata"]["name"]): o["metadata"].get("uid")
+                  for o in kube.list("ScaledObject", None)}
     for kind in WRITER_KINDS:
         if not kube.served(kind):
             if kind in OPTIONAL_WRITERS:
                 continue
             raise StagingError(f"the {group_of(kind)} API is not served: the writer inventory cannot be complete")
         cross = kind in ("PredictiveAutoscaler", "LegacyPredictiveAutoscaler")
-        for o in kube.list(kind, None if cross else namespace):
+        for o in kube.list(kind, None):
             as_writer = dict(o, kind="PredictiveAutoscaler" if cross else kind)
-            owners = [r for r in o.get("metadata", {}).get("ownerReferences", [])
-                      if r.get("kind") == "ScaledObject" and r.get("controller")]
             for ns, name in c28.render._writer_targets(as_writer):
                 if ns != namespace or name not in names:
                     continue
-                w = f"{kind}/{o['metadata']['name']}"
-                if kind == "HorizontalPodAutoscaler" and owners:
-                    w = f"ScaledObject/{owners[0]['name']}"
+                w = ident(kind, o)
+                if kind == "HorizontalPodAutoscaler":
+                    owners = [r for r in o.get("metadata", {}).get("ownerReferences", [])
+                              if r.get("kind") == "ScaledObject" and r.get("controller")]
+                    so_ns = o["metadata"].get("namespace")
+                    if owners and scaled.get((so_ns, owners[0].get("name"))) == owners[0].get("uid"):
+                        w = {"kind": "ScaledObject", "namespace": so_ns, "name": owners[0]["name"],
+                             "uid": owners[0]["uid"]}
                 if w not in found[name]:
                     found[name].append(w)
-    return {k: sorted(v) for k, v in found.items()}
+    return {k: sorted(v, key=lambda i: (i["kind"], i["namespace"] or "", i["name"], i["uid"] or ""))
+            for k, v in found.items()}
+
+
+def subset_diff(want, live, path_: str = "", ignore: Iterable[str] = ()) -> List[str]:
+    """Paths where the rendered (reviewed) object differs from the live one. Every rendered leaf must be present and
+    equal live; fields the API server only ADDS (defaults, status) are not differences. `ignore`: path prefixes."""
+    if any(path_ == p or path_.startswith(p + "/") for p in ignore):
+        return []
+    if isinstance(want, dict):
+        if not isinstance(live, dict):
+            return [path_ or "/"]
+        out = []
+        for k, v in want.items():
+            out += subset_diff(v, live.get(k), f"{path_}/{k}", ignore)
+        return out
+    if isinstance(want, list):
+        if not isinstance(live, list) or len(live) != len(want):
+            return [path_]
+        out = []
+        for i, (a, b) in enumerate(zip(want, live)):
+            out += subset_diff(a, b, f"{path_}/{i}", ignore)
+        return out
+    if want == live or (isinstance(want, (int, float)) and not isinstance(want, bool) and str(want) == str(live)):
+        return []
+    return [path_]
 
 
 def write_new(p: str, text: str) -> str:
@@ -357,3 +627,7 @@ json_digest = C.digest
 
 def utcnow() -> str:
     return C.utc_now()
+
+
+def json_pointer(key: str) -> str:
+    return key.replace("~", "~0").replace("/", "~1")

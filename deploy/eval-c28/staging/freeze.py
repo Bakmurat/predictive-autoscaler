@@ -96,22 +96,24 @@ def _images(record: X.Record, s: Dict) -> Tuple[Dict, str]:
 
 
 def _prepared(record: X.Record) -> Dict:
+    import prepare
     entries = X.receipts(record, "prepare")
-    created = {(e["data"]["object"]["kind"], e["data"]["object"]["name"]): e["data"]["object"]
-               for e in entries if e["event"] == "created"}
+    created = {(k, n): ref for (k, _, n), ref in prepare.created_objects(record).items()}
     phases = {e["data"]["phase"] for e in entries if e["event"] == "phase-complete"}
     return {"created": created, "phases": phases}
 
 
 def _infrastructure(record: X.Record) -> Tuple[Dict, List[str]]:
     s = record.section("reserve")
+    import reserve
     entries = X.receipts(record, "reserve")
-    applied = {e["data"]["node"]["uid"] for e in entries if e["event"] == "node-reserved"}
-    restored = {e["data"]["node"]["uid"] for e in entries if e["event"] == "node-restored"}
+    held = reserve.reserved_nodes(record)
     nodes, probs = [], []
+    if X.open_intents(entries):
+        probs.append("the reserve journal has intents with unknown outcomes: run recover first")
     for role in ("workload", "support"):
         n = s["nodes"][role]
-        if n["uid"] not in applied or n["uid"] in restored:
+        if n["uid"] not in held:
             probs.append(f"the {role} node's reservation is not applied in the reserve receipts")
         nodes.append({"role": role, "name": n["name"], "uid": n["uid"]})
     return {"nodes": nodes, "reservation_receipts_sha256": entries[-1]["sha256"] if entries else ""}, probs
@@ -200,7 +202,8 @@ def assemble_doc(record: X.Record) -> Tuple[Dict, Dict, List[str]]:
         "scorer": {"sha256": X.sha256_file(os.path.join(src, "deploy", "eval-c28", "harness", "c28", "score.py")),
                    "bootstrap_seed": F.BOOTSTRAP_SEED},
         "activation_scope": {"cluster_uid": record.cluster_uid, "namespaces": [params["namespace"]],
-                             "target_uids": sorted(targets["deployments"].values())},
+                             "target_uids": sorted(targets["deployments"].values()),
+                             "targets": dict(sorted(targets["deployments"].items()))},
         "fault_scope": {"namespace": params["namespace"], "quota_name": params["quota"]["name"],
                         "quota_uid": (quota or {}).get("uid", ""), "run_label": f"{X.RUN_LABEL}={record.run_id}",
                         "priority_class": params["priority_class"], "pods_normal": params["quota"]["pods_normal"]},
@@ -209,6 +212,16 @@ def assemble_doc(record: X.Record) -> Tuple[Dict, Dict, List[str]]:
     }
     if targets.get("cluster_uid") != record.cluster_uid or len(targets.get("deployments", {})) != 10:
         problems.append("targets.json is not the ten targets of this cluster")
+    if images.get("fixture") != params["image"]:
+        problems.append("the params' fixture image is not the verified images.json fixture")
+    sch = inputs["schedule"]
+    qd = sch.get("qualification_deadline_utc")
+    if not (isinstance(qd, str) and c28.runlock._TS.match(qd) and sch.get("start_utc", "") <= qd < sch.get("end_utc", "")):
+        problems.append("schedule.qualification_deadline_utc (the frozen 14-day qualification deadline) is required "
+                        "inside the schedule")
+    lat = sch.get("max_release_lateness_s")
+    if not (isinstance(lat, int) and not isinstance(lat, bool) and 0 < lat <= 900):
+        problems.append("schedule.max_release_lateness_s (the predeclared block lateness limit, 1-900 s) is required")
     for label, pr in sorted((s.get("prerequisites") or {}).items()):
         path = record.resolve(pr.get("path", ""))
         if not os.path.isfile(path) or X.sha256_file(path) != pr.get("sha256"):
@@ -239,7 +252,7 @@ def live_identity_problems(record: X.Record, kube: X.Kube, doc: Dict) -> List[st
     out = []
     params = X.load_params(record)
     deployed = {d["metadata"]["uid"] for d in kube.list("Deployment", params["namespace"],
-                                                         selector=f"{X.RUN_LABEL}={record.run_id}")}
+                                                         labels={X.RUN_LABEL: record.run_id})}
     missing = sorted(set(doc["activation_scope"]["target_uids"]) - deployed)
     if missing:
         out.append(f"target UIDs not live: {missing}")
@@ -330,16 +343,13 @@ def _signed_docs(record: X.Record, directory: str, namespace: str, run: Callable
     return out
 
 
-def reviewer_status(record: X.Record, runlock_digest: str, run: Callable = subprocess.run) -> Tuple[bool, str]:
-    """Two distinct allowlisted reviewers signed receipts for exactly this canonical run-lock digest, before the
-    schedule's start."""
+def _valid_receipts(record: X.Record, runlock_digest: str, run: Callable) -> Tuple[Dict[str, Dict], List[str]]:
+    """{reviewer: receipt} of the valid, signed reviewer receipts for this canonical run-lock digest (signed before
+    the schedule's start), and why the others do not count."""
     s = _section(record)
-    try:
-        _, lock = _verified_lock(record)
-    except X.StagingError as e:
-        return False, str(e)
+    _, lock = _verified_lock(record)
     start = lock["schedule"]["start_utc"]
-    good, notes = set(), []
+    good, notes = {}, []
     for doc, prob in _signed_docs(record, s["receipts_dir"], RECEIPT_NS, run):
         if prob:
             notes.append(prob)
@@ -350,11 +360,37 @@ def reviewer_status(record: X.Record, runlock_digest: str, run: Callable = subpr
         elif not (isinstance(doc.get("at"), str) and doc["at"] < start):
             notes.append(f"{doc.get('reviewer')}: signed at {doc.get('at')}, not before the schedule start {start}")
         else:
-            good.add(doc["reviewer"])
+            good[doc["reviewer"]] = doc
+    return good, notes
+
+
+def reviewer_status(record: X.Record, runlock_digest: str, run: Callable = subprocess.run) -> Tuple[bool, str]:
+    """Two distinct allowlisted reviewers signed receipts for exactly this canonical run-lock digest, before the
+    schedule's start."""
+    try:
+        good, notes = _valid_receipts(record, runlock_digest, run)
+    except X.StagingError as e:
+        return False, str(e)
     if len(good) < 2:
         return False, f"{len(good)} valid reviewer receipt(s), two distinct required" + (
             f" ({'; '.join(notes)})" if notes else "")
     return True, f"signed by {sorted(good)}"
+
+
+def signed_prerequisite(record: X.Record, runlock_digest: str, label: str, run: Callable = subprocess.run) -> bool:
+    """The prerequisite `label` (freeze.prerequisites) exists with its recorded hash, and at least two distinct valid
+    reviewer receipts attest exactly that hash."""
+    pr = (_section(record).get("prerequisites") or {}).get(label)
+    if not pr:
+        return False
+    path = record.resolve(pr.get("path", ""))
+    if not os.path.isfile(path) or X.sha256_file(path) != pr.get("sha256"):
+        return False
+    try:
+        good, _ = _valid_receipts(record, runlock_digest, run)
+    except X.StagingError:
+        return False
+    return len([r for r in good.values() if (r.get("prerequisites") or {}).get(label) == pr["sha256"]]) >= 2
 
 
 def gate_status(record: X.Record, runlock_digest: str, run: Callable = subprocess.run) -> Dict[str, Dict]:
@@ -409,18 +445,29 @@ def plan_qualification(record: X.Record, run: Callable = subprocess.run) -> Dict
     for g, v in gates.items():
         if v["outcome"] != "pass":
             problems.append(f"{g} is {v['outcome']}: no qualification without two signed passes")
-    images, commit = _images(record, s)
-    st_ref = images.get("statistical", "")
+    # Source, image and scope come from the SIGNED run-lock only; the working files must agree with it.
+    commit = lock["source"]["commit"]
+    st_ref = lock["images"].get("statistical", "")
+    scope = lock["activation_scope"]
+    ns = lock["collection"]["namespace"]
+    lock_targets = scope.get("targets") or {}
+    pa_targets = sorted(n for n in lock_targets if n.startswith("c28-pa-"))
+    if sorted(lock_targets.values()) != sorted(scope["target_uids"]) or len(pa_targets) != 6:
+        problems.append("the run-lock's activation scope does not name the six PA targets by UID")
+    images, img_commit = _images(record, s)
+    if images.get("statistical") != st_ref or img_commit != commit:
+        problems.append("images.json differs from the signed run-lock (statistical image or source commit)")
     targets = _load(os.path.join(record.evidence_dir, "targets.json"))
-    params = X.load_params(record)
-    pa_targets = sorted(n for n in targets["deployments"] if n.startswith("c28-pa-"))
+    if targets.get("deployments") != lock_targets or targets.get("cluster_uid") != scope["cluster_uid"]:
+        problems.append("targets.json differs from the signed run-lock's target UIDs")
+    if scope["cluster_uid"] != record.cluster_uid:
+        problems.append("the signed run-lock is for another cluster than the record")
     reviewers = sorted({r for v in gates.values() for r in v["signed_pass_by"]})
     doc = {"schema": "lab-qualification/v1", "source_tree": commit, "image_digest": st_ref.partition("@")[2],
            "run_lock_sha256": digest, "gates": {g: "pass" for g in QUAL_GATES}, "reviewers": reviewers,
            "not_before": q.get("not_before", ""), "expires": q.get("expires", ""),
-           "scope": {"cluster_uid": record.cluster_uid, "namespaces": [params["namespace"]],
-                     "targets": [{"namespace": params["namespace"], "name": n, "uid": targets["deployments"][n]}
-                                 for n in pa_targets]}}
+           "scope": {"cluster_uid": scope["cluster_uid"], "namespaces": [ns],
+                     "targets": [{"namespace": ns, "name": n, "uid": lock_targets[n]} for n in pa_targets]}}
     if not problems:
         problems += _validate_qualification(doc, commit)
     successor = None

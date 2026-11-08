@@ -1,8 +1,10 @@
 import json
+import os
 
 import pytest
 
 import execlib as X
+import part2_fixtures as PF
 import fake2 as F
 import reserve
 from part2_fixtures import RUN, S_UID, W_UID, api, base_params, make_record, reserve_section  # noqa: F401
@@ -69,8 +71,10 @@ def test_apply_adds_exactly_taint_and_label_and_saves_originals(api, make_record
     s = api.obj("Node", "worker-s")
     assert s["spec"]["taints"] == [TAINT] and s["metadata"]["labels"]["c28.devkuban.com/role"] == "support"
     assert {v for v, _ in api.mutations()} == {"replace"}            # no delete, drain, evict, cordon
-    reserved = [e for e in X.receipts(record, "reserve") if e["event"] == "node-reserved"]
-    assert reserved[0]["data"]["node"]["original_taints"] == [keep]
+    held = reserve.reserved_nodes(record)
+    assert held[W_UID]["original_taints"] == [keep] and held[S_UID]["original_taints"] is None
+    intents = [e for e in X.receipts(record, "reserve") if e["event"].startswith("intent-")]
+    assert intents[0]["data"]["pre"]["fields"]["/spec/taints"] == [keep]       # pre-state on disk before the call
 
 
 def test_conflicting_existing_value_is_refused(api, make_record):
@@ -185,3 +189,26 @@ def test_cli_plan_then_apply(api, make_record, capsys):
     capsys.readouterr()
     assert reserve.main(args, api=api) == 1                       # the live state moved on: refused
     assert reserve.main(["--record", record.path, "apply", "--plan-digest", out["plan_digest"]], api=api) == 1
+
+
+def test_lost_response_during_apply_is_recovered_from_the_journal(api, make_record):
+    """Codex #32 item 2: the node patch commits, the response is lost; the lock is held, recovery records it, and
+    rollback still knows the original taints (from the intent's pre-state)."""
+    import common_records as C
+    record, kube = setup(api, make_record)
+    plan, digest = reviewed(record, kube)
+    real = api.replace
+
+    def lost(path, body):
+        out = real(path, body)
+        raise C.ApiError("replace: failed (timeout)", 504)
+    api.replace = lost
+    with pytest.raises(X.StagingError):
+        reserve.apply(record, kube, plan, digest)
+    api.replace = real
+    assert os.path.exists(PF.lock_file(record))
+    assert reserve.rollback_plan(record, kube)["problems"]                  # unknown outcomes: recover first
+    PF.recover(record, kube)
+    assert W_UID in reserve.reserved_nodes(record)
+    do_rollback(record, kube)
+    assert api.obj("Node", "worker-w")["spec"].get("taints") == []

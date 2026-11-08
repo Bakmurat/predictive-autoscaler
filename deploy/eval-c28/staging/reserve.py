@@ -194,30 +194,59 @@ def plan(record: X.Record, kube: X.Kube) -> Dict:
                       never=["drain", "cordon", "evict", "NoExecute", "restart", "delete", "stateful move"])
 
 
+def reserved_nodes(record: X.Record) -> Dict[str, Dict]:
+    """The nodes this run's reservation currently holds, from the journal (applied intents, live or recovered):
+    uid -> {node, uid, original_taints, original_role_label, unschedulable, added_taint, added_label}."""
+    held: Dict[str, Dict] = {}
+    for it in X.applied_intents(X.receipts(record, HELPER)):
+        d = it["data"]
+        if d["kind"] != "Node" or d["op"] != "update":
+            continue
+        ctx = d.get("context", {})
+        if ctx.get("action") == "reserve":
+            f = d["pre"].get("fields", {})
+            held[d["uid"]] = {"role": ctx.get("role"), "node": d["name"], "uid": d["uid"],
+                              "original_taints": f.get("/spec/taints"),
+                              "original_role_label": f.get(ctx.get("label_ptr", "")),
+                              "unschedulable": bool(f.get("/spec/unschedulable")),
+                              "added_taint": ctx.get("added_taint"), "added_label": ctx.get("added_label")}
+        elif ctx.get("action") == "rollback":
+            held.pop(d["uid"], None)
+    return held
+
+
+def _ptr(role_label: str) -> str:
+    return f"/metadata/labels/{X.json_pointer(role_label)}"
+
+
 def apply(record: X.Record, kube: X.Kube, reviewed: Dict, reviewed_digest: str) -> Dict:
     live = plan(record, kube)
     X.require_live(reviewed, reviewed_digest, HELPER, record, live)
     if live["problems"]:
         raise X.StagingError("the plan has conflicts: " + "; ".join(live["problems"]))
-    X.receipt(record, HELPER, "apply-start", {"plan_sha256": reviewed_digest})
-    done = []
-    for a in live["actions"]:
-        def mutate(body, a=a):
-            if body.get("spec", {}).get("taints") != a["original_taints"] or \
-                    (body["metadata"].get("labels") or {}).get(live["role_label"]) != a["original_role_label"]:
-                raise X.StagingError(f"node {a['node']}'s taints or role label changed since the plan; refusing")
-            if a["add_taint"]:
-                body.setdefault("spec", {}).setdefault("taints", []).append(a["add_taint"])
-            if a["add_label"]:
-                body["metadata"].setdefault("labels", {})[live["role_label"]] = a["add_label"]
-        after = kube.update("Node", a["node"], None, a["uid"], mutate) if (a["add_taint"] or a["add_label"]) else None
-        entry = {k: a[k] for k in ("role", "node", "uid", "unschedulable", "original_taints", "original_role_label")}
-        entry.update({"added_taint": a["add_taint"], "added_label": a["add_label"],
-                      "taints_after": (after or {}).get("spec", {}).get("taints")})
-        done.append(entry)
-        X.receipt(record, HELPER, "node-reserved", {"plan_sha256": reviewed_digest, "node": entry})
-    return X.receipt(record, HELPER, "apply-complete", {"plan_sha256": reviewed_digest, "nodes": done,
-                                                        "mutations": kube.mutations})
+    ptr = _ptr(live["role_label"])
+    with X.mutating(record, kube, HELPER) as _:
+        X.receipt(record, HELPER, "apply-start", {"plan_sha256": reviewed_digest})
+        for a in live["actions"]:
+            if not (a["add_taint"] or a["add_label"]):
+                continue
+
+            def mutate(body, a=a):
+                if body.get("spec", {}).get("taints") != a["original_taints"] or \
+                        (body["metadata"].get("labels") or {}).get(live["role_label"]) != a["original_role_label"]:
+                    raise X.StagingError(f"node {a['node']}'s taints or role label changed since the plan; refusing")
+                if a["add_taint"]:
+                    body.setdefault("spec", {}).setdefault("taints", []).append(a["add_taint"])
+                if a["add_label"]:
+                    body["metadata"].setdefault("labels", {})[live["role_label"]] = a["add_label"]
+            expect = [["/spec/taints", {"contains": live["taint"]}], [ptr, a["add_label"] or a["original_role_label"]]]
+            kube.journal.context = {"action": "reserve", "role": a["role"], "label_ptr": ptr,
+                                    "added_taint": a["add_taint"], "added_label": a["add_label"]}
+            kube.update("Node", a["node"], None, a["uid"], mutate, expect=expect,
+                        pre_fields=["/spec/taints", ptr, "/spec/unschedulable"])
+        return X.receipt(record, HELPER, "apply-complete", {"plan_sha256": reviewed_digest,
+                                                            "nodes": list(reserved_nodes(record).values()),
+                                                            "mutations": kube.mutations})
 
 
 def rollback_plan(record: X.Record, kube: X.Kube) -> Dict:
@@ -225,14 +254,8 @@ def rollback_plan(record: X.Record, kube: X.Kube) -> Dict:
     s = _section(record, params)
     taint = _taint(s, record.run_id)
     entries = X.receipts(record, HELPER)
-    changes = {}
-    for e in entries:
-        if e["event"] == "node-reserved":
-            changes[e["data"]["node"]["uid"]] = e["data"]["node"]
-        elif e["event"] == "node-restored":
-            changes.pop(e["data"]["node"]["uid"], None)
     actions = []
-    for ch in changes.values():
+    for ch in reserved_nodes(record).values():
         n = kube.get("Node", ch["node"])
         if n is None or n["metadata"]["uid"] != ch["uid"]:
             actions.append({"node": ch["node"], "uid": ch["uid"], "skip": "the node is gone or replaced"})
@@ -246,6 +269,8 @@ def rollback_plan(record: X.Record, kube: X.Kube) -> Dict:
                         "label_now": label_now, "original_unschedulable": ch["unschedulable"],
                         "unschedulable_now": bool(n.get("spec", {}).get("unschedulable", False))})
     problems = [f"node {a['node']} carries the run taint more than once" for a in actions if a.get("taint_ambiguous")]
+    if X.open_intents(entries):
+        problems.append("the journal has intents with unknown outcomes: run recover first")
     return X.new_plan(ROLLBACK, record, actions, taint=taint, role_label=s["role_label"],
                       receipts_head=entries[-1]["sha256"] if entries else "", problems=problems,
                       never=["evict", "uncordon", "cordon", "remove another taint or label"])
@@ -256,10 +281,11 @@ def rollback(record: X.Record, kube: X.Kube, reviewed: Dict, reviewed_digest: st
     X.require_live(reviewed, reviewed_digest, ROLLBACK, record, live)
     if live["problems"]:
         raise X.StagingError("; ".join(live["problems"]))
-    for a in live["actions"]:
-        if a.get("skip"):
-            continue
-        if a["remove_taint"] or a["remove_label"]:
+    ptr = _ptr(live["role_label"])
+    with X.mutating(record, kube, HELPER):
+        for a in live["actions"]:
+            if a.get("skip"):
+                continue
             def mutate(body, a=a):
                 if (body.get("spec", {}).get("taints") or []) != a["taints_now"] or \
                         (body["metadata"].get("labels") or {}).get(live["role_label"]) != a["label_now"]:
@@ -268,15 +294,20 @@ def rollback(record: X.Record, kube: X.Kube, reviewed: Dict, reviewed_digest: st
                     body["spec"]["taints"] = [t for t in body["spec"]["taints"] if t != live["taint"]]
                 if a["remove_label"]:
                     del body["metadata"]["labels"][live["role_label"]]
-            kube.update("Node", a["node"], None, a["uid"], mutate)
-        X.receipt(record, HELPER, "node-restored", {"plan_sha256": reviewed_digest,
-                                                    "node": {"node": a["node"], "uid": a["uid"]},
-                                                    "removed_taint": a["remove_taint"],
-                                                    "removed_label": a["remove_label"],
-                                                    "cordon_unchanged": a["unschedulable_now"] ==
-                                                    a["original_unschedulable"]})
-    return X.receipt(record, HELPER, "rollback-complete", {"plan_sha256": reviewed_digest,
-                                                           "mutations": kube.mutations})
+            expect = [["/spec/taints", {"lacks": live["taint"]}]]
+            if a["remove_label"]:
+                expect.append([ptr, None])
+            kube.journal.context = {"action": "rollback"}
+            kube.update("Node", a["node"], None, a["uid"], mutate, expect=expect,
+                        pre_fields=["/spec/taints", ptr, "/spec/unschedulable"])
+            X.receipt(record, HELPER, "node-restored", {"plan_sha256": reviewed_digest,
+                                                        "node": {"node": a["node"], "uid": a["uid"]},
+                                                        "removed_taint": a["remove_taint"],
+                                                        "removed_label": a["remove_label"],
+                                                        "cordon_unchanged": a["unschedulable_now"] ==
+                                                        a["original_unschedulable"]})
+        return X.receipt(record, HELPER, "rollback-complete", {"plan_sha256": reviewed_digest,
+                                                               "mutations": kube.mutations})
 
 
 def rendered_placement_problems(params: Dict) -> List[str]:
@@ -309,8 +340,7 @@ def verify(record: X.Record, kube: X.Kube) -> Dict:
     s = _section(record, params)
     taint = _taint(s, record.run_id)
     problems, nodes = [], []
-    applied = {e["data"]["node"]["uid"]: e["data"]["node"] for e in X.receipts(record, HELPER)
-               if e["event"] == "node-reserved"}
+    applied = reserved_nodes(record)
     for role in ROLES:
         n = _node(kube, s, role)
         taints = n.get("spec", {}).get("taints") or []
@@ -348,14 +378,20 @@ def main(argv=None, api=None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--record", required=True)
     ap.add_argument("command", nargs="?", default="plan",
-                    choices=["plan", "apply", "rollback-plan", "rollback", "verify"])
+                    choices=["plan", "apply", "rollback-plan", "rollback", "verify", "recover-plan", "recover"])
     ap.add_argument("--plan", default="")
     ap.add_argument("--plan-digest", default="")
     args = ap.parse_args(argv)
     try:
         record = X.load_record(args.record, ("reserve",))
         kube = record.kube(api)
-        if args.command == "plan":
+        if args.command == "recover-plan":
+            X.emit(X.cli_plan(record, "recover", X.recover_plan(record, kube), "recover-plan"))
+        elif args.command == "recover":
+            if not args.plan:
+                raise X.StagingError("recover needs --plan <the reviewed recover plan> and --plan-digest")
+            X.emit(X.recover(record, kube, X.load_plan(args.plan), args.plan_digest))
+        elif args.command == "plan":
             X.emit(X.cli_plan(record, HELPER, plan(record, kube)))
         elif args.command == "rollback-plan":
             X.emit(X.cli_plan(record, ROLLBACK, rollback_plan(record, kube), "rollback-plan"))
