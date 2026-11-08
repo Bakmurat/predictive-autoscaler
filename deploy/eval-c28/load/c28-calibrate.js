@@ -7,6 +7,10 @@
 //     -e C28CAL_RATE_PER_MIN=1200 -e C28CAL_SETTLE_S=300 -e C28CAL_MEASURE_S=900 -e C28CAL_SEED=... \
 //     -e C28CAL_PREALLOCATED_VUS=N -e C28CAL_MAX_VUS=M -e C28CAL_TIMEOUT_S=2 c28-calibrate.js
 //
+// Each scenario's ACTUAL start (exec.scenario.startTime, after k6 initialization and VU allocation) is recorded as
+// the min/max of a per-scenario Trend and reported as start_ms, so calibrate.py measures the observer window from the
+// real measurement start, never from the container start plus the nominal settling.
+//
 // The per-scenario counts and latencies leave the pod as its termination message (/dev/termination-log, part of the
 // Pod's status), so calibrate.py reads them from the API without logs, a sidecar or an extra output. Submetrics exist
 // only for metrics with a threshold, hence the always-true thresholds below. A metric without samples is absent from
@@ -14,6 +18,10 @@
 // and treats any other absence as missing evidence, never as zero.
 import http from 'k6/http';
 import { sleep } from 'k6';
+import exec from 'k6/execution';
+import { Trend } from 'k6/metrics';
+
+const scenarioStart = new Trend('c28cal_scenario_start_ms');
 
 function intEnv(name, lo, hi) {
   const v = Number(__ENV[name]);
@@ -46,6 +54,7 @@ for (const s of SCENARIOS) {
   thresholds[`http_reqs{scenario:${s}}`] = ['count>=0'];
   thresholds[`http_req_failed{scenario:${s}}`] = ['rate>=0'];
   thresholds[`http_req_duration{scenario:${s}}`] = ['max>=0'];
+  thresholds[`c28cal_scenario_start_ms{scenario:${s}}`] = ['max>=0'];
 }
 
 export const options = {
@@ -73,7 +82,12 @@ function rnd() {
   return state / 4294967296;
 }
 
+let startRecorded = '';
 export default function () {
+  if (startRecorded !== exec.scenario.name) {       // once per VU and scenario
+    scenarioStart.add(exec.scenario.startTime);
+    startRecorded = exec.scenario.name;
+  }
   sleep(rnd() * 0.1);
   http.get(`${base}/t/${target}/work`, { timeout: `${timeoutS}s`, tags: { name: 'work' } });
 }
@@ -87,6 +101,8 @@ export function handleSummary(data) {
     for (const m of METRICS) {
       out.scenarios[s][m] = pick(`${m}{scenario:${s}}`);
     }
+    const st = pick(`c28cal_scenario_start_ms{scenario:${s}}`);
+    out.scenarios[s].start_ms = st ? { min: st.min, max: st.max } : null;
   }
   return { '/dev/termination-log': JSON.stringify(out) };
 }

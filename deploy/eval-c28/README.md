@@ -259,12 +259,21 @@ Every trial goes through a pinned calibration ingress on W (offered demand is co
 it), one k6 Job on S (`load/c28-calibrate.js`: settle and measure scenarios, its summary in the pod's termination
 message, a finite `activeDeadlineSeconds`). Scheduled, dispatched, received and terminal outcomes are reconciled;
 missing outcomes are unknown (never successes), more arrivals at the ingress than the generator dispatched is
-incomplete evidence. **Queue rule:** with the window cut into 60 s bins, END = mean of the last `edge_bins` bins and
+incomplete evidence, and the dispatch reconciliation is exact (zero dropped arrivals is the criterion; an absent
+`dropped_iterations` counts as zero only when every scheduled arrival was dispatched). The observer window is the
+measure scenario's actual start as k6 recorded it, never the container start plus the nominal settling. Guest steal
+above 5 % for five consecutive one-minute bins on W or S, or a missing steal observation, stops the trial. The
+work-selection idle interval must be proven idle (ingress and fixture request counters unchanged, waiting queue and
+in-flight 0). **Queue rule** (on the WAITING queue; in-flight work is recorded separately): with the window cut into
+60 s bins, END = mean of the last `edge_bins` bins and
 INCREASE = END - mean of the first `edge_bins`, a repetition fails when END / replicas > `max_end_backlog_per_replica`, or
 when INCREASE > `max_increase` AND the least-squares slope > `max_slope_per_min`; bounded growth below those numbers
 passes.
 
-Before and during every trial: the reservation with this calibration's own objects recognized only through their
+Before and during every trial, and once more before a completed trial is accepted: the measured configuration equal
+to the reviewed rendering (owned objects, the trial's Job, every admitted pod's containers, environment and
+resources; only the controlled replica count may differ), the observer queries proven to select exactly the live pods
+with fresh data, the interference stop, the reservation with this calibration's own objects recognized only through their
 journal-recorded UIDs (`reserve.verify(calibration=...)`: the pod's ReplicaSet must exist with exactly the referenced UID
 and belong to one of the journal's Deployment UIDs, or the pod's Job must be one of its Job UIDs; no name prefix), the
 calibration footprint plus every other live pod within 75 % of each node's live allocatable, no rollout in progress for
@@ -277,7 +286,8 @@ measurement is recorded as interrupted and never resumed.
 
 The evidence bundle (`evidence/calibrate/<id>/`) holds the contract, the rendered objects, per trial the Job, pod
 snapshots with their image identities, the raw observer responses and the derived result, then the manifest of hashes,
-the certificate (READY or NOT READY with every reason, curves with CPU and throttling, every unsuccessful trial) and the
+the certificate (READY or NOT READY with every reason; the 1.2 x Q4 probe is the calibration's own ceiling, and the
+experiment's maximum-arrival admission stays PENDING, curves with CPU and throttling, every unsuccessful trial) and the
 hash-chained journal. `reduce` recomputes everything from that bundle and refuses any difference. The certificate says
 what it does not cover: the CPU HPA target, the startup profiles, the twelve-replica layout and single-pod bursts are not
 qualified by it, and no prospective history or confirmation evidence starts during calibration.

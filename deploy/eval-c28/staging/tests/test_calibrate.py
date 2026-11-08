@@ -135,18 +135,18 @@ def test_recomputation_detects_a_wrong_verdict(cal):
     assert K.evaluate_trial(ctx.con, raw)["verdict"] == "PASS"
     # the exact queue rule: an end backlog above the per-replica cap fails; bounded growth passes
     bad = copy.deepcopy(raw)
-    for v in bad["observations"]["fixture_backlog"]["response"]["data"]["result"][0]["values"]:
+    for v in bad["observations"]["fixture_queue"]["response"]["data"]["result"][0]["values"]:
         v[1] = "4.5"
     r = K.evaluate_trial(ctx.con, bad)
     assert r["verdict"] == "FAIL" and r["criteria"]["queue_growth"]["end_over_cap"]
     grow = copy.deepcopy(raw)
     ws = r["criteria"]["window"]["start"]
-    for v in grow["observations"]["fixture_backlog"]["response"]["data"]["result"][0]["values"]:
+    for v in grow["observations"]["fixture_queue"]["response"]["data"]["result"][0]["values"]:
         v[1] = str(min(3.9, (v[0] - ws) / 60 * 0.25))          # +0.25/min: slope > 0.2, increase > 2 -> sustained
     r = K.evaluate_trial(ctx.con, grow)
     assert r["verdict"] == "FAIL" and r["criteria"]["queue_growth"]["sustained"]
     small = copy.deepcopy(raw)
-    for v in small["observations"]["fixture_backlog"]["response"]["data"]["result"][0]["values"]:
+    for v in small["observations"]["fixture_queue"]["response"]["data"]["result"][0]["values"]:
         v[1] = str((v[0] - ws) / 60 * 0.1)                      # slow growth under both bounds
     assert K.evaluate_trial(ctx.con, small)["verdict"] == "PASS"
     # missing and stale observations are unknown, never zero
@@ -154,8 +154,8 @@ def test_recomputation_detects_a_wrong_verdict(cal):
     miss["observations"]["fixture_cpu_cores"] = {"error": "URLError"}
     assert K.evaluate_trial(ctx.con, miss)["verdict"] == "INCOMPLETE"
     stale = copy.deepcopy(raw)
-    stale["observations"]["fixture_backlog"]["response"]["data"]["result"][0]["values"] = \
-        stale["observations"]["fixture_backlog"]["response"]["data"]["result"][0]["values"][:10]
+    stale["observations"]["fixture_queue"]["response"]["data"]["result"][0]["values"] = \
+        stale["observations"]["fixture_queue"]["response"]["data"]["result"][0]["values"][:10]
     assert "stale or missing" in " ".join(K.evaluate_trial(ctx.con, stale)["incomplete"])
     # a lost outcome is unknown: it can only bound the failure fraction
     lost = copy.deepcopy(raw)
@@ -694,3 +694,242 @@ def test_verify_open_and_closed(cal, api):
     K.stop(ctx, plan, digest)
     v = K.verify(ctx)
     assert v["state"] == "closed" and v["bundle"]["reproduced"]
+
+
+# --- Codex review of 0657f2b: one regression test per finding --------------------------------------------------------
+
+def _raw(ctx, trial):
+    base = os.path.join(ctx.dir, "trials", trial)
+    begin = [e["data"] for e in ctx.entries() if e["event"] == "trial-begin" and e["data"]["trial"]["id"] == trial]
+    return {"trial": begin[0]["trial"], "generator_pod": json.load(open(os.path.join(base, "generator-pod.json"))),
+            "pods_begin": json.load(open(os.path.join(base, "pods-begin.json"))),
+            "pods_end": json.load(open(os.path.join(base, "pods-end.json"))),
+            "observations": json.load(open(os.path.join(base, "observations.json")))}
+
+
+def _summary(raw):
+    term = raw["generator_pod"]["status"]["containerStatuses"][0]["state"]["terminated"]
+    return term, json.loads(term["message"])
+
+
+def test_f1_fixture_changed_before_its_first_scale_is_refused(cal, api):
+    """Codex repro: the fixture CPU limit changed 50m -> 500m before its first scale still produced READY."""
+    ctx = cal()
+
+    def tamper(world, api_):
+        dep = api_.objects.get(("deployments", "demo", ctx.nm["variants"][0]))
+        if dep and not world.__dict__.get("tampered"):
+            dep["spec"]["template"]["spec"]["containers"][0]["resources"]["limits"]["cpu"] = "500m"
+            world.tampered = True
+    ctx.world.hooks.append(tamper)
+    with pytest.raises(X.StagingError, match="differs from its reviewed rendering"):
+        run(ctx)
+    c = cert(ctx)
+    assert c["verdict"] == "NOT READY" and c["trials"] == 0
+    assert api.objects.get(("deployments", "demo", ctx.nm["variants"][0])) is None     # cleaned up, never scaled
+    scales = [e for e in ctx.entries() if e["event"] == "scale-write"]
+    assert scales == []
+
+
+def test_f1_admitted_pod_changed_mid_measurement_stops_the_trial(cal, api):
+    ctx = cal()
+
+    def tamper(world, api_):
+        if any(k == "jobs" and n.endswith("t003") for (k, _, n) in api_.objects) and not world.__dict__.get("t"):
+            pod = next(o for (k, _, n), o in api_.objects.items() if k == "pods" and
+                       n.startswith(ctx.nm["variants"][0] + "-"))
+            for e in pod["spec"]["containers"][0]["env"]:
+                if e["name"] == "WORK_ITERATIONS":
+                    e["value"] = "300"
+            world.t = True
+    ctx.world.hooks.append(tamper)
+    out = run(ctx)
+    stopped = [e["data"] for e in ctx.entries() if e["event"] == "trial-stopped"]
+    assert out["verdict"] == "NOT READY" and stopped[0]["trial"]["id"] == "t003"
+    assert "differs from its reviewed template" in stopped[0]["reason"]
+
+
+def test_f1_job_changed_mid_measurement_stops_the_trial(cal, api):
+    ctx = cal()
+
+    def tamper(world, api_):
+        job = next((o for (k, _, n), o in api_.objects.items() if k == "jobs" and n.endswith("t003")), None)
+        if job and not world.__dict__.get("t"):
+            job["spec"]["template"]["spec"]["containers"][0]["args"][3] = "C28CAL_TARGET=elsewhere"
+            world.t = True
+    ctx.world.hooks.append(tamper)
+    out = run(ctx)
+    stopped = [e["data"] for e in ctx.entries() if e["event"] == "trial-stopped"]
+    assert out["verdict"] == "NOT READY" and "differs from its reviewed rendering" in stopped[0]["reason"]
+
+
+def test_f2_writer_appearing_after_the_scale_intent_is_not_submitted(cal, api, monkeypatch):
+    """Codex repro: an HPA inserted after the intent; the fixture still went 0 -> 1."""
+    ctx = cal()
+    real = C.append_receipt
+
+    def append(rec, helper, event, data, *a, **kw):
+        out = real(rec, helper, event, data, *a, **kw)
+        if helper == K.HELPER and event.startswith("intent-") and data.get("op") == "calibrate-scale" and \
+                ("horizontalpodautoscalers", "demo", "intruder") not in api.objects:
+            api.put(_hpa(ctx.nm["variants"][0]))
+        return out
+    monkeypatch.setattr(C, "append_receipt", append)
+    with pytest.raises(X.StagingError, match="pre-write check refused"):
+        run(ctx)
+    monkeypatch.setattr(C, "append_receipt", real)
+    dep = api.objects[("deployments", "demo", ctx.nm["variants"][0])]
+    assert (dep["spec"].get("replicas") or 0) == 0                         # nothing was written
+    writes = [e["data"]["result"] for e in ctx.entries() if e["event"] == "scale-write"]
+    assert writes == ["not-submitted"]
+    assert lock_held(ctx)                                                   # the step's outcome is for recover
+    api.objects.pop(("horizontalpodautoscalers", "demo", "intruder"))
+    rp = X.recover_plan(ctx.record, ctx.kube)
+    assert [(a["observed"], a.get("state")) for a in rp["actions"]] == [("not-done", "not-applied")]
+    PF.recover(ctx.record, ctx.kube)
+    plan, digest = CW.reviewed(ctx, K.plan_stop, K.STOP, "stop-plan")
+    K.stop(ctx, plan, digest, "writer appeared")
+    assert not lock_held(ctx)
+
+
+def test_f3_steal_stop_during_a_trial(cal, api):
+    ctx = cal()
+
+    def steal(world, api_):
+        if any(k == "jobs" and n.endswith("t003") for (k, _, n) in api_.objects):
+            world.steal["worker-s"] = 9.0
+    ctx.world.hooks.append(steal)
+    out = run(ctx)
+    stopped = [e["data"] for e in ctx.entries() if e["event"] == "trial-stopped"]
+    assert out["verdict"] == "NOT READY" and "guest steal above 5%" in stopped[0]["reason"]
+
+
+def test_f3_missing_steal_observation_refuses_the_plan(cal):
+    ctx = cal()
+    ctx.world.missing = {"steal"}
+    assert any("required observation missing" in p and "worker-w" in p and "worker-s" in p
+               for p in K.plan(ctx)["problems"])
+    ctx.world.missing = set()
+    ctx.world.steal = {"worker-w": 6.0}
+    assert any("guest steal above 5%" in p and "on worker-w" in p for p in K.plan(ctx)["problems"])
+    ctx.world.steal = {"worker-w": 5.0}                     # at the bar, not above it
+    assert not any("steal" in p for p in K.plan(ctx)["problems"])
+
+
+def test_f3_completion_is_accepted_only_after_a_final_gate(cal, api):
+    """A writer appearing just as the Job completes: the trial must not be accepted."""
+    ctx = cal()
+
+    def at_completion(world, api_):
+        job = next((o for (k, _, n), o in api_.objects.items() if k == "jobs" and n.endswith("t003")), None)
+        if job and job.get("status", {}).get("conditions") and \
+                ("horizontalpodautoscalers", "demo", "intruder") not in api_.objects:
+            api_.put(_hpa(ctx.nm["variants"][0]))
+    ctx.world.hooks.append(at_completion)
+    out = run(ctx)
+    stopped = [e["data"] for e in ctx.entries() if e["event"] == "trial-stopped"]
+    assert out["verdict"] == "NOT READY" and stopped[0]["reason"].startswith("after completion")
+    assert not os.path.exists(os.path.join(ctx.dir, "trials", "t003", "result.json"))
+
+
+def test_f3_steal_inside_the_measurement_window_is_evidence(cal):
+    ctx = cal()
+    run(ctx)
+    raw = _raw(ctx, "t003")
+    assert K.evaluate_trial(ctx.con, raw)["criteria"]["steal"]["workload"]["longest_run_over"] == 0
+    bad = copy.deepcopy(raw)
+    vals = next(r for r in bad["observations"]["steal"]["response"]["data"]["result"]
+                if r["metric"]["node"] == "worker-w")["values"]
+    for v in vals[3:8]:
+        v[1] = "7.5"
+    r = K.evaluate_trial(ctx.con, bad)
+    assert r["verdict"] == "INCOMPLETE" and any("interference: guest steal" in w for w in r["incomplete"])
+    gap = copy.deepcopy(raw)
+    res = gap["observations"]["steal"]["response"]["data"]["result"]
+    next(x for x in res if x["metric"]["node"] == "worker-s")["values"].pop(6)
+    assert any("required observation missing" in w for w in K.evaluate_trial(ctx.con, gap)["incomplete"])
+
+
+def test_f4_window_comes_from_the_actual_scenario_start(cal):
+    ctx = cal()
+    ctx.world.init_delay = 40                    # k6 initialization/VU allocation delays the scenarios
+    out = run(ctx)
+    assert out["verdict"] == "READY"
+    raw = _raw(ctx, "t003")
+    term, summ = _summary(raw)
+    start = summ["scenarios"]["measure"]["start_ms"]["min"] // 1000
+    assert start == K._utc(term["startedAt"]) + 300 + 40
+    r = json.load(open(os.path.join(ctx.dir, "trials", "t003", "result.json")))
+    assert r["criteria"]["window"] == {"start": start, "end": start + 900}
+    assert raw["observations"]["fixture_queue"]["start"] == start
+    gone = copy.deepcopy(raw)
+    t, sm = _summary(gone)
+    sm["scenarios"]["measure"]["start_ms"] = None
+    t["message"] = json.dumps(sm)
+    assert any("no actual measure-scenario start" in w for w in K.evaluate_trial(ctx.con, gone)["incomplete"])
+
+
+def test_f5_one_dropped_arrival_is_censored(cal):
+    """Codex repro: one drop returned PASS / uncensored."""
+    ctx = cal()
+    ctx.world.drops = 1
+    out = run(ctx)
+    r = json.load(open(os.path.join(ctx.dir, "trials", "t001", "result.json")))
+    assert out["verdict"] == "NOT READY" and r["verdict"] == "LIMIT" and r["delivery"] == "censored"
+    assert any("zero-drop" in w for w in r["limits"])
+
+
+def test_f5_absent_drops_are_zero_only_with_exact_reconciliation(cal):
+    ctx = cal()
+    run(ctx)
+    raw = _raw(ctx, "t003")
+    t, sm = _summary(raw)
+    assert sm["scenarios"]["measure"]["dropped_iterations"] is None
+    sm["scenarios"]["measure"]["iterations"]["count"] -= 1         # one scheduled arrival never dispatched
+    sm["scenarios"]["measure"]["http_reqs"]["count"] -= 1
+    t["message"] = json.dumps(sm)
+    r = K.evaluate_trial(ctx.con, raw)
+    assert r["verdict"] == "INCOMPLETE" and any("k6 counts are incomplete" in w for w in r["incomplete"])
+
+
+def test_f6_direct_traffic_during_idle_is_refused(cal):
+    ctx = cal()
+    ctx.world.direct_traffic = True
+    out = run(ctx)
+    r = json.load(open(os.path.join(ctx.dir, "trials", "t001", "result.json")))
+    assert out["verdict"] == "NOT READY" and r["verdict"] == "INCOMPLETE"
+    assert any("idle baseline not demonstrated idle" in w and "direct-to-fixture" in w for w in r["incomplete"])
+
+
+def test_f6_idle_ingress_movement_and_undrained_work_are_refused(cal):
+    ctx = cal()
+    run(ctx)
+    raw = _raw(ctx, "t001")
+    assert K.evaluate_trial(ctx.con, raw)["criteria"]["idle"]["idle_fixture_inflight"] == "0 throughout"
+    moved = copy.deepcopy(raw)
+    moved["observations"]["ingress_idle_start"]["requests"] = moved["observations"]["ingress_after"]["requests"]
+    moved["observations"]["ingress_idle_start"]["requests"] = copy.deepcopy(
+        moved["observations"]["ingress_idle_start"]["requests"])
+    for v in moved["observations"]["ingress_idle_start"]["requests"]["response"]["data"]["result"][0]["values"]:
+        v[0] -= 10_000
+    r = K.evaluate_trial(ctx.con, moved)
+    assert any("idle baseline" in w for w in r["incomplete"])
+    busy = copy.deepcopy(raw)
+    busy["observations"]["idle_fixture_inflight"]["response"]["data"]["result"][0]["values"][2][1] = "1"
+    assert any("idle_fixture_inflight is not 0" in w for w in K.evaluate_trial(ctx.con, busy)["incomplete"])
+
+
+def test_observer_queries_must_select_the_live_pods(cal):
+    ctx = cal()
+    ctx.world.up_label = "kubernetes_pod_name"        # the queries do not see pods under the declared label
+    out = run(ctx)
+    c = cert(ctx)
+    ns = [e["data"] for e in ctx.entries() if e["event"] == "trial-not-started"]
+    assert out["verdict"] == "NOT READY" and c["trials"] == 0
+    assert any("does not prove the live" in p for p in ns[0]["problems"])
+
+
+def test_certificate_states_the_pending_experiment_admission(cal):
+    ctx = cal()
+    run(ctx)
+    assert any("maximum-arrival admission stays PENDING" in s for s in cert(ctx)["scope_limits"])

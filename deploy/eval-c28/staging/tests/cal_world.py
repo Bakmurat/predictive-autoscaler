@@ -23,11 +23,15 @@ FIXTURE = "harbor.example/autoscaler/c28-fixture@sha256:" + "a" * 64
 GENERATOR = "grafana/k6@sha256:" + "e" * 64
 T0 = 1_796_000_000
 
+STEAL = 'max by (node) (rate(node_cpu_seconds_total{mode="steal"}[1m])) * 100'
 QUERIES = {
     "ingress_up": 'up{namespace="__NAMESPACE__",pod=~"__PODS__"}',
+    "fixture_up": 'up{namespace="__NAMESPACE__",pod=~"__PODS__"}',
+    "fixture_requests": 'sum(c28_requests_total{namespace="__NAMESPACE__",target="__TARGET__"})',
+    "fixture_inflight": 'sum(c28_inflight{namespace="__NAMESPACE__",target="__TARGET__"})',
     "ingress_requests": 'sum(c28_ingress_requests_total{namespace="__NAMESPACE__",target="__TARGET__"})',
     "ingress_responses": 'sum(c28_ingress_responses_total{namespace="__NAMESPACE__",target="__TARGET__"})',
-    "fixture_backlog": 'sum(c28_queue{namespace="__NAMESPACE__",target="__TARGET__"})',
+    "fixture_queue": 'sum(c28_queue{namespace="__NAMESPACE__",target="__TARGET__"})',
 }
 CPU = 'sum(rate(container_cpu_usage_seconds_total{namespace="__NAMESPACE__",pod=~"__PODS__",container!=""}[1m]))'
 THR = ('sum(rate(container_cpu_cfs_throttled_periods_total{namespace="__NAMESPACE__",pod=~"__PODS__"}[1m])) / '
@@ -56,8 +60,10 @@ def contract(tmp, **over):
         "generator": {"k6_version": "0.57.0", "cpu_request": "500m", "cpu_limit": "1", "memory_request": "256Mi",
                       "memory_limit": "512Mi"},
         "observer": {"query_api": "http://vmselect.monitoring.svc:8481/select/0/prometheus", "step_s": 15,
-                     "max_staleness_s": 60, "scrape": "annotations", "queries": dict(QUERIES), "pods": []},
-        "criteria": {"p95_ms": 200, "p99_ms": 500, "max_failure_fraction": 0.001, "max_dropped_fraction": 0.001,
+                     "max_staleness_s": 60, "scrape": "annotations", "queries": dict(QUERIES), "pods": [],
+                     "pod_label": "pod"},
+        "stops": {"steal_query": STEAL, "node_label": "node", "steal_percent": 5, "steal_bins": 5},
+        "criteria": {"p95_ms": 200, "p99_ms": 500, "max_failure_fraction": 0.001, "max_dropped_arrivals": 0,
                      "linearity_min": 0.90, "ceiling_factor": 1.2,
                      "queue_growth": {"bin_s": 60, "edge_bins": 2, "max_increase": 2.0, "max_slope_per_min": 0.2,
                                       "max_end_backlog_per_replica": 4.0},
@@ -101,6 +107,11 @@ class World:
         self.lin4, self.drops, self.extra_arrivals, self.gen_throttle = 1.0, 0, 0, 0.0
         self.stale_after = None
         self.truncate_windows = False
+        self.init_delay = 3           # k6 initialization: the measure scenario starts this long after start + settle
+        self.steal = {}               # node -> steal percent (default 1.0)
+        self.direct_traffic = False   # requests straight to the fixture (bypassing the ingress) during idle
+        self.drop_key_absent = True   # k6 omits dropped_iterations when nothing dropped
+        self.up_label = "pod"         # the label the observer's up series name pods with
         self.missing = set()
         self.counters = {}            # target -> {"req": n, "resp": n}
         self.windows = []             # [{target, start, end, rate_rps, wi, ok}]
@@ -141,17 +152,24 @@ class World:
                                  observedGeneration=dep["metadata"].get("generation", 1))
             rs = api.objects[("replicasets", ns, f"{dep['metadata']['name']}-rs")]
             tmpl = dep["spec"]["template"]
+            renamed = []
             for (pk, _, _), pod in api.objects.items():
                 if pk == "pods" and any(r.get("uid") == rs["metadata"]["uid"]
                                         for r in pod["metadata"].get("ownerReferences") or []):
                     if pod["metadata"].get("labels"):
                         continue
+                    old = pod["metadata"]["name"]
+                    pod["metadata"]["name"] = f"{dep['metadata']['name']}-7d9f8c6b5-{old[-5:]}"
+                    renamed.append((old, pod))
                     pod["metadata"]["labels"] = dict(tmpl["metadata"]["labels"])
                     pod["spec"] = {**json.loads(json.dumps(tmpl["spec"])), "nodeName": "worker-w"}
                     pod["status"] = {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}],
                                      "containerStatuses": [{"name": tmpl["spec"]["containers"][0]["name"],
                                                             "imageID": FIXTURE, "restartCount": 0,
                                                             "state": {"running": {}}}]}
+            for old, pod in renamed:
+                api.objects.pop(("pods", ns, old), None)
+                api.objects[("pods", ns, pod["metadata"]["name"])] = pod
 
     def _jobs(self, api):
         now = self.clock.now()
@@ -178,7 +196,7 @@ class World:
             pod = pods[0]
             started = K._utc(pod["status"]["containerStatuses"][0]["state"]["running"]["startedAt"])
             settle, measure = int(env["C28CAL_SETTLE_S"]), int(env["C28CAL_MEASURE_S"])
-            if now < started + settle + measure + 5:
+            if now < started + self.init_delay + settle + measure + 5:
                 continue
             self._complete(api, job, pod, env, started)
 
@@ -201,19 +219,22 @@ class World:
             disp = sched - dropped
             failed = 0 if ok else math.ceil(0.05 * disp)
             scen[s] = {"iterations": {"count": disp, "rate": disp / dur},
-                       "dropped_iterations": ({"count": dropped, "rate": dropped / dur} if dropped else None),
+                       "dropped_iterations": ({"count": dropped, "rate": dropped / dur}
+                                              if dropped or not self.drop_key_absent else None),
                        "http_reqs": {"count": disp, "rate": disp / dur},
                        "http_req_failed": {"rate": failed / disp, "passes": failed, "fails": disp - failed},
                        "http_req_duration": {"avg": 30, "min": 5, "p(50)": 25, "p(95)": 50 if ok else 450,
                                              "p(99)": 120 if ok else 900, "max": 300 if ok else 2000,
-                                             "count": disp}}
+                                             "count": disp},
+                       "start_ms": {"min": (started + self.init_delay + (settle if s == "measure" else 0)) * 1000,
+                                    "max": (started + self.init_delay + (settle if s == "measure" else 0)) * 1000}}
             total = disp
             c = self.counters.setdefault(target, {"req": 0, "resp": 0})
             c["req"] += total + (self.extra_arrivals if s == "measure" else 0)
             c["resp"] += total + (self.extra_arrivals if s == "measure" else 0)
         summary = {"schema": K.K6_SCHEMA, "trial": env["C28CAL_TRIAL"], "target": target, "rate_per_min": rate,
                    "settle_s": settle, "measure_s": measure, "seed": int(env["C28CAL_SEED"]), "scenarios": scen}
-        ws = started + settle
+        ws = started + self.init_delay + settle
         self.windows.append({"target": target, "start": started, "ws": ws, "end": ws + measure,
                              "rate_rps": rate / 60, "wi": wi, "ok": ok, "job": job["metadata"]["name"]})
         cs = pod["status"]["containerStatuses"][0]
@@ -234,6 +255,13 @@ class World:
             grid = grid[:len(grid) // 2]
         target = (re.search(r'target="([^"]*)"', query) or [None, None])[1]
         pods = (re.search(r'pod=~"([^"]*)"', query) or [None, ""])[1]
+        if query == STEAL:
+            g60 = [t for t in range(start - start % 60, last + 1, 60) if t >= start]
+            if "steal" in self.missing:
+                return {"status": "success", "data": {"result": []}}
+            return {"status": "success", "data": {"result": [
+                {"metric": {"node": n}, "values": [[t, str(self.steal.get(n, 1.0))] for t in g60]}
+                for n in ("worker-w", "worker-s")]}}
         if query.startswith("up{"):
             kind = "up"
         elif "c28_ingress_requests_total" in query:
@@ -242,19 +270,32 @@ class World:
             kind = "resp"
         elif "c28_queue" in query:
             kind = "backlog"
+        elif "c28_inflight" in query:
+            kind = "inflight"
+        elif "c28_requests_total" in query:
+            kind = "fixture_requests"
         elif "cfs_throttled" in query:
             kind = "throttle"
         else:
             kind = "cpu"
         if kind in self.missing:
             return {"status": "success", "data": {"result": []}}
+        if kind == "fixture_requests":
+            if not self.direct_traffic:
+                return {"status": "success", "data": {"result": []}}
+            return self._series(grid, lambda t: t - start)
+        if kind == "inflight":
+            return self._series(grid, lambda t: 0.5 if self._window(target=target, t=t) else 0)
         if kind in ("req", "resp"):
             c = self.counters.get(target)
             if c is None:
                 return {"status": "success", "data": {"result": []}}
             return self._series(grid, lambda t: c[kind])
         if kind == "up":
-            return self._series(grid, lambda t: 1)
+            live = sorted(o["metadata"]["name"] for (k, _, _), o in self.api.objects.items()
+                          if k == "pods" and re.fullmatch(pods, o["metadata"]["name"]))
+            return {"status": "success", "data": {"result": [
+                {"metric": {self.up_label: n}, "values": [[t, "1"] for t in grid]} for n in live]}}
         if kind == "backlog":
             def backlog(t):
                 w = self._window(target=target, t=t)
