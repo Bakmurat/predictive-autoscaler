@@ -133,9 +133,10 @@ CPU 9 × 2 × 50 + 12 × 50 + 2 × 50 + 100 + 400 = 2100m = 52.5 % (limit 3000m)
 
 **Idle-arm parking below the starting count is not implemented**, so `idle_arm_replicas` below the starting count is
 refused (that would need the writers stopped, the count restored before each session, history preserved and the loaded
-arm's frozen bounds unchanged). `session.py` admits a session only when EVERY target, the selected one included, sits
-at exactly the common starting count and has converged there (`idle_arm_replicas` is only the budget's upper bound):
-desired replicas equal to the count, status (observed generation, replicas, updated, ready, available) equal to it, and exactly that many Pods owned through its ReplicaSets (bound by controller UID to the
+arm's frozen bounds unchanged). `session.py` admits a session only when EVERY target, the selected one included, exists
+with its recorded UID, sits at exactly the common starting count and has converged there (`idle_arm_replicas` is only
+the budget's upper bound): desired replicas equal to the count, status (observed generation, replicas, updated, ready,
+available) equal to it, and exactly that many Pods owned through its ReplicaSets (bound by controller UID to the
 Deployment's UID), none of them terminating and every one Running and Ready. A session never scales a target, and a
 stopped session leaves its target at whatever count its writer last set; the start refusal names those targets and
 points to the restore.
@@ -151,10 +152,10 @@ session.py --record R recover-plan | recover --plan F --plan-digest D   # after 
 `restore-plan` lists every arm whose desired replicas differ from the **common starting count** (or that has not
 converged at it), each bound by name, UID (from `targets.json`), generation, resourceVersion and current replicas. The
 count is frozen, never a CLI value: every arm's rendered Deployment `spec.replicas` (`render.FIXED_REPLICAS`, 2), the
-same for every arm and at most `residency.idle_arm_replicas`; for a confirmation record the arm renderings must equal the
-signed run-lock's (`arms.<arm/profile>.rendered_sha256`). The plan refuses while any session is open or unresolved, any
-intent or earlier restore is unresolved, or any generator Job or Pod of the run remains (terminating and finished ones
-included). Per arm, the writer must be shut down or provably write nothing, otherwise that arm is listed under
+same for every arm and at most `residency.idle_arm_replicas`; for a confirmation record the arm renderings must equal
+the signed run-lock's (`arms.<arm/profile>.rendered_sha256`). The plan refuses while any session is open or unresolved,
+any intent or earlier restore is unresolved, or any generator Job or Pod of the run remains (terminating and finished
+ones included). Per arm, the writer must be shut down or provably write nothing, otherwise that arm is listed under
 `refused` with the reason and left alone:
 
 | Arm | Writer inactive when |
@@ -164,13 +165,15 @@ included). Per arm, the writer must be shut down or provably write nothing, othe
 
 `restore` recomputes the plan under the shared evaluation lock and runs only the reviewed digest. Each arm is one
 journalled step (intent before, outcome after): the cluster UID re-check, a re-check of the bound Deployment, `PUT
-.../deployments/<name>/scale` with the read resourceVersion and the UID (a Scale response without `spec.replicas`
-means 0), then a bounded wait (record `restore.timeout_s`, default 600) until desired, status and the owned Pod census
-through the ReplicaSets (terminating Pods included, the admission's accounting) equal the count with every Pod Running
-and Ready, the writer still inactive and the desired count unchanged. The writer and the bound Deployment are
-re-checked immediately before each arm's write (after the earlier arms' waits), both before its intent and inside it.
-The write's outcome is persisted as a `restore-write` receipt bound to the step (applied with the resulting
-generation, refused, or unknown). A refusal, a timeout or a crash leaves the step unresolved and the lock held;
+.../deployments/<name>/scale` with the read resourceVersion and the UID (a Scale response without `spec.replicas` means
+0), then a bounded wait (record `restore.timeout_s`, default 600) until desired, status and the owned Pod census through
+the ReplicaSets (terminating Pods included, the admission's accounting) equal the count with every Pod Running and
+Ready, the writer still inactive and the desired count unchanged. The writer and the bound Deployment are re-checked
+immediately before each arm's write (after the earlier arms' waits), both before its intent and inside it. The write's
+progress is persisted as `restore-write` receipts bound to the step: `not-submitted` when the pre-write check refuses,
+`submitting` durably before the request, then applied (with the resulting generation), refused or unknown. Only a
+request marked `submitting` can be recovered as a lost response; a change after an unsubmitted or refused write is
+someone else's and stays unresolved. A refusal, a timeout or a crash leaves the step unresolved and the lock held;
 `recover` accepts only a transition consistent with that intent and receipt, with the writer provably inactive again:
 done when the write applied (or a lost response took exactly one generation step to the count) and the arm converged;
 not-done, state `applied-convergence-pending`, when it applied but has not converged (admission keeps refusing the arm,
@@ -181,5 +184,5 @@ state). A session start refuses while a restore is open.
 
 A restore never touches a writer (mode, min/max bounds), a fault schedule, the quota, the recorder or any history path:
 the PredictiveAutoscalers stay in Recommend and keep collecting their forecast and decision history, the ingress and
-recorder keep observing every target, and the receipts (`restore-begin`, the per-arm intent/step, `restore-closed`) record
-when and why a target's replica count changed, so the replica series around a restore stays attributable.
+recorder keep observing every target, and the receipts (`restore-begin`, the per-arm intent/step, `restore-closed`)
+record when and why a target's replica count changed, so the replica series around a restore stays attributable.

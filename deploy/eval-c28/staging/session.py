@@ -469,14 +469,16 @@ def _residency_problems(c: Context, job: Dict) -> List[str]:
         out.append(f"the generator requests ({req.get('cpu')}, {req.get('memory')}) exceed the residency budget's "
                    "generator (params residency.generator)")
     count, _, count_problems = starting_count(c)
-    if count is None:
-        out += count_problems
+    out += count_problems                 # a count can come with failed provenance checks (e.g. the run-lock's)
     rs_all, pods_all = c.kube.list("ReplicaSet", c.ns), c.kube.list("Pod", c.ns)
     unsettled = []
     for name in sorted(_arm_targets(c.c28)):
         dep = c.kube.get("Deployment", name, c.ns)
-        if dep is None:
-            continue                      # a missing selected target is refused by the start's own UID check
+        uid = c.targets["deployments"].get(name)
+        if dep is None or not uid or dep["metadata"]["uid"] != uid:
+            out.append(f"{name} is missing or replaced (UID differs from targets.json): every target must exist at "
+                       "the common starting count")
+            continue
         probs = idle_residency_problems(dep, rs_all, pods_all, r["idle_arm_replicas"])
         want = int(dep["spec"].get("replicas") or 0)
         if count is not None and want != count and want <= r["idle_arm_replicas"]:
@@ -1125,20 +1127,31 @@ def _pre_write_check(f: Fleet, a: Dict) -> None:
 
 def _restore_arm(f: Fleet, a: Dict, deadline: int, mark: str) -> Dict:
     """One arm under its journalled step: the pre-write check, the /scale write with the plan's resourceVersion and the
-    UID (its outcome persisted as a restore-write receipt bound to the step's mark: applied with the resulting
-    generation, refused, or unknown), then the wait until it converged at the target (desired, status and the owned pod
-    census through its ReplicaSets, terminating pods included, all Running and Ready), its writer still inactive. Any
-    failure raises (the step stays unresolved for recover)."""
+    UID (restore-write receipts bound to the step's mark: "not-submitted" when the pre-write check refuses,
+    "submitting" durably before the request, then applied with the resulting generation, refused, or unknown), then
+    the wait until it converged at the target (desired, status and the owned pod census through its ReplicaSets,
+    terminating pods included, all Running and Ready), its writer still inactive. Any failure raises (the step stays
+    unresolved for recover)."""
     name, to = a["name"], a["to"]
-    _pre_write_check(f, a)
+    base = {"restore": f.kube.journal.context.get("restore"), "mark": mark, "name": name}
+    try:
+        _pre_write_check(f, a)
+    except X.StagingError as e:
+        X.receipt(f.record, HELPER, "restore-write", dict(base, result="not-submitted", why=str(e)[:300]))
+        raise
     if a["op"] == "scale":
-        base = {"restore": f.kube.journal.context.get("restore"), "mark": mark, "name": name}
+        # "submitting" is durable BEFORE the request: without it no request was ever sent, so recovery can tell an
+        # unattempted step from a request whose response was lost.
+        X.receipt(f.record, HELPER, "restore-write", dict(base, result="submitting"))
         try:
             out = f.kube.scale("Deployment", name, f.ns, a["uid"], a["resourceVersion"], to)
         except C.ApiError as e:
             definitive = getattr(e, "status", None) in X.DEFINITIVE
             X.receipt(f.record, HELPER, "restore-write", dict(base, result="refused" if definitive else "unknown",
                                                               status=getattr(e, "status", None)))
+            raise
+        except Exception:
+            X.receipt(f.record, HELPER, "restore-write", dict(base, result="unknown"))
             raise
         X.receipt(f.record, HELPER, "restore-write", dict(base, result="applied",
                                                           resourceVersion=out["metadata"].get("resourceVersion"),
@@ -1198,12 +1211,13 @@ def reconcile_restore(kube: X.Kube, d: Dict, record: X.Record) -> Dict:
     """recover's view of a restore step whose outcome is unknown (a refusal, a timeout, a lost response, a crash). It
     accepts only a transition consistent with the persisted intent and the step's restore-write receipt, with the
     writer provably inactive NOW:
-      * the write applied (receipt, or a lost response with exactly one generation step to the target) and nothing
-        since: done when converged, else not-done, state "applied-convergence-pending" (admission keeps refusing the
-        arm, selected or not, until it converges);
+      * the write applied (receipt, or a request durably marked "submitting" whose response was lost, with exactly one
+        generation step to the target) and nothing since: done when converged, else not-done, state
+        "applied-convergence-pending" (admission keeps refusing the arm, selected or not, until it converges);
       * a wait-only step (no write) at the unchanged generation: done when converged, else convergence pending;
-      * no write applied (refused, or never sent) and the Deployment at its planned generation and replicas: not-done,
-        state "not-applied";
+      * no write applied (refused, not submitted after a pre-write refusal, or never sent) and the Deployment at its
+        planned generation and replicas: not-done, state "not-applied"; any change after an unsubmitted or refused
+        write is someone else's;
       * anything else (gone, replaced, an unexplained generation change, another count, an active writer): unresolved.
     """
     live = kube.get("Deployment", d["name"], d["namespace"])
@@ -1221,21 +1235,24 @@ def reconcile_restore(kube: X.Kube, d: Dict, record: X.Record) -> Dict:
     gen, cur = live["metadata"].get("generation"), int(live["spec"].get("replicas") or 0)
     writes = [e["data"] for e in X.receipts(record, HELPER)
               if e["event"] == "restore-write" and e["data"].get("mark") == d["mark"]]
-    wrote = writes[-1]["result"] if writes else None
+    submitted = any(w["result"] == "submitting" for w in writes)
+    final = next((w for w in reversed(writes) if w["result"] != "submitting"), None)
+    wrote = final["result"] if final else ("submitted, response lost" if submitted else "never submitted")
     state_of = {"applied": "applied-convergence-pending", "wait": "wait-convergence-pending"}
     if pre_rep == to:
         kind, want_gen = "wait", pre_gen
     elif wrote == "applied":
-        kind, want_gen = "applied", writes[-1]["generation"]
+        kind, want_gen = "applied", final["generation"]
     elif gen == pre_gen and cur == pre_rep:
         return {"observed": "not-done", "state": "not-applied", "uid": d["uid"],
-                "why": "the scale was not applied" + (" (refused)" if wrote == "refused" else "")}
-    elif wrote != "refused" and isinstance(pre_gen, int) and gen == pre_gen + 1 and cur == to:
+                "why": f"the scale was not applied ({wrote})"}
+    elif submitted and wrote in ("unknown", "submitted, response lost") and isinstance(pre_gen, int) and \
+            gen == pre_gen + 1 and cur == to:
         kind, want_gen = "applied", pre_gen + 1          # a lost response: exactly our one step, nothing since
     else:
         return {"observed": "unresolved",
                 "why": f"at {cur} replicas, generation {gen}: not explained by the intent (planned {pre_rep} at "
-                       f"generation {pre_gen}, target {to}, write {wrote or 'unknown'})"}
+                       f"generation {pre_gen}, target {to}, write {wrote})"}
     if gen != want_gen or cur != to:
         return {"observed": "unresolved", "why": f"at {cur} replicas, generation {gen}: changed after the restore's "
                                                  f"{kind} (expected {to} at generation {want_gen})"}

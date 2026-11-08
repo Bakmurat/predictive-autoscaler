@@ -289,9 +289,9 @@ def test_scale_goes_through_the_subresource_with_rv_and_uid_and_bounds_stay(worl
     assert out["event"] == "restore-closed" and out["data"]["resolved"] is True
     assert out["data"]["done"] == [{"name": TARGET, "from": 6, "to": 2, "generation": a["generation"] + 1}]
     ev = [e for e in X.receipts(record, "session") if e["event"].startswith(("intent-", "step-", "restore-"))]
-    assert [e["event"] for e in ev][-5:-2] == ["restore-begin", ev[-4]["event"], "restore-write"]
-    assert ev[-4]["event"].startswith("intent-") and ev[-2]["event"].startswith("step-")
-    assert ev[-1]["event"] == "restore-closed" and ev[-3]["data"]["result"] == "applied"
+    names = [e["event"] for e in ev]
+    assert names[-6] == "restore-begin" and names[-5].startswith("intent-") and names[-2].startswith("step-")
+    assert [e["data"]["result"] for e in ev[-4:-2]] == ["submitting", "applied"] and names[-1] == "restore-closed"
     intent = [e for e in ev if e["event"].startswith("intent-")][-1]["data"]
     assert intent["op"] == "restore" and intent["pre"] == {"resourceVersion": a["resourceVersion"],
                                                           "generation": a["generation"], "replicas": 6}
@@ -603,7 +603,8 @@ def test_drift_after_an_applied_write_is_unresolved(world):
     with pytest.raises(X.StagingError, match="within the restore timeout"):
         S.restore(f, plan, digest)
     writes = [e["data"] for e in X.receipts(record, "session") if e["event"] == "restore-write"]
-    assert [w["result"] for w in writes] == ["applied"] and writes[0]["generation"] == p["actions"][0]["generation"] + 1
+    assert [w["result"] for w in writes] == ["submitting", "applied"]
+    assert writes[1]["generation"] == p["actions"][0]["generation"] + 1
     dep = api.obj("Deployment", TARGET, NS)                       # someone rewrites the spec at the same count
     dep["metadata"]["generation"] += 1
     rp = X.recover_plan(record, f.kube)
@@ -625,7 +626,7 @@ def test_a_lost_scale_response_is_recovered_as_our_one_step(world):
         S.restore(f, plan, digest)
     api.replace = real
     writes = [e["data"]["result"] for e in X.receipts(record, "session") if e["event"] == "restore-write"]
-    assert writes == ["unknown"] and api.obj("Deployment", TARGET, NS)["spec"]["replicas"] == 2
+    assert writes == ["submitting", "unknown"] and api.obj("Deployment", TARGET, NS)["spec"]["replicas"] == 2
     rp = X.recover_plan(record, f.kube)
     assert [(a["observed"]) for a in rp["actions"]] == ["done"]
     PF.recover(record, f.kube, S.recover_follow_up(record))
@@ -650,3 +651,90 @@ def test_recovery_rechecks_writer_inactivity(world):
              "spec": {"scaleTargetRef": {"kind": "Deployment", "name": TARGET}, "minReplicas": 1, "maxReplicas": 12}})
     rp = X.recover_plan(record, f.kube)
     assert rp["actions"][0]["observed"] == "unresolved" and "writer is not provably inactive" in rp["actions"][0]["why"]
+
+
+# --- Codex re-review of 1f9d2fc ----------------------------------------------------------------------------------
+
+def test_a_missing_or_replaced_other_target_blocks_a_start(world):
+    """Codex re-review finding 1: removing c28-h-rps-s90 left an H-CPU/s20 start plan without problems."""
+    api = world["api"]
+    record = session_record(world)
+    del api.objects[("deployments", NS, "c28-h-rps-s90")]
+    assert "c28-h-rps-s90 is missing or replaced (UID differs from targets.json)" in problems(world, record)
+    api.obj("Deployment", "c28-pa-r-s20", NS)["metadata"]["uid"] = F.new_uid()
+    assert "c28-pa-r-s20 is missing or replaced" in problems(world, record)
+
+
+def test_starting_count_provenance_problems_reach_the_start(world):
+    """A count can come with failed provenance checks: a changed rendering of ANOTHER arm (not the selected PA-N)
+    differs from the signed run-lock's and refuses the start."""
+    record, target = confirmation_world(world, sign_receipts=False)
+    params = PF.base_params()
+    params["hpa_cpu_target_percent"] = 70                         # changes the H-CPU renderings only
+    record, target = confirmation_world(world, sign_receipts=False, params=params)
+    from test_session import BLOCK_T
+    probs = problems(world, record, BLOCK_T - 60)
+    assert "H-CPU/s20: the rendering differs from the signed run-lock's" in probs
+    assert "PredictiveAutoscaler/c28-pa-n-s20 differs" not in probs
+
+
+def test_a_refused_pre_write_check_is_never_attributed_to_the_restore(world):
+    """Codex re-review finding 2: a writer appears between intent and PUT; the restore refuses with no write; that
+    writer scales six -> two and disappears; recovery must not report the restore done."""
+    record, c = loaded_and_stopped(world)
+    api = world["api"]
+    f, p, plan, digest = plan_restore(world, record)
+    real = S._pre_write_check
+    calls = []
+
+    def writer_in_the_window(f_, a):
+        calls.append(a["name"])
+        if len(calls) == 2:                                       # inside the step, after the intent
+            api.put({"apiVersion": "autoscaling/v2", "kind": "HorizontalPodAutoscaler",
+                     "metadata": {"name": "intruder", "namespace": NS},
+                     "spec": {"scaleTargetRef": {"kind": "Deployment", "name": TARGET}, "minReplicas": 1,
+                              "maxReplicas": 12}})
+        return real(f_, a)
+    S._pre_write_check = writer_in_the_window
+    before = len(api.mutations())
+    try:
+        with pytest.raises(X.StagingError, match="not provably inactive before the write"):
+            S.restore(f, plan, digest)
+    finally:
+        S._pre_write_check = real
+    assert len(api.mutations()) == before                         # zero API mutations
+    writes = [e["data"]["result"] for e in X.receipts(record, "session") if e["event"] == "restore-write"]
+    assert writes == ["not-submitted"]
+    scale_live(api, TARGET, 2)                                    # the intruder scales six -> two ...
+    del api.objects[("horizontalpodautoscalers", NS, "intruder")]  # ... and disappears
+    rp = X.recover_plan(record, f.kube)
+    assert rp["actions"][0]["observed"] == "unresolved"
+    assert "not explained by the intent" in rp["actions"][0]["why"] and "not-submitted" in rp["actions"][0]["why"]
+    with pytest.raises(X.StagingError, match="unresolved outcomes"):
+        PF.recover(record, f.kube, S.recover_follow_up(record))
+
+
+def test_a_crash_before_submitting_is_never_a_lost_response(world):
+    """An intent with no restore-write receipt at all was never submitted: a later one-step change to the target is
+    someone else's, unlike a request durably marked submitting whose response was lost."""
+    record, c = loaded_and_stopped(world)
+    api = world["api"]
+    f, p, plan, digest = plan_restore(world, record)
+    real = S._pre_write_check
+    calls = []
+
+    def crash_inside(f_, a):
+        calls.append(a["name"])
+        if len(calls) == 2:
+            raise KeyboardInterrupt                               # the executor dies after the intent, before any write
+        return real(f_, a)
+    S._pre_write_check = crash_inside
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            S.restore(f, plan, digest)
+    finally:
+        S._pre_write_check = real
+    assert not [e for e in X.receipts(record, "session") if e["event"] == "restore-write"]
+    scale_live(api, TARGET, 2)
+    rp = X.recover_plan(record, f.kube)
+    assert rp["actions"][0]["observed"] == "unresolved" and "never submitted" in rp["actions"][0]["why"]
