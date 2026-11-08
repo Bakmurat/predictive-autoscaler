@@ -134,7 +134,10 @@ def test_split_credential_arguments_are_redacted():
     o = C.sanitize_object({"kind": "Pod", "metadata": {"name": "p"}, "spec": {"containers": [{"name": "c", "args": [
         "--password", "hunter2", "--api-key", "123", "-p", "pin", "--enable-auth", "--port=8080", "--mode", "x"]}]}})
     assert o["spec"]["containers"][0]["args"] == ["--password", C.REDACTED, "--api-key", C.REDACTED, "-p", C.REDACTED,
-                                                  "--enable-auth", "--port=8080", "--mode", "x"]
+                                                  "--enable-auth", C.REDACTED, "--mode", "x"]   # unconditional
+    dash = C.sanitize_object({"kind": "Pod", "metadata": {"name": "p"}, "spec": {"containers": [{"name": "c", "args": [
+        "--password", "-starts-with-dash-SECRET", "--token", "--also-a-secret"]}]}})
+    assert "SECRET" not in json.dumps(dash) and "also-a-secret" not in json.dumps(dash)
 
 
 def test_kubectl_stderr_never_reaches_an_error_message():
@@ -150,6 +153,8 @@ def test_kubectl_stderr_never_reaches_an_error_message():
 
 def test_the_exclusive_lock_survives_an_in_flight_mutation(tmp_path):
     rec = record(tmp_path)
+    assert C.lock_path(rec, "legacy").endswith(f"{CLUSTER}-legacy.lock")
+    assert C.lock_path(dict(rec, lock_dir="/srv/c28-locks"), "legacy") == f"/srv/c28-locks/{CLUSTER}-legacy.lock"
     with C.exclusive_lock(rec, "legacy"):
         with pytest.raises(C.StagingError, match="another execution"):
             with C.exclusive_lock(rec, "legacy"):

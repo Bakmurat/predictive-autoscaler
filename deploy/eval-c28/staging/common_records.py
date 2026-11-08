@@ -382,16 +382,26 @@ def append_receipt(rec: Mapping, helper: str, event: str, data: Mapping, clock=N
     return r
 
 
-class exclusive_lock:
-    """One executor per helper and run: <evidence_dir>/locks/<helper>.lock, created exclusively. The lock is released
-    on a clean finish, or on an error while `safe` is true (no mutation in flight: the caller sets safe False after
-    recording a mutation's intent and True after recording its outcome). Otherwise it stays (fail closed) until a
-    reviewer reconciles the receipts and removes it."""
+def lock_path(rec: Mapping, scope: str) -> str:
+    """The ONE mutation lock of a cluster and resource scope (e.g. "legacy" for every legacy quiesce/restore), in the
+    shared lock directory (record lock_dir: one directory on the executor host for every run; default under the
+    evidence directory)."""
+    root = rec.get("lock_dir") or os.path.join(rec["evidence_dir"], "locks")
+    return os.path.join(root, f"{rec['cluster_uid']}-{scope}.lock")
 
-    def __init__(self, rec: Mapping, helper: str, clock=None):
+
+class exclusive_lock:
+    """One executor per cluster and resource scope (lock_path), created exclusively. The lock is released on a clean
+    finish, or on an error while `safe` is true (no mutation in flight: the caller sets safe False after recording a
+    mutation's intent and True after recording its outcome). Otherwise it stays (fail closed) until the helper's
+    recovery procedure has reconciled every ambiguous intent against the live objects and removed it."""
+
+    def __init__(self, rec: Mapping, scope: str, clock=None, holder: str = ""):
         self.safe = True
-        self.path = os.path.join(rec["evidence_dir"], "locks", f"{helper}.lock")
-        self.body = json.dumps({"helper": helper, "run_id": rec["run_id"], "pid": os.getpid(), "at": utc_now(clock)})
+        self.path = lock_path(rec, scope)
+        self.body = json.dumps({"scope": scope, "holder": holder or scope, "run_id": rec["run_id"],
+                                "cluster_uid": rec["cluster_uid"], "pid": os.getpid(), "at": utc_now(clock)},
+                               sort_keys=True)
 
     def __enter__(self):
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
@@ -440,11 +450,10 @@ def _sanitize_env(env: List) -> List:
 def _sanitize_args(args: List) -> List:
     out, redact_next = [], False
     for a in args or []:
-        if redact_next and not (isinstance(a, str) and a.startswith("-")):
+        if redact_next:                          # unconditionally: a credential may itself start with "-"
             out.append(REDACTED)
             redact_next = False
             continue
-        redact_next = False
         if isinstance(a, str):
             if _CRED_FLAG_SPLIT.match(a):
                 redact_next = True                   # "--password value": the value is the next argument
@@ -534,7 +543,8 @@ def api_for(rec: Mapping, run: Callable = subprocess.run) -> KubectlApi:
     return KubectlApi(rec["kubeconfig"], run=run)
 
 
-__all__ = ["exclusive_lock", "ApiError", "KINDS", "KubectlApi", "NotFound", "StagingError", "add_common_args",
+__all__ = ["exclusive_lock", "lock_path", "ApiError", "KINDS", "KubectlApi", "NotFound", "StagingError",
+           "add_common_args",
            "api_for",
            "append_receipt", "assert_clean", "canonical", "cluster_uid", "digest", "discover_groups", "kind_group",
            "list_items", "load_plan", "load_record", "make_plan", "path_of", "plan_digest", "read_receipts",

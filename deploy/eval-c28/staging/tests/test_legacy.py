@@ -12,10 +12,40 @@ import legacy as LG
 from fakes import CLUSTER, MARKERS, legacy_cluster, record
 
 T0 = 1_794_000_000
+REAL_PROM = LG.PromClient                                                    # before the autouse fixture patches it
+
+
+class Metrics:
+    """A fake metrics API: per-target request rate and data age (no network)."""
+
+    def __init__(self, rate=0.0, age=5.0, missing=()):
+        self.rate, self.age, self.missing, self.queries = rate, age, set(missing), []
+
+    def __call__(self, expr):
+        self.queries.append(expr)
+        target = expr.split('workload="')[1].split('"')[0]
+        if target in self.missing:
+            return None
+        return self.age if expr.startswith("time()") else self.rate
+
+
+@pytest.fixture(autouse=True)
+def quiet_metrics(monkeypatch):
+    m = Metrics()
+    monkeypatch.setattr(LG, "PromClient", lambda base, **kw: m)          # never a network call in tests
+    return m
+
+
+ARRIVALS = {"query_api": "http://vmselect.monitoring.svc:8481/select/0/prometheus",
+            "rate_query": 'sum(rate(istio_requests_total{destination_workload="{target}",'
+                          'destination_workload_namespace="demo"}[1m]))',
+            "age_query": 'time() - max(timestamp(istio_requests_total{destination_workload="{target}"}))',
+            "max_age_seconds": 120}
 
 
 def ready_record(tmp_path, **legacy):
     rec = record(tmp_path, legacy={"parked_replicas": 0, "job_deadline_seconds": 600, "wait_timeout_seconds": 60,
+                                   "arrivals": dict(ARRIVALS),
                                    "external_launchers": ["pf-loop on the ops box"],
                                    "external_launchers_attested": True, **legacy})
     r = C.append_receipt(rec, "archive", "archive-complete", {"plan_sha256": "f" * 64}, clock=lambda: T0)
@@ -364,13 +394,123 @@ def test_a_lost_response_after_a_delete_stays_recoverable(tmp_path):
     with pytest.raises(C.ApiError):
         LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
     assert ("scaledobjects", "demo", "nginx-test-keda-fallback") not in api.objects
-    assert os.path.exists(os.path.join(rec["evidence_dir"], "locks", "legacy.lock"))   # fail closed
+    lock = C.lock_path(rec, "legacy")
+    assert os.path.exists(lock)                                              # fail closed
     with pytest.raises(C.StagingError, match="another execution"):
         LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
     api.delete = real_delete
+    with pytest.raises(C.StagingError, match="run legacy.py recover"):
+        LG.build_restore_plan(api, rec)                                      # no guessing over an ambiguous intent
+    with pytest.raises(C.StagingError, match="sha256 differs"):
+        LG.recover(api, rec, "0" * 64, clock)
+    report = LG.recover(api, rec, C.sha256_file(lock), clock)
+    assert list(report.values()) == ["done"] and not os.path.exists(lock)
     rplan = LG.build_restore_plan(api, rec)
     recreate = [a for a in rplan["actions"] if a["op"] == "recreate"]
     assert [a["name"] for a in recreate] == ["nginx-test-keda-fallback"]
     LG.restore(api, rec, rplan, C.plan_digest(rplan), sleep=clock.sleep, monotonic=clock, clock=clock)
     assert ("scaledobjects", "demo", "nginx-test-keda-fallback") in api.objects
     assert api.objects[("deployments", "demo", "k6-nginx-test")]["spec"]["replicas"] == 1
+
+
+
+# --- Codex r2 on #31 ----------------------------------------------------------------------------------------------
+
+def test_an_orphan_hpa_is_an_independent_writer_at_restore(tmp_path):
+    # Finding 1: only a VERIFIED owner/target pair is one writer; an HPA with a dangling ScaledObject reference counts.
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    plan = LG.build_plan(api, rec)
+    LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    api.add("horizontalpodautoscalers", {"kind": "HorizontalPodAutoscaler", "metadata": {
+        "name": "orphan", "namespace": "demo", "ownerReferences": [{"kind": "ScaledObject", "name": "gone",
+                                                                    "uid": "dead-beef", "controller": True}]},
+        "spec": {"scaleTargetRef": {"kind": "Deployment", "name": "nginx-test"}}})
+    assert LG.writer_census(api)["nginx-test"] == ["horizontalpodautoscalers orphan"]
+    rplan = LG.build_restore_plan(api, rec)
+    with pytest.raises(C.StagingError, match="already have writers"):
+        LG.restore(api, rec, rplan, C.plan_digest(rplan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    assert api.objects[("deployments", "ml-engine", "predictive-operator")]["spec"]["replicas"] == 0
+
+
+def test_a_change_after_validation_is_never_overwritten(tmp_path):
+    # Finding 2: the PUT carries the validated object's resourceVersion; the post-state is the response's.
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    plan = LG.build_plan(api, rec)
+    LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    step = next(r for r in C.read_receipts(C.receipts_path(rec, "legacy"))
+                if r["event"].startswith("step-") and r["data"]["action"].get("name") == "nginx-reactive")
+    d = api.objects[("deployments", "demo", "nginx-reactive")]
+    assert step["data"]["post"]["replicas"] == 0 and step["data"]["post"]["generation"] == d["metadata"]["generation"]
+    rplan = LG.build_restore_plan(api, rec)
+    real = api.replace
+
+    def racing(path, body):
+        if path.endswith("/deployments/nginx-reactive/scale"):                 # another writer, after validation
+            d["spec"]["replicas"] = 7
+            d["metadata"]["resourceVersion"] = api._next_rv()
+        return real(path, body)
+    api.replace = racing
+    with pytest.raises(C.ApiError, match="conflict"):
+        LG.restore(api, rec, rplan, C.plan_digest(rplan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    assert d["spec"]["replicas"] == 7                                       # the intervening change stands
+
+
+def test_quiesce_and_restore_share_one_lock(tmp_path):
+    # Finding 3: one mutation lock per cluster and scope, whichever helper holds it.
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    plan = LG.build_plan(api, rec)
+    LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    rplan = LG.build_restore_plan(api, rec)
+    with C.exclusive_lock(rec, "legacy", holder="a concurrent quiesce"):
+        with pytest.raises(C.StagingError, match="another execution"):
+            LG.restore(api, rec, rplan, C.plan_digest(rplan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    assert api.objects[("deployments", "ml-engine", "ml-api")]["spec"]["replicas"] == 0
+
+
+@pytest.mark.parametrize("metrics, why", [(Metrics(rate=0.4), "still receives requests"),
+                                          (Metrics(missing={"myapptwo"}), "no fresh request-counter observation"),
+                                          (Metrics(age=900), "stale")])
+def test_arrivals_must_be_observed_zero_before_parking(tmp_path, quiet_metrics, metrics, why):
+    # Finding 5: a quiet replica count is not zero traffic; fresh per-target request counters are.
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    plan = LG.build_plan(api, rec)
+    with pytest.raises(C.StagingError, match=why):
+        LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock,
+                   metrics=metrics)
+    assert api.objects[("deployments", "demo", "nginx-test")]["spec"]["replicas"] == 3        # not parked
+    assert any('destination_workload="nginx-ensemble-q95"' in q for q in metrics.queries)
+
+
+def test_retirement_needs_fresh_zero_arrivals_throughout(tmp_path, quiet_metrics):
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    plan = LG.build_plan(api, rec)
+    LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    assert LG.verify(api, rec, 600, clock.sleep, clock, clock)["retired"] is True
+    blind = Metrics(missing={"nginx-test"})
+    v = LG.verify(api, rec, 600, clock.sleep, clock, clock, metrics=blind)
+    assert v["retired"] is False and any("no fresh request-counter observation" in p for p in v["problems"])
+    with pytest.raises(C.StagingError, match="arrivals"):
+        LG.build_plan(api, dict(rec, legacy={k: v for k, v in rec["legacy"].items() if k != "arrivals"}))
+
+
+def test_the_metrics_client_returns_one_value_or_nothing():
+    import io
+
+    class Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def opener(body):
+        return lambda url, timeout: Resp(json.dumps(body).encode())
+    one = {"status": "success", "data": {"result": [{"value": [1, "0"]}]}}
+    two = {"status": "success", "data": {"result": [{"value": [1, "0"]}, {"value": [1, "3"]}]}}
+    assert REAL_PROM("http://vm", opener=opener(one))("q") == 0.0
+    assert REAL_PROM("http://vm", opener=opener(two))("q") is None             # ambiguous: no observation
+    assert REAL_PROM("http://vm", opener=opener({"status": "success", "data": {"result": []}}))("q") is None
+
+    def down(url, timeout):
+        raise OSError("connection refused")
+    assert REAL_PROM("http://vm", opener=down)("q") is None
