@@ -420,7 +420,8 @@ def generator_job(c: Context, active_deadline: int, suspend: bool) -> Dict:
     return {"apiVersion": "batch/v1", "kind": "Job",
             "metadata": {"name": names["job"], "namespace": c.ns, "labels": c.labels()},
             "spec": {"backoffLimit": 0, "activeDeadlineSeconds": active_deadline, "suspend": suspend,
-                     "template": {"metadata": {"labels": c.labels()}, "spec": {
+                     "template": {"metadata": {"labels": c.labels(),
+                                               "annotations": dict(c.c28.render.SIDECAR_FREE)}, "spec": {
                          "restartPolicy": "Never", "automountServiceAccountToken": False,
                          "securityContext": {"runAsNonRoot": True, "runAsUser": 12345,
                                              "seccompProfile": {"type": "RuntimeDefault"}},
@@ -443,6 +444,36 @@ def generator_job(c: Context, active_deadline: int, suspend: bool) -> Dict:
                                                              "capabilities": {"drop": ["ALL"]}},
                                          "volumeMounts": [{"name": "plan", "mountPath": "/plan", "readOnly": True}]}],
                          "volumes": [{"name": "plan", "configMap": {"name": names["plan_cm"]}}]}}}}
+
+
+def _residency_problems(c: Context, job: Dict) -> List[str]:
+    """The session stays inside the params' residency budget: its generator is sidecar-free and requests no more than
+    the budgeted generator, and every other fixture target sits at no more than the budgeted idle replica count (the
+    W computation assumes it; nothing here parks or restores replicas)."""
+    R, out = c.c28.render, []
+    try:
+        R.audit_sidecar_free([job])
+        r = R.residency_params(c.params)
+    except R.ParamsError as e:
+        return [str(e)]
+    req = (job["spec"]["template"]["spec"]["containers"][0].get("resources") or {}).get("requests") or {}
+    try:
+        cpu, mem = R.cpu_millicores(req.get("cpu", "0")), R.memory_bytes(req.get("memory", "0"))
+    except R.ParamsError as e:
+        return [f"session.generator_resources: {e}"]
+    if cpu <= 0 or mem <= 0:
+        out.append("session.generator_resources must set CPU and memory requests (the residency budget counts them)")
+    if cpu > r["generator"][0] or mem > r["generator"][1]:
+        out.append(f"the generator requests ({req.get('cpu')}, {req.get('memory')}) exceed the residency budget's "
+                   "generator (params residency.generator)")
+    for profile in c.c28.frozen.PROFILES:
+        for arm in c.c28.frozen.ARMS:
+            name = R.target_name(arm, profile)
+            dep = c.kube.get("Deployment", name, c.ns) if name != c.target else None
+            if dep is not None and (dep["spec"].get("replicas") or 0) > r["idle_arm_replicas"]:
+                out.append(f"{name} has {dep['spec'].get('replicas')} replicas, above the residency budget's idle "
+                           f"count {r['idle_arm_replicas']}: restore it before loading another arm")
+    return out
 
 
 def _load_script() -> str:
@@ -536,6 +567,7 @@ def plan_start(c: Context) -> Dict:
         actions.append({"op": "activate", "kind": "PredictiveAutoscaler", "name": c.target, "uid": uid,
                         "from": "Recommend", "to": "Active"})
     job = generator_job(c, job_deadline(c, b), suspend=c.s["phase"] == "confirmation")
+    problems += _residency_problems(c, job)
     actions.append({"op": "create-plan-configmap", "name": names["plan_cm"], "script_sha256":
                     X.sha256_bytes(script.encode()), "plan_digest_k6": c.plan["digest"]})
     actions.append({"op": "create-generator", "name": names["job"], "sha256": X.json_digest(job),

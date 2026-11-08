@@ -155,6 +155,25 @@ def test_one_loaded_arm_at_a_time(world):
     assert "sessions still open" in probs and "generators of the run still active" in probs
 
 
+def test_generator_is_sidecar_free_and_inside_the_residency_budget(world):
+    record = session_record(world)
+    start_session(world, record)
+    job = world["api"].obj("Job", "c28-gen-s-0001", "demo")
+    assert job["spec"]["template"]["metadata"]["annotations"] == {"sidecar.istio.io/inject": "false"}
+
+
+def test_generator_above_its_residency_budget_is_refused(world):
+    record = session_record(world, generator_resources={"requests": {"cpu": "750m", "memory": "256Mi"},
+                                                        "limits": {"cpu": "1", "memory": "512Mi"}})
+    assert "exceed the residency budget's generator" in problems(world, record)
+
+
+def test_other_targets_above_the_idle_count_block_a_session(world):
+    world["api"].obj("Deployment", "c28-pa-e-s90", "demo")["spec"]["replicas"] = 7      # left over from a session
+    probs = problems(world, session_record(world))
+    assert "c28-pa-e-s90 has 7 replicas, above the residency budget's idle count 2" in probs
+
+
 def test_preparation_pa_session_never_activates(world):
     record = session_record(world, arm="PA-N", plan=write_plan(world, "ordinary", 101, "c28-pa-n-s20", name="pa.json"))
     assert not any(a["op"] in ("activate", "create-writer") for a in S.plan_start(ctx(world, record))["actions"])

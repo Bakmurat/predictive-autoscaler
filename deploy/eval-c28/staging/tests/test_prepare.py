@@ -75,6 +75,26 @@ def test_values_overlay_has_the_staging_must_haves(api, make_record):
     assert any("exists" in p for p in prepare.plan(record, kube, "values")["problems"])
 
 
+def test_values_overlay_keeps_the_release_pods_sidecar_free(api, make_record):
+    record, kube = setup(api, make_record)
+    params, s = X.load_params(record), prepare._section(record)
+    v = prepare.staging_values(record, params, s)
+    for k in ("operator", "forecaster"):
+        assert v[k]["podAnnotations"] == {"sidecar.istio.io/inject": "false"}
+    assert prepare.values_problems(v, params) == []
+    del v["forecaster"]["podAnnotations"]
+    assert prepare.values_problems(v, params) == ['forecaster.podAnnotations must carry sidecar.istio.io/inject: '
+                                                  '"false" (sidecar-free)']
+
+
+def test_staging_requires_the_residency_section(api, make_record):
+    params = base_params()
+    del params["residency"]
+    record = X.load_record(make_record({"prepare": prepare_section()}, params=params), ("prepare",))
+    with pytest.raises(X.StagingError, match="residency section"):
+        X.load_params(record)
+
+
 def test_network_policy_cannot_be_disabled(api, make_record):
     s = prepare_section()
     s["release"]["network_policy"]["enabled"] = False

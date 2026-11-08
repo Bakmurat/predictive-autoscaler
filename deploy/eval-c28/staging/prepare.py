@@ -112,12 +112,14 @@ def staging_values(record: X.Record, params: Dict, s: Dict) -> Dict:
         "operator": {"replicas": 1, "watchNamespaces": [params["namespace"]],
                      "forecasterAddress": routes["operator"]["forecasterAddress"],
                      "forecastLedger": {"enabled": True, "persistence": {"existingClaim": st["ledger_claim"]["name"]}},
+                     "podAnnotations": dict(routes["operator"]["podAnnotations"]),
                      **copy.deepcopy(support)},
         "forecaster": {"engine": "statistical",
                        "statistical": {"persistence": {"existingClaim": st["state_claim"]["name"], "retain": True},
                                        "labQualification": {"configMap": ""}},
                        "auth": {"enabled": True},
                        "tls": {"extraDNSNames": routes["forecaster"]["tls"]["extraDNSNames"]},
+                       "podAnnotations": dict(routes["forecaster"]["podAnnotations"]),
                        **copy.deepcopy(support)},
         "training": {"targets": []},
         "networkPolicy": copy.deepcopy(rel["network_policy"]),
@@ -144,6 +146,10 @@ def values_problems(v: Dict, params: Dict) -> List[str]:
         out.append("operator.forecasterAddress must be the forecast route")
     if v["networkPolicy"].get("enabled") is not True:
         out.append("NetworkPolicies stay enabled")
+    c28 = X.import_harness()
+    for k in ("operator", "forecaster"):
+        if (v[k].get("podAnnotations") or {}).get(c28.render.SIDECAR_ANNOTATION) != "false":
+            out.append(f"{k}.podAnnotations must carry {c28.render.SIDECAR_ANNOTATION}: \"false\" (sidecar-free)")
     for k in ("operator", "statisticalForecaster"):
         if not str(v["images"][k]["digest"]).startswith("sha256:"):
             out.append(f"images.{k} must be digest-pinned")

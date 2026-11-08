@@ -30,7 +30,16 @@ def base_params():
     p["nodes"] = {"workload": "worker-w", "support": "worker-s"}
     p["reservation"]["taint_value"] = RUN
     p["image"] = "harbor.example/autoscaler/c28-fixture@sha256:" + "a" * 64
+    p["residency"] = RESIDENCY
     return p
+
+
+# The prodcluster staging helpers require a residency section; these nodes admit the kind-smoke resources.
+RESIDENCY = {"workload": {"allocatable": {"cpu": "8", "memory": "16Gi"},
+                          "system_requests": {"cpu": "200m", "memory": "256Mi"}},
+             "support": {"allocatable": {"cpu": "8", "memory": "16Gi"},
+                         "system_requests": {"cpu": "200m", "memory": "256Mi"}},
+             "support_extra": []}
 
 
 def lock_file(record):

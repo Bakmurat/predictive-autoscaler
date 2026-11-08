@@ -8,8 +8,8 @@ evidence by itself. The executor uses it under a locked run-lock and the change 
 |---|---|
 | `fixture/` | The HTTP fixture: one binary in three modes. `server` is the workload: fixed CPU work, a fixed response, a bounded queue, a measured startup delay and `/ready`, `/metrics`. `ingress` counts offered demand per target before the target can reject it, with a 2 s timeout and no retries. `tcpproxy` is the evaluation-owned metrics and forecast routes, with scheduled outages. `Dockerfile` builds a static, non-root image. |
 | `load/c28.js` | The k6 open-loop generator (ramping-arrival-rate, one request per iteration), driven by a plan from `python -m c28 plan`. |
-| `harness/c28/` | `render` (fixture, ingress, routes, quota and the five arms for both startup profiles, with an exclusive-writer audit), `schedule` (programs, k6 plans, fault timetable, the frozen session order), `runlock`, `collect` (hashed evidence bundle), `reduce` (per-window metrics), `score` (paired day-block bootstrap, Holm correction, the section 8 classification), `inject` (the guarded quota fault). `frozen.py` holds every value the manifest freezes. |
-| `params/` | `kind-smoke.json` for the kind smoke. `prodcluster.template.json` lists what the run-lock must resolve; it cannot be rendered until every placeholder is replaced. |
+| `harness/c28/` | `render` (fixture, ingress, routes, quota and the five arms for both startup profiles, with an exclusive-writer audit, a sidecar-free audit and the residency budget), `schedule` (programs, k6 plans, fault timetable, the frozen session order), `runlock`, `collect` (hashed evidence bundle), `reduce` (per-window metrics), `score` (paired day-block bootstrap, Holm correction, the section 8 classification), `inject` (the guarded quota fault). `frozen.py` holds every value the manifest freezes. |
+| `params/` | `kind-smoke.json` for the kind smoke. `prodcluster.template.json` lists what the run-lock must resolve; it cannot be rendered until every placeholder is replaced (the calibrated fixture resources and the W/S residency inputs included). |
 | `smoke/kind.sh` | The aspire kind-bed smoke, on its own cluster and kubeconfig only. `--render-only` renders and audits offline; `scripts/verify.sh` runs that mode. |
 
 ```sh
@@ -19,6 +19,7 @@ python -m c28 plan --kind scored --seed 201 --capacity 35 --target c28-pa-n-s20 
 python -m c28 order
 python -m c28 runlock lock runlock.json && python -m c28 runlock verify runlock.json --manifest-root <dir>
 python -m c28 release-values --params P --out release-values.yaml   # the evaluation release's routes and TLS name
+python -m c28 residency --params P          # W/S maximum resident requests against 75 % of allocatable (exit 1 when over)
 python -m c28 collect --runlock runlock.json --targets c28-pa-n-s20 --start 2026-11-20T00:00:00Z \
   --end 2026-11-21T00:00:00Z --out bundle/ --file plan=plan-201-c28-pa-n-s20.json --file ledgers=decisions.jsonl
 python -m c28 reduce --runlock runlock.json --bundle bundle/ --target c28-pa-n-s20 --block-start 2026-11-20T00:00:00Z
@@ -72,3 +73,56 @@ Other open items:
 
 - The default queries are a starting point. They must be adapted to the observer (k6 remote-write series, kube-state-metrics) and frozen in the run-lock, and the collector then uses exactly those.
 - The E1 policy-cost binding and the lab-qualification mechanism are implemented by C2.8a (#27). The study still records them as section 1 prerequisites, which are true only for the reviewed evaluation build of the pinned tree.
+
+## Sidecar-free evaluation
+
+The evaluation runs in prodcluster's `demo`, which has Istio sidecar injection enabled namespace-wide. That policy is
+not changed. Instead every Pod template rendered for the evaluation carries the pod annotation
+`sidecar.istio.io/inject: "false"` on the pod template's metadata (an annotation on the Deployment's own metadata does
+not reach the pods). That covers the ten fixture Deployments, the ingress, the two fault routes (`render`), the
+generator Jobs (`staging/session.py`) and the evaluation release's operator and forecaster (`podAnnotations` in
+`release-values` and in `prepare.py`'s staging overlay, which `values_problems` checks). `render` refuses a rendering
+in which any Pod template lacks the annotation (`audit_sidecar_free`), and `session.py` audits its generator Job the
+same way. A default sidecar (100m CPU / 128Mi requested per pod) would otherwise make the workload node unschedulable.
+
+**Claim limit.** Results concern this sidecar-free fixture, not mesh-enabled workloads. They are not directly comparable
+with the old prodcluster benchmark, whose `demo` pods ran with sidecars.
+
+## Fixture resources and the residency budget
+
+The fixture's CPU/memory requests and limits are a calibrated, reviewed parameter (manifest section 3), identical for
+every arm. They are never invented or lowered to make the budget fit. `validate` refuses a missing or placeholder value
+(`<...>`) and a request above its limit. The prodcluster template keeps them as placeholders; the kind smoke keeps its
+own values.
+
+When the params carry a `residency` section, `render` computes the evaluation's maximum resident requests on each
+reserved node and refuses when evaluation plus node-system requests exceed **75 % of allocatable** (the manifest's
+>= 25 % headroom), CPU and memory checked separately, listing every contribution. The prodcluster staging helpers
+(`execlib.load_params`) require the section; the kind smoke may omit it.
+
+| Field | Meaning |
+|---|---|
+| `residency.workload` / `residency.support` | `allocatable` {cpu, memory} from the fresh dated node inventory; `system_requests` {cpu, memory}: the summed requests of the node-level pods that stay on that node (DaemonSets, allowlisted agents). Required. |
+| `overlap_pods` | Extra pods of the loaded arm counted on W for startup/termination overlap. Default 2 (= the frozen scale-down step of two pods: terminating pods keep their requests on the node until gone while scale-up, stabilization 0, already creates replacements); at least 1. |
+| `idle_arm_replicas` | Replica count of every arm that is not loaded. Default 2, the fixed starting count every target is created and verified at (no parking). A higher, conservative value is allowed. A lower value is refused (see below). |
+| `operator`, `forecaster` | Requests budgeted on S. Defaults: the chart's operator request 100m/128Mi, the forecaster at 1 CPU/512Mi (its limit, STAGING S2). |
+| `generator` | `concurrent` generator Jobs (warm-up/history generators included) and the requests of each. Default one Job at 500m/256Mi (session.py's default). `session.py` refuses a generator that requests more. |
+| `support_extra` | Every other evaluation pod on S (recorder, adapters): `[{name, replicas, cpu_request, memory_request}]`, or `[]`. |
+
+How it is computed, from the rendered pod templates (each pinned to its role by required node affinity):
+
+- **W:** nine idle arms × `idle_arm_replicas` + the loaded arm × maxReplicas (12) + `overlap_pods` of the loaded arm
+  (the arm with the largest per-pod request, so the worst case) + the ingress at its replicas + W's system requests.
+  One arm is loaded at a time (confirmation is sequential; `session.py` refuses a second open session or generator).
+- **S:** the two fault routes + operator + forecaster + `concurrent` generators + `support_extra` + S's system requests.
+
+Example (W allocatable 4000m / 7.75Gi, system 400m / 512Mi, fixture 50m / 32Mi, ingress 100m / 64Mi, defaults):
+CPU 9 × 2 × 50 + 12 × 50 + 2 × 50 + 100 + 400 = 2100m = 52.5 % (limit 3000m); memory 32 × 32Mi + 64Mi + 512Mi =
+1600Mi = 20.2 % of 7936Mi. The same node with a 100m fixture needs 3700m = 92.5 % and is refused.
+
+**Idle-arm parking is not implemented.** Parking inactive arms at fewer replicas between sessions would need their
+writers stopped, the common starting count restored before each session, history collection preserved and the loaded
+arm's frozen bounds unchanged. Nothing in the harness or `session.py` does that (sessions never scale a target, and a
+stopped session leaves its target at whatever count its writer last set). So `idle_arm_replicas` below the starting
+count is refused, and `session.py` refuses to start while any other target sits above `idle_arm_replicas`: a target
+left scaled up by an earlier session must be restored (a reviewed step) before the next arm is loaded.

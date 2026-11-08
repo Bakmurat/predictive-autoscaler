@@ -6,6 +6,16 @@ PredictiveAutoscaler (PA-R, PA-N, PA-E). Fixture pods tolerate only the run's ow
 workload node by role label and hostname; the ingress sits on the workload node too, the fault routes on the support
 node. Every PredictiveAutoscaler is rendered in Recommend mode: switching an arm to Active is the executor's gated
 step (section 1, prerequisite 3), never a rendering default.
+
+Sidecar-free: the evaluation runs in prodcluster's `demo`, which injects Istio sidecars namespace-wide. Every Pod
+template rendered for the evaluation carries the pod annotation `sidecar.istio.io/inject: "false"` (the namespace policy
+is never changed), and audit_sidecar_free() refuses a rendering in which any Pod template lacks it. Results therefore
+concern this sidecar-free fixture, not mesh-enabled workloads.
+
+Residency: when the params carry a `residency` section (required by the prodcluster staging helpers, optional for the
+kind smoke), residency_report() computes the evaluation's maximum resident requests on W and S from the rendered pod
+templates plus the declared unrendered components, and render_all() refuses when evaluation plus node-system requests
+exceed 75 % of a node's allocatable, CPU and memory separately (frozen.RESIDENCY_LIMIT_FRACTION).
 """
 
 from __future__ import annotations
@@ -25,6 +35,21 @@ TARGET_LABEL = "c28.devkuban.com/target"
 _DNS = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
 _DIGEST_IMAGE = re.compile(r"^[a-z0-9][a-z0-9./:-]*@sha256:[0-9a-f]{64}$")
 _QUANTITY = re.compile(r"^[0-9]+(\.[0-9]+)?(m|Mi|Gi|Ki)?$")
+_CPU = re.compile(r"^([0-9]+(?:\.[0-9]+)?)(m?)$")
+_MEMORY = re.compile(r"^([0-9]+(?:\.[0-9]+)?)(Ki|Mi|Gi|Ti|k|M|G|T)?$")
+_MEMORY_UNITS = {None: 1, "": 1, "Ki": 2**10, "Mi": 2**20, "Gi": 2**30, "Ti": 2**40, "k": 10**3, "M": 10**6,
+                 "G": 10**9, "T": 10**12}
+
+# The pod annotation that keeps Istio's injector away from every evaluation pod (demo injects namespace-wide).
+SIDECAR_ANNOTATION = "sidecar.istio.io/inject"
+SIDECAR_FREE = {SIDECAR_ANNOTATION: "false"}
+# Requests of the evaluation components the renderer does not render, used unless params.residency overrides them:
+# the operator at the chart's default request (charts/predictive-autoscaler values.yaml operator.resources) and one
+# generator Job at session.py's default generator_resources. The forecaster is frozen.FORECASTER_BUDGET.
+OPERATOR_BUDGET = {"cpu_request": "100m", "memory_request": "128Mi"}
+GENERATOR_BUDGET = {"concurrent": 1, "cpu_request": "500m", "memory_request": "256Mi"}
+
+FIXED_REPLICAS = 2          # every target's fixed replica count outside a session (the common starting count, section 5)
 
 REQUIRED = ("schema", "run_id", "namespace", "control_namespace", "release", "image", "c0_rps", "nodes", "reservation",
             "fixture", "ingress", "proxy", "hpa_cpu_target_percent", "keda", "routes", "priority_class", "quota",
@@ -33,6 +58,26 @@ REQUIRED = ("schema", "run_id", "namespace", "control_namespace", "release", "im
 
 class ParamsError(ValueError):
     pass
+
+
+def _placeholder(v) -> bool:
+    return isinstance(v, str) and v.strip().startswith("<")
+
+
+def cpu_millicores(q) -> Decimal:
+    """A CPU quantity ("250m", "1", "0.5") in millicores."""
+    m = _CPU.match(str(q))
+    if not m:
+        raise ParamsError(f"{q!r} is not a CPU quantity (e.g. 250m or 1)")
+    return Decimal(m.group(1)) * (1 if m.group(2) else 1000)
+
+
+def memory_bytes(q) -> Decimal:
+    """A memory quantity ("128Mi", "7.75Gi", "512M", bytes) in bytes."""
+    m = _MEMORY.match(str(q))
+    if not m:
+        raise ParamsError(f"{q!r} is not a memory quantity (e.g. 128Mi or 7.75Gi)")
+    return Decimal(m.group(1)) * _MEMORY_UNITS[m.group(2)]
 
 
 def capacity_rps(c0: float) -> str:
@@ -63,8 +108,16 @@ def validate(p: Dict) -> None:
         raise ParamsError("the workload and support nodes must differ (section 11.1)")
     for res in ("fixture", "ingress", "proxy"):
         for k in ("cpu_request", "cpu_limit", "memory_request", "memory_limit"):
-            if not _QUANTITY.match(str(p[res].get(k, ""))):
+            if k not in p[res]:
+                raise ParamsError(f"{res}.{k} is missing" + (_FIXTURE_RESOURCES if res == "fixture" else ""))
+            if _placeholder(p[res][k]):
+                raise ParamsError(f"{res}.{k} is still a placeholder" + (_FIXTURE_RESOURCES if res == "fixture" else ""))
+            if not _QUANTITY.match(str(p[res][k])):
                 raise ParamsError(f"{res}.{k} is not a quantity")
+        parse = (("cpu_request", "cpu_limit", cpu_millicores), ("memory_request", "memory_limit", memory_bytes))
+        for req, lim, fn in parse:
+            if fn(p[res][req]) <= 0 or fn(p[res][req]) > fn(p[res][lim]):
+                raise ParamsError(f"{res}.{req} must be positive and at most {res}.{lim}")
     if p["hpa_cpu_target_percent"] not in F.HPA_CPU_CANDIDATES:
         raise ParamsError(f"hpa_cpu_target_percent must be one of the tuning candidates {F.HPA_CPU_CANDIDATES}")
     if p["scrape"] not in ("PodMonitor", "VMPodScrape", "annotations"):
@@ -77,6 +130,97 @@ def validate(p: Dict) -> None:
     if not (str(p["keda"]["server_address"]) == route or str(p["keda"]["server_address"]).startswith(route + "/")):
         raise ParamsError(f"keda.server_address must go through the evaluation metrics route ({route}), so the RPS "
                           "outage reaches H-RPS")
+    if "residency" in p:
+        residency_params(p)
+
+
+_FIXTURE_RESOURCES = (": the fixture's CPU/memory requests and limits are the calibrated, reviewed values (manifest "
+                      "section 3), identical for every arm; they are never invented or lowered to fit the residency "
+                      "budget")
+
+
+def _req_pair(d, where: str) -> Tuple[Decimal, Decimal]:
+    if not isinstance(d, dict):
+        raise ParamsError(f"{where} must be an object with cpu and memory")
+    for k in ("cpu", "memory"):
+        if k not in d:
+            raise ParamsError(f"{where}.{k} is missing")
+        if _placeholder(d[k]):
+            raise ParamsError(f"{where}.{k} is still a placeholder: use the value of the fresh dated node inventory")
+    return cpu_millicores(d["cpu"]), memory_bytes(d["memory"])
+
+
+def _component(d, where: str) -> Tuple[Decimal, Decimal]:
+    if not isinstance(d, dict):
+        raise ParamsError(f"{where} must be an object with cpu_request and memory_request")
+    for k in ("cpu_request", "memory_request"):
+        if k not in d or _placeholder(d[k]):
+            raise ParamsError(f"{where}.{k} is missing or a placeholder")
+    return cpu_millicores(d["cpu_request"]), memory_bytes(d["memory_request"])
+
+
+def _count(v, where: str, lo: int, hi: int = 1_000) -> int:
+    if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
+        raise ParamsError(f"{where} must be an integer in {lo}..{hi}")
+    return v
+
+
+def residency_params(p: Dict) -> Dict:
+    """The validated, normalized residency section (millicores and bytes), defaults applied.
+
+      residency.workload / residency.support: {"allocatable": {"cpu", "memory"}, "system_requests": {"cpu", "memory"}}
+          allocatable from the fresh node inventory; system_requests = the summed requests of the node-level pods that
+          stay on that node (DaemonSets and other allowlisted system agents).
+      residency.overlap_pods (default 2 = frozen SCALE_DOWN_PODS, at least 1): extra pods of the loaded arm counted on
+          W for startup/termination overlap. A scale-down step may terminate up to two pods, whose requests the
+          scheduler keeps counting until they are gone, while scale-up (stabilization 0) creates their replacements.
+      residency.idle_arm_replicas (default = the rendered fixed replica count, 2): the replica count of every arm that
+          is not loaded. A value below the fixed starting count is idle-arm PARKING, which needs a parking mechanism
+          (writers stopped, the starting count restored before each session, history preserved, the loaded arm's
+          frozen bounds unchanged) that is not implemented: it is refused.
+      residency.operator (default the chart's request 100m/128Mi), residency.forecaster (default 1 CPU/512Mi),
+      residency.generator ({"concurrent", "cpu_request", "memory_request"}, default one Job at 500m/256Mi; history and
+          warm-up generators that may run at the same time count in "concurrent"),
+      residency.support_extra (default []): [{"name", "replicas", "cpu_request", "memory_request"}] for every other
+          unrendered evaluation pod on S (recorder, adapters)."""
+    r = p.get("residency")
+    if not isinstance(r, dict):
+        raise ParamsError("residency must be an object")
+    out: Dict = {"nodes": {}}
+    for role in ("workload", "support"):
+        n = r.get(role)
+        if not isinstance(n, dict):
+            raise ParamsError(f"residency.{role} needs allocatable and system_requests")
+        alloc = _req_pair(n.get("allocatable"), f"residency.{role}.allocatable")
+        system = _req_pair(n.get("system_requests"), f"residency.{role}.system_requests")
+        if alloc[0] <= 0 or alloc[1] <= 0:
+            raise ParamsError(f"residency.{role}.allocatable must be positive")
+        out["nodes"][role] = {"allocatable": alloc, "system": system}
+    out["overlap_pods"] = _count(r.get("overlap_pods", F.SCALE_DOWN_PODS), "residency.overlap_pods", 1, F.MAX_REPLICAS)
+    fixed = FIXED_REPLICAS
+    idle = _count(r.get("idle_arm_replicas", fixed), "residency.idle_arm_replicas", 0, F.MAX_REPLICAS)
+    if idle < fixed:
+        raise ParamsError(f"residency.idle_arm_replicas {idle} is below the fixed starting count {fixed}: parking idle "
+                          "arms needs a parking mechanism (writers stopped, starting count restored before each "
+                          "session, history preserved, frozen bounds unchanged) that is not implemented")
+    out["idle_arm_replicas"] = idle
+    out["operator"] = _component(r.get("operator", OPERATOR_BUDGET), "residency.operator")
+    out["forecaster"] = _component(r.get("forecaster", F.FORECASTER_BUDGET), "residency.forecaster")
+    g = r.get("generator", GENERATOR_BUDGET)
+    out["generator"] = _component(g, "residency.generator")
+    out["generator_concurrent"] = _count(g.get("concurrent", 1), "residency.generator.concurrent", 1, 20)
+    extra = r.get("support_extra", [])
+    if _placeholder(extra) or not isinstance(extra, list):
+        raise ParamsError("residency.support_extra must list every other evaluation pod on S (recorder, adapters), "
+                          "or be [] when there is none")
+    out["support_extra"] = []
+    for i, e in enumerate(extra):
+        where = f"residency.support_extra[{i}]"
+        if not isinstance(e, dict) or not _DNS.match(str(e.get("name", ""))):
+            raise ParamsError(f"{where} needs a name")
+        out["support_extra"].append((e["name"], _count(e.get("replicas", 1), f"{where}.replicas", 1, 20),
+                                     *_component(e, where)))
+    return out
 
 
 def route_host(p: Dict, kind: str) -> str:
@@ -90,8 +234,10 @@ def eval_release_values(p: Dict) -> Dict:
     validate(p)
     fr = route_host(p, "forecast")
     return {"prometheus": {"url": f"http://{route_host(p, 'metrics')}:8481"},
-            "operator": {"watchNamespaces": [p["namespace"]], "forecasterAddress": f"{fr}:8443"},
-            "forecaster": {"engine": "statistical", "tls": {"extraDNSNames": [fr]}}}
+            "operator": {"watchNamespaces": [p["namespace"]], "forecasterAddress": f"{fr}:8443",
+                         "podAnnotations": dict(SIDECAR_FREE)},
+            "forecaster": {"engine": "statistical", "tls": {"extraDNSNames": [fr]},
+                           "podAnnotations": dict(SIDECAR_FREE)}}
 
 
 def _route_policies(p: Dict) -> List[Dict]:
@@ -230,7 +376,8 @@ def render_arm(p: Dict, arm: str, profile: str) -> List[Dict]:
            {"name": "STARTUP_DELAY_SECONDS", "value": str(F.PROFILES[profile])},
            {"name": "FAULT_FILE", "value": "/etc/c28/faults.json"}]
     pod = {"metadata": {"labels": labels,
-                        "annotations": {"prometheus.io/scrape": "true", "prometheus.io/port": "8080"}},
+                        "annotations": {"prometheus.io/scrape": "true", "prometheus.io/port": "8080",
+                                        **SIDECAR_FREE}},
            "spec": {"priorityClassName": p["priority_class"], "automountServiceAccountToken": False,
                     "securityContext": _SECURITY, "terminationGracePeriodSeconds": 10, **_placement(p, "workload"),
                     "containers": [{"name": "fixture", "image": p["image"], "env": env,
@@ -245,7 +392,7 @@ def render_arm(p: Dict, arm: str, profile: str) -> List[Dict]:
                     "volumes": [{"name": "faults", "configMap": {"name": f"{target}-faults", "optional": True}}]}}
     deployment = {"apiVersion": "apps/v1", "kind": "Deployment",
                   "metadata": {"name": target, "namespace": ns, "labels": labels},
-                  "spec": {"replicas": 2, "revisionHistoryLimit": 2,
+                  "spec": {"replicas": FIXED_REPLICAS, "revisionHistoryLimit": 2,
                            "selector": {"matchLabels": {TARGET_LABEL: target}},
                            "strategy": {"type": "RollingUpdate", "rollingUpdate": {"maxSurge": 0, "maxUnavailable": 1}},
                            "template": pod}}
@@ -260,7 +407,7 @@ def _proxy(p: Dict, name: str, upstream: str, port: int) -> List[Dict]:
           "data": {"faults.json": "{}"}}
     dep = {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": name, "namespace": ns, "labels": labels},
            "spec": {"replicas": 1, "selector": {"matchLabels": {"app.kubernetes.io/name": name, RUN_LABEL: p["run_id"]}},
-                    "template": {"metadata": {"labels": labels}, "spec": {
+                    "template": {"metadata": {"labels": labels, "annotations": dict(SIDECAR_FREE)}, "spec": {
                         "automountServiceAccountToken": False, "securityContext": _SECURITY, **_placement(p, "support"),
                         "containers": [{"name": "proxy", "image": p["image"],
                                         "env": [{"name": "MODE", "value": "tcpproxy"}, {"name": "UPSTREAM", "value": upstream},
@@ -297,7 +444,8 @@ def render_common(p: Dict) -> List[Dict]:
     ingress = {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "c28-ingress", "namespace": ns, "labels": ilabels},
                "spec": {"replicas": 1, "selector": {"matchLabels": {"app.kubernetes.io/name": "c28-ingress", RUN_LABEL: p["run_id"]}},
                         "template": {"metadata": {"labels": ilabels,
-                                                  "annotations": {"prometheus.io/scrape": "true", "prometheus.io/port": "8080"}},
+                                                  "annotations": {"prometheus.io/scrape": "true", "prometheus.io/port": "8080",
+                                                                  **SIDECAR_FREE}},
                                      "spec": {"automountServiceAccountToken": False, "securityContext": _SECURITY,
                                               **_placement(p, "workload"),
                                               "containers": [{"name": "ingress", "image": p["image"],
@@ -327,11 +475,161 @@ def render_common(p: Dict) -> List[Dict]:
 
 
 def render_all(p: Dict) -> List[Dict]:
+    objs = render_all_unchecked(p)
+    audit_rendered(objs)
+    audit_sidecar_free(objs)
+    if "residency" in p:
+        check_residency(p, objs)
+    return objs
+
+
+# --- sidecar-free audit ---------------------------------------------------------------------------------------------
+
+def pod_templates(obj: Dict) -> List[Dict]:
+    """The Pod templates an object carries (Deployment/StatefulSet/DaemonSet/ReplicaSet/Job .spec.template, a CronJob's
+    jobTemplate, or a Pod itself)."""
+    kind, spec = obj.get("kind"), obj.get("spec") or {}
+    if kind == "Pod":
+        return [obj]
+    if kind == "CronJob":
+        return [((spec.get("jobTemplate") or {}).get("spec") or {}).get("template") or {}]
+    if kind in ("Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "Job"):
+        return [spec.get("template") or {}]
+    return []
+
+
+def audit_sidecar_free(objs: List[Dict]) -> None:
+    """Every rendered Pod template carries sidecar.istio.io/inject: "false" on the POD metadata (the namespace keeps
+    its injection policy; an annotation on the workload's own metadata does not reach the pods)."""
+    bad = [f"{o['kind']}/{o['metadata']['name']}" for o in objs for t in pod_templates(o)
+           if ((t.get("metadata") or {}).get("annotations") or {}).get(SIDECAR_ANNOTATION) != "false"]
+    if bad:
+        raise ParamsError(f"Pod templates without {SIDECAR_ANNOTATION}: \"false\" (the evaluation is sidecar-free): "
+                          f"{', '.join(bad)}")
+
+
+# --- residency budget -----------------------------------------------------------------------------------------------
+
+def _pod_requests(template: Dict) -> Tuple[Decimal, Decimal]:
+    """A pod's effective requests: the sum over its containers, or the largest init container if that is larger."""
+    spec = template.get("spec") or {}
+
+    def total(cs):
+        cpu = sum((cpu_millicores(((c.get("resources") or {}).get("requests") or {}).get("cpu", "0")) for c in cs),
+                  Decimal(0))
+        mem = sum((memory_bytes(((c.get("resources") or {}).get("requests") or {}).get("memory", "0")) for c in cs),
+                  Decimal(0))
+        return cpu, mem
+    run = total(spec.get("containers") or [])
+    inits = [total([c]) for c in spec.get("initContainers") or []]
+    return (max([run[0]] + [i[0] for i in inits]), max([run[1]] + [i[1] for i in inits]))
+
+
+def _role(template: Dict, p: Dict) -> str:
+    """The reservation role (workload/support) a template's required node affinity pins it to."""
+    role_label = p["reservation"]["role_label"]
+    terms = (((template.get("spec") or {}).get("affinity") or {}).get("nodeAffinity") or {}).get(
+        "requiredDuringSchedulingIgnoredDuringExecution", {}).get("nodeSelectorTerms", [])
+    for t in terms:
+        for e in t.get("matchExpressions", []):
+            if e.get("key") == role_label and e.get("operator") == "In" and len(e.get("values", [])) == 1:
+                return e["values"][0]
+    raise ParamsError("a rendered pod template is not pinned to a reservation role; its residency is unknown")
+
+
+def _mi(b: Decimal) -> str:
+    return f"{format((Decimal(b) / 2**20).quantize(Decimal('0.1')).normalize(), 'f')}Mi"
+
+
+def _m(cpu: Decimal) -> str:
+    return f"{format(Decimal(cpu).normalize(), 'f')}m"
+
+
+def residency_report(p: Dict, objs: List[Dict] = None) -> Dict:
+    """The evaluation's maximum resident requests on W and S against 75 % of each node's allocatable.
+
+    W: the ten fixture arms, all but one at idle_arm_replicas, the loaded arm (the largest per-pod request, so the worst
+       case) at maxReplicas plus overlap_pods, plus every other rendered pod pinned to W (the ingress) at its replicas.
+    S: every rendered pod pinned to S (the two fault routes) at its replicas, the operator, the forecaster, the
+       generator Jobs that may run at the same time, and support_extra.
+    Each node adds its system_requests. CPU and memory are checked separately; problems lists every exceedance."""
+    r = residency_params(p)
+    objs = render_all_unchecked(p) if objs is None else objs
+    contrib: Dict[str, List[Dict]] = {"workload": [], "support": []}
+    sums: Dict[str, List[Decimal]] = {"workload": [Decimal(0), Decimal(0)], "support": [Decimal(0), Decimal(0)]}
+
+    def add(role, name, pods, cpu, mem, note=""):
+        sums[role][0] += cpu * pods
+        sums[role][1] += mem * pods
+        contrib[role].append({"name": name, "pods": pods, "per_pod_cpu": _m(cpu), "per_pod_memory": _mi(mem),
+                              "cpu_m": float(cpu * pods), "memory_bytes": int(mem * pods),
+                              **({"note": note} if note else {})})
+    arms = []
+    for o in objs:
+        for t in pod_templates(o):
+            role = _role(t, p)
+            cpu, mem = _pod_requests(t)
+            name = f"{o['kind']}/{o['metadata']['name']}"
+            if o["kind"] == "Deployment" and (o["metadata"].get("labels") or {}).get(ARM_LABEL):
+                if role != "workload":
+                    raise ParamsError(f"{name} is a fixture arm pinned to {role}, not the workload node")
+                arms.append((name, cpu, mem))
+            else:
+                replicas = 1 if o["kind"] in ("Pod", "Job", "CronJob") else int(o["spec"].get("replicas", 1))
+                add(role, name, replicas, cpu, mem)
+    if arms:
+        idle, overlap = r["idle_arm_replicas"], r["overlap_pods"]
+        loaded = max(arms, key=lambda a: (a[1], a[2]))
+        for name, cpu, mem in arms:
+            if name == loaded[0]:
+                add("workload", name, F.MAX_REPLICAS, cpu, mem, "loaded arm at maxReplicas (worst-case arm)")
+                add("workload", f"{name} overlap", overlap, cpu, mem, "startup/termination overlap of the loaded arm")
+            else:
+                add("workload", name, idle, cpu, mem, "idle arm")
+    add("support", "operator", 1, *r["operator"])
+    add("support", "forecaster", 1, *r["forecaster"])
+    add("support", "generator Jobs", r["generator_concurrent"], *r["generator"], "concurrent generators")
+    for name, replicas, cpu, mem in r["support_extra"]:
+        add("support", name, replicas, cpu, mem)
+    out = {"limit_fraction": F.RESIDENCY_LIMIT_FRACTION, "idle_arm_replicas": r["idle_arm_replicas"],
+           "overlap_pods": r["overlap_pods"], "nodes": {}, "problems": []}
+    limit = Decimal(str(F.RESIDENCY_LIMIT_FRACTION))
+    for role in ("workload", "support"):
+        alloc, system = r["nodes"][role]["allocatable"], r["nodes"][role]["system"]
+        add(role, "node system pods", 1, *system, "DaemonSets and other system agents (params)")
+        cpu, mem = sums[role]
+        node = {"node": p["nodes"][role], "allocatable": {"cpu_m": float(alloc[0]), "memory_bytes": int(alloc[1])},
+                "total": {"cpu_m": float(cpu), "memory_bytes": int(mem)},
+                "fraction": {"cpu": float(cpu / alloc[0]), "memory": float(mem / alloc[1])},
+                "contributions": contrib[role]}
+        out["nodes"][role] = node
+        listing = "; ".join(f"{c['name']} {c['pods']}x({c['per_pod_cpu']}, {c['per_pod_memory']})"
+                            for c in contrib[role])
+        if cpu > alloc[0] * limit:
+            out["problems"].append(f"{role} node {p['nodes'][role]}: CPU requests {_m(cpu)} are "
+                                   f"{float(cpu / alloc[0]):.1%} of allocatable {_m(alloc[0])}, above "
+                                   f"{F.RESIDENCY_LIMIT_FRACTION:.0%}; contributions: {listing}")
+        if mem > alloc[1] * limit:
+            out["problems"].append(f"{role} node {p['nodes'][role]}: memory requests {_mi(mem)} are "
+                                   f"{float(mem / alloc[1]):.1%} of allocatable {_mi(alloc[1])}, above "
+                                   f"{F.RESIDENCY_LIMIT_FRACTION:.0%}; contributions: {listing}")
+    return out
+
+
+def check_residency(p: Dict, objs: List[Dict] = None) -> Dict:
+    rep = residency_report(p, objs)
+    if rep["problems"]:
+        raise ParamsError("residency budget exceeded (evaluation + system requests > 75 % of allocatable): "
+                          + " | ".join(rep["problems"]))
+    return rep
+
+
+def render_all_unchecked(p: Dict) -> List[Dict]:
+    """Every evaluation object, without the audits (render_all runs them)."""
     objs = render_common(p)
     for profile in F.PROFILES:
         for arm in F.ARMS:
             objs += render_arm(p, arm, profile)
-    audit_rendered(objs)
     return objs
 
 

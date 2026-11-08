@@ -20,10 +20,10 @@
   "max_inflight": "<bounded>",
   "max_queue": "<bounded>",
   "queue_timeout_seconds": 1.5,
-  "cpu_request": "<identical for every arm>",
-  "cpu_limit": "<same>",
-  "memory_request": "<same>",
-  "memory_limit": "<same>"
+  "cpu_request": "<calibrated and reviewed (section 3), identical for every arm; never lowered to fit the residency budget>",
+  "cpu_limit": "<calibrated and reviewed, same for every arm>",
+  "memory_request": "<calibrated and reviewed, same for every arm>",
+  "memory_limit": "<calibrated and reviewed, same for every arm>"
  },
  "ingress": {
   "cpu_request": "<sized for 120 % of maximum planned arrivals>",
@@ -53,5 +53,43 @@
  },
  "scrape": "<VMPodScrape | PodMonitor | annotations, per the observer>",
  "release": "<evaluation Helm release name, e.g. pa-eval>",
- "release_network_policies": "<true when the release enforces NetworkPolicies>"
+ "release_network_policies": "<true when the release enforces NetworkPolicies>",
+ "residency": {
+  "workload": {
+   "allocatable": {
+    "cpu": "<W allocatable CPU from the fresh dated inventory, e.g. 4000m>",
+    "memory": "<W allocatable memory, e.g. 7.75Gi>"
+   },
+   "system_requests": {
+    "cpu": "<summed CPU requests of the system pods that stay on W (DaemonSets, agents)>",
+    "memory": "<their summed memory requests>"
+   }
+  },
+  "support": {
+   "allocatable": {
+    "cpu": "<S allocatable CPU>",
+    "memory": "<S allocatable memory>"
+   },
+   "system_requests": {
+    "cpu": "<summed CPU requests of the system pods that stay on S>",
+    "memory": "<their summed memory requests>"
+   }
+  },
+  "overlap_pods": 2,
+  "idle_arm_replicas": 2,
+  "operator": {
+   "cpu_request": "100m",
+   "memory_request": "128Mi"
+  },
+  "forecaster": {
+   "cpu_request": "1",
+   "memory_request": "512Mi"
+  },
+  "generator": {
+   "concurrent": 1,
+   "cpu_request": "500m",
+   "memory_request": "256Mi"
+  },
+  "support_extra": "<every other evaluation pod on S (recorder, adapters) as [{name, replicas, cpu_request, memory_request}], or [] when none>"
+ }
 }

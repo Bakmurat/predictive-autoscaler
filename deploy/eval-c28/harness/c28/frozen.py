@@ -29,6 +29,12 @@ RATE_RANGE = "60s"                                                      # RPS qu
 SCRAPE_INTERVAL_S = 15
 REQUEST_TIMEOUT_S = 2                                                   # section 3; no automatic retries
 
+# Section 2 / STAGING S2 admission: >= 25 % CPU and memory headroom, so evaluation plus node-system requests may use at
+# most 75 % of each reserved node's allocatable, CPU and memory checked separately (render.residency_report).
+RESIDENCY_LIMIT_FRACTION = 0.75
+# Section 11.1 / STAGING S2: the forecaster is budgeted at one core and 512 MiB (its limit), not its smaller request.
+FORECASTER_BUDGET = {"cpu_request": "1", "memory_request": "512Mi"}
+
 # Common scaling budgets (section 4): scale-up stabilization 0; scale-down stabilization 300 s; at most
 # max(10 % of current, 2 pods) per 120 s, selectPolicy Max. Scale-down headroom 0 for every PA arm.
 SCALE_DOWN_STABILIZATION_S = 300

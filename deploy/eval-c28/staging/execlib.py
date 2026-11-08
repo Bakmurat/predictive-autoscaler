@@ -533,6 +533,9 @@ def load_params(record: Record) -> Dict:
         raise StagingError("the record must name its params file (c28-params/v1)")
     with open(p) as fh:
         params = json.load(fh)
+    if "residency" not in params:
+        raise StagingError("params: the residency section (W/S allocatable and system requests) is required for the "
+                           "prodcluster staging helpers")
     try:
         c28.render.validate(params)
     except c28.render.ParamsError as e:
