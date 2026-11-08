@@ -59,6 +59,7 @@ EXTRA_KINDS = {
     "networkpolicies": ("/apis/networking.k8s.io/v1", "networkpolicies", True),
     "podmonitors": ("/apis/monitoring.coreos.com/v1", "podmonitors", True),
     "vmpodscrapes": ("/apis/operator.victoriametrics.com/v1beta1", "vmpodscrapes", True),
+    "volumeattachments": ("/apis/storage.k8s.io/v1", "volumeattachments", False),
 }
 # Object kind -> table key.
 KIND_KEY = {
@@ -69,7 +70,7 @@ KIND_KEY = {
     "PredictiveAutoscaler": "pa-new", "LegacyPredictiveAutoscaler": "pa-legacy",
     "ConfigMap": "configmaps", "ResourceQuota": "resourcequotas", "ReplicaSet": "replicasets",
     "PriorityClass": "priorityclasses", "StorageClass": "storageclasses", "NetworkPolicy": "networkpolicies",
-    "PodMonitor": "podmonitors", "VMPodScrape": "vmpodscrapes",
+    "PodMonitor": "podmonitors", "VMPodScrape": "vmpodscrapes", "VolumeAttachment": "volumeattachments",
 }
 if C.KINDS["pa-legacy"][0] != f"/apis/{legacy_allowlist.LEGACY_GROUP}/v1alpha1":     # pragma: no cover
     raise ImportError("common_records and legacy_allowlist disagree on the legacy API group")

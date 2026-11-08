@@ -17,7 +17,8 @@ Every helper (inventory, archive, sanitize-render, legacy; reserve, prepare, fre
     of a cluster and resource scope in the mandatory shared lock_dir, recording host, boot, PID and process start;
     mutation_step() writes intent-<n> before and step-<n> after each mutation; a recovery uses recovery_guard(rec,
     scope, lock_sha256) (exclusive, owner proven terminated) and writes reconciled-<n> only for outcomes it can
-    decide; anything else stays unresolved and keeps the lock.
+    decide; anything else stays unresolved and keeps the lock. recovery_guard.release_stale() refuses while ANY
+    journal of the owning record (unresolved_intents: every tool that wrote under the lock) has an unresolved intent.
   * SANITIZING: sanitize_object() turns any API object into a reviewable record: no Secret data (Secrets are reduced
     to a stub), no ConfigMap contents (per-key sha256 only), no managedFields, no last-applied configuration, no
     literal credential env values or credential flags, no URL user-info. assert_clean() is the last guard on every
@@ -511,11 +512,42 @@ class recovery_guard:
         return self
 
     def release_stale(self) -> None:
+        """Release only when NO journal of the owning record (whatever tool wrote it under this lock) keeps an
+        unresolved intent; each tool's recover resolves its own, and the last one releases."""
+        left = unresolved_intents(self.rec)
+        if left:
+            todo = sorted({RECOVER_COMMANDS.get(j, f"the {j} tool's recover") for j in left})
+            raise StagingError(f"unresolved intents remain under this lock {left}: the lock stays; run "
+                               f"{' and '.join(todo)} first")
         os.unlink(self.path)
 
     def __exit__(self, exc_type, exc, tb):
         os.unlink(self.guard)
         return False
+
+
+# Which command resolves a journal's intents (the executor is told; any unknown journal still blocks).
+RECOVER_COMMANDS = {"legacy": "legacy.py recover", "legacy-restore": "legacy.py recover",
+                    "populate-s0": "populate_s0.py recover", "populate-s0-probe": "populate_s0.py recover"}
+
+
+def unresolved_intents(rec: Mapping) -> Dict[str, List[str]]:
+    """{journal (helper): [steps]} of every intent-<n> in the record's receipt directory with neither step-<n> nor
+    reconciled-<n>, across ALL tools' journals (the generic view a shared lock needs)."""
+    root = os.path.join(rec["evidence_dir"], "receipts")
+    out: Dict[str, List[str]] = {}
+    if not os.path.isdir(root):
+        return out
+    for name in sorted(os.listdir(root)):
+        if not name.endswith(".jsonl"):
+            continue
+        entries = read_receipts(os.path.join(root, name))
+        closed = {e["event"].split("-", 1)[1] for e in entries if e["event"].startswith(("step-", "reconciled-"))}
+        pending = [e["event"][len("intent-"):] for e in entries
+                   if e["event"].startswith("intent-") and e["event"][len("intent-"):] not in closed]
+        if pending:
+            out[name[:-len(".jsonl")]] = pending
+    return out
 
 
 def mutation_step(rec: Mapping, helper: str, lock: exclusive_lock, step, intent: Mapping, call: Callable,
@@ -657,7 +689,8 @@ def api_for(rec: Mapping, run: Callable = subprocess.run) -> KubectlApi:
     return KubectlApi(rec["kubeconfig"], run=run)
 
 
-__all__ = ["exclusive_lock", "lock_path", "mutation_step", "owner_terminated", "process_start", "recovery_guard",
+__all__ = ["exclusive_lock", "lock_path", "mutation_step", "unresolved_intents", "owner_terminated", "process_start",
+           "recovery_guard",
            "ApiError", "KINDS", "KubectlApi", "NotFound", "StagingError",
            "add_common_args",
            "api_for",
