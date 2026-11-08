@@ -166,3 +166,21 @@ def test_the_exclusive_lock_survives_an_in_flight_mutation(tmp_path):
     with pytest.raises(C.StagingError, match="crashed"):
         with C.exclusive_lock(rec, "legacy"):
             pass
+
+
+
+# --- C2.8f: the helper's own exclude_secrets switch ---------------------------------------------------------------
+
+def test_exclude_secrets_is_accepted_only_at_its_exact_path_as_a_boolean(tmp_path):
+    ok = record(tmp_path, archive={"velero": {"exclude_secrets": True}})
+    assert C.record_problems(ok) == []
+    assert C.record_problems(record(tmp_path, archive={"velero": {"exclude_secrets": False}})) == []
+    for bad in ({"archive": {"velero": {"exclude_secrets": "true"}}},          # not a boolean
+                {"archive": {"velero": {"exclude_secrets": 1}}},
+                {"archive": {"velero": {"exclude_secrets": {"value": True}}}},
+                {"archive": {"exclude_secrets": True}},                        # another path
+                {"legacy": {"velero": {"exclude_secrets": True}}},
+                {"archive": {"velero": {"secret_name": "x"}}},                 # other secret-named keys
+                {"archive": {"velero": {"exclude_secret": True}}},
+                {"archive": {"velero": {"token": True}}}):
+        assert any("credential material" in p for p in C.record_problems(record(tmp_path, **bad))), bad

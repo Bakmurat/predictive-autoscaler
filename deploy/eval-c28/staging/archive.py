@@ -145,8 +145,33 @@ def velero_backup(rec: Mapping) -> Dict:
             "metadata": {"name": v["backup_name"], "namespace": v["namespace"], "labels": labels}, "spec": spec}
 
 
+def reviewed_missing_problems(rec: Mapping, missing: List[Mapping]) -> List[str]:
+    """archive.unaccounted_reviewed must name EXACTLY the allowlisted objects found missing, each once, by identity
+    (kind, namespace, name, role) with a non-empty reason; no blanket boolean, no extra or absent entry."""
+    reviewed = rec["archive"].get("unaccounted_reviewed", [])
+    if not isinstance(reviewed, list):
+        return ["archive.unaccounted_reviewed must be a list of {kind, namespace, name, role, reason} entries"]
+    keys, out = [], []
+    for e in reviewed:
+        if not isinstance(e, dict) or set(e) != {"kind", "namespace", "name", "role", "reason"} or \
+                not isinstance(e.get("reason"), str) or not e["reason"].strip():
+            out.append(f"unaccounted_reviewed entry {e!r} needs exactly kind, namespace, name, role and a reason")
+            continue
+        keys.append((e["kind"], e["namespace"], e["name"], e["role"]))
+    if len(keys) != len(set(keys)):
+        out.append("unaccounted_reviewed lists an object twice")
+    want = {(m["kind"], m["namespace"], m["name"], m["role"]) for m in missing}
+    if set(keys) != want:
+        out.append(f"the reviewed missing set differs from the missing set: unreviewed "
+                   f"{sorted(want - set(keys))}, reviewed but present {sorted(set(keys) - want)}")
+    return out
+
+
 def build_plan(api, rec: Mapping, run=subprocess.run) -> Dict:
     inv = I.collect(api, rec)
+    errs = reviewed_missing_problems(rec, inv["legacy"]["missing"])
+    if errs:
+        raise C.StagingError("plan refused: " + "; ".join(errs))
     objs = []
     for e in inv["legacy"]["found"]:
         objs.append({k: e[k] for k in ("kind", "namespace", "name", "uid")})
@@ -319,9 +344,7 @@ def verify(rec: Mapping, plan: Mapping, clock=None) -> Dict:
         if v["warnings"] and len(assessed) != v["warnings"]:
             problems.append(f"{v['warnings']} Velero warnings, {len(assessed)} assessed in "
                             f"archive.velero.warnings_assessed")
-    if plan["unaccounted"] and not rec["archive"].get("unaccounted_reviewed"):
-        problems.append(f"allowlisted objects not found: {[u['name'] for u in plan['unaccounted']]} "
-                        f"(set archive.unaccounted_reviewed after review)")
+    problems += reviewed_missing_problems(rec, plan["unaccounted"])
     if plan["blockers"]:
         problems.append("inventory blockers: " + "; ".join(plan["blockers"]))
     if problems:

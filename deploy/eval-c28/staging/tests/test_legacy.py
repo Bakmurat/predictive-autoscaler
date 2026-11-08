@@ -642,3 +642,85 @@ def test_recovery_needs_the_owning_runs_record(tmp_path):
         assert os.path.exists(lock)
     assert not any(r["event"].startswith("reconciled-") for r in C.read_receipts(C.receipts_path(rec, "legacy")))
     assert LG.recover(api, rec, sha, clock) and not os.path.exists(lock)
+
+
+
+# --- C2.8f: an absent Lease (leader election off in 0472829) -------------------------------------------------------
+
+def no_lease_cluster():
+    api = legacy_cluster()
+    del api.objects[("leases", "ml-engine", "predictive-autoscaler-leader")]
+    return api
+
+
+def test_an_absent_lease_that_stays_absent_is_quiet(tmp_path):
+    api, rec, clock = no_lease_cluster(), ready_record(tmp_path), Clock()
+    plan = LG.build_plan(api, rec)
+    obs = next(a for a in plan["actions"] if a["op"] == "observe_quiet")
+    assert obs["lease"] is None
+    LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    assert api.objects[("deployments", "demo", "nginx-test")]["spec"]["replicas"] == 0
+    assert LG.verify(api, rec, 600, clock.sleep, clock, clock)["retired"] is True
+
+
+def appear_lease(api, after_polls):
+    n = {"i": 0}
+
+    def hook(a):
+        n["i"] += 1
+        if n["i"] == after_polls and ("leases", "ml-engine", "predictive-autoscaler-leader") not in a.objects:
+            a.add("leases", {"kind": "Lease", "metadata": {"name": "predictive-autoscaler-leader",
+                                                           "namespace": "ml-engine"},
+                             "spec": {"holderIdentity": "predictive-operator-new",
+                                      "renewTime": "2026-11-08T03:00:00Z"}})
+    api.on_poll.append(hook)
+
+
+def test_a_lease_appearing_during_the_quiet_interval_blocks_parking(tmp_path):
+    api, rec, clock = no_lease_cluster(), ready_record(tmp_path), Clock()
+    plan = LG.build_plan(api, rec)
+    real_get, reads = api.get, {"n": 0}
+
+    def get(path):                               # the observation's baseline reads it absent; then a leader appears
+        if path.endswith("/leases/predictive-autoscaler-leader"):
+            reads["n"] += 1
+            if reads["n"] == 3:
+                api.add("leases", {"kind": "Lease", "metadata": {"name": "predictive-autoscaler-leader",
+                                                                 "namespace": "ml-engine"},
+                                   "spec": {"holderIdentity": "x", "renewTime": "2026-11-08T03:00:00Z"}})
+        return real_get(path)
+    api.get = get
+    with pytest.raises(C.StagingError, match="Lease appeared"):
+        LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    assert reads["n"] >= 3                                                   # it happened inside the observation
+    assert api.objects[("deployments", "demo", "nginx-test")]["spec"]["replicas"] == 3        # not parked
+
+
+def test_a_lease_appearing_after_planning_or_during_verify_blocks(tmp_path):
+    api, rec, clock = no_lease_cluster(), ready_record(tmp_path), Clock()
+    plan = LG.build_plan(api, rec)
+    appear_lease(api, 1)                                                     # before the observation starts
+    with pytest.raises(C.StagingError, match="Lease appeared"):
+        LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    api2, rec2, clock2 = no_lease_cluster(), ready_record(tmp_path / "b"), Clock()
+    plan2 = LG.build_plan(api2, rec2)
+    LG.quiesce(api2, rec2, plan2, C.plan_digest(plan2), sleep=clock2.sleep, monotonic=clock2, clock=clock2)
+    appear_lease(api2, 150)                                                   # mid-observation
+    v = LG.verify(api2, rec2, 600, clock2.sleep, clock2, clock2)
+    assert v["retired"] is False and any("Lease appeared" in p for p in v["problems"])
+
+
+def test_a_planned_lease_disappearing_before_the_observation_blocks(tmp_path):
+    # C2.8f review: presence and UID are compared both ways when the baseline is set.
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    plan = LG.build_plan(api, rec)
+    assert next(a for a in plan["actions"] if a["op"] == "observe_quiet")["lease"] is not None
+    del api.objects[("leases", "ml-engine", "predictive-autoscaler-leader")]
+    with pytest.raises(C.StagingError, match="disappeared"):
+        LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    assert api.objects[("deployments", "demo", "nginx-test")]["spec"]["replicas"] == 3        # not parked
+    api2, rec2, clock2 = legacy_cluster(), ready_record(tmp_path / "b"), Clock()
+    plan2 = LG.build_plan(api2, rec2)
+    api2.objects[("leases", "ml-engine", "predictive-autoscaler-leader")]["spec"]["renewTime"] = "2026-11-08T01:00:00Z"
+    LG.quiesce(api2, rec2, plan2, C.plan_digest(plan2), sleep=clock2.sleep, monotonic=clock2, clock=clock2)
+    assert api2.objects[("deployments", "demo", "nginx-test")]["spec"]["replicas"] == 0       # renewal before: fine
