@@ -2,6 +2,7 @@
 locally, a scratch git repository, and a small mandatory corpus. KUBECONFIG=/dev/null (conftest)."""
 
 import hashlib
+import copy
 import json
 import os
 import subprocess
@@ -357,14 +358,13 @@ def test_destination_tampering_fails_verify(env):
 D = '{"event": "decision", "at": "%s"}'
 @pytest.mark.parametrize("lines, why", [
     ([D % "2026-11-01T00:00:00Z", D % "2026-11-03T00:00:00Z", D % "2026-11-01T01:00:00Z"],
-     "follows a record more than 600 s after it (not append-ordered)"),
+     "follows a record more than 0 s after it (not append-ordered)"),
     ([D % "2026-11-01T00:00:00Z", '{"event": "decision", "other": 1}'], "has no timestamp for its type (['at'])"),
     ([D % "2026-11-05T00:00:00Z"], "no record of forecasts.jsonl is at or before the cutoff"),
     (['{"run_started": "2026-10-05T06:40:00Z", "operator_version": "v0.9", "token_hint": "abc123secret"}'],
-     "at line 1 has no timestamp for its type (['issued_at']): keys ['operator_version', 'run_started', "
-     "'token_hint'], event <absent>"),
+     "at line 1 has no timestamp for its type (['issued_at']): keys [], 3 other keys (sha256 "),
     (['{"event": "brand_new_kind", "at": "2026-11-01T00:00:00Z", "value": "zzz-sensitive"}'],
-     "has an unknown record type: keys ['at', 'event', 'value'], event brand_new_kind"),
+     "has an unknown record type: keys ['at', 'event', 'value'], event unknown (str, sha256 "),
 ])
 def test_jsonl_prefix_selection_fails_closed(env, lines, why):
     e = env
@@ -372,6 +372,8 @@ def test_jsonl_prefix_selection_fails_closed(env, lines, why):
     do_probe(e)
     probs = P.plan(e["record"], e["kube"])["problems"]
     assert any(why in p for p in probs), probs
+    for leaked in ("token_hint", "run_started", "operator_version", "abc123secret", "brand_new_kind", "zzz-sensitive"):
+        assert not any(leaked in p for p in probs), probs
 
 
 def test_rule_cutoff_override(env):
@@ -602,7 +604,7 @@ def test_unreviewed_files_block_and_reviewed_exclusions_are_listed(env):
     assert {x["path"] for x in ex} == {"logs/api-state.json", ".staging/123-abc/partial.pkl"}
     assert all(x["reason"] for x in ex)
     rule_ex = {x["path"]: x["reason"] for x in p["pvcs"]["ml-models-pvc"]["rule_excluded"]}
-    assert rule_ex["lstm_myapp_requests.meta.json"] == "trained after the cutoff"
+    assert rule_ex["lstm_myapp_requests.meta.json"].startswith("the artifact does not match its sidecar")
 
 
 def test_trainer_index_with_writer_records_and_recovered_index(env):
@@ -792,39 +794,150 @@ def test_every_writer_record_type_at_0472829_is_timestamped(env):
             {"event": "decision", "at": "2026-11-02T00:05:00Z"}]
     write(os.path.join(e["vols"]["forecast-log-pvc"], "forecasts.jsonl"), jl(*recs))
     do_probe(e)
+    assert any("follows a record more than 0 s after it" in x                  # strict by default
+               for x in P.plan(e["record"], e["kube"])["problems"])
+    set_forecast_tolerance(e, 60, "reviewed: the operator's issuance and decision writers interleave by seconds")
+    do_probe(e)
     p = P.plan(e["record"], e["kube"])
     it = p["pvcs"]["forecast-log-pvc"]["selection"][0]
     assert (it["lines"], it["overshoot_lines"], it["lines_after_cutoff"]) == (7, 1, 1)
+    assert "not campaign records" in it["overshoot_note"]
     assert not any("forecast-log-pvc" in x for x in p["problems"])
 
 
-def test_shape_reports_never_carry_values(env):
+def set_forecast_tolerance(e, seconds, review):
+    doc = json.load(open(e["path"]))
+    rule = copy.deepcopy(P.DEFAULT_RULES["forecast-log-pvc"][0])
+    rule.update(order_tolerance_seconds=seconds, order_tolerance_review=review)
+    doc["populate"]["pvcs"]["forecast-log-pvc"]["rules"] = [rule]
+    write(e["path"], json.dumps(doc))
+    e["record"] = X.load_record(e["path"], ("populate", "archive"))
+
+
+@pytest.mark.parametrize("rec", [
+    {"header": "SECRET-VALUE-123", "event": "x y z!"},
+    {"private_marker_abc": 1, "event": "pm-marker-xyz"},                  # short identifier-like names and events
+    {"at": "2026-11-01T00:00:00Z", "event": {"pm-marker-xyz": 1}},
+    ["pm-marker-xyz"],
+])
+def test_shape_reports_never_carry_values(env, rec):
+    """Codex #36 item 1: only allowlisted (0472829) key names and known event names are printed; anything else is a
+    count, a JSON type or a digest."""
     e = env
-    write(os.path.join(e["vols"]["forecast-log-pvc"], "forecasts.jsonl"),
-          json.dumps({"header": "SECRET-VALUE-123", "event": "x y z!"}) + "\n")
+    write(os.path.join(e["vols"]["forecast-log-pvc"], "forecasts.jsonl"), json.dumps(rec) + "\n")
     do_probe(e)
     text = "\n".join(P.plan(e["record"], e["kube"])["problems"])
-    assert "keys ['event', 'header'], event <not an identifier>" in text and "SECRET-VALUE-123" not in text
+    assert "forecasts.jsonl at line 1" in text
+    for leaked in ("SECRET-VALUE-123", "header", "x y z!", "private_marker_abc", "pm-marker-xyz"):
+        assert leaked not in text, text
+
+
+def test_order_tolerance_is_strict_unless_reviewed_and_recorded(env):
+    """Codex #36 item 4: no implicit tolerance; a tolerance needs a per-rule review, which the plan and manifest
+    state, and the overhang stays distinct from campaign membership."""
+    e = env
+    recs = [{"event": "decision", "at": "2026-11-01T23:59:00Z"}, {"event": "decision", "at": "2026-11-02T00:00:30Z"},
+            {"event": "decision", "at": "2026-11-01T23:59:50Z"}]
+    write(os.path.join(e["vols"]["forecast-log-pvc"], "forecasts.jsonl"), jl(*recs))
+    do_probe(e)
+    assert any("not append-ordered" in x for x in P.plan(e["record"], e["kube"])["problems"])
+    doc = json.load(open(e["path"]))
+    rule = dict(P.DEFAULT_RULES["forecast-log-pvc"][0], order_tolerance_seconds=60)
+    doc["populate"]["pvcs"]["forecast-log-pvc"]["rules"] = [rule]
+    write(e["path"], json.dumps(doc))
+    with pytest.raises(X.StagingError, match="needs an order_tolerance_review"):
+        P.effective_rules(P.section(X.load_record(e["path"], ("populate", "archive"))), "forecast-log-pvc")
+    set_forecast_tolerance(e, 60, "reviewed 2026-11-08: interleaved writers")
+    do_probe(e)
+    p = P.plan(e["record"], e["kube"])
+    tol = p["pvcs"]["forecast-log-pvc"]["order_tolerances"]
+    assert tol == [{"path": "forecasts.jsonl", "seconds": 60, "review": "reviewed 2026-11-08: interleaved writers",
+                    "overhang": "lines after the cutoff inside the prefix; not campaign records"}]
+    it = p["pvcs"]["forecast-log-pvc"]["selection"][0]
+    assert (it["lines"], it["overshoot_lines"]) == (3, 1) and "not campaign records" in it["overshoot_note"]
+    do_export(e)
+    root = e["record"].doc["archive"]["evidence"]["export_dir"]
+    man = json.load(open(os.path.join(root, "pvc-exports/forecast-log-pvc/manifest.json")))
+    assert man["order_tolerances"] == tol
+
+
+def add_training(e, job, uid, collected, started, finished):
+    a = e["vols"]["evidence-archive-pvc"]
+    log = "log of %s\n" % job
+    rec = {"collected_at": collected, "job": job, "pod_uid": uid,
+           "containers": [{"name": "trainer", "started_at": started, "finished_at": finished,
+                           "log_sha256": sha(log.encode()), "previous_log_saved": False}]}
+    if started is None:
+        del rec["containers"][0]["started_at"]
+    with open(os.path.join(a, "logs/trainer-index.jsonl"), "a") as fh:
+        fh.write(jl(rec))
+    base = "logs/trainer/%s-%s" % (job, uid[:8])
+    write(os.path.join(a, base + ".json"), json.dumps(rec))
+    write(os.path.join(a, base + ".trainer.log"), log)
+    return base
+
+
+def set_trainer_reviewed(e, reviewed):
+    doc = json.load(open(e["path"]))
+    rules = copy.deepcopy(P.DEFAULT_RULES["evidence-archive-pvc"])
+    rules[-1]["reviewed"] = reviewed
+    doc["populate"]["pvcs"]["evidence-archive-pvc"]["rules"] = rules
+    write(e["path"], json.dumps(doc))
+    e["record"] = X.load_record(e["path"], ("populate", "archive"))
+
+
+def test_trainings_are_classified_by_execution_not_collection(env):
+    """Codex #36 item 3: a training that RAN in the campaign but was collected after it is selected; one that ran
+    after the cutoff is excluded by the index pairing; a straddling or untimed one needs an explicit review."""
+    e = env
+    post = add_training(e, "ml-training-29900000", "9f9f9f9f-0000", "2026-11-02T06:35:00Z",
+                        "2026-11-02T06:00:00Z", "2026-11-02T06:20:00Z")
+    late = add_training(e, "ml-training-29800000", "8e8e8e8e-0000", "2026-11-03T06:35:00Z",   # collected late
+                        "2026-11-01T18:00:00Z", "2026-11-01T18:20:00Z")
+    do_probe(e)
+    p = P.plan(e["record"], e["kube"])
+    assert p["problems"] == [], p["problems"]
+    sel = {it["path"]: it for it in p["pvcs"]["evidence-archive-pvc"]["selection"]}
+    assert sel[late + ".trainer.log"]["collected_after_cutoff"] is True
+    assert sel[late + ".json"]["finished_at"] == "2026-11-01T18:20:00Z"
+    ex = {x["path"]: x["reason"] for x in p["pvcs"]["evidence-archive-pvc"]["rule_excluded"]}
+    assert ex[post + ".json"] == ex[post + ".trainer.log"] == "post-campaign training (executed after the cutoff)"
+    straddle = add_training(e, "ml-training-29850000", "85858585-0000", "2026-11-03T07:00:00Z",
+                            "2026-11-01T23:55:00Z", "2026-11-02T00:15:00Z")
+    untimed = add_training(e, "ml-training-29860000", "86868686-0000", "2026-11-03T07:01:00Z", None,
+                           "2026-11-02T00:16:00Z")
+    do_probe(e)
+    probs = P.plan(e["record"], e["kube"])["problems"]
+    assert any("29850000" in x and "straddles the cutoff; needs an explicit review" in x for x in probs), probs
+    assert any("29860000" in x and "execution times are missing; needs an explicit review" in x for x in probs)
+    set_trainer_reviewed(e, [
+        {"job": "ml-training-29850000", "pod_uid": "85858585-0000", "decision": "select", "reason": "slot 18Z ran"},
+        {"job": "ml-training-29860000", "pod_uid": "86868686-0000", "decision": "exclude", "reason": "post 00Z"}])
+    do_probe(e)
+    p = P.plan(e["record"], e["kube"])
+    assert p["problems"] == [], p["problems"]
+    sel = {it["path"]: it for it in p["pvcs"]["evidence-archive-pvc"]["selection"]}
+    assert sel[straddle + ".trainer.log"]["reviewed"] == "reviewed: slot 18Z ran"
+    ex = {x["path"]: x["reason"] for x in p["pvcs"]["evidence-archive-pvc"]["rule_excluded"]}
+    assert ex[untimed + ".json"] == "reviewed: post 00Z"
+    set_trainer_reviewed(e, [
+        {"job": "ml-training-29800000", "pod_uid": "8e8e8e8e-0000", "decision": "exclude", "reason": "no"}])
+    do_probe(e)
+    assert any("29800000" in x and "unambiguous" in x for x in P.plan(e["record"], e["kube"])["problems"])
 
 
 def test_post_campaign_trainings_are_excluded_by_the_index_pairing(env):
-    """Files referenced by trainer-index records AFTER the cutoff are excluded with a reason; a file no index record
-    references still blocks."""
+    """Files of trainings that ran AFTER the cutoff are excluded with a reason; a file no index record references
+    still blocks."""
     e = env
     a = e["vols"]["evidence-archive-pvc"]
-    log = "post\n"
-    late = {"collected_at": "2026-11-03T06:35:00Z", "job": "ml-training-29900000", "pod_uid": "9f9f9f9f-0000",
-            "containers": [{"name": "trainer", "log_sha256": sha(log.encode()), "previous_log_saved": False}]}
-    with open(os.path.join(a, "logs/trainer-index.jsonl"), "a") as fh:
-        fh.write(jl(late))
-    write(os.path.join(a, "logs/trainer/ml-training-29900000-9f9f9f9f.json"), json.dumps(late))
-    write(os.path.join(a, "logs/trainer/ml-training-29900000-9f9f9f9f.trainer.log"), log)
+    base = add_training(e, "ml-training-29900000", "9f9f9f9f-0000", "2026-11-03T06:35:00Z",
+                        "2026-11-03T06:00:00Z", "2026-11-03T06:20:00Z")
     do_probe(e)
     p = P.plan(e["record"], e["kube"])
     assert not any("29900000" in x for x in p["problems"]), p["problems"]
     ex = {x["path"]: x["reason"] for x in p["pvcs"]["evidence-archive-pvc"]["rule_excluded"]}
-    assert ex["logs/trainer/ml-training-29900000-9f9f9f9f.json"] == "post-campaign training (after cutoff)"
-    assert ex["logs/trainer/ml-training-29900000-9f9f9f9f.trainer.log"] == "post-campaign training (after cutoff)"
+    assert ex[base + ".json"] == ex[base + ".trainer.log"] == "post-campaign training (executed after the cutoff)"
     write(os.path.join(a, "logs/trainer/ml-training-29911111-aaaaaaaa.json"), "{}")    # referenced by no record
     do_probe(e)
     assert any("ml-training-29911111-aaaaaaaa.json is neither selected" in x
@@ -881,6 +994,31 @@ def test_empty_by_design_refuses_anything_campaign_relevant(env):
     do_probe(e)
     assert any("does not match its sidecar" in x and "declared empty by design" in x
                for x in P.plan(e["record"], e["kube"])["problems"])
+
+
+def test_empty_by_design_needs_every_pair_verified_before_its_time(env):
+    """Codex #36 item 2: a post-cutoff sidecar whose artifact does not match (sha256 or size) blocks the empty export
+    instead of justifying it."""
+    e = env
+    models_after_cutoff_only(e)
+    m = e["vols"]["ml-models-pvc"]
+    write(os.path.join(m, "lstm_nginx-test_requests.pkl"), b"rewritten-model")       # sidecar sha now mismatches
+    set_empty_by_design(e)
+    do_probe(e)
+    probs = P.plan(e["record"], e["kube"])["problems"]
+    assert any("does not match its sidecar" in x and "declared empty by design" in x for x in probs), probs
+    art = b"current-model"
+    write(os.path.join(m, "lstm_nginx-test_requests.pkl"), art)
+    write(os.path.join(m, "lstm_nginx-test_requests.meta.json"),
+          json.dumps({"trained_at": "2026-11-08T00:20:00Z", "artifact_sha256": sha(art), "artifact_bytes": 999}))
+    do_probe(e)
+    probs = P.plan(e["record"], e["kube"])["problems"]
+    assert any("does not match its sidecar" in x for x in probs), probs
+    with pytest.raises(Exception):
+        do_export(e)
+    forged = [{"path": "lstm_a.meta.json", "reason": "trained after the cutoff", "ts": "2026-11-08T00:00:00Z"}]
+    _, eprobs = P.empty_by_design("ml-models-pvc", "r", [], forged, [], [{"cutoff": CUTOFF}])
+    assert eprobs                                                     # an exclusion without pair_verified never counts
 
 
 def test_empty_by_design_only_for_ml_models(env):
