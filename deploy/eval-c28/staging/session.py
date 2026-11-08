@@ -32,8 +32,10 @@ from that journal, so a create whose response was lost is still owned and cleane
 session's generator pods are gone (terminating ones included), in-flight requests have timed out, and the writer is
 confirmed inactive (the PA's observed mode is Recommend, or the created writer and its KEDA HPA are gone); anything
 else, including objects replaced under the session, is recorded as unresolved and keeps the session open. The block
-generator is created suspended and released by the watchdog at the block start; a release or start later than the
-lock's max_release_lateness_s stops the session and classifies the block as a late (replacement) slot.
+generator is created suspended and released by the watchdog at the block start. The block's start is acknowledged
+only by evidence attributed to this session (owned k6 container started, the session-tagged k6 iteration counter
+and exactly one matching ingress series rising after it); a release later than the lock's max_release_lateness_s,
+or no attributed acknowledgment within it, stops the session and classifies the block as a late (replacement) slot.
 
 The record's "session" section:
   {"id": "s-0001", "phase": "preparation"|"confirmation", "arm": "PA-N", "profile": "s20", "seed": 201,
@@ -41,6 +43,8 @@ The record's "session" section:
    "manifest_root": "<dir>", "generator_image": "<repo>@sha256:...", "generator_resources": {...},
    "generator_env": {non-secret k6 settings}, "arrival_budget": {"max_rps": N, "max_total_arrivals": N},
    "deadline_utc": "...", "itt_fallback": false, "quiesce_timeout_s": 300,
+   "arrival_ack": {"ingress": {"metric": "c28_ingress_requests_total", "labels": {<attribution labels>}},
+                   "generator": {"metric": "k6_iterations_total"}, "step_s": 5},
    "stops": {"steal_query": "<PromQL, percent per node>", "query_api": "http://...", "node_label": "node",
              "steal_percent": 5, "steal_bins": 5}}
 """
@@ -389,7 +393,11 @@ def _quota_problems(c: Context) -> List[str]:
 
 def generator_job(c: Context, active_deadline: int, suspend: bool) -> Dict:
     s, names, r = c.s, c.names(), c.params["reservation"]
-    env = ["run", "-e", "C28_PLAN=/plan/plan.json", "-e", f"C28_BASE_URL=http://c28-ingress.{c.ns}.svc",
+    # Test-wide tags on every k6 sample, the session's included, so its metrics are attributable to THIS session.
+    tags = {"c28_session": c.session_id, "c28_target": c.target, "c28_plan": c.plan["digest"],
+            "c28_seed": str(c.plan["seed"]), "c28_label": c.plan["label"]}
+    env = ["run"] + [a for k, v in sorted(tags.items()) for a in ("--tag", f"{k}={v}")] + [
+           "-e", "C28_PLAN=/plan/plan.json", "-e", f"C28_BASE_URL=http://c28-ingress.{c.ns}.svc",
            "-e", "C28_SUMMARY=/tmp/summary.json"]
     for k, v in sorted((s.get("generator_env") or {}).items()):
         env += ["-e", f"{k}={v}"]
@@ -866,7 +874,7 @@ def release(c: Context, fetch: Callable[[str], Dict] = None) -> List[str]:
     if X.last(entries, "block-classified", session=c.session_id):
         return []
     k6 = _k6_state(c, owned["job"]["uid"])
-    first = first_arrival(c, fetch, begin)
+    first, why = acknowledgment(c, fetch, begin, k6)
     if first is not None:
         lateness = first - begin
         _classify(c, "on-time" if lateness <= limit else "late-replacement-slot", lateness, k6)
@@ -874,7 +882,7 @@ def release(c: Context, fetch: Callable[[str], Dict] = None) -> List[str]:
                                              f"block start (> {limit} s)"]
     if now - begin > limit:
         _classify(c, "late-replacement-slot", None, k6)
-        return [f"no arrival acknowledged at the ingress within {limit} s of the block start (k6: {k6})"]
+        return [f"the block is UNACKNOWLEDGED {limit} s after its start (k6: {k6}; {why})"]
     return []
 
 
@@ -891,29 +899,79 @@ def _k6_state(c: Context, job_uid: str) -> str:
     return "absent"
 
 
-def first_arrival(c: Context, fetch: Callable[[str], Dict], begin: int) -> Optional[int]:
-    """The generator's schedule-start acknowledgment: the first scrape interval after the block start in which the
-    independent ingress counted an arrival for this target (its counter rose above its value at the block start).
-    None while nothing is acknowledged or the observation fails."""
+def _series(c: Context, fetch: Callable[[str], Dict], selector: str, begin: int, step: int) -> Tuple[Optional[Dict], str]:
     st = c.s.get("stops") or {}
-    ack = c.s.get("arrival_ack") or {}
-    expr = ack.get("query", 'sum(c28_ingress_requests_total{target="{target}"})').replace("{target}", c.target)
-    step = int(ack.get("step_s", 5))
-    if not st.get("query_api"):
-        return None
-    q = urllib.parse.urlencode({"query": expr, "start": begin - 60, "end": c.now(), "step": step})
+    q = urllib.parse.urlencode({"query": selector, "start": begin - 60, "end": c.now(), "step": step})
     try:
-        doc = fetch(f"{st['query_api'].rstrip('/')}/api/v1/query_range?{q}")
-        values = [(int(float(t)), float(v)) for t, v in doc["data"]["result"][0]["values"]]
-    except Exception:           # noqa: BLE001 - not acknowledged (yet)
-        return None
+        result = fetch(f"{st['query_api'].rstrip('/')}/api/v1/query_range?{q}")["data"]["result"]
+    except Exception as e:      # noqa: BLE001
+        return None, f"query failed ({type(e).__name__})"
+    if len(result) != 1:
+        return None, f"{len(result)} series for {selector} (exactly one required)"
+    return result[0], ""
+
+
+def _first_rise(series: Dict, begin: int, new_series: bool) -> Tuple[Optional[int], str]:
+    try:
+        values = [(int(float(t)), float(v)) for t, v in series.get("values", [])]
+    except (TypeError, ValueError):
+        return None, "malformed samples"
+    if not values or not all(math.isfinite(v) for _, v in values):
+        return None, "no finite samples"
     base = [v for t, v in values if t <= begin]
-    if not base or not all(math.isfinite(v) for _, v in values):
-        return None
+    if not base and not new_series:
+        return None, "no sample at the block start to compare with"
+    ref = base[-1] if base else 0.0
     for t, v in values:
-        if t > begin and v > base[-1]:
-            return t
-    return None
+        if t > begin and v > ref:
+            return t, ""
+    return None, "no rise after the block start"
+
+
+def acknowledgment(c: Context, fetch: Callable[[str], Dict], begin: int, k6: str) -> Tuple[Optional[int], str]:
+    """The block's schedule-start acknowledgment, attributed to THIS session; (first arrival time, why not).
+    All of these are required, or the block stays UNACKNOWLEDGED:
+      * owned k6 startup evidence: the k6 container of the pod bound to the owned Job UID has started;
+      * the generator's own counter (arrival_ack.generator.metric, default k6_iterations_total) carrying this
+        session's c28_session, c28_target and c28_plan tags: exactly one series, rising after the block start;
+      * the admitted ingress counter (arrival_ack.ingress.metric, default c28_ingress_requests_total) for this target
+        with every recorded attribution label (arrival_ack.ingress.labels: e.g. namespace, pod, run): exactly one
+        series whose labels match, rising after the block start and not before the generator's first iteration.
+    A target-wide counter increase alone never acknowledges a block."""
+    if k6 not in ("running", "terminated"):
+        return None, f"no owned k6 startup evidence (k6 container {k6})"
+    ack = c.s.get("arrival_ack") or {}
+    st = c.s.get("stops") or {}
+    if not st.get("query_api"):
+        return None, "no query API configured"
+    step = int(ack.get("step_s", 5))
+    gen = ack.get("generator") or {}
+    gsel = (f'{gen.get("metric", "k6_iterations_total")}{{c28_session="{c.session_id}",c28_target="{c.target}",'
+            f'c28_plan="{c.plan["digest"]}"}}')
+    gs, why = _series(c, fetch, gsel, begin, step)
+    if gs is None:
+        return None, f"generator: {why}"
+    gfirst, why = _first_rise(gs, begin, new_series=True)
+    if gfirst is None:
+        return None, f"generator: {why}"
+    ing = ack.get("ingress") or {}
+    labels = dict(ing.get("labels") or {})
+    if not labels:
+        return None, "ingress: no attribution labels recorded (arrival_ack.ingress.labels)"
+    labels["target"] = c.target
+    isel = ing.get("metric", "c28_ingress_requests_total") + "{" + ",".join(
+        f'{k}="{v}"' for k, v in sorted(labels.items())) + "}"
+    ins, why = _series(c, fetch, isel, begin, step)
+    if ins is None:
+        return None, f"ingress: {why}"
+    if any((ins.get("metric") or {}).get(k) != v for k, v in labels.items()):
+        return None, "ingress: the series' labels do not match the recorded attribution"
+    ifirst, why = _first_rise(ins, begin, new_series=False)
+    if ifirst is None:
+        return None, f"ingress: {why}"
+    if ifirst < gfirst - step:
+        return None, "ingress: the counter rose before this session's generator started (not attributable)"
+    return max(gfirst, ifirst), ""
 
 
 def watch(c: Context, start_digest: str, fetch: Callable[[str], Dict] = _http_json, interval: int = 30,

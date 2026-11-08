@@ -27,17 +27,35 @@ def steal(clock, value="1.0", nodes=NODES, stale=0):
     return fetch
 
 
-def observe(clock, arrivals_at=None, steal_value="1.0"):
-    """A fake query API: fresh steal samples for both nodes, and the ingress counter for the target rising from 0 to
-    5 at `arrivals_at` (never when None)."""
+INGRESS_LABELS = {"namespace": "demo", "c28_run": "c28-r1"}
+
+
+def observe(clock, arrivals_at=None, gen_at="same", gen_series=1, ingress_labels=None, ingress_series=1,
+            steal_value="1.0"):
+    """A fake query API: fresh steal samples for both nodes; this session's tagged k6 iteration counter rising at
+    `gen_at` (default: with the arrivals); the ingress counter for the target rising from 0 to 5 at `arrivals_at`."""
+    import re
     import urllib.parse
+    gen_at = arrivals_at if gen_at == "same" else gen_at
+
+    def counter(start, end, step, at, new):
+        return [[t, "0" if at is None or t < at else "5"] for t in range(start, end + 1, step)
+                if not (new and at is not None and t < at - 5)]
 
     def fetch(url):
         q = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
-        if "c28_ingress_requests_total" in q["query"][0]:
-            start, end, step = int(q["start"][0]), int(q["end"][0]), int(q["step"][0])
-            vals = [[t, "0" if arrivals_at is None or t < arrivals_at else "5"] for t in range(start, end + 1, step)]
-            return {"data": {"result": [{"metric": {}, "values": vals}]}}
+        query = q["query"][0]
+        start, end, step = int(q.get("start", [0])[0]), int(q.get("end", [0])[0]), int(q.get("step", [60])[0])
+        labels = dict(re.findall(r'(\w+)="([^"]*)"', query))
+        if query.startswith("k6_iterations_total"):
+            if gen_at is None:
+                return {"data": {"result": []}}
+            return {"data": {"result": [{"metric": labels, "values": counter(start, end, step, gen_at, True)}
+                                        for _ in range(gen_series)]}}
+        if query.startswith("c28_ingress_requests_total"):
+            metric = dict(ingress_labels if ingress_labels is not None else INGRESS_LABELS, target=labels["target"])
+            return {"data": {"result": [{"metric": metric, "values": counter(start, end, step, arrivals_at, False)}
+                                        for _ in range(ingress_series)]}}
         return steal(clock, steal_value)(url)
     return fetch
 
@@ -391,6 +409,7 @@ def confirmation_world(world, arm="PA-N", seed=201, block=BLOCK, sign_receipts=T
             sign(world["keys"][who], freeze.RECEIPT_NS, path)
     target = X.import_harness().render.target_name(arm, "s20")
     over = dict(id="c-0001", phase="confirmation", arm=arm, profile="s20", seed=seed,
+                arrival_ack={"ingress": {"labels": INGRESS_LABELS}},
                 plan=f"evidence/plans/scored-{seed}-{target}.json", block_start=block,
                 runlock="evidence/runlock.json", manifest_root=".", deadline_utc="2026-12-11T00:30:00Z",
                 arrival_budget={"max_rps": 500, "max_total_arrivals": 50_000_000})
@@ -626,9 +645,52 @@ def test_a_running_sidecar_or_container_start_is_not_an_arrival(world):
     assert X.last(X.receipts(record, "session"), "block-classified") is None
     c.clock.t = BLOCK_T + 130
     out = S.watch(c, digest, fetch=observe(c.clock), max_checks=1)
-    assert out["ended"] in ("stopped", "unresolved") and "no arrival acknowledged" in out["stops"][0]
+    assert out["ended"] in ("stopped", "unresolved") and "no owned k6 startup evidence" in out["stops"][0]
     cls = X.last(X.receipts(record, "session"), "block-classified")["data"]
     assert cls["classification"] == "late-replacement-slot" and cls["k6_container"] == "waiting"
+
+
+def test_block_needs_owned_k6_evidence(world):
+    """Codex #32 r3: ingress and generator metrics without an owned, started k6 container never acknowledge."""
+    record, target = confirmation_world(world)
+    c, digest, started = start_session(world, record, now=BLOCK_T - 60)
+    c.clock.t = BLOCK_T + 1
+    S.watch(c, digest, fetch=observe(c.clock), max_checks=1)                   # released
+    c.clock.t = BLOCK_T + 130
+    out = S.watch(c, digest, fetch=observe(c.clock, arrivals_at=BLOCK_T + 5), max_checks=1)
+    assert out["ended"] in ("stopped", "unresolved") and "no owned k6 startup evidence" in out["stops"][0]
+    cls = X.last(X.receipts(record, "session"), "block-classified")["data"]
+    assert cls["classification"] == "late-replacement-slot" and cls["k6_container"] == "absent"
+
+
+@pytest.mark.parametrize("obs_kw, why", [
+    ({"gen_at": None}, "generator: 0 series"),                              # target-wide rise, no session series
+    ({"gen_series": 2}, "generator: 2 series"),
+    ({"ingress_series": 2}, "ingress: 2 series"),
+    ({"ingress_labels": {"namespace": "other", "c28_run": "c28-r1"}}, "labels do not match"),
+    ({"gen_at": BLOCK_T + 40}, "rose before this session's generator started"),
+])
+def test_unattributable_series_keep_the_block_unacknowledged(world, obs_kw, why):
+    """Codex #32 r3: exactly one series with the expected labels on both sides, ordered generator-first."""
+    record, target = confirmation_world(world)
+    api = world["api"]
+    c, digest, started = start_session(world, record, now=BLOCK_T - 60)
+    c.clock.t = BLOCK_T + 1
+    S.watch(c, digest, fetch=observe(c.clock), max_checks=1)
+    generator_pod(api, "c-0001", K6_RUNNING)
+    c.clock.t = BLOCK_T + 60
+    S.watch(c, digest, fetch=observe(c.clock, arrivals_at=BLOCK_T + 5, **obs_kw), max_checks=1)
+    assert X.last(X.receipts(record, "session"), "block-classified") is None          # unacknowledged, not on-time
+    c.clock.t = BLOCK_T + 130
+    out = S.watch(c, digest, fetch=observe(c.clock, arrivals_at=BLOCK_T + 5, **obs_kw), max_checks=1)
+    assert "UNACKNOWLEDGED" in out["stops"][0] and why in out["stops"][0], out["stops"]
+
+
+def test_generator_carries_the_session_tag(world):
+    record, target = confirmation_world(world)
+    c, digest, started = start_session(world, record, now=BLOCK_T - 60)
+    args = world["api"].obj("Job", "c28-gen-c-0001", "demo")["spec"]["template"]["spec"]["containers"][0]["args"]
+    assert args[:3] == ["run", "--tag", "c28_label=confirmation"] and "c28_session=c-0001" in args
 
 
 def test_pending_owner_moves_block_start_and_stop_sessions(world):
