@@ -101,11 +101,14 @@ def capacity_rps(c0: float) -> str:
 
 
 def validate(p: Dict) -> None:
+    """The FULL c28-params/v1 validation: every field the experiment consumes is complete and well-formed, and no
+    value anywhere is still a template placeholder. It includes every stage validation (validate_stage)."""
     missing = [k for k in REQUIRED if k not in p]
     if missing:
         raise ParamsError(f"missing parameters: {', '.join(missing)}")
     if p["schema"] != "c28-params/v1":
         raise ParamsError("schema must be c28-params/v1")
+    validate_stage(p, "reservation")
     for key in ("run_id", "namespace", "control_namespace", "priority_class"):
         if not _DNS.match(str(p[key])) or len(str(p[key])) > 40:
             raise ParamsError(f"{key} must be a short DNS label")
@@ -144,6 +147,141 @@ def validate(p: Dict) -> None:
                           "outage reaches H-RPS")
     if "residency" in p:
         residency_params(p)
+    left = placeholder_fields(p)
+    if left:
+        raise ParamsError(f"still placeholders: {', '.join(left)}")
+
+
+# --- stage-scoped validation ------------------------------------------------------------------------------------------
+# A stage that runs before the experiment parameters can be completed validates exactly the fields it consumes, with
+# the full validation's strictness for those fields; every other field may still be a placeholder. Passing a stage
+# validation says NOTHING about experiment readiness: that is full_validation_problems() == [] (validate() passes).
+# The reservation stage (staging/reserve.py: plan, apply, rollback-plan, rollback, verify's reservation part) consumes
+# run_id (the taint value and the run label of evaluation pods), nodes.workload/support (bound to the record's
+# name+UID), reservation.taint_key/taint_value/role_label, and control_namespace + release (occupant classification:
+# the evaluation release's pods on S count as evaluation pods). Capacity calibration on the reserved W comes after it.
+STAGE_FIELDS = {
+    "reservation": ("schema", "run_id", "nodes.workload", "nodes.support", "reservation.taint_key",
+                    "reservation.taint_value", "reservation.role_label", "control_namespace", "release"),
+}
+_LABEL_NAME = re.compile(r"^[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$")
+_DNS_SUBDOMAIN = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$")
+
+
+def _qualified_name(v) -> bool:
+    """A Kubernetes qualified name (label/taint key): [prefix/]name, prefix a DNS subdomain of at most 253, name at
+    most 63 alphanumerics, '-', '_' or '.', starting and ending alphanumeric."""
+    if not isinstance(v, str) or _placeholder(v) or v.count("/") > 1:
+        return False
+    prefix, _, name = v.rpartition("/")
+    if "/" in v and not (prefix and len(prefix) <= 253 and _DNS_SUBDOMAIN.match(prefix)):
+        return False
+    return bool(_LABEL_NAME.match(name))
+
+
+def _short_label(p: Dict, key: str) -> Optional[str]:
+    v = p.get(key)
+    if _placeholder(v):
+        return f"{key} is still a placeholder"
+    if not (isinstance(v, str) and _DNS.match(v) and len(v) <= 40):
+        return f"{key} must be a short DNS label"
+    return None
+
+
+def stage_problems(p: Dict, stage: str) -> List[str]:
+    """Every problem of the fields `stage` consumes (STAGE_FIELDS[stage]); never raises. Empty means only that this
+    stage may run, never that the experiment parameters are complete."""
+    if stage not in STAGE_FIELDS:
+        raise ValueError(f"unknown params stage {stage!r} (known: {', '.join(sorted(STAGE_FIELDS))})")
+    if not isinstance(p, dict):
+        return ["the params must be a JSON object"]
+    out: List[str] = []
+    if p.get("schema") != "c28-params/v1":
+        out.append("schema must be c28-params/v1")
+    for key in ("run_id", "control_namespace"):
+        bad = _short_label(p, key)
+        if bad:
+            out.append(bad)
+    rel = p.get("release")
+    if _placeholder(rel):
+        out.append("release is still a placeholder")
+    elif not (isinstance(rel, str) and _DNS.match(rel)):
+        out.append("release must be the evaluation Helm release name")
+    nodes = p.get("nodes")
+    if not isinstance(nodes, dict):
+        out.append("nodes must name the workload and support nodes")
+        nodes = {}
+    for role in ("workload", "support"):
+        v = nodes.get(role)
+        if _placeholder(v):
+            out.append(f"nodes.{role} is still a placeholder")
+        elif not (isinstance(v, str) and _DNS.match(v)):
+            out.append(f"nodes.{role} must be a node name")
+    if nodes.get("workload") is not None and nodes.get("workload") == nodes.get("support"):
+        out.append("the workload and support nodes must differ (section 11.1)")
+    r = p.get("reservation")
+    if not isinstance(r, dict):
+        out.append("reservation must name taint_key, taint_value and role_label")
+        r = {}
+    for key in ("taint_key", "role_label"):
+        v = r.get(key)
+        if _placeholder(v):
+            out.append(f"reservation.{key} is still a placeholder")
+        elif not _qualified_name(v):
+            out.append(f"reservation.{key} must be a Kubernetes qualified name ([prefix/]name)")
+    if r.get("taint_key") is not None and r.get("taint_key") == r.get("role_label"):
+        out.append("reservation.taint_key and reservation.role_label must differ")
+    tv = r.get("taint_value")
+    if _placeholder(tv):
+        out.append("reservation.taint_value is still a placeholder")
+    elif not (isinstance(tv, str) and _LABEL_NAME.match(tv)):
+        out.append("reservation.taint_value must be a label value")
+    elif isinstance(p.get("run_id"), str) and tv != p["run_id"]:
+        out.append("reservation.taint_value must be the run_id")
+    return out
+
+
+def validate_stage(p: Dict, stage: str) -> None:
+    """Raise ParamsError unless every field `stage` consumes is complete and well-formed (stage_problems)."""
+    problems = stage_problems(p, stage)
+    if problems:
+        raise ParamsError(f"{stage} stage: " + "; ".join(problems))
+
+
+def placeholder_fields(p, prefix: str = "") -> List[str]:
+    """The dotted paths of every value that is still a template placeholder (a string starting with '<')."""
+    if _placeholder(p):
+        return [prefix or "(root)"]
+    out: List[str] = []
+    if isinstance(p, dict):
+        for k in sorted(p):
+            out += placeholder_fields(p[k], f"{prefix}.{k}" if prefix else str(k))
+    elif isinstance(p, list):
+        for i, v in enumerate(p):
+            out += placeholder_fields(v, f"{prefix}[{i}]")
+    return out
+
+
+def full_validation_problems(p: Dict) -> List[str]:
+    """The full validation's verdict without raising: the missing required parameters, every placeholder field, and
+    validate()'s refusal. Empty exactly when validate(p) passes, i.e. the experiment parameters are complete."""
+    if not isinstance(p, dict):
+        return ["the params must be a JSON object"]
+    out: List[str] = []
+    missing = [k for k in REQUIRED if k not in p]
+    if missing:
+        out.append(f"missing: {', '.join(missing)}")
+    left = placeholder_fields(p)
+    if left:
+        out.append(f"placeholders: {', '.join(left)}")
+    try:
+        validate(p)
+    except ParamsError as e:
+        if str(e) != f"still placeholders: {', '.join(left)}":       # already listed above
+            out.append(str(e))
+    except (KeyError, TypeError, AttributeError, ValueError) as e:     # a malformed section the checks above reached
+        out.append(f"malformed params ({type(e).__name__}: {e})")
+    return out
 
 
 _FIXTURE_RESOURCES = (": the fixture's CPU/memory requests and limits are the calibrated, reviewed values (manifest "

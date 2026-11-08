@@ -545,6 +545,36 @@ def load_params(record: Record) -> Dict:
     return params
 
 
+def load_params_stage(record: Record, stage: str) -> Dict:
+    """The c28-params/v1 file the record names, validated ONLY for `stage` (render.validate_stage): every field that
+    stage consumes is complete and strict, other fields may still be placeholders. It is for steps that must run before
+    the experiment parameters can be completed (reserve.py: the reservation precedes capacity calibration on W). It
+    never implies experiment readiness: check experiment_params_problems(params) == [] for that, and every helper that
+    renders, prepares, freezes or runs the experiment uses load_params (the full validation)."""
+    c28 = import_harness()
+    p = record.resolve(str(record.doc.get("params", "")))
+    if not record.doc.get("params") or not os.path.isfile(p):
+        raise StagingError("the record must name its params file (c28-params/v1)")
+    with open(p) as fh:
+        params = json.load(fh)
+    try:
+        c28.render.validate_stage(params, stage)
+    except c28.render.ParamsError as e:
+        raise StagingError(f"params: {e}") from e
+    if params["run_id"] != record.run_id:
+        raise StagingError("params.run_id differs from the record's run_id")
+    return params
+
+
+def experiment_params_problems(params: Dict) -> List[str]:
+    """Why load_params would refuse these params (the residency section, then the full validation), without raising:
+    empty exactly when the experiment parameters are complete."""
+    c28 = import_harness()
+    out = [] if isinstance(params, dict) and "residency" in params else \
+        ["missing: residency (W/S allocatable and system requests, required for the prodcluster staging helpers)"]
+    return out + c28.render.full_validation_problems(params)
+
+
 def injection_problems(kube: "Kube", params: Dict, owner_uids: Optional[set] = None) -> List[str]:
     """Admitted evaluation pods must carry no istio-proxy/istio-init container (render.unexpected_injection). The pods:
     those with the run's label in the fixture and control namespaces, the evaluation release's pods, and any pod whose
