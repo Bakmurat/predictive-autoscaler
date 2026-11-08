@@ -1,0 +1,118 @@
+"""common_records: the preparation record, the explicit kubectl client, reviewed plans, write-once evidence, the
+hash-chained receipt log and the sanitizer."""
+
+import json
+
+import pytest
+
+import common_records as C
+from fakes import CLUSTER, record
+
+
+def test_a_record_is_explicit_resolved_and_credential_free(tmp_path):
+    rec = record(tmp_path)
+    assert C.record_problems(rec) == []
+    for change, why in ((dict(kubeconfig={"path": "/home/ops/.kube/config", "context": "prodcluster"}), "default"),
+                        (dict(kubeconfig={"path": "x", "context": "c", "token": "t"}), "exactly"),
+                        (dict(run_id="<run id>"), "run_id"),
+                        (dict(cluster_uid="kube-system"), "cluster_uid"),
+                        (dict(source={"commit": "abc"}), "commit"),
+                        (dict(legacy={"note": "TODO"}), "unresolved"),
+                        (dict(legacy={"password": "x"}), "credential"),
+                        (dict(archive={"url": "https://u:p@host/x"}), "credential-bearing")):
+        bad = dict(rec, **change)
+        assert any(why in p for p in C.record_problems(bad)), change
+    assert any("legacy section" in p for p in C.record_problems(rec, ("legacy",)))
+    f = tmp_path / "r.json"
+    f.write_text(json.dumps(dict(rec, run_id="<x>")))
+    with pytest.raises(C.StagingError):
+        C.load_record(str(f))
+
+
+class Run:
+    def __init__(self, rc=0, out="{}", err=""):
+        self.calls, self.rc, self.out, self.err = [], rc, out, err
+
+    def __call__(self, args, input=None, capture_output=True, text=True):
+        self.calls.append((args, input))
+        return type("P", (), {"returncode": self.rc, "stdout": self.out, "stderr": self.err})()
+
+
+def test_the_kubectl_client_is_explicit_and_fails_closed():
+    run = Run(out='{"metadata": {"uid": "u"}}')
+    api = C.KubectlApi({"path": "/k/eval.yaml", "context": "prodcluster"}, run=run)
+    assert api.get("/api/v1/namespaces/kube-system") == {"metadata": {"uid": "u"}}
+    args, _ = run.calls[0]
+    assert args[:6] == ["kubectl", "--kubeconfig", "/k/eval.yaml", "--context", "prodcluster",
+                        "--request-timeout=30s"] and args[6:] == ["get", "--raw", "/api/v1/namespaces/kube-system"]
+    api.delete("/apis/keda.sh/v1alpha1/namespaces/demo/scaledobjects/x", "uid-1")
+    args, body = run.calls[1]
+    assert args[6:] == ["delete", "--raw", "/apis/keda.sh/v1alpha1/namespaces/demo/scaledobjects/x", "-f", "-"]
+    assert json.loads(body)["preconditions"] == {"uid": "uid-1"}
+    missing = C.KubectlApi({"path": "k", "context": "c"}, run=Run(rc=1, err="Error from server (NotFound)"))
+    assert missing.get("/x") is None
+    with pytest.raises(C.ApiError):
+        C.KubectlApi({"path": "k", "context": "c"}, run=Run(rc=1, err="Forbidden")).get("/x")
+    with pytest.raises(C.NotFound):
+        C.KubectlApi({"path": "k", "context": "c"}, run=Run(rc=1, err="not found")).delete("/x", "u")
+
+
+def test_a_mutation_needs_the_reviewed_plan(tmp_path):
+    rec = record(tmp_path)
+    plan = C.make_plan("legacy", rec, [{"step": 1, "op": "scale"}])
+    d = C.plan_digest(plan)
+    C.require_reviewed(plan, d, "legacy", rec)
+    for digest, helper, r in ((None, "legacy", rec), ("0" * 64, "legacy", rec), (d, "archive", rec),
+                              (d, "legacy", dict(rec, run_id="other"))):
+        with pytest.raises(C.StagingError):
+            C.require_reviewed(plan, digest, helper, r)
+    edited = dict(plan, actions=[{"step": 1, "op": "delete"}])
+    with pytest.raises(C.StagingError, match="differs"):
+        C.require_reviewed(edited, d, "legacy", rec)
+
+
+def test_evidence_is_written_once_and_receipts_are_chained(tmp_path):
+    rec = record(tmp_path)
+    p = tmp_path / "e" / "x.json"
+    C.write_once(str(p), b"1")
+    with pytest.raises(C.StagingError, match="written once"):
+        C.write_once(str(p), b"2")
+    a = C.append_receipt(rec, "legacy", "one", {"n": 1}, clock=lambda: 0)
+    b = C.append_receipt(rec, "legacy", "two", {"n": 2}, clock=lambda: 60)
+    assert b["prev"] == a["sha256"] and [r["event"] for r in C.read_receipts(C.receipts_path(rec, "legacy"))] == \
+        ["one", "two"]
+    path = C.receipts_path(rec, "legacy")
+    lines = open(path).read().splitlines()
+    lines[0] = lines[0].replace('"n": 1', '"n": 9')
+    open(path, "w").write("\n".join(lines) + "\n")
+    with pytest.raises(C.StagingError, match="hash chain"):
+        C.read_receipts(path)
+
+
+def test_the_cluster_identity_is_checked(tmp_path):
+    from fakes import legacy_cluster
+    api = legacy_cluster()
+    C.require_cluster(api, CLUSTER)
+    with pytest.raises(C.StagingError, match="kube-system UID"):
+        C.require_cluster(api, "00000000-0000-4000-8000-000000000000")
+
+
+def test_sanitizing_removes_every_secret_carrier():
+    from fakes import LAST_APPLIED_MARKER, SECRET_DATA, SECRET_VALUE
+    secret = C.sanitize_object({"kind": "Secret", "metadata": {"name": "s", "namespace": "demo"},
+                                "data": {"k": SECRET_DATA}, "stringData": {"p": SECRET_VALUE}})
+    assert secret["sanitized"] == "secret-values-removed" and SECRET_DATA not in json.dumps(secret)
+    cm = C.sanitize_object({"kind": "ConfigMap", "metadata": {"name": "c"}, "data": {"script.js": SECRET_VALUE}})
+    assert "data" not in cm and SECRET_VALUE not in json.dumps(cm) and set(cm["data_sha256"]) == {"script.js"}
+    cj = C.sanitize_object({"kind": "CronJob", "metadata": {"name": "j", "managedFields": [{}], "annotations": {
+        C.LAST_APPLIED: LAST_APPLIED_MARKER, "x-api-token": "abc", "description": "kept"}},
+        "spec": {"jobTemplate": {"spec": {"template": {"spec": {"containers": [{"name": "c", "env": [
+            {"name": "AWS_SECRET_ACCESS_KEY", "value": SECRET_VALUE}, {"name": "MODE", "value": "server"}],
+            "command": ["run", f"--password={SECRET_VALUE}"]}]}}}}}})
+    text = json.dumps(cj)
+    assert SECRET_VALUE not in text and LAST_APPLIED_MARKER not in text and "managedFields" not in text
+    assert cj["metadata"]["annotations"] == {"x-api-token": C.REDACTED, "description": "kept"}
+    with pytest.raises(C.StagingError):
+        C.assert_clean("-----BEGIN RSA PRIVATE KEY-----")
+    with pytest.raises(C.StagingError):
+        C.assert_clean("value: x", secrets=["value: x"])
