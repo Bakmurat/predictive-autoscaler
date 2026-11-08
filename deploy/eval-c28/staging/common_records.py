@@ -13,6 +13,11 @@ Every helper (inventory, archive, sanitize-render, legacy; reserve, prepare, fre
     mutation runs only with `--plan-digest <that digest>` and only while the plan file still has it
     (require_reviewed). Evidence files are written once (write_once refuses to overwrite); receipts are appended to a
     hash-chained JSON-lines log (append_receipt), never rewritten.
+  * LOCKS and INTENTS (stable interface, shared with part 2): exclusive_lock(rec, scope) is the ONE mutation lock
+    of a cluster and resource scope in the mandatory shared lock_dir, recording host, boot, PID and process start;
+    mutation_step() writes intent-<n> before and step-<n> after each mutation; a recovery uses recovery_guard(rec,
+    scope, lock_sha256) (exclusive, owner proven terminated) and writes reconciled-<n> only for outcomes it can
+    decide; anything else stays unresolved and keeps the lock.
   * SANITIZING: sanitize_object() turns any API object into a reviewable record: no Secret data (Secrets are reduced
     to a stub), no ConfigMap contents (per-key sha256 only), no managedFields, no last-applied configuration, no
     literal credential env values or credential flags, no URL user-info. assert_clean() is the last guard on every
@@ -120,6 +125,8 @@ def record_problems(rec: Mapping, sections: Sequence[str] = ()) -> List[str]:
         out.append("kubeconfig.path must be an explicit evaluation kubeconfig, not the default ~/.kube/config")
     if not isinstance(rec.get("evidence_dir"), str) or not rec.get("evidence_dir"):
         out.append("evidence_dir is required")
+    if not isinstance(rec.get("lock_dir"), str) or not os.path.isabs(rec.get("lock_dir", "")):
+        out.append("lock_dir is required: the absolute, shared mutation-lock directory of the executor host")
     src = rec.get("source")
     if not isinstance(src, dict) or not _COMMIT.match(str(src.get("commit", ""))):
         out.append("source.commit must be a full git commit")
@@ -383,25 +390,62 @@ def append_receipt(rec: Mapping, helper: str, event: str, data: Mapping, clock=N
 
 
 def lock_path(rec: Mapping, scope: str) -> str:
-    """The ONE mutation lock of a cluster and resource scope (e.g. "legacy" for every legacy quiesce/restore), in the
-    shared lock directory (record lock_dir: one directory on the executor host for every run; default under the
-    evidence directory)."""
-    root = rec.get("lock_dir") or os.path.join(rec["evidence_dir"], "locks")
+    """The ONE mutation lock of a cluster and resource scope (e.g. "legacy" for every legacy quiesce/restore) in the
+    record's MANDATORY shared lock directory (lock_dir: one absolute directory on the executor host, the same for every
+    run and helper, so separate runs can never take separate locks)."""
+    root = rec.get("lock_dir")
+    if not isinstance(root, str) or not os.path.isabs(root):
+        raise StagingError("the record needs lock_dir: the absolute, shared mutation-lock directory")
     return os.path.join(root, f"{rec['cluster_uid']}-{scope}.lock")
 
 
+def _boot_id() -> str:
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def process_start(pid: int) -> Optional[str]:
+    """A process's start time (clock ticks since boot, /proc/<pid>/stat field 22), or None when it does not exist."""
+    try:
+        with open(f"/proc/{pid}/stat") as fh:
+            stat = fh.read()
+    except OSError:
+        return None
+    return stat.rsplit(")", 1)[1].split()[19]
+
+
+def owner_terminated(body: Mapping) -> (bool, str):
+    """Whether the executor that wrote a lock has certainly ended: same host and boot, and its PID is gone or now
+    belongs to a process started at another time. Another host or boot cannot be verified here: not terminated."""
+    import socket
+    if body.get("host") != socket.gethostname():
+        return False, f"the lock was taken on host {body.get('host')!r}: verify and recover there"
+    if body.get("boot_id") != _boot_id():
+        return False, "the lock was taken in another boot of this host: its executor cannot be checked"
+    start = process_start(int(body.get("pid", -1)))
+    if start is not None and start == body.get("pid_start"):
+        return False, f"its executor (pid {body.get('pid')}) is still running"
+    return True, "executor gone"
+
+
 class exclusive_lock:
-    """One executor per cluster and resource scope (lock_path), created exclusively. The lock is released on a clean
-    finish, or on an error while `safe` is true (no mutation in flight: the caller sets safe False after recording a
-    mutation's intent and True after recording its outcome). Otherwise it stays (fail closed) until the helper's
-    recovery procedure has reconciled every ambiguous intent against the live objects and removed it."""
+    """One executor per cluster and resource scope (lock_path), created exclusively; the lock records the owner's
+    host, boot, PID and process start time. It is released on a clean finish, or on an error while `safe` is true (no
+    mutation in flight: mutation_step sets safe False after recording a mutation's intent and True after recording its
+    outcome). Otherwise it stays (fail closed) until the helper's recovery has proved the owner gone (recovery_guard)
+    and reconciled every ambiguous intent against the live objects."""
 
     def __init__(self, rec: Mapping, scope: str, clock=None, holder: str = ""):
+        import socket
         self.safe = True
         self.path = lock_path(rec, scope)
         self.body = json.dumps({"scope": scope, "holder": holder or scope, "run_id": rec["run_id"],
-                                "cluster_uid": rec["cluster_uid"], "pid": os.getpid(), "at": utc_now(clock)},
-                               sort_keys=True)
+                                "cluster_uid": rec["cluster_uid"], "pid": os.getpid(),
+                                "pid_start": process_start(os.getpid()), "host": socket.gethostname(),
+                                "boot_id": _boot_id(), "at": utc_now(clock)}, sort_keys=True)
 
     def __enter__(self):
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
@@ -409,15 +453,72 @@ class exclusive_lock:
             fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
         except FileExistsError as e:
             raise StagingError(f"{self.path} exists: another execution is running or crashed; inspect its receipts "
-                               f"and remove the lock deliberately") from e
+                               f"and run the helper's recover command") from e
         with os.fdopen(fd, "w") as fh:
             fh.write(self.body)
+            fh.flush()
+            os.fsync(fh.fileno())
         return self
 
     def __exit__(self, exc_type, exc, tb):
         if exc_type is None or self.safe:
             os.unlink(self.path)
         return False
+
+
+class recovery_guard:
+    """Exclusive recovery of a stale lock: given the lock file's sha256, it takes <lock>.recovery exclusively (one
+    recoverer), proves the lock's executor terminated (owner_terminated), and leaves the stale lock in place while the
+    caller reconciles, so no executor can start meanwhile. release_stale() removes it once every intent is resolved;
+    otherwise the stale lock stays."""
+
+    def __init__(self, rec: Mapping, scope: str, lock_sha256: str):
+        self.path, self.sha = lock_path(rec, scope), lock_sha256
+        self.guard = self.path + ".recovery"
+
+    def __enter__(self):
+        if not os.path.exists(self.path):
+            raise StagingError("no mutation lock is held: nothing to recover")
+        try:
+            fd = os.open(self.guard, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
+        except FileExistsError as e:
+            raise StagingError("another recovery is in progress") from e
+        os.close(fd)
+        try:
+            if sha256_file(self.path) != self.sha:
+                raise StagingError("the lock file's sha256 differs from the one given; refusing")
+            with open(self.path) as fh:
+                body = json.load(fh)
+            gone, why = owner_terminated(body)
+            if not gone:
+                raise StagingError(f"refusing to recover: {why}")
+        except BaseException:
+            os.unlink(self.guard)
+            raise
+        return self
+
+    def release_stale(self) -> None:
+        os.unlink(self.path)
+
+    def __exit__(self, exc_type, exc, tb):
+        os.unlink(self.guard)
+        return False
+
+
+def mutation_step(rec: Mapping, helper: str, lock: exclusive_lock, step, intent: Mapping, call: Callable,
+                  clock=None) -> Dict:
+    """The intent protocol shared by every mutating helper. Receipts in <evidence_dir>/receipts/<helper>.jsonl:
+      intent-<step>      {"action", "pre", ...}: durable (fsync) BEFORE the call; pre is the validated state;
+      step-<step>        {"action", "pre", "result", "post", ...}: after it, post taken from the call's response;
+      reconciled-<step>  {"observed": "done"|"not-done", ...}: written only by a recovery that could decide;
+    an intent with neither outcome is UNRESOLVED and keeps the lock. call() returns (result, post)."""
+    data = dict(intent)
+    append_receipt(rec, helper, f"intent-{step}", data, clock)
+    lock.safe = False
+    result, post = call()
+    r = append_receipt(rec, helper, f"step-{step}", {**data, "result": result, "post": post}, clock)
+    lock.safe = True
+    return r
 
 
 # --- sanitizing -------------------------------------------------------------------------------------------------
@@ -543,7 +644,8 @@ def api_for(rec: Mapping, run: Callable = subprocess.run) -> KubectlApi:
     return KubectlApi(rec["kubeconfig"], run=run)
 
 
-__all__ = ["exclusive_lock", "lock_path", "ApiError", "KINDS", "KubectlApi", "NotFound", "StagingError",
+__all__ = ["exclusive_lock", "lock_path", "mutation_step", "owner_terminated", "process_start", "recovery_guard",
+           "ApiError", "KINDS", "KubectlApi", "NotFound", "StagingError",
            "add_common_args",
            "api_for",
            "append_receipt", "assert_clean", "canonical", "cluster_uid", "digest", "discover_groups", "kind_group",

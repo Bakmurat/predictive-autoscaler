@@ -43,6 +43,16 @@ ARRIVALS = {"query_api": "http://vmselect.monitoring.svc:8481/select/0/prometheu
             "max_age_seconds": 120}
 
 
+def crash_owner(lock_file):
+    """Make a lock look left behind by a dead executor: a PID that has certainly exited."""
+    import subprocess
+    p = subprocess.Popen(["true"])
+    p.wait()
+    body = json.load(open(lock_file))
+    body["pid"] = p.pid
+    open(lock_file, "w").write(json.dumps(body, sort_keys=True))
+
+
 def ready_record(tmp_path, **legacy):
     rec = record(tmp_path, legacy={"parked_replicas": 0, "job_deadline_seconds": 600, "wait_timeout_seconds": 60,
                                    "arrivals": dict(ARRIVALS),
@@ -211,7 +221,9 @@ def test_restore_undoes_exactly_what_quiesce_did(tmp_path):
     assert api.objects[("deployments", "demo", "c28-pa-n-s20")]["spec"]["replicas"] == 2   # never touched
     so = api.objects[("scaledobjects", "demo", "nginx-test-keda-fallback")]
     assert so["spec"]["scaleTargetRef"] == {"name": "nginx-test"}
-    assert so["metadata"]["annotations"] == {"autoscaling.keda.sh/paused": "true"}
+    ann = so["metadata"]["annotations"]
+    assert ann["autoscaling.keda.sh/paused"] == "true" and ann[LG.OP_ANNOTATION].startswith("c28-r1-")
+    assert set(ann) == {"autoscaling.keda.sh/paused", LG.OP_ANNOTATION}
 
 
 def test_restore_never_overwrites_and_refuses_recreated_targets(tmp_path):
@@ -403,6 +415,9 @@ def test_a_lost_response_after_a_delete_stays_recoverable(tmp_path):
         LG.build_restore_plan(api, rec)                                      # no guessing over an ambiguous intent
     with pytest.raises(C.StagingError, match="sha256 differs"):
         LG.recover(api, rec, "0" * 64, clock)
+    with pytest.raises(C.StagingError, match="still running"):
+        LG.recover(api, rec, C.sha256_file(lock), clock)                 # this test process holds it: alive
+    crash_owner(lock)                                                   # the executor has died
     report = LG.recover(api, rec, C.sha256_file(lock), clock)
     assert list(report.values()) == ["done"] and not os.path.exists(lock)
     rplan = LG.build_restore_plan(api, rec)
@@ -468,7 +483,7 @@ def test_quiesce_and_restore_share_one_lock(tmp_path):
 
 
 @pytest.mark.parametrize("metrics, why", [(Metrics(rate=0.4), "still receives requests"),
-                                          (Metrics(missing={"myapptwo"}), "no fresh request-counter observation"),
+                                          (Metrics(missing={"myapptwo"}), "no fresh, finite request-counter"),
                                           (Metrics(age=900), "stale")])
 def test_arrivals_must_be_observed_zero_before_parking(tmp_path, quiet_metrics, metrics, why):
     # Finding 5: a quiet replica count is not zero traffic; fresh per-target request counters are.
@@ -488,7 +503,7 @@ def test_retirement_needs_fresh_zero_arrivals_throughout(tmp_path, quiet_metrics
     assert LG.verify(api, rec, 600, clock.sleep, clock, clock)["retired"] is True
     blind = Metrics(missing={"nginx-test"})
     v = LG.verify(api, rec, 600, clock.sleep, clock, clock, metrics=blind)
-    assert v["retired"] is False and any("no fresh request-counter observation" in p for p in v["problems"])
+    assert v["retired"] is False and any("no fresh, finite request-counter observation" in p for p in v["problems"])
     with pytest.raises(C.StagingError, match="arrivals"):
         LG.build_plan(api, dict(rec, legacy={k: v for k, v in rec["legacy"].items() if k != "arrivals"}))
 
@@ -505,12 +520,108 @@ def test_the_metrics_client_returns_one_value_or_nothing():
 
     def opener(body):
         return lambda url, timeout: Resp(json.dumps(body).encode())
-    one = {"status": "success", "data": {"result": [{"value": [1, "0"]}]}}
-    two = {"status": "success", "data": {"result": [{"value": [1, "0"]}, {"value": [1, "3"]}]}}
-    assert REAL_PROM("http://vm", opener=opener(one))("q") == 0.0
-    assert REAL_PROM("http://vm", opener=opener(two))("q") is None             # ambiguous: no observation
-    assert REAL_PROM("http://vm", opener=opener({"status": "success", "data": {"result": []}}))("q") is None
+    now = lambda: 1000.0  # noqa: E731
+    one = {"status": "success", "data": {"result": [{"value": [1000, "0"]}]}}
+    two = {"status": "success", "data": {"result": [{"value": [1000, "0"]}, {"value": [1000, "3"]}]}}
+    assert REAL_PROM("http://vm", opener=opener(one), now=now)("q") == 0.0
+    assert REAL_PROM("http://vm", opener=opener(two), now=now)("q") is None   # ambiguous: no observation
+    assert REAL_PROM("http://vm", opener=opener({"status": "success", "data": {"result": []}}), now=now)("q") is None
+    stale = {"status": "success", "data": {"result": [{"value": [100, "0"]}]}}
+    assert REAL_PROM("http://vm", opener=opener(stale), now=now)("q") is None # Codex r3: timestamps are checked
+    nan = {"status": "success", "data": {"result": [{"value": [1000, "NaN"]}]}}
+    assert REAL_PROM("http://vm", opener=opener(nan), now=now)("q") is None
 
     def down(url, timeout):
         raise OSError("connection refused")
-    assert REAL_PROM("http://vm", opener=down)("q") is None
+    assert REAL_PROM("http://vm", opener=down, now=now)("q") is None
+
+
+
+# --- Codex r3 on #31 ----------------------------------------------------------------------------------------------
+
+def lost_delete(tmp_path):
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    plan = LG.build_plan(api, rec)
+    real_delete = api.delete
+
+    def lossy(path, uid, rv=None):
+        real_delete(path, uid, rv)
+        raise C.ApiError("delete: failed (timeout, exit 1)", 504)
+    api.delete = lossy
+    with pytest.raises(C.ApiError):
+        LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    api.delete = real_delete
+    return api, rec, clock, C.lock_path(rec, "legacy")
+
+
+def test_recovery_never_takes_a_live_or_foreign_lock(tmp_path):
+    # Finding 1: exclusive recovery, executor proven gone; a mandatory shared lock directory.
+    api, rec, clock, lock = lost_delete(tmp_path)
+    with pytest.raises(C.StagingError, match="still running"):
+        LG.recover(api, rec, C.sha256_file(lock), clock)
+    body = json.load(open(lock))
+    body["host"] = "another-host"
+    open(lock, "w").write(json.dumps(body))
+    with pytest.raises(C.StagingError, match="another-host"):
+        LG.recover(api, rec, C.sha256_file(lock), clock)
+    crash_owner(lock)
+    body = json.load(open(lock))
+    body["host"] = __import__("socket").gethostname()
+    open(lock, "w").write(json.dumps(body))
+    open(lock + ".recovery", "w").close()                                 # a concurrent recoverer
+    with pytest.raises(C.StagingError, match="another recovery"):
+        LG.recover(api, rec, C.sha256_file(lock), clock)
+    os.unlink(lock + ".recovery")
+    assert LG.recover(api, rec, C.sha256_file(lock), clock) and not os.path.exists(lock)
+    assert any("lock_dir is required" in p for p in C.record_problems({k: v for k, v in rec.items()
+                                                                        if k != "lock_dir"}))
+    with pytest.raises(C.StagingError, match="lock_dir"):
+        C.lock_path({k: v for k, v in rec.items() if k != "lock_dir"}, "legacy")
+
+
+def test_an_ambiguous_recreation_or_drifted_update_stays_unresolved(tmp_path):
+    # Finding 2: a same-named object without this operation's identity, or an update with drift, decides nothing.
+    api, rec, clock, lock = lost_delete(tmp_path)
+    crash_owner(lock)
+    api.objects[("deployments", "demo", "k6-nginx-test")]["metadata"]["generation"] += 5       # drift elsewhere
+    api.add("scaledobjects", {"kind": "ScaledObject", "metadata": {"name": "nginx-test-keda-fallback",
+                                                                   "namespace": "demo"}, "spec": {}})
+    with pytest.raises(C.StagingError, match="unresolved outcomes"):
+        LG.recover(api, rec, C.sha256_file(lock), clock)
+    assert os.path.exists(lock)                                             # fail closed
+    events = [r["event"] for r in C.read_receipts(C.receipts_path(rec, "legacy"))]
+    assert events[-1] == "recovery-unresolved" and not any(e.startswith("reconciled-") for e in events)
+    # The recreation identity: only the object created by this restore operation counts as its outcome.
+    d = {"action": {"op": "recreate", "kind": "scaledobjects", "namespace": "demo", "name": "nginx-test-keda-fallback"},
+         "operation": "op-1"}
+    assert LG._observe_outcome(api, d)["observed"] == "unresolved"
+    api.objects[("scaledobjects", "demo", "nginx-test-keda-fallback")]["metadata"]["annotations"] = {
+        LG.OP_ANNOTATION: "op-1"}
+    assert LG._observe_outcome(api, d)["observed"] == "done"
+    dep = api.objects[("deployments", "demo", "nginx-reactive")]
+    g = dep["metadata"]["generation"]
+    up = {"action": {"op": "scale", "kind": "deployments", "namespace": "demo", "name": "nginx-reactive",
+                     "uid": dep["metadata"]["uid"], "after": 0}, "pre": {"replicas": 3, "generation": g}}
+    assert LG._observe_outcome(api, up)["observed"] == "not-done"
+    dep["spec"]["replicas"], dep["metadata"]["generation"] = 0, g + 2       # done, plus another change
+    assert LG._observe_outcome(api, up)["observed"] == "unresolved"
+    dep["metadata"]["generation"] = g + 1
+    assert LG._observe_outcome(api, up)["observed"] == "done"
+
+
+@pytest.mark.parametrize("rate, age", [(float("nan"), 5.0), (0.0, float("nan")), (-1.0, 5.0), (0.0, -3.0),
+                                       (float("inf"), 5.0), (0.0, 121.0), (1e-9, 5.0)])
+def test_the_arrival_gate_needs_finite_zero_rate_and_a_valid_age(rate, age):
+    # Finding 3.
+    problems = LG.arrival_problems(lambda q: age if q.startswith("time()") else rate, ARRIVALS, ["nginx-test"])
+    assert problems and "nginx-test" in problems[0]
+    assert LG.arrival_problems(lambda q: 0.0, ARRIVALS, ["nginx-test"]) == []
+
+
+def test_a_paused_scaled_object_does_not_hide_its_generated_hpa(tmp_path):
+    # Finding 4: a pause annotation does not prove the generated HPA stopped writing.
+    api = legacy_cluster()
+    api.objects[("deployments", "ml-engine", "predictive-operator")]["spec"]["replicas"] = 0   # PAs inactive
+    census = LG.writer_census(api)
+    assert census["nginx-test"] == ["horizontalpodautoscalers keda-hpa-nginx-test-keda-fallback"]   # not empty
+    assert census["myapptwo"] == ["scaledobjects myapptwo-keda-fallback"]          # absorbed: verified, counted owner

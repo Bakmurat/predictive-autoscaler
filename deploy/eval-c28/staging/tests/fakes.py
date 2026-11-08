@@ -104,8 +104,9 @@ class FakeApi:
         if bm.get("uid") and bm["uid"] != o["metadata"]["uid"]:
             raise Conflict("UID precondition failed", 409)
         if sub == "scale":
+            if o["spec"].get("replicas") != body["spec"]["replicas"]:
+                o["metadata"]["generation"] += 1         # a spec change raises the generation by one
             o["spec"]["replicas"] = body["spec"]["replicas"]
-            o["metadata"]["generation"] += 1
             if self.instant_pods:
                 self.sync_pods(o)
         else:
@@ -260,6 +261,7 @@ def legacy_cluster(extra_groups=None):
 def record(tmp_path, **sections):
     rec = {"schema": "c28-preparation/v1", "run_id": "c28-r1", "cluster_uid": CLUSTER,
            "kubeconfig": {"path": "/home/ops/.kube/eval-prod.yaml", "context": "prodcluster"},
-           "evidence_dir": str(tmp_path / "evidence"), "source": {"commit": "a" * 40}}
+           "evidence_dir": str(tmp_path / "evidence"), "lock_dir": str(tmp_path / "shared-locks"),
+           "source": {"commit": "a" * 40}}
     rec.update(sections)
     return rec

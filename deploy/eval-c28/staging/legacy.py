@@ -52,6 +52,7 @@ import legacy_allowlist as L  # noqa: E402
 HELPER = "legacy"
 RESTORE = "legacy-restore"
 LOCK_SCOPE = "legacy"                               # ONE mutation lock for quiesce and restore on a cluster
+OP_ANNOTATION = "c28.devkuban.com/restore-operation"  # identity of a recreation, for recovery
 QUIET_SECONDS = 600
 SAMPLE_SECONDS = 10.0
 NEVER = ("persistentvolumeclaims", "persistentvolumes", "pa-legacy", "customresourcedefinitions", "namespaces",
@@ -80,21 +81,30 @@ def _settings(rec: Mapping) -> Dict:
 
 
 class PromClient:
-    """Instant queries against the Prometheus-compatible API (VictoriaMetrics vmselect): one value or None."""
+    """Instant queries against the Prometheus-compatible API (VictoriaMetrics vmselect): exactly one finite value whose
+    evaluation timestamp is within max_skew_seconds of now, or None (no observation)."""
 
-    def __init__(self, base: str, opener=None, timeout: float = 10.0):
+    def __init__(self, base: str, opener=None, timeout: float = 10.0, now: Callable = time.time,
+                 max_skew_seconds: float = 30.0):
         import urllib.request
-        self.base, self.timeout = base.rstrip("/"), timeout
+        self.base, self.timeout, self.now, self.max_skew = base.rstrip("/"), timeout, now, max_skew_seconds
         self.opener = opener or urllib.request.urlopen
 
     def __call__(self, expr: str) -> Optional[float]:
+        import math
         import urllib.parse
         try:
-            with self.opener(f"{self.base}/api/v1/query?" + urllib.parse.urlencode({"query": expr}),
+            t = self.now()
+            with self.opener(f"{self.base}/api/v1/query?" + urllib.parse.urlencode({"query": expr, "time": f"{t:.3f}"}),
                              timeout=self.timeout) as r:
                 doc = json.loads(r.read(1 << 20))
             res = doc["data"]["result"]
-            return float(res[0]["value"][1]) if doc.get("status") == "success" and len(res) == 1 else None
+            if doc.get("status") != "success" or len(res) != 1:
+                return None
+            ts, value = float(res[0]["value"][0]), float(res[0]["value"][1])
+            if not (math.isfinite(ts) and math.isfinite(value)) or abs(ts - t) > self.max_skew:
+                return None                      # not an observation of now
+            return value
         except Exception:                        # unreachable, malformed or ambiguous: no observation
             return None
 
@@ -103,16 +113,18 @@ def arrival_problems(metrics: Callable, arrivals: Mapping, targets) -> List[str]
     """Fresh, target-bound request-counter observations: each target's request rate must be observed (exactly one
     sample), zero, and backed by data no older than max_age_seconds; a missing observation is a problem, never a
     zero."""
+    import math
     out = []
     for t in targets:
         rate = metrics(arrivals["rate_query"].replace("{target}", t))
         age = metrics(arrivals["age_query"].replace("{target}", t))
-        if rate is None or age is None:
-            out.append(f"no fresh request-counter observation for {t}")
-        elif age > arrivals["max_age_seconds"]:
-            out.append(f"the request counters of {t} are stale ({age:.0f} s old)")
-        elif rate > 0:
-            out.append(f"{t} still receives requests ({rate:g}/s)")
+        ok = all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in (rate, age))
+        if not ok:
+            out.append(f"no fresh, finite request-counter observation for {t}")
+        elif not 0 <= age <= arrivals["max_age_seconds"]:
+            out.append(f"the request counters of {t} are stale or from the future (age {age:g} s)")
+        elif rate != 0:
+            out.append(f"{t} still receives requests or reports an invalid rate ({rate:g}/s)")
     return out
 
 
@@ -332,13 +344,7 @@ def _mutate(api, rec: Mapping, helper: str, lock, a: Mapping, clock, pre: Mappin
     """Intent (with the VALIDATED pre-state) durably first, then the call, then the outcome with the post-state taken
     from the mutation's own response (never a later read)."""
     intent = {"action": a, "pre": _state(pre), **(extra or {})}
-    C.append_receipt(rec, helper, f"intent-{a['step']}", intent, clock)
-    lock.safe = False
-    result, post = call(pre)
-    data = {"action": a, "pre": intent["pre"], "result": result, "post": post, **(extra or {})}
-    r = C.append_receipt(rec, helper, f"step-{a['step']}", data, clock)
-    lock.safe = True
-    return r
+    return C.mutation_step(rec, helper, lock, a["step"], intent, lambda: call(pre), clock)
 
 
 def _scale_call(api, a: Mapping, replicas: int):
@@ -514,24 +520,37 @@ def verify(api, rec: Mapping, observe_seconds: int = 0, sleep: Callable = time.s
 # --- restore -------------------------------------------------------------------------------------------------------
 
 def _observe_outcome(api, d: Mapping) -> Dict:
-    """The live outcome of an intent whose call was interrupted: {"observed": "done"|"not-done", ...}."""
+    """The live outcome of an intent whose call was interrupted: {"observed": "done"|"not-done"|"unresolved", ...}.
+    Only an unambiguous observation decides: a recreation is done only if the object carries this operation's identity
+    annotation; an update only if the generation advanced by exactly one with the intended value (or did not move at all
+    for not-done); a deletion only if the object is gone. Anything else (drift, another owner's object) is
+    unresolved."""
     a = d["action"]
     o = api.get(C.path_of(a["kind"], a["namespace"], a["name"]))
+    base = {"action": a, "pre": d.get("pre"), "post": None}
     if a["op"] == "delete":
-        done = o is None or o["metadata"].get("uid") != a["uid"]
-        return {"observed": "done" if done else "not-done", "action": a, "pre": d.get("pre"), "post": None,
-                "result": {"deleted": a["uid"]}, "snapshot": d.get("snapshot")}
+        if o is None:
+            return dict(base, observed="done", result={"deleted": a["uid"]}, snapshot=d.get("snapshot"))
+        if o["metadata"].get("uid") == a["uid"]:
+            return dict(base, observed="not-done")
+        return dict(base, observed="unresolved", why="a same-named object with another UID exists")
     if a["op"] == "recreate":
-        return {"observed": "done" if o is not None else "not-done", "action": a,
-                "result": {"recreated_uid": (o or {}).get("metadata", {}).get("uid")}}
+        if o is None:
+            return dict(base, observed="not-done")
+        if ((o["metadata"].get("annotations") or {}).get(OP_ANNOTATION)) == d.get("operation"):
+            return dict(base, observed="done", result={"recreated_uid": o["metadata"].get("uid")})
+        return dict(base, observed="unresolved", why="a same-named object without this operation's identity exists")
     if o is None or o["metadata"].get("uid") != a["uid"]:
-        raise C.StagingError(f"{a['kind']} {a['namespace']}/{a['name']} vanished after an interrupted step; "
-                             f"reconcile it by hand")
+        return dict(base, observed="unresolved", why="the object vanished or was recreated")
     st, key = _state(o), ("replicas" if a["op"] == "scale" else "suspend")
-    target = a["after"]
-    done = st[key] == target and st["generation"] != d["pre"]["generation"]
-    return {"observed": "done" if done else "not-done", "action": a, "pre": d["pre"],
-            "result": {"from": d["pre"][key], "to": st[key]}, "post": st}
+    pre, target = d["pre"], a["after"]
+    if pre[key] == target and st[key] == target and st["generation"] == pre["generation"]:
+        return dict(base, observed="done", result={"from": pre[key], "to": target}, post=st)     # a no-op
+    if st[key] == target and st["generation"] == pre["generation"] + 1:
+        return dict(base, observed="done", result={"from": pre[key], "to": target}, post=st)
+    if st[key] == pre[key] and st["generation"] == pre["generation"]:
+        return dict(base, observed="not-done", post=st)
+    return dict(base, observed="unresolved", why="the object changed in another way (drift)", post=st)
 
 
 def _outcomes(receipts: List[Dict]) -> (Dict[str, Dict], List[str]):
@@ -550,26 +569,30 @@ def _outcomes(receipts: List[Dict]) -> (Dict[str, Dict], List[str]):
 
 
 def recover(api, rec: Mapping, lock_sha: str, clock=None) -> Dict:
-    """The recovery procedure for an ambiguous outcome: with the exact lock file's sha256 (so a live execution's lock
-    is never taken by mistake), observe every unresolved intent of quiesce and restore against the live object,
-    append the observation as a reconciled-<step> receipt, then release the lock."""
-    path = C.lock_path(rec, LOCK_SCOPE)
-    if not os.path.exists(path):
-        raise C.StagingError("no legacy mutation lock is held: nothing to recover")
-    if C.sha256_file(path) != lock_sha:
-        raise C.StagingError("the lock file's sha256 differs from --lock-sha256; refusing")
-    C.require_cluster(api, rec["cluster_uid"])
-    report = {}
-    for helper in (HELPER, RESTORE):
-        receipts = C.read_receipts(C.receipts_path(rec, helper))
-        _, ambiguous = _outcomes(receipts)
-        intents = {r["event"][7:]: r["data"] for r in receipts if r["event"].startswith("intent-")}
-        for n in ambiguous:
-            obs = _observe_outcome(api, intents[n])
-            C.append_receipt(rec, helper, f"reconciled-{n}", obs, clock)
-            report[f"{helper}/{n}"] = obs["observed"]
-    os.unlink(path)
-    C.append_receipt(rec, HELPER, "lock-recovered", {"lock_sha256": lock_sha, "reconciled": report}, clock)
+    """The recovery procedure for an ambiguous outcome. With the exact lock file's sha256 it takes the recovery guard
+    (one recoverer; the lock's executor proven terminated: same host and boot, PID gone or reused), observes every
+    unresolved intent of quiesce and restore against the live object and records decided outcomes as reconciled-<n>.
+    The stale lock is released only when every intent is decided; an unresolved one keeps it (fail closed)."""
+    with C.recovery_guard(rec, LOCK_SCOPE, lock_sha) as guard:
+        C.require_cluster(api, rec["cluster_uid"])
+        report, unresolved = {}, {}
+        for helper in (HELPER, RESTORE):
+            receipts = C.read_receipts(C.receipts_path(rec, helper))
+            _, ambiguous = _outcomes(receipts)
+            intents = {r["event"][7:]: r["data"] for r in receipts if r["event"].startswith("intent-")}
+            for n in ambiguous:
+                obs = _observe_outcome(api, intents[n])
+                if obs["observed"] == "unresolved":
+                    unresolved[f"{helper}/{n}"] = obs["why"]
+                    continue
+                C.append_receipt(rec, helper, f"reconciled-{n}", obs, clock)
+                report[f"{helper}/{n}"] = obs["observed"]
+        if unresolved:
+            C.append_receipt(rec, HELPER, "recovery-unresolved", {"lock_sha256": lock_sha, "decided": report,
+                                                                  "unresolved": unresolved}, clock)
+            raise C.StagingError(f"unresolved outcomes {unresolved}: the lock stays; reconcile them by hand")
+        guard.release_stale()
+        C.append_receipt(rec, HELPER, "lock-recovered", {"lock_sha256": lock_sha, "reconciled": report}, clock)
     return report
 
 
@@ -645,7 +668,10 @@ def writer_census(api) -> Dict[str, List[str]]:
         t = (p.get("spec") or {}).get("targetDeployment") or {}
         if operator_on and t.get("name") in out and (t.get("namespace") or p["metadata"]["namespace"]) == "demo":
             out[t["name"]].append(f"legacy PA {p['metadata']['name']}")
-    sos = {o["metadata"]["uid"]: o for o in C.list_items(api, "scaledobjects", "demo")}
+    # Only ScaledObjects that are counted (not paused) absorb their generated HPA: a paused one does not prove that
+    # its HPA stopped writing, so that HPA counts on its own.
+    sos = {o["metadata"]["uid"]: o for o in C.list_items(api, "scaledobjects", "demo")
+           if (o["metadata"].get("annotations") or {}).get("autoscaling.keda.sh/paused") != "true"}
     for kind in ("scaledobjects", "pa-new", "horizontalpodautoscalers"):
         for w in C.list_items(api, kind, "demo"):
             m, sp = w["metadata"], w.get("spec") or {}
@@ -696,10 +722,16 @@ def restore(api, rec: Mapping, plan: Mapping, reviewed: str, sleep: Callable = t
                     raise C.StagingError(f"{a['kind']} {a['namespace']}/{a['name']} exists; never overwritten")
                 with open(snap["path"]) as fh:
                     body = _recreate_body(json.load(fh))
-                C.append_receipt(rec, RESTORE, f"intent-{a['step']}", {"action": a}, clock)
-                lock.safe = False
-                created = api.create(C.path_of(a["kind"], a["namespace"]), body)
-                res = {"recreated_uid": (created.get("metadata") or {}).get("uid")}
+                operation = f"{rec['run_id']}-{reviewed[:12]}-{a['step']}-{os.urandom(4).hex()}"
+                body["metadata"].setdefault("annotations", {})[OP_ANNOTATION] = operation
+
+                def create(body=body, a=a):
+                    created = api.create(C.path_of(a["kind"], a["namespace"]), body)
+                    m = created.get("metadata") or {}
+                    return {"recreated_uid": m.get("uid")}, {"uid": m.get("uid"), "operation": operation}
+                done.append(C.mutation_step(rec, RESTORE, lock, a["step"], {"action": a, "operation": operation},
+                                            create, clock))
+                continue
             elif a["op"] == "check_no_foreign_writer":
                 legacy_names = {f"legacy PA {n}" for _, _, n, r in L.entries("pa")} | \
                     {f"scaledobjects {n}" for n in L.KEDA_OBJECTS}
