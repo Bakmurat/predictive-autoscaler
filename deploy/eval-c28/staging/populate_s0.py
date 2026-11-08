@@ -2,71 +2,74 @@
 """S0 export populator: fill archive.evidence.export_dir with every mandatory artifact (STAGING-C28-PROD.md S0; the
 S0 record proposal's content_sources, pvc_content_requirements and export_contract).
 
-  populate_s0.py --record R probe-plan                        read-only: what the size/file-count probe would run
-  populate_s0.py --record R probe --plan F --plan-digest D    run the read-only probe pods, record sizes and selections
+  populate_s0.py --record R probe-plan                        read-only: what the probe would run
+  populate_s0.py --record R probe --plan F --plan-digest D    read-only reader pods: sizes, selections and digests
   populate_s0.py --record R [plan]                            read-only: the export plan (from the probe receipts)
   populate_s0.py --record R export --plan F --plan-digest D   populate export_dir exactly as reviewed
   populate_s0.py --record R verify                            read-only: export_dir == mandatory, every chain verifies
-  populate_s0.py --record R recover-plan | recover --plan F --plan-digest D   reconcile an unknown pod outcome
+  populate_s0.py --record R recover-plan | recover --plan F --plan-digest D   finish an unresolved reader lifecycle
 
 What it produces, beneath export_dir (never overwriting a different file; an identical one is kept):
   * campaign/, protocol/, inventory/: the allowlisted files copied byte-for-byte from content_sources, each secret-
     scanned (a hit blocks; no value is printed) and hashed at source and destination; every checksum manifest's chain
     is verified at the source base and again at the destination.
-  * source/legacy-source-manifest.json (git blob IDs of the legacy revision's manifests, the observed operator image
-    digest, the terminations file's revision and blob), source/helper-source-manifest.json (the helper revision's
-    blob IDs), source/terminations.json (the exact bytes of the final campaign terminations file at its revision).
-  * restoration/legacy-selective-restore.md: the exact UID-bound restore order of the legacy objects (from the
-    inventory), the retained claims, no namespace-wide restore, no PVC replacement, a foreign-writer check before the
-    generators restart.
+  * source/legacy-source-manifest.json, source/helper-source-manifest.json, source/terminations.json (provenance from
+    git, run without any ambient GIT_* environment), restoration/legacy-selective-restore.md.
   * pvc-exports/<pvc>/campaign-export.tar, manifest.json, SHA256SUMS for forecast-log-pvc, evidence-archive-pvc,
-    load-evidence-pvc and ml-models-pvc: only campaign files selected by their OWN names or record timestamps against
-    an immutable cutoff (never "whatever is there now"), streamed out of a read-only reader pod as a tar with a per-file
-    sha256 receipt and a trailer; every member is verified locally against the receipt and the reviewed selection.
-  * storage/pvc-retention-and-export-coverage.json: all five claims (UID, PV, reclaim policy, consumers), what is
-    protected by a verified export (or, for p8-evidence-pvc, the existing verified fetch) and what stays retained but
-    NOT backed up.
-  * S0-SHA256SUMS over every mandatory file except itself, written last.
+    load-evidence-pvc and ml-models-pvc.
+  * storage/pvc-retention-and-export-coverage.json, then S0-SHA256SUMS over every mandatory file except itself.
 
-Reader pods (one per claim, per probe or export): namespace ml-engine, the claim mounted read-only, no service-account
-token, non-root, read-only root filesystem, pinned to the node the RWO volume is attached to (VolumeAttachment), a
-deadline. They are refused while any load-evidence, ml-training, evidence-archive or p8 Job is active (a query error
-refuses too). Each pod is created and deleted through common_records.mutation_step under the "s0-export" lock (the run
-also refuses while the legacy lock is held), and cleanup is PROVEN: the pod is gone, no pod with the run's nonce
-remains, and a volume that was not attached before is released again; otherwise the run fails and says so.
+PVC selection is BYTE-BOUND: the probe records every selected file's (or prefix's) sha256, and the export streams
+exactly those bytes; a member whose sha256 differs from the probe's is refused. The probe also verifies the ORIGINAL
+hashes the campaign writers recorded (an archive bundle's artifact_sha256/sidecar_sha256, a model sidecar's
+artifact_sha256/artifact_bytes, a trainer log's log_sha256); transport hashes never replace them. Every file of a
+claim is either selected, excluded by a rule with its reason, or matched by a reviewed exclusion
+(populate.pvcs.<pvc>.excluded_reviewed); anything else blocks the plan. A model pair is exported only when the
+evidence archive selection holds its immutable archived copy (same artifact and sidecar hashes).
 
-Selection rules (populate.pvcs.<pvc>.rules; the plan shows the effective rules; each rule may set its own cutoff):
-  {"type": "jsonl_prefix", "path": P, "ts_fields": [...]}         the longest prefix of an append-only JSONL file
-        whose records are all at or before the cutoff (each record must carry one of ts_fields; a later record before
-        an earlier one, or a record without a timestamp, fails the rule); exported as the prefix bytes
-  {"type": "named", "glob": G, "ts_regex": R, "ts_format": F}     files whose NAME carries a UTC time at or before the
-        cutoff (R's first group parsed with F)
-  {"type": "bundles", "manifest_glob": G, "ts_field": T}          whole directories whose manifest's T is at or
-        before the cutoff (the manifest and every regular file beside it)
+Rules (populate.pvcs.<pvc>.rules; cutoff "campaign" = populate.cutoff, "collection" = populate.collection_cutoff for
+the collectors' own post-stop files, or an explicit UTC time):
+  {"type": "jsonl_prefix", "path": P, "ts_fields": [...]}     the longest prefix of an append-only JSONL file whose
+        records are at or before the cutoff (the first present field of ts_fields; a record without one, or an
+        earlier record after a later one, fails the rule)
+  {"type": "named", "glob": G, "ts_regex": R, "ts_format": F}  files whose NAME carries a time at or before the cutoff
+  {"type": "bundles", "manifest_glob": G, "ts_field": T}       archive bundles by their manifest's T, every original
+        hash verified; a sidecar variant's artifact_key must name a selected bundle
   {"type": "pairs", "sidecar_glob": G, "artifact_from": S, "artifact_to": A, "ts_field": T, "sha_field": H}
-        a sidecar whose T is at or before the cutoff, with its artifact (name S replaced by A); with H, the artifact's
-        sha256 must equal the sidecar's H, or the pair is inconsistent (in progress) and excluded
-Empty files are never exported (listed as excluded). A rule that matches nothing, or any rule problem, blocks the plan.
+        model sidecar + artifact; the artifact's sha256 (and size) must equal the sidecar's, or the pair is excluded
+  {"type": "trainer_logs", "index": I, "dir": D}               every trainer record of index I up to the cutoff with
+        its referenced files (<job>-<pod uid[:8]>.json and each container's .log/.previous.log, log_sha256 verified)
+
+Reader pods (namespace ml-engine): the claim mounted read-only, no service-account token, non-root, read-only root
+filesystem, pinned to the node the RWO volume is attached to (VolumeAttachment), a deadline. Before EACH reader the
+claim binding (UID, PV, attachment) and the campaign-job precondition (no active load-evidence, ml-training,
+evidence-archive or p8 Job; a query error refuses) are revalidated. The whole lifecycle of a reader (create, work,
+delete, proof) is ONE common_records.mutation_step: its intent is durable before the pod is created, a delete intent
+is durable before every delete, and the outcome is written only once cleanup is PROVEN (no pod of the run's nonce
+remains and a volume that was not attached before is released). An unproven cleanup leaves the intent unresolved and
+the lock held until `recover` proves it. The lock is the legacy scope's (common_records.exclusive_lock(rec,
+"legacy")): S0 readers and legacy quiesce/restore exclude each other atomically, and recovery here never releases the
+lock while a legacy intent is unresolved.
 
 The record's "populate" section:
-  {"cutoff": "2026-11-02T00:00:00Z",
+  {"cutoff": "2026-11-02T00:00:00Z", "collection_cutoff": "2026-11-02T08:44:00Z",
    "content_sources": {"campaign/": DIR, "protocol/": DIR, "inventory/": DIR},
    "legacy_source": {"repo_dir": DIR, "commit": "0472829", "paths": [...], "operator_image": "<repo>@sha256:..."},
    "terminations": {"repo_dir": DIR, "commit": REV, "path": "deploy/prodcluster/load-gate/terminations.json"},
    "helper_source": {"repo_dir": DIR, "commit": REV, "paths": [...]},
-   "inventory": "<inventory file name under content_sources inventory/>",
-   "retained_pvcs": [{"name", "uid"}, ...],                                   all five claims
+   "inventory": "<inventory file name>", "retained_pvcs": [{"name", "uid"} x5],
    "p8": {"export": "campaign/final-20261102/p8-fetch-final-20261102.jsonl", "sha256": HEX},
-   "requirements": {"<pvc>": "<what Report 2 / rollback needs from it>"},
-   "reader": {"image": "<repo>@sha256:...", "deadline_seconds": 1800, "exec_timeout_seconds": 1800},
-   "budget": {"max_total_bytes": N},
-   "pvcs": {"<pvc>": {"uid": UID, "mount": "/data", "max_bytes": N, "rules": [...]}, ...}}
+   "requirements": {"<pvc>": "..."}, "reader": {"image": "<repo>@sha256:...", "deadline_seconds": N,
+   "exec_timeout_seconds": N}, "budget": {"max_total_bytes": N},
+   "pvcs": {"<pvc>": {"uid": UID, "mount": "/data", "max_bytes": N, "rules": "default" | [...],
+                      "excluded_reviewed": "default" | [{"glob": G, "reason": "..."}]}}}
 """
 
 from __future__ import annotations
 
 import argparse
 import copy
+import fnmatch
 import hashlib
 import json
 import os
@@ -86,7 +89,8 @@ import legacy_allowlist as L  # noqa: E402
 
 HELPER = "populate-s0"
 PROBE = "populate-s0-probe"
-LOCK_SCOPE = "s0-export"
+LOCK_SCOPE = "legacy"                     # the legacy scope's ONE lock: S0 readers and legacy mutations exclude
+LEGACY_HELPERS = ("legacy", "legacy-restore")
 NS = "ml-engine"
 READER_LABEL = "c28.devkuban.com/s0-reader"
 NONCE_LABEL = "c28.devkuban.com/s0-nonce"
@@ -97,24 +101,24 @@ _DIGEST_IMAGE = re.compile(r"^[a-z0-9][a-z0-9./:-]*@sha256:[0-9a-f]{64}$")
 _TS = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 _COMMITISH = re.compile(r"^[0-9a-f]{7,40}$")
 
-# --- the in-pod reader (stdlib only; read-only; run with the selection on stdin) -------------------------------------
+# --- the in-pod reader (stdlib only; read-only; the job on stdin) ----------------------------------------------------
 
 READER = r'''
-import datetime, fnmatch, glob, hashlib, io, json, os, re, sys, tarfile
+import datetime, glob, hashlib, io, json, os, re, sys, tarfile
 
 def utc(s):
     if not isinstance(s, str):
         return None
-    s = s.strip()
     for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f%z"):
         try:
-            t = datetime.datetime.strptime(s, fmt)
-            if t.tzinfo is None:
-                t = t.replace(tzinfo=datetime.timezone.utc)
-            return t.astimezone(datetime.timezone.utc)
+            t = datetime.datetime.strptime(s.strip(), fmt)
+            return (t if t.tzinfo else t.replace(tzinfo=datetime.timezone.utc)).astimezone(datetime.timezone.utc)
         except ValueError:
             pass
     return None
+
+def iso(t):
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def safe(mount, rel):
     p = os.path.normpath(os.path.join(mount, rel))
@@ -123,88 +127,8 @@ def safe(mount, rel):
     return p
 
 def files_under(mount, pattern):
-    out = []
-    for p in sorted(glob.glob(os.path.join(mount, pattern))):
-        if os.path.isfile(p) and not os.path.islink(p):
-            out.append(os.path.relpath(p, mount))
-    return out
-
-def jsonl_prefix(mount, rule, cutoff):
-    p = safe(mount, rule["path"])
-    if not os.path.isfile(p):
-        return [], {"missing": rule["path"]}, ["the file " + rule["path"] + " does not exist"]
-    probs, offset, lines, later, size, seen_later = [], 0, 0, 0, 0, False
-    last_ts = None
-    with open(p, "rb") as fh:
-        for raw in fh:
-            size += len(raw)
-            if not raw.endswith(b"\n"):
-                break                                 # a partially written last line is never exported
-            try:
-                rec = json.loads(raw)
-            except ValueError:
-                probs.append("malformed JSON at line %d" % (lines + later + 1))
-                break
-            ts = None
-            for f in rule["ts_fields"]:
-                ts = utc(rec.get(f)) if isinstance(rec, dict) else None
-                if ts:
-                    break
-            if ts is None:
-                probs.append("a record without any of %s at line %d" % (rule["ts_fields"], lines + later + 1))
-                break
-            if ts <= cutoff:
-                if seen_later:
-                    probs.append("a record at or before the cutoff after a later one (not append-ordered)")
-                    break
-                offset += len(raw); lines += 1
-            else:
-                seen_later = True; later += 1
-    if lines == 0 and not probs:
-        probs.append("no record of " + rule["path"] + " is at or before the cutoff")
-    sel = [{"path": rule["path"], "kind": "prefix", "bytes": offset, "lines": lines}] if lines and not probs else []
-    return sel, {"lines_after_cutoff": later, "file_bytes_read": size}, probs
-
-def named(mount, rule, cutoff):
-    sel, excl, probs = [], {"after_cutoff": 0, "empty": 0, "unnamed": 0}, []
-    rx = re.compile(rule["ts_regex"])
-    for rel in files_under(mount, rule["glob"]):
-        m = rx.search(os.path.basename(rel))
-        if not m:
-            excl["unnamed"] += 1; continue
-        try:
-            ts = datetime.datetime.strptime(m.group(1), rule["ts_format"]).replace(tzinfo=datetime.timezone.utc)
-        except ValueError:
-            excl["unnamed"] += 1; continue
-        size = os.path.getsize(os.path.join(mount, rel))
-        if ts > cutoff:
-            excl["after_cutoff"] += 1
-        elif size == 0:
-            excl["empty"] += 1
-        else:
-            sel.append({"path": rel, "kind": "file", "bytes": size, "ts": ts.strftime("%Y-%m-%dT%H:%M:%SZ")})
-    return sel, excl, probs
-
-def bundles(mount, rule, cutoff):
-    sel, excl, probs = [], {"after_cutoff": 0, "empty": 0, "no_timestamp": 0}, []
-    for rel in files_under(mount, rule["manifest_glob"]):
-        try:
-            man = json.load(open(os.path.join(mount, rel)))
-        except ValueError:
-            probs.append("unreadable manifest " + rel); continue
-        ts = utc(man.get(rule["ts_field"])) if isinstance(man, dict) else None
-        if ts is None:
-            excl["no_timestamp"] += 1; continue
-        if ts > cutoff:
-            excl["after_cutoff"] += 1; continue
-        d = os.path.dirname(rel)
-        for f in files_under(mount, os.path.join(d, "*")):
-            size = os.path.getsize(os.path.join(mount, f))
-            if size == 0:
-                excl["empty"] += 1
-            else:
-                sel.append({"path": f, "kind": "file", "bytes": size, "ts": ts.strftime("%Y-%m-%dT%H:%M:%SZ")})
-    return sel, excl, probs
+    return [os.path.relpath(p, mount) for p in sorted(glob.glob(os.path.join(mount, pattern)))
+            if os.path.isfile(p) and not os.path.islink(p)]
 
 def sha(path, limit=None):
     h, n = hashlib.sha256(), 0
@@ -219,34 +143,162 @@ def sha(path, limit=None):
             h.update(b); n += len(b)
     return h.hexdigest(), n
 
+def item(mount, rel, kind="file", limit=None, **extra):
+    h, n = sha(os.path.join(mount, rel), limit)
+    d = {"path": rel, "kind": kind, "bytes": n, "sha256": h}
+    d.update(extra)
+    return d
+
+def records_until(mount, rel, fields, cutoff):
+    """(prefix bytes, [(record, ts)] at or before the cutoff, records after, problems) of an append-only JSONL file."""
+    p = safe(mount, rel)
+    out, offset, later, probs, seen_later = [], 0, 0, [], False
+    with open(p, "rb") as fh:
+        for n, raw in enumerate(fh, 1):
+            if not raw.endswith(b"\n"):
+                break                                  # a partially written last line is never exported
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                probs.append("malformed JSON at line %d of %s" % (n, rel)); break
+            ts = next((utc(rec.get(f)) for f in fields if isinstance(rec, dict) and utc(rec.get(f))), None)
+            if ts is None:
+                probs.append("a record of %s without any of %s at line %d" % (rel, fields, n)); break
+            if ts <= cutoff:
+                if seen_later:
+                    probs.append("%s: a record at or before the cutoff after a later one (line %d)" % (rel, n)); break
+                offset += len(raw); out.append((rec, ts))
+            else:
+                seen_later = True; later += 1
+    return offset, out, later, probs
+
+def jsonl_prefix(mount, rule, cutoff):
+    if not os.path.isfile(safe(mount, rule["path"])):
+        return [], [], ["the file " + rule["path"] + " does not exist"]
+    offset, recs, later, probs = records_until(mount, rule["path"], rule["ts_fields"], cutoff)
+    if not recs and not probs:
+        probs.append("no record of " + rule["path"] + " is at or before the cutoff")
+    if probs:
+        return [], [], probs
+    return [item(mount, rule["path"], "prefix", offset, lines=len(recs), lines_after_cutoff=later)], [], []
+
+def named(mount, rule, cutoff):
+    sel, excl, rx = [], [], re.compile(rule["ts_regex"])
+    for rel in files_under(mount, rule["glob"]):
+        m = rx.search(os.path.basename(rel))
+        try:
+            ts = datetime.datetime.strptime(m.group(1), rule["ts_format"]).replace(tzinfo=datetime.timezone.utc)
+        except (AttributeError, ValueError):
+            excl.append({"path": rel, "reason": "no time in its name"}); continue
+        if ts > cutoff:
+            excl.append({"path": rel, "reason": "named after the cutoff"})
+        elif os.path.getsize(os.path.join(mount, rel)) == 0:
+            excl.append({"path": rel, "reason": "empty"})
+        else:
+            sel.append(item(mount, rel, ts=iso(ts)))
+    return sel, excl, []
+
+def bundles(mount, rule, cutoff):
+    sel, excl, probs = [], [], []
+    for rel in files_under(mount, rule["manifest_glob"]):
+        d = os.path.dirname(rel)
+        members = files_under(mount, os.path.join(d, "*"))
+        try:
+            man = json.load(open(os.path.join(mount, rel)))
+        except ValueError:
+            probs.append("unreadable manifest " + rel); continue
+        ts = utc(man.get(rule["ts_field"])) if isinstance(man, dict) else None
+        if ts is None or ts > cutoff:
+            excl += [{"path": f, "reason": "bundle without %s" % rule["ts_field"] if ts is None
+                      else "bundle copied after the cutoff"} for f in members]
+            continue
+        art = os.path.join(d, man.get("artifact") or "")
+        sides = [f for f in members if f not in (rel, art)]
+        ok = len(sides) == 1
+        if os.path.isfile(os.path.join(mount, art)):
+            ok = ok and sha(os.path.join(mount, art))[0] == man.get("artifact_sha256")
+        elif not man.get("artifact_key"):
+            ok = False                                 # neither the artifact nor a variant reference
+        if ok:
+            ok = sha(os.path.join(mount, sides[0]))[0] == man.get("sidecar_sha256")
+            try:
+                ok = ok and json.load(open(os.path.join(mount, sides[0]))).get("artifact_sha256") == man.get("artifact_sha256")
+            except ValueError:
+                ok = False
+        if not ok:
+            probs.append("bundle %s: its files do not match the manifest's original hashes" % d); continue
+        ref = {"bundle": man.get("key"), "artifact_sha256": man.get("artifact_sha256"),
+               "sidecar_sha256": man.get("sidecar_sha256"), "artifact_key": man.get("artifact_key"),
+               "verified": "artifact_sha256/sidecar_sha256 of the bundle manifest"}
+        for f in members:
+            if os.path.getsize(os.path.join(mount, f)) == 0:
+                excl.append({"path": f, "reason": "empty"})
+            else:
+                sel.append(item(mount, f, ts=iso(ts), **(ref if f == rel else {"bundle": man.get("key")})))
+    return sel, excl, probs
+
 def pairs(mount, rule, cutoff):
-    sel, excl, probs = [], {"after_cutoff": 0, "empty": 0, "no_timestamp": 0, "inconsistent": 0, "no_artifact": 0}, []
+    sel, excl = [], []
     for rel in files_under(mount, rule["sidecar_glob"]):
+        art = rel[: -len(rule["artifact_from"])] + rule["artifact_to"] if rel.endswith(rule["artifact_from"]) else None
+        both = [rel] + ([art] if art and os.path.isfile(os.path.join(mount, art)) else [])
         try:
             meta = json.load(open(os.path.join(mount, rel)))
         except ValueError:
-            probs.append("unreadable sidecar " + rel); continue
+            meta = {}
         ts = utc(meta.get(rule["ts_field"])) if isinstance(meta, dict) else None
-        if ts is None:
-            excl["no_timestamp"] += 1; continue
-        if ts > cutoff:
-            excl["after_cutoff"] += 1; continue
-        art = rel[: -len(rule["artifact_from"])] + rule["artifact_to"] if rel.endswith(rule["artifact_from"]) else None
-        ap = os.path.join(mount, art) if art else None
-        if not ap or not os.path.isfile(ap) or os.path.islink(ap):
-            excl["no_artifact"] += 1; continue
-        if rule.get("sha_field"):
-            if sha(ap)[0] != meta.get(rule["sha_field"]):
-                excl["inconsistent"] += 1; continue
-        for f in (rel, art):
-            size = os.path.getsize(os.path.join(mount, f))
-            if size == 0:
-                excl["empty"] += 1
+        if len(both) < 2:
+            reason = "sidecar without its artifact"
+        elif ts is None:
+            reason = "sidecar without " + rule["ts_field"]
+        elif ts > cutoff:
+            reason = "trained after the cutoff"
+        else:
+            h, n = sha(os.path.join(mount, art))
+            if h != meta.get(rule["sha_field"]) or meta.get("artifact_bytes") not in (None, n):
+                reason = "the artifact does not match its sidecar (in progress or rewritten)"
             else:
-                sel.append({"path": f, "kind": "file", "bytes": size, "ts": ts.strftime("%Y-%m-%dT%H:%M:%SZ")})
+                reason = None
+        if reason:
+            excl += [{"path": f, "reason": reason} for f in both]
+            continue
+        sel.append(item(mount, rel, ts=iso(ts), artifact_sha256=meta.get(rule["sha_field"])))
+        sel.append(item(mount, art, ts=iso(ts), verified="equals the sidecar's " + rule["sha_field"]))
+    return sel, excl, []
+
+def trainer_logs(mount, rule, cutoff):
+    sel, excl = [], []
+    if not os.path.isfile(safe(mount, rule["index"])):
+        return [], [], ["the trainer index " + rule["index"] + " does not exist"]
+    _, recs, _, probs = records_until(mount, rule["index"], ["collected_at"], cutoff)
+    if probs:
+        return [], [], probs
+    for rec, ts in recs:
+        base = "%s-%s" % (rec.get("job"), str(rec.get("pod_uid", ""))[:8])
+        meta = os.path.join(rule["dir"], base + ".json")
+        if not os.path.isfile(safe(mount, meta)):
+            probs.append("trainer record %s: %s is missing" % (base, meta)); continue
+        refs = [(meta, None)]
+        for c in rec.get("containers") or []:
+            refs.append((os.path.join(rule["dir"], "%s.%s.log" % (base, c.get("name"))), c.get("log_sha256")))
+            if c.get("previous_log_saved"):
+                refs.append((os.path.join(rule["dir"], "%s.%s.previous.log" % (base, c.get("name"))), None))
+        for f, want in refs:
+            p = safe(mount, f)
+            if not os.path.isfile(p):
+                probs.append("trainer record %s: %s is missing" % (base, f)); continue
+            h, n = sha(p)
+            if want is not None and h != want:
+                probs.append("trainer record %s: %s does not match its log_sha256" % (base, f)); continue
+            if n == 0:
+                excl.append({"path": f, "reason": "empty (hash verified)"})
+            else:
+                sel.append(item(mount, f, ts=iso(ts), trainer_record=base,
+                                **({"verified": "equals the index's log_sha256"} if want else {})))
     return sel, excl, probs
 
-RULES = {"jsonl_prefix": jsonl_prefix, "named": named, "bundles": bundles, "pairs": pairs}
+RULES = {"jsonl_prefix": jsonl_prefix, "named": named, "bundles": bundles, "pairs": pairs,
+         "trainer_logs": trainer_logs}
 
 class Hashing:
     def __init__(self, out):
@@ -274,45 +326,43 @@ def main():
     job = json.load(sys.stdin)
     mount, mode = job["mount"], job["mode"]
     if mode == "probe":
-        out = {"rules": [], "volume": {"files": 0, "bytes": 0}}
+        out = {"rules": [], "volume": {"files": 0, "bytes": 0}, "unconsidered": []}
+        considered = set()
+        for rule in job["rules"]:
+            try:
+                sel, excl, probs = RULES[rule["type"]](mount, rule, utc(rule["cutoff"]))
+            except Exception as e:
+                sel, excl, probs = [], [], ["%s: %s" % (type(e).__name__, e)]
+            if not sel and not probs:
+                probs.append("the rule selects nothing")
+            considered |= {s["path"] for s in sel} | {x["path"] for x in excl}
+            out["rules"].append({"rule": rule, "selected": sel, "excluded": excl, "problems": probs})
         for d, _, names in os.walk(mount):
             for n in names:
                 p = os.path.join(d, n)
                 if os.path.isfile(p) and not os.path.islink(p):
-                    out["volume"]["files"] += 1; out["volume"]["bytes"] += os.path.getsize(p)
-        for rule in job["rules"]:
-            cutoff = utc(rule["cutoff"])
-            try:
-                sel, excl, probs = RULES[rule["type"]](mount, rule, cutoff)
-            except Exception as e:
-                sel, excl, probs = [], {}, ["%s: %s" % (type(e).__name__, e)]
-            if not sel and not probs:
-                probs.append("the rule selects nothing")
-            out["rules"].append({"rule": rule, "selected": sel, "excluded": excl, "problems": probs})
+                    rel, size = os.path.relpath(p, mount), os.path.getsize(p)
+                    out["volume"]["files"] += 1; out["volume"]["bytes"] += size
+                    if rel not in considered:
+                        out["unconsidered"].append({"path": rel, "bytes": size})
         sys.stdout.write(json.dumps(out, sort_keys=True))
         return 0
-    # export: exactly the reviewed selection, in order; a file whose size moved is refused (not immutable)
     out = Hashing(sys.stdout.buffer)
     files, probs = [], []
     with tarfile.open(fileobj=out, mode="w|", format=tarfile.PAX_FORMAT) as tar:
-        for item in job["selection"]:
-            p = safe(mount, item["path"])
+        for it in job["selection"]:
+            p = safe(mount, it["path"])
             size = os.path.getsize(p)
-            if item["kind"] == "file" and size != item["bytes"]:
-                probs.append(item["path"] + " changed size since the probe"); break
-            if item["kind"] == "prefix" and size < item["bytes"]:
-                probs.append(item["path"] + " shrank below its reviewed prefix"); break
+            if (it["kind"] == "file" and size != it["bytes"]) or (it["kind"] == "prefix" and size < it["bytes"]):
+                probs.append(it["path"] + " changed since the probe"); break
             h = hashlib.sha256()
-            info = tarfile.TarInfo(item["path"])
-            info.size, info.mode, info.mtime = item["bytes"], 0o444, 0
+            info = tarfile.TarInfo(it["path"])
+            info.size, info.mode, info.mtime = it["bytes"], 0o444, 0
             with open(p, "rb") as fh:
-                tar.addfile(info, Limited(fh, item["bytes"], h))
-            if item["kind"] == "prefix":
-                with open(p, "rb") as fh:
-                    fh.seek(item["bytes"] - 1)
-                    if fh.read(1) != b"\n":
-                        probs.append(item["path"] + ": the reviewed prefix does not end at a record boundary"); break
-            files.append({"path": item["path"], "bytes": item["bytes"], "sha256": h.hexdigest()})
+                tar.addfile(info, Limited(fh, it["bytes"], h))
+            if h.hexdigest() != it["sha256"]:
+                probs.append(it["path"] + ": its bytes differ from the probe's sha256"); break
+            files.append({"path": it["path"], "bytes": it["bytes"], "sha256": h.hexdigest()})
     out.flush()
     sys.stderr.write(json.dumps({"trailer": {"bytes": out.n, "sha256": out.h.hexdigest()}, "files": files,
                                  "problems": probs}) + "\n")
@@ -322,25 +372,39 @@ sys.exit(main())
 '''
 READER_SHA256 = hashlib.sha256(READER.encode()).hexdigest()
 
+COLLECTOR_LOGS = (("INDEX.jsonl", ["recovered_at", "copied_at", "at"]), ("REJECTS.jsonl", ["at"]),
+                  ("RUNS.jsonl", ["finished_at"]), ("logs/api-ensemble.jsonl", ["collected_at"]),
+                  ("logs/api-reload.jsonl", ["collected_at"]), ("logs/api-coverage.jsonl", ["collected_at"]),
+                  ("logs/trainer-index.jsonl", ["collected_at"]))
 DEFAULT_RULES = {
-    "forecast-log-pvc": [{"type": "jsonl_prefix", "path": "forecasts.jsonl", "ts_fields": ["at", "issued_at"]}],
-    "evidence-archive-pvc": [
-        {"type": "bundles", "manifest_glob": "archive/*/manifest.json", "ts_field": "copied_at"},
-        {"type": "jsonl_prefix", "path": "INDEX.jsonl", "ts_fields": ["copied_at", "at", "recovered_at"]},
-        {"type": "jsonl_prefix", "path": "logs/api-ensemble.jsonl", "ts_fields": ["ts"]},
-        {"type": "jsonl_prefix", "path": "logs/trainer-index.jsonl", "ts_fields": ["at", "finished_at", "started_at"]},
-    ],
+    "forecast-log-pvc": [{"type": "jsonl_prefix", "path": "forecasts.jsonl", "ts_fields": ["at", "issued_at"],
+                          "cutoff": "campaign"}],
+    "evidence-archive-pvc": [{"type": "bundles", "manifest_glob": "archive/*/manifest.json", "ts_field": "copied_at",
+                              "cutoff": "collection"}]
+    + [{"type": "jsonl_prefix", "path": p, "ts_fields": f, "cutoff": "collection"} for p, f in COLLECTOR_LOGS]
+    + [{"type": "trainer_logs", "index": "logs/trainer-index.jsonl", "dir": "logs/trainer", "cutoff": "collection"}],
     "load-evidence-pvc": [
-        {"type": "named", "glob": "attempts/load-*.json", "ts_regex": r"^load-(\d{8}T\d{4})Z", "ts_format": "%Y%m%dT%H%M"},
-        {"type": "named", "glob": "load-*.json", "ts_regex": r"^load-(\d{8}T\d{4})Z\.json$", "ts_format": "%Y%m%dT%H%M"},
-    ],
-    "ml-models-pvc": [{"type": "pairs", "sidecar_glob": "*.meta.json", "artifact_from": ".meta.json",
-                       "artifact_to": ".pkl", "ts_field": "trained_at"}],
+        {"type": "named", "glob": "attempts/load-*.json", "ts_regex": r"^load-(\d{8}T\d{4})Z", "ts_format": "%Y%m%dT%H%M",
+         "cutoff": "campaign"},
+        {"type": "named", "glob": "load-*.json", "ts_regex": r"^load-(\d{8}T\d{4})Z\.json$", "ts_format": "%Y%m%dT%H%M",
+         "cutoff": "campaign"}],
+    "ml-models-pvc": [{"type": "pairs", "sidecar_glob": "lstm_*.meta.json", "artifact_from": ".meta.json",
+                       "artifact_to": ".pkl", "ts_field": "trained_at", "sha_field": "artifact_sha256",
+                       "cutoff": "campaign"}],
+}
+DEFAULT_EXCLUDED = {
+    "forecast-log-pvc": [],
+    "evidence-archive-pvc": [{"glob": "logs/api-state.json", "reason": "the collector's mutable cursor, not evidence"},
+                             {"glob": ".staging/*", "reason": "the archiver's in-progress staging, never complete"},
+                             {"glob": ".staging/*/*", "reason": "the archiver's in-progress staging, never complete"}],
+    "load-evidence-pvc": [{"glob": ".lock", "reason": "the collector's empty lock file"}],
+    "ml-models-pvc": [],
 }
 RULE_KEYS = {"jsonl_prefix": {"type", "path", "ts_fields", "cutoff"},
              "named": {"type", "glob", "ts_regex", "ts_format", "cutoff"},
              "bundles": {"type", "manifest_glob", "ts_field", "cutoff"},
-             "pairs": {"type", "sidecar_glob", "artifact_from", "artifact_to", "ts_field", "sha_field", "cutoff"}}
+             "pairs": {"type", "sidecar_glob", "artifact_from", "artifact_to", "ts_field", "sha_field", "cutoff"},
+             "trainer_logs": {"type", "index", "dir", "cutoff"}}
 
 
 # --- the record -------------------------------------------------------------------------------------------------------
@@ -348,8 +412,9 @@ RULE_KEYS = {"jsonl_prefix": {"type", "path", "ts_fields", "cutoff"},
 def section(record: X.Record) -> Dict:
     s = record.section("populate")
     probs = []
-    if not _TS.match(str(s.get("cutoff", ""))):
-        probs.append("populate.cutoff must be an RFC 3339 UTC time")
+    for k in ("cutoff",) + (("collection_cutoff",) if "collection_cutoff" in s else ()):
+        if not _TS.match(str(s.get(k, ""))):
+            probs.append(f"populate.{k} must be an RFC 3339 UTC time")
     cs = s.get("content_sources") or {}
     for top in LOCAL_TOPS:
         if not os.path.isdir(record.resolve(str(cs.get(top, "")))):
@@ -384,15 +449,24 @@ def section(record: X.Record) -> Dict:
 def effective_rules(s: Dict, pvc: str) -> List[Dict]:
     rules = s["pvcs"][pvc].get("rules", "default")
     rules = copy.deepcopy(DEFAULT_RULES[pvc] if rules == "default" else rules)
+    named_cutoffs = {"campaign": s["cutoff"], "collection": s.get("collection_cutoff", s["cutoff"])}
     out = []
     for r in rules:
         if r.get("type") not in RULE_KEYS or not set(r) <= RULE_KEYS[r["type"]]:
             raise X.StagingError(f"{pvc}: unknown rule or field in {r}")
-        r.setdefault("cutoff", s["cutoff"])
-        if not _TS.match(r["cutoff"]):
+        r["cutoff"] = named_cutoffs.get(r.get("cutoff", "campaign"), r.get("cutoff"))
+        if not _TS.match(str(r["cutoff"])):
             raise X.StagingError(f"{pvc}: rule cutoff {r['cutoff']!r} is not an RFC 3339 UTC time")
         out.append(r)
     return out
+
+
+def reviewed_exclusions(s: Dict, pvc: str) -> List[Dict]:
+    ex = s["pvcs"][pvc].get("excluded_reviewed", "default")
+    ex = copy.deepcopy(DEFAULT_EXCLUDED[pvc] if ex == "default" else ex)
+    if not all(isinstance(e, dict) and e.get("glob") and str(e.get("reason", "")).strip() for e in ex):
+        raise X.StagingError(f"{pvc}: every reviewed exclusion needs a glob and a reason")
+    return ex
 
 
 def evidence(record: X.Record) -> Dict:
@@ -566,21 +640,6 @@ def busy_jobs(kube: X.Kube) -> List[str]:
     return sorted(out)
 
 
-def claim_binding(kube: X.Kube, name: str, uid: str) -> Dict:
-    pvc = kube.get("PersistentVolumeClaim", name, NS)
-    if pvc is None or pvc["metadata"]["uid"] != uid:
-        raise X.StagingError(f"{name} is missing or its UID differs from the record")
-    pv_name = (pvc.get("spec") or {}).get("volumeName")
-    pv = kube.get("PersistentVolume", pv_name) if pv_name else None
-    if pv is None:
-        raise X.StagingError(f"{name} is not bound to a volume")
-    node = attached_node(kube, pv_name)
-    return {"name": name, "uid": uid, "pv": pv_name, "pv_uid": pv["metadata"]["uid"],
-            "reclaim_policy": (pv.get("spec") or {}).get("persistentVolumeReclaimPolicy"),
-            "storage_class": (pvc.get("spec") or {}).get("storageClassName"),
-            "access_modes": (pvc.get("spec") or {}).get("accessModes"), "attached_node": node}
-
-
 def attached_node(kube: X.Kube, pv_name: str) -> str:
     nodes = [a["spec"]["nodeName"] for a in kube.list("VolumeAttachment")
              if (a.get("spec") or {}).get("source", {}).get("persistentVolumeName") == pv_name
@@ -590,9 +649,25 @@ def attached_node(kube: X.Kube, pv_name: str) -> str:
     return nodes[0] if nodes else ""
 
 
+def claim_binding(kube: X.Kube, name: str, uid: str) -> Dict:
+    pvc = kube.get("PersistentVolumeClaim", name, NS)
+    if pvc is None or pvc["metadata"]["uid"] != uid:
+        raise X.StagingError(f"{name} is missing or its UID differs from the record")
+    pv_name = (pvc.get("spec") or {}).get("volumeName")
+    pv = kube.get("PersistentVolume", pv_name) if pv_name else None
+    if pv is None:
+        raise X.StagingError(f"{name} is not bound to a volume")
+    return {"name": name, "uid": uid, "pv": pv_name, "pv_uid": pv["metadata"]["uid"],
+            "reclaim_policy": (pv.get("spec") or {}).get("persistentVolumeReclaimPolicy"),
+            "storage_class": (pvc.get("spec") or {}).get("storageClassName"),
+            "access_modes": (pvc.get("spec") or {}).get("accessModes"), "attached_node": attached_node(kube, pv_name)}
+
+
 def consumers(kube: X.Kube) -> Dict[str, List[Dict]]:
     out: Dict[str, List[Dict]] = {}
     for p in kube.list("Pod", NS):
+        if READER_LABEL in (p["metadata"].get("labels") or {}):
+            continue
         for v in (p.get("spec") or {}).get("volumes") or []:
             c = (v.get("persistentVolumeClaim") or {}).get("claimName")
             if c:
@@ -608,16 +683,13 @@ def leftover_readers(kube: X.Kube, record: X.Record) -> List[str]:
 
 def reader_pod(record: X.Record, s: Dict, pvc: str, binding: Dict, nonce: str) -> Dict:
     r = s["reader"]
-    terms = [{"key": "kubernetes.io/hostname", "operator": "In", "values": [binding["attached_node"]]}] \
-        if binding["attached_node"] else []
-    spec = {"restartPolicy": "Never", "activeDeadlineSeconds": int(r.get("deadline_seconds", 1800)),
+    deadline = int(r.get("deadline_seconds", 1800))
+    spec = {"restartPolicy": "Never", "activeDeadlineSeconds": deadline,
             "automountServiceAccountToken": False, "enableServiceLinks": False,
             "securityContext": {"runAsNonRoot": True, "runAsUser": 65534, "runAsGroup": 65534,
                                 "seccompProfile": {"type": "RuntimeDefault"}},
             "containers": [{"name": "reader", "image": r["image"],
-                            "command": ["python3", "-B", "-c",
-                                        f"import time; time.sleep({int(r.get('deadline_seconds', 1800))})"],
-                            "stdin": False,
+                            "command": ["python3", "-B", "-c", f"import time; time.sleep({deadline})"],
                             "securityContext": {"allowPrivilegeEscalation": False, "readOnlyRootFilesystem": True,
                                                 "capabilities": {"drop": ["ALL"]}},
                             "resources": {"requests": {"cpu": "50m", "memory": "64Mi"},
@@ -625,9 +697,10 @@ def reader_pod(record: X.Record, s: Dict, pvc: str, binding: Dict, nonce: str) -
                             "volumeMounts": [{"name": "data", "mountPath": s["pvcs"][pvc]["mount"],
                                               "readOnly": True}]}],
             "volumes": [{"name": "data", "persistentVolumeClaim": {"claimName": pvc, "readOnly": True}}]}
-    if terms:
-        spec["affinity"] = {"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {
-            "nodeSelectorTerms": [{"matchExpressions": terms}]}}}
+    if binding["attached_node"]:
+        spec["affinity"] = {"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": [
+            {"matchExpressions": [{"key": "kubernetes.io/hostname", "operator": "In",
+                                   "values": [binding["attached_node"]]}]}]}}}
     return {"apiVersion": "v1", "kind": "Pod",
             "metadata": {"name": f"c28-s0-{pvc[:-4]}-{nonce}", "namespace": NS,
                          "labels": {READER_LABEL: record.run_id, NONCE_LABEL: nonce,
@@ -655,86 +728,135 @@ class Exec:
         return res.returncode, (res.stderr or b"").decode("utf-8", errors="replace")
 
 
-class Reader:
-    """One reader pod's lifecycle under the s0-export lock: created and deleted through mutation_step, cleanup proven."""
-
-    def __init__(self, record: X.Record, kube: X.Kube, lock, helper: str, s: Dict, pvc: str, binding: Dict,
-                 sleep=time.sleep, now=time.monotonic):
-        self.record, self.kube, self.lock, self.helper, self.s = record, kube, lock, helper, s
-        self.pvc, self.binding, self.sleep, self.now = pvc, binding, sleep, now
-        self.nonce = secrets.token_hex(5)
-        self.body = reader_pod(record, s, pvc, binding, self.nonce)
-        self.name, self.uid = self.body["metadata"]["name"], None
-
-    def _step(self, op: str, call: Callable[[], Dict], extra: Dict) -> Dict:
-        entries = X.receipts(self.record, self.helper)
-        n = str(max([int(e["event"].split("-", 1)[1]) for e in entries
-                     if e["event"].startswith(("intent-", "step-", "reconciled-"))] or [0]) + 1)
-        intent = {"op": op, "kind": "Pod", "namespace": NS, "name": self.name, "pvc": self.pvc, "nonce": self.nonce,
-                  "pre": {"attached_node": self.binding["attached_node"]}, **extra}
-
-        def do():
-            out = call()
-            return "applied", {"uid": ((out or {}).get("metadata") or {}).get("uid") or extra.get("uid")}
-        return C.mutation_step(self.record.doc, self.helper, self.lock, n, intent, do)
-
-    def __enter__(self):
-        C.require_cluster(self.kube.api, self.record.cluster_uid)
-        r = self._step("create", lambda: self.kube.api.create(X.path("Pod", NS), self.body),
-                       {"body_sha256": C.digest(self.body)})
-        self.uid = r["data"]["post"]["uid"]
-        deadline = self.now() + 300
-        while True:
-            p = self.kube.get("Pod", self.name, NS)
-            phase = ((p or {}).get("status") or {}).get("phase")
-            if p is not None and phase == "Running":
-                return self
-            if phase in ("Failed", "Succeeded") or self.now() > deadline:
-                raise X.StagingError(f"reader pod {self.name} did not start (phase {phase})")
-            self.sleep(2)
-
-    def __exit__(self, exc_type, exc, tb):
-        self.cleanup()
-        return False
-
-    def cleanup(self) -> None:
-        """Delete by UID and PROVE: no pod of this nonce remains and a volume not attached before is released."""
-        if self.uid and self.kube.get("Pod", self.name, NS) is not None:
-            C.require_cluster(self.kube.api, self.record.cluster_uid)
-            self._step("delete", lambda: self.kube.api.delete(X.path("Pod", NS, self.name), self.uid) or {},
-                       {"uid": self.uid})
-        deadline = self.now() + 300
-        while True:
-            left = self.kube.list("Pod", NS, labels={NONCE_LABEL: self.nonce})
-            node = attached_node(self.kube, self.binding["pv"])
-            released = bool(self.binding["attached_node"]) or not node
-            if not left and released:
-                X.receipt(self.record, self.helper, "reader-cleanup-proven",
-                          {"pvc": self.pvc, "pod": self.name, "uid": self.uid, "nonce": self.nonce,
-                           "volume_attached_after": node, "volume_attached_before": self.binding["attached_node"]})
-                return
-            if self.now() > deadline:
-                raise X.StagingError(f"cleanup of {self.name} is NOT proven (pods {[p['metadata']['name'] for p in left]}"
-                                     f", volume attached to {node!r}); check before anything else runs")
-            self.sleep(2)
+def _next_step(record: X.Record, helper: str) -> str:
+    return str(max([int(e["event"].split("-", 1)[1]) for e in X.receipts(record, helper)
+                    if e["event"].startswith(("intent-", "step-", "reconciled-"))] or [0]) + 1)
 
 
-# --- probe ------------------------------------------------------------------------------------------------------------
+def prove_cleanup(record: X.Record, kube: X.Kube, helper: str, step: str, pvc: str, pv: str, nonce: str,
+                  attached_before: str, sleep, now, timeout: float = 300) -> Dict:
+    """Delete every pod of the nonce (each delete intent durable first, UID-bound) and PROVE: no pod of the nonce
+    remains and a volume that was not attached before is released. Raises when unproven."""
+    deadline = now() + timeout
+    deleted = set()
+    while True:
+        left = kube.list("Pod", NS, labels={NONCE_LABEL: nonce})
+        for p in left:
+            uid = p["metadata"].get("uid")
+            if uid in deleted:
+                continue
+            C.require_cluster(kube.api, record.cluster_uid)
+            X.receipt(record, helper, f"delete-intent-{step}", {"pod": p["metadata"]["name"], "uid": uid,
+                                                                "nonce": nonce})
+            try:
+                kube.api.delete(X.path("Pod", NS, p["metadata"]["name"]), uid)
+            except C.NotFound:
+                pass
+            deleted.add(uid)
+        node = attached_node(kube, pv)
+        if not left and (attached_before or not node):
+            return {"pods_left": 0, "attached_before": attached_before, "attached_after": node,
+                    "deleted": sorted(deleted)}
+        if now() > deadline:
+            raise X.StagingError(f"cleanup of the {pvc} reader (nonce {nonce}) is NOT proven: pods "
+                                 f"{[p['metadata']['name'] for p in left]}, volume attached to {node!r}; the "
+                                 "operation stays unresolved and the lock held (recover)")
+        sleep(2)
+
+
+def revalidate(record: X.Record, kube: X.Kube, s: Dict, pvc: str, planned: Dict) -> None:
+    """Right before EACH reader: the claim binding is the planned one and no campaign Job runs."""
+    C.require_cluster(kube.api, record.cluster_uid)
+    busy = busy_jobs(kube)
+    if busy:
+        raise X.StagingError(f"active Jobs {busy}: no reader while they run")
+    live = claim_binding(kube, pvc, s["pvcs"][pvc]["uid"])
+    if {k: live[k] for k in ("uid", "pv", "pv_uid", "attached_node")} != \
+            {k: planned[k] for k in ("uid", "pv", "pv_uid", "attached_node")}:
+        raise X.StagingError(f"{pvc}'s binding changed since the plan ({live} vs {planned})")
+
+
+def run_reader(record: X.Record, kube: X.Kube, lock, helper: str, s: Dict, pvc: str, binding: Dict, job: Dict,
+               exe, sleep, now) -> Tuple[int, str, str]:
+    """ONE reader lifecycle as ONE mutation_step: intent (pod, nonce, claim, attachment) before the create; the pod
+    created, used and deleted; the outcome only after cleanup is PROVEN. A work failure after a proven cleanup is
+    re-raised with the lock safe; an unproven cleanup leaves the intent unresolved and the lock held."""
+    revalidate(record, kube, s, pvc, binding)
+    nonce = secrets.token_hex(5)
+    body = reader_pod(record, s, pvc, binding, nonce)
+    name = body["metadata"]["name"]
+    tmp = os.path.join(record.evidence_dir, "populate", f"{helper}-{pvc}-{nonce}.out")
+    os.makedirs(os.path.dirname(tmp), exist_ok=True)
+    step = _next_step(record, helper)
+    intent = {"op": "reader", "pvc": pvc, "pv": binding["pv"], "pod": name, "nonce": nonce,
+              "attached_before": binding["attached_node"], "body_sha256": C.digest(body), "mode": job["mode"]}
+    failure: List[BaseException] = []
+    result: Dict = {"rc": None, "stderr": "", "uid": None}
+
+    def lifecycle():
+        try:
+            C.require_cluster(kube.api, record.cluster_uid)
+            out = kube.api.create(X.path("Pod", NS), body)
+            result["uid"] = (out.get("metadata") or {}).get("uid")
+            deadline = now() + 300
+            while True:
+                p = kube.get("Pod", name, NS)
+                phase = ((p or {}).get("status") or {}).get("phase")
+                if phase == "Running":
+                    break
+                if phase in ("Failed", "Succeeded") or now() > deadline:
+                    raise X.StagingError(f"reader pod {name} did not start (phase {phase})")
+                sleep(2)
+            result["rc"], result["stderr"] = exe(name, job, tmp)
+        except Exception as e:      # noqa: BLE001 - kept, re-raised after the proven cleanup
+            failure.append(e)
+        proof = prove_cleanup(record, kube, helper, step, pvc, binding["pv"], nonce, binding["attached_node"],
+                              sleep, now)            # raises when unproven: no outcome, the lock stays
+        return ("cleaned" if not failure else "cleaned-after-failure"),             {"uid": result["uid"], "proof": proof, "error": type(failure[0]).__name__ if failure else None}
+    C.mutation_step(record.doc, helper, lock, step, intent, lifecycle)
+    X.receipt(record, helper, "reader-cleanup-proven", {"pvc": pvc, "pod": name, "nonce": nonce, "step": step})
+    if failure:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise failure[0]
+    return result["rc"], result["stderr"], tmp
+
 
 def _pre_checks(record: X.Record, kube: X.Kube, s: Dict) -> Tuple[Dict, List[str]]:
     C.require_cluster(kube.api, record.cluster_uid)
     probs = []
-    if os.path.exists(C.lock_path(record.doc, "legacy")):
-        probs.append("the legacy mutation lock is held")
+    lp = C.lock_path(record.doc, LOCK_SCOPE)
+    if os.path.exists(lp):
+        probs.append(f"the shared legacy-scope lock is held ({lp})")
     busy = busy_jobs(kube)
     if busy:
         probs.append(f"active Jobs {busy}: no reader while they run")
     left = leftover_readers(kube, record)
     if left:
-        probs.append(f"leftover reader pods {left}: clean them first (recover)")
+        probs.append(f"leftover reader pods {left}: run recover")
+    for h in (HELPER, PROBE) + LEGACY_HELPERS:
+        if _unresolved_steps(record, h):
+            probs.append(f"unresolved intents in the {h} journal: run recover")
     bindings = {p: claim_binding(kube, p, s["pvcs"][p]["uid"]) for p in PVC_EXPORTS}
     return bindings, probs
 
+
+def _steps(record: X.Record, helper: str) -> Dict[str, Dict]:
+    steps: Dict[str, Dict] = {}
+    for e in X.receipts(record, helper):
+        for pre in ("intent-", "step-", "reconciled-", "delete-intent-"):
+            if e["event"].startswith(pre):
+                steps.setdefault(e["event"][len(pre):], {}).setdefault(pre, []).append(e["data"])
+                break
+    return steps
+
+
+def _unresolved_steps(record: X.Record, helper: str) -> List[Tuple[str, Dict]]:
+    return [(n, st["intent-"][0]) for n, st in sorted(_steps(record, helper).items(), key=lambda kv: int(kv[0]))
+            if "intent-" in st and "step-" not in st and "reconciled-" not in st]
+
+
+# --- probe ------------------------------------------------------------------------------------------------------------
 
 def probe_plan(record: X.Record, kube: X.Kube) -> Dict:
     s = section(record)
@@ -742,15 +864,7 @@ def probe_plan(record: X.Record, kube: X.Kube) -> Dict:
     actions = [{"pvc": p, "binding": bindings[p], "mount": s["pvcs"][p]["mount"], "rules": effective_rules(s, p)}
                for p in PVC_EXPORTS]
     return X.new_plan(PROBE, record, actions, reader_sha256=READER_SHA256, reader_image=s["reader"]["image"],
-                      problems=probs, note="read-only reader pods: sizes, file counts and the rule selections")
-
-
-def _run_reader(record, kube, lock, helper, s, pvc, binding, job, exe, sleep, now) -> Tuple[int, str, str]:
-    tmp = os.path.join(record.evidence_dir, "populate", f"{helper}-{pvc}-{secrets.token_hex(4)}.out")
-    os.makedirs(os.path.dirname(tmp), exist_ok=True)
-    with Reader(record, kube, lock, helper, s, pvc, binding, sleep, now) as rd:
-        rc, err = exe(rd.name, job, tmp)
-    return rc, err, tmp
+                      problems=probs, note="read-only reader pods: sizes, selections, original-hash checks, digests")
 
 
 def probe(record: X.Record, kube: X.Kube, reviewed: Dict, digest: str, exe=None, sleep=time.sleep,
@@ -759,34 +873,52 @@ def probe(record: X.Record, kube: X.Kube, reviewed: Dict, digest: str, exe=None,
     exe = exe or Exec(record, int(s["reader"].get("exec_timeout_seconds", 1800)))
     with C.exclusive_lock(record.doc, LOCK_SCOPE, holder=PROBE) as lock:
         live = probe_plan(record, kube)
+        live["problems"] = [p for p in live["problems"] if not p.startswith("the shared legacy-scope lock")]
         X.require_live(reviewed, digest, PROBE, record, live)
         if live["problems"]:
             raise X.StagingError("the probe plan has problems: " + "; ".join(live["problems"]))
-        results = {}
         for a in live["actions"]:
             job = {"mode": "probe", "mount": a["mount"], "rules": a["rules"]}
-            rc, err, tmp = _run_reader(record, kube, lock, PROBE, s, a["pvc"], a["binding"], job, exe, sleep, now)
+            rc, err, tmp = run_reader(record, kube, lock, PROBE, s, a["pvc"], a["binding"], job, exe, sleep, now)
             try:
                 out = json.load(open(tmp))
             except ValueError as e:
                 raise X.StagingError(f"{a['pvc']}: the probe output is not JSON (exit {rc})") from e
             finally:
                 os.unlink(tmp)
-            results[a["pvc"]] = out
             X.receipt(record, PROBE, "probed", {"pvc": a["pvc"], "plan_sha256": digest, "binding": a["binding"],
                                                 "rules_sha256": C.digest(a["rules"]), "result": out})
-        return X.receipt(record, PROBE, "probe-complete", {"plan_sha256": digest, "pvcs": sorted(results)})
+        return X.receipt(record, PROBE, "probe-complete", {"plan_sha256": digest})
 
 
 def probe_results(record: X.Record) -> Dict[str, Dict]:
-    out = {}
-    for e in X.receipts(record, PROBE):
-        if e["event"] == "probed":
-            out[e["data"]["pvc"]] = e["data"]
-    return out
+    return {e["data"]["pvc"]: e["data"] for e in X.receipts(record, PROBE) if e["event"] == "probed"}
 
 
 # --- the export plan --------------------------------------------------------------------------------------------------
+
+def _rule_label(r: Dict) -> str:
+    return f"{r['type']} {r.get('path') or r.get('glob') or r.get('manifest_glob') or r.get('sidecar_glob') or r.get('index')}"
+
+
+def archive_closure_problems(pvcs: Dict[str, Dict]) -> List[str]:
+    """Every exported model pair has its immutable archived copy in the evidence-archive selection (same artifact and
+    sidecar hashes); every sidecar-variant bundle's artifact_key names a selected bundle."""
+    out = []
+    ea = pvcs.get("evidence-archive-pvc", {}).get("selection", [])
+    manifests = [it for it in ea if "artifact_sha256" in it and "sidecar_sha256" in it]
+    archived = {(m["artifact_sha256"], m["sidecar_sha256"]) for m in manifests}
+    keys = {m.get("bundle") for m in manifests}
+    for m in manifests:
+        if m.get("artifact_key") and m["artifact_key"] not in keys:
+            out.append(f"evidence-archive bundle {m['bundle']}: its artifact_key {m['artifact_key']} is not selected")
+    sel = pvcs.get("ml-models-pvc", {}).get("selection", [])
+    for sc in (it for it in sel if it.get("artifact_sha256")):
+        if (sc["artifact_sha256"], sc["sha256"]) not in archived:
+            out.append(f"ml-models {sc['path']}: no immutable archived copy (same artifact and sidecar hashes) in the "
+                       "evidence-archive selection; the mutable model directory is not historical storage")
+    return out
+
 
 def plan(record: X.Record, kube: X.Kube) -> Dict:
     s = section(record)
@@ -807,17 +939,25 @@ def plan(record: X.Record, kube: X.Kube) -> Dict:
         if r is None:
             probs.append(f"{p}: not probed (run probe first)")
             continue
-        if r["rules_sha256"] != C.digest(rules) or r["binding"]["uid"] != bindings[p]["uid"] \
-                or r["binding"]["pv"] != bindings[p]["pv"]:
+        if r["rules_sha256"] != C.digest(rules) or {k: r["binding"][k] for k in ("uid", "pv", "pv_uid")} != \
+                {k: bindings[p][k] for k in ("uid", "pv", "pv_uid")}:
             probs.append(f"{p}: the probe was for other rules or another binding: probe again")
             continue
         selection = [it for rr in r["result"]["rules"] for it in rr["selected"]]
         for rr in r["result"]["rules"]:
-            probs += [f"{p}: rule {rr['rule']['type']} ({rr['rule'].get('path') or rr['rule'].get('glob') or rr['rule'].get('manifest_glob') or rr['rule'].get('sidecar_glob')}): {x}"
-                      for x in rr["problems"]]
+            probs += [f"{p}: rule {_rule_label(rr['rule'])}: {x}" for x in rr["problems"]]
         paths = [it["path"] for it in selection]
         if len(set(paths)) != len(paths):
             probs.append(f"{p}: two rules select the same file")
+        rule_excluded = [x for rr in r["result"]["rules"] for x in rr["excluded"]]
+        reviewed_ex = reviewed_exclusions(s, p)
+        exclusions = []
+        for f in r["result"]["unconsidered"]:
+            why = next((e["reason"] for e in reviewed_ex if fnmatch.fnmatch(f["path"], e["glob"])), None)
+            if why is None:
+                probs.append(f"{p}: {f['path']} is neither selected, excluded by a rule, nor a reviewed exclusion")
+            else:
+                exclusions.append({"path": f["path"], "bytes": f["bytes"], "reason": why})
         size = sum(it["bytes"] for it in selection)
         total += size
         if size > s["pvcs"][p]["max_bytes"]:
@@ -825,7 +965,8 @@ def plan(record: X.Record, kube: X.Kube) -> Dict:
         if not selection:
             probs.append(f"{p}: nothing selected (an empty export is never produced)")
         pvcs[p] = {"binding": bindings[p], "rules": rules, "selection": selection, "bytes": size,
-                   "volume": r["result"]["volume"], "excluded": [rr["excluded"] for rr in r["result"]["rules"]]}
+                   "volume": r["result"]["volume"], "rule_excluded": rule_excluded, "reviewed_exclusions": exclusions}
+    probs += archive_closure_problems(pvcs)
     if total > s["budget"]["max_total_bytes"]:
         probs.append(f"the PVC exports total {total} bytes, over the budget {s['budget']['max_total_bytes']}")
     export_dir = ev["export_dir"]
@@ -840,12 +981,13 @@ def plan(record: X.Record, kube: X.Kube) -> Dict:
         probs.append(f"what this populator produces differs from archive.evidence.mandatory: missing "
                      f"{sorted(set(ev['mandatory']) - expected)[:5]}, extra {sorted(expected - set(ev['mandatory']))[:5]}")
     p8 = s["p8"]
-    p8_path = next((f for f in local if f["path"] == p8["export"]), None)
-    if p8_path is None or p8_path["sha256"] != p8["sha256"]:
+    p8f = next((f for f in local if f["path"] == p8["export"]), None)
+    if p8f is None or p8f["sha256"] != p8["sha256"]:
         probs.append("the existing p8-evidence-pvc fetch is not among the copied files with its recorded sha256")
     actions = [{"copy": f["path"], "sha256": f["sha256"], "bytes": f["bytes"]} for f in local]
     actions += [{"generate": k, "sha256": hashlib.sha256(v).hexdigest()} for k, v in sorted(gen.items())]
-    actions += [{"export": p, "files": len(v["selection"]), "bytes": v["bytes"]} for p, v in pvcs.items()]
+    actions += [{"export": p, "files": len(v["selection"]), "bytes": v["bytes"],
+                 "selection_sha256": C.digest(v["selection"])} for p, v in pvcs.items()]
     return X.new_plan(HELPER, record, actions, export_dir=export_dir, local=local, pvcs=pvcs,
                       consumers=consumers(kube), total_pvc_bytes=total, reader_sha256=READER_SHA256,
                       problems=probs)
@@ -864,24 +1006,23 @@ def _write_identical(path: str, data: bytes) -> str:
 
 
 def verify_tar(path: str, selection: List[Dict], trailer: Dict) -> List[str]:
-    out = []
+    """The received tar equals the reader's trailer, its receipt equals the reviewed selection (paths, sizes AND the
+    probe's sha256), and every member's bytes hash to it."""
     if C.sha256_file(path) != trailer["trailer"]["sha256"] or os.path.getsize(path) != trailer["trailer"]["bytes"]:
         return ["the received tar does not match the reader's trailer"]
-    want = [(it["path"], it["bytes"]) for it in selection]
-    got_files = trailer["files"]
-    if [(f["path"], f["bytes"]) for f in got_files] != want:
-        return ["the reader's receipt is not exactly the reviewed selection"]
+    want = [(it["path"], it["bytes"], it["sha256"]) for it in selection]
+    if [(f["path"], f["bytes"], f["sha256"]) for f in trailer["files"]] != want:
+        return ["the reader's receipt is not exactly the reviewed selection (paths, sizes and sha256)"]
+    out = []
     with tarfile.open(path, "r:") as tar:
         members = tar.getmembers()
-        if [(m.name, m.size) for m in members] != want:
+        if [(m.name, m.size) for m in members] != [(p, b) for p, b, _ in want]:
             return ["the tar's members are not exactly the reviewed selection"]
-        for m, f in zip(members, got_files):
+        for m, (_, _, h) in zip(members, want):
             if not m.isreg() or m.name.startswith("/") or ".." in m.name.split("/"):
                 out.append(f"unsafe tar member {m.name}")
-                continue
-            h = hashlib.sha256(tar.extractfile(m).read()).hexdigest()
-            if h != f["sha256"]:
-                out.append(f"{m.name}: the member's sha256 differs from the reader's receipt")
+            elif hashlib.sha256(tar.extractfile(m).read()).hexdigest() != h:
+                out.append(f"{m.name}: the member's bytes differ from the reviewed sha256")
     return out
 
 
@@ -892,7 +1033,7 @@ def export_pvc(record, kube, lock, s, pvc, info, exe, sleep, now, digest) -> Dic
     if os.path.exists(tar_path):
         raise X.StagingError(f"{tar_path} exists (a PVC export is produced once)")
     job = {"mode": "export", "mount": s["pvcs"][pvc]["mount"], "selection": info["selection"]}
-    rc, err, tmp = _run_reader(record, kube, lock, HELPER, s, pvc, info["binding"], job, exe, sleep, now)
+    rc, err, tmp = run_reader(record, kube, lock, HELPER, s, pvc, info["binding"], job, exe, sleep, now)
     try:
         trailer = json.loads(err.strip().splitlines()[-1]) if err.strip() else {}
     except ValueError:
@@ -906,25 +1047,25 @@ def export_pvc(record, kube, lock, s, pvc, info, exe, sleep, now, digest) -> Dic
         raise X.StagingError(f"{pvc}: " + "; ".join(probs))
     os.rename(tmp, tar_path)
     tar_sha = C.sha256_file(tar_path)
-    sel = {it["path"]: it for it in info["selection"]}
     manifest = {"schema": "c28-pvc-export/v1", "run_id": record.run_id, "cluster_uid": record.cluster_uid,
                 "pvc": pvc, "pvc_uid": info["binding"]["uid"], "pv": info["binding"]["pv"],
                 "pv_uid": info["binding"]["pv_uid"], "rules": info["rules"],
                 "cutoffs": sorted({r["cutoff"] for r in info["rules"]}), "reader_sha256": READER_SHA256,
                 "populator_sha256": C.sha256_file(os.path.abspath(__file__)), "plan_sha256": digest,
-                "files": [{"source_path": f["path"], "member": f["path"], "bytes": f["bytes"], "sha256": f["sha256"],
-                           "selection": {k: sel[f["path"]].get(k) for k in ("kind", "ts", "lines")
-                                         if sel[f["path"]].get(k) is not None}} for f in trailer["files"]],
-                "excluded": info["excluded"], "volume_totals_at_probe": info["volume"],
+                "files": [dict({k: v for k, v in it.items() if k not in ("path",)}, source_path=it["path"],
+                               member=it["path"]) for it in info["selection"]],
+                "rule_excluded": info["rule_excluded"], "reviewed_exclusions": info["reviewed_exclusions"],
+                "volume_totals_at_probe": info["volume"],
                 "tar": {"file": "campaign-export.tar", "bytes": os.path.getsize(tar_path), "sha256": tar_sha},
-                "note": "campaign artifacts selected by their own names or record timestamps against the cutoff; "
-                        "the rest of the volume is retained but not exported"}
+                "note": "campaign artifacts selected by their own names or record timestamps against the cutoff, "
+                        "byte-bound to the probe and with the writers' original hashes verified; the rest of the "
+                        "volume is retained but not exported"}
     mtext = (json.dumps(manifest, indent=1, sort_keys=True) + "\n").encode()
     C.assert_clean(mtext.decode())
     _write_identical(os.path.join(d, "manifest.json"), mtext)
     sums = f"{tar_sha}  campaign-export.tar\n{hashlib.sha256(mtext).hexdigest()}  manifest.json\n".encode()
     _write_identical(os.path.join(d, "SHA256SUMS"), sums)
-    X.receipt(record, HELPER, "pvc-exported", {"pvc": pvc, "files": len(trailer["files"]), "tar_sha256": tar_sha,
+    X.receipt(record, HELPER, "pvc-exported", {"pvc": pvc, "files": len(info["selection"]), "tar_sha256": tar_sha,
                                                "manifest_sha256": hashlib.sha256(mtext).hexdigest()})
     return manifest
 
@@ -932,6 +1073,8 @@ def export_pvc(record, kube, lock, s, pvc, info, exe, sleep, now, digest) -> Dic
 def coverage(record: X.Record, s: Dict, p: Dict, manifests: Dict[str, Dict]) -> bytes:
     inv = _inventory(record, s)
     pvs = {v["claim"]["uid"]: v for v in inv["objects"].get("persistentvolumes", []) if v.get("claim")}
+    ea = manifests.get("evidence-archive-pvc", {}).get("files", [])
+    archived = {(f["artifact_sha256"], f["sidecar_sha256"]): f for f in ea if "sidecar_sha256" in f}
     claims = []
     for r in s["retained_pvcs"]:
         pv = pvs.get(r["uid"], {})
@@ -944,10 +1087,18 @@ def coverage(record: X.Record, s: Dict, p: Dict, manifests: Dict[str, Dict]) -> 
             entry["protected"] = {"export": f"pvc-exports/{r['name']}/campaign-export.tar",
                                   "manifest": f"pvc-exports/{r['name']}/manifest.json", "files": len(m["files"]),
                                   "bytes": sum(f["bytes"] for f in m["files"]), "tar_sha256": m["tar"]["sha256"],
-                                  "cutoffs": m["cutoffs"], "verified": "every member against the reader receipt"}
+                                  "cutoffs": m["cutoffs"],
+                                  "verified": "every member against the probe's sha256 and the writers' original "
+                                              "hashes"}
+            if r["name"] == "ml-models-pvc":
+                entry["protected"]["archived_copies"] = [
+                    {"model_sidecar": f["member"], "archived_bundle": archived[(f["artifact_sha256"], f["sha256"])]["bundle"]}
+                    for f in m["files"] if f.get("artifact_sha256") and (f["artifact_sha256"], f["sha256"]) in archived]
             entry["residual_not_backed_up"] = {
                 "description": "every other file of the volume (and any later appends) is RETAINED on the claim but "
-                               "NOT backed up by S0", "volume_files_at_probe": m["volume_totals_at_probe"]["files"],
+                               "NOT backed up by S0", "reviewed_exclusions": m["reviewed_exclusions"],
+                "rule_excluded": len(m["rule_excluded"]),
+                "volume_files_at_probe": m["volume_totals_at_probe"]["files"],
                 "volume_bytes_at_probe": m["volume_totals_at_probe"]["bytes"]}
         elif r["name"] == "p8-evidence-pvc":
             entry["protected"] = {"export": s["p8"]["export"], "sha256": s["p8"]["sha256"],
@@ -974,6 +1125,7 @@ def export(record: X.Record, kube: X.Kube, reviewed: Dict, digest: str, exe=None
     exe = exe or Exec(record, int(s["reader"].get("exec_timeout_seconds", 1800)))
     with C.exclusive_lock(record.doc, LOCK_SCOPE, holder=HELPER) as lock:
         live = plan(record, kube)
+        live["problems"] = [p for p in live["problems"] if not p.startswith("the shared legacy-scope lock")]
         X.require_live(reviewed, digest, HELPER, record, live)
         if live["problems"]:
             raise X.StagingError("the export plan has problems: " + "; ".join(live["problems"]))
@@ -1008,14 +1160,14 @@ def export(record: X.Record, kube: X.Kube, reviewed: Dict, digest: str, exe=None
         v = verify(record)
         if v["problems"]:
             raise X.StagingError("the populated export does not verify: " + "; ".join(v["problems"][:10]))
-        return X.receipt(record, HELPER, "export-complete", {"plan_sha256": digest, "files": v["files"],
-                                                             "s0_sha256sums": C.sha256_file(os.path.join(root,
-                                                                                                         "S0-SHA256SUMS"))})
+        return X.receipt(record, HELPER, "export-complete", {
+            "plan_sha256": digest, "files": v["files"],
+            "s0_sha256sums": C.sha256_file(os.path.join(root, "S0-SHA256SUMS"))})
 
 
 def verify(record: X.Record) -> Dict:
     """Read-only: export_dir holds exactly the mandatory files, every checksum manifest verifies at the destination,
-    and every PVC export's tar matches its manifest member by member."""
+    and every PVC export's tar matches its manifest member by member (sha256)."""
     ev = evidence(record)
     root, probs = ev["export_dir"], []
     have = set()
@@ -1033,8 +1185,7 @@ def verify(record: X.Record) -> Dict:
             d = os.path.join(root, "pvc-exports", pvc)
             m = json.load(open(os.path.join(d, "manifest.json")))
             files = [{"path": f["member"], "bytes": f["bytes"], "sha256": f["sha256"]} for f in m["files"]]
-            probs += [f"{pvc}: {x}" for x in verify_tar(os.path.join(d, "campaign-export.tar"),
-                                                        [{"path": f["path"], "bytes": f["bytes"]} for f in files],
+            probs += [f"{pvc}: {x}" for x in verify_tar(os.path.join(d, "campaign-export.tar"), files,
                                                         {"trailer": {"bytes": m["tar"]["bytes"],
                                                                      "sha256": m["tar"]["sha256"]}, "files": files})]
             if not files or any(f["bytes"] <= 0 for f in files):
@@ -1045,59 +1196,49 @@ def verify(record: X.Record) -> Dict:
 
 # --- recovery ---------------------------------------------------------------------------------------------------------
 
-def _unresolved(record: X.Record) -> List[Tuple[str, str, Dict]]:
-    out = []
-    for helper in (HELPER, PROBE):
-        steps: Dict[str, Dict] = {}
-        for e in X.receipts(record, helper):
-            for pre in ("intent-", "step-", "reconciled-"):
-                if e["event"].startswith(pre):
-                    steps.setdefault(e["event"][len(pre):], {})[pre] = e["data"]
-        for n, st in sorted(steps.items(), key=lambda kv: int(kv[0])):
-            if "intent-" in st and "step-" not in st and "reconciled-" not in st:
-                out.append((helper, n, st["intent-"]))
-    return out
-
-
 def recover_plan(record: X.Record, kube: X.Kube) -> Dict:
+    """Read-only: every unresolved reader lifecycle with the pods of its nonce still present and its volume state."""
     actions = []
-    for helper, n, it in _unresolved(record):
-        live = kube.get("Pod", it["name"], NS)
-        nonce_ok = live is not None and (live["metadata"].get("labels") or {}).get(NONCE_LABEL) == it["nonce"]
-        if it["op"] == "create":
-            observed = "done" if nonce_ok else ("not-done" if live is None else "unresolved")
-        else:
-            observed = "done" if live is None or live["metadata"].get("uid") != it.get("uid") else "not-done"
-        actions.append({"helper": helper, "step": n, "op": it["op"], "pod": it["name"], "observed": observed,
-                        "uid": (live or {}).get("metadata", {}).get("uid")})
+    for helper in (HELPER, PROBE):
+        for n, it in _unresolved_steps(record, helper):
+            pods = kube.list("Pod", NS, labels={NONCE_LABEL: it["nonce"]})
+            node = attached_node(kube, it["pv"])
+            actions.append({"helper": helper, "step": n, "pvc": it["pvc"], "nonce": it["nonce"],
+                            "pods": sorted(p["metadata"]["name"] for p in pods), "attached_now": node,
+                            "attached_before": it["attached_before"]})
+    legacy = [f"{h}/{n}" for h in LEGACY_HELPERS for n, _ in _unresolved_steps(record, h)]
     lp = C.lock_path(record.doc, LOCK_SCOPE)
     return X.new_plan("populate-s0-recover", record, actions, lock=lp,
                       lock_sha256=C.sha256_file(lp) if os.path.exists(lp) else "",
-                      leftover_readers=leftover_readers(kube, record))
+                      legacy_unresolved=legacy, leftover_readers=leftover_readers(kube, record))
 
 
-def recover(record: X.Record, kube: X.Kube, reviewed: Dict, digest: str) -> Dict:
-    """recovery_guard (owner proven gone), reconciled-<n> for decided outcomes, then delete every leftover reader pod of
-    this run by UID, and release the stale lock only when nothing stays unresolved."""
+def recover(record: X.Record, kube: X.Kube, reviewed: Dict, digest: str, sleep=time.sleep,
+            now=time.monotonic) -> Dict:
+    """recovery_guard (the lock's owner proven gone); for each unresolved reader lifecycle: delete the pods of its
+    nonce (durable delete intents) and PROVE cleanup, then reconciled-<n>; release the shared lock only when nothing of
+    S0 OR legacy stays unresolved and no reader pod of the run remains."""
     live = recover_plan(record, kube)
     X.require_live(reviewed, digest, "populate-s0-recover", record, live)
     with C.recovery_guard(record.doc, LOCK_SCOPE, live["lock_sha256"]) as guard:
         C.require_cluster(kube.api, record.cluster_uid)
-        bad = [a for a in live["actions"] if a["observed"] == "unresolved"]
         for a in live["actions"]:
-            if a["observed"] != "unresolved":
-                C.append_receipt(record.doc, a["helper"], f"reconciled-{a['step']}",
-                                 {"observed": a["observed"], "uid": a["uid"]})
-        if bad:
-            raise X.StagingError(f"unresolved outcomes {bad}: the lock stays")
-        for name in live["leftover_readers"]:
-            p = kube.get("Pod", name, NS)
-            if p is not None:
-                kube.api.delete(X.path("Pod", NS, name), p["metadata"]["uid"])
+            proof = prove_cleanup(record, kube, a["helper"], a["step"], a["pvc"],
+                                  _unresolved_steps_map(record, a["helper"])[a["step"]]["pv"], a["nonce"],
+                                  a["attached_before"], sleep, now)
+            C.append_receipt(record.doc, a["helper"], f"reconciled-{a['step']}",
+                             {"observed": "done", "cleanup": proof})
         if leftover_readers(kube, record):
-            raise X.StagingError("leftover reader pods remain: the lock stays")
+            raise X.StagingError("reader pods of the run remain: the lock stays")
+        if live["legacy_unresolved"]:
+            raise X.StagingError(f"legacy intents {live['legacy_unresolved']} are unresolved: the shared lock stays "
+                                 "(legacy.py recover)")
         guard.release_stale()
         return X.receipt(record, HELPER, "recovered", {"plan_sha256": digest, "reconciled": len(live["actions"])})
+
+
+def _unresolved_steps_map(record: X.Record, helper: str) -> Dict[str, Dict]:
+    return dict(_unresolved_steps(record, helper))
 
 
 # --- CLI --------------------------------------------------------------------------------------------------------------

@@ -47,33 +47,83 @@ class Clock:
         self.t += s
 
 
+def jl(*recs):
+    return "".join(json.dumps(r, sort_keys=True) + "\n" for r in recs)
+
+
 def volumes(root):
-    """The four claims' campaign contents (and post-cutoff/live material that must NOT be exported)."""
+    """The four claims as the campaign writers left them (deploy/eks-benchmark/instrumentation/archive.py,
+    collect_load_evidence.py, the operator and trainer), plus post-cutoff and live material that must NOT be exported."""
     v = {p: os.path.join(root, "vol", p) for p in MOUNTS}
     fc = [{"event": "decision", "at": "2026-11-01T23:58:00Z"}, {"issued_at": "2026-11-01T23:59:00Z", "forecasts": []},
           {"event": "decision", "at": "2026-11-02T00:01:00Z"}]
-    write(os.path.join(v["forecast-log-pvc"], "forecasts.jsonl"),
-          "".join(json.dumps(r) + "\n" for r in fc) + '{"event": "decision", "at": "2026-11-0')   # partial last line
+    write(os.path.join(v["forecast-log-pvc"], "forecasts.jsonl"), jl(*fc) + '{"event": "decision", "at": "2026-11-0')
     a = v["evidence-archive-pvc"]
-    write(os.path.join(a, "archive/k1/manifest.json"), json.dumps({"copied_at": "2026-10-20T01:00:00Z"}))
-    write(os.path.join(a, "archive/k1/lstm.pkl"), b"\x00model-bytes-1")
-    write(os.path.join(a, "archive/k1/meta.json"), json.dumps({"training_cutoff": "2026-10-19T18:00:00Z"}))
-    write(os.path.join(a, "archive/k2/manifest.json"), json.dumps({"copied_at": "2026-11-05T01:00:00Z"}))   # later
-    write(os.path.join(a, "archive/k2/lstm.pkl"), b"later")
-    write(os.path.join(a, "INDEX.jsonl"), json.dumps({"event": "archived", "copied_at": "2026-10-20T01:00:00Z"}) + "\n")
-    write(os.path.join(a, "logs/api-ensemble.jsonl"), json.dumps({"ts": "2026-10-30T00:00:00Z"}) + "\n")
-    write(os.path.join(a, "logs/trainer-index.jsonl"), json.dumps({"at": "2026-10-30T00:00:00Z"}) + "\n")
+    # the model pair, trained before the cutoff, archived immutably (archive_pair: manifest + artifact + sidecar)
+    art = b"pickled-model-v1"
+    side = json.dumps({"trained_at": "2026-11-01T18:20:00Z", "training_cutoff": "2026-11-01T18:00:00Z",
+                       "artifact_sha256": sha(art), "artifact_bytes": len(art)}, sort_keys=True).encode()
+    key = f"20261101T1800Z-{sha(art)[:12]}"
+    man = {"key": key, "copied_at": "2026-11-01T18:35:02Z", "started_at": "2026-11-01T18:35:00Z", "event": "archived",
+           "artifact": "lstm_nginx-test_requests.pkl", "artifact_sha256": sha(art), "artifact_bytes": len(art),
+           "sidecar_sha256": sha(side), "training_cutoff": "2026-11-01T18:00:00Z",
+           "trained_at_per_sidecar": "2026-11-01T18:20:00Z", "archiver_version": 2, "job": "evidence-archive-1"}
+    write(os.path.join(a, f"archive/{key}/manifest.json"), json.dumps(man, indent=1, sort_keys=True))
+    write(os.path.join(a, f"archive/{key}/lstm_nginx-test_requests.pkl"), art)
+    write(os.path.join(a, f"archive/{key}/lstm_nginx-test_requests.meta.json"), side)
+    # a sidecar variant of the same artifact (artifact_key, no artifact file)
+    side2 = json.dumps({"trained_at": "2026-11-01T18:20:00Z", "training_cutoff": "2026-11-01T18:00:00Z",
+                        "artifact_sha256": sha(art), "note": "re-written sidecar"}, sort_keys=True).encode()
+    vkey = f"{key}-sidecar-{sha(side2)[:12]}"
+    write(os.path.join(a, f"archive/{vkey}/manifest.json"), json.dumps(dict(man, key=vkey, artifact_key=key,
+                                                                            event="sidecar_variant",
+                                                                            sidecar_sha256=sha(side2),
+                                                                            copied_at="2026-11-01T20:05:00Z")))
+    write(os.path.join(a, f"archive/{vkey}/lstm_nginx-test_requests.meta.json"), side2)
+    # a bundle archived after the collection cutoff
+    write(os.path.join(a, "archive/20261103T0000Z-later/manifest.json"),
+          json.dumps({"key": "x", "copied_at": "2026-11-03T00:05:00Z", "artifact": "a.pkl"}))
+    write(os.path.join(a, "archive/20261103T0000Z-later/a.pkl"), b"later")
+    # INDEX with a recovered record whose OLD copied_at follows newer records (recovered_at is its append time)
+    write(os.path.join(a, "INDEX.jsonl"), jl(
+        dict(man, event="archived"), {"event": "sidecar_variant", "key": vkey, "copied_at": "2026-11-01T20:05:00Z"},
+        dict(man, event="archived", index_recovered=True, recovered_at="2026-11-01T21:00:00Z"),
+        {"event": "archived", "key": "x", "copied_at": "2026-11-03T00:05:00Z"}))
+    write(os.path.join(a, "REJECTS.jsonl"), jl({"event": "rejected", "at": "2026-10-30T10:00:00Z",
+                                                "reason": "artifact changed during copy", "job": "e-2"}))
+    write(os.path.join(a, "RUNS.jsonl"), jl({"started_at": "2026-11-01T18:35:00Z", "finished_at": "2026-11-01T18:35:03Z",
+                                             "pair": {"result": "archived"}, "errors": []},
+                                            {"started_at": "2026-11-02T09:00:00Z", "finished_at": "2026-11-02T09:00:02Z",
+                                             "pair": {}, "errors": []}))
+    write(os.path.join(a, "logs/api-ensemble.jsonl"), jl({"ts": "2026-11-01T23:59:58Z", "collected_at": "2026-11-02T00:05:00Z",
+                                                          "line_sha256": "a" * 64}))
+    write(os.path.join(a, "logs/api-reload.jsonl"), jl({"ts": "2026-11-01T10:00:00Z", "collected_at": "2026-11-01T10:05:00Z",
+                                                        "line": "reloaded"}))
+    write(os.path.join(a, "logs/api-coverage.jsonl"), jl({"collected_at": "2026-11-01T10:05:00Z", "pod": "ml-api-0",
+                                                          "lines": 3, "flags": []}))
+    log = "2026-11-01T18:20:00Z trained\n"
+    base = "ml-training-29001-1a2b3c4d"
+    tmeta = {"collected_at": "2026-11-01T18:35:01Z", "job": "ml-training-29001", "job_uid": "j-uid",
+             "pod": "ml-training-29001-x", "pod_uid": "1a2b3c4d-0000-4000-8000-000000000000", "phase": "Succeeded",
+             "containers": [{"name": "trainer", "exit_code": 0, "started_at": "2026-11-01T18:00:05Z",
+                             "finished_at": "2026-11-01T18:20:01Z", "log_sha256": sha(log.encode()),
+                             "log_lines": 1, "previous_log_saved": False}], "archiver_version": 2}
+    write(os.path.join(a, f"logs/trainer/{base}.json"), json.dumps(tmeta, indent=1, sort_keys=True))
+    write(os.path.join(a, f"logs/trainer/{base}.trainer.log"), log)
+    write(os.path.join(a, "logs/trainer-index.jsonl"), jl(tmeta))
+    write(os.path.join(a, "logs/api-state.json"), json.dumps({"uid": {"last_ts": "x"}}))
+    write(os.path.join(a, ".staging/123-abc/partial.pkl"), b"partial")
     e = v["load-evidence-pvc"]
     write(os.path.join(e, "attempts/load-20261101T2300Z-20261101T231400Z-7.json"), json.dumps({"hour": 1}))
     write(os.path.join(e, "attempts/load-20261102T0100Z-20261102T011400Z-7.json"), json.dumps({"hour": 2}))  # later
     write(os.path.join(e, "load-20261101T2300Z.json"), json.dumps({"latest": 1}))
     write(os.path.join(e, ".lock"), b"")
     m = v["ml-models-pvc"]
-    art = b"pickled-model"
     write(os.path.join(m, "lstm_nginx-test_requests.pkl"), art)
-    write(os.path.join(m, "lstm_nginx-test_requests.meta.json"), json.dumps({"trained_at": "2026-11-01T18:20:00Z"}))
+    write(os.path.join(m, "lstm_nginx-test_requests.meta.json"), side)
     write(os.path.join(m, "lstm_myapp_requests.pkl"), b"in-progress")
-    write(os.path.join(m, "lstm_myapp_requests.meta.json"), json.dumps({"trained_at": "2026-11-03T00:00:00Z"}))
+    write(os.path.join(m, "lstm_myapp_requests.meta.json"), json.dumps({"trained_at": "2026-11-03T00:00:00Z",
+                                                                         "artifact_sha256": "0" * 64}))
     return v
 
 
@@ -140,7 +190,7 @@ def env(tmp_path):
                                     "checksum_manifests": ["S0-SHA256SUMS", "campaign/final-20261102/SHA256SUMS-fetch"]
                                     + [f"pvc-exports/{p}/SHA256SUMS" for p in P.PVC_EXPORTS]}},
            "populate": {
-               "cutoff": CUTOFF,
+               "cutoff": CUTOFF, "collection_cutoff": "2026-11-02T08:44:00Z",
                "content_sources": {"campaign/": camp, "protocol/": proto, "inventory/": inv},
                "legacy_source": {"repo_dir": repo, "commit": head[:7], "paths": ["k8s-manifests"],
                                  "operator_image": "harbor.example/autoscaler/operator@sha256:" + "b" * 64},
@@ -237,12 +287,20 @@ def test_full_population_and_verification(env):
         sorted(mandatory())
     # cutoff selection by the files' own names and record timestamps
     fc = members(e, "forecast-log-pvc")["forecasts.jsonl"]
-    assert fc["selection"] == {"kind": "prefix", "lines": 2}
-    assert set(members(e, "evidence-archive-pvc")) == {"archive/k1/manifest.json", "archive/k1/lstm.pkl",
-                                                       "archive/k1/meta.json", "INDEX.jsonl",
-                                                       "logs/api-ensemble.jsonl", "logs/trainer-index.jsonl"}
+    assert (fc["kind"], fc["lines"], fc["lines_after_cutoff"]) == ("prefix", 2, 1)
+    ea = members(e, "evidence-archive-pvc")
+    bundles = {p.split("/")[1] for p in ea if p.startswith("archive/")}
+    assert len(bundles) == 2 and not any("later" in b for b in bundles)        # the post-cutoff bundle is out
+    assert {"INDEX.jsonl", "REJECTS.jsonl", "RUNS.jsonl", "logs/api-ensemble.jsonl", "logs/api-reload.jsonl",
+            "logs/api-coverage.jsonl", "logs/trainer-index.jsonl", "logs/trainer/ml-training-29001-1a2b3c4d.json",
+            "logs/trainer/ml-training-29001-1a2b3c4d.trainer.log"} <= set(ea)
+    assert ea["INDEX.jsonl"]["lines"] == 3 and ea["RUNS.jsonl"]["lines"] == 1    # recovered record kept, later out
+    assert ea["logs/trainer/ml-training-29001-1a2b3c4d.trainer.log"]["verified"] == "equals the index's log_sha256"
+    assert not any(p.startswith((".staging", "logs/api-state")) for p in ea)
+    man = json.load(open(os.path.join(root, "pvc-exports/evidence-archive-pvc/manifest.json")))
+    assert {x["path"] for x in man["reviewed_exclusions"]} == {"logs/api-state.json", ".staging/123-abc/partial.pkl"}
     assert set(members(e, "load-evidence-pvc")) == {"attempts/load-20261101T2300Z-20261101T231400Z-7.json",
-                                                    "load-20261101T2300Z.json"}            # .lock empty, later hour out
+                                                    "load-20261101T2300Z.json"}            # .lock reviewed, later out
     assert set(members(e, "ml-models-pvc")) == {"lstm_nginx-test_requests.pkl", "lstm_nginx-test_requests.meta.json"}
     # S0-SHA256SUMS covers every mandatory file except itself
     s0 = open(os.path.join(root, "S0-SHA256SUMS")).read().splitlines()
@@ -254,6 +312,8 @@ def test_full_population_and_verification(env):
     assert not os.path.exists(C.lock_path(e["record"].doc, P.LOCK_SCOPE))
     cov = json.load(open(os.path.join(root, "storage/pvc-retention-and-export-coverage.json")))
     assert len(cov["claims"]) == 5 and all("residual_not_backed_up" in c for c in cov["claims"])
+    models = next(c for c in cov["claims"] if c["claim"] == "ml-models-pvc")
+    assert models["protected"]["archived_copies"][0]["archived_bundle"].startswith("20261101T1800Z-")
     assert all("warning" in c for c in cov["claims"])                        # reclaim policy Delete is flagged
 
 
@@ -292,7 +352,7 @@ def test_destination_tampering_fails_verify(env):
 
 @pytest.mark.parametrize("lines, why", [
     (['{"at": "2026-11-01T00:00:00Z"}', '{"at": "2026-11-03T00:00:00Z"}', '{"at": "2026-11-01T01:00:00Z"}'],
-     "not append-ordered"),
+     "a record at or before the cutoff after a later one"),
     (['{"at": "2026-11-01T00:00:00Z"}', '{"other": 1}'], "without any of"),
     (['{"at": "2026-11-05T00:00:00Z"}'], "no record of forecasts.jsonl is at or before the cutoff"),
 ])
@@ -340,16 +400,6 @@ def test_busy_jobs_and_leftover_readers_refuse(env):
     assert any("active Jobs ['ml-training-29001']" in p for p in P.probe_plan(e["record"], e["kube"])["problems"])
 
 
-def test_cleanup_must_be_proven(env):
-    e = env
-    real = e["api"].delete
-    e["api"].delete = lambda path, uid, rv=None: {}                     # the API accepts, the pod never goes
-    p, d = reviewed(e["record"], P.probe_plan(e["record"], e["kube"]), P.PROBE, "probe-plan")
-    with pytest.raises(X.StagingError, match="cleanup of .* is NOT proven"):
-        P.probe(e["record"], e["kube"], p, d, e["exe"], e["clock"].sleep, e["clock"].now)
-    e["api"].delete = real
-
-
 def test_member_mismatch_is_rejected(env):
     e = env
     do_probe(e)
@@ -358,7 +408,7 @@ def test_member_mismatch_is_rejected(env):
         if pvc == "load-evidence-pvc":
             write(os.path.join(job["mount"], "load-20261101T2300Z.json"), json.dumps({"latest": 2, "x": "y"}))
     e["exe"] = fake_exec(e["vols"], grow)
-    with pytest.raises(X.StagingError, match="changed size since the probe"):
+    with pytest.raises(X.StagingError, match="changed since the probe"):
         do_export(e)
     assert P.leftover_readers(e["kube"], e["record"]) == []             # cleanup still proven after the failure
 
@@ -396,7 +446,51 @@ def test_existing_different_destination_is_never_overwritten(env):
     assert any("never overwritten" in p for p in P.plan(e["record"], e["kube"])["problems"])
 
 
-def test_lost_create_response_holds_the_lock_until_recovery(env):
+def crash(record):
+    lock = C.lock_path(record.doc, P.LOCK_SCOPE)
+    body = json.load(open(lock))
+    dead = subprocess.Popen(["true"]); dead.wait()
+    body["pid"] = dead.pid
+    open(lock, "w").write(json.dumps(body, sort_keys=True))
+    return lock
+
+
+def test_unproven_cleanup_keeps_the_lock_until_recovery_proves_it(env):
+    """Codex #34 item 1: a reader whose deletion cannot be proven leaves its lifecycle unresolved and the shared lock
+    held; recovery deletes the nonce's pods (durable delete intents) and proves cleanup before releasing."""
+    e = env
+    real = e["api"].delete
+    e["api"].delete = lambda path, uid, rv=None: {}
+    p, d = reviewed(e["record"], P.probe_plan(e["record"], e["kube"]), P.PROBE, "probe-plan")
+    with pytest.raises(X.StagingError, match="NOT proven"):
+        P.probe(e["record"], e["kube"], p, d, e["exe"], e["clock"].sleep, e["clock"].now)
+    e["api"].delete = real
+    lock = C.lock_path(e["record"].doc, P.LOCK_SCOPE)
+    assert os.path.exists(lock) and P.leftover_readers(e["kube"], e["record"])
+    assert P._unresolved_steps(e["record"], P.PROBE)
+    assert [r for r in X.receipts(e["record"], P.PROBE) if r["event"].startswith("delete-intent-")]
+    crash(e["record"])
+    rp, rd = reviewed(e["record"], P.recover_plan(e["record"], e["kube"]), "populate-s0-recover", "recover-plan")
+    assert rp["actions"][0]["pods"]
+    P.recover(e["record"], e["kube"], rp, rd, e["clock"].sleep, e["clock"].now)
+    assert not os.path.exists(lock) and P.leftover_readers(e["kube"], e["record"]) == []
+    assert P._unresolved_steps(e["record"], P.PROBE) == []
+
+
+def test_startup_failure_still_cleans_up_before_releasing(env):
+    """Codex #34 item 1: a reader that never starts is still deleted and proven gone; only then is the lock released."""
+    e = env
+    e["api"].on_poll.clear()                                           # the kubelet never runs the pod
+    p, d = reviewed(e["record"], P.probe_plan(e["record"], e["kube"]), P.PROBE, "probe-plan")
+    with pytest.raises(X.StagingError, match="did not start"):
+        P.probe(e["record"], e["kube"], p, d, e["exe"], e["clock"].sleep, e["clock"].now)
+    assert P.leftover_readers(e["kube"], e["record"]) == []
+    assert not os.path.exists(C.lock_path(e["record"].doc, P.LOCK_SCOPE))
+    steps = [r for r in X.receipts(e["record"], P.PROBE) if r["event"].startswith("step-")]
+    assert steps[-1]["data"]["result"] == "cleaned-after-failure"
+
+
+def test_lost_create_response_is_reconciled_by_the_proven_cleanup(env):
     e = env
     real = e["api"].create
 
@@ -407,17 +501,109 @@ def test_lost_create_response_holds_the_lock_until_recovery(env):
     p, d = reviewed(e["record"], P.probe_plan(e["record"], e["kube"]), P.PROBE, "probe-plan")
     with pytest.raises(C.ApiError):
         P.probe(e["record"], e["kube"], p, d, e["exe"], e["clock"].sleep, e["clock"].now)
-    e["api"].create = real
-    lock = C.lock_path(e["record"].doc, P.LOCK_SCOPE)
-    assert os.path.exists(lock) and P.leftover_readers(e["kube"], e["record"])
-    body = json.load(open(lock))
-    dead = subprocess.Popen(["true"]); dead.wait()
-    body["pid"] = dead.pid
-    open(lock, "w").write(json.dumps(body, sort_keys=True))
-    rp, rd = reviewed(e["record"], P.recover_plan(e["record"], e["kube"]), "populate-s0-recover", "recover-plan")
-    assert [a["observed"] for a in rp["actions"]] == ["done"]
-    P.recover(e["record"], e["kube"], rp, rd)
-    assert not os.path.exists(lock) and P.leftover_readers(e["kube"], e["record"]) == []
+    assert P.leftover_readers(e["kube"], e["record"]) == []             # the committed pod was found and deleted
+
+
+def test_legacy_and_s0_exclude_each_other(env):
+    """Codex #34 item 2: one atomic lock per cluster and scope; neither side can start while the other holds it."""
+    e = env
+    p, d = reviewed(e["record"], P.probe_plan(e["record"], e["kube"]), P.PROBE, "probe-plan")
+    with C.exclusive_lock(e["record"].doc, "legacy", holder="legacy quiesce"):        # legacy.py's scope
+        with pytest.raises(X.StagingError, match="exists"):
+            P.probe(e["record"], e["kube"], p, d, e["exe"], e["clock"].sleep, e["clock"].now)
+    seen = []
+
+    def legacy_tries(pvc, job):
+        try:
+            with C.exclusive_lock(e["record"].doc, "legacy", holder="legacy quiesce"):
+                seen.append("legacy ran")
+        except X.StagingError:
+            seen.append("legacy refused")
+    e["exe"] = fake_exec(e["vols"], legacy_tries)
+    P.probe(e["record"], e["kube"], p, d, e["exe"], e["clock"].sleep, e["clock"].now)
+    assert set(seen) == {"legacy refused"}
+
+
+def test_preconditions_are_revalidated_before_each_reader(env):
+    e = env
+    p, d = reviewed(e["record"], P.probe_plan(e["record"], e["kube"]), P.PROBE, "probe-plan")
+
+    def job_starts(pvc, job):
+        if pvc == "forecast-log-pvc":
+            e["api"].add("jobs", {"kind": "Job", "metadata": {"name": "evidence-archive-29002", "namespace": "ml-engine"},
+                                  "status": {"active": 1}})
+    e["exe"] = fake_exec(e["vols"], job_starts)
+    with pytest.raises(X.StagingError, match="active Jobs"):
+        P.probe(e["record"], e["kube"], p, d, e["exe"], e["clock"].sleep, e["clock"].now)
+    assert [r["data"]["pvc"] for r in X.receipts(e["record"], P.PROBE) if r["event"] == "probed"] == ["forecast-log-pvc"]
+    assert P.leftover_readers(e["kube"], e["record"]) == []
+
+
+def test_same_length_edit_after_the_probe_is_refused(env):
+    """Codex #34 item 3: the selection is byte-bound (sha256), not size-bound."""
+    e = env
+    do_probe(e)
+
+    def edit(pvc, job):
+        if pvc == "load-evidence-pvc":
+            write(os.path.join(job["mount"], "load-20261101T2300Z.json"), json.dumps({"latest": 7}))   # same length
+    e["exe"] = fake_exec(e["vols"], edit)
+    with pytest.raises(X.StagingError, match="bytes differ from the probe"):
+        do_export(e)
+
+
+@pytest.mark.parametrize("target, why", [
+    ("bundle-artifact", "do not match the manifest's original hashes"),
+    ("trainer-log", "does not match its log_sha256"),
+])
+def test_original_writer_hashes_are_verified(env, target, why):
+    e = env
+    a = e["vols"]["evidence-archive-pvc"]
+    if target == "bundle-artifact":
+        d = next(x for x in os.listdir(os.path.join(a, "archive")) if "sidecar" not in x and "later" not in x)
+        write(os.path.join(a, "archive", d, "lstm_nginx-test_requests.pkl"), b"pickled-model-vX")
+    else:
+        write(os.path.join(a, "logs/trainer/ml-training-29001-1a2b3c4d.trainer.log"), "tampered\n")
+    do_probe(e)
+    assert any(why in x for x in P.plan(e["record"], e["kube"])["problems"])
+
+
+def test_model_without_an_archived_copy_is_refused(env):
+    """The mutable model directory is not historical storage: an exported pair needs its archived immutable copy."""
+    e = env
+    m = e["vols"]["ml-models-pvc"]
+    art = b"another-model"
+    write(os.path.join(m, "lstm_other_requests.pkl"), art)
+    write(os.path.join(m, "lstm_other_requests.meta.json"), json.dumps({"trained_at": "2026-11-01T12:00:00Z",
+                                                                          "artifact_sha256": sha(art)}))
+    do_probe(e)
+    assert any("lstm_other_requests.meta.json: no immutable archived copy" in x
+               for x in P.plan(e["record"], e["kube"])["problems"])
+
+
+def test_unreviewed_files_block_and_reviewed_exclusions_are_listed(env):
+    """Codex #34 item 5: every file is selected, rule-excluded with a reason, or a reviewed exclusion."""
+    e = env
+    write(os.path.join(e["vols"]["evidence-archive-pvc"], "logs/new-collector.jsonl"), jl({"at": "x"}))
+    do_probe(e)
+    p = P.plan(e["record"], e["kube"])
+    assert any("logs/new-collector.jsonl is neither selected" in x for x in p["problems"])
+    ex = p["pvcs"]["evidence-archive-pvc"]["reviewed_exclusions"]
+    assert {x["path"] for x in ex} == {"logs/api-state.json", ".staging/123-abc/partial.pkl"}
+    assert all(x["reason"] for x in ex)
+    rule_ex = {x["path"]: x["reason"] for x in p["pvcs"]["ml-models-pvc"]["rule_excluded"]}
+    assert rule_ex["lstm_myapp_requests.meta.json"] == "trained after the cutoff"
+
+
+def test_trainer_index_with_writer_records_and_recovered_index(env):
+    """Codex #34 item 4: the writer's collected_at and nested containers; a recovered INDEX record (old copied_at
+    after newer records) does not break the prefix."""
+    e = env
+    do_probe(e)
+    p = P.plan(e["record"], e["kube"])
+    assert p["problems"] == [], p["problems"]
+    sel = {it["path"]: it for it in p["pvcs"]["evidence-archive-pvc"]["selection"]}
+    assert sel["logs/trainer-index.jsonl"]["lines"] == 1 and sel["INDEX.jsonl"]["lines"] == 3
 
 
 def test_cli_plan_is_read_only(env, capsys):
