@@ -1,6 +1,7 @@
 """Part 2's view of part 1's in-memory API (fakes.FakeApi, not edited): the extra kinds part 2 touches (ConfigMaps,
 ResourceQuotas, ReplicaSets, PriorityClasses, StorageClasses, NetworkPolicies, scrape objects) are routed too, and a
-replace stores the whole body (metadata labels, data, spec), still refusing a stale resourceVersion or another UID."""
+replace stores the whole body (metadata labels, data, spec), still refusing a stale resourceVersion or another UID; a
+replace of a Deployment's /scale changes only spec.replicas and answers a Scale (spec.replicas omitted at 0)."""
 
 import copy
 import uuid
@@ -53,11 +54,29 @@ class FakeApi2(fakes.FakeApi):
             raise fakes.Conflict("resourceVersion conflict", 409)
         if bm.get("uid") != o["metadata"]["uid"]:
             raise fakes.Conflict("UID precondition failed", 409)
+        if sub == "scale":
+            return self._scale(o, body)
         new = copy.deepcopy(body)
         new["metadata"]["generation"] = o["metadata"].get("generation", 1) + (body.get("spec") != o.get("spec"))
         new["metadata"]["resourceVersion"] = self._next_rv()
         self.objects[(kind, ns, name)] = new
         return copy.deepcopy(new)
+
+    def _scale(self, o, body):
+        """The Deployment scale subresource: only spec.replicas changes (generation +1 on a change); the response is an
+        autoscaling/v1 Scale whose spec.replicas is omitted at 0 (omitempty), as the real API server answers."""
+        want = body["spec"]["replicas"]
+        if o["spec"].get("replicas") != want:
+            o["metadata"]["generation"] = o["metadata"].get("generation", 1) + 1
+        o["spec"]["replicas"] = want
+        o["metadata"]["resourceVersion"] = self._next_rv()
+        if self.instant_pods:
+            self.sync_pods(o)
+        m = o["metadata"]
+        return {"apiVersion": "autoscaling/v1", "kind": "Scale",
+                "metadata": {"name": m["name"], "namespace": m["namespace"], "uid": m["uid"],
+                             "resourceVersion": m["resourceVersion"]},
+                "spec": {"replicas": want} if want else {}, "status": {"replicas": o["status"].get("replicas", 0)}}
 
     # --- test conveniences ---
     def put(self, obj):
