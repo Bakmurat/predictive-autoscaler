@@ -96,6 +96,32 @@ then takes the existing stop/unresolved path. A default sidecar
 **Claim limit.** Results concern this sidecar-free fixture, not mesh-enabled workloads. They are not directly comparable
 with the old prodcluster benchmark, whose `demo` pods ran with sidecars.
 
+## Params stages: reservation before calibration
+
+The full c28-params/v1 file can only be completed after capacity calibration on the reserved W (`c0_rps`, fixture
+resources, `work_iterations`, the HPA target, routes, ...), so the S2 reservation validates only the fields it
+consumes: `render.validate_stage(params, "reservation")` (`execlib.load_params_stage`) checks `schema`, `run_id`,
+`nodes.workload`/`nodes.support`, `reservation.taint_key`/`taint_value`/`role_label` and `control_namespace` +
+`release` (occupant classification on S) with the full validation's strictness (no placeholders, DNS names,
+qualified label keys, the taint value equal to the run id); every other field may still be a placeholder.
+`reserve.py` plan/apply/rollback-plan/rollback/verify use it, so rollback never needs calibrated parameters.
+Passing a stage validation says nothing about readiness: `render.full_validation_problems(params)` (and
+`execlib.experiment_params_problems`, which adds the residency requirement) list why the params are incomplete. `reserve.py
+verify` reports `reservation: PASS|FAIL`, `placement: PASS|FAIL|NOT READY` (the rendered placement is checked only
+on complete params), `ready_for_experiment` and `experiment_readiness`, which follows the combined verdict and names
+every failing part (`reservation FAIL (...)`, `params incomplete (...)`, `rendered placement FAIL (...)`); exit 0
+ready, 3 reserved but not ready, 1 fail; its `problems` include the NOT READY item. `validate` (the full validation,
+used by `load_params` in prepare, freeze and session) includes the reservation stage and refuses any remaining
+placeholder anywhere in the file.
+
+Two gates read that verdict. `reserve.require_ready_for_experiment` needs the complete experiment parameters on a
+passing reservation: `prepare.py` requires it live in every phase's plan and again in apply's recomputation under the
+shared lock, so a reservation lost between review and apply creates nothing. It is NOT the calibration gate (it needs
+the calibrated values themselves, which would recreate the c0/HPA-target cycle). Capacity calibration on W will need
+`reserve.require_reservation_pass` (the reservation part alone) plus its own separately validated calibration
+configuration and admission checks; calibration is not implemented here. `residency` stays outside the reservation
+stage and mandatory for workload admission (`load_params`, prepare's residency audit).
+
 ## Fixture resources and the residency budget
 
 The fixture's CPU/memory requests and limits are a calibrated, reviewed parameter (manifest section 3), identical for

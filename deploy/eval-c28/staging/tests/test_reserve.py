@@ -12,7 +12,7 @@ from part2_fixtures import RUN, S_UID, W_UID, api, base_params, make_record, res
 TAINT = {"key": "c28.devkuban.com/reserved", "value": RUN, "effect": "NoSchedule"}
 
 
-def setup(api, make_record, w_taints=None, **over):
+def setup(api, make_record, w_taints=None, params=None, **over):
     api.put(F.node("worker-w", taints=w_taints, uid=W_UID))
     api.put(F.node("worker-s", uid=S_UID))
     section = reserve_section(**over)
@@ -22,7 +22,7 @@ def setup(api, make_record, w_taints=None, **over):
     api.put(F.pod("cilium-abc", "kube-system", "worker-w", owner=("DaemonSet", "cilium"),
                   tolerations=[{"operator": "Exists"}]))
     api.put(F.pod("kube-proxy-worker-w", "kube-system", "worker-w", owner=("Node", "worker-w")))
-    record = X.load_record(make_record({"reserve": section}), ("reserve",))
+    record = X.load_record(make_record({"reserve": section}, params=params), ("reserve",))
     return record, record.kube(api)
 
 
@@ -153,6 +153,9 @@ def test_verify_passes_with_only_allowed_and_evaluation_pods(api, make_record):
                   labels={X.RUN_LABEL: RUN}))
     out = reserve.verify(record, kube)
     assert out["problems"] == [] and out["result"] == "PASS"
+    assert out["reservation"] == "PASS" and out["placement"] == "PASS" and out["ready_for_experiment"] is True
+    assert out["experiment_readiness"] == "READY"
+    reserve.require_ready_for_experiment(out)
 
 
 def test_movable_owner_is_reported_pending_not_moved(api, make_record):
@@ -212,3 +215,194 @@ def test_lost_response_during_apply_is_recovered_from_the_journal(api, make_reco
     assert W_UID in reserve.reserved_nodes(record)
     do_rollback(record, kube)
     assert api.obj("Node", "worker-w")["spec"].get("taints") == []
+
+
+# --- reservation-stage params (Codex: reservation applied is separate from ready for calibration/experiment) ---------
+
+def stage_params():
+    """The prodcluster template with only the fields the reservation consumes filled in: every experiment field (c0,
+    fixture resources, work_iterations, HPA target, routes, image, residency, ...) is still a placeholder."""
+    with open(os.path.join(PF.STAGING, "..", "params", "prodcluster.template.json")) as fh:
+        p = json.load(fh)
+    p["run_id"] = RUN
+    p["nodes"] = {"workload": "worker-w", "support": "worker-s"}
+    p["reservation"]["taint_value"] = RUN
+    p["release"] = "pa-eval"
+    return p
+
+
+CONSUMED = ["schema", "run_id", "nodes.workload", "nodes.support", "reservation.taint_key", "reservation.taint_value",
+            "reservation.role_label", "control_namespace", "release"]
+
+
+def _set(p, dotted, value):
+    cur = p
+    *parents, leaf = dotted.split(".")
+    for k in parents:
+        cur = cur[k]
+    cur[leaf] = value
+
+
+def test_stage_fields_are_exactly_what_reserve_consumes():
+    assert list(X.import_harness().render.STAGE_FIELDS["reservation"]) == CONSUMED
+
+
+def test_stage_params_are_incomplete_for_the_experiment(api, make_record):
+    record, _ = setup(api, make_record, params=stage_params())
+    with pytest.raises(X.StagingError, match="placeholder|must be"):
+        X.load_params(record)                                   # the full loader still refuses them
+    problems = X.experiment_params_problems(stage_params())
+    text = "; ".join(problems)
+    assert "c0_rps" in text and "fixture.work_iterations" in text and "routes.metrics_upstream" in text
+    assert X.experiment_params_problems(base_params()) == []
+
+
+def test_reservation_works_with_stage_params(api, make_record):
+    record, kube = setup(api, make_record, params=stage_params())
+    p = reserve.plan(record, kube)
+    assert p["problems"] == [] and api.mutations() == []
+    do_apply(record, kube)
+    w = api.obj("Node", "worker-w")
+    assert w["spec"]["taints"] == [TAINT] and w["metadata"]["labels"]["c28.devkuban.com/role"] == "workload"
+    out = reserve.verify(record, kube)
+    assert out["reservation"] == "PASS" and out["reservation_problems"] == []
+    assert out["placement"] == "NOT READY" and out["placement_problems"] == []
+    assert out["ready_for_experiment"] is False and out["result"] == "RESERVED-NOT-READY"
+    assert out["experiment_readiness"].startswith("NOT READY: params incomplete (")
+    assert "c0_rps" in out["experiment_readiness"] and "fixture.cpu_request" in out["experiment_readiness"]
+    # an empty problems list can never be mistaken for readiness: the NOT READY item is in it
+    assert out["problems"] == ["experiment readiness: " + out["experiment_readiness"]]
+    with pytest.raises(X.StagingError, match="not ready for the experiment"):
+        reserve.require_ready_for_experiment(out)
+    do_rollback(record, kube)
+    assert api.obj("Node", "worker-w")["spec"]["taints"] == []
+    assert "c28.devkuban.com/role" not in api.obj("Node", "worker-s")["metadata"]["labels"]
+
+
+def test_verify_fail_is_not_reported_as_reserved(api, make_record):
+    record, kube = setup(api, make_record, params=stage_params())
+    out = reserve.verify(record, kube)                          # nothing applied yet
+    assert out["reservation"] == "FAIL" and out["placement"] == "NOT READY"
+    assert out["result"] == "FAIL" and out["ready_for_experiment"] is False
+
+
+def test_rollback_needs_only_reservation_stage_params(api, make_record, tmp_path):
+    """Applied with complete params; the params file then loses its calibrated values: rollback still works."""
+    record, kube = setup(api, make_record)
+    do_apply(record, kube)
+    (tmp_path / "params.json").write_text(json.dumps(stage_params()))
+    with pytest.raises(X.StagingError):
+        X.load_params(record)
+    do_rollback(record, kube)
+    assert api.obj("Node", "worker-w")["spec"]["taints"] == []
+    assert reserve.rollback_plan(record, kube)["actions"] == []
+
+
+@pytest.mark.parametrize("field", CONSUMED)
+def test_a_placeholder_in_a_consumed_field_is_refused(api, make_record, field):
+    params = stage_params()
+    _set(params, field, "<still to fill>")
+    record, kube = setup(api, make_record, params=params)
+    for fn in (reserve.plan, reserve.rollback_plan, reserve.verify):
+        with pytest.raises(X.StagingError, match="placeholder|schema must be"):
+            fn(record, kube)
+    assert api.mutations() == []
+
+
+@pytest.mark.parametrize("field,value,why", [
+    ("run_id", "C28_R1", "short DNS label"),
+    ("control_namespace", "Pa-Eval", "short DNS label"),
+    ("release", "pa_eval", "Helm release"),
+    ("nodes.workload", "worker-s", "must differ"),
+    ("nodes.support", "Worker S", "node name"),
+    ("reservation.taint_key", "bad key!", "qualified name"),
+    ("reservation.role_label", "c28.devkuban.com/a/b", "qualified name"),
+    ("reservation.taint_value", "c28-other", "must be the run_id"),
+    ("reservation.taint_value", 7, "label value"),
+])
+def test_a_malformed_consumed_field_is_refused(api, make_record, field, value, why):
+    params = stage_params()
+    _set(params, field, value)
+    record, kube = setup(api, make_record, params=params)
+    with pytest.raises(X.StagingError, match=why):
+        reserve.plan(record, kube)
+
+
+def test_cli_verify_exit_distinguishes_reserved_from_ready(api, make_record, capsys):
+    record, kube = setup(api, make_record, params=stage_params())
+    do_apply(record, kube)
+    assert reserve.main(["--record", record.path, "verify"], api=api) == reserve.NOT_READY_EXIT
+    out = json.loads(capsys.readouterr().out)
+    assert out["result"] == "RESERVED-NOT-READY" and out["ready_for_experiment"] is False
+
+
+def test_cli_verify_ready_with_complete_params(api, make_record, capsys):
+    record, kube = setup(api, make_record)
+    do_apply(record, kube)
+    assert reserve.main(["--record", record.path, "verify"], api=api) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["ready_for_experiment"] is True and out["placement"] == "PASS"
+
+
+def test_prepare_refuses_incomplete_params(api, make_record):
+    import prepare
+    api.put(F.node("worker-w", uid=W_UID))
+    api.put(F.node("worker-s", uid=S_UID))
+    record = X.load_record(make_record({"prepare": PF.prepare_section(), "reserve": reserve_section()},
+                                       params=stage_params()), ("prepare",))
+    kube = record.kube(api)
+    for fn in (lambda: prepare.plan(record, kube, "values"), lambda: prepare.verify(record, kube)):
+        with pytest.raises(X.StagingError, match="params"):
+            fn()
+    assert api.mutations() == []
+
+
+def test_session_reservation_stops_include_not_ready(api, make_record):
+    """session.py's reservation check turns reserve verify's problems into stops: incomplete params are a stop."""
+    import session
+    record, kube = setup(api, make_record, params=stage_params())
+    do_apply(record, kube)
+    ctx = type("Ctx", (), {"record": record, "kube": kube})()
+    stops = session._occupant_stops(ctx)
+    assert stops and any("NOT READY" in s for s in stops)
+
+
+# --- one coherent verdict (Codex #46 review, finding 2) and the calibration-side gate ---------------------------------
+
+def test_readiness_follows_the_combined_verdict(api, make_record):
+    """Complete params with a passing rendered placement but a FAILED reservation is NOT READY, with the reasons."""
+    record, kube = setup(api, make_record)
+    out = reserve.verify(record, kube)                          # nothing applied
+    assert out["placement"] == "PASS" and out["reservation"] == "FAIL" and out["ready_for_experiment"] is False
+    assert out["experiment_readiness"].startswith("NOT READY: reservation FAIL (")
+    assert "the run taint is not exactly" in out["experiment_readiness"]
+    assert out["experiment_readiness"] != "READY"
+
+
+def test_readiness_lists_every_failing_part(api, make_record):
+    record, kube = setup(api, make_record, params=stage_params())
+    out = reserve.verify(record, kube)                          # nothing applied, params incomplete
+    r = out["experiment_readiness"]
+    assert r.startswith("NOT READY: reservation FAIL (") and " | params incomplete (" in r and "c0_rps" in r
+
+
+def test_readiness_names_a_failing_rendered_placement(api, make_record, monkeypatch):
+    record, kube = setup(api, make_record)
+    do_apply(record, kube)
+    monkeypatch.setattr(reserve, "rendered_placement_problems", lambda p: ["c28-x: tolerations wrong"])
+    out = reserve.verify(record, kube)
+    assert out["reservation"] == "PASS" and out["placement"] == "FAIL" and out["result"] == "FAIL"
+    assert out["experiment_readiness"] == "NOT READY: rendered placement FAIL (c28-x: tolerations wrong)"
+    assert out["problems"] == ["c28-x: tolerations wrong"]
+
+
+def test_reservation_pass_gate_needs_no_experiment_params(api, make_record):
+    """What calibration will build on: the reservation part alone, never the complete experiment parameters."""
+    record, kube = setup(api, make_record, params=stage_params())
+    with pytest.raises(X.StagingError, match="does not pass"):
+        reserve.require_reservation_pass(reserve.verify(record, kube))
+    do_apply(record, kube)
+    out = reserve.verify(record, kube)
+    reserve.require_reservation_pass(out)
+    with pytest.raises(X.StagingError, match="not ready for the experiment"):
+        reserve.require_ready_for_experiment(out)

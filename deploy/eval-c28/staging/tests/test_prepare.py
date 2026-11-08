@@ -9,14 +9,24 @@ import execlib as X
 import part2_fixtures as PF
 import fake2 as F
 import prepare
-from part2_fixtures import RUN, api, base_params, make_record, prepare_section  # noqa: F401
+from part2_fixtures import (RUN, S_UID, W_UID, api, base_params, make_record, prepare_section,  # noqa: F401
+                            reserve_section)
 
 
-def setup(api, make_record, section=None):
+def setup(api, make_record, section=None, reserved=True):
+    """A record with prepare and reserve sections; the reservation applied (preparation requires its live verdict)."""
+    import reserve
     api.put({"apiVersion": "storage.k8s.io/v1", "kind": "StorageClass", "metadata": {"name": "retained-ssd"},
              "reclaimPolicy": "Retain"})
-    record = X.load_record(make_record({"prepare": section or prepare_section()}), ("prepare",))
-    return record, record.kube(api)
+    api.put(F.node("worker-w", uid=W_UID))
+    api.put(F.node("worker-s", uid=S_UID))
+    record = X.load_record(make_record({"prepare": section or prepare_section(), "reserve": reserve_section()}),
+                           ("prepare",))
+    kube = record.kube(api)
+    if reserved:
+        PF.plan_and_apply(reserve, record, kube)
+        api.calls.clear()                     # the call log starts after the reservation: the tests watch prepare
+    return record, kube
 
 
 def reviewed(record, kube, phase):
@@ -264,3 +274,61 @@ def test_lost_response_resumes_from_the_journal(api, make_record):
     assert len(targets["deployments"]) == 10
     for name, uid in targets["deployments"].items():
         assert api.obj("Deployment", name, "demo")["metadata"]["uid"] == uid
+
+
+# --- the live reservation gate (Codex #46 review, finding 1) ----------------------------------------------------------
+
+def _drop_w_taint(api):
+    w = api.obj("Node", "worker-w")
+    w["spec"]["taints"] = [t for t in w["spec"]["taints"] if t.get("key") != "c28.devkuban.com/reserved"]
+
+
+def test_every_plan_requires_the_live_reservation_verdict(api, make_record):
+    record, kube = setup(api, make_record, reserved=False)
+    for ph in prepare.PHASES:
+        p = prepare.plan(record, kube, ph)
+        assert any(x.startswith("reservation gate: ") for x in p["problems"]), ph
+        assert p["reservation_gate"]["reservation"] == "FAIL" and p["reservation_gate"]["ready_for_experiment"] is False
+
+
+def test_a_lost_reservation_blocks_preparation(api, make_record):
+    """Codex repro: apply reservation, remove W's taint, then prepare targets: reservation FAIL is a problem."""
+    record, kube = setup(api, make_record)
+    for ph in ("namespaces", "storage", "values", "common"):
+        run_phase(record, kube, ph)
+    _drop_w_taint(api)
+    p = prepare.plan(record, kube, "targets")
+    text = "\n".join(p["problems"])
+    assert "reservation gate: workload worker-w: the run taint is not exactly" in text
+    assert p["reservation_gate"] == {"reservation": "FAIL", "placement": "PASS", "ready_for_experiment": False,
+                                     "result": "FAIL"}
+
+
+def test_reservation_lost_between_review_and_apply_creates_nothing(api, make_record):
+    record, kube = setup(api, make_record)
+    for ph in ("namespaces", "storage", "values", "common"):
+        run_phase(record, kube, ph)
+    plan, digest = reviewed(record, kube, "targets")
+    assert plan["problems"] == [] and plan["reservation_gate"]["ready_for_experiment"] is True
+    api.calls.clear()
+    _drop_w_taint(api)
+    with pytest.raises(X.StagingError, match="changed since review|no longer produces the reviewed plan"):
+        prepare.apply(record, kube, "targets", plan, digest)
+    assert [c for c in api.mutations() if c[0] == "create"] == []
+    assert api.mutations() == []
+    assert not os.path.exists(os.path.join(record.evidence_dir, "targets.json"))
+
+
+def test_an_unplanned_occupant_blocks_preparation(api, make_record):
+    record, kube = setup(api, make_record)
+    api.put(F.pod("stray-1", "shop", "worker-w", owner=("Deployment", "stray")))
+    p = prepare.plan(record, kube, "namespaces")
+    assert any("reservation gate: workload: shop/stray-1" in x for x in p["problems"])
+
+
+def test_a_record_without_reservation_is_refused(api, make_record):
+    api.put({"apiVersion": "storage.k8s.io/v1", "kind": "StorageClass", "metadata": {"name": "retained-ssd"},
+             "reclaimPolicy": "Retain"})
+    record = X.load_record(make_record({"prepare": prepare_section()}), ("prepare",))
+    p = prepare.plan(record, record.kube(api), "namespaces")
+    assert "reservation gate: the record has no reserve section (reserve.py first)" in p["problems"]

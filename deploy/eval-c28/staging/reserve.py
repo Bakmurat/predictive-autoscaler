@@ -6,6 +6,7 @@
   reserve.py --record R rollback-plan                              read-only: what rollback would remove
   reserve.py --record R rollback --plan F --plan-digest D          remove only this run's own taint and label
   reserve.py --record R verify                                     read-only: reservation, occupants, placement
+                                                                   (exit 0 ready, 3 reserved but NOT READY, 1 fail)
 
 What it changes: on each of the two recorded nodes (bound by name AND UID) it adds the run's NoSchedule taint
 <taint key>=<run id> and the role label <role label>=workload|support, nothing else. A taint is not an evacuation:
@@ -25,6 +26,24 @@ The record's "reserve" section:
                "broad_tolerations": [{"namespace", "kind", "name"}]},  reviewed owners whose tolerations admit the taint
    "movable": [{"namespace", "kind", "name", "uid"}]}            owner-approved stateless owners still to move
 The taint value is the record's run_id. The params file must name the same nodes, taint key/value and role label.
+
+Params stage: the reservation comes BEFORE capacity calibration on the reserved W, so the experiment parameters
+(c0_rps, fixture resources, work_iterations, the HPA target, routes, ...) cannot be complete yet. Every command
+therefore validates only the reservation stage of the params (execlib.load_params_stage / render.validate_stage):
+run_id, nodes.workload/support, reservation.taint_key/taint_value/role_label, and control_namespace + release (the
+evaluation release's pods on S classify as evaluation occupants), with the full validation's strictness; rollback
+needs nothing more. verify separates "reservation verified" (require_reservation_pass: what calibration will build on,
+with its own calibration-configuration and admission checks) from "ready for the experiment" (complete parameters,
+require_ready_for_experiment; prepare.py enforces it live in every plan and again under the lock at apply):
+  reservation: PASS|FAIL                 taint, role labels, cordon, pressure, occupants, broad tolerations
+  placement:   PASS|FAIL|NOT READY       the rendered pods' tolerations and node affinity, checked only when the params
+                                         validate fully (otherwise NOT READY, never PASS)
+  experiment_readiness: "READY" | "NOT READY: " + every failing part with its reasons: "reservation FAIL (...)",
+                         "params incomplete (<missing/placeholder fields; refusal>)", "rendered placement FAIL (...)"
+  ready_for_experiment: true only when reservation and placement both PASS
+  problems: everything blocking the experiment, the NOT READY item included, so an empty list implies
+            ready_for_experiment (callers still check ready_for_experiment, never an empty list alone)
+  result: PASS (ready) | RESERVED-NOT-READY | FAIL
 """
 
 from __future__ import annotations
@@ -39,6 +58,8 @@ import execlib as X
 ROLES = ("workload", "support")
 HELPER = "reserve"
 ROLLBACK = "reserve-rollback"
+STAGE = "reservation"            # the params stage reserve consumes (c28.render.STAGE_FIELDS["reservation"])
+NOT_READY_EXIT = 3               # verify's exit status when the reservation PASSES but the experiment is NOT READY
 
 
 def _section(record: X.Record, params: Dict) -> Dict:
@@ -161,7 +182,7 @@ def _node(kube: X.Kube, s: Dict, role: str) -> Dict:
 
 
 def plan(record: X.Record, kube: X.Kube) -> Dict:
-    params = X.load_params(record)
+    params = X.load_params_stage(record, STAGE)
     s = _section(record, params)
     taint = _taint(s, record.run_id)
     actions = []
@@ -250,7 +271,7 @@ def apply(record: X.Record, kube: X.Kube, reviewed: Dict, reviewed_digest: str) 
 
 
 def rollback_plan(record: X.Record, kube: X.Kube) -> Dict:
-    params = X.load_params(record)
+    params = X.load_params_stage(record, STAGE)
     s = _section(record, params)
     taint = _taint(s, record.run_id)
     entries = X.receipts(record, HELPER)
@@ -336,10 +357,10 @@ def rendered_placement_problems(params: Dict) -> List[str]:
 
 
 def verify(record: X.Record, kube: X.Kube) -> Dict:
-    params = X.load_params(record)
+    params = X.load_params_stage(record, STAGE)
     s = _section(record, params)
     taint = _taint(s, record.run_id)
-    problems, nodes = [], []
+    problems, nodes = [], []                  # problems: the reservation's own
     applied = reserved_nodes(record)
     for role in ROLES:
         n = _node(kube, s, role)
@@ -368,9 +389,51 @@ def verify(record: X.Record, kube: X.Kube) -> Dict:
     broad = _broad_tolerations(kube, record, s, taint)
     for b in broad:
         problems.append(f"{b['namespace']}/{b['kind']}/{b['name']} tolerates the run taint and is not allowlisted")
-    problems += rendered_placement_problems(params)
+    incomplete = X.experiment_params_problems(params)
+    if incomplete:
+        placement, placement_problems = "NOT READY", []
+    else:
+        try:
+            placement_problems = rendered_placement_problems(params)
+        except X.import_harness().render.ParamsError as e:
+            placement_problems = [f"the params do not render: {e}"]
+        placement = "PASS" if not placement_problems else "FAIL"
+    reservation = "PASS" if not problems else "FAIL"
+    ready = reservation == "PASS" and placement == "PASS"
+    # experiment_readiness comes from the COMBINED verdict, every failing part with its specific reasons
+    incomplete_item = f"params incomplete ({'; '.join(incomplete)})"
+    reasons = ([f"reservation FAIL ({'; '.join(problems)})"] if problems else []) + \
+        ([incomplete_item] if incomplete else []) + \
+        ([f"rendered placement FAIL ({'; '.join(placement_problems)})"] if placement_problems else [])
+    readiness = "READY" if ready else "NOT READY: " + " | ".join(reasons)
+    blocking = problems + placement_problems + ([f"experiment readiness: NOT READY: {incomplete_item}"]
+                                                if incomplete else [])
+    result = "PASS" if ready else ("RESERVED-NOT-READY" if reservation == "PASS" and placement == "NOT READY"
+                                   else "FAIL")
     return {"helper": HELPER, "action": "verify", "run_id": record.run_id, "nodes": nodes, "occupants": occ,
-            "broad_tolerations": broad, "problems": problems, "result": "PASS" if not problems else "FAIL"}
+            "broad_tolerations": broad, "reservation": reservation, "reservation_problems": problems,
+            "placement": placement, "placement_problems": placement_problems, "experiment_readiness": readiness,
+            "ready_for_experiment": ready, "problems": blocking, "result": result}
+
+
+def require_reservation_pass(out: Dict) -> None:
+    """The reservation part of reserve verify's verdict only (taint, role labels, cordon, pressure, occupants, broad
+    tolerations), whatever the experiment parameters. Capacity calibration on W will need this PLUS its own separately
+    validated calibration configuration and admission checks (not implemented here); it never needs complete experiment
+    parameters, which would recreate the c0/HPA-target dependency cycle."""
+    if not (out.get("reservation") == "PASS" and out.get("reservation_problems") == []):
+        raise X.StagingError(f"the reservation does not pass: {out.get('reservation')} "
+                             f"({'; '.join(out.get('reservation_problems') or []) or 'no verdict'})")
+
+
+def require_ready_for_experiment(out: Dict) -> None:
+    """For callers that need the COMPLETE experiment parameters on a passing reservation (preparation, sessions):
+    reservation and rendered placement PASS, never an empty problems list alone. It is NOT the calibration gate:
+    it requires the calibrated parameters themselves (see require_reservation_pass)."""
+    if not (out.get("ready_for_experiment") is True and out.get("reservation") == "PASS"
+            and out.get("placement") == "PASS" and not out.get("problems")):
+        raise X.StagingError(f"the reservation is not ready for the experiment: reservation {out.get('reservation')}, "
+                             f"placement {out.get('placement')} ({out.get('experiment_readiness')})")
 
 
 def main(argv=None, api=None) -> int:
@@ -403,7 +466,7 @@ def main(argv=None, api=None) -> int:
         else:
             out = verify(record, kube)
             X.emit(out)
-            return 0 if out["result"] == "PASS" else 1
+            return 0 if out["ready_for_experiment"] else NOT_READY_EXIT if out["result"] == "RESERVED-NOT-READY" else 1
     except X.StagingError as e:
         print(f"reserve: refused: {e}", file=sys.stderr)
         return 1

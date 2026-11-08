@@ -20,7 +20,9 @@ Phases, in order (each a separate reviewed plan; nothing is applied as one unatt
   pas         the six PredictiveAutoscalers, every one in Recommend
 HPA and KEDA writers are never created here: session.py enables exactly one target's writer for its session.
 
-Every phase refuses any name that already exists (cluster-scoped PriorityClass included), any rendered object outside
+Every phase requires the live reservation verdict (reserve.verify: reservation PASS and rendered placement PASS on
+complete parameters, ready_for_experiment), in its plan and again in apply's recomputation under the shared lock, so
+a reservation lost between review and apply creates nothing. Every phase refuses any name that already exists (cluster-scoped PriorityClass included), any rendered object outside
 the c28-* names, any existing writer that references a target name, an unrendered fault schedule that is not empty,
 and a PredictiveAutoscaler not in Recommend. It never updates, adopts or deletes an existing object.
 
@@ -40,7 +42,7 @@ import json
 import os
 import re
 import sys
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import yaml
 
@@ -176,6 +178,23 @@ def admission_problems(record: X.Record, params: Dict, s: Dict, parts: Dict) -> 
     return [f"residency: {p}" for p in rep["problems"]]
 
 
+def reservation_gate(record: X.Record, kube: X.Kube) -> Tuple[Dict, List[str]]:
+    """The LIVE reservation verdict every preparation plan requires (reserve.verify, recomputed again under the shared
+    lock when apply re-plans): reservation PASS and rendered placement PASS on complete parameters
+    (ready_for_experiment), never an empty problems list alone. Returns the compact verdict the plan records (part of
+    its digest) and the blocking problems, each reason kept."""
+    if not record.doc.get("reserve"):
+        return {"reservation": "MISSING"}, ["reservation gate: the record has no reserve section (reserve.py first)"]
+    import reserve
+    out = reserve.verify(record, kube)
+    gate = {k: out[k] for k in ("reservation", "placement", "ready_for_experiment", "result")}
+    try:
+        reserve.require_ready_for_experiment(out)
+    except X.StagingError as e:
+        return gate, [f"reservation gate: {p}" for p in out["problems"]] or [f"reservation gate: {e}"]
+    return gate, []
+
+
 def _exists(kube: X.Kube, obj: Dict) -> Optional[Dict]:
     return kube.get(obj["kind"], obj["metadata"]["name"], obj["metadata"].get("namespace"))
 
@@ -209,7 +228,9 @@ def plan(record: X.Record, kube: X.Kube, phase: str) -> Dict:
     s = _section(record)
     parts = split(params)
     problems: List[str] = admission_problems(record, params, s, parts)
-    out = {"phase": phase}
+    gate, gate_problems = reservation_gate(record, kube)
+    problems += gate_problems
+    out = {"phase": phase, "reservation_gate": gate}
     if phase == "values":
         v = staging_values(record, params, s)
         problems += values_problems(v, params)
