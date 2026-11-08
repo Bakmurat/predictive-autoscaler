@@ -155,14 +155,11 @@ def check_bindings(study: dict, lock: dict, digest: str) -> None:
 
 def check_applicability(study: dict, lock: dict) -> None:
     """Section 12: the study scores under exactly the run-lock's applicability declaration (the frozen one, bound to
-    the same manifest digest), and every PA block reports the family field the run-lock recorded for its arm."""
+    the same manifest digest); otherwise the binding is malformed and the study is refused. An observed family field
+    or candidate set that differs from the run-lock's is NOT a binding error: it is a recorded runtime violation, and
+    the scorer classifies it as a contract FAIL."""
     if study.get("applicability") != lock.get("applicability"):
         raise BindingError("the study's applicability declaration is not the run-lock's")
-    for b in study.get("blocks", []):
-        rec = lock["arms"].get(f"{b.get('arm')}/{b.get('profile')}", {})
-        if b.get("families") is not None and b["families"] != rec.get("families"):
-            raise BindingError(f"block {b.get('arm')}/{b.get('profile')}/{b.get('seed')}: families differ from the "
-                               f"run-lock's")
 
 
 def main(argv=None) -> int:

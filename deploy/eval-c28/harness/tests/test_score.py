@@ -298,3 +298,17 @@ def test_the_family_field_and_candidate_set_are_verified():
     out = S.score(st)
     assert out["outcome"] == "FAIL" and any("spec.prediction.families" in r for r in
                                             out["candidates"]["PA-N"]["reasons"]["FAIL"])
+
+
+@pytest.mark.parametrize("change, fail", [
+    ({"families": None, "candidates_seen": ["seasonal_naive", "statistical"]}, "issued candidates"),
+    ({"families": ["seasonalNaive", "statistical"], "candidates_seen": None}, "spec.prediction.families"),
+])
+def test_a_known_family_violation_fails_beside_missing_evidence(change, fail):
+    # Codex r1 on #30: each observation is checked on its own; the missing one adds INCOMPLETE, never hides the FAIL.
+    st = study(lambda s: edit_blocks(s, "PA-N", lambda b: b.update(change) if b["seed"] == 201 else None))
+    out = S.score(st)
+    pan = out["candidates"]["PA-N"]
+    assert out["outcome"] == "FAIL" and pan["outcome"] == "FAIL"
+    assert any(fail in r for r in pan["reasons"]["FAIL"])
+    assert any("not verified at confirmation" in r for r in pan["reasons"]["INCOMPLETE"])

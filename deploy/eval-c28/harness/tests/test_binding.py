@@ -140,6 +140,6 @@ def test_the_study_scores_under_the_runlocks_applicability(locked):
     other["manifest_sha256"] = "9" * 64                       # another manifest version
     with pytest.raises(BindingError, match="applicability"):
         check_applicability({"applicability": other, "blocks": blocks}, doc)
-    with pytest.raises(BindingError, match="families differ"):
-        check_applicability({"applicability": copy.deepcopy(doc["applicability"]),
-                             "blocks": [dict(blocks[0], families=["seasonalNaive", "statistical"])]}, doc)
+    # An observed family mismatch is a runtime violation for the scorer (contract FAIL), not a malformed binding.
+    check_applicability({"applicability": copy.deepcopy(doc["applicability"]),
+                         "blocks": [dict(blocks[0], families=["seasonalNaive", "statistical"])]}, doc)

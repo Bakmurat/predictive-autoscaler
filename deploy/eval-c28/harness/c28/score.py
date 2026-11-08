@@ -314,12 +314,13 @@ def classify_candidate(study: Dict, arm: str, benefit: Dict[str, Dict] = None) -
         if x.get("invalid_cause") == "product":
             reasons["FAIL"].append(f"product-caused invalid block {x['arm']}/{x['profile']}/{x['seed']}")
     for x in blocks:                             # the family field and effective candidate set (C2.8a), observed
-        if x["arm"] not in F.PA_ARMS or x.get("families") is None or x.get("candidates_seen") is None:
+        if x["arm"] not in F.PA_ARMS:
             continue
         where = f"{x['arm']}/{x['profile']}/{x['seed']}"
-        if list(x["families"]) != list(F.PA_FAMILIES[x["arm"]]):
+        # Each observation on its own: a known violation is FAIL even when the other observation is missing.
+        if x.get("families") is not None and list(x["families"]) != list(F.PA_FAMILIES[x["arm"]]):
             reasons["FAIL"].append(f"contract failure: {where} ran with spec.prediction.families {x['families']}")
-        if not set(x["candidates_seen"]) <= set(F.PA_CANDIDATES[x["arm"]]):
+        if x.get("candidates_seen") is not None and not set(x["candidates_seen"]) <= set(F.PA_CANDIDATES[x["arm"]]):
             reasons["FAIL"].append(f"contract failure: {where} issued candidates {sorted(x['candidates_seen'])} "
                                    f"outside {list(F.PA_CANDIDATES[x['arm']])}")
 
