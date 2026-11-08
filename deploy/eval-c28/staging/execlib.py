@@ -249,13 +249,16 @@ def _expect_holds(obj: Dict, expect: List) -> bool:
 
 # Reconcilers of the journalled ops a helper defines itself (op -> fn(kube, intent data) -> observation); a helper
 # registers its own at import (session.py: "restore"). An op without a loaded reconciler is never guessed: unresolved.
-RECONCILERS: Dict[str, Callable[["Kube", Dict], Dict]] = {}
+RECONCILERS: Dict[str, Callable[["Kube", Dict, Optional["Record"]], Dict]] = {}
 
 
-def reconcile(kube: "Kube", d: Dict) -> Dict:
-    """What an unresolved intent actually did, read live: {"observed": done | not-done | unresolved, ...}."""
+def reconcile(kube: "Kube", d: Dict, record: Optional["Record"] = None) -> Dict:
+    """What an unresolved intent actually did, read live: {"observed": done | not-done | unresolved, ...}. A helper's
+    reconciler also gets the record (its journal holds what the step persisted before the outcome was lost)."""
     if d["op"] in RECONCILERS:
-        return RECONCILERS[d["op"]](kube, d)
+        if record is None:
+            return {"observed": "unresolved", "why": f"the {d['op']!r} reconciler needs the record"}
+        return RECONCILERS[d["op"]](kube, d, record)
     if d["op"] not in ("create", "delete", "update"):
         return {"observed": "unresolved", "why": f"no reconciler for the {d['op']!r} intent is loaded (recover "
                                                  "through the helper that wrote it)"}
@@ -288,7 +291,7 @@ def recover_plan(record: "Record", kube: "Kube") -> Dict:
             d = it["data"]
             actions.append({"helper": helper, "step": it["step"], "op": d["op"], "kind": d["kind"],
                             "namespace": d["namespace"], "name": d["name"], "context": d.get("context", {}),
-                            **reconcile(kube, d)})
+                            **reconcile(kube, d, record)})
     path_ = lock_file(record)
     sha = C.sha256_file(path_) if os.path.exists(path_) else ""
     return new_plan("recover", record, actions, lock=path_, lock_sha256=sha,
@@ -306,7 +309,7 @@ def recover(record: "Record", kube: "Kube", reviewed: Dict, reviewed_digest: str
         for a in live["actions"]:
             if a["observed"] != "unresolved":
                 C.append_receipt(record.doc, a["helper"], f"reconciled-{a['step']}",
-                                 {k: a[k] for k in ("observed", "uid", "why", "context") if k in a})
+                                 {k: a[k] for k in ("observed", "state", "uid", "why", "context") if k in a})
         if live["unresolved"]:
             receipt(record, "recover", "recovery-unresolved", {"plan_sha256": reviewed_digest,
                                                                "unresolved": live["unresolved"]})
@@ -425,12 +428,13 @@ class Kube:
             return out
         raise StagingError(f"{kind}/{name}: kept losing to concurrent updates ({last_err}); refusing")
 
-    def step(self, op: str, kind: str, namespace: Optional[str], name: str, uid: str, fn: Callable[[], Dict],
+    def step(self, op: str, kind: str, namespace: Optional[str], name: str, uid: str, fn: Callable[[str], Dict],
              pre: Optional[Dict] = None, expect: Optional[List] = None) -> Dict:
         """A helper-defined journalled step (e.g. session.py's restore: a /scale write plus the wait for its
-        convergence): intent-<n> with the validated pre-state BEFORE fn runs, step-<n> only when fn returns (its result
-        object's metadata is the post-state). ANY exception, a definitive API refusal included, leaves the intent
-        unresolved and the lock held: the helper's registered reconciler (RECONCILERS[op]) decides it in recover."""
+        convergence): intent-<n> with the validated pre-state BEFORE fn(mark) runs (mark: the intent's journal mark, for
+        what fn persists in between), step-<n> only when fn returns (its result object's metadata is the post-state).
+        ANY exception, a definitive API refusal included, leaves the intent unresolved and the lock held: the helper's
+        registered reconciler (RECONCILERS[op], given the record) decides it in recover."""
         j = self._journal()
         if not (isinstance(uid, str) and _UUID.match(uid)):
             raise StagingError(f"{kind}/{name}: a {op} step needs the bound UID")
@@ -439,7 +443,7 @@ class Kube:
 
         def do(mark):
             try:
-                result["out"] = fn()
+                result["out"] = fn(mark)
             except C.ApiError as e:          # not a plain refusal here: the step's outcome is decided by recover
                 raise StagingError(f"{kind}/{name}: {op} failed ({e})") from e
             return result["out"]

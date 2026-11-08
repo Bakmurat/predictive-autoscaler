@@ -47,8 +47,11 @@ each arm's writer provably inactive (PA arms: their own PredictiveAutoscaler, Re
 the current generation; H-CPU/H-RPS: no HPA, ScaledObject or KEDA HPA at all); otherwise it refuses that arm and says
 why. Each arm is one journalled step: the /scale write (read resourceVersion + UID), then the wait until desired,
 status and the owned pod census (terminating pods included) equal the count with every pod Running and Ready. A
-refusal, a timeout or a crash leaves the step unresolved; `recover` decides it from the live Deployment and pods and
-closes the restore. Writers' bounds and modes, faults, the quota, the recorder and history are never touched.
+refusal, a timeout or a crash leaves the step unresolved; `recover` decides it from the live Deployment and pods, only
+for a transition consistent with the intent and its restore-write receipt and with the writer inactive again
+(applied-convergence-pending and not-applied are recorded apart), and closes the restore. Admission checks EVERY
+target, the selected one included, at exactly the starting count and converged. Writers' bounds and modes, faults,
+the quota, the recorder and history are never touched.
 
 The record's "session" section:
   {"id": "s-0001", "phase": "preparation"|"confirmation", "arm": "PA-N", "profile": "s20", "seed": 201,
@@ -80,6 +83,7 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional, Tuple
 
+import common_records as C
 import execlib as X
 
 HELPER = "session"
@@ -444,9 +448,10 @@ def generator_job(c: Context, active_deadline: int, suspend: bool) -> Dict:
 
 def _residency_problems(c: Context, job: Dict) -> List[str]:
     """The session stays inside the params' residency budget: its generator is sidecar-free and requests no more than
-    the budgeted generator, and every other fixture target sits at no more than the budgeted idle replica count (the
-    W computation assumes it). The start itself never scales a target: a target left above it is restored first by
-    restore-plan / restore, which the refusal names."""
+    the budgeted generator, and EVERY fixture target, the selected one included, sits at exactly the frozen common
+    starting count and has converged there (desired, status and the owned pod census; the idle residency budget is only
+    an upper bound the W computation assumes). The start itself never scales a target: a target left elsewhere is
+    restored first by restore-plan / restore, which the refusal names."""
     R, out = c.c28.render, []
     try:
         R.audit_sidecar_free([job])
@@ -463,16 +468,23 @@ def _residency_problems(c: Context, job: Dict) -> List[str]:
     if cpu > r["generator"][0] or mem > r["generator"][1]:
         out.append(f"the generator requests ({req.get('cpu')}, {req.get('memory')}) exceed the residency budget's "
                    "generator (params residency.generator)")
+    count, _, count_problems = starting_count(c)
+    if count is None:
+        out += count_problems
     rs_all, pods_all = c.kube.list("ReplicaSet", c.ns), c.kube.list("Pod", c.ns)
     unsettled = []
-    for profile in c.c28.frozen.PROFILES:
-        for arm in c.c28.frozen.ARMS:
-            name = R.target_name(arm, profile)
-            dep = c.kube.get("Deployment", name, c.ns) if name != c.target else None
-            idle = idle_residency_problems(dep, rs_all, pods_all, r["idle_arm_replicas"]) if dep is not None else []
-            out += idle
-            if idle:
-                unsettled.append(name)
+    for name in sorted(_arm_targets(c.c28)):
+        dep = c.kube.get("Deployment", name, c.ns)
+        if dep is None:
+            continue                      # a missing selected target is refused by the start's own UID check
+        probs = idle_residency_problems(dep, rs_all, pods_all, r["idle_arm_replicas"])
+        want = int(dep["spec"].get("replicas") or 0)
+        if count is not None and want != count and want <= r["idle_arm_replicas"]:
+            probs.append(f"{name} has {want} replicas, not the common starting count {count}: restore it "
+                         "(restore-plan / restore) before loading an arm")
+        out += probs
+        if probs:
+            unsettled.append(name)
     if unsettled:
         out.append(f"restore {sorted(unsettled)} to the common starting count first: session.py --record R "
                    "restore-plan, review it, then restore --plan P --plan-digest D")
@@ -905,11 +917,15 @@ class Fleet:
         self.timeout_s = int((record.doc.get("restore") or {}).get("timeout_s", 600))
 
     def arms(self) -> Dict[str, Tuple[str, str]]:
-        R = self.c28.render
-        return {R.target_name(a, p): (a, p) for a in self.c28.frozen.ARMS for p in self.c28.frozen.PROFILES}
+        return _arm_targets(self.c28)
 
 
-def starting_count(f: Fleet) -> Tuple[Optional[int], Dict, List[str]]:
+def _arm_targets(c28) -> Dict[str, Tuple[str, str]]:
+    """Every fixture target: name -> (arm, profile)."""
+    return {c28.render.target_name(a, p): (a, p) for a in c28.frozen.ARMS for p in c28.frozen.PROFILES}
+
+
+def starting_count(f) -> Tuple[Optional[int], Dict, List[str]]:
     """(count, provenance, problems): the frozen common starting count, from the arms' renderings (and, for a block,
     the run-lock's)."""
     R, problems, counts = f.c28.render, [], {}
@@ -917,7 +933,7 @@ def starting_count(f: Fleet) -> Tuple[Optional[int], Dict, List[str]]:
         idle = R.residency_params(f.params)["idle_arm_replicas"]
     except R.ParamsError as e:
         return None, {}, [str(e)]
-    for name, (arm, profile) in sorted(f.arms().items()):
+    for name, (arm, profile) in sorted(_arm_targets(f.c28).items()):
         objs = R.render_arm(f.params, arm, profile)
         if f.lock is not None and X.json_digest(objs) != f.lock["arms"][f"{arm}/{profile}"]["rendered_sha256"]:
             problems.append(f"{arm}/{profile}: the rendering differs from the signed run-lock's: params changed after "
@@ -1089,12 +1105,11 @@ def restore_plan(f: Fleet) -> Dict:
                              "history", "evict or delete pods"])
 
 
-def _restore_arm(f: Fleet, a: Dict, deadline: int) -> Dict:
-    """One arm under its journalled step: re-check the bound Deployment, write /scale with its resourceVersion and
-    UID, then wait until it converged at the target (desired, status and the owned pod census through its ReplicaSets,
-    terminating pods included, all Running and Ready), its writer still inactive. Any failure raises (the step stays
-    unresolved for recover)."""
-    name, to = a["name"], a["to"]
+def _pre_write_check(f: Fleet, a: Dict) -> None:
+    """Immediately before an arm's write: the bound Deployment unchanged since the plan (UID, generation, replicas)
+    and its writer, re-read now, still exactly as inactive as the plan recorded. Run again after every earlier arm's
+    wait, since a writer may appear meanwhile."""
+    name = a["name"]
     dep = f.kube.get("Deployment", name, f.ns)
     if dep is None or dep["metadata"]["uid"] != a["uid"]:
         raise X.StagingError(f"{name} is gone or replaced; refusing")
@@ -1102,8 +1117,32 @@ def _restore_arm(f: Fleet, a: Dict, deadline: int) -> Dict:
     if m.get("generation") != a["generation"] or int(dep["spec"].get("replicas") or 0) != a["from"]:
         raise X.StagingError(f"{name} changed since the reviewed plan (generation {m.get('generation')}, replicas "
                              f"{dep['spec'].get('replicas')}); refusing")
+    why = _writer_refusal(f, name, a["arm"], X.writer_inventory(f.kube, f.ns, [name]))
+    if why or _writer_desc(f, name, a["arm"]) != a["writer"]:
+        raise X.StagingError(f"{name}: the writer is not provably inactive before the write: "
+                             f"{why or 'it changed since the reviewed plan'}; refusing")
+
+
+def _restore_arm(f: Fleet, a: Dict, deadline: int, mark: str) -> Dict:
+    """One arm under its journalled step: the pre-write check, the /scale write with the plan's resourceVersion and the
+    UID (its outcome persisted as a restore-write receipt bound to the step's mark: applied with the resulting
+    generation, refused, or unknown), then the wait until it converged at the target (desired, status and the owned pod
+    census through its ReplicaSets, terminating pods included, all Running and Ready), its writer still inactive. Any
+    failure raises (the step stays unresolved for recover)."""
+    name, to = a["name"], a["to"]
+    _pre_write_check(f, a)
     if a["op"] == "scale":
-        f.kube.scale("Deployment", name, f.ns, a["uid"], a["resourceVersion"], to)
+        base = {"restore": f.kube.journal.context.get("restore"), "mark": mark, "name": name}
+        try:
+            out = f.kube.scale("Deployment", name, f.ns, a["uid"], a["resourceVersion"], to)
+        except C.ApiError as e:
+            definitive = getattr(e, "status", None) in X.DEFINITIVE
+            X.receipt(f.record, HELPER, "restore-write", dict(base, result="refused" if definitive else "unknown",
+                                                              status=getattr(e, "status", None)))
+            raise
+        X.receipt(f.record, HELPER, "restore-write", dict(base, result="applied",
+                                                          resourceVersion=out["metadata"].get("resourceVersion"),
+                                                          generation=a["generation"] + 1))
     while True:
         dep = f.kube.get("Deployment", name, f.ns)
         if dep is None or dep["metadata"]["uid"] != a["uid"]:
@@ -1137,8 +1176,9 @@ def restore(f: Fleet, reviewed: Dict, reviewed_digest: str) -> Dict:
         deadline, done = f.now() + p["timeout_s"], []
         try:
             for a in p["actions"]:
+                _pre_write_check(f, a)           # before the intent too: a refusal here leaves nothing to recover
                 dep = f.kube.step("restore", "Deployment", f.ns, a["name"], a["uid"],
-                                  lambda a=a: _restore_arm(f, a, deadline),
+                                  lambda mark, a=a: _restore_arm(f, a, deadline, mark),
                                   pre={"resourceVersion": a.get("resourceVersion"), "generation": a["generation"],
                                        "replicas": a["from"]},
                                   expect=[["/spec/replicas", a["to"]]])
@@ -1154,26 +1194,56 @@ def restore(f: Fleet, reviewed: Dict, reviewed_digest: str) -> Dict:
                                                               "refused": p["refused"]})
 
 
-def reconcile_restore(kube: X.Kube, d: Dict) -> Dict:
-    """recover's view of a restore step whose outcome is unknown (a refusal, a timeout, a lost response, a crash):
-    done when the Deployment converged at the target; not-done when the scale was not applied (generation and replicas
-    as before) or applied but not yet converged (the arm then stays as observed: admission and a new restore-plan
-    judge it live); unresolved when the Deployment is gone, replaced or at another count."""
+def reconcile_restore(kube: X.Kube, d: Dict, record: X.Record) -> Dict:
+    """recover's view of a restore step whose outcome is unknown (a refusal, a timeout, a lost response, a crash). It
+    accepts only a transition consistent with the persisted intent and the step's restore-write receipt, with the
+    writer provably inactive NOW:
+      * the write applied (receipt, or a lost response with exactly one generation step to the target) and nothing
+        since: done when converged, else not-done, state "applied-convergence-pending" (admission keeps refusing the
+        arm, selected or not, until it converges);
+      * a wait-only step (no write) at the unchanged generation: done when converged, else convergence pending;
+      * no write applied (refused, or never sent) and the Deployment at its planned generation and replicas: not-done,
+        state "not-applied";
+      * anything else (gone, replaced, an unexplained generation change, another count, an active writer): unresolved.
+    """
     live = kube.get("Deployment", d["name"], d["namespace"])
     if live is None or live["metadata"].get("uid") != d["uid"]:
         return {"observed": "unresolved", "why": "the Deployment is gone or replaced"}
-    to = d["expect"][0][1]
-    cur = int(live["spec"].get("replicas") or 0)
-    if cur == to:
-        left = idle_residency_problems(live, kube.list("ReplicaSet", d["namespace"]), kube.list("Pod", d["namespace"]),
-                                       to)
-        if not left:
-            return {"observed": "done", "uid": d["uid"]}
-        return {"observed": "not-done", "uid": d["uid"], "why": f"scaled to {to} but not converged: {'; '.join(left)}"}
-    if cur == d["pre"].get("replicas") and live["metadata"].get("generation") == d["pre"].get("generation"):
-        return {"observed": "not-done", "uid": d["uid"], "why": "the scale was not applied"}
-    return {"observed": "unresolved", "why": f"at {cur} replicas (generation {live['metadata'].get('generation')}), "
-                                             f"neither the planned {d['pre'].get('replicas')} nor the target {to}"}
+    try:
+        f = Fleet(record, kube)
+        arm = f.arms()[d["name"]][0]
+    except (X.StagingError, KeyError) as e:
+        return {"observed": "unresolved", "why": f"the restore context cannot be loaded: {e}"}
+    why = _writer_refusal(f, d["name"], arm, X.writer_inventory(kube, d["namespace"], [d["name"]]))
+    if why:
+        return {"observed": "unresolved", "why": f"the writer is not provably inactive: {why}"}
+    to, pre_gen, pre_rep = d["expect"][0][1], d["pre"].get("generation"), d["pre"].get("replicas")
+    gen, cur = live["metadata"].get("generation"), int(live["spec"].get("replicas") or 0)
+    writes = [e["data"] for e in X.receipts(record, HELPER)
+              if e["event"] == "restore-write" and e["data"].get("mark") == d["mark"]]
+    wrote = writes[-1]["result"] if writes else None
+    state_of = {"applied": "applied-convergence-pending", "wait": "wait-convergence-pending"}
+    if pre_rep == to:
+        kind, want_gen = "wait", pre_gen
+    elif wrote == "applied":
+        kind, want_gen = "applied", writes[-1]["generation"]
+    elif gen == pre_gen and cur == pre_rep:
+        return {"observed": "not-done", "state": "not-applied", "uid": d["uid"],
+                "why": "the scale was not applied" + (" (refused)" if wrote == "refused" else "")}
+    elif wrote != "refused" and isinstance(pre_gen, int) and gen == pre_gen + 1 and cur == to:
+        kind, want_gen = "applied", pre_gen + 1          # a lost response: exactly our one step, nothing since
+    else:
+        return {"observed": "unresolved",
+                "why": f"at {cur} replicas, generation {gen}: not explained by the intent (planned {pre_rep} at "
+                       f"generation {pre_gen}, target {to}, write {wrote or 'unknown'})"}
+    if gen != want_gen or cur != to:
+        return {"observed": "unresolved", "why": f"at {cur} replicas, generation {gen}: changed after the restore's "
+                                                 f"{kind} (expected {to} at generation {want_gen})"}
+    left = idle_residency_problems(live, kube.list("ReplicaSet", d["namespace"]), kube.list("Pod", d["namespace"]), to)
+    if not left:
+        return {"observed": "done", "uid": d["uid"]}
+    return {"observed": "not-done", "state": state_of[kind], "uid": d["uid"],
+            "why": f"at {to} but not converged: {'; '.join(left)}"}
 
 
 X.RECONCILERS["restore"] = reconcile_restore
@@ -1184,12 +1254,20 @@ def close_recovered_restores(record: X.Record) -> None:
     entries = X.receipts(record, HELPER)
     applied = {(it["data"].get("context", {}).get("restore"), it["data"]["name"])
                for it in X.applied_intents(entries) if it["data"]["op"] == "restore"}
+    steps = {n: d for n, d in X._steps(entries).items() if d["intent"] and d["intent"]["op"] == "restore"}
     for rid in open_restores(entries):
         begin = X.last(entries, "restore-begin", restore=rid)
         arms = begin["data"]["arms"]
         done = [n for n in arms if (rid, n) in applied]
+        states = {}
+        for st in steps.values():
+            if st["intent"].get("context", {}).get("restore") == rid and st["intent"]["name"] not in done:
+                rec = st["reconciled"] or {}
+                states[st["intent"]["name"]] = rec.get("state") or ("not-applied" if (st["outcome"] or {}).get(
+                    "result") == "not-applied" else "not-attempted")
         X.receipt(record, HELPER, "restore-closed", {"restore": rid, "resolved": done == arms, "done": done,
-                                                     "not_done": [n for n in arms if n not in done],
+                                                     "not_done": {n: states.get(n, "not-attempted")
+                                                                  for n in arms if n not in done},
                                                      "by": "recover"})
 
 

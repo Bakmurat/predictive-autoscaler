@@ -7,6 +7,7 @@ import os
 
 import pytest
 
+import common_records as C
 import execlib as X
 import fake2 as F
 import part2_fixtures as PF
@@ -288,7 +289,9 @@ def test_scale_goes_through_the_subresource_with_rv_and_uid_and_bounds_stay(worl
     assert out["event"] == "restore-closed" and out["data"]["resolved"] is True
     assert out["data"]["done"] == [{"name": TARGET, "from": 6, "to": 2, "generation": a["generation"] + 1}]
     ev = [e for e in X.receipts(record, "session") if e["event"].startswith(("intent-", "step-", "restore-"))]
-    assert [e["event"].split("-")[0] for e in ev][-4:] == ["restore", "intent", "step", "restore"]
+    assert [e["event"] for e in ev][-5:-2] == ["restore-begin", ev[-4]["event"], "restore-write"]
+    assert ev[-4]["event"].startswith("intent-") and ev[-2]["event"].startswith("step-")
+    assert ev[-1]["event"] == "restore-closed" and ev[-3]["data"]["result"] == "applied"
     intent = [e for e in ev if e["event"].startswith("intent-")][-1]["data"]
     assert intent["op"] == "restore" and intent["pre"] == {"resourceVersion": a["resourceVersion"],
                                                           "generation": a["generation"], "replicas": 6}
@@ -314,11 +317,11 @@ def test_a_concurrent_change_between_check_and_write_is_a_conflict(world):
     assert api.obj("Deployment", TARGET, NS)["spec"]["replicas"] == 6
     assert os.path.exists(PF.lock_file(record)) and S.open_restores(X.receipts(record, "session"))
     rp = X.recover_plan(record, f.kube)
-    assert [(a["op"], a["observed"], a["why"]) for a in rp["actions"]] == [("restore", "not-done",
-                                                                             "the scale was not applied")]
+    assert [(a["op"], a["observed"], a["state"], a["why"]) for a in rp["actions"]] == [
+        ("restore", "not-done", "not-applied", "the scale was not applied (refused)")]
     PF.recover(record, f.kube, S.recover_follow_up(record))
     closed = X.last(X.receipts(record, "session"), "restore-closed")["data"]
-    assert closed["resolved"] is False and closed["not_done"] == [TARGET] and closed["by"] == "recover"
+    assert closed["resolved"] is False and closed["not_done"] == {TARGET: "not-applied"} and closed["by"] == "recover"
     assert not os.path.exists(PF.lock_file(record))
     f, p, plan, digest = plan_restore(world, record)              # re-planned from the live state
     assert S.restore(f, plan, digest)["data"]["resolved"] is True
@@ -376,14 +379,15 @@ def test_timeout_leaves_an_unresolved_step_that_recover_resolves(world):
     probs = problems(world, nxt)
     assert "restores still open" in probs and "unknown outcomes" in probs
     rp = X.recover_plan(record, f.kube)
-    assert rp["actions"][0]["observed"] == "not-done" and "not converged" in rp["actions"][0]["why"]
+    assert (rp["actions"][0]["observed"], rp["actions"][0]["state"]) == ("not-done", "applied-convergence-pending")
+    assert "not converged" in rp["actions"][0]["why"]
     ctl.stuck = False                                             # the pods finally go
     clock.t += 60
     rp = X.recover_plan(record, f.kube)
     assert [(a["op"], a["observed"]) for a in rp["actions"]] == [("restore", "done")]
     PF.recover(record, f.kube, S.recover_follow_up(record))
     closed = X.last(X.receipts(record, "session"), "restore-closed")["data"]
-    assert closed == {"restore": f"r-{digest[:12]}", "resolved": True, "done": [TARGET], "not_done": [],
+    assert closed == {"restore": f"r-{digest[:12]}", "resolved": True, "done": [TARGET], "not_done": {},
                       "by": "recover"}
     assert "start-recovered" not in events(record)                # a restore is not a session
     assert not os.path.exists(PF.lock_file(record))
@@ -454,7 +458,7 @@ def test_kube_scale_to_zero_through_the_fake_api(world):
         kube.scale("Deployment", "c28-pa-r-s20", NS, uid, rv, 0)
     with X.mutating(record, kube, "session", {"phase": "test"}):
         out = kube.step("restore", "Deployment", NS, "c28-pa-r-s20", uid,
-                        lambda: kube.scale("Deployment", "c28-pa-r-s20", NS, uid, rv, 0),
+                        lambda mark: kube.scale("Deployment", "c28-pa-r-s20", NS, uid, rv, 0),
                         expect=[["/spec/replicas", 0]])
     assert out["kind"] == "Scale" and "replicas" not in out["spec"] and dep["spec"]["replicas"] == 0
     entries = X.receipts(record, "session")
@@ -465,3 +469,184 @@ def test_kube_scale_to_zero_through_the_fake_api(world):
 def test_an_unknown_journalled_op_is_never_guessed(world):
     assert X.reconcile(world["record"].kube(world["api"]), {"op": "mystery", "kind": "Deployment", "name": "x",
                                                             "namespace": NS})["observed"] == "unresolved"
+
+
+# --- Codex review of #45: regressions ------------------------------------------------------------------------------
+
+def test_the_selected_arm_must_be_at_the_starting_count_too(world):
+    """Codex #45 finding 1: stop H-CPU/s20 at six replicas, then plan another session on the same arm."""
+    record, c = loaded_and_stopped(world)
+    again = session_record(world, id="s-0002", plan=write_plan(world, "ordinary", 102, TARGET, name="p2.json"))
+    probs = problems(world, again)
+    assert "c28-h-cpu-s20 has 6 replicas, above the residency budget's idle count 2" in probs
+    assert "restore ['c28-h-cpu-s20'] to the common starting count first" in probs
+    scale_live(world["api"], TARGET, 1)                           # below the count is not the starting count either
+    probs = problems(world, again)
+    assert "c28-h-cpu-s20 has 1 replicas, not the common starting count 2" in probs
+
+
+def test_an_unconverged_selected_arm_is_refused(world):
+    record, c = loaded_and_stopped(world, replicas=2)             # back at the count, but a pod is not Ready
+    owned_pods(world["api"], TARGET)[0]["status"]["conditions"] = [{"type": "Ready", "status": "False"}]
+    again = session_record(world, id="s-0002", plan=write_plan(world, "ordinary", 102, TARGET, name="p2.json"))
+    assert "c28-h-cpu-s20 has pods that are not Running and Ready" in problems(world, again)
+
+
+def test_a_writer_appearing_on_a_later_arm_is_caught_before_its_write(world):
+    """Codex #45 finding 2: a foreign HPA appears on the second arm after the first arm finished."""
+    record, c = loaded_and_stopped(world)
+    api = world["api"]
+    second = "c28-h-rps-s90"
+    scale_live(api, second, 6)
+    f, p, plan, digest = plan_restore(world, record)
+    assert [a["name"] for a in p["actions"]] == [TARGET, second]
+
+    def foreign_writer(api):
+        if api.obj("Deployment", TARGET, NS)["spec"]["replicas"] == 2 and \
+                api.obj("HorizontalPodAutoscaler", "foreign", NS) is None:
+            api.put({"apiVersion": "autoscaling/v2", "kind": "HorizontalPodAutoscaler",
+                     "metadata": {"name": "foreign", "namespace": NS},
+                     "spec": {"scaleTargetRef": {"kind": "Deployment", "name": second}, "minReplicas": 1,
+                              "maxReplicas": 12}})
+    api.on_poll.append(foreign_writer)
+    with pytest.raises(X.StagingError, match="c28-h-rps-s90: the writer is not provably inactive before the write"):
+        S.restore(f, plan, digest)
+    assert api.obj("Deployment", second, NS)["spec"]["replicas"] == 6
+    assert not any(c[1].endswith(f"/deployments/{second}/scale") for c in api.mutations())
+    closed = X.last(X.receipts(record, "session"), "restore-closed")["data"]
+    assert closed["resolved"] is False and [d["name"] for d in closed["done"]] == [TARGET]
+    assert not os.path.exists(PF.lock_file(record))               # refused before any write was in flight
+
+
+def test_the_pre_write_check_also_runs_inside_the_step(world):
+    """The writer check sits immediately before the PUT, after the intent: a writer appearing in that window leaves the
+    step for recover, which finds nothing applied."""
+    record, c = loaded_and_stopped(world)
+    api = world["api"]
+    f, p, plan, digest = plan_restore(world, record)
+    real = S._pre_write_check
+    calls = []
+
+    def second_call_sees_a_writer(f_, a):
+        calls.append(a["name"])
+        if len(calls) == 2:
+            api.put({"apiVersion": "autoscaling/v2", "kind": "HorizontalPodAutoscaler",
+                     "metadata": {"name": "late", "namespace": NS},
+                     "spec": {"scaleTargetRef": {"kind": "Deployment", "name": TARGET}, "minReplicas": 1,
+                              "maxReplicas": 12}})
+        return real(f_, a)
+    S._pre_write_check = second_call_sees_a_writer
+    try:
+        with pytest.raises(X.StagingError, match="not provably inactive before the write"):
+            S.restore(f, plan, digest)
+    finally:
+        S._pre_write_check = real
+    assert api.obj("Deployment", TARGET, NS)["spec"]["replicas"] == 6 and os.path.exists(PF.lock_file(record))
+    rp = X.recover_plan(record, f.kube)
+    assert rp["actions"][0]["observed"] == "unresolved" and "writer is not provably inactive" in rp["actions"][0]["why"]
+    del api.objects[("horizontalpodautoscalers", NS, "late")]
+    rp = X.recover_plan(record, f.kube)
+    assert (rp["actions"][0]["observed"], rp["actions"][0]["state"]) == ("not-done", "not-applied")
+
+
+def test_recovery_refuses_intervening_drift(world):
+    """Codex #45 finding 3: the PUT conflicts, then two external changes take replicas six -> three -> two."""
+    record, c = loaded_and_stopped(world)
+    api = world["api"]
+    f, p, plan, digest = plan_restore(world, record)
+    real = api.replace
+
+    def racing(path, body):
+        api.obj("Deployment", TARGET, NS)["metadata"]["resourceVersion"] = api._next_rv()
+        return real(path, body)
+    api.replace = racing
+    with pytest.raises(X.StagingError):
+        S.restore(f, plan, digest)
+    api.replace = real
+    scale_live(api, TARGET, 3)
+    scale_live(api, TARGET, 2)                                    # converged at the target, by someone else
+    rp = X.recover_plan(record, f.kube)
+    assert rp["actions"][0]["observed"] == "unresolved" and "not explained by the intent" in rp["actions"][0]["why"]
+    with pytest.raises(X.StagingError, match="unresolved outcomes"):
+        PF.recover(record, f.kube, S.recover_follow_up(record))
+    assert os.path.exists(PF.lock_file(record)) and S.open_restores(X.receipts(record, "session"))
+
+
+def test_a_single_external_change_after_a_refused_write_is_not_ours(world):
+    record, c = loaded_and_stopped(world)
+    api = world["api"]
+    f, p, plan, digest = plan_restore(world, record)
+    real = api.replace
+
+    def racing(path, body):
+        api.obj("Deployment", TARGET, NS)["metadata"]["resourceVersion"] = api._next_rv()
+        return real(path, body)
+    api.replace = racing
+    with pytest.raises(X.StagingError):
+        S.restore(f, plan, digest)
+    api.replace = real
+    scale_live(api, TARGET, 2)                                    # one step to the target, but our write was refused
+    assert X.recover_plan(record, f.kube)["actions"][0]["observed"] == "unresolved"
+
+
+def test_drift_after_an_applied_write_is_unresolved(world):
+    record, c = loaded_and_stopped(world)
+    api = world["api"]
+    clock = Clock(T0)
+    api.instant_pods = False
+    api.on_poll.remove(settle)
+    api.on_poll.append(SlowController(clock, stuck=True))
+    f = fleet(world, record, clock)
+    f.timeout_s = 30
+    p = S.restore_plan(f)
+    plan, digest = review(record, p, S.RESTORE, "restore")
+    with pytest.raises(X.StagingError, match="within the restore timeout"):
+        S.restore(f, plan, digest)
+    writes = [e["data"] for e in X.receipts(record, "session") if e["event"] == "restore-write"]
+    assert [w["result"] for w in writes] == ["applied"] and writes[0]["generation"] == p["actions"][0]["generation"] + 1
+    dep = api.obj("Deployment", TARGET, NS)                       # someone rewrites the spec at the same count
+    dep["metadata"]["generation"] += 1
+    rp = X.recover_plan(record, f.kube)
+    assert rp["actions"][0]["observed"] == "unresolved" and "changed after the restore's applied" in \
+        rp["actions"][0]["why"]
+
+
+def test_a_lost_scale_response_is_recovered_as_our_one_step(world):
+    record, c = loaded_and_stopped(world)
+    api = world["api"]
+    f, p, plan, digest = plan_restore(world, record)
+    real = api.replace
+
+    def lost(path, body):
+        real(path, body)
+        raise C.ApiError("replace: failed (timeout)", 504)
+    api.replace = lost
+    with pytest.raises(X.StagingError):
+        S.restore(f, plan, digest)
+    api.replace = real
+    writes = [e["data"]["result"] for e in X.receipts(record, "session") if e["event"] == "restore-write"]
+    assert writes == ["unknown"] and api.obj("Deployment", TARGET, NS)["spec"]["replicas"] == 2
+    rp = X.recover_plan(record, f.kube)
+    assert [(a["observed"]) for a in rp["actions"]] == ["done"]
+    PF.recover(record, f.kube, S.recover_follow_up(record))
+    assert X.last(X.receipts(record, "session"), "restore-closed")["data"]["resolved"] is True
+
+
+def test_recovery_rechecks_writer_inactivity(world):
+    record, c = loaded_and_stopped(world)
+    api = world["api"]
+    f, p, plan, digest = plan_restore(world, record)
+    real = api.replace
+
+    def lost(path, body):
+        real(path, body)
+        raise C.ApiError("replace: failed (timeout)", 504)
+    api.replace = lost
+    with pytest.raises(X.StagingError):
+        S.restore(f, plan, digest)
+    api.replace = real
+    api.put({"apiVersion": "autoscaling/v2", "kind": "HorizontalPodAutoscaler",
+             "metadata": {"name": "new", "namespace": NS},
+             "spec": {"scaleTargetRef": {"kind": "Deployment", "name": TARGET}, "minReplicas": 1, "maxReplicas": 12}})
+    rp = X.recover_plan(record, f.kube)
+    assert rp["actions"][0]["observed"] == "unresolved" and "writer is not provably inactive" in rp["actions"][0]["why"]

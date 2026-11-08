@@ -133,9 +133,9 @@ CPU 9 × 2 × 50 + 12 × 50 + 2 × 50 + 100 + 400 = 2100m = 52.5 % (limit 3000m)
 
 **Idle-arm parking below the starting count is not implemented**, so `idle_arm_replicas` below the starting count is
 refused (that would need the writers stopped, the count restored before each session, history preserved and the loaded
-arm's frozen bounds unchanged). `session.py` admits a session only when every other target has converged to its idle
-residency: desired replicas at most `idle_arm_replicas`, status (observed generation, replicas, updated, ready,
-available) equal to it, and exactly that many Pods owned through its ReplicaSets (bound by controller UID to the
+arm's frozen bounds unchanged). `session.py` admits a session only when EVERY target, the selected one included, sits
+at exactly the common starting count and has converged there (`idle_arm_replicas` is only the budget's upper bound):
+desired replicas equal to the count, status (observed generation, replicas, updated, ready, available) equal to it, and exactly that many Pods owned through its ReplicaSets (bound by controller UID to the
 Deployment's UID), none of them terminating and every one Running and Ready. A session never scales a target, and a
 stopped session leaves its target at whatever count its writer last set; the start refusal names those targets and
 points to the restore.
@@ -167,11 +167,17 @@ journalled step (intent before, outcome after): the cluster UID re-check, a re-c
 .../deployments/<name>/scale` with the read resourceVersion and the UID (a Scale response without `spec.replicas`
 means 0), then a bounded wait (record `restore.timeout_s`, default 600) until desired, status and the owned Pod census
 through the ReplicaSets (terminating Pods included, the admission's accounting) equal the count with every Pod Running
-and Ready, the writer still inactive and the desired count unchanged. A refusal, a timeout or a crash leaves the step
-unresolved and the lock held; `recover` decides it from the live Deployment and Pods (done when converged; not done when
-the scale was not applied or has not converged yet, the arm then judged live by the next plan; unresolved when the
-Deployment is gone, replaced or at another count) and closes the restore record (`restore-closed`, `resolved` true or
-false). A session start refuses while a restore is open.
+and Ready, the writer still inactive and the desired count unchanged. The writer and the bound Deployment are
+re-checked immediately before each arm's write (after the earlier arms' waits), both before its intent and inside it.
+The write's outcome is persisted as a `restore-write` receipt bound to the step (applied with the resulting
+generation, refused, or unknown). A refusal, a timeout or a crash leaves the step unresolved and the lock held;
+`recover` accepts only a transition consistent with that intent and receipt, with the writer provably inactive again:
+done when the write applied (or a lost response took exactly one generation step to the count) and the arm converged;
+not-done, state `applied-convergence-pending`, when it applied but has not converged (admission keeps refusing the arm,
+selected or not); not-done, state `not-applied`, when nothing was written and the Deployment is at its planned
+generation and replicas; unresolved for anything else (gone, replaced, an unexplained generation change, another count,
+an active writer). It then closes the restore record (`restore-closed`, `resolved` true or false, each unfinished arm's
+state). A session start refuses while a restore is open.
 
 A restore never touches a writer (mode, min/max bounds), a fault schedule, the quota, the recorder or any history path:
 the PredictiveAutoscalers stay in Recommend and keep collecting their forecast and decision history, the ingress and
