@@ -724,3 +724,36 @@ def test_a_planned_lease_disappearing_before_the_observation_blocks(tmp_path):
     api2.objects[("leases", "ml-engine", "predictive-autoscaler-leader")]["spec"]["renewTime"] = "2026-11-08T01:00:00Z"
     LG.quiesce(api2, rec2, plan2, C.plan_digest(plan2), sleep=clock2.sleep, monotonic=clock2, clock=clock2)
     assert api2.objects[("deployments", "demo", "nginx-test")]["spec"]["replicas"] == 0       # renewal before: fine
+
+
+# --- C2.8h: the shared lock is released only when no tool's intent is unresolved -----------------------------------
+
+def test_legacy_recover_never_releases_a_lock_with_a_populate_intent_unresolved(tmp_path):
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    with pytest.raises(RuntimeError):
+        with C.exclusive_lock(rec, "legacy", holder="populate-s0") as lock:
+            C.append_receipt(rec, "populate-s0", "intent-1", {"pvc": "p8-evidence-pvc", "nonce": "n-1",
+                                                               "pod": "c28-s0-reader-1"}, clock)
+            lock.safe = False                       # the reader pod's cleanup is not proven
+            raise RuntimeError("populate crashed")
+    C.append_receipt(rec, "populate-s0", "delete-intent-1", {"pod": "c28-s0-reader-1"}, clock)   # not an intent-
+    assert C.unresolved_intents(rec) == {"populate-s0": ["1"]}
+    lock = C.lock_path(rec, "legacy")
+    crash_owner(lock)
+    with pytest.raises(C.StagingError, match="populate-s0.*populate_s0.py recover"):
+        LG.recover(api, rec, C.sha256_file(lock), clock)                   # legacy has nothing of its own to do
+    assert os.path.exists(lock) and not os.path.exists(lock + ".recovery")
+    C.append_receipt(rec, "populate-s0", "reconciled-1", {"observed": "done", "cleanup": "proven"}, clock)
+    assert C.unresolved_intents(rec) == {}
+    LG.recover(api, rec, C.sha256_file(lock), clock)
+    assert not os.path.exists(lock)
+
+
+def test_unresolved_intents_spans_every_journal(tmp_path):
+    rec = record(tmp_path)
+    C.append_receipt(rec, "legacy", "intent-3", {}, lambda: 0)
+    C.append_receipt(rec, "legacy", "step-3", {}, lambda: 0)
+    C.append_receipt(rec, "legacy-restore", "intent-12", {}, lambda: 0)
+    C.append_receipt(rec, "populate-s0-probe", "intent-2", {}, lambda: 0)
+    C.append_receipt(rec, "populate-s0-probe", "reconciled-2", {"observed": "not-done"}, lambda: 0)
+    assert C.unresolved_intents(rec) == {"legacy-restore": ["12"]}
