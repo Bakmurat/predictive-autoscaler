@@ -163,6 +163,48 @@ def find(doc: Mapping, kind: str, namespace, name: str):
                 None)
 
 
+def _writer_blockers(doc: Mapping) -> List[str]:
+    """Writers checked by their ACTUAL targets and ownership: an allowlisted PA or ScaledObject must target its own arm;
+    an HPA is the benchmark's only when a listed ScaledObject (same UID) controls it and it targets that object's arm;
+    any other writer of a legacy target, any legacy PA that is not an arm, and any reconciler of the legacy namespaces
+    blocks."""
+    listed = {(k, ns, n) for k, ns, n, _ in L.ALLOWLIST}
+    targets = {("demo", a) for a in L.ARMS}
+    sos = {w["uid"]: w for w in doc["writers"].get("scaledobjects") or []
+           if ("scaledobjects", w["namespace"], w["name"]) in listed}
+    blockers = []
+    for kind in ("horizontalpodautoscalers", "scaledobjects", "pa-legacy", "pa-new"):
+        for w in doc["writers"].get(kind) or []:
+            tgt = _writer_target(kind, w, w["namespace"])
+            if (kind, w["namespace"], w["name"]) in listed:
+                want = L.expected_target(kind, w["name"])
+                if want is not None and tgt != want:
+                    blockers.append(f"{kind} {w['namespace']}/{w['name']} targets {tgt}, not its arm {want}")
+                continue
+            if kind == "horizontalpodautoscalers":
+                owner = next((r for r in w.get("ownerReferences") or [] if r.get("controller")), None)
+                so = sos.get((owner or {}).get("uid")) if owner and owner.get("kind") == "ScaledObject" else None
+                if so is not None:
+                    so_tgt = _writer_target("scaledobjects", so, so["namespace"])
+                    if tgt != so_tgt or owner.get("name") != so["name"]:
+                        blockers.append(f"HPA {w['namespace']}/{w['name']} is owned by {so['name']} but targets "
+                                        f"{tgt}, not {so_tgt}")
+                    continue
+            if kind == "pa-legacy":
+                blockers.append(f"legacy PA {w['namespace']}/{w['name']} is not a benchmark arm: the old operator has "
+                                f"another consumer")
+            elif tgt in targets:
+                blockers.append(f"{kind} {w['namespace']}/{w['name']} writes legacy target {tgt[1]} and is not on the "
+                                f"allowlist")
+    if doc["writers"].get("scaledobjects") is None:
+        blockers.append("the keda.sh API group is not served: the benchmark ScaledObjects cannot be verified")
+    for a in doc["writers"].get("applications") or []:
+        if (a.get("destination") or {}).get("namespace") in doc["namespaces"]:
+            blockers.append(f"Argo CD application {a['namespace']}/{a['name']} reconciles "
+                            f"{a['destination']['namespace']}: suspend it at its source first")
+    return blockers
+
+
 def resolve_allowlist(doc: Mapping) -> Dict:
     """Allowlist entries found (with UID) or missing; unclassified objects; blockers."""
     found, missing = [], []
@@ -171,33 +213,22 @@ def resolve_allowlist(doc: Mapping) -> Dict:
         item = {"kind": kind, "namespace": ns, "name": name, "role": role}
         (found if o else missing).append(dict(item, uid=o["uid"]) if o else item)
     listed = {(k, ns, n) for k, ns, n, _ in L.ALLOWLIST}
-    generated = {L.generated_hpa(n) for n in L.KEDA_OBJECTS}
     unclassified = []
     for kind in ("deployments", "statefulsets", "daemonsets", "cronjobs"):
         for o in doc["objects"].get(kind, []):
             if (kind, o["namespace"], o["name"]) not in listed:
                 unclassified.append({"kind": kind, "namespace": o["namespace"], "name": o["name"], "uid": o["uid"]})
-    targets = {("demo", a) for a in L.ARMS}
-    blockers = []
-    for kind in ("horizontalpodautoscalers", "scaledobjects", "pa-legacy", "pa-new"):
-        for w in doc["writers"].get(kind) or []:
-            key = (kind, w["namespace"], w["name"])
-            tgt = _writer_target(kind, w, w["namespace"])
-            allowed = key in listed or (kind == "horizontalpodautoscalers" and w["name"] in generated)
-            if kind == "pa-legacy" and not allowed:
-                blockers.append(f"legacy PA {w['namespace']}/{w['name']} is not a benchmark arm: the old operator has "
-                                f"another consumer")
-            elif tgt in targets and not allowed:
-                blockers.append(f"{kind} {w['namespace']}/{w['name']} writes legacy target {tgt[1]} and is not on the "
-                                f"allowlist")
-    if doc["writers"].get("scaledobjects") is None:
-        blockers.append("the keda.sh API group is not served: the benchmark ScaledObjects cannot be verified")
-    for kind in ("applications",):
-        for a in doc["writers"].get(kind) or []:
-            if (a.get("destination") or {}).get("namespace") in doc["namespaces"]:
-                blockers.append(f"Argo CD application {a['namespace']}/{a['name']} reconciles "
-                                f"{a['destination']['namespace']}: suspend it at its source first")
-    return {"found": found, "missing": missing, "unclassified": unclassified, "blockers": blockers}
+    return {"found": found, "missing": missing, "unclassified": unclassified, "blockers": _writer_blockers(doc)}
+
+
+def live_blockers(api, rec: Mapping) -> List[str]:
+    """The consumer, writer and reconciler blockers read live (cluster-wide), for a re-check right before a
+    shutdown step."""
+    groups = C.discover_groups(api)
+    writers = {k: ([reduce_object(k, o) for o in C.list_items(api, k)] if C.kind_group(k) in groups else None)
+               for k in WRITERS}
+    namespaces = list((rec.get("inventory") or {}).get("namespaces") or L.NAMESPACES)
+    return _writer_blockers({"writers": writers, "namespaces": namespaces})
 
 
 def problems(doc: Mapping) -> List[str]:

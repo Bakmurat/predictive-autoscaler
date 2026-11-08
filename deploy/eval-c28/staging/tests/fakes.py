@@ -32,6 +32,7 @@ class FakeApi:
             "autoscaler.example.com", "autoscaling.devkuban.com", "velero.io"]
         self._rv = 1000
         self.on_poll = []                        # callables run at each list/get (simulate progress)
+        self.instant_pods = True                 # scaling creates/removes the Deployment's pods at once
 
     # --- helpers -------------------------------------------------------------------------------------------------
     def _next_rv(self):
@@ -104,8 +105,9 @@ class FakeApi:
             raise Conflict("UID precondition failed", 409)
         if sub == "scale":
             o["spec"]["replicas"] = body["spec"]["replicas"]
-            o.setdefault("status", {})["replicas"] = body["spec"]["replicas"]      # pods follow at once here
             o["metadata"]["generation"] += 1
+            if self.instant_pods:
+                self.sync_pods(o)
         else:
             if body.get("spec") != o.get("spec"):
                 o["metadata"]["generation"] += 1
@@ -138,6 +140,27 @@ class FakeApi:
                 del self.objects[key]
         return {}
 
+    def sync_pods(self, dep):
+        """Make the Deployment's ReplicaSet own exactly spec.replicas pods (and report them ready)."""
+        m = dep["metadata"]
+        rs_key = ("replicasets", m["namespace"], f"{m['name']}-rs")
+        if rs_key not in self.objects:
+            self.add("replicasets", {"kind": "ReplicaSet", "metadata": {
+                "name": rs_key[2], "namespace": m["namespace"],
+                "ownerReferences": [{"kind": "Deployment", "name": m["name"], "uid": m["uid"], "controller": True}]}})
+        rs_uid = self.objects[rs_key]["metadata"]["uid"]
+        pods = sorted(k for k, v in self.objects.items() if k[0] == "pods" and
+                      any(r.get("uid") == rs_uid for r in v["metadata"].get("ownerReferences") or []))
+        want = dep["spec"].get("replicas") or 0
+        for k in pods[want:]:
+            del self.objects[k]
+        for i in range(len(pods), want):
+            self.add("pods", {"kind": "Pod", "metadata": {
+                "name": f"{m['name']}-{uuid.uuid4().hex[:5]}", "namespace": m["namespace"],
+                "ownerReferences": [{"kind": "ReplicaSet", "name": rs_key[2], "uid": rs_uid, "controller": True}]},
+                "spec": {}, "status": {"phase": "Running"}})
+        dep.setdefault("status", {}).update(replicas=want, readyReplicas=want)
+
     def mutations(self):
         return [c for c in self.calls if c[0] != "get"]
 
@@ -154,7 +177,7 @@ def legacy_cluster(extra_groups=None):
                                                                         "value": LAST_APPLIED_MARKER}]}})}
 
     def deployment(ns, name, replicas, env=None, annotations=None):
-        return api.add("deployments", {
+        d = api.add("deployments", {
             "apiVersion": "apps/v1", "kind": "Deployment",
             "metadata": {"name": name, "namespace": ns, "labels": {"app": name}, "annotations": dict(annotations or {}),
                          "managedFields": [{"manager": "kubectl"}]},
@@ -162,6 +185,8 @@ def legacy_cluster(extra_groups=None):
                 {"name": "c", "image": f"harbor.example/{name}@sha256:" + "a" * 64, "env": env or [],
                  "args": [f"--api-token={SECRET_VALUE}"]}]}}},
             "status": {"replicas": replicas, "readyReplicas": replicas}})
+        api.sync_pods(d)
+        return d
 
     arms = ("nginx-test", "nginx-reactive", "myapptwo", "nginx-seasonal", "nginx-ensemble", "nginx-ensemble-q95")
     for a in arms:

@@ -49,7 +49,11 @@ SECRET_KEY = re.compile(r"(token|password|passwd|secret|client-key|client_key|pr
 CREDENTIAL_NAME = re.compile(r"(token|passw|secret|credential|private|bearer|api[_-]?key|access[_-]?key|auth|"
                              r"client[_-]?key|cert|^key$|_key$|-key$)", re.IGNORECASE)
 _URL_USERINFO = re.compile(r"([a-z][a-z0-9+.-]*://)[^/@\s:]+:[^/@\s]+@", re.IGNORECASE)
-_CRED_FLAG = re.compile(r"^(--?[A-Za-z0-9_.-]*(token|passw|secret|key|credential|auth)[A-Za-z0-9_.-]*=).+$", re.I)
+_CRED_FLAG = re.compile(r"^(--?[A-Za-z0-9_.-]*(token|passw|secret|key|credential|auth|cert)[A-Za-z0-9_.-]*=).+$",
+                        re.I)
+# A credential flag whose value is the NEXT argument ("--password value", "-p value").
+_CRED_FLAG_SPLIT = re.compile(r"^(--?[A-Za-z0-9_.-]*(token|passw|secret|key|credential|auth|cert)[A-Za-z0-9_.-]*|-p)$",
+                              re.I)
 # Text that must never leave a helper, whatever field it hides in.
 _LEAK = re.compile(r"(-----BEGIN [A-Z ]*PRIVATE KEY-----|\"?" + re.escape(LAST_APPLIED) +
                    r"|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.|[a-z][a-z0-9+.-]*://[^/@\s:\"]+:[^/@\s\"]+@)")
@@ -154,6 +158,22 @@ class NotFound(ApiError):
     pass
 
 
+_STATUS = {400: "bad request", 401: "unauthorized", 403: "forbidden", 404: "not found", 409: "conflict",
+           422: "invalid", 429: "throttled", 500: "server error", 504: "timeout"}
+_STATUS_WORDS = ((404, ("NotFound", "not found")), (409, ("Conflict", "conflict", "the object has been modified",
+                                                         "Precondition failed")),
+                 (403, ("Forbidden", "forbidden")), (401, ("Unauthorized", "unauthorized")),
+                 (422, ("Invalid", "is invalid")), (429, ("TooManyRequests",)), (400, ("BadRequest",)),
+                 (504, ("Timeout", "timeout", "deadline exceeded")), (500, ("InternalError",)))
+
+
+def _classify(stderr: str) -> Optional[int]:
+    for status, words in _STATUS_WORDS:
+        if any(w in stderr for w in words):
+            return status
+    return None
+
+
 class KubectlApi:
     """Raw API access through kubectl with an explicit kubeconfig and context. get() returns None for 404."""
 
@@ -170,13 +190,13 @@ class KubectlApi:
             stdin = json.dumps(body)
         p = self.run(args, input=stdin, capture_output=True, text=True)
         if p.returncode != 0:
-            err = (p.stderr or "").strip().splitlines()
-            msg = err[-1] if err else "kubectl failed"
-            if "NotFound" in msg or "not found" in msg:
+            # Never echo kubectl's stderr (it can quote a request body or a credential): classify it.
+            status = _classify(p.stderr or "")
+            if status == 404:
                 if verb == "get":
                     return None
                 raise NotFound(f"{verb} {path}: not found", 404)
-            raise ApiError(f"{verb} {path}: {msg[:300]}")
+            raise ApiError(f"{verb} {path}: failed ({_STATUS.get(status, 'error')}, exit {p.returncode})", status)
         out = (p.stdout or "").strip()
         return json.loads(out) if out else {}
 
@@ -207,6 +227,7 @@ KINDS = {
     "persistentvolumeclaims": ("/api/v1", "persistentvolumeclaims", True),
     "persistentvolumes": ("/api/v1", "persistentvolumes", False),
     "deployments": ("/apis/apps/v1", "deployments", True),
+    "replicasets": ("/apis/apps/v1", "replicasets", True),
     "statefulsets": ("/apis/apps/v1", "statefulsets", True),
     "daemonsets": ("/apis/apps/v1", "daemonsets", True),
     "cronjobs": ("/apis/batch/v1", "cronjobs", True),
@@ -354,20 +375,48 @@ def append_receipt(rec: Mapping, helper: str, event: str, data: Mapping, clock=N
     line = json.dumps(r, sort_keys=True)
     assert_clean(line, secrets)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "a") as fh:
+    with open(path, "a") as fh:                  # crash-safe: on disk before the caller acts on it
         fh.write(line + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
     return r
+
+
+class exclusive_lock:
+    """One executor per helper and run: <evidence_dir>/locks/<helper>.lock, created exclusively. The lock is released
+    on a clean finish, or on an error while `safe` is true (no mutation in flight: the caller sets safe False after
+    recording a mutation's intent and True after recording its outcome). Otherwise it stays (fail closed) until a
+    reviewer reconciles the receipts and removes it."""
+
+    def __init__(self, rec: Mapping, helper: str, clock=None):
+        self.safe = True
+        self.path = os.path.join(rec["evidence_dir"], "locks", f"{helper}.lock")
+        self.body = json.dumps({"helper": helper, "run_id": rec["run_id"], "pid": os.getpid(), "at": utc_now(clock)})
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        try:
+            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
+        except FileExistsError as e:
+            raise StagingError(f"{self.path} exists: another execution is running or crashed; inspect its receipts "
+                               f"and remove the lock deliberately") from e
+        with os.fdopen(fd, "w") as fh:
+            fh.write(self.body)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None or self.safe:
+            os.unlink(self.path)
+        return False
 
 
 # --- sanitizing -------------------------------------------------------------------------------------------------
 
-_BENIGN = re.compile(r"^(/[^\s]*|true|false|[0-9]+)$")       # file paths, booleans, numbers: never credentials
-
-
 def _redact_value(name: str, value):
-    if isinstance(value, str) and _LEAK.search(value):
+    """A credential-named variable is redacted whatever its value looks like (a number or a path can be a secret)."""
+    if CREDENTIAL_NAME.search(name):
         return REDACTED
-    if isinstance(value, str) and CREDENTIAL_NAME.search(name) and not _BENIGN.match(value):
+    if isinstance(value, str) and _LEAK.search(value):
         return REDACTED
     if isinstance(value, str):
         return _URL_USERINFO.sub(r"\1" + REDACTED + "@", value)
@@ -389,11 +438,20 @@ def _sanitize_env(env: List) -> List:
 
 
 def _sanitize_args(args: List) -> List:
-    out = []
+    out, redact_next = [], False
     for a in args or []:
+        if redact_next and not (isinstance(a, str) and a.startswith("-")):
+            out.append(REDACTED)
+            redact_next = False
+            continue
+        redact_next = False
         if isinstance(a, str):
+            if _CRED_FLAG_SPLIT.match(a):
+                redact_next = True                   # "--password value": the value is the next argument
             a = _CRED_FLAG.sub(r"\1" + REDACTED, a)
             a = REDACTED if _LEAK.search(a) else _URL_USERINFO.sub(r"\1" + REDACTED + "@", a)
+        else:
+            a = REDACTED if CREDENTIAL_NAME.search(str(a)) else a
         out.append(a)
     return out
 
@@ -476,7 +534,8 @@ def api_for(rec: Mapping, run: Callable = subprocess.run) -> KubectlApi:
     return KubectlApi(rec["kubeconfig"], run=run)
 
 
-__all__ = ["ApiError", "KINDS", "KubectlApi", "NotFound", "StagingError", "add_common_args", "api_for",
+__all__ = ["exclusive_lock", "ApiError", "KINDS", "KubectlApi", "NotFound", "StagingError", "add_common_args",
+           "api_for",
            "append_receipt", "assert_clean", "canonical", "cluster_uid", "digest", "discover_groups", "kind_group",
            "list_items", "load_plan", "load_record", "make_plan", "path_of", "plan_digest", "read_receipts",
            "receipts_path", "record_problems", "require_cluster", "require_reviewed", "sanitize_metadata",

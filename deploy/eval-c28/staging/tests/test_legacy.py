@@ -3,6 +3,7 @@ untouched; verify and the ten quiet minutes; selective restore."""
 
 import copy
 import json
+import os
 
 import pytest
 
@@ -118,7 +119,7 @@ def test_execution_refuses_drift_and_another_cluster(tmp_path):
     plan3 = LG.build_plan(api3, rec3)
     old = api3.objects.pop(("scaledobjects", "demo", "myapptwo-keda-fallback"))      # recreated: new UID
     api3.add("scaledobjects", dict(old, metadata={k: v for k, v in old["metadata"].items() if k not in ("uid",)}))
-    with pytest.raises(C.StagingError, match="another UID"):
+    with pytest.raises(C.StagingError, match="another UID|changed since the plan"):
         LG.quiesce(api3, rec3, plan3, C.plan_digest(plan3), sleep=clock.sleep, monotonic=clock, clock=clock)
     assert ("scaledobjects", "demo", "myapptwo-keda-fallback") in api3.objects        # never deleted
 
@@ -149,17 +150,15 @@ def test_active_jobs_finish_first_or_quiesce_stops(tmp_path):
 
 def test_verify_declares_retirement_only_after_ten_quiet_minutes(tmp_path):
     api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
-    assert LG.verify(api, rec, clock=clock, now=clock())["quiesced"] is False
+    v0 = LG.verify(api, rec, 0, clock.sleep, clock, clock)
+    assert v0["quiesced"] is False and v0["problems"]
     plan = LG.build_plan(api, rec)
     LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
-    clock.t += 1
-    v1 = LG.verify(api, rec, clock=clock, now=clock())
+    v1 = LG.verify(api, rec, 0, clock.sleep, clock, clock)
     assert v1["quiesced"] and not v1["retired"] and v1["problems"] == []
-    clock.t += 601
-    assert LG.verify(api, rec, clock=clock, now=clock())["retired"] is True
-    api.objects[("deployments", "demo", "nginx-test")]["spec"]["replicas"] = 2          # something wrote a target
-    v3 = LG.verify(api, rec, clock=clock, now=clock())
-    assert not v3["retired"] and any("nginx-test" in p for p in v3["problems"])
+    v2 = LG.verify(api, rec, 600, clock.sleep, clock, clock)
+    assert v2["retired"] is True and v2["samples"] > 50                    # continuous, not two snapshots
+    assert LG.verify(api, rec, 300, clock.sleep, clock, clock)["retired"] is False      # too short
 
 
 def test_restore_undoes_exactly_what_quiesce_did(tmp_path):
@@ -235,3 +234,143 @@ def test_even_a_reviewed_plan_cannot_touch_evidence_or_foreign_objects(tmp_path,
     with pytest.raises(C.StagingError, match="not a mutable legacy object"):
         LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
     assert api.mutations() == []
+
+
+
+# --- Codex r1 on #31 ----------------------------------------------------------------------------------------------
+
+def test_a_consumer_added_after_planning_stops_the_operator_shutdown(tmp_path):
+    # Finding 2: consumers and reconcilers are re-checked live right before the operator stops.
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    plan = LG.build_plan(api, rec)
+    api.add("pa-legacy", {"kind": "PredictiveAutoscaler", "metadata": {"name": "shop-pa", "namespace": "shop"},
+                          "spec": {"targetDeployment": {"name": "web", "namespace": "shop"}}})
+    with pytest.raises(C.StagingError, match="another consumer"):
+        LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    assert api.objects[("deployments", "ml-engine", "predictive-operator")]["spec"]["replicas"] == 1
+    assert api.objects[("deployments", "demo", "k6-nginx-test")]["spec"]["replicas"] == 0     # arrivals did stop
+
+
+@pytest.mark.parametrize("change, why", [
+    (lambda api: api.objects[("pa-legacy", "demo", "nginx-test-autoscaler")]["spec"]["targetDeployment"].update(
+        name="checkout"), "not its arm"),
+    (lambda api: api.objects[("scaledobjects", "demo", "myapptwo-keda-fallback")]["spec"]["scaleTargetRef"].update(
+        name="nginx-test"), "not its arm"),
+    (lambda api: api.objects[("horizontalpodautoscalers", "demo", "keda-hpa-myapptwo-keda-fallback")][
+        "metadata"].update(ownerReferences=[]), "not on the allowlist"),
+    (lambda api: api.objects[("horizontalpodautoscalers", "demo", "keda-hpa-myapptwo-keda-fallback")]["spec"][
+        "scaleTargetRef"].update(name="nginx-reactive"), "owned by myapptwo-keda-fallback but targets"),
+])
+def test_allowlisted_writers_are_checked_by_actual_target_and_owner(tmp_path, change, why):
+    api, rec = legacy_cluster(), ready_record(tmp_path)
+    change(api)
+    with pytest.raises(C.StagingError, match=why):
+        LG.build_plan(api, rec)
+
+
+def test_surviving_pods_or_a_renewed_lease_block_parking_and_retirement(tmp_path):
+    # Finding 3: owned pods (terminating ones included) and Lease renewals are the shutdown signals.
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    plan = LG.build_plan(api, rec)
+    op = api.objects[("deployments", "ml-engine", "predictive-operator")]
+    rs = api.objects[("replicasets", "ml-engine", "predictive-operator-rs")]
+    api.instant_pods = False
+    real_replace = api.replace
+
+    def replace(path, body):
+        out = real_replace(path, body)
+        if path.endswith("/deployments/predictive-operator/scale"):          # the old pod hangs in Terminating
+            api.add("pods", {"kind": "Pod", "metadata": {"name": "predictive-operator-stuck", "namespace": "ml-engine",
+                                                         "deletionTimestamp": "2026-11-08T00:00:00Z",
+                                                         "ownerReferences": [{"kind": "ReplicaSet",
+                                                                              "uid": rs["metadata"]["uid"]}]}})
+        return out
+    api.replace = replace
+    for k in [k for k, v in api.objects.items() if k[0] == "pods"]:          # generators' pods are gone already
+        if not any(r.get("uid") == rs["metadata"]["uid"] for r in api.objects[k]["metadata"]["ownerReferences"]):
+            del api.objects[k]
+    with pytest.raises(C.StagingError, match="pod termination"):
+        LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    assert op["spec"]["replicas"] == 0
+    assert api.objects[("deployments", "demo", "nginx-test")]["spec"]["replicas"] == 3        # not parked
+
+    api2, rec2, clock2 = legacy_cluster(), ready_record(tmp_path / "b"), Clock()
+    plan2 = LG.build_plan(api2, rec2)
+    lease = api2.objects[("leases", "ml-engine", "predictive-autoscaler-leader")]
+    polls = {"n": 0}
+
+    def renew(a):
+        polls["n"] += 1
+        if api2.objects[("deployments", "ml-engine", "predictive-operator")]["spec"]["replicas"] == 0:
+            lease["spec"]["renewTime"] = f"2026-11-08T00:{polls['n'] % 60:02d}:00Z"          # someone still renews
+    api2.on_poll.append(renew)
+    with pytest.raises(C.StagingError, match="Lease"):
+        LG.quiesce(api2, rec2, plan2, C.plan_digest(plan2), sleep=clock2.sleep, monotonic=clock2, clock=clock2)
+    assert api2.objects[("deployments", "demo", "nginx-test")]["spec"]["replicas"] == 3       # not parked
+
+    api3, rec3, clock3 = legacy_cluster(), ready_record(tmp_path / "c"), Clock()
+    plan3 = LG.build_plan(api3, rec3)
+    LG.quiesce(api3, rec3, plan3, C.plan_digest(plan3), sleep=clock3.sleep, monotonic=clock3, clock=clock3)
+    lease3 = api3.objects[("leases", "ml-engine", "predictive-autoscaler-leader")]
+    n = {"i": 0}
+
+    def renew_later(a):
+        n["i"] += 1
+        if n["i"] == 200:
+            lease3["spec"]["renewTime"] = "2026-11-09T00:00:00Z"
+    api3.on_poll.append(renew_later)
+    v = LG.verify(api3, rec3, 600, clock3.sleep, clock3, clock3)
+    assert v["retired"] is False and any("changed during the observation" in p for p in v["problems"])
+
+
+def test_restore_refuses_drift_after_quiesce(tmp_path):
+    # Finding 4: restore is bound to the post-quiesce generation and value.
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    plan = LG.build_plan(api, rec)
+    LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    rplan = LG.build_restore_plan(api, rec)
+    d = api.objects[("deployments", "demo", "nginx-reactive")]
+    d["spec"]["replicas"] = 5                                               # a newer owner decision, same UID
+    d["metadata"]["generation"] += 1
+    with pytest.raises(C.StagingError, match="changed|drifted"):
+        LG.restore(api, rec, rplan, C.plan_digest(rplan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    assert d["spec"]["replicas"] == 5                                       # never overwritten
+
+
+def test_restore_refuses_a_foreign_writer_before_restoring_writers(tmp_path):
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    plan = LG.build_plan(api, rec)
+    LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    api.add("pa-new", {"kind": "PredictiveAutoscaler", "metadata": {"name": "adopter", "namespace": "demo"},
+                       "spec": {"targetDeployment": {"name": "nginx-test", "namespace": "demo"}}})
+    rplan = LG.build_restore_plan(api, rec)
+    with pytest.raises(C.StagingError, match="already have writers"):
+        LG.restore(api, rec, rplan, C.plan_digest(rplan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    assert ("scaledobjects", "demo", "nginx-test-keda-fallback") not in api.objects
+    assert api.objects[("deployments", "ml-engine", "predictive-operator")]["spec"]["replicas"] == 0
+
+
+def test_a_lost_response_after_a_delete_stays_recoverable(tmp_path):
+    # Finding 5: the intent (with the snapshot) is durable before the call; an ambiguous outcome keeps the lock and
+    # restore-plan reconciles it against the live object.
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    plan = LG.build_plan(api, rec)
+    real_delete = api.delete
+
+    def lossy(path, uid, rv=None):
+        real_delete(path, uid, rv)
+        raise C.ApiError("delete: failed (timeout, exit 1)", 504)            # deleted, but the response was lost
+    api.delete = lossy
+    with pytest.raises(C.ApiError):
+        LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    assert ("scaledobjects", "demo", "nginx-test-keda-fallback") not in api.objects
+    assert os.path.exists(os.path.join(rec["evidence_dir"], "locks", "legacy.lock"))   # fail closed
+    with pytest.raises(C.StagingError, match="another execution"):
+        LG.quiesce(api, rec, plan, C.plan_digest(plan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    api.delete = real_delete
+    rplan = LG.build_restore_plan(api, rec)
+    recreate = [a for a in rplan["actions"] if a["op"] == "recreate"]
+    assert [a["name"] for a in recreate] == ["nginx-test-keda-fallback"]
+    LG.restore(api, rec, rplan, C.plan_digest(rplan), sleep=clock.sleep, monotonic=clock, clock=clock)
+    assert ("scaledobjects", "demo", "nginx-test-keda-fallback") in api.objects
+    assert api.objects[("deployments", "demo", "k6-nginx-test")]["spec"]["replicas"] == 1

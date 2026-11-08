@@ -67,7 +67,7 @@ def test_secrets_and_credential_fields_never_pass(tmp_path):
     assert [d["kind"] for d in docs] == ["Deployment", "ConfigMap"] and "1 Secret documents discarded" in out
     env = {e["name"]: e.get("value") for e in docs[0]["spec"]["template"]["spec"]["containers"][0]["env"]}
     assert env["VM_PASSWORD"] == C.REDACTED and env["METRICS_URL"] == C.REDACTED        # user-info: whole value
-    assert env["FORECASTER_TLS_CERT"] == "/etc/predictive-autoscaler/tls/tls.crt"        # a path is kept for review
+    assert env["FORECASTER_TLS_CERT"] == C.REDACTED          # credential-named: redacted even when path-shaped
     assert docs[0]["spec"]["template"]["spec"]["containers"][0]["args"] == [f"--token={C.REDACTED}",
                                                                            "--leader-elect=true"]
     assert set(docs[1]["data_sha256"]) == {"dash.json"} and "data" not in docs[1]

@@ -36,12 +36,17 @@ def scratch_repo(tmp_path):
 def setup(tmp_path, **velero):
     repo, commit = scratch_repo(tmp_path)
     export = tmp_path / "export"
-    for rel, body in (("p8/run-1/result.json", '{"ok": true}'), ("freeze/capture-v7.tar.gz", "tar"),
-                      ("SHA256SUMS", "sums")):
+    import hashlib
+    sums = []
+    for rel, body in (("p8/run-1/result.json", '{"ok": true}'), ("freeze/capture-v7.tar.gz", "tar")):
         (export / rel).parent.mkdir(parents=True, exist_ok=True)
         (export / rel).write_text(body)
+        sums.append(f"{hashlib.sha256(body.encode()).hexdigest()}  {rel}")
+    (export / "SHA256SUMS").write_text("\n".join(sums) + "\n")
     rec = record(tmp_path, source={"commit": commit, "repo_dir": repo}, archive={
         "evidence": {"export_dir": str(export), "allowlist": ["p8/*", "freeze/*", "SHA256SUMS"],
+                     "mandatory": ["p8/run-1/result.json", "freeze/capture-v7.tar.gz", "SHA256SUMS"],
+                     "checksum_manifests": ["SHA256SUMS"],
                      "destination": str(tmp_path / "offcluster")},
         "velero": {"namespace": "velero", "backup_name": "c28-r1-legacy-20261108", "storage_location": "minio-default",
                    "ttl": "2160h0m0s", "metadata_only": True, "included_namespaces": ["demo", "ml-engine"],
@@ -80,7 +85,7 @@ def test_a_complete_archive_earns_its_receipt_and_leaks_nothing(tmp_path):
     with pytest.raises(C.StagingError, match="Velero"):
         A.verify(rec, plan)                                                              # no status receipt yet
     complete_backup(api, rec)
-    A.velero_receipt(api, rec)
+    A.velero_receipt(api, rec, plan)
     r = A.verify(rec, plan)
     assert r["event"] == "archive-complete" and r["data"]["plan_sha256"] == d
     for f in (tmp_path / "evidence").rglob("*"):
@@ -103,7 +108,7 @@ def test_any_gap_refuses_the_archive(tmp_path, break_it, why):
     api, rec = setup(tmp_path)
     plan, _ = run_all(api, rec)
     break_it(api, rec, tmp_path)
-    A.velero_receipt(api, rec)
+    A.velero_receipt(api, rec, plan)
     with pytest.raises(C.StagingError, match=why):
         A.verify(rec, plan)
     events = [r["event"] for r in C.read_receipts(C.receipts_path(rec, "archive"))]
@@ -114,7 +119,7 @@ def test_assessed_warnings_pass(tmp_path):
     api, rec = setup(tmp_path, warnings_assessed=["volume snapshot skipped: metadata-only by design"])
     plan, _ = run_all(api, rec)
     complete_backup(api, rec, warnings=1)
-    A.velero_receipt(api, rec)
+    A.velero_receipt(api, rec, plan)
     assert A.verify(rec, plan)["event"] == "archive-complete"
 
 
@@ -150,3 +155,47 @@ def test_the_cli_plan_is_read_only(tmp_path, capsys):
     assert api.mutations() == []
     out = capsys.readouterr().out
     assert "plan digest" in out and "velero spec" in out
+
+
+# --- Codex r1 on #31 ----------------------------------------------------------------------------------------------
+
+def test_a_replacement_backup_never_satisfies_s0(tmp_path):
+    # Finding 6: the status must be the submitted Backup's (UID), with the run label and the reviewed spec.
+    api, rec = setup(tmp_path)
+    plan, _ = run_all(api, rec)
+    key = ("backups", "velero", rec["archive"]["velero"]["backup_name"])
+    old = api.objects.pop(key)
+    api.add("backups", {"kind": "Backup", "metadata": {"name": key[2], "namespace": "velero",
+                                                       "labels": old["metadata"]["labels"]},
+                        "spec": old["spec"], "status": {"phase": "Completed", "errors": 0, "warnings": 0}})
+    with pytest.raises(C.StagingError, match="another UID"):
+        A.velero_receipt(api, rec, plan)
+    with pytest.raises(C.StagingError, match="Velero"):
+        A.verify(rec, plan)
+    api2, rec2 = setup(tmp_path / "b")
+    plan2, _ = run_all(api2, rec2)
+    complete_backup(api2, rec2)
+    backup = api2.objects[("backups", "velero", rec2["archive"]["velero"]["backup_name"])]
+    backup["spec"]["includedNamespaces"] = ["demo"]
+    with pytest.raises(C.StagingError, match="reviewed specification"):
+        A.velero_receipt(api2, rec2, plan2)
+    with pytest.raises(C.StagingError, match="submitted no Backup"):
+        A.velero_receipt(api2, rec2, dict(plan2, evidence=[]))                           # another plan
+
+
+@pytest.mark.parametrize("change, why", [
+    (lambda rec, tmp: rec["archive"]["evidence"].update(mandatory=[]), "mandatory must list"),
+    (lambda rec, tmp: rec["archive"]["evidence"]["mandatory"].append("p8/run-2/result.json"),
+     "missing from the export"),
+    (lambda rec, tmp: (tmp / "export" / "freeze" / "capture-v7.tar.gz").write_text("changed"), "recorded checksum"),
+    (lambda rec, tmp: (tmp / "export" / "SHA256SUMS").write_text(""), "lists no file"),
+    (lambda rec, tmp: (tmp / "export" / "SHA256SUMS").write_text("0" * 64 + "  ../outside\n"), "outside the export"),
+    (lambda rec, tmp: rec["archive"]["evidence"].update(checksum_manifests=["p8/SUMS-not-mandatory"]),
+     "itself be a mandatory artifact"),
+])
+def test_completeness_needs_the_mandatory_manifest_and_verified_chains(tmp_path, change, why):
+    # Finding 7: allowlisting proves nothing missing; checksum manifests are verified, not copied.
+    api, rec = setup(tmp_path)
+    change(rec, tmp_path)
+    with pytest.raises(C.StagingError, match=why):
+        A.build_plan(api, rec)

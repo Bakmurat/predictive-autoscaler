@@ -22,7 +22,8 @@ LEGACY_GROUP = "autoscaler.example.com"
 LEGACY_LEASE = "predictive-autoscaler-leader"
 ARMS = ("nginx-test", "nginx-reactive", "myapptwo", "nginx-seasonal", "nginx-ensemble", "nginx-ensemble-q95")
 PA_ARMS = ("nginx-test", "nginx-reactive", "nginx-seasonal", "nginx-ensemble", "nginx-ensemble-q95")
-KEDA_OBJECTS = ("nginx-test-keda-fallback", "myapptwo-keda-fallback")
+KEDA_TARGETS = {"nginx-test-keda-fallback": "nginx-test", "myapptwo-keda-fallback": "myapptwo"}
+KEDA_OBJECTS = tuple(KEDA_TARGETS)
 
 ALLOWLIST = (
     [("cronjobs", "ml-engine", n, "launcher") for n in ("ml-training", "evidence-archive", "load-evidence")]
@@ -48,3 +49,12 @@ def generated_hpa(scaled_object: str) -> str:
 
 def entries(role=None):
     return [e for e in ALLOWLIST if role is None or e[3] == role]
+
+
+def expected_target(kind: str, name: str):
+    """The Deployment (in demo) an allowlisted writer must actually target; None for other kinds."""
+    if kind == "pa-legacy" and name.endswith("-autoscaler"):
+        return ("demo", name[:-len("-autoscaler")])
+    if kind == "scaledobjects":
+        return ("demo", KEDA_TARGETS.get(name))
+    return None

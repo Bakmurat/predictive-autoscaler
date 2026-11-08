@@ -116,3 +116,48 @@ def test_sanitizing_removes_every_secret_carrier():
         C.assert_clean("-----BEGIN RSA PRIVATE KEY-----")
     with pytest.raises(C.StagingError):
         C.assert_clean("value: x", secrets=["value: x"])
+
+
+# --- Codex r1 on #31, finding 1 ---------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("env", [{"name": "DB_PASSWORD", "value": "123456"},
+                                 {"name": "API_SECRET_FILE", "value": "/run/s3cr3t-9f8e7d"},
+                                 {"name": "AUTH_TOKEN", "value": "true-SECRET"},
+                                 {"name": "PIN_KEY", "value": "0042"}])
+def test_numeric_or_path_shaped_credentials_are_redacted(env):
+    o = C.sanitize_object({"kind": "Pod", "metadata": {"name": "p"}, "spec": {"containers": [{"name": "c",
+                                                                                         "env": [env]}]}})
+    assert o["spec"]["containers"][0]["env"][0]["value"] == C.REDACTED
+
+
+def test_split_credential_arguments_are_redacted():
+    o = C.sanitize_object({"kind": "Pod", "metadata": {"name": "p"}, "spec": {"containers": [{"name": "c", "args": [
+        "--password", "hunter2", "--api-key", "123", "-p", "pin", "--enable-auth", "--port=8080", "--mode", "x"]}]}})
+    assert o["spec"]["containers"][0]["args"] == ["--password", C.REDACTED, "--api-key", C.REDACTED, "-p", C.REDACTED,
+                                                  "--enable-auth", "--port=8080", "--mode", "x"]
+
+
+def test_kubectl_stderr_never_reaches_an_error_message():
+    secret = "Bearer eyJhbGciOiJSUzI1NiJ9.SECRETPAYLOAD.sig hunter2"
+    for err, status in ((f"Error from server (Forbidden): {secret}", 403),
+                        (f"error: the object has been modified; body: {secret}", 409),
+                        (f"weird failure {secret}", None)):
+        api = C.KubectlApi({"path": "k", "context": "c"}, run=Run(rc=1, err=err))
+        with pytest.raises(C.ApiError) as e:
+            api.replace("/apis/apps/v1/namespaces/demo/deployments/x", {"spec": {}})
+        assert "hunter2" not in str(e.value) and "SECRETPAYLOAD" not in str(e.value) and e.value.status == status
+
+
+def test_the_exclusive_lock_survives_an_in_flight_mutation(tmp_path):
+    rec = record(tmp_path)
+    with C.exclusive_lock(rec, "legacy"):
+        with pytest.raises(C.StagingError, match="another execution"):
+            with C.exclusive_lock(rec, "legacy"):
+                pass
+    with pytest.raises(C.ApiError):
+        with C.exclusive_lock(rec, "legacy") as lock:
+            lock.safe = False                    # an intent is recorded, the call's outcome is unknown
+            raise C.ApiError("lost response")
+    with pytest.raises(C.StagingError, match="crashed"):
+        with C.exclusive_lock(rec, "legacy"):
+            pass

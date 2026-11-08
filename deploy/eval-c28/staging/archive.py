@@ -5,14 +5,17 @@
   archive.py --record R snapshot --plan P --plan-digest D      sanitized object snapshots (reads the cluster only)
   archive.py --record R export --plan P --plan-digest D        copy the allowlisted evidence files off-cluster
   archive.py --record R velero-submit --plan P --plan-digest D create the reviewed Velero Backup (the one mutation)
-  archive.py --record R velero-receipt                         read-only: the Backup's UID, phase, errors, warnings
+  archive.py --record R velero-receipt --plan P                read-only: that submitted Backup's phase, errors,
+                                                               warnings (bound to its UID, run and reviewed spec)
   archive.py --record R verify --plan P                        the archive-complete receipt, or a refusal
 
 The plan binds: the sanitized snapshots of every allowlisted legacy object and every writer of a legacy target (with
 the claims' PVs), the source revisions (git ls-tree of the recorded commit: blob ids of deploy/prodcluster,
 deploy/eks-benchmark and k8s-manifests/base, never the working tree), the evidence files the approved export procedure
 staged locally (record archive.evidence.export_dir; only files matching archive.evidence.allowlist, never a live
-database file or WAL), and the Velero Backup specification (unique name, explicit storage location, scope, TTL;
+database file or WAL; every file of the explicit archive.evidence.mandatory manifest present; every checksum manifest
+in archive.evidence.checksum_manifests verified file by file, here and again at the destination), and the Velero
+Backup specification (unique name, explicit storage location, scope, TTL;
 labelled metadata-only when it does not back up volume data). Snapshots never contain a Secret value, ConfigMap
 contents, a literal credential env value or a last-applied configuration; no Secret or ConfigMap is archived at all.
 `verify` recomputes every hash: the snapshots, the received copies at the off-cluster destination, the source list;
@@ -29,7 +32,7 @@ import os
 import shutil
 import subprocess
 import sys
-from typing import Dict, List, Mapping
+from typing import Dict, List, Mapping, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -78,7 +81,50 @@ def _evidence_files(rec: Mapping) -> List[Dict]:
         raise C.StagingError("export directory holds files that are not archived as evidence: " + "; ".join(refused))
     if not files:
         raise C.StagingError("no evidence file matches the allowlist")
+    mandatory = ev.get("mandatory") or []
+    if not mandatory:
+        raise C.StagingError("archive.evidence.mandatory must list every required artifact explicitly (allowlisting "
+                             "alone cannot show that nothing is missing)")
+    have = {f["path"] for f in files}
+    missing = sorted(set(mandatory) - have)
+    if missing:
+        raise C.StagingError(f"mandatory artifacts are missing from the export: {missing}")
+    chains = ev.get("checksum_manifests") or []
+    if not set(chains) <= set(mandatory):
+        raise C.StagingError("every checksum manifest must itself be a mandatory artifact")
+    problems = checksum_chain_problems(root, chains)
+    if problems:
+        raise C.StagingError("checksum chains do not verify: " + "; ".join(problems))
     return sorted(files, key=lambda f: f["path"])
+
+
+def checksum_chain_problems(root: str, manifests) -> List[str]:
+    """Each checksum manifest (sha256sum format: "<hex>  <path relative to the manifest's directory>") must list at
+    least one file, and every listed file must exist under root with that hash (a chain is verified, not copied)."""
+    out = []
+    for m in manifests:
+        mpath = os.path.join(root, m)
+        try:
+            lines = [ln for ln in open(mpath).read().splitlines() if ln.strip()]
+        except OSError:
+            out.append(f"{m} is unreadable")
+            continue
+        if not lines:
+            out.append(f"{m} lists no file")
+        for ln in lines:
+            parts = ln.split(None, 1)
+            if len(parts) != 2 or len(parts[0]) != 64:
+                out.append(f"{m}: malformed line")
+                continue
+            want, rel = parts[0].lower(), parts[1].lstrip("*").strip()
+            target = os.path.abspath(os.path.join(os.path.dirname(mpath), rel))
+            if not target.startswith(os.path.abspath(root) + os.sep):
+                out.append(f"{m}: {rel} lies outside the export")
+            elif not os.path.isfile(target):
+                out.append(f"{m}: {rel} is missing")
+            elif C.sha256_file(target) != want:
+                out.append(f"{m}: {rel} does not match its recorded checksum")
+    return out
 
 
 def velero_backup(rec: Mapping) -> Dict:
@@ -122,6 +168,8 @@ def build_plan(api, rec: Mapping, run=subprocess.run) -> Dict:
     return C.make_plan(HELPER, rec, [], inventory_sha256=C.digest(inv), snapshots=objs,
                        unaccounted=inv["legacy"]["missing"], blockers=inv["legacy"]["blockers"],
                        source=_source_revisions(rec, run), evidence=_evidence_files(rec), velero=backup,
+                       mandatory=sorted(rec["archive"]["evidence"]["mandatory"]),
+                       checksum_manifests=sorted(rec["archive"]["evidence"].get("checksum_manifests") or []),
                        destination=rec["archive"]["evidence"].get("destination"))
 
 
@@ -171,12 +219,17 @@ def export(rec: Mapping, plan: Mapping, reviewed: str, clock=None) -> Dict:
 
 def verify_destination(plan: Mapping) -> List[str]:
     out = []
+    planned = {f["path"] for f in plan["evidence"]}
+    out += [f"mandatory {m} was not planned" for m in plan.get("mandatory", []) if m not in planned]
     for f in plan["evidence"]:
         d = os.path.join(plan["destination"] or "", f["path"])
         if not os.path.isfile(d):
             out.append(f"{f['path']} missing at the destination")
         elif C.sha256_file(d) != f["sha256"]:
             out.append(f"{f['path']} differs at the destination")
+    if not out and plan.get("checksum_manifests"):
+        out += [f"at the destination: {p}" for p in checksum_chain_problems(plan["destination"],
+                                                                           plan["checksum_manifests"])]
     return out
 
 
@@ -193,14 +246,31 @@ def velero_submit(api, rec: Mapping, plan: Mapping, reviewed: str, clock=None) -
     return r
 
 
-def velero_receipt(api, rec: Mapping, clock=None) -> Dict:
+def _submitted(rec: Mapping, pdig: str) -> Optional[Dict]:
+    subs = [r["data"] for r in C.read_receipts(C.receipts_path(rec, HELPER))
+            if r["event"] == "velero-submitted" and r["data"]["plan_sha256"] == pdig]
+    return subs[-1] if subs else None
+
+
+def velero_receipt(api, rec: Mapping, plan: Mapping, clock=None) -> Dict:
+    """The status of exactly the Backup this plan submitted: same UID, run label and reviewed spec."""
     C.require_cluster(api, rec["cluster_uid"])
-    b = velero_backup(rec)
+    pdig = C.plan_digest(plan)
+    sub = _submitted(rec, pdig)
+    if sub is None:
+        raise C.StagingError("this plan submitted no Backup")
+    b = plan["velero"]
     o = api.get(C.path_of("backups", b["metadata"]["namespace"], b["metadata"]["name"]))
     if o is None:
         raise C.StagingError("the Backup does not exist")
+    m, spec = o.get("metadata") or {}, o.get("spec") or {}
+    if m.get("uid") != sub["uid"]:
+        raise C.StagingError("the Backup has another UID than the one this plan submitted (replaced); refusing")
+    if (m.get("labels") or {}).get("c28.devkuban.com/run") != rec["run_id"] or \
+            any(spec.get(k) != v for k, v in b["spec"].items()):
+        raise C.StagingError("the Backup's labels or spec differ from the reviewed specification; refusing")
     st = o.get("status") or {}
-    data = {"name": b["metadata"]["name"], "uid": o["metadata"].get("uid"), "phase": st.get("phase"),
+    data = {"plan_sha256": pdig, "name": b["metadata"]["name"], "uid": m.get("uid"), "phase": st.get("phase"),
             "errors": st.get("errors", 0), "warnings": st.get("warnings", 0),
             "metadata_only": b["spec"]["snapshotVolumes"] is False,
             "storage_location": (o.get("spec") or {}).get("storageLocation"),
@@ -236,8 +306,9 @@ def verify(rec: Mapping, plan: Mapping, clock=None) -> Dict:
     problems += verify_destination(plan)
     if not plan["source"]["blobs"]:
         problems.append("no source revisions recorded")
-    status = [r["data"] for r in receipts if r["event"] == "velero-status" and r["data"]["name"] ==
-              plan["velero"]["metadata"]["name"]]
+    sub = _submitted(rec, pdig)
+    status = [r["data"] for r in receipts if r["event"] == "velero-status" and sub is not None
+              and r["data"].get("plan_sha256") == pdig and r["data"]["uid"] == sub["uid"]]
     if not status:
         problems.append("no Velero status receipt")
     else:
@@ -272,7 +343,8 @@ def main(argv=None, api=None, run=subprocess.run, clock=None) -> int:
         p = sub.add_parser(name)
         p.add_argument("--plan", required=True)
         p.add_argument("--plan-digest", required=True)
-    sub.add_parser("velero-receipt")
+    vr = sub.add_parser("velero-receipt")
+    vr.add_argument("--plan", required=True)
     v = sub.add_parser("verify")
     v.add_argument("--plan", required=True)
     a = ap.parse_args(argv)
@@ -295,7 +367,7 @@ def main(argv=None, api=None, run=subprocess.run, clock=None) -> int:
         elif cmd == "velero-submit":
             print(json.dumps(velero_submit(api, rec, C.load_plan(a.plan), a.plan_digest, clock)["data"]))
         elif cmd == "velero-receipt":
-            print(json.dumps(velero_receipt(api, rec, clock), sort_keys=True))
+            print(json.dumps(velero_receipt(api, rec, C.load_plan(a.plan), clock), sort_keys=True))
         else:
             r = verify(rec, C.load_plan(a.plan), clock)
             print(f"archive complete: receipt {r['sha256']} (set legacy.archive_receipt_sha256 to it)")
