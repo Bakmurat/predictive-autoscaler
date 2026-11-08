@@ -9,22 +9,21 @@
                                                                warnings (bound to its UID, run and reviewed spec)
   archive.py --record R verify --plan P                        the archive-complete receipt, or a refusal
 
-The plan binds: the sanitized snapshots of every allowlisted legacy object and every writer of a legacy target (with
-the claims' PVs), the campaign source revisions (git ls-tree of archive.source_revision.commit, the reviewed
-benchmark revision, never the helper commit source.commit nor the working tree: blob ids of deploy/prodcluster,
-deploy/eks-benchmark and k8s-manifests/base, each required), the populate-s0 export-complete receipt the evidence
-comes from (archive.evidence.export_receipt, with the S0-SHA256SUMS digest it certified; every file S0-SHA256SUMS
-certifies is re-hashed here and at the destination, and the archived evidence is exactly those files plus the
-manifest, whatever checksum_manifests lists), the evidence files the approved export procedure staged locally (record archive.evidence.export_dir; only files matching
-archive.evidence.allowlist, never a live
-database file or WAL; every file of the explicit archive.evidence.mandatory manifest present; every checksum manifest
-in archive.evidence.checksum_manifests verified file by file, here and again at the destination), and the Velero
-Backup specification (unique name, explicit storage location, scope, TTL;
-labelled metadata-only when it does not back up volume data). Snapshots never contain a Secret value, ConfigMap
-contents, a literal credential env value or a last-applied configuration; no Secret or ConfigMap is archived at all.
-`verify` recomputes every hash: the snapshots, the received copies at the off-cluster destination, the source list;
-it requires the Backup Completed with zero errors and each warning assessed in the record; any gap refuses the
-archive-complete receipt that legacy.py requires before S4.
+The plan binds: the sanitized snapshots of every allowlisted legacy object and every writer of a legacy target (with the
+claims' PVs), the campaign source revisions (git ls-tree of archive.source_revision.commit, the reviewed benchmark
+revision, never the helper commit source.commit nor the working tree: blob ids of deploy/prodcluster,
+deploy/eks-benchmark and k8s-manifests/base, each required), the populate-s0 export-complete receipt the evidence comes
+from (archive.evidence.export_receipt, with the S0-SHA256SUMS digest it certified; every file S0-SHA256SUMS certifies is
+re-hashed here and at the destination, and the archived evidence is exactly those files plus the manifest, whatever
+checksum_manifests lists), the evidence files the approved export procedure staged locally (record
+archive.evidence.export_dir; only files matching archive.evidence.allowlist, never a live database file or WAL; every
+file of the explicit archive.evidence.mandatory manifest present; every checksum manifest in
+archive.evidence.checksum_manifests verified file by file, here and again at the destination), and the Velero Backup
+specification (unique name, explicit storage location, scope, TTL; labelled metadata-only when it does not back up
+volume data). Snapshots never contain a Secret value, ConfigMap contents, a literal credential env value or a
+last-applied configuration; no Secret or ConfigMap is archived at all. `verify` recomputes every hash: the snapshots,
+the received copies at the off-cluster destination, the source list; it requires the Backup Completed with zero errors
+and each warning assessed in the record; any gap refuses the archive-complete receipt that legacy.py requires before S4.
 """
 
 from __future__ import annotations
