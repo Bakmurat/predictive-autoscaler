@@ -241,7 +241,10 @@ def env(tmp_path):
                                   "spec": {"nodeName": "prodworker-ml", "source": {"persistentVolumeName":
                                                                                    "pv-ml-models-pvc"}},
                                   "status": {"attached": True}})
-    api.add("pods", {"kind": "Pod", "metadata": {"name": "ml-api-0", "namespace": "ml-engine"},
+    api.add("pods", {"kind": "Pod", "metadata": {"name": "ml-api-6fd467c54f-9jrrw", "namespace": "ml-engine",
+                                                 "uid": "pod-ml-api",
+                                                 "ownerReferences": [{"kind": "ReplicaSet", "name": "ml-api-6fd467c54f",
+                                                                      "controller": True}]},
                      "spec": {"nodeName": "prodworker-ml", "volumes": [
                          {"name": "m", "persistentVolumeClaim": {"claimName": "ml-models-pvc"}}]},
                      "status": {"phase": "Running"}})
@@ -1405,3 +1408,78 @@ def test_unreviewed_identities_are_reported_by_digest_only(env, extra, why):
     probs = P.plan(e["record"], e["kube"])["problems"]
     assert any(why in x for x in probs), probs
     assert not any("pm-marker" in x for x in probs), probs
+
+
+def add_job_pod(e, job, pvc, n, node="prodworker-ml", phase="Succeeded", owner_kind="Job"):
+    e["api"].add("pods", {"kind": "Pod", "metadata": {"name": f"{job}-{n}", "namespace": "ml-engine", "uid": f"u-{n}",
+                                                      "ownerReferences": [{"kind": owner_kind, "name": job,
+                                                                           "controller": True}]},
+                          "spec": {"nodeName": node, "volumes": [
+                              {"name": "d", "persistentVolumeClaim": {"claimName": pvc}}]},
+                          "status": {"phase": phase}})
+
+
+def test_consumer_churn_and_attachment_do_not_change_the_plan_digest(env):
+    """The 08:51Z refusal: the evidence-archive CronJob's new pod (and its attachment) changed the live plan. Who uses
+    a claim and where it is attached are live preconditions, re-validated before each reader and recorded in the
+    receipts, never part of the reviewed digest."""
+    e = env
+    do_probe(e)
+    p1 = P.plan(e["record"], e["kube"])
+    assert p1["problems"] == [], p1["problems"]
+    assert "consumers" not in p1 and all("attached_node" not in v["binding"] for v in p1["pvcs"].values())
+    add_job_pod(e, "evidence-archive-29902130", "evidence-archive-pvc", "a1b2c")      # the 08:50Z CronJob pod
+    add_job_pod(e, "evidence-archive-29902130", "ml-models-pvc", "a1b2d")
+    e["api"].add("volumeattachments", {"kind": "VolumeAttachment", "metadata": {"name": "va-2"},
+                                       "spec": {"nodeName": "prodworker-ml", "source": {
+                                           "persistentVolumeName": "pv-evidence-archive-pvc"}},
+                                       "status": {"attached": True}})
+    p2 = P.plan(e["record"], e["kube"])
+    assert C.plan_digest(p2) == C.plan_digest(p1)
+    p, d = reviewed(e["record"], p1, P.HELPER, "plan")
+    out = P.export(e["record"], e["kube"], p, d, e["exe"], e["clock"].sleep, e["clock"].now)
+    assert out["event"] == "export-complete"
+    pre = [r["data"] for r in X.receipts(e["record"], P.HELPER) if r["event"] == "reader-preconditions"]
+    ea = next(x for x in pre if x["pvc"] == "evidence-archive-pvc")
+    assert ea["attached_node"] == "prodworker-ml" and {c["pod"] for c in ea["consumers"]} == {
+        "evidence-archive-29902130-a1b2c"}
+    assert all(c["owner"]["kind"] == "Job" for c in ea["consumers"])
+
+
+@pytest.mark.parametrize("job, owner_kind", [("debug-shell", "Job"), ("evidence-archive-29902130", "StatefulSet"),
+                                             ("pm-marker-writer-7", "Job")])
+def test_an_unknown_consumer_kind_blocks(env, job, owner_kind):
+    e = env
+    do_probe(e)
+    p1 = P.plan(e["record"], e["kube"])
+    assert p1["problems"] == []
+    p, d = reviewed(e["record"], p1, P.HELPER, "plan")
+    add_job_pod(e, job, "evidence-archive-pvc", "zz9", phase="Running", owner_kind=owner_kind)
+    with pytest.raises(X.StagingError, match="unknown writer kind"):
+        P.export(e["record"], e["kube"], p, d, e["exe"], e["clock"].sleep, e["clock"].now)
+    assert not [o for (k, _, _), o in e["api"].objects.items()
+                if k == "pods" and P.READER_LABEL in (o["metadata"].get("labels") or {})]
+    probs = P.plan(e["record"], e["kube"])["problems"]
+    assert any("unknown writer kind" in x for x in probs) and not any("pm-marker" in x for x in probs)
+
+
+def test_a_consumer_appearing_between_readers_blocks_the_next_reader(env):
+    """The precondition is re-validated before EACH reader, not only at plan time."""
+    e = env
+    do_probe(e)
+    p, d = reviewed(e["record"], P.plan(e["record"], e["kube"]), P.HELPER, "plan")
+    real = P.revalidate
+    calls = []
+
+    def spy(record, kube, s, pvc, planned):
+        calls.append(pvc)
+        if pvc == "load-evidence-pvc":
+            add_job_pod(e, "rogue", "load-evidence-pvc", "r1", phase="Running")
+        return real(record, kube, s, pvc, planned)
+    P.revalidate = spy
+    try:
+        with pytest.raises(X.StagingError, match="unknown writer kind"):
+            P.export(e["record"], e["kube"], p, d, e["exe"], e["clock"].sleep, e["clock"].now)
+    finally:
+        P.revalidate = real
+    assert calls[:2] == ["forecast-log-pvc", "evidence-archive-pvc"] and "load-evidence-pvc" in calls

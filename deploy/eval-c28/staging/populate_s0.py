@@ -63,9 +63,12 @@ empty tar whose manifest, like the coverage file, carries those member reference
 tar and manifest digests) and the current pairs' hashes and byte counts; verify re-resolves them.
 
 Reader pods (namespace ml-engine): the claim mounted read-only, no service-account token, non-root, read-only root
-filesystem, pinned to the node the RWO volume is attached to (VolumeAttachment), a deadline. Before EACH reader the
-claim binding (UID, PV, attachment) and the campaign-job precondition (no active load-evidence, ml-training,
-evidence-archive or p8 Job; a query error refuses) are revalidated. The whole lifecycle of a reader (create, work,
+filesystem, pinned to the node the RWO volume is attached to (VolumeAttachment), a deadline. A reviewed plan binds
+only the claim's storage IDENTITY (UID, PV, reclaim policy, class, access modes); the LIVE preconditions are
+re-validated before EACH reader and recorded in its reader-preconditions receipt, never digested: no active
+load-evidence, ml-training, evidence-archive or p8 Job (a query error refuses), every pod using the claim is an
+allowlisted writer kind (WRITER_KINDS: the campaign CronJobs' Job pods, the ml-api / predictive-operator ReplicaSet
+pods), and the node the volume is attached to now. The whole lifecycle of a reader (create, work,
 delete, proof) is ONE common_records.mutation_step: its intent is durable before the pod is created, a delete intent
 is durable before every delete, and the outcome is written only once cleanup is PROVEN (no pod of the run's nonce
 remains and a volume that was not attached before is released). An unproven cleanup leaves the intent unresolved and
@@ -1160,17 +1163,54 @@ def claim_binding(kube: X.Kube, name: str, uid: str) -> Dict:
             "access_modes": (pvc.get("spec") or {}).get("accessModes"), "attached_node": attached_node(kube, pv_name)}
 
 
+# The binding fields a reviewed plan binds: the claim's storage IDENTITY. Where the volume is attached right now, and
+# which pods use it, are LIVE preconditions (re-validated before each reader, recorded in the receipts), never part
+# of a plan digest: the campaign CronJobs create a pod every 15 minutes.
+STABLE_BINDING = ("name", "uid", "pv", "pv_uid", "reclaim_policy", "storage_class", "access_modes")
+# The writer kinds allowed to use a claim while S0 reads it, by the pod's controller (kind, name pattern): the
+# campaign CronJobs' Job pods (<cronjob>-<scheduled minute>) and the Deployments' ReplicaSet pods. Anything else
+# blocks the reader.
+WRITER_KINDS = {
+    "evidence-archive-pvc": [("Job", r"evidence-archive-\d+")],
+    "forecast-log-pvc": [("ReplicaSet", r"predictive-operator-[a-z0-9]+")],
+    "load-evidence-pvc": [("Job", r"load-evidence-\d+")],
+    "ml-models-pvc": [("Job", r"evidence-archive-\d+"), ("Job", r"ml-training-\d+"), ("ReplicaSet", r"ml-api-[a-z0-9]+")],
+}
+
+
+def stable(binding: Dict) -> Dict:
+    return {k: binding.get(k) for k in STABLE_BINDING}
+
+
 def consumers(kube: X.Kube) -> Dict[str, List[Dict]]:
     out: Dict[str, List[Dict]] = {}
     for p in kube.list("Pod", NS):
         if READER_LABEL in (p["metadata"].get("labels") or {}):
             continue
+        refs = p["metadata"].get("ownerReferences") or []
+        ctl = next((r for r in refs if r.get("controller")), refs[0] if refs else {})
         for v in (p.get("spec") or {}).get("volumes") or []:
             c = (v.get("persistentVolumeClaim") or {}).get("claimName")
             if c:
                 out.setdefault(c, []).append({"pod": p["metadata"]["name"], "uid": p["metadata"].get("uid"),
                                               "node": (p.get("spec") or {}).get("nodeName"),
+                                              "owner": {"kind": ctl.get("kind"), "name": ctl.get("name")},
+                                              "phase": (p.get("status") or {}).get("phase"),
                                               "read_only": bool(v["persistentVolumeClaim"].get("readOnly"))})
+    return out
+
+
+def consumer_problems(pvc: str, cons: List[Dict]) -> List[str]:
+    """Every pod using the claim is an allowlisted writer kind (its controller's kind and name pattern); an unknown
+    one is reported by a digest of its identity, never its names."""
+    out = []
+    for c in cons:
+        o = c.get("owner") or {}
+        if not any(o.get("kind") == k and isinstance(o.get("name"), str) and re.fullmatch(rx, o["name"])
+                   for k, rx in WRITER_KINDS.get(pvc, [])):
+            out.append(f"{pvc}: a pod of an unknown writer kind uses the claim (sha256 "
+                       f"{hashlib.sha256(json.dumps([c.get('pod'), o.get('kind'), o.get('name')]).encode()).hexdigest()[:12]}"
+                       f"); only {[k + ' ' + rx for k, rx in WRITER_KINDS.get(pvc, [])]} may")
     return out
 
 
@@ -1283,16 +1323,23 @@ def prove_cleanup(record: X.Record, kube: X.Kube, helper: str, step: str, pvc: s
         sleep(2)
 
 
-def revalidate(record: X.Record, kube: X.Kube, s: Dict, pvc: str, planned: Dict) -> None:
-    """Right before EACH reader: the claim binding is the planned one and no campaign Job runs."""
+def revalidate(record: X.Record, kube: X.Kube, s: Dict, pvc: str, planned: Dict) -> Dict:
+    """Right before EACH reader, the LIVE preconditions (not part of any plan digest): the claim's storage identity
+    is the planned one, no campaign Job runs, every pod using the claim is an allowlisted writer kind, and the node
+    the volume is attached to now (the reader pod is pinned there). Returns them for the receipts."""
     C.require_cluster(kube.api, record.cluster_uid)
     busy = busy_jobs(kube)
     if busy:
         raise X.StagingError(f"active Jobs {busy}: no reader while they run")
     live = claim_binding(kube, pvc, s["pvcs"][pvc]["uid"])
-    if {k: live[k] for k in ("uid", "pv", "pv_uid", "attached_node")} != \
-            {k: planned[k] for k in ("uid", "pv", "pv_uid", "attached_node")}:
-        raise X.StagingError(f"{pvc}'s binding changed since the plan ({live} vs {planned})")
+    if stable(live) != stable(planned):
+        raise X.StagingError(f"{pvc}'s storage identity changed since the plan ({stable(live)} vs {stable(planned)})")
+    cons = consumers(kube).get(pvc, [])
+    probs = consumer_problems(pvc, cons)
+    if probs:
+        raise X.StagingError("; ".join(probs))
+    return {"attached_node": live["attached_node"], "busy_jobs": [],
+            "consumers": [{k: c[k] for k in ("pod", "uid", "owner", "phase", "read_only")} for c in cons]}
 
 
 def run_reader(record: X.Record, kube: X.Kube, lock, helper: str, s: Dict, pvc: str, binding: Dict, job: Dict,
@@ -1300,7 +1347,8 @@ def run_reader(record: X.Record, kube: X.Kube, lock, helper: str, s: Dict, pvc: 
     """ONE reader lifecycle as ONE mutation_step: intent (pod, nonce, claim, attachment) before the create; the pod
     created, used and deleted; the outcome only after cleanup is PROVEN. A work failure after a proven cleanup is
     re-raised with the lock safe; an unproven cleanup leaves the intent unresolved and the lock held."""
-    revalidate(record, kube, s, pvc, binding)
+    pre = revalidate(record, kube, s, pvc, binding)
+    binding = dict(stable(binding), attached_node=pre["attached_node"])     # the attachment resolved live
     nonce = secrets.token_hex(5)
     body = reader_pod(record, s, pvc, binding, nonce)
     name = body["metadata"]["name"]
@@ -1332,6 +1380,7 @@ def run_reader(record: X.Record, kube: X.Kube, lock, helper: str, s: Dict, pvc: 
         proof = prove_cleanup(record, kube, helper, step, pvc, binding["pv"], nonce, binding["attached_node"],
                               sleep, now)            # raises when unproven: no outcome, the lock stays
         return ("cleaned" if not failure else "cleaned-after-failure"),             {"uid": result["uid"], "proof": proof, "error": type(failure[0]).__name__ if failure else None}
+    X.receipt(record, helper, "reader-preconditions", {"pvc": pvc, "step": step, "nonce": nonce, **pre})
     C.mutation_step(record.doc, helper, lock, step, intent, lifecycle)
     X.receipt(record, helper, "reader-cleanup-proven", {"pvc": pvc, "pod": name, "nonce": nonce, "step": step})
     if failure:
@@ -1356,7 +1405,10 @@ def _pre_checks(record: X.Record, kube: X.Kube, s: Dict) -> Tuple[Dict, List[str
     for h in (HELPER, PROBE) + LEGACY_HELPERS:
         if _unresolved_steps(record, h):
             probs.append(f"unresolved intents in the {h} journal: run recover")
-    bindings = {p: claim_binding(kube, p, s["pvcs"][p]["uid"]) for p in PVC_EXPORTS}
+    bindings = {p: stable(claim_binding(kube, p, s["pvcs"][p]["uid"])) for p in PVC_EXPORTS}
+    cons = consumers(kube)
+    for p in PVC_EXPORTS:
+        probs += consumer_problems(p, cons.get(p, []))
     return bindings, probs
 
 
@@ -1396,9 +1448,10 @@ def probe(record: X.Record, kube: X.Kube, reviewed: Dict, digest: str, exe=None,
     with C.exclusive_lock(record.doc, LOCK_SCOPE, holder=PROBE) as lock:
         live = probe_plan(record, kube)
         live["problems"] = [p for p in live["problems"] if not p.startswith("the shared legacy-scope lock")]
-        X.require_live(reviewed, digest, PROBE, record, live)
+        C.require_reviewed(reviewed, digest, PROBE, record.doc)
         if live["problems"]:
             raise X.StagingError("the probe plan has problems: " + "; ".join(live["problems"]))
+        X.require_live(reviewed, digest, PROBE, record, live)
         for a in live["actions"]:
             job = {"mode": "probe", "mount": a["mount"], "rules": a["rules"]}
             rc, err, tmp = run_reader(record, kube, lock, PROBE, s, a["pvc"], a["binding"], job, exe, sleep, now)
@@ -1687,7 +1740,7 @@ def plan(record: X.Record, kube: X.Kube) -> Dict:
     actions += [{"export": p, "files": len(v["selection"]), "bytes": v["bytes"],
                  "selection_sha256": C.digest(v["selection"])} for p, v in pvcs.items()]
     return X.new_plan(HELPER, record, actions, export_dir=export_dir, local=local, pvcs=pvcs,
-                      consumers=consumers(kube), total_pvc_bytes=total, reader_sha256=READER_SHA256,
+                      total_pvc_bytes=total, reader_sha256=READER_SHA256,
                       problems=probs)
 
 
@@ -1849,7 +1902,7 @@ def export_empty(record: X.Record, d: str, pvc: str, info: Dict, digest: str, do
     return manifest
 
 
-def coverage(record: X.Record, s: Dict, p: Dict, manifests: Dict[str, Dict]) -> bytes:
+def coverage(record: X.Record, s: Dict, p: Dict, manifests: Dict[str, Dict], cons: Dict[str, List[Dict]]) -> bytes:
     inv = _inventory(record, s)
     pvs = {v["claim"]["uid"]: v for v in inv["objects"].get("persistentvolumes", []) if v.get("claim")}
     ea = manifests.get("evidence-archive-pvc", {}).get("files", [])
@@ -1859,7 +1912,8 @@ def coverage(record: X.Record, s: Dict, p: Dict, manifests: Dict[str, Dict]) -> 
         pv = pvs.get(r["uid"], {})
         entry = {"claim": r["name"], "namespace": NS, "uid": r["uid"], "pv": pv.get("name"),
                  "pv_uid": pv.get("uid"), "reclaim_policy": pv.get("reclaim_policy"),
-                 "storage_class": pv.get("storage_class"), "consumers_at_plan": p["consumers"].get(r["name"], []),
+                 "storage_class": pv.get("storage_class"), "consumers_at_export": [
+                     {k: c[k] for k in ("pod", "uid", "owner", "read_only")} for c in cons.get(r["name"], [])],
                  "required": (s.get("requirements") or {}).get(r["name"], "")}
         if r["name"] in manifests and manifests[r["name"]].get("empty_by_design"):
             m = manifests[r["name"]]
@@ -1924,9 +1978,10 @@ def export(record: X.Record, kube: X.Kube, reviewed: Dict, digest: str, exe=None
     with C.exclusive_lock(record.doc, LOCK_SCOPE, holder=HELPER) as lock:
         live = plan(record, kube)
         live["problems"] = [p for p in live["problems"] if not p.startswith("the shared legacy-scope lock")]
-        X.require_live(reviewed, digest, HELPER, record, live)
+        C.require_reviewed(reviewed, digest, HELPER, record.doc)
         if live["problems"]:
             raise X.StagingError("the export plan has problems: " + "; ".join(live["problems"]))
+        X.require_live(reviewed, digest, HELPER, record, live)
         root = ev["export_dir"]
         os.makedirs(root, exist_ok=True)
         X.receipt(record, HELPER, "export-start", {"plan_sha256": digest, "export_dir": root})
@@ -1952,7 +2007,7 @@ def export(record: X.Record, kube: X.Kube, reviewed: Dict, digest: str, exe=None
                                         manifests)
         os.makedirs(os.path.join(root, "storage"), exist_ok=True)
         _write_identical(os.path.join(root, "storage", "pvc-retention-and-export-coverage.json"),
-                         coverage(record, s, live, manifests))
+                         coverage(record, s, live, manifests, consumers(kube)))
         sums = "".join(f"{C.sha256_file(os.path.join(root, m))}  {m}\n" for m in sorted(ev["mandatory"])
                        if m != "S0-SHA256SUMS")
         _write_identical(os.path.join(root, "S0-SHA256SUMS"), sums.encode())
