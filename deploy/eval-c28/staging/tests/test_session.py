@@ -191,6 +191,41 @@ def test_terminating_pods_of_an_idle_arm_block_a_session(world):
     assert "c28-pa-r-s90 owns 12 pods (10 terminating) for 2 desired" in problems(world, session_record(world))
 
 
+def _owned_pods(api, name):
+    dep = api.obj("Deployment", name, "demo")
+    rs_uids = {o["metadata"]["uid"] for (k, ns, _), o in api.objects.items() if k == "replicasets" and ns == "demo"
+               and any(r["uid"] == dep["metadata"]["uid"] for r in o["metadata"].get("ownerReferences", []))}
+    return [o for (k, ns, _), o in api.objects.items() if k == "pods" and ns == "demo"
+            and any(r["uid"] in rs_uids for r in o["metadata"].get("ownerReferences", []))]
+
+
+def test_terminating_owned_pods_block_a_session_even_when_the_count_matches(world):
+    """Codex PR #43 re-review repro 1: desired 2, owned 2, both terminating, status still two ready."""
+    pods = _owned_pods(world["api"], "c28-h-cpu-s90")
+    assert len(pods) == 2
+    for p in pods:
+        p["metadata"]["deletionTimestamp"] = "2026-12-01T00:00:00Z"
+    probs = problems(world, session_record(world))
+    assert "c28-h-cpu-s90 has 2 terminating pods" in probs
+    assert "owns 2 pods (2 terminating) for 2 desired" not in probs          # the count alone would have passed
+
+
+def test_owned_pods_must_be_running_and_ready(world):
+    pods = _owned_pods(world["api"], "c28-pa-n-s90")
+    pods[0]["status"]["conditions"] = [{"type": "Ready", "status": "False"}]
+    pods[1]["status"]["phase"] = "Pending"
+    probs = problems(world, session_record(world))
+    assert f"c28-pa-n-s90 has pods that are not Running and Ready: {sorted(p['metadata']['name'] for p in pods)}" \
+        in probs
+
+
+def test_injected_evaluation_pods_block_a_start(world):
+    pod = _owned_pods(world["api"], "c28-pa-e-s20")[0]
+    pod["metadata"].setdefault("labels", {})[X.RUN_LABEL] = "c28-r1"
+    pod["spec"]["containers"] = [{"name": "fixture"}, {"name": "istio-proxy"}]
+    assert "has injected containers ['istio-proxy'] (unexpected injection)" in problems(world, session_record(world))
+
+
 def test_an_unconverged_idle_arm_blocks_a_session(world):
     dep = world["api"].obj("Deployment", "c28-h-rps-s90", "demo")
     dep["status"]["availableReplicas"] = 1
@@ -492,6 +527,31 @@ def generator_pod(api, sid, statuses, job_uid=None, name=None):
 
 
 K6_RUNNING = [{"name": "k6", "state": {"running": {"startedAt": "2026-12-10T00:00:03Z"}}}]
+
+
+def test_injection_into_a_generator_pod_stops_the_session(world):
+    """Codex PR #43 re-review repro 2: istio-proxy in the owned generator Pod after start is a watchdog stop."""
+    record = session_record(world)
+    c, digest, started = start_session(world, record)
+    generator_pod(world["api"], "s-0001", K6_RUNNING)
+    assert S.verify(c, steal(c.clock))["result"] == "OK"
+    world["api"].obj("Pod", "c28-gen-s-0001-x", "demo")["spec"]["containers"] = [{"name": "k6"},
+                                                                                {"name": "istio-proxy"}]
+    v = S.verify(c, steal(c.clock))
+    assert v["result"] == "STOP" and any("c28-gen-s-0001-x has injected containers ['istio-proxy']" in s
+                                         for s in v["stops"])
+    out = S.watch(c, digest, fetch=steal(c.clock), max_checks=1)
+    assert out["ended"] in ("stopped", "unresolved") and any("unexpected injection" in s for s in out["stops"])
+
+
+def test_a_relabelled_replacement_generator_pod_is_still_audited(world):
+    record = session_record(world)
+    c, digest, started = start_session(world, record)
+    generator_pod(world["api"], "s-0001", K6_RUNNING, name="c28-gen-s-0001-replacement")
+    p = world["api"].obj("Pod", "c28-gen-s-0001-replacement", "demo")
+    p["metadata"]["labels"] = {}                                  # found through its controller (the owned Job)
+    p["spec"]["initContainers"] = [{"name": "istio-init"}]
+    assert any("istio-init" in s for s in S.verify(c, steal(c.clock))["stops"])
 
 
 def test_confirmation_pa_session(world):

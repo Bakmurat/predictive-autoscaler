@@ -499,6 +499,14 @@ def idle_residency_problems(dep: Dict, replicasets: List[Dict], pods: List[Dict]
     if len(owned) != want:
         out.append(f"{name} owns {len(owned)} pods ({terminating} terminating) for {want} desired: not converged to "
                    "its idle residency")
+    if terminating:
+        out.append(f"{name} has {terminating} terminating pods: wait until they are gone")
+    unready = sorted(p["metadata"]["name"] for p in owned if not p["metadata"].get("deletionTimestamp") and not (
+        (p.get("status") or {}).get("phase") == "Running" and any(
+            cd.get("type") == "Ready" and cd.get("status") == "True"
+            for cd in (p.get("status") or {}).get("conditions") or [])))
+    if unready:
+        out.append(f"{name} has pods that are not Running and Ready: {unready}")
     st = dep.get("status") or {}
     lagging = [k for k in ("replicas", "updatedReplicas", "readyReplicas", "availableReplicas")
                if int(st.get(k) or 0) != want]
@@ -551,6 +559,7 @@ def plan_start(c: Context) -> Dict:
     problems += readiness_problems
     problems += _node_stops(c)
     problems += _occupant_stops(c)                  # the reservation must verify before any session starts
+    problems += X.injection_problems(c.kube, c.params)   # no admitted evaluation pod carries Istio's containers
     problems += _quota_problems(c)
     b, budget = _budget(c), c.s["arrival_budget"]
     if b["peak_rps"] > budget["max_rps"] or b["total_arrivals"] > budget["max_total_arrivals"]:
@@ -908,6 +917,7 @@ def verify(c: Context, fetch: Callable[[str], Dict] = _http_json) -> Dict:
     stops += _node_stops(c)
     stops += steal_stop(c, fetch)
     stops += _occupant_stops(c)
+    stops += X.injection_problems(c.kube, c.params, {owned["job"]["uid"]} if owned.get("job") else set())
     if c.now() >= _utc(state["begin"]["data"]["deadline_utc"]):
         stops.append("the session deadline has passed")
     if owned.get("job"):

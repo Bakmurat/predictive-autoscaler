@@ -183,6 +183,9 @@ def converge(api, namespace="demo"):
             want = dep["spec"].get("replicas") or 0
             dep["status"].update(updatedReplicas=want, availableReplicas=want,
                                  observedGeneration=dep["metadata"].get("generation", 1))
+    for (kind, ns, _), pod in api.objects.items():
+        if kind == "pods" and ns == namespace:
+            pod.setdefault("status", {}).update(phase="Running", conditions=[{"type": "Ready", "status": "True"}])
 
 
 @pytest.fixture

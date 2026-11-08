@@ -86,8 +86,11 @@ workload's own metadata or in a selector. That covers the ten fixture Deployment
 and `podAnnotations` in `release-values` and in `prepare.py`'s staging overlay, which `values_problems` checks; the
 chart gained `operator.podLabels` and `forecaster.podLabels`, which may never set its selector keys). `render` refuses a
 rendering in which any Pod template lacks the label or the annotation (`audit_sidecar_free`); `session.py` audits its
-generator Job the same way; `prepare.py verify` reports any admitted evaluation pod whose regular or init containers
-include `istio-proxy`/`istio-init` (`render.unexpected_injection`, reusable for the live checks). A default sidecar
+generator Job the same way. Any admitted evaluation pod whose regular or init containers include
+`istio-proxy`/`istio-init` (`render.unexpected_injection` via `execlib.injection_problems`: the run's pods, the
+release's pods and any pod controlled by the session's generator Job, replacements included) is a problem for
+`prepare.py verify`, refuses a session start, and is a stop for every `session.py verify` and watchdog check, which
+then takes the existing stop/unresolved path. A default sidecar
 (100m CPU / 128Mi requested per pod) would otherwise make the workload node unschedulable.
 
 **Claim limit.** Results concern this sidecar-free fixture, not mesh-enabled workloads. They are not directly comparable
@@ -134,7 +137,7 @@ arm's frozen bounds unchanged. Nothing in the harness or `session.py` does that 
 stopped session leaves its target at whatever count its writer last set). So `idle_arm_replicas` below the starting
 count is refused. `session.py` admits a session only when every other target has converged to its idle residency: desired
 replicas at most `idle_arm_replicas`, status (observed generation, replicas, updated, ready, available) equal to it, and
-exactly that many Pods owned through its ReplicaSets (bound by controller UID to the Deployment's UID), terminating Pods
-included. A target left scaled up by an earlier session must be restored first. That restore (writer shutdown
+exactly that many Pods owned through its ReplicaSets (bound by controller UID to the Deployment's UID), none of them
+terminating and every one Running and Ready. A target left scaled up by an earlier session must be restored first. That restore (writer shutdown
 confirmed, a UID/resourceVersion-protected scale, waiting until the excess Pods are gone) is not implemented yet and is
 a hard prerequisite before S5.

@@ -369,14 +369,7 @@ def verify(record: X.Record, kube: X.Kube) -> Dict:
 def injection_problems(kube: X.Kube, params: Dict) -> List[str]:
     """Admitted evaluation pods (the run's label in the fixture and control namespaces, and the evaluation release's
     pods) must carry no istio-proxy/istio-init container: injection despite the opt-out is a problem."""
-    c28 = X.import_harness()
-    pods = []
-    for ns in sorted({params["namespace"], params["control_namespace"]}):
-        for p in kube.list("Pod", ns):
-            ls = (p.get("metadata") or {}).get("labels") or {}
-            if ls.get(X.RUN_LABEL) == params["run_id"] or ls.get("app.kubernetes.io/instance") == params["release"]:
-                pods.append(p)
-    return c28.render.unexpected_injection(pods)
+    return X.injection_problems(kube, params)
 
 
 def main(argv=None, api=None) -> int:
