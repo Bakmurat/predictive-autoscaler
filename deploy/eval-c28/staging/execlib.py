@@ -25,6 +25,10 @@ legacy_allowlist names the legacy API group. This module only adds what part 2 n
     after); an unknown outcome keeps the lock; recover() takes recovery_guard (owner proven terminated), writes
     reconciled-<n> for what it can decide from the live objects, and releases the stale lock only when nothing stays
     unresolved. What a helper owns is derived from this journal.
+  * Helper-defined steps: Kube.step journals an operation the helper composes itself (session.py's restore: a
+    Kube.scale write through /scale with the read resourceVersion and UID, then the wait for convergence); any failure
+    inside it stays unresolved, and recover decides it with the reconciler the helper registered in RECONCILERS. An op
+    without a loaded reconciler is never guessed.
 """
 
 from __future__ import annotations
@@ -243,8 +247,18 @@ def _expect_holds(obj: Dict, expect: List) -> bool:
     return True
 
 
+# Reconcilers of the journalled ops a helper defines itself (op -> fn(kube, intent data) -> observation); a helper
+# registers its own at import (session.py: "restore"). An op without a loaded reconciler is never guessed: unresolved.
+RECONCILERS: Dict[str, Callable[["Kube", Dict], Dict]] = {}
+
+
 def reconcile(kube: "Kube", d: Dict) -> Dict:
     """What an unresolved intent actually did, read live: {"observed": done | not-done | unresolved, ...}."""
+    if d["op"] in RECONCILERS:
+        return RECONCILERS[d["op"]](kube, d)
+    if d["op"] not in ("create", "delete", "update"):
+        return {"observed": "unresolved", "why": f"no reconciler for the {d['op']!r} intent is loaded (recover "
+                                                 "through the helper that wrote it)"}
     live = kube.get(d["kind"], d["name"], d["namespace"])
     if d["op"] == "create":
         if live is None:
@@ -411,6 +425,42 @@ class Kube:
             return out
         raise StagingError(f"{kind}/{name}: kept losing to concurrent updates ({last_err}); refusing")
 
+    def step(self, op: str, kind: str, namespace: Optional[str], name: str, uid: str, fn: Callable[[], Dict],
+             pre: Optional[Dict] = None, expect: Optional[List] = None) -> Dict:
+        """A helper-defined journalled step (e.g. session.py's restore: a /scale write plus the wait for its
+        convergence): intent-<n> with the validated pre-state BEFORE fn runs, step-<n> only when fn returns (its result
+        object's metadata is the post-state). ANY exception, a definitive API refusal included, leaves the intent
+        unresolved and the lock held: the helper's registered reconciler (RECONCILERS[op]) decides it in recover."""
+        j = self._journal()
+        if not (isinstance(uid, str) and _UUID.match(uid)):
+            raise StagingError(f"{kind}/{name}: a {op} step needs the bound UID")
+        C.require_cluster(self.api, self.cluster_uid)
+        result: Dict = {}
+
+        def do(mark):
+            try:
+                result["out"] = fn()
+            except C.ApiError as e:          # not a plain refusal here: the step's outcome is decided by recover
+                raise StagingError(f"{kind}/{name}: {op} failed ({e})") from e
+            return result["out"]
+        j.run(op, kind, namespace, name, do, uid=uid, pre=pre, expect=expect or [])
+        self.mutations.append({"op": op, "kind": kind, "namespace": namespace, "name": name, "uid": uid})
+        return result["out"]
+
+    def scale(self, kind: str, name: str, namespace: str, uid: str, resource_version: str, replicas: int) -> Dict:
+        """PUT <object>/scale (autoscaling/v1 Scale) guarded by the read resourceVersion and the UID: any change after
+        that read, even a status update, is a 409 and nothing is written. Call it inside a journalled step; the cluster
+        identity is re-checked immediately before the write. Returns the confirmed Scale."""
+        self._journal()
+        if not (isinstance(uid, str) and _UUID.match(uid)) or not resource_version:
+            raise StagingError(f"{kind}/{name}: a scale needs the bound UID and the read resourceVersion")
+        C.require_cluster(self.api, self.cluster_uid)
+        resp = self.api.replace(path(kind, namespace, name) + "/scale", {
+            "apiVersion": "autoscaling/v1", "kind": "Scale",
+            "metadata": {"name": name, "namespace": namespace, "uid": uid, "resourceVersion": resource_version},
+            "spec": {"replicas": replicas}})
+        return confirm_scale(resp, kind, name, uid, replicas)
+
     def delete(self, kind: str, name: str, namespace: Optional[str], uid: str) -> None:
         j = self._journal()
         if not (isinstance(uid, str) and _UUID.match(uid)):
@@ -442,6 +492,19 @@ class mutating:
         if self.lock.safe and not unresolved and os.path.exists(self.lock.path):
             os.unlink(self.lock.path)
         return False
+
+
+def confirm_scale(resp: Optional[Dict], kind: str, name: str, uid: str, replicas: int) -> Dict:
+    """The /scale response must be a Scale for exactly that UID confirming `replicas`. autoscaling/v1 ScaleSpec has
+    replicas `omitempty`, so a Scale response for the expected UID without spec.replicas means 0."""
+    resp = resp or {}
+    m = resp.get("metadata") or {}
+    if resp.get("kind") != "Scale" or m.get("uid") != uid:
+        raise StagingError(f"the scale response of {kind}/{name} is not a Scale for UID {uid}")
+    got = (resp.get("spec") or {}).get("replicas", 0)
+    if got != replicas:
+        raise StagingError(f"the scale response of {kind}/{name} confirms {got}, not {replicas}")
+    return resp
 
 
 def object_ref(obj: Dict) -> Dict:
