@@ -9,18 +9,21 @@
                                                                warnings (bound to its UID, run and reviewed spec)
   archive.py --record R verify --plan P                        the archive-complete receipt, or a refusal
 
-The plan binds: the sanitized snapshots of every allowlisted legacy object and every writer of a legacy target (with
-the claims' PVs), the source revisions (git ls-tree of the recorded commit: blob ids of deploy/prodcluster,
-deploy/eks-benchmark and k8s-manifests/base, never the working tree), the evidence files the approved export procedure
-staged locally (record archive.evidence.export_dir; only files matching archive.evidence.allowlist, never a live
-database file or WAL; every file of the explicit archive.evidence.mandatory manifest present; every checksum manifest
-in archive.evidence.checksum_manifests verified file by file, here and again at the destination), and the Velero
-Backup specification (unique name, explicit storage location, scope, TTL;
-labelled metadata-only when it does not back up volume data). Snapshots never contain a Secret value, ConfigMap
-contents, a literal credential env value or a last-applied configuration; no Secret or ConfigMap is archived at all.
-`verify` recomputes every hash: the snapshots, the received copies at the off-cluster destination, the source list;
-it requires the Backup Completed with zero errors and each warning assessed in the record; any gap refuses the
-archive-complete receipt that legacy.py requires before S4.
+The plan binds: the sanitized snapshots of every allowlisted legacy object and every writer of a legacy target (with the
+claims' PVs), the campaign source revisions (git ls-tree of archive.source_revision.commit, the reviewed benchmark
+revision, never the helper commit source.commit nor the working tree: blob ids of deploy/prodcluster,
+deploy/eks-benchmark and k8s-manifests/base, each required), the populate-s0 export-complete receipt the evidence comes
+from (archive.evidence.export_receipt, with the S0-SHA256SUMS digest it certified; every file S0-SHA256SUMS certifies is
+re-hashed here and at the destination, and the archived evidence is exactly those files plus the manifest, whatever
+checksum_manifests lists), the evidence files the approved export procedure staged locally (record
+archive.evidence.export_dir; only files matching archive.evidence.allowlist, never a live database file or WAL; every
+file of the explicit archive.evidence.mandatory manifest present; every checksum manifest in
+archive.evidence.checksum_manifests verified file by file, here and again at the destination), and the Velero Backup
+specification (unique name, explicit storage location, scope, TTL; labelled metadata-only when it does not back up
+volume data). Snapshots never contain a Secret value, ConfigMap contents, a literal credential env value or a
+last-applied configuration; no Secret or ConfigMap is archived at all. `verify` recomputes every hash: the snapshots,
+the received copies at the off-cluster destination, the source list; it requires the Backup Completed with zero errors
+and each warning assessed in the record; any gap refuses the archive-complete receipt that legacy.py requires before S4.
 """
 
 from __future__ import annotations
@@ -41,24 +44,87 @@ import inventory as I  # noqa: E402
 import legacy_allowlist as L  # noqa: E402
 
 HELPER = "archive"
+POPULATE = "populate-s0"
+S0_SUMS = "S0-SHA256SUMS"
 SOURCE_PATHS = ("deploy/prodcluster", "deploy/eks-benchmark", "k8s-manifests/base")
 LIVE_DB = ("*-wal", "*-shm", "*-journal", "*.sqlite", "*.sqlite3", "*.db")
 
 
-def _source_revisions(rec: Mapping, run=subprocess.run) -> Dict:
-    src = rec["source"]
-    repo = src.get("repo_dir")
-    if not repo:
-        raise C.StagingError("source.repo_dir is required to record the source revisions")
-    p = run(["git", "-C", repo, "ls-tree", "-r", src["commit"], "--", *SOURCE_PATHS], capture_output=True, text=True,
-            env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")})
+def _campaign_source(rec: Mapping, run=subprocess.run) -> Dict:
+    """The campaign's source trees at archive.source_revision: an explicit, reviewed commit (the benchmark's), never
+    the helper commit in source.commit, so an archive cannot silently record whatever the executor has checked out."""
+    sr = (rec.get("archive") or {}).get("source_revision")
+    if not isinstance(sr, dict) or set(sr) != {"repo_dir", "commit"} or not sr["repo_dir"]:
+        raise C.StagingError("archive.source_revision = {repo_dir, commit} is required: the campaign's source revision "
+                             "(source.commit is the helper's and is never used here)")
+    commit = str(sr["commit"])
+    if not C._COMMIT.match(commit):
+        raise C.StagingError("archive.source_revision.commit must be a full git commit")
+    repo = os.path.expanduser(str(sr["repo_dir"]))
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    v = run(["git", "-C", repo, "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}"], capture_output=True,
+            text=True, env=env)
+    if v.returncode != 0 or v.stdout.strip() != commit:
+        raise C.StagingError(f"archive.source_revision.commit {commit} is not a commit in {repo}")
+    p = run(["git", "-C", repo, "ls-tree", "-r", commit, "--", *SOURCE_PATHS], capture_output=True, text=True, env=env)
     if p.returncode != 0 or not p.stdout.strip():
-        raise C.StagingError(f"git ls-tree of {src['commit']} failed or is empty")
+        raise C.StagingError(f"git ls-tree of {commit} failed or is empty")
     blobs = {}
     for line in p.stdout.splitlines():
         meta, _, path = line.partition("\t")
         blobs[path] = meta.split()[2]
-    return {"commit": src["commit"], "paths": list(SOURCE_PATHS), "blobs": blobs}
+    missing = [d for d in SOURCE_PATHS if not any(b.startswith(d + "/") for b in blobs)]
+    if missing:
+        raise C.StagingError(f"the campaign source revision {commit} lacks {', '.join(missing)}")
+    return {"commit": commit, "paths": list(SOURCE_PATHS), "blobs": blobs}
+
+
+def _s0_entries(root: str) -> Dict[str, str]:
+    """S0-SHA256SUMS as {path: sha256}, every entry verified against the file it certifies (always, whatever
+    archive.evidence.checksum_manifests lists)."""
+    problems = checksum_chain_problems(root, [S0_SUMS])
+    if problems:
+        raise C.StagingError(f"{S0_SUMS} does not verify: " + "; ".join(problems))
+    out = {}
+    for ln in open(os.path.join(root, S0_SUMS)).read().splitlines():
+        if ln.strip():
+            want, rel = ln.split(None, 1)
+            out[os.path.normpath(rel.lstrip("*").strip())] = want.lower()
+    return out
+
+
+def _export_binding(rec: Mapping) -> Dict:
+    """The completed populate-s0 export this archive takes its evidence from: its export-complete receipt (by hash, in
+    the verified chain), the S0-SHA256SUMS digest it certified, which must still match the staged file, and every
+    file that manifest certifies, re-hashed."""
+    ev = rec["archive"].get("evidence") or {}
+    ref = ev.get("export_receipt")
+    if not isinstance(ref, dict) or set(ref) != {"sha256", "s0_sha256sums"}:
+        raise C.StagingError("archive.evidence.export_receipt = {sha256, s0_sha256sums} is required: the populate-s0 "
+                             "export-complete receipt the evidence comes from")
+    done = [r for r in C.read_receipts(C.receipts_path(rec, POPULATE)) if r["sha256"] == ref["sha256"]]
+    if not done or done[0]["event"] != "export-complete" or done[0]["run_id"] != rec["run_id"]:
+        raise C.StagingError("archive.evidence.export_receipt names no populate-s0 export-complete receipt of this run")
+    root = ev.get("export_dir") or ""
+    sums = os.path.join(root, S0_SUMS)
+    if done[0]["data"].get("s0_sha256sums") != ref["s0_sha256sums"] or not os.path.isfile(sums) \
+            or C.sha256_file(sums) != ref["s0_sha256sums"]:
+        raise C.StagingError(f"{S0_SUMS} does not match the export-complete receipt: the staged export changed")
+    entries = _s0_entries(root)
+    return {"receipt_sha256": ref["sha256"], "s0_sha256sums": ref["s0_sha256sums"],
+            "plan_sha256": done[0]["data"].get("plan_sha256"), "entries": len(entries),
+            "entries_sha256": C.digest(entries)}
+
+
+def _inventory_problems(evidence: List[Mapping], entries: Mapping[str, str]) -> List[str]:
+    """The archived evidence is exactly what S0-SHA256SUMS certifies, plus that manifest itself."""
+    have = {f["path"]: f["sha256"] for f in evidence if f["path"] != S0_SUMS}
+    out = [f"{p} is archived but not certified by {S0_SUMS}" for p in sorted(set(have) - set(entries))]
+    out += [f"{p} is certified by {S0_SUMS} but not archived" for p in sorted(set(entries) - set(have))]
+    out += [f"{p} differs from its {S0_SUMS} entry" for p in sorted(set(have) & set(entries)) if have[p] != entries[p]]
+    if not any(f["path"] == S0_SUMS for f in evidence):
+        out.append(f"{S0_SUMS} itself is not archived")
+    return out
 
 
 def _evidence_files(rec: Mapping) -> List[Dict]:
@@ -190,9 +256,15 @@ def build_plan(api, rec: Mapping, run=subprocess.run) -> Dict:
         raise C.StagingError("the velero.io API group is not served: no Velero backup is possible")
     if api.get(vpath) is not None:
         raise C.StagingError(f"a Velero Backup named {backup['metadata']['name']} exists: choose a unique name")
+    evidence = _evidence_files(rec)                  # its own chains first, then the populate export binding
+    binding = _export_binding(rec)
+    gaps = _inventory_problems(evidence, _s0_entries(rec["archive"]["evidence"]["export_dir"]))
+    if gaps:
+        raise C.StagingError("the evidence is not the certified populate-s0 export: " + "; ".join(gaps))
     return C.make_plan(HELPER, rec, [], inventory_sha256=C.digest(inv), snapshots=objs,
                        unaccounted=inv["legacy"]["missing"], blockers=inv["legacy"]["blockers"],
-                       source=_source_revisions(rec, run), evidence=_evidence_files(rec), velero=backup,
+                       campaign_source=_campaign_source(rec, run), export=binding,
+                       evidence=evidence, velero=backup,
                        mandatory=sorted(rec["archive"]["evidence"]["mandatory"]),
                        checksum_manifests=sorted(rec["archive"]["evidence"].get("checksum_manifests") or []),
                        destination=rec["archive"]["evidence"].get("destination"))
@@ -252,9 +324,9 @@ def verify_destination(plan: Mapping) -> List[str]:
             out.append(f"{f['path']} missing at the destination")
         elif C.sha256_file(d) != f["sha256"]:
             out.append(f"{f['path']} differs at the destination")
-    if not out and plan.get("checksum_manifests"):
-        out += [f"at the destination: {p}" for p in checksum_chain_problems(plan["destination"],
-                                                                           plan["checksum_manifests"])]
+    if not out:
+        chains = sorted(set(plan.get("checksum_manifests") or []) | {S0_SUMS})
+        out += [f"at the destination: {p}" for p in checksum_chain_problems(plan["destination"], chains)]
     return out
 
 
@@ -329,8 +401,13 @@ def verify(rec: Mapping, plan: Mapping, clock=None) -> Dict:
                     except C.StagingError:
                         problems.append(f"snapshot {s['file']} is not sanitized")
     problems += verify_destination(plan)
-    if not plan["source"]["blobs"]:
-        problems.append("no source revisions recorded")
+    if not plan["campaign_source"]["blobs"]:
+        problems.append("no campaign source revisions recorded")
+    try:
+        if _export_binding(rec) != plan["export"]:
+            problems.append("the populate-s0 export binding differs from the plan")
+    except C.StagingError as e:
+        problems.append(str(e))
     sub = _submitted(rec, pdig)
     status = [r["data"] for r in receipts if r["event"] == "velero-status" and sub is not None
               and r["data"].get("plan_sha256") == pdig and r["data"]["uid"] == sub["uid"]]
@@ -353,7 +430,10 @@ def verify(rec: Mapping, plan: Mapping, clock=None) -> Dict:
     r = C.append_receipt(rec, HELPER, "archive-complete", {"plan_sha256": pdig, "velero": status[-1],
                                                           "snapshots": len(plan["snapshots"]),
                                                           "evidence_files": len(plan["evidence"]),
-                                                          "source_commit": plan["source"]["commit"]}, clock)
+                                                          "helper_commit": plan["source_commit"],
+                                                          "campaign_commit": plan["campaign_source"]["commit"],
+                                                          "export_receipt_sha256": plan["export"]["receipt_sha256"]},
+                              clock)
     return r
 
 
