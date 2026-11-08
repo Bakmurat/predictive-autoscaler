@@ -47,7 +47,7 @@ Arms. Every arm runs as its own Deployment (`c28-<arm>-<s20|s90>`, so each has a
 - **H-RPS:** a KEDA ScaledObject on the target's offered RPS, `AverageValue` = c, `ignoreNullValues=false`. Its generated HPA is the writer.
 - **PA-R, PA-N, PA-E:** PredictiveAutoscalers on the statistical engine with capacity c, scale-down headroom 0, the frozen calibration and caps, and the profile's startup budget.
   - PA-R sets the predictive extra to 0, so it is reactive on the same Go policy, grid and scheduling. Its forecasting keeps running, with its overhead (shadow issuances); the forecasts just never add replicas.
-  - PA-N carries the `c28.devkuban.com/family-restriction: seasonal_naive` annotation as scaffolding only. Confirmation must verify C2.8a's actual `spec.prediction.families` field and the effective candidate set (PR #27); the scorer reports NOT READY until then.
+  - Each PA arm sets the real `spec.prediction.families` (C2.8a, #27): PA-N `[seasonalNaive]` (E1-product is never fitted or offered), PA-R and PA-E `[seasonalNaive, statistical]`. The run-lock records each arm's families and effective candidate set; every PA block reports the families observed at confirmation and the candidates its issuances carried. A missing record is INCOMPLETE; any other set is a contract failure (FAIL).
 
 All PredictiveAutoscalers render in Recommend mode; activation is the executor's gated step. HPA and KEDA keep their native cadence on prodcluster (section 11.3).
 
@@ -60,11 +60,15 @@ Faults are scheduled. A ConfigMap written before each block lists absolute UTC w
 Faults and their limits.
 
 - **Forecast route:** a TCP pass-through. The evaluation release dials it by name (`operator.forecasterAddress`), and that name is in the forecaster's certificate (`forecaster.tls.extraDNSNames`), so TLS verification stays on. The chart refuses an address whose host is not in the certificate. The fixture tests verify through the proxy; the smoke checks a forecast answer over the route.
-- **H-CPU's metric outage is not implemented.** CPU HPA reads the resource-metrics API through the shared metrics-server, not the evaluation-owned query route. No evaluation-scoped CPU-metric fault exists, so the `cpu_metric_fault` prerequisite keeps the full matrix NOT READY until one is built and independently verified. The metrics route is never a substitute for it.
+- **H-CPU's CPU-metric outage is N/A, not tested (manifest section 12).** CPU HPA reads the resource-metrics API through the shared metrics-server, and the protocol never intervenes there. H-CPU runs the full 24-hour program, the 12:20 step included, with normal CPU telemetry. Its 12:00–14:00 window is an unperturbed control that stays in every total; it is never zero-filled and never counted as fault coverage.
+  - **Request-metric arms:** the 12:15–12:30 RPS-query outage stays required for H-RPS, PA-R, PA-N and PA-E. The `rps_metric_fault` prerequisite and a per-block `metric_outage: verified` record are needed. Anything else keeps the study NOT READY or INCOMPLETE.
+  - **Applicability declaration:** the run-lock and the study carry exactly the frozen declaration (`frozen.APPLICABILITY`), bound to the amended manifest's digest, and the cohort is locked before its first scored run. There is no `cpu_metric_fault` flag and no caller-supplied waiver.
+  - **Comparisons:** the eight-test Holm family is unchanged, and H-CPU is in no inferential comparison.
+  - **Disclosure:** every score carries this sentence: "CPU HPA metric-outage behavior was not tested; its corresponding interval retained normal CPU telemetry. Outage comparisons concern request-metric controllers only."
 - **Quota fault:** the injector binds to the locked cluster UID, quota UID, run label and PriorityClass scope before patching (the patch carries the UID). It counts only the run's pods with the run's PriorityClass, so the ingress is never counted. Restore uses only the approved original limit recorded in the run-lock (`fault_scope.pods_normal`).
 - **New certificate names need a rotation.** Adding `forecaster.tls.extraDNSNames` does not renew an existing self-signed certificate on upgrade: delete the forecaster TLS Secret and `helm upgrade` (docs/helm.md).
 
 Other open items:
 
 - The default queries are a starting point. They must be adapted to the observer (k6 remote-write series, kube-state-metrics) and frozen in the run-lock, and the collector then uses exactly those.
-- The E1 policy-cost binding and the lab-qualification mechanism are prerequisites owned by C2.8a (manifest section 1).
+- The E1 policy-cost binding and the lab-qualification mechanism are implemented by C2.8a (#27). The study still records them as section 1 prerequisites, which are true only for the reviewed evaluation build of the pinned tree.

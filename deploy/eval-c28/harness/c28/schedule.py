@@ -132,6 +132,9 @@ def fault_timetable(block_start: datetime) -> Dict:
         "schema": "c28-faults/v1", "block_start": _ts(block_start),
         # Each proxy reads its own file (tcpproxy MODE): outages refuse and cut the evaluation-owned route.
         "metrics_route": {"outages": [{"start": _ts(at(12, 15)), "end": _ts(at(12, 30))}]},
+        # Section 12: the route outage is the request-metric arms' (H-RPS, PA-R, PA-N, PA-E); H-CPU keeps normal CPU
+        # telemetry and the full program, its CPU-metric outage N/A (not tested). Recorded so every block says so.
+        "metric_outage_applicability": dict(F.METRIC_OUTAGE_APPLICABILITY),
         "forecast_route": {"outages": [{"start": _ts(at(14, 15)), "end": _ts(at(14, 35))}]},
         # The server reads this at process start: pods started in the window become ready 120 s later.
         "slow_start": {"slow_starts": [{"start": _ts(at(20)), "end": _ts(at(20, 45)), "extra_startup_seconds": 120}]},

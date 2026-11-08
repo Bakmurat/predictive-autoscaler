@@ -105,7 +105,9 @@ def test_baselines_and_pa_arms_carry_the_frozen_configuration(params):
         budget = 30 if pa["metadata"]["name"].endswith("s20") else 120
         assert s["behavior"]["startup"] == {"fallbackDelaySeconds": budget, "minimumDelaySeconds": budget,
                                             "actuationAllowanceSeconds": 15}
-        assert (pa["metadata"].get("annotations", {}).get(render.FAMILY_RESTRICTION) == "seasonal_naive") == (arm == "pa-n")
+        assert pred["families"] == {"pa-r": ["seasonalNaive", "statistical"], "pa-n": ["seasonalNaive"],
+                                    "pa-e": ["seasonalNaive", "statistical"]}[arm]     # the real field (C2.8a)
+        assert not any("family" in k for k in pa["metadata"].get("annotations", {}))  # no annotation scaffolding
 
 
 def test_the_quota_is_scoped_to_the_run_priority_class(params):
