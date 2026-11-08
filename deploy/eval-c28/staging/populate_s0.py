@@ -128,16 +128,29 @@ _COMMITISH = re.compile(r"^[0-9a-f]{7,40}$")
 READER = r'''
 import datetime, glob, hashlib, io, json, os, re, sys, tarfile
 
+RFC3339 = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$")
+
 def utc(s):
-    if not isinstance(s, str):
+    """An RFC 3339 / Go time.RFC3339Nano time (fractional seconds of 1-9 digits; Z or a +-hh:mm offset) in UTC, or
+    None for anything else. Digits beyond the microsecond round UP, so a time just after a whole-second cutoff never
+    compares as at or before it."""
+    m = RFC3339.match(s.strip()) if isinstance(s, str) else None
+    if not m:
         return None
-    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f%z"):
-        try:
-            t = datetime.datetime.strptime(s.strip(), fmt)
-            return (t if t.tzinfo else t.replace(tzinfo=datetime.timezone.utc)).astimezone(datetime.timezone.utc)
-        except ValueError:
-            pass
-    return None
+    y, mo, d, h, mi, se, frac, tz = m.groups()
+    frac = frac or ""
+    us = int((frac + "000000")[:6]) + (1 if frac[6:].strip("0") else 0)
+    try:
+        t = datetime.datetime(int(y), int(mo), int(d), int(h), int(mi), int(se), tzinfo=datetime.timezone.utc)
+        if tz != "Z":
+            oh, om = int(tz[1:3]), int(tz[4:6])
+            if oh > 23 or om > 59:
+                return None
+            off = datetime.timedelta(hours=oh, minutes=om)
+            t = t - off if tz[0] == "+" else t + off
+    except ValueError:
+        return None
+    return t + datetime.timedelta(microseconds=us)
 
 def iso(t):
     return t.strftime("%Y-%m-%dT%H:%M:%SZ")

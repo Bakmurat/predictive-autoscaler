@@ -1138,3 +1138,45 @@ def test_empty_by_design_only_for_ml_models(env):
     write(e["path"], json.dumps(doc))
     with pytest.raises(X.StagingError, match="allowed only for ml-models-pvc"):
         P.section(X.load_record(e["path"], ("populate", "archive")))
+
+
+def reader_ns():
+    ns = {"__name__": "reader_under_test"}
+    exec(compile(P.READER.replace("sys.exit(run())", ""), "reader", "exec"), ns)
+    return ns
+
+
+@pytest.mark.parametrize("text, want", [
+    ("2026-10-05T06:41:02Z", "2026-10-05T06:41:02+00:00"),
+    ("2026-10-05T06:41:02.5Z", "2026-10-05T06:41:02.500000+00:00"),
+    ("2026-10-05T06:41:02.123456789Z", "2026-10-05T06:41:02.123457+00:00"),      # Go RFC3339Nano, rounded UP
+    ("2026-10-05T06:41:02.123456000Z", "2026-10-05T06:41:02.123456+00:00"),
+    ("2026-10-05T08:41:02.1+02:00", "2026-10-05T06:41:02.100000+00:00"),
+    ("2026-10-05T01:41:02-05:00", "2026-10-05T06:41:02+00:00"),
+    ("2026-11-01T23:59:59.999999999Z", "2026-11-02T00:00:00+00:00"),
+])
+def test_reader_parses_go_rfc3339nano(text, want):
+    """The probe's forecast-log line 1 (forecast_ledger_session, Go time.RFC3339Nano) failed the old parser."""
+    assert reader_ns()["utc"](text).isoformat() == want
+
+
+@pytest.mark.parametrize("text", ["2026-10-05T06:41:02", "2026-10-05 06:41:02Z", "2026-10-05T06:41:02.Z",
+                                  "2026-10-05T06:41:02.1234567890Z", "2026-13-05T06:41:02Z", "2026-10-05T06:41:02+24:00",
+                                  "2026-10-05T06:41:02z", "1759646462", "", None, 1759646462])
+def test_reader_refuses_unparseable_times(text):
+    assert reader_ns()["utc"](text) is None
+
+
+def test_nanosecond_times_never_round_into_the_cutoff(env):
+    """A record a nanosecond after the cutoff is after it; Go-format records before it are selected."""
+    e = env
+    recs = [{"event": "forecast_ledger_session", "at": "2026-10-05T06:41:02.123456789Z", "event_seq": 1,
+             "operator_run_id": "r1", "schema": "forecast-attempt-v1"},
+            {"issued_at": "2026-11-01T23:59:59.999999999+00:00", "forecasts": []},
+            {"event": "decision", "at": "2026-11-02T00:00:00.000000001Z"}]
+    write(os.path.join(e["vols"]["forecast-log-pvc"], "forecasts.jsonl"), jl(*recs))
+    do_probe(e)
+    p = P.plan(e["record"], e["kube"])
+    assert not any("forecast-log-pvc" in x for x in p["problems"]), p["problems"]
+    it = p["pvcs"]["forecast-log-pvc"]["selection"][0]
+    assert (it["lines"], it["lines_after_cutoff"]) == (2, 1)
