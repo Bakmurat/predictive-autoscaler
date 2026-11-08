@@ -1364,3 +1364,70 @@ def test_a_committed_park_write_with_a_lost_response_resumes_after_recovery(tmp_
     assert LG.verify(api, rec, 600, clock.sleep, clock, clock)["retired"] is True
     rplan = LG.build_restore_plan(api, rec)                                 # the recovered write is undone too
     assert "myapptwo" in [a.get("name") for a in rplan["actions"]]
+
+
+# --- C2.8n Codex re-review of 81fdeef: one validated Job snapshot, one observation --------------------------------
+
+@pytest.mark.parametrize("after_reads", [1, 2, 3, 4])
+def test_a_job_slipping_in_after_parks_validation_never_becomes_baseline(tmp_path, after_reads):
+    # Codex repro 1: a completed legacy Job inserted between park's Job validation and a later read must not be
+    # adopted: either park refuses, or verify (phase A's Job set kept through retirement) does not retire.
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    quiesce(api, rec, clock)
+    pplan = LG.build_park_plan(api, rec)
+    real_get, real_replace, st = api.get, api.replace, {"armed": False, "reads": 0, "done": False}
+
+    def replace(path, body):
+        out = real_replace(path, body)
+        if path.endswith("/deployments/ml-api/scale"):                     # the last parking write
+            st["armed"] = True
+        return out
+
+    def get(path):
+        out = real_get(path)
+        if st["armed"] and not st["done"] and path.endswith("/namespaces/ml-engine/jobs"):
+            st["reads"] += 1
+            if st["reads"] == after_reads:
+                st["done"] = True
+                historical_job(api, "ml-training-slipped")
+        return out
+    api.replace, api.get = replace, get
+    try:
+        LG.park(api, rec, pplan, C.plan_digest(pplan), sleep=clock.sleep, monotonic=clock, clock=clock)
+        parked = True
+    except C.StagingError as e:
+        parked = False
+        assert "legacy Jobs appeared" in str(e)
+    api.replace, api.get = real_replace, real_get
+    assert st["done"] or after_reads > 1                                     # inserted, or park read fewer times
+    if not st["done"]:
+        historical_job(api, "ml-training-slipped")                           # then it appears right after park
+    if parked:
+        pc = [r for r in journal(rec) if r["event"] == "park-complete"][-1]
+        slipped = api.objects[("jobs", "ml-engine", "ml-training-slipped")]["metadata"]["uid"]
+        assert slipped not in pc["data"]["jobs"]                             # never adopted unchecked
+        v = LG.verify(api, rec, 600, clock.sleep, clock, clock)
+        assert v["retired"] is False and any("ml-training-slipped" in p for p in v["problems"]), v["problems"]
+
+
+def test_verify_runs_one_observation_of_the_requested_length(tmp_path):
+    # Codex repro 2: 600 s requested must take 600 s (not 1,200), and a failure must not start another observation.
+    api, rec, clock = legacy_cluster(), ready_record(tmp_path), Clock()
+    full(api, rec, clock)
+    t0 = clock.t
+    v = LG.verify(api, rec, 600, clock.sleep, clock, clock)
+    assert v["retired"] is True and 600 <= clock.t - t0 < 600 + LG.SAMPLE_SECONDS
+    assert v["samples"] == 61 and v["observed_seconds"] == 600               # one sample per 10 s, both ends
+    t1, fired = clock.t, {}
+
+    def late_pod(a):
+        if clock.t >= t1 + 100 and not fired:
+            fired["at"] = clock.t
+            a.add("pods", {"kind": "Pod", "metadata": {"name": "nginx-test-back", "namespace": "demo",
+                                                       "ownerReferences": [{"kind": "ReplicaSet",
+                                                                            "uid": _rs_uid(a, "nginx-test")}]},
+                           "status": {"phase": "Running"}})
+    api.on_poll.append(late_pod)
+    v2 = LG.verify(api, rec, 600, clock.sleep, clock, clock)
+    assert v2["retired"] is False and len(v2["problems"]) == 1 and v2["observed_seconds"] == 0
+    assert clock.t - t1 <= 100 + LG.SAMPLE_SECONDS                           # stopped at the failure, no second run

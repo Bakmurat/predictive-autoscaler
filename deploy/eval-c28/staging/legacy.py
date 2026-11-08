@@ -55,12 +55,14 @@ establish fresh zero traffic after parking; verify therefore does NOT query metr
 zero. It requires (i) phase A's completed arrivals observation (>= 600 s of fresh per-target, per-reporter zero
 rates; its receipt is bound into phase B's plan and park-complete receipt and re-verified through the hash chain) and
 (ii) a park-complete receipt bound to that phase A, recording the post-park control state and Job identities (checked
-there against phase A's Lease and Jobs). verify compares every sample, from the first, against those PRESERVED
-baselines (never against its own first sample, so a Lease created or a Job finished between park and verify is
-caught; deleting historical Jobs is allowed), and observes for >= 600 s that the targets stay at the parked
-count with no pods and their captured UIDs, no generator/operator/API pod exists, the launcher CronJobs stay suspended
-and no Job of theirs appears or runs, no ScaledObject or generated HPA, HPA, new-group PA, legacy PA consumer or
-reconciler appears, the old Lease is not renewed or created, and nothing is recreated or rescaled.
+there against phase A's Lease and Jobs, from the one snapshot that is recorded). verify compares every sample, from
+the first, against those PRESERVED baselines (Jobs: phase A's identity set, kept through retirement), never against
+its own first sample or a later unchecked read, so a Lease created or a Job finished between park and verify is
+caught (deleting historical Jobs is allowed). It runs ONE continuous observation and observes for >= 600 s that
+the targets stay at the parked count with no pods and their captured UIDs, no generator/operator/API pod exists,
+the launcher CronJobs stay suspended and no Job of theirs appears or runs, no ScaledObject or generated HPA, HPA,
+new-group PA, legacy PA consumer or reconciler appears, the old Lease is not renewed or created, and nothing is
+recreated or rescaled.
 
 Quiesce, park and restore share ONE mutation lock per cluster (common_records.lock_path, scope "legacy") and one
 receipt journal ("legacy"; step numbers continue across phases and attempts, so every intent is unique). Execution
@@ -482,10 +484,11 @@ def job_uids(api) -> List[str]:
     return sorted(j["metadata"].get("uid") for j in _legacy_jobs(api, _jobs_spec()))
 
 
-def new_job_problems(api, baseline_uids) -> List[str]:
-    """Legacy Jobs (any status) that are not in the preserved baseline; deleted historical Jobs are allowed."""
-    new = sorted(j["metadata"].get("name") for j in _legacy_jobs(api, _jobs_spec())
-                 if j["metadata"].get("uid") not in set(baseline_uids))
+def new_job_problems(api, baseline_uids, jobs: Optional[List[Dict]] = None) -> List[str]:
+    """Legacy Jobs (any status) that are not in the preserved baseline; deleted historical Jobs are allowed. With
+    `jobs`, that exact snapshot is checked (so the identities recorded are the ones validated, never a second read)."""
+    jobs = _legacy_jobs(api, _jobs_spec()) if jobs is None else jobs
+    new = sorted(j["metadata"].get("name") for j in jobs if j["metadata"].get("uid") not in set(baseline_uids))
     return [f"legacy Jobs appeared {new} (a launcher or reconciler is active)"] if new else []
 
 
@@ -952,14 +955,15 @@ def park(api, rec: Mapping, plan: Mapping, reviewed: str, sleep: Callable = time
                 done.append(r)
         uids = {t["name"]: t["uid"] for t in pa["complete"]["data"]["targets"]}
         problems, state = _snapshot_problems(api, rec, s, uids)
-        problems += new_job_problems(api, pa["complete"]["data"]["jobs"])
+        jobs = _legacy_jobs(api, _jobs_spec())                  # ONE read: validated, then recorded as is
+        problems += new_job_problems(api, pa["complete"]["data"]["jobs"], jobs)
         if state["lease"] != pa["complete"]["data"]["lease"]:
             problems.append("the old operator's Lease differs from phase A's (renewed, created or removed)")
         if problems:
             raise C.StagingError("the post-park control state is not clean: " + "; ".join(problems))
         C.append_receipt(rec, HELPER, "park-complete", {
             "phase": "park", "plan_sha256": reviewed, "steps": len(done), "state": state,
-            "jobs": job_uids(api),
+            "jobs": sorted(j["metadata"].get("uid") for j in jobs),
             "quiesce_receipt_sha256": pa["complete"]["sha256"], "observed_receipt_sha256": pa["observed"]["sha256"],
             "targets": [[t["namespace"], t["name"], t["uid"]] for t in pa["complete"]["data"]["targets"]]}, clock)
     return done
@@ -1015,14 +1019,15 @@ def _retirement_chain(rec: Mapping) -> Dict:
         return {"problem": str(e)}
     parks = [r for r in pa["after"] if r["event"] == "park-complete"]
     p = parks[-1] if parks else None
-    if p and (p["data"].get("quiesce_receipt_sha256"), p["data"].get("observed_receipt_sha256")) != \
-            (pa["complete"]["sha256"], pa["observed"]["sha256"]):
-        return {"problem": "the park-complete receipt is not bound to the latest phase A"}
+    if p and ((p["data"].get("quiesce_receipt_sha256"), p["data"].get("observed_receipt_sha256")) !=
+              (pa["complete"]["sha256"], pa["observed"]["sha256"]) or
+              not set(p["data"].get("jobs") or []) <= set(pa["complete"]["data"]["jobs"])):
+        return {"problem": "the park-complete receipt is not bound to the latest phase A (or holds Jobs it lacks)"}
     return {"quiesce_receipt_sha256": pa["complete"]["sha256"], "observed_receipt_sha256": pa["observed"]["sha256"],
             "observed_seconds": pa["observed"]["data"]["seconds"], "park_receipt_sha256": p and p["sha256"],
             "uids": {t["name"]: t["uid"] for t in pa["complete"]["data"]["targets"]},
             "lease": pa["complete"]["data"]["lease"], "jobs": pa["complete"]["data"]["jobs"],
-            "park_state": p and p["data"]["state"], "park_jobs": p and p["data"]["jobs"]}
+            "park_state": p and p["data"]["state"]}
 
 
 def verify(api, rec: Mapping, observe_seconds: int = 0, sleep: Callable = time.sleep,
@@ -1037,11 +1042,11 @@ def verify(api, rec: Mapping, observe_seconds: int = 0, sleep: Callable = time.s
     s = _settings(rec)
     chain = _retirement_chain(rec)
     first_problems, live = _snapshot_problems(api, rec, s, chain.get("uids"))
-    # The baselines are the PRESERVED ones: the control state and Job identities park-complete recorded (itself
-    # checked against phase A's Lease and Jobs), never verify's own first sample. Without a park, the first sample
-    # (diagnostic only: no retirement without a park).
+    # The baselines are the PRESERVED ones: the control state park-complete recorded (checked there against phase A's
+    # Lease) and phase A's own Job identity set, kept through retirement; never verify's own first sample, never a
+    # later unchecked read. Without a park, the first sample (diagnostic only: no retirement without a park).
     baseline = chain.get("park_state") or live
-    jobs0 = chain.get("park_jobs") if chain.get("park_state") else job_uids(api)
+    jobs0 = chain.get("jobs") if chain.get("park_state") else job_uids(api)
     problems, samples = list(first_problems), 0
 
     def sample():
@@ -1054,10 +1059,6 @@ def verify(api, rec: Mapping, observe_seconds: int = 0, sleep: Callable = time.s
     if not problems:
         try:
             samples = _observe(sample, max(observe_seconds, 0), sleep, monotonic, "not quiet")
-        except C.StagingError as e:
-            problems.append(str(e))
-        try:
-            samples = _observe(sample, observe_seconds, sleep, monotonic, "not quiet")
         except C.StagingError as e:
             problems.append(str(e))
     parked = bool(chain.get("park_receipt_sha256"))
