@@ -15,7 +15,8 @@
 #
 #   deploy/eval-c28/smoke/kind.sh               build, create the cluster, run, delete it
 #   KEEP=1 deploy/eval-c28/smoke/kind.sh        keep the cluster for inspection
-#   deploy/eval-c28/smoke/kind.sh --render-only render and audit the manifests offline (no cluster, no docker)
+#   deploy/eval-c28/smoke/kind.sh --render-only render and audit the manifests offline and self-test check 7's
+#                                               classifier (no cluster, no docker; scripts/verify.sh runs it)
 # Needs: docker, kind, kubectl, helm, python3 with PyYAML. OPERATOR_IMAGE / FORECASTER_IMAGE (local tags) skip builds.
 set -euo pipefail
 
@@ -26,7 +27,43 @@ PY="${PYTHON:-python3}"
 case "$PY" in */*) PY="$(cd "$(dirname "$PY")" && pwd)/$(basename "$PY")" ;; esac
 c28() { (cd "$HARNESS" && KUBECONFIG=/dev/null "$PY" -m c28 "$@"); }
 
+# Check 7's classifier: does a PredictionReady (reason, message) prove an answer from the forecast API over the route?
+# Only what the operator derives from a response counts: the trust reasons it copies from the service's answer, a 422
+# refusal, Ready (a verified answer), and an HTTP error status ("ML API returned status", built only from a response read
+# over the verified connection). LeadInsufficient is decided by the operator before any request (v2_reconcile.go
+# readiness), so it proves nothing about the route; a TLS or dial failure is DataUnavailable with a transport error.
+forecast_api_answered() {
+  case "$1" in
+    HistoryInsufficient|CalibrationInsufficient|ShadowInsufficient|CoverageLow|RequestRefused|Ready) return 0 ;;
+    DataUnavailable) [[ "$2" == "ML API returned status "* ]] ;;
+    *) return 1 ;;
+  esac
+}
+classifier_self_test() {
+  local bad=0 want r m got
+  while IFS='|' read -r want r m; do
+    if forecast_api_answered "$r" "$m"; then got=yes; else got=no; fi
+    [ "$got" = "$want" ] || { echo "check-7 classifier: reason '$r' ($m) gave $got, want $want" >&2; bad=1; }
+  done <<'CASES'
+no|LeadInsufficient|no startup budget: set spec.behavior.startup.fallbackDelaySeconds until enough startups are observed
+no|DataUnavailable|Post "https://c28-forecast-route.pa-eval-system.svc:8443/v2/predict": tls: failed to verify certificate: x509: certificate is valid for pa-eval-predictive-autoscaler-forecaster.pa-eval-system.svc, not c28-forecast-route.pa-eval-system.svc
+no|DataUnavailable|Post "https://c28-forecast-route.pa-eval-system.svc:8443/v2/predict": dial tcp 10.96.12.34:8443: connect: connection refused
+no|DataUnavailable|no forecast
+no|CapacityMissing|no per-replica capacity: no forecast is requested
+no|SettingsInvalid|invalid settings
+no|EvidenceStale|no qualifying outcome within 900 s
+no||
+yes|DataUnavailable|ML API returned status 503: {"detail":{"error":"DataUnavailable","message":"the newest finalized observation is too old"}}
+yes|HistoryInsufficient|trust state Untrusted, reason HistoryInsufficient, service eligibility false
+yes|RequestRefused|forecast refused
+yes|Ready|ready to activate: the forecast passed every check; Recommend mode still makes no writes
+CASES
+  return "$bad"
+}
+
 if [ "${1:-}" = --render-only ]; then
+  classifier_self_test || { echo "render-only: check 7's classifier self-test failed" >&2; exit 1; }
+  echo "render-only: check 7's classifier accepts only answers from the forecast API"
   out="$(mktemp -d)"
   c28 render --params "$PARAMS" --out "$out/all.yaml"
   "$PY" - "$out/all.yaml" "$PARAMS" "$HARNESS" <<'PY'
@@ -348,17 +385,16 @@ pass "6. the scoped quota denies fixture pods only; ScaleOutBlocked=QuotaExceede
 
 # --- 7. the forecast route keeps TLS verification -------------------------------------------------------------------------
 # The operator dials https://c28-forecast-route...:8443 (a TCP pass-through) and verifies the forecaster's certificate
-# against that name (forecaster.tls.extraDNSNames). A service answer proves the verified path: a trust reason, a 422
-# refusal, or an HTTP error status from the service ("ML API returned status", built only from a response read over
-# the verified connection). A TLS or dial failure is DataUnavailable with a transport error instead. The smoke's load
-# reaches only the H-RPS arm, so the PA arms' series are empty and the usual answer here is the service's 503.
+# against that name (forecaster.tls.extraDNSNames). Only an answer from the forecast API counts (forecast_api_answered,
+# above). The smoke's load reaches only the H-RPS arm, so the PA arms' series are empty and the usual answer here is the
+# service's 503.
 service_reason() {
   local r m
   r="$(k -n "$NS" get pa c28-pa-n-s20 -o jsonpath='{.status.conditions[?(@.type=="PredictionReady")].reason}')"
   m="$(k -n "$NS" get pa c28-pa-n-s20 -o jsonpath='{.status.conditions[?(@.type=="PredictionReady")].message}')"
-  case "$r" in HistoryInsufficient|CalibrationInsufficient|ShadowInsufficient|CoverageLow|LeadInsufficient|RequestRefused|Ready) return 0 ;; esac
-  [ "$r" = DataUnavailable ] && [[ "$m" == "ML API returned status "* ]]
+  forecast_api_answered "$r" "$m"
 }
 wait_for 300 "a forecast answer through the verified route" service_reason
-pass "7. forecasts reach the operator through the route with certificate verification on"
+log "check 7 saw PredictionReady $(k -n "$NS" get pa c28-pa-n-s20 -o jsonpath='{.status.conditions[?(@.type=="PredictionReady")].reason}: {.status.conditions[?(@.type=="PredictionReady")].message}' | cut -c1-160)"
+pass "7. forecast API reachable through the certificate-verified route"
 log "smoke complete (accelerated, engineering only: no C2.8 evidence)"
