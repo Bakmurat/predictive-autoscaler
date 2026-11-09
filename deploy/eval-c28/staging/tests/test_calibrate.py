@@ -924,7 +924,7 @@ def test_observer_queries_must_select_the_live_pods(cal):
     ctx.world.up_label = "kubernetes_pod_name"        # the queries do not see pods under the declared label
     out = run(ctx)
     c = cert(ctx)
-    ns = [e["data"] for e in ctx.entries() if e["event"] == "trial-not-started"]
+    ns = [e["data"] for e in ctx.entries() if e["event"] == "observer-not-ready"]
     assert out["verdict"] == "NOT READY" and c["trials"] == 0
     assert any("does not prove the live" in p for p in ns[0]["problems"])
 
@@ -1267,3 +1267,68 @@ def test_s5_example_contract_uses_prod_style_queries(cal):
     bad = copy.deepcopy(ctx.con)
     bad["observer"]["queries"]["fixture_cpu_cores"] = q["fixture_cpu_cores"].replace("[1m]", "[5m]")
     assert any("rate window" in p for p in K._observer_problems(bad["observer"], X.import_harness().render))
+
+
+# --- Codex review of 2aa1bcf ------------------------------------------------------------------------------------------
+
+def _raw_doc(points):
+    return {"start": 940, "end": 1000, "step": 15,
+            "response": {"data": {"result": [{"metric": {"pod": "p"}, "values": [[t, str(v)] for t, v in points]}]}}}
+
+
+def test_t1_freshness_is_judged_at_the_gate_time_with_full_coverage(cal):
+    """Codex repro: gate 1000, evaluations 940/955/970, raw 880/895/910, max_staleness_s 60 passed."""
+    ctx = cal()
+    con = ctx.con
+    stale_tail = _raw_doc([(940, 880), (955, 895), (970, 910)])
+    why, d = K.raw_freshness(con, stale_tail, ["p"], "pod", 940, 1000)
+    assert why and "missing head or tail" in why
+    gap = _raw_doc([(940, 930), (955, 945), (985, 975), (1000, 990)])
+    assert "gap" in K.raw_freshness(con, gap, ["p"], "pod", 940, 1000)[0]
+    good = _raw_doc([(t, t - 10) for t in range(940, 1001, 15)])
+    why, d = K.raw_freshness(con, good, ["p"], "pod", 940, 1000)
+    assert why == "" and d["p"]["age_at_end_s"] == 10
+    # every evaluation present but the raw samples stopped long ago: old at the gate time
+    frozen = _raw_doc([(t, 925) for t in range(940, 1001, 15)])
+    why, d = K.raw_freshness(con, frozen, ["p"], "pod", 940, 1000)
+    assert "75 s old" in why and d["p"]["age_at_end_s"] == 75
+
+
+def test_t2_new_pods_get_a_bounded_observer_warmup(cal):
+    ctx = cal()
+    out = run(ctx)
+    assert out["verdict"] == "READY"
+    ready = [e["data"] for e in ctx.entries() if e["event"] == "observer-ready"]
+    assert ready[0]["trial"] == "t001" and ready[0]["waited_s"] >= ctx.world.scrape_delay
+    # the idle interval began only after the observer saw the new pod
+    raw = _raw(ctx, "t001")
+    born = min(v for k, v in ctx.world.born.items() if k.startswith(ctx.nm["variants"][0] + "-"))
+    assert raw["observations"]["idle_window"]["start"] >= born + ctx.world.scrape_delay
+
+
+def test_t2_observer_warmup_timeout_is_not_ready(cal, api):
+    ctx = cal()
+    ctx.world.scrape_delay = 100_000                  # the new pods are never scraped
+    out = run(ctx)
+    c = cert(ctx)
+    nr = [e["data"] for e in ctx.entries() if e["event"] == "observer-not-ready"]
+    assert out["verdict"] == "NOT READY" and c["trials"] == 0 and c["halted"]["category"] == "incomplete"
+    assert nr and nr[0]["timeout_s"] == 300
+    assert live_calibration_objects(api, ctx.cal) == []
+
+
+def test_t2_safety_guards_stay_active_during_the_warmup(cal, api):
+    ctx = cal()
+    ctx.world.scrape_delay = 100_000
+
+    def intrude(world, api_):                         # a writer appears while the wait is under way
+        born = [v for k, v in world.born.items() if k.startswith(ctx.nm["variants"][0] + "-")]
+        if born and world.clock.now() >= min(born) + 30 and \
+                ("horizontalpodautoscalers", "demo", "intruder") not in api_.objects:
+            api_.put(_hpa(ctx.nm["variants"][0]))
+    ctx.world.hooks.append(intrude)
+    out = run(ctx)
+    stopped = [e["data"] for e in ctx.entries() if e["event"] == "observer-wait-stopped"]
+    assert out["verdict"] == "NOT READY" and cert(ctx)["halted"]["category"] == "stopped"
+    assert stopped and any("replica writer" in p for p in stopped[0]["problems"])
+    assert not any(e["event"] == "observer-not-ready" for e in ctx.entries())

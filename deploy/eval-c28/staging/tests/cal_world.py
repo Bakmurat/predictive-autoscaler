@@ -79,7 +79,8 @@ def contract(tmp, **over):
                       "memory_limit": "512Mi"},
         "observer": {"query_api": "http://vmselect.monitoring.svc:8481/select/0/prometheus", "step_s": 15,
                      "max_staleness_s": 60, "scrape": "VMPodScrape", "queries": dict(QUERIES), "pods": [],
-                     "pod_label": "pod", "freshness": dict(FRESHNESS), "cpu_scrape_interval_s": 30},
+                     "pod_label": "pod", "freshness": dict(FRESHNESS), "cpu_scrape_interval_s": 30,
+                     "readiness_timeout_s": 300},
         "stops": {"steal_query": STEAL, "node_label": "nodename", "steal_percent": 5, "steal_bins": 5},
         "criteria": {"p95_ms": 200, "p99_ms": 500, "max_failure_fraction": 0.001, "max_dropped_arrivals": 0,
                      "linearity_min": 0.90, "ceiling_factor": 1.2,
@@ -133,6 +134,8 @@ class World:
         self.raw_age = 10             # age of the newest raw sample behind every series
         self.raw_missing = set()      # pods/nodes whose raw samples are absent (hidden inside a sum otherwise)
         self.raw_stale = set()        # pods/nodes whose newest raw sample is 200 s old
+        self.born = {}                # pod name -> creation time: no samples exist before born + scrape_delay
+        self.scrape_delay = 20        # a new pod's first scrape lands this long after its creation
         self.missing = set()
         self.counters = {}            # target -> {"req": n, "resp": n}
         self.windows = []             # [{target, start, end, rate_rps, wi, ok}]
@@ -182,6 +185,7 @@ class World:
                     old = pod["metadata"]["name"]
                     pod["metadata"]["name"] = f"{dep['metadata']['name']}-7d9f8c6b5-{old[-5:]}"
                     renamed.append((old, pod))
+                    self.born[pod["metadata"]["name"]] = self.clock.now()
                     pod["metadata"]["labels"] = {**tmpl["metadata"]["labels"], "pod-template-hash": "7d9f8c6b5"}
                     pod["metadata"]["annotations"] = dict(tmpl["metadata"].get("annotations") or {})
                     pod["spec"] = {**json.loads(json.dumps(tmpl["spec"])), "nodeName": "worker-w"}
@@ -215,6 +219,7 @@ class World:
                         {"name": "k6", "imageID": "docker.io/" + GENERATOR, "restartCount": 0,
                          "state": {"running": {"startedAt": K._ts(now)}}}]}})
                 job["status"] = {"active": 1, "startTime": K._ts(now)}
+                self.born[f"{name}-abcde"] = now
                 continue
             if not pods or job.get("status", {}).get("conditions"):
                 continue
@@ -305,6 +310,7 @@ class World:
                 for n in ("worker-w", "worker-s")]}}
         if "timestamp(" in query:
             return self._raw(query, grid, pods)
+        self._q_pods = pods
         if query.startswith("up{"):
             kind = "up"
         elif "c28_ingress_requests_total" in query:
@@ -323,23 +329,28 @@ class World:
             kind = "cpu"
         if kind in self.missing:
             return {"status": "success", "data": {"result": []}}
+        target_pods = (lambda t: self._alive(lambda n: n.startswith(f"{target}-") and "-ing-" not in n, t))
         if kind == "fixture_requests":
             if not self.direct_traffic:
                 return {"status": "success", "data": {"result": []}}
-            return self._series(grid, lambda t: t - start)
+            return self._series([t for t in grid if target_pods(t)], lambda t: t - start)
         if kind == "inflight":
-            return self._series(grid, lambda t: 0.5 if self._window(target=target, t=t) else 0)
+            return self._series([t for t in grid if target_pods(t)],
+                                lambda t: 0.5 if self._window(target=target, t=t) else 0)
         if kind in ("req", "resp"):
             c = self.counters.get(target)
             if c is None:
                 return {"status": "success", "data": {"result": []}}
-            return self._series(grid, lambda t: c[kind])
+            return self._series([t for t in grid if self._alive(lambda n: "-ing-" in n, t)], lambda t: c[kind])
         if kind == "up":
             live = sorted(o["metadata"]["name"] for (k, _, _), o in self.api.objects.items()
                           if k == "pods" and re.fullmatch(pods, o["metadata"]["name"]))
-            return {"status": "success", "data": {"result": [
-                {"metric": {self.up_label: n}, "values": [[t, "1"] for t in grid]} for n in live]}}
+            series_ = [{"metric": {self.up_label: n}, "values": [[t, "1"] for t in grid if self._born_ok(n, t)]}
+                       for n in live]
+            return {"status": "success", "data": {"result": [x for x in series_ if x["values"]]}}
         if kind == "backlog":
+            grid = [t for t in grid if target_pods(t)]
+
             def backlog(t):
                 w = self._window(target=target, t=t)
                 if not w:
@@ -347,6 +358,7 @@ class World:
                 return 0.2 if w["ok"] else 0.2 + (t - w["ws"]) / 60
             return self._series(grid, backlog)
         comp = "generator" if "-gen-" in pods else "ingress" if "-ing-" in pods else "fixture"
+        grid = [t for t in grid if self._alive(lambda n: bool(re.fullmatch(pods, n)), t)]
         if kind == "throttle":
             return self._series(grid, lambda t: {"generator": self.gen_throttle, "ingress": 0.0}.get(comp, 0.1))
         if comp != "fixture":
@@ -367,16 +379,25 @@ class World:
             label = "pod"
             names = sorted(o["metadata"]["name"] for (k, _, _), o in self.api.objects.items()
                            if k == "pods" and re.fullmatch(pods, o["metadata"]["name"]))
-        return {"status": "success", "data": {"result": [
-            {"metric": {label: n}, "values": [[t, str(t - (200 if n in self.raw_stale else self.raw_age))]
-                                              for t in grid]}
-            for n in names if n not in self.raw_missing]}}
+        series_ = [{"metric": {label: n}, "values": [[t, str(t - (200 if n in self.raw_stale else self.raw_age))]
+                                                     for t in grid if label == "nodename" or self._born_ok(n, t)]}
+                   for n in names if n not in self.raw_missing]
+        return {"status": "success", "data": {"result": [x for x in series_ if x["values"]]}}
+
+    def _born_ok(self, name, t):
+        """A pod has samples only from its creation plus the first scrape delay on (never before it existed)."""
+        return name in self.born and t >= self.born[name] + self.scrape_delay
+
+    def _alive(self, pred, t):
+        return any(self._born_ok(n, t) for (k, _, n) in self.api.objects if k == "pods" and pred(n))
 
     def _window(self, target, t):
         return next((w for w in self.windows if w["target"] == target and w["start"] <= t <= w["end"]), None)
 
     @staticmethod
     def _series(grid, fn):
+        if not grid:
+            return {"status": "success", "data": {"result": []}}
         return {"status": "success", "data": {"result": [{"metric": {}, "values": [[t, str(fn(t))] for t in grid]}]}}
 
 

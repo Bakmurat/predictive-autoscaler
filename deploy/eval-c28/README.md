@@ -278,7 +278,9 @@ pods Ready and non-terminating, not by revision lag; RollingUpdate objects keep 
 the guarded owners' generations and pod UID/revision/restart sets, and any replacement, restart, revision or template
 change during it stops the trial. Every expected source (each fixture pod, the ingress, the generator while it runs,
 W and S for steal) must show a fresh raw sample (a `timestamp()` query per source, `observer.freshness`) at every
-evaluation, so one pod's missing series cannot hide inside a sum. Dispatched, received and answered arrivals reconcile
+evaluation (every step present, the newest raw sample judged against the gate time), so one pod's missing series cannot
+hide inside a sum. New pods get a bounded observer warm-up (`observer.readiness_timeout_s`, safety guards active)
+before any idle interval or load begins. Dispatched, received and answered arrivals reconcile
 with tolerance 0/0. The idle CPU baseline is averaged only after a washout of the 60 s rate window plus one CPU scrape
 interval.
 

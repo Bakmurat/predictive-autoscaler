@@ -141,9 +141,12 @@ stops on a replacement, restart, revision or template change. Raw samples: for e
 pod's own metrics and CPU, the ingress pod, the generator pod while it runs, W and S for steal) a timestamp() query
 (observer.freshness) must return exactly one series per source with its newest raw sample at most max_staleness_s old
 at every evaluation of the window, live at every gate and in the evidence (raw_freshness), so a missing pod cannot
-vanish inside a sum. Dispatched, received and answered arrivals reconcile with tolerance 0/0 (the contract allows
-nothing else). The selection's idle CPU is averaged only after a washout of the 60 s rate window plus one CPU scrape
-interval (observer.cpu_scrape_interval_s), and idle_s must cover the washout plus 120 s of averaging.
+vanish inside a sum; every evaluation step must be present (no missing tail or interior gap) and the newest raw sample
+is judged against the gate time itself. New pods get a bounded observer warm-up (observer.readiness_timeout_s): the
+queries are polled, with every safety guard active, until they see the live pods, and the idle interval or the load
+begins only then. Dispatched, received and answered arrivals reconcile with tolerance 0/0 (the contract allows nothing
+else). The selection's idle CPU is averaged only after a washout of the 60 s rate window plus one CPU scrape interval
+(observer.cpu_scrape_interval_s), and idle_s must cover the washout plus 120 s of averaging.
 
 Interruption. Everything runs under the shared evaluation lock (execlib.mutating) with intents before and outcomes
 after each create, delete and /scale step; an unknown outcome keeps the lock until `recover`. Trial boundaries
@@ -448,7 +451,7 @@ def _work_selection_problems(ws, cr) -> List[str]:
 
 def _observer_problems(ob, R) -> List[str]:
     keys = {"query_api", "step_s", "max_staleness_s", "scrape", "queries", "pods", "pod_label", "freshness",
-            "cpu_scrape_interval_s"}
+            "cpu_scrape_interval_s", "readiness_timeout_s"}
     if not (isinstance(ob, dict) and set(ob) == keys):
         return [f"observer must be exactly {sorted(keys)}"]
     out = []
@@ -480,6 +483,8 @@ def _observer_problems(ob, R) -> List[str]:
             if not (isinstance(fr[name], str) and "timestamp(" in fr[name] and token in fr[name]):
                 out.append(f"observer.freshness.{name} must be a timestamp() query" +
                            (f" using {token}" if token else ""))
+    if not (_int(ob["readiness_timeout_s"]) and 30 <= ob["readiness_timeout_s"] <= 1800):
+        out.append("observer.readiness_timeout_s must be the bounded wait for new pods' metrics (30..1800 s)")
     if not (_int(ob["cpu_scrape_interval_s"]) and 5 <= ob["cpu_scrape_interval_s"] <= 60):
         out.append("observer.cpu_scrape_interval_s must be the cAdvisor scrape interval in seconds (5..60)")
     pods = ob["pods"]
@@ -1193,8 +1198,11 @@ def raw_freshness(con: Dict, obs: Optional[Dict], expected: List[str], label: st
                   end: int) -> Tuple[str, Dict]:
     """Raw-sample freshness and coverage of one source over [start, end]: the timestamp() query must return EXACTLY one
     series per expected pod or node (by `label`; a missing series would otherwise vanish silently inside a sum), each
-    with points covering the interval at the evaluation cadence, and at every evaluation the newest raw sample at most
-    max_staleness_s old (and not from the future). Returns (why, {name: {max_age_s, points}})."""
+    with an evaluation at EVERY step of the interval (the first within one step of `start`, the last within one step of
+    `end`, consecutive evaluations exactly one step apart: no missing tail, no interior gap), at every evaluation t
+    the newest raw sample at most max_staleness_s old (t - value, never from the future), and at `end` itself (the gate
+    time for a live check) the newest raw sample at most max_staleness_s old: end - last value. Returns (why,
+    {name: {max_age_s, age_at_end_s, points}})."""
     step, stale = con["observer"]["step_s"], con["observer"]["max_staleness_s"]
     by, why = series_by_label(obs or {}, label)
     if by is None:
@@ -1209,14 +1217,19 @@ def raw_freshness(con: Dict, obs: Optional[Dict], expected: List[str], label: st
         out.append(f"unexpected sources {extra}")
     for name in sorted(set(expected) & set(by)):
         pts = [(t, v) for t, v in by[name] if start - step <= t <= end]
-        gap = covered(pts, start, end, step) if pts else "no samples in the interval"
+        ts = [t for t, _ in pts]
         ages = [t - v for t, v in pts]
-        detail[name] = {"max_age_s": max(ages) if ages else None, "points": len(pts)}
-        if gap:
-            out.append(f"{name}: {gap}")
-        elif max(ages) > stale or min(ages) < -step:
-            out.append(f"{name}: a raw sample {max(ages):.0f} s old (max_staleness_s {stale})" if max(ages) > stale
-                       else f"{name}: a raw sample timestamped in the future")
+        at_end = (end - pts[-1][1]) if pts else None
+        detail[name] = {"max_age_s": max(ages) if ages else None, "age_at_end_s": at_end, "points": len(pts)}
+        if not pts:
+            out.append(f"{name}: no evaluation in the interval")
+        elif ts[0] > start + step or ts[-1] < end - step:
+            out.append(f"{name}: the evaluations do not reach the interval's edges (a missing head or tail)")
+        elif any(b - a != step for a, b in zip(ts, ts[1:])):
+            out.append(f"{name}: an evaluation is missing inside the interval (gap)")
+        elif max(ages) > stale or min(ages) < -step or at_end > stale:
+            out.append(f"{name}: a raw sample {max(max(ages), at_end):.0f} s old (max_staleness_s {stale})"
+                       if max(max(ages), at_end) > stale else f"{name}: a raw sample timestamped in the future")
     return "; ".join(out), detail
 
 
@@ -2588,6 +2601,8 @@ def run_trial(ctx: Context, meta: Dict, decision_sha: str, guard: Optional[Dict]
     tdir = f"trials/{trial}"
     observations: Dict = {}
 
+    await_observer(ctx, meta, fstate, guard)
+
     def pre_gate() -> Tuple[List[str], str]:
         return gate_problems(ctx, fstate, guard=guard) + converged(ctx, fx["name"], fx["uid"], n) + \
             observer_problems(ctx, meta["variant"]), fresh(ctx.fetch, con, ctx.cal, ctx.now())
@@ -2701,6 +2716,33 @@ def run_trial(ctx: Context, meta: Dict, decision_sha: str, guard: Optional[Dict]
     rfile = ctx.write(f"{tdir}/result.json", result)
     ctx.receipt("trial-result", {"trial": meta, "verdict": result["verdict"], "files": files, "result": rfile})
     return result
+
+
+def await_observer(ctx: Context, meta: Dict, fstate: Dict, guard: Dict) -> int:
+    """Bounded observer readiness after pods were created or scaled up: new pods have no metrics until their first
+    scrapes, so the queries are polled (every step_s, at most observer.readiness_timeout_s) until observer_problems and
+    the ingress freshness pass for the live ingress and active-variant pods. The safety guards stay active on every
+    poll (a gate violation stops at once). The idle interval or the load begins only after this. Returns the seconds
+    waited; a timeout halts the calibration as incomplete evidence."""
+    con = ctx.con
+    t0, timeout = ctx.now(), con["observer"]["readiness_timeout_s"]
+    while True:
+        problems = gate_problems(ctx, fstate, guard=guard)
+        if problems:
+            ctx.receipt("observer-wait-stopped", {"trial": meta, "problems": problems})
+            raise Halt("stopped", "; ".join(problems))
+        why = observer_problems(ctx, meta["variant"])
+        stale = fresh(ctx.fetch, con, ctx.cal, ctx.now())
+        if stale:
+            why.append(stale)
+        if not why:
+            waited = ctx.now() - t0
+            ctx.receipt("observer-ready", {"trial": meta["id"], "variant": meta["variant"], "waited_s": waited})
+            return waited
+        if ctx.now() - t0 >= timeout:
+            ctx.receipt("observer-not-ready", {"trial": meta, "timeout_s": timeout, "problems": why})
+            raise Halt("incomplete", f"the observer did not see the new pods within {timeout} s: {'; '.join(why)}")
+        ctx.sleep(con["observer"]["step_s"])
 
 
 def se_step(con: Dict) -> int:
