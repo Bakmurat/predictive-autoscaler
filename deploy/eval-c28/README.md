@@ -272,6 +272,18 @@ INCREASE = END - mean of the first `edge_bins`, a repetition fails when END / re
 when INCREASE > `max_increase` AND the least-squares slope > `max_slope_per_min`; bounded growth below those numbers
 passes.
 
+The rollout guard judges OnDelete DaemonSets and StatefulSets (pods deliberately kept on an older template, such as
+prod's velero node-agent or the VictoriaMetrics StatefulSets) by observed generation, expected pod count and all their
+pods Ready and non-terminating, not by revision lag; RollingUpdate objects keep the strict rules. Each plateau records
+the guarded owners' generations and pod UID/revision/restart sets, and any replacement, restart, revision or template
+change during it stops the trial. Every expected source (each fixture pod, the ingress, the generator while it runs,
+W and S for steal) must show a fresh raw sample (a `timestamp()` query per source, `observer.freshness`) at every
+evaluation (every step present, the newest raw sample judged against the gate time), so one pod's missing series cannot
+hide inside a sum. New pods get a bounded observer warm-up (`observer.readiness_timeout_s`, safety guards active)
+before any idle interval or load begins. Dispatched, received and answered arrivals reconcile
+with tolerance 0/0. The idle CPU baseline is averaged only after a washout of the 60 s rate window plus one CPU scrape
+interval.
+
 Before and during every trial, and once more before a completed trial is accepted: the measured configuration equal
 to the reviewed rendering, compared strictly (owned objects, the trial's Job, every admitted pod: every container and pod
 field, a field the rendering omits must be absent unless it is a listed API default, and admission may add only the
