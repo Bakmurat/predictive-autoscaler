@@ -154,7 +154,11 @@ writer API is listed strictly (a listing failure refuses); a group the successfu
 "API discovery-proven absent" (it says nothing about objects that may once have existed); a failed or malformed
 discovery refuses. The availability per group is bound into the reviewed plan and the calibration-begin receipt,
 rechecked under the lock before anything is created, and any change during the calibration (an absent API appearing, a
-served one disappearing) stops it.
+served one disappearing) stops it. The census covers HPAs, KEDA ScaledObjects, both PredictiveAutoscaler groups and
+CronHorizontalPodAutoscalers (kubernetes-cronhpa-controller, a scheduled replica writer) as replica writers, and
+VerticalPodAutoscalers as resource writers: a VPA on a calibration object is allowed and recorded only in updateMode
+Off (the plan's resource_writers); any other mode, including the API's default Auto, or a change away from Off, is a
+stop.
 
 Interruption. Everything runs under the shared evaluation lock (execlib.mutating) with intents before and outcomes
 after each create, delete and /scale step; an unknown outcome keeps the lock until `recover`. Trial boundaries
@@ -2098,7 +2102,8 @@ def writer_apis(kube: X.Kube) -> Tuple[Dict[str, str], Dict]:
     plus the discovery result. Only a successful, well-formed discovery proves absence; a failed or malformed one
     raises (and refuses). It says what discovery shows now, not that such objects could never have existed."""
     groups = kube.discover_fresh()
-    return {X.group_of(k): ("served" if X.group_of(k) in groups else ABSENT) for k in X.WRITER_KINDS}, groups
+    return {X.group_of(k): ("served" if X.group_of(k) in groups else ABSENT)
+            for k in X.WRITER_KINDS + X.RESOURCE_WRITER_KINDS}, groups
 
 
 def writer_problems(ctx: Context) -> List[str]:
@@ -2115,11 +2120,18 @@ def writer_problems(ctx: Context) -> List[str]:
         changed = [g for g in sorted(set(bound) | set(apis)) if bound.get(g) != apis.get(g)]
         out.append("writer census: the writer APIs changed since the reviewed plan: " +
                    ", ".join(f"{g} {bound.get(g)} -> {apis.get(g)}" for g in changed))
+    targets = ctx.nm["variants"] + [ctx.nm["ingress"]]
     try:
-        inv = X.writer_inventory(ctx.kube, ctx.ns, ctx.nm["variants"] + [ctx.nm["ingress"]], groups=groups,
-                                 absent_ok=True)
+        inv = X.writer_inventory(ctx.kube, ctx.ns, targets, groups=groups, absent_ok=True)
+        vpas = X.resource_writer_inventory(ctx.kube, ctx.ns, targets, groups=groups)
     except C.StagingError as e:
         return out + [f"writer census: listing a served writer API failed ({e})"]
+    for name, vs in sorted(vpas.items()):           # an "Off" VPA writes nothing; any other mode rewrites resources
+        writing = [f"{X.ident_str(v)}#{v['uid']} (updateMode {v['update_mode']})" for v in vs
+                   if v["update_mode"] != "Off"]
+        if writing:
+            out.append(f"{name}: VerticalPodAutoscaler resource writer(s) {writing}: only updateMode Off is allowed "
+                       "during the calibration")
     return out + [f"{name}: replica writer(s) {[X.ident_str(w) + '#' + str(w['uid']) for w in ws]}: the calibration "
                   "runs at fixed replicas with no writer" for name, ws in sorted(inv.items()) if ws]
 
@@ -2465,9 +2477,10 @@ def plan(ctx: Context) -> Dict:
     rates = {str(n): dict(zip(("min", "max", "initial"), bounds(ctx.con, n)))
              for n in ctx.con["search"]["replica_counts"]}
     try:
-        apis = writer_apis(ctx.kube)[0]
+        apis, groups = writer_apis(ctx.kube)
+        recorded = X.resource_writer_inventory(ctx.kube, ctx.ns, ctx.nm["variants"] + [ctx.nm["ingress"]], groups)
     except C.StagingError:
-        apis = {"discovery": "failed"}                 # writer_problems already refuses the plan
+        apis, recorded = {"discovery": "failed"}, {}   # writer_problems already refuses the plan
     return X.new_plan(HELPER, ctx.record, [{"op": "create", "kind": o["kind"], "name": o["metadata"]["name"],
                                             "sha256": X.json_digest(o)} for o in objs],
                       calibration_id=ctx.cal, contract_sha256=ctx.sha, contract=ctx.con,
@@ -2484,7 +2497,7 @@ def plan(ctx: Context) -> Dict:
                               "deadline_utc": ctx.con["search"]["deadline_utc"], "worst_case": wc,
                               "generator_job_deadline_s": ctx.con["search"]["settle_s"] +
                               ctx.con["search"]["measure_s"] + ctx.con["search"]["job_slack_s"]},
-                      admission=adm, writer_apis=apis, problems=problems,
+                      admission=adm, writer_apis=apis, resource_writers=recorded, problems=problems,
                       never=["scale anything but the calibration fixture", "write a writer", "touch a confirmation "
                              "target, the quota or a fault schedule", "resume an interrupted measurement",
                              "a rate outside the plan's bounds"])
@@ -2570,6 +2583,8 @@ def reconcile_scale(kube: X.Kube, d: Dict, record: X.Record) -> Dict:
     try:
         _, groups = writer_apis(kube)
         writers = X.writer_inventory(kube, d["namespace"], [d["name"]], groups=groups, absent_ok=True).get(d["name"])
+        writers = writers or [v for v in X.resource_writer_inventory(kube, d["namespace"], [d["name"]], groups).get(
+            d["name"], []) if v["update_mode"] != "Off"]
     except C.StagingError as e:
         return {"observed": "unresolved", "why": f"the writer census failed ({e})"}
     if writers:

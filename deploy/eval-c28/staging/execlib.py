@@ -64,6 +64,9 @@ EXTRA_KINDS = {
     "podmonitors": ("/apis/monitoring.coreos.com/v1", "podmonitors", True),
     "vmpodscrapes": ("/apis/operator.victoriametrics.com/v1beta1", "vmpodscrapes", True),
     "volumeattachments": ("/apis/storage.k8s.io/v1", "volumeattachments", False),
+    # kubernetes-cronhpa-controller's scheduled replica writer, and the Vertical Pod Autoscaler (a resource writer)
+    "cronhpas": ("/apis/autoscaling.alibabacloud.com/v1beta1", "cronhorizontalpodautoscalers", True),
+    "vpas": ("/apis/autoscaling.k8s.io/v1", "verticalpodautoscalers", True),
 }
 # Object kind -> table key.
 KIND_KEY = {
@@ -76,6 +79,7 @@ KIND_KEY = {
     "ConfigMap": "configmaps", "ResourceQuota": "resourcequotas", "ReplicaSet": "replicasets",
     "PriorityClass": "priorityclasses", "StorageClass": "storageclasses", "NetworkPolicy": "networkpolicies",
     "PodMonitor": "podmonitors", "VMPodScrape": "vmpodscrapes", "VolumeAttachment": "volumeattachments",
+    "CronHorizontalPodAutoscaler": "cronhpas", "VerticalPodAutoscaler": "vpas",
 }
 if C.KINDS["pa-legacy"][0] != f"/apis/{legacy_allowlist.LEGACY_GROUP}/v1alpha1":     # pragma: no cover
     raise ImportError("common_records and legacy_allowlist disagree on the legacy API group")
@@ -672,8 +676,11 @@ def injection_problems(kube: "Kube", params: Dict, owner_uids: Optional[set] = N
     return c28.render.unexpected_injection(pods)
 
 
-WRITER_KINDS = ("HorizontalPodAutoscaler", "ScaledObject", "PredictiveAutoscaler", "LegacyPredictiveAutoscaler")
-OPTIONAL_WRITERS = ("ScaledObject", "LegacyPredictiveAutoscaler")
+WRITER_KINDS = ("HorizontalPodAutoscaler", "ScaledObject", "PredictiveAutoscaler", "LegacyPredictiveAutoscaler",
+                "CronHorizontalPodAutoscaler")
+OPTIONAL_WRITERS = ("ScaledObject", "LegacyPredictiveAutoscaler", "CronHorizontalPodAutoscaler")
+RESOURCE_WRITER_KINDS = ("VerticalPodAutoscaler",)
+VPA_DEFAULT_MODE = "Auto"          # the VPA API's default updateMode when spec.updatePolicy omits it
 
 
 def ident(kind: str, obj: Dict) -> Dict:
@@ -712,7 +719,9 @@ def writer_inventory(kube: Kube, namespace: str, names: Iterable[str], groups: O
         cross = kind in ("PredictiveAutoscaler", "LegacyPredictiveAutoscaler")
         for o in kube.list(kind, None):
             as_writer = dict(o, kind="PredictiveAutoscaler" if cross else kind)
-            for ns, name in c28.render._writer_targets(as_writer):
+            targets = _cronhpa_targets(o) if kind == "CronHorizontalPodAutoscaler" else \
+                c28.render._writer_targets(as_writer)
+            for ns, name in targets:
                 if ns != namespace or name not in names:
                     continue
                 w = ident(kind, o)
@@ -727,6 +736,36 @@ def writer_inventory(kube: Kube, namespace: str, names: Iterable[str], groups: O
                     found[name].append(w)
     return {k: sorted(v, key=lambda i: (i["kind"], i["namespace"] or "", i["name"], i["uid"] or ""))
             for k, v in found.items()}
+
+
+def _cronhpa_targets(o: Dict) -> List[tuple]:
+    """A CronHorizontalPodAutoscaler writes the replica count of its scaleTargetRef (a Deployment by default) in its own
+    namespace on its schedule: a replica writer like an HPA."""
+    ref = (o.get("spec") or {}).get("scaleTargetRef") or {}
+    if (ref.get("kind") or "Deployment") != "Deployment" or not ref.get("name"):
+        return []
+    return [((o.get("metadata") or {}).get("namespace"), ref["name"])]
+
+
+def resource_writer_inventory(kube: Kube, namespace: str, names: Iterable[str],
+                              groups: Optional[Dict] = None) -> Dict[str, List[Dict]]:
+    """Every VerticalPodAutoscaler whose targetRef is one of the named Deployments in `namespace`, with its effective
+    updateMode (VPA_DEFAULT_MODE when unset): {name: [{kind, namespace, name, uid, update_mode}]}. Only "Off" writes
+    nothing; Auto, Recreate, Initial and InPlaceOrRecreate write the pods' resources. The VPA API is optional: skipped
+    only when discovery (`groups`, else the cached Kube.served) shows it absent; a listing failure raises."""
+    names = set(names)
+    found: Dict[str, List[Dict]] = {n: [] for n in names}
+    served = (lambda kind: group_of(kind) in groups) if groups is not None else kube.served
+    if not served("VerticalPodAutoscaler"):
+        return found
+    for o in kube.list("VerticalPodAutoscaler", None):
+        spec, m = o.get("spec") or {}, o.get("metadata") or {}
+        ref = spec.get("targetRef") or {}
+        if m.get("namespace") != namespace or (ref.get("kind") or "") != "Deployment" or ref.get("name") not in names:
+            continue
+        mode = ((spec.get("updatePolicy") or {}).get("updateMode")) or VPA_DEFAULT_MODE
+        found[ref["name"]].append(dict(ident("VerticalPodAutoscaler", o), update_mode=mode))
+    return {k: sorted(v, key=lambda i: (i["namespace"] or "", i["name"])) for k, v in found.items()}
 
 
 def subset_diff(want, live, path_: str = "", ignore: Iterable[str] = ()) -> List[str]:

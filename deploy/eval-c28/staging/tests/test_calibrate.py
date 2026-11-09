@@ -1337,6 +1337,8 @@ def test_t2_safety_guards_stay_active_during_the_warmup(cal, api):
 # --- c2.8t: writer API groups that discovery proves absent -----------------------------------------------------------
 
 PA_GROUP = "autoscaling.devkuban.com"
+CRON_GROUP = "autoscaling.alibabacloud.com"
+VPA_GROUP = "autoscaling.k8s.io"
 
 
 def _absent(api, group=PA_GROUP):
@@ -1347,7 +1349,9 @@ def test_u1_absent_writer_api_is_discovery_proven_absent_and_bound(cal, api):
     """prod: the new PredictiveAutoscaler CRD is not installed yet (circular with S3)."""
     ctx = cal()
     served = K.plan(ctx)["writer_apis"]
-    assert set(served.values()) == {"served"} and PA_GROUP in served
+    assert {g: served[g] for g in ("autoscaling", "keda.sh", PA_GROUP, "autoscaler.example.com")} == \
+        dict.fromkeys(("autoscaling", "keda.sh", PA_GROUP, "autoscaler.example.com"), "served")
+    assert served[CRON_GROUP] == served[VPA_GROUP] == K.ABSENT          # not served by the fake by default
     _absent(api)
     p = K.plan(ctx)
     assert p["problems"] == [], p["problems"]
@@ -1474,3 +1478,90 @@ def test_u3_availability_change_between_review_and_apply_is_refused(cal, api):
     api.groups = api.groups + [PA_GROUP]
     with pytest.raises(X.StagingError, match="no longer produces the reviewed plan"):
         K.apply(ctx, plan, digest)
+
+
+def _cronhpa(target, name="nightly"):
+    return {"apiVersion": "autoscaling.alibabacloud.com/v1beta1", "kind": "CronHorizontalPodAutoscaler",
+            "metadata": {"name": name, "namespace": "demo"},
+            "spec": {"scaleTargetRef": {"apiVersion": "apps/v1", "kind": "Deployment", "name": target},
+                     "jobs": [{"name": "up", "schedule": "0 0 8 * * *", "targetSize": 4}]}}
+
+
+def _vpa(target, mode=None, name="vpa"):
+    spec = {"targetRef": {"apiVersion": "apps/v1", "kind": "Deployment", "name": target}}
+    if mode is not None:
+        spec["updatePolicy"] = {"updateMode": mode}
+    return {"apiVersion": "autoscaling.k8s.io/v1", "kind": "VerticalPodAutoscaler",
+            "metadata": {"name": name, "namespace": "demo"}, "spec": spec}
+
+
+def test_v1_cronhpa_is_a_replica_writer_served_or_absent(cal, api):
+    ctx = cal()
+    api.groups = api.groups + [CRON_GROUP]
+    assert K.plan(ctx)["writer_apis"][CRON_GROUP] == "served" and K.plan(ctx)["problems"] == []
+    api.put(_cronhpa(ctx.nm["variants"][0]))
+    assert any("CronHorizontalPodAutoscaler/demo/nightly" in p for p in K.plan(ctx)["problems"])
+    api.put(_cronhpa("some-other-app", name="other"))          # not ours: ignored
+    api.objects.pop(("cronhpas", "demo", "nightly"))
+    assert K.plan(ctx)["problems"] == []
+    # the shared inventory (session/prepare) sees it as a writer too, once its API is served
+    inv = X.writer_inventory(record_kube(ctx), "demo", ["some-other-app"])
+    assert [w["kind"] for w in inv["some-other-app"]] == ["CronHorizontalPodAutoscaler"]
+    # an unserved group is discovery-proven absent: its objects are not listed
+    api.groups = [g for g in api.groups if g != CRON_GROUP]
+    assert K.plan(ctx)["writer_apis"][CRON_GROUP] == K.ABSENT
+
+
+def test_v1_cronhpa_appearing_mid_trial_stops(cal, api):
+    ctx = cal()
+    api.groups = api.groups + [CRON_GROUP]
+
+    def cron(world, api_):
+        if any(k == "jobs" and n.endswith("t003") for (k, _, n) in api_.objects) and \
+                ("cronhpas", "demo", "nightly") not in api_.objects:
+            api_.put(_cronhpa(ctx.nm["variants"][0]))
+    ctx.world.hooks.append(cron)
+    out = run(ctx)
+    stopped = [e["data"] for e in ctx.entries() if e["event"] == "trial-stopped"]
+    assert out["verdict"] == "NOT READY" and "CronHorizontalPodAutoscaler" in stopped[0]["reason"]
+
+
+@pytest.mark.parametrize("mode", [None, "Auto", "Recreate", "Initial", "InPlaceOrRecreate"])
+def test_v2_a_writing_vpa_refuses(cal, api, mode):
+    ctx = cal()
+    api.groups = api.groups + [VPA_GROUP]
+    api.put(_vpa(ctx.nm["variants"][1], mode))
+    want = mode or "Auto"                                     # the VPA API's default updateMode
+    assert any(f"updateMode {want}" in p for p in K.plan(ctx)["problems"])
+
+
+def test_v2_an_off_vpa_is_recorded_and_allowed_until_its_mode_changes(cal, api):
+    ctx = cal()
+    api.groups = api.groups + [VPA_GROUP]
+    api.put(_vpa(ctx.nm["variants"][0], "Off", name="goldilocks-fixture"))
+    p = K.plan(ctx)
+    assert p["problems"] == [] and p["writer_apis"][VPA_GROUP] == "served"
+    assert [v["update_mode"] for v in p["resource_writers"][ctx.nm["variants"][0]]] == ["Off"]
+
+    def flip(world, api_):
+        if any(k == "jobs" and n.endswith("t003") for (k, _, n) in api_.objects):
+            api_.objects[("vpas", "demo", "goldilocks-fixture")]["spec"]["updatePolicy"]["updateMode"] = "Auto"
+    ctx.world.hooks.append(flip)
+    out = run(ctx)
+    stopped = [e["data"] for e in ctx.entries() if e["event"] == "trial-stopped"]
+    assert out["verdict"] == "NOT READY" and "updateMode Auto" in stopped[0]["reason"]
+
+
+def test_v2_vpa_api_absent_or_disappearing(cal, api):
+    ctx = cal()
+    assert K.plan(ctx)["writer_apis"][VPA_GROUP] == K.ABSENT and K.plan(ctx)["problems"] == []
+    api.groups = api.groups + [VPA_GROUP]
+
+    def gone(world, api_):
+        if any(k == "jobs" and n.endswith("t003") for (k, _, n) in api_.objects):
+            api_.groups = [g for g in api_.groups if g != VPA_GROUP]
+    ctx.world.hooks.append(gone)
+    out = run(ctx)
+    stopped = [e["data"] for e in ctx.entries() if e["event"] == "trial-stopped"]
+    assert out["verdict"] == "NOT READY" and f"{VPA_GROUP} served -> API discovery-proven absent" in \
+        stopped[0]["reason"]
