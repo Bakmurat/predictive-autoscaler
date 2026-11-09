@@ -9,6 +9,9 @@
 # deletes only the cluster it created. Nothing here is C2.8 evidence.
 #
 #   deploy/eval-c28/smoke/calibrate-kind.sh --images images.json --out report.json      (KEEP=1 keeps the cluster)
+# A fixture built locally and pushed to a throwaway local registry (never Harbor) is reached the same way, by digest:
+#   REGISTRY_MIRROR=localhost:5002=http://<registry container>:5000 REGISTRY_CONTAINER=<registry container> ...
+# writes a containerd hosts.toml for localhost:5002 on every node and connects that container to the kind network.
 # Needs: docker, kind, kubectl, python3 with PyYAML.
 set -euo pipefail
 
@@ -79,6 +82,19 @@ log "creating $CLUSTER"
   --wait 120s >/dev/null
 guard
 W="$CLUSTER-worker"; S="$CLUSTER-worker2"
+if [ -n "${REGISTRY_MIRROR:-}" ]; then
+  MIRROR_HOST="${REGISTRY_MIRROR%%=*}"; MIRROR_URL="${REGISTRY_MIRROR#*=}"
+  [[ "$MIRROR_HOST" =~ ^localhost:[0-9]+$ && "$MIRROR_URL" =~ ^http://[a-z0-9.-]+:[0-9]+$ ]] \
+    || die "REGISTRY_MIRROR must be localhost:<port>=http://<container>:<port>"
+  [ -n "${REGISTRY_CONTAINER:-}" ] && docker container inspect "$REGISTRY_CONTAINER" >/dev/null 2>&1 \
+    || die "REGISTRY_CONTAINER must name the running local registry"
+  docker network connect kind "$REGISTRY_CONTAINER" 2>/dev/null || true
+  for node in "$CLUSTER-control-plane" "$W" "$S"; do
+    docker exec "$node" sh -c "mkdir -p /etc/containerd/certs.d/$MIRROR_HOST && printf '[host.\"%s\"]\n' \
+      '$MIRROR_URL' > /etc/containerd/certs.d/$MIRROR_HOST/hosts.toml" || die "node $node: registry mirror"
+  done
+  log "local registry $MIRROR_HOST -> $MIRROR_URL on every node"
+fi
 # The reviewed images reach the nodes by digest (containerd verifies the manifest digest), as smoke/kind.sh does.
 while read -r node ref; do
   docker exec "$node" crictl pull "$ref" >/dev/null || die "node $node: pull $ref"

@@ -24,7 +24,19 @@ checks what the offline tests can only simulate:
   8. the real admission gate: calibrate.pod_problems / object_problems find NO difference between the rendered and the
      ADMITTED fixture, ingress and k6 pods and their Deployments, Services, ConfigMap and Job (the API server's
      defaults and the DefaultTolerationSeconds not-ready/unreachable tolerations included, which must actually be
-     present), while copies with an added command or a changed default toleration are refused.
+     present), while copies with an added command or a changed default toleration are refused. That covers the
+     ingress's ServiceAccount, Role and RoleBinding and its explicit projected token volume (no admission-generated
+     kube-api-access-<random> volume may appear);
+  9. the endpoints-rr ingress against a real API server (Codex review of PR #51):
+     a. RBAC/API access: the ingress (its own ServiceAccount, the namespaced EndpointSlice-reader Role) reports
+        ROUTING endpoints-rr, discovery synced 1, stale 0, no list/watch errors;
+     b. membership follows the fixture: scaled 1 -> 2 -> 3 -> 1, its c28_ingress_endpoint set equals the variant's
+        READY pods each time (the generation moves; a removed pod leaves the set);
+     c. no retries, exactly once: in a trial at 2 replicas every pod HANDLED exactly what the ingress DISPATCHED to it
+        (the fixture's own c28_requests_total per pod) and the sum equals the ingress's received arrivals and k6's
+        dispatched; the round-robin's spread is reported;
+     d. readiness only after the first successful LIST: an ingress pod whose ServiceAccount has NO RoleBinding gets
+        403s, counts list errors, reports synced 0 and never becomes Ready.
 
   calibrate_kind.py --kubeconfig K --context C --images images.json --workload W --support S --out report.json
 """
@@ -108,6 +120,26 @@ class Smoke:
     def pods(self, selector=""):
         args = ["get", "pods", "-n", NS] + (["-l", selector] if selector else [])
         return self.kj(*args).get("items", [])
+
+    # --- metrics read from a pod itself (port-forward) --------------------------------------------------------------
+    def metrics_of(self, ref):
+        port = free_port()
+        pf = subprocess.Popen(self.base + ["-n", NS, "port-forward", ref, f"{port}:8080"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            return self.wait(f"{ref} /metrics", lambda: fetch_text(f"http://127.0.0.1:{port}/metrics"), 30)
+        finally:
+            pf.terminate()
+            pf.wait()
+
+    def ingress_metrics(self):
+        return self.metrics_of(f"deploy/{self.nm['ingress']}")
+
+    def ready_pods(self, name):
+        return sorted(p["metadata"]["name"] for p in self.pods(f"{K.CAL_LABEL}={self.cal}")
+                      if p["metadata"]["name"].startswith(name + "-") and not p["metadata"].get("deletionTimestamp")
+                      and any(c.get("type") == "Ready" and c.get("status") == "True"
+                              for c in p["status"].get("conditions", [])))
 
     # --- the ingress counters, read from the pod itself ------------------------------------------------------------
     def ingress_counts(self, target):
@@ -207,6 +239,11 @@ class Smoke:
         gone = self.wait("the deadline-expired Job's pods gone", lambda: not self.pods(f"job-name={d['job']}"), 120)
         self.ok("6-active-deadline", conds.get("Failed", {}).get("reason") == "DeadlineExceeded" and gone,
                 {"conditions": list(conds), "reason": conds.get("Failed", {}).get("reason")})
+        # 9: the endpoints-rr ingress against the real API server
+        self.check_discovery_synced()
+        self.check_membership(variant, (2, 3, 1))
+        self.check_exactly_once(variant)
+        self.check_rbac_denied_never_ready()
         # cleanup: delete everything this smoke created (UID-bound), prove every labelled pod gone
         t0 = time.time()
         for kind, plural, api in (("Job", "jobs", "/apis/batch/v1"),):
@@ -219,6 +256,99 @@ class Smoke:
             self.k("delete", o["kind"].lower(), "-n", NS, o["metadata"]["name"], "--wait=false")
         self.wait("calibration pods gone", lambda: not self.pods(f"{K.CAL_LABEL}={self.cal}"), 180)
         self.ok("6-cleanup", True, {"seconds": round(time.time() - t0, 1)})
+
+    # --- 9: endpoints-rr --------------------------------------------------------------------------------------------
+    def check_discovery_synced(self):
+        m = self.ingress_metrics()
+        got = {k: metric(m, k) for k in ("c28_ingress_discovery_synced", "c28_ingress_discovery_stale")}
+        errs = {st: metric(m, "c28_ingress_discovery_errors_total", stage=st) for st in ("list", "watch")}
+        routing = metric(m, "c28_ingress_routing", mode="endpoints-rr")
+        self.ok("9a-rbac-api-access-synced", got == {"c28_ingress_discovery_synced": 1.0,
+                                                     "c28_ingress_discovery_stale": 0.0} and routing == 1.0 and
+                errs == {"list": 0.0, "watch": 0.0}, {**got, "errors": errs, "routing_endpoints_rr": routing})
+
+    def endpoint_set(self, target):
+        return sorted(lbl["endpoint_pod"] for lbl, _ in series(self.ingress_metrics(), "c28_ingress_endpoint")
+                      if lbl.get("target") == target)
+
+    def check_membership(self, variant, counts):
+        for n in counts:
+            gen0 = metric(self.ingress_metrics(), "c28_ingress_endpoints_generation", target=variant)
+            self.k("scale", "-n", NS, f"deploy/{variant}", f"--replicas={n}")
+            self.wait(f"{n} ready {variant} pods", lambda: len(self.ready_pods(variant)) == n and len(
+                [p for p in self.pods(f"{K.CAL_LABEL}={self.cal}") if p["metadata"]["name"].startswith(
+                    variant + "-")]) == n, 180)
+            want, t0 = self.ready_pods(variant), time.time()
+            try:
+                got = self.wait("the ingress routes to exactly the ready pods",
+                                lambda: (lambda e: e if e == want else None)(self.endpoint_set(variant)), 60)
+            except RuntimeError:
+                got = self.endpoint_set(variant)
+            gen1 = metric(self.ingress_metrics(), "c28_ingress_endpoints_generation", target=variant)
+            self.ok(f"9b-membership-follows-scale-to-{n}", got == want and gen1 is not None and gen0 is not None
+                    and gen1 > gen0, {"ready_pods": want, "discovered": got, "generation": [gen0, gen1],
+                                      "followed_within_s": round(time.time() - t0, 1)})
+
+    def fixture_handled(self, pods):
+        out = {}
+        for p in pods:
+            out[p] = sum(v for _, v in series(self.metrics_of(f"pod/{p}"), "c28_requests_total"))
+        return out
+
+    def dispatched(self, target):
+        return {lbl["endpoint_pod"]: v for lbl, v in series(self.ingress_metrics(), "c28_ingress_dispatched_total")
+                if lbl.get("target") == target}
+
+    def check_exactly_once(self, variant):
+        self.k("scale", "-n", NS, f"deploy/{variant}", "--replicas=2")
+        self.wait("2 ready pods routed", lambda: len(self.ready_pods(variant)) == 2 and
+                  self.endpoint_set(variant) == self.ready_pods(variant), 180)
+        pods = self.ready_pods(variant)
+        h0, d0 = self.fixture_handled(pods), self.dispatched(variant)
+        t = self.trial(5, variant, 600)
+        h1, d1 = self.fixture_handled(pods), self.dispatched(variant)
+        handled = {p: h1[p] - h0[p] for p in pods}
+        disp = {p: d1.get(p, 0.0) - d0.get(p, 0.0) for p in pods}
+        stray = {p: v - d0.get(p, 0.0) for p, v in d1.items() if p not in pods and v != d0.get(p, 0.0)}
+        summary = json.loads((K._terminated(t["pod"], "k6") or {}).get("message") or "{}")
+        k6 = sum(K._metric(summary, s, "iterations", "count") or 0 for s in ("settle", "measure"))
+        received = t["after"][0] - t["before"][0]
+        spread = max(disp.values()) - min(disp.values()) if disp else None
+        self.ok("9c-exactly-once-no-retries", handled == disp and not stray and sum(disp.values()) == received == k6
+                and received > 0, {"handled_by_pod": handled, "dispatched_by_pod": disp, "stray": stray,
+                                   "ingress_received": received, "k6_dispatched": k6, "rr_spread": spread})
+
+    def check_rbac_denied_never_ready(self):
+        """An ingress pod running as a ServiceAccount WITHOUT the RoleBinding: discovery is refused (403), counted,
+        never synced, and the pod never becomes Ready (readiness only after the first successful LIST)."""
+        dep = self.kj("get", "deployment", "-n", NS, self.nm["ingress"])
+        name = f"{self.nm['ingress']}-noperm"
+        self.apply({"apiVersion": "v1", "kind": "ServiceAccount",
+                    "metadata": {"name": name, "namespace": NS}, "automountServiceAccountToken": False})
+        spec = copy.deepcopy(dep["spec"]["template"]["spec"])
+        spec["serviceAccountName"] = name
+        spec.pop("serviceAccount", None)
+        pod = self.apply({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": name, "namespace": NS,
+                          "labels": {"app.kubernetes.io/part-of": "c28-cal-smoke-negative",
+                                     "sidecar.istio.io/inject": "false"},
+                          "annotations": {"sidecar.istio.io/inject": "false"}}, "spec": spec})
+        try:
+            self.wait("the no-permission ingress running", lambda: (lambda p: p if p.get("status", {}).get(
+                "phase") == "Running" else None)(self.kj("get", "pod", "-n", NS, name)), 120)
+            time.sleep(30)                                    # six readiness periods, many list attempts
+            live = self.kj("get", "pod", "-n", NS, name)
+            ready = any(c.get("type") == "Ready" and c.get("status") == "True"
+                        for c in live["status"].get("conditions", []))
+            m = self.metrics_of(f"pod/{name}")
+            errs = metric(m, "c28_ingress_discovery_errors_total", stage="list")
+            synced = metric(m, "c28_ingress_discovery_synced")
+            logs = self.k("logs", "-n", NS, name, check=False)
+            self.ok("9d-no-rbac-never-synced-never-ready", not ready and synced == 0.0 and (errs or 0) > 0 and
+                    "403" in logs, {"ready": ready, "synced": synced, "list_errors": errs,
+                                    "log_has_403": "403" in logs, "uid": pod["metadata"]["uid"]})
+        finally:
+            self.k("delete", "pod", "-n", NS, name, "--wait=true", check=False)
+            self.k("delete", "serviceaccount", "-n", NS, name, check=False)
 
     def check_admission(self, objs, variant):
         """The rendered objects and pod templates against what the API server actually admitted."""
@@ -340,6 +470,26 @@ def read_images(path):
             raise SystemExit(f"images: {role} is not pinned by digest")
         out[role] = ref
     return out
+
+
+_SERIES = re.compile(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(.*)\})? (\S+)$')
+_LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\.)*)"')
+
+
+def series(text, name):
+    """[(labels, value)] of one metric in a Prometheus text exposition."""
+    out = []
+    for line in text.splitlines():
+        m = _SERIES.match(line)
+        if m and m.group(1) == name:
+            out.append((dict(_LABEL.findall(m.group(2) or "")), float(m.group(3))))
+    return out
+
+
+def metric(text, name, **labels):
+    """The value of the one series of `name` whose labels include `labels` (None when absent)."""
+    hits = [v for lbl, v in series(text, name) if all(lbl.get(k) == v_ for k, v_ in labels.items())]
+    return hits[0] if len(hits) == 1 else None
 
 
 def free_port():

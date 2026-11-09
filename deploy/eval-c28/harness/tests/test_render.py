@@ -193,3 +193,87 @@ def test_route_policies_are_rendered_only_for_an_enforcing_release(params):
     assert pols["c28-forecast-route-to-forecaster"]["spec"]["podSelector"]["matchLabels"] == {
         "app.kubernetes.io/name": "predictive-autoscaler", "app.kubernetes.io/instance": "pa-eval",
         "app.kubernetes.io/component": "forecaster"}
+
+
+# --- the ingress routes per request over READY endpoints, with a namespaced EndpointSlice reader identity ---------------
+
+def _ingress(objs):
+    return next(d for d in by(objs, "Deployment") if d["metadata"]["name"] == "c28-ingress")
+
+
+def test_the_ingress_routes_per_request_with_a_least_privilege_identity(params):
+    objs = render.render_all(params)
+    assert not by(objs, "ClusterRole") and not by(objs, "ClusterRoleBinding")
+    (sa,), (role,), (rb,) = by(objs, "ServiceAccount"), by(objs, "Role"), by(objs, "RoleBinding")
+    for o in (sa, role, rb):
+        assert o["metadata"]["name"] == "c28-ingress" and o["metadata"]["namespace"] == "demo"
+        assert o["metadata"]["labels"][render.RUN_LABEL] == params["run_id"]
+    assert sa["automountServiceAccountToken"] is False
+    assert role["rules"] == [{"apiGroups": ["discovery.k8s.io"], "resources": ["endpointslices"],
+                              "verbs": ["get", "list", "watch"]}]
+    assert rb["roleRef"] == {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "c28-ingress"}
+    assert rb["subjects"] == [{"kind": "ServiceAccount", "name": "c28-ingress", "namespace": "demo"}]
+    order = [(o["kind"], o["metadata"]["name"]) for o in render.render_common(params)]
+    assert order.index(("RoleBinding", "c28-ingress")) < order.index(("Deployment", "c28-ingress"))
+    spec = _ingress(objs)["spec"]["template"]["spec"]
+    env = {e["name"]: e["value"] for e in spec["containers"][0]["env"]}
+    assert env["ROUTING"] == "endpoints-rr" and env["DISCOVERY_RESYNC_SECONDS"] == "30" and \
+        env["DISCOVERY_STALE_SECONDS"] == "90" and env["TIMEOUT_SECONDS"] == str(F.REQUEST_TIMEOUT_S)
+    assert spec["serviceAccountName"] == "c28-ingress" and spec["automountServiceAccountToken"] is False
+    (vol,) = spec["volumes"]
+    srcs = vol["projected"]["sources"]
+    assert srcs[0] == {"serviceAccountToken": {"path": "token", "expirationSeconds": 3600}}
+    assert spec["containers"][0]["volumeMounts"] == [{"name": "kube-api-access", "readOnly": True,
+                                                      "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount"}]
+    # every upstream is a Service of the ingress's own namespace (its Role is namespaced)
+    for up in env["UPSTREAMS"].split(","):
+        assert up.split("=", 1)[1].endswith(".demo.svc")
+    # nothing else runs as a ServiceAccount or carries a token
+    for d in by(objs, "Deployment"):
+        if d["metadata"]["name"] != "c28-ingress":
+            s = d["spec"]["template"]["spec"]
+            assert "serviceAccountName" not in s and s["automountServiceAccountToken"] is False
+            assert not any("projected" in v for v in s.get("volumes") or [])
+
+
+def _mutate_kind(kind, fn):
+    def go(objs):
+        fn(next(o for o in objs if o["kind"] == kind))
+    return go
+
+
+def _mutate_ingress(fn):
+    def go(objs):
+        fn(_ingress(objs)["spec"]["template"]["spec"])
+    return go
+
+
+def _fixture_spec(objs):
+    return next(d for d in by(objs, "Deployment") if render.ARM_LABEL in d["metadata"]["labels"])["spec"]["template"]["spec"]
+
+
+@pytest.mark.parametrize("mutate", [
+    _mutate_kind("Role", lambda r: r["rules"][0]["verbs"].append("create")),
+    _mutate_kind("Role", lambda r: r["rules"][0]["resources"].append("pods")),
+    _mutate_kind("Role", lambda r: r["rules"].append({"apiGroups": [""], "resources": ["secrets"], "verbs": ["get"]})),
+    _mutate_kind("RoleBinding", lambda b: b["subjects"][0].update(namespace="kube-system")),
+    _mutate_kind("RoleBinding", lambda b: b["subjects"].append({"kind": "ServiceAccount", "name": "default",
+                                                               "namespace": "demo"})),
+    _mutate_kind("RoleBinding", lambda b: b["roleRef"].update(kind="ClusterRole", name="admin")),
+    _mutate_kind("ServiceAccount", lambda s: s.update(automountServiceAccountToken=True)),
+    lambda objs: objs.append({"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole",
+                              "metadata": {"name": "c28-x"}, "rules": []}),
+    _mutate_ingress(lambda s: s["containers"][0]["env"].pop()),                     # stale bound left to the default
+    _mutate_ingress(lambda s: [e.update(value="service") for e in s["containers"][0]["env"] if e["name"] == "ROUTING"]),
+    _mutate_ingress(lambda s: s.update(automountServiceAccountToken=True)),
+    _mutate_ingress(lambda s: s.update(serviceAccountName="default")),
+    _mutate_ingress(lambda s: s["volumes"][0]["projected"]["sources"][0]["serviceAccountToken"].update(
+        expirationSeconds=86400)),
+    lambda objs: _fixture_spec(objs).update(serviceAccountName="c28-ingress"),
+    lambda objs: _fixture_spec(objs).update(volumes=_fixture_spec(objs)["volumes"] + [render.ingress_token()[0]]),
+])
+def test_the_rbac_audit_refuses_anything_broader(params, mutate):
+    objs = render.render_all(params)
+    mutate(objs)
+    with pytest.raises(render.ParamsError, match="RBAC audit"):
+        render.audit_rbac(objs)

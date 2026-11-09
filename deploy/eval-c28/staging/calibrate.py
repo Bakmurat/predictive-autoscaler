@@ -22,12 +22,14 @@ c = 0.875 c0 (render.capacity_rps). It qualifies nothing else: not the HPA targe
 twelve-replica layout; burst behaviour is fixture characterization only (no claim that autoscaling covers single-pod
 bursts); no prospective history or confirmation evidence starts during calibration.
 
-The calibration contract (record section "calibrate": {"contract": "<file>"}, schema c28-calibration-contract/v1) is
+The calibration contract (record section "calibrate": {"contract": "<file>"}, schema c28-calibration-contract/v2; v1,
+which predates the endpoints-rr ingress and its discovery gate, is refused, while recorded v1 bundles still reduce) is
 frozen independently of the unfinished experiment params (only the reservation stage of the params is read). It binds
 the cluster and node UIDs, the namespace, the source commit and load-script hash, the S1 images.json and its fixture and
 generator digests, the candidate fixture configuration (resources, max_inflight, max_queue, queue timeout, GOMAXPROCS,
 response size, startup delay), the work_iterations selection, the ingress and generator resources, the observer (query
-API, the evaluation's 15 s scrape cadence, staleness, scrape kind, the exact queries), the criteria (the manifest's
+API, the evaluation's 15 s scrape cadence, staleness, scrape kind, the exact queries, and observer.discovery: the
+ingress's synced/stale gauges, its scrape timestamp, endpoint membership and per-endpoint dispatch), the criteria (the manifest's
 numbers, which may not be changed, the queue rule, the limit bounds, the 1.2 ceiling factor), the search (bounds,
 factor, resolution, maximum trials, total deadline, seed, grace and timeouts), the admission budget and the rollout
 guard. Every consumed value is validated: finite, positive where a count or rate, no placeholders, no unknown keys.
@@ -43,7 +45,10 @@ quota or run-lock ever counts them, and their names c28cal-* never collide with 
     explicit GOMAXPROCS env, sidecar-free (label AND annotation), pinned to W by the run taint toleration and required
     role + hostname affinity, no PriorityClass. The selection never edits a pod template;
   * the pinned calibration ingress <id>-ing and its Service on W (render.render_common's ingress shape, one route per
-    variant), which counts offered demand before the fixture can reject it: every request goes through it;
+    variant), which counts offered demand before the fixture can reject it: every request goes through it. It routes
+    per request in a strict round-robin over the variant's READY pods (render.INGRESS_ROUTING, set explicitly), so
+    its ServiceAccount, Role (get/list/watch EndpointSlices in the namespace, nothing else) and RoleBinding <id>-ing
+    are created before it and removed after it (render.audit_rbac checks the rendering);
   * the k6 script ConfigMap <id>-k6 (load/c28-calibrate.js) and, when the contract's scrape kind is PodMonitor or
     VMPodScrape, one scrape object for the fixture and ingress pods at the 15 s cadence;
   * one k6 Job per trial, <id>-gen-tNNN, on S, backoffLimit 0 and a finite activeDeadlineSeconds (settle + measure +
@@ -132,6 +137,16 @@ the calibration. Every /scale write re-checks the writers, the configuration and
 before the PUT, inside its journalled step, with scale-write receipts not-submitted / submitting / applied / refused /
 unknown, so recover tells a refused pre-write check from a lost response.
 
+Discovery gate (contract v2; discovery_problems, discovery_verdict, dispatch_counts). The endpoints-rr ingress must,
+before any load (polled inside the bounded observer warm-up; a timeout refuses the trial), report synced 1 and stale 0
+from a fresh scrape and route to EXACTLY the active variant's live fixture pods (its c28_ingress_endpoint series whose
+raw sample is from that same scrape, compared with the pods this calibration owns through the UID chain). During the
+measurement every poll re-checks it (a stale flag, a missing or old discovery metric or a membership mismatch stops
+the trial as incomplete evidence), and evaluate_trial re-checks every evaluation of the measurement window from the
+recorded series, so a blip between two polls invalidates the result. Each trial records the per-endpoint dispatch:
+every arrival dispatched exactly once (the sum equals the ingress's received arrivals) and only to the trial's fixture
+pods; the spread is reported, never judged.
+
 Guards added before the contract freeze. The rollout guard judges OnDelete DaemonSets and StatefulSets (which
 deliberately keep pods on an older template) by observed generation, the expected pod count in status and their own
 pods all Running, Ready and non-terminating, never by revision lag; RollingUpdate objects keep the strict rules; the
@@ -200,7 +215,11 @@ import reserve
 
 HELPER = "calibrate"
 STOP = "calibrate-stop"
-CONTRACT_SCHEMA = "c28-calibration-contract/v1"
+CONTRACT_SCHEMA = "c28-calibration-contract/v2"
+# v1 contracts predate the endpoints-rr ingress and its discovery gate (observer.discovery): refused for new
+# calibrations (a v2 contract is a new calibration ID). Recorded v1 bundles still reduce: evaluate_trial applies the
+# discovery checks only to a contract that carries observer.discovery.
+REFUSED_CONTRACT_SCHEMAS = ("c28-calibration-contract/v1",)
 CERT_SCHEMA = "c28-calibration-certificate/v1"
 RESULT_SCHEMA = "c28-calibration-trial/v1"
 K6_SCHEMA = "c28-calibration-k6/v1"
@@ -234,6 +253,14 @@ ROLLOUT_KINDS = ["DaemonSet", "Deployment", "StatefulSet"]
 # per node (stops.node_label) whose values are the raw samples' own timestamps (MetricsQL timestamp() of a selector).
 FRESHNESS_TOKENS = {"fixture_metrics": "__PODS__", "fixture_cpu": "__PODS__", "ingress_metrics": "__PODS__",
                     "ingress_cpu": "__PODS__", "generator_cpu": "__PODS__", "steal": ""}
+# The ingress's endpoint discovery (contract v2, observer.discovery; fixture ROUTING=endpoints-rr): per ingress pod its
+# synced and stale gauges and the raw timestamp of its newest scrape; per variant the raw timestamps of the
+# c28_ingress_endpoint{target, endpoint_pod} membership series (one per READY endpoint in the ingress's set: current
+# when its raw sample is from the ingress's newest scrape) and the per-endpoint dispatch counters.
+DISCOVERY_TOKENS = {"synced": "__PODS__", "stale": "__PODS__", "scrape_timestamp": "__PODS__",
+                    "endpoints": "__TARGET__", "dispatched": "__TARGET__"}
+DISCOVERY_TIMESTAMPS = ("scrape_timestamp", "endpoints")
+ENDPOINT_LABEL = "endpoint_pod"
 CPU_QUERIES = ("fixture_cpu_cores", "fixture_throttled_fraction", "ingress_cpu_cores", "ingress_throttled_fraction",
                "generator_cpu_cores", "generator_throttled_fraction")
 RATE_WINDOW_S = 60               # frozen.RATE_RANGE: every CPU query's rate()/increase() window is [1m]
@@ -328,7 +355,10 @@ def contract_problems(con, record: X.Record, params: Dict) -> List[str]:
             out.append(f"{path_}: credential material is never recorded")
         if isinstance(v, str) and (C._UNRESOLVED.search(v) or C._LEAK.search(v) or v.strip().startswith("<")):
             out.append(f"{path_}: unresolved placeholder or credential-bearing value")
-    if con["schema"] != CONTRACT_SCHEMA:
+    if con["schema"] in REFUSED_CONTRACT_SCHEMAS:
+        out.append(f"schema {con['schema']} predates the endpoints-rr ingress and its discovery gate: write a "
+                   f"{CONTRACT_SCHEMA} contract with observer.discovery (a new calibration)")
+    elif con["schema"] != CONTRACT_SCHEMA:
         out.append(f"schema must be {CONTRACT_SCHEMA}")
     if con["run_id"] != record.run_id:
         out.append("run_id differs from the record")
@@ -463,7 +493,7 @@ def _work_selection_problems(ws, cr) -> List[str]:
 
 def _observer_problems(ob, R) -> List[str]:
     keys = {"query_api", "step_s", "max_staleness_s", "scrape", "queries", "pods", "pod_label", "freshness",
-            "cpu_scrape_interval_s", "readiness_timeout_s"}
+            "cpu_scrape_interval_s", "readiness_timeout_s", "discovery"}
     if not (isinstance(ob, dict) and set(ob) == keys):
         return [f"observer must be exactly {sorted(keys)}"]
     out = []
@@ -495,6 +525,20 @@ def _observer_problems(ob, R) -> List[str]:
             if not (isinstance(fr[name], str) and "timestamp(" in fr[name] and token in fr[name]):
                 out.append(f"observer.freshness.{name} must be a timestamp() query" +
                            (f" using {token}" if token else ""))
+    dq = ob["discovery"]
+    if not (isinstance(dq, dict) and set(dq) == set(DISCOVERY_TOKENS)):
+        out.append(f"observer.discovery must be exactly {sorted(DISCOVERY_TOKENS)} (the ingress's endpoint "
+                   "discovery: synced, stale, its scrape timestamp, endpoint membership and per-endpoint dispatch)")
+    else:
+        for name, token in DISCOVERY_TOKENS.items():
+            q = dq[name]
+            if not (isinstance(q, str) and q.strip() and token in q):
+                out.append(f"observer.discovery.{name} must be a query using {token}")
+            elif (name in DISCOVERY_TIMESTAMPS) != ("timestamp(" in q):
+                out.append(f"observer.discovery.{name} must " + ("" if name in DISCOVERY_TIMESTAMPS else "not ") +
+                           "be a timestamp() query")
+            elif name in ("endpoints", "dispatched") and ENDPOINT_LABEL not in q:
+                out.append(f"observer.discovery.{name} must keep the {ENDPOINT_LABEL} label (by ({ENDPOINT_LABEL}))")
     if not (_int(ob["readiness_timeout_s"]) and 30 <= ob["readiness_timeout_s"] <= 1800):
         out.append("observer.readiness_timeout_s must be the bounded wait for new pods' metrics (30..1800 s)")
     if not (_int(ob["cpu_scrape_interval_s"]) and 5 <= ob["cpu_scrape_interval_s"] <= 60):
@@ -698,18 +742,20 @@ def render_fixture(con: Dict, cal: str, params: Dict, k: int) -> List[Dict]:
 
 def render_ingress(con: Dict, cal: str, params: Dict) -> List[Dict]:
     """The pinned calibration ingress (render_common's ingress shape) whose only upstreams are the two calibration
-    fixture variants (one route each)."""
+    fixture variants (one route each), preceded by its ServiceAccount, Role and RoleBinding (endpoints-rr routing)."""
     R = X.import_harness().render
     ns, nm = con["namespace"], names(cal)
     lab = labels(con, cal, "calibration-ingress")
     sel = {CAL_LABEL: cal, X.COMPONENT_LABEL: "calibration-ingress"}
+    token_volume, token_mount = R.ingress_token()
     dep = {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": nm["ingress"], "namespace": ns,
                                                                        "labels": lab},
            "spec": {"replicas": 1, "selector": {"matchLabels": sel}, "strategy": {"type": "Recreate"},
                     "template": {"metadata": {"labels": {**lab, **R.SIDECAR_FREE},
                                               "annotations": {"prometheus.io/scrape": "true",
                                                               "prometheus.io/port": "8080", **R.SIDECAR_FREE}},
-                                 "spec": {"automountServiceAccountToken": False, "securityContext": R._SECURITY,
+                                 "spec": {"serviceAccountName": nm["ingress"],
+                                          "automountServiceAccountToken": False, "securityContext": R._SECURITY,
                                           **_placement(params, "workload"),
                                           "containers": [{"name": "ingress", "image": con["images"]["fixture"],
                                                           "env": [{"name": "MODE", "value": "ingress"},
@@ -717,16 +763,19 @@ def render_ingress(con: Dict, cal: str, params: Dict) -> List[Dict]:
                                                                       f"{v}=http://{v}.{ns}.svc"
                                                                       for v in nm["variants"])},
                                                                   {"name": "TIMEOUT_SECONDS",
-                                                                   "value": str(REQUEST_TIMEOUT_S)}],
+                                                                   "value": str(REQUEST_TIMEOUT_S)},
+                                                                  *R.ingress_routing_env()],
                                                           "ports": [{"name": "http", "containerPort": 8080}],
                                                           "readinessProbe": {"httpGet": {"path": "/ready",
                                                                                          "port": "http"},
                                                                              "periodSeconds": 5},
                                                           "resources": _res(con["ingress"]),
-                                                          "securityContext": R._CONTAINER_SECURITY}]}}}}
+                                                          "securityContext": R._CONTAINER_SECURITY,
+                                                          "volumeMounts": [token_mount]}],
+                                          "volumes": [token_volume]}}}}
     svc = {"apiVersion": "v1", "kind": "Service", "metadata": {"name": nm["ingress"], "namespace": ns, "labels": lab},
            "spec": {"selector": sel, "ports": [{"name": "http", "port": 80, "targetPort": "http"}]}}
-    return [dep, svc]
+    return R.ingress_rbac(ns, nm["ingress"], lab) + [dep, svc]
 
 
 def render_objects(con: Dict, cal: str, params: Dict, script: str) -> List[Dict]:
@@ -751,6 +800,7 @@ def render_objects(con: Dict, cal: str, params: Dict, script: str) -> List[Dict]
                          "podMetricsEndpoints": [{"port": "http", "path": "/metrics",
                                                   "interval": f"{con['observer']['step_s']}s"}]}})
     R.audit_sidecar_free(objs)
+    R.audit_rbac(objs)
     return objs
 
 
@@ -975,6 +1025,11 @@ def query_range(fetch: Callable[[str], Dict], con: Dict, query: str, start: int,
     return rec
 
 
+def resolve_discovery(con: Dict, name: str, target: str = "", pods: str = "") -> str:
+    q = con["observer"]["discovery"][name]
+    return q.replace("__NAMESPACE__", con["namespace"]).replace("__TARGET__", target).replace("__PODS__", pods)
+
+
 def series(obs: Dict) -> Tuple[Optional[List[Tuple[int, float]]], str]:
     """The one series of a recorded range query, or (None, why)."""
     if not isinstance(obs, dict) or "response" not in obs:
@@ -1045,6 +1100,8 @@ def ingress_reading(fetch, con: Dict, cal: str, target: str, at: int) -> Dict:
                         for k in ("requests", "responses")}}
     out["up"] = query_range(fetch, con, resolve_query(con, target, "ingress_up", names(cal)["ingress_pods"]),
                             at - span, at)
+    if "discovery" in con["observer"]:
+        out["dispatched"] = query_range(fetch, con, resolve_discovery(con, "dispatched", target), at - span, at)
     return out
 
 
@@ -1309,6 +1366,95 @@ def idle_verdict(con: Dict, obs: Dict, readings: Dict) -> Tuple[str, Dict]:
     return "; ".join(dict.fromkeys(out)), detail
 
 
+def discovery_verdict(con: Dict, obs: Dict, ingress_pod: str, expected: List[str], start: int, end: int,
+                      live: bool = False) -> Tuple[List[str], Dict]:
+    """The ingress's endpoint discovery over [start, end] from recorded range queries (obs: synced, stale,
+    scrape_timestamp, endpoints): the ingress pod's newest scrape fresh at every evaluation (raw_freshness), synced 1
+    and stale 0 at every evaluation, and at every evaluation the CURRENT membership (endpoint series whose raw sample
+    is from that same scrape) exactly the expected fixture pods. live=True judges only the newest evaluation (the
+    live gate); otherwise every evaluation must be present (the measurement window). Returns (problems, detail)."""
+    step, out, detail = con["observer"]["step_s"], [], {}
+    why, fd = raw_freshness(con, obs.get("scrape_timestamp"), [ingress_pod], con["observer"]["pod_label"], start, end)
+    detail["scrape"] = fd
+    if why:
+        return [f"discovery metrics missing or old: {why}"], detail
+    by, _ = series_by_label(obs.get("scrape_timestamp") or {}, con["observer"]["pod_label"])
+    ref = {t: v for t, v in by[ingress_pod] if start - step <= t <= end}
+    times = sorted(ref)[-1:] if live else sorted(ref)
+    for name, want in (("synced", 1.0), ("stale", 0.0)):
+        g, why = series_by_label(obs.get(name) or {}, con["observer"]["pod_label"])
+        vals = dict((g or {}).get(ingress_pod) or [])
+        if g is None or set(g) != {ingress_pod}:
+            out.append(f"discovery {name}: not exactly one series for the ingress pod ({why or sorted(g or {})})")
+            continue
+        bad = [t for t in times if vals.get(t) != want]
+        detail[name] = {"evaluations": len(times), "not_" + ("synced" if want else "fresh"): len(bad)}
+        if bad:
+            out.append(f"discovery {name}: {'not 1 (never synced)' if want else 'the ingress reports stale discovery'}"
+                       f" at {len(bad)} of {len(times)} evaluations (first {_ts(bad[0])})")
+    eps, why = series_by_label(obs.get("endpoints") or {}, ENDPOINT_LABEL)
+    if eps is None:
+        return out + [f"discovery membership: {why}"], detail
+    exp, mism = sorted(expected), []
+    for t in times:
+        cur = sorted(k for k, pts in eps.items() if dict(pts).get(t) == ref[t])
+        if cur != exp:
+            mism.append({"at": t, "discovered": cur})
+    detail["membership"] = {"expected": exp, "evaluations": len(times), "mismatches": mism[:5]}
+    if mism:
+        out.append(f"discovery membership: the ingress routes to {mism[0]['discovered']} at {_ts(mism[0]['at'])}, "
+                   f"not exactly the fixture pods {exp} ({len(mism)} of {len(times)} evaluations)")
+    return out, detail
+
+
+def _last_by_label(obs: Dict, label: str, at: int, con: Dict) -> Tuple[Optional[Dict[str, float]], str]:
+    """Each series' newest value at or before `at` (fresh: within max_staleness_s), keyed by `label`."""
+    by, why = series_by_label(obs or {}, label)
+    if by is None:
+        return None, why
+    out = {}
+    for k, pts in by.items():
+        pts = [p for p in pts if p[0] <= at]
+        if not pts or at - pts[-1][0] > con["observer"]["max_staleness_s"]:
+            return None, f"{label} {k}: no fresh sample"
+        out[k] = pts[-1][1]
+    return out, ""
+
+
+def dispatch_counts(con: Dict, obs: Dict, expected: List[str], received: Optional[float]) -> Tuple[List[str], Dict]:
+    """Per-endpoint dispatch during the trial (after - before of c28_ingress_dispatched_total by endpoint_pod; a
+    counter that does not exist yet is 0): every arrival dispatched exactly once (sum = the ingress's received, no
+    retry or duplicate) and only to the trial's fixture pods. Balance is reported, never judged."""
+    side = {}
+    for s in ("before", "after"):
+        r = obs.get(f"ingress_{s}") or {}
+        v, why = _last_by_label(r.get("dispatched") or {}, ENDPOINT_LABEL, int(r.get("at") or 0), con)
+        if v is None:
+            return [f"per-endpoint dispatch {s} the trial: {why}"], {}
+        side[s] = v
+    by = {k: side["after"].get(k, 0.0) - side["before"].get(k, 0.0) for k in set(side["after"]) | set(side["before"])}
+    by = {k: v for k, v in by.items() if v != 0 or k in expected}
+    for k in expected:
+        by.setdefault(k, 0.0)
+    total = sum(by.values())
+    vals = [by[k] for k in sorted(expected)]
+    mean = total / len(vals) if vals else 0.0
+    detail = {"by_endpoint": dict(sorted(by.items())), "total": total,
+              "max_over_min": (max(vals) / min(vals)) if vals and min(vals) > 0 else None,
+              "max_share": (max(vals) / total) if total > 0 else None,
+              "cv": (math.sqrt(sum((v - mean) ** 2 for v in vals) / len(vals)) / mean) if mean > 0 else None}
+    out = []
+    if any(v < 0 for v in by.values()):
+        out.append("a per-endpoint dispatch counter went backwards (an ingress restart or reset)")
+    stray = sorted(k for k, v in by.items() if v > 0 and k not in expected)
+    if stray:
+        out.append(f"arrivals were dispatched to pods outside the trial's fixture pods: {stray}")
+    if received is not None and total != received:
+        out.append(f"per-endpoint dispatch {total:g} does not reconcile with the {received:g} arrivals the ingress "
+                   "received (each arrival must be dispatched exactly once)")
+    return out, detail
+
+
 def evaluate_trial(con: Dict, raw: Dict) -> Dict:
     """The verdict of one trial from its raw evidence alone (raw: trial meta, generator_pod, pods_begin, pods_end,
     observations). INCOMPLETE > LIMIT > FAIL > PASS; every criterion is reported separately. `delivery` says whether
@@ -1393,6 +1539,12 @@ def evaluate_trial(con: Dict, raw: Dict) -> Dict:
             limits.append(f"{dispatched - received:g} dispatched arrivals never reached the ingress (a network "
                           "limit; offered demand was censored)")
     crit["ingress"] = ing
+    if "discovery" in con["observer"]:              # v2: per-endpoint dispatch, recorded per trial
+        fx_names = sorted((p.get("metadata") or {}).get("name") for p in (raw.get("pods_begin") or {}).get(
+            t["variant"]) or [])
+        why_x, dx = dispatch_counts(con, obs, fx_names, ing.get("received"))
+        crit["dispatch"] = dx
+        incomplete += why_x
     window, why = measurement_window(con, kind, summary, started)
     if why and summary:
         incomplete.append(f"measurement window: {why}")
@@ -1482,6 +1634,17 @@ def evaluate_trial(con: Dict, raw: Dict) -> Dict:
             crit["raw_freshness"][source] = d
             if why_r:
                 incomplete.append(f"raw {source}: {why_r}")
+        if "discovery" in con["observer"]:          # v2: the ingress routed to exactly the fixture pods throughout
+            dw = obs.get("discovery_window") or {}
+            ing_pods = names(pb_.get("ingress"))
+            if any((dw.get(k) or {}).get("start") != window["start"] or (dw.get(k) or {}).get("end") != window["end"]
+                   for k in ("synced", "stale", "scrape_timestamp", "endpoints")) or len(ing_pods) != 1:
+                incomplete.append("discovery: not recorded over the measurement window for exactly one ingress pod")
+            else:
+                why_d, d = discovery_verdict(con, dw, ing_pods[0], names(pb_.get(t["variant"])), window["start"],
+                                             window["end"])
+                crit["discovery"] = d
+                incomplete += [f"discovery over the window: {w}" for w in why_d]
     if kind == "selection":
         idle_why, idle = idle_verdict(con, obs, readings)
         crit["idle"] = idle
@@ -2245,6 +2408,12 @@ OBJECT_DEFAULTS = {
                 "ipFamilies": ANY, "ipFamilyPolicy": "SingleStack", "internalTrafficPolicy": "Cluster",
                 "ports/*/protocol": "TCP"},
 }
+# The behaviour-bearing top-level fields of the ingress's ServiceAccount, Role and RoleBinding (they have no spec),
+# compared strictly like a spec; the only API default among them is a ServiceAccount subject's empty apiGroup.
+RBAC_KINDS = ("ServiceAccount", "Role", "RoleBinding")
+RBAC_FIELDS = ("automountServiceAccountToken", "secrets", "imagePullSecrets", "rules", "aggregationRule", "roleRef",
+               "subjects")
+RBAC_DEFAULTS = {"subjects/*/apiGroup": ""}
 # Labels the controllers add to the pods they create (never behaviour of the workload itself).
 POD_LABEL_DEFAULTS = ("pod-template-hash", "controller-uid", "job-name", "batch.kubernetes.io/controller-uid",
                       "batch.kubernetes.io/job-name")
@@ -2290,10 +2459,22 @@ def strict_diff(want, live, path: str, defaults: Dict, ignore: Tuple = ()) -> Li
     return [] if _scalar_eq(want, live) else [path]
 
 
+def _drop_mirrored_service_account(want: Dict, live: Dict, where: str = "") -> List[str]:
+    """The API server mirrors serviceAccountName into the deprecated serviceAccount field: when the rendering names a
+    ServiceAccount, the live mirror of exactly that name is removed before the comparison (POD_DEFAULTS allows only
+    "default"), and any other value is a difference."""
+    if "serviceAccountName" not in want or "serviceAccount" in want or "serviceAccount" not in live:
+        return []
+    if live.pop("serviceAccount") == want["serviceAccountName"]:
+        return []
+    return [f"{where}/serviceAccount (differs from the rendered serviceAccountName)"]
+
+
 def _pod_spec_diff(want: Dict, live: Dict) -> List[str]:
     """A pod spec against its rendering: the admission-added default tolerations removed (each once, exactly), every
-    other toleration exactly as rendered, then strict_diff under POD_DEFAULTS."""
+    other toleration exactly as rendered, the mirrored serviceAccount dropped, then strict_diff under POD_DEFAULTS."""
     live = copy.deepcopy(live)
+    mirror = _drop_mirrored_service_account(want, live)
     tol = list(live.get("tolerations") or [])
     for d in ADMISSION_TOLERATIONS:
         if d in tol and d not in (want.get("tolerations") or []):
@@ -2302,7 +2483,7 @@ def _pod_spec_diff(want: Dict, live: Dict) -> List[str]:
         live["tolerations"] = tol
     else:
         live.pop("tolerations", None)
-    return strict_diff(want, live, "", POD_DEFAULTS)
+    return mirror + strict_diff(want, live, "", POD_DEFAULTS)
 
 
 def pod_problems(where: str, tmpl: Dict, pod: Dict) -> List[str]:
@@ -2321,13 +2502,17 @@ def pod_problems(where: str, tmpl: Dict, pod: Dict) -> List[str]:
 
 def object_problems(kind: str, want: Dict, live: Dict, ignore: Tuple = ()) -> List[str]:
     """A live workload object against its rendering: labels (rendered ones equal), spec (strictly, OBJECT_DEFAULTS;
-    a pod template's tolerations with the admission defaults removed) and a ConfigMap's data exactly."""
+    a pod template's tolerations with the admission defaults removed, its mirrored serviceAccount dropped), a
+    ConfigMap's data exactly, and a ServiceAccount's, Role's or RoleBinding's RBAC_FIELDS strictly (absent in the
+    rendering means absent)."""
     diff = [f"/metadata/labels/{k}" for k, v in sorted((want["metadata"].get("labels") or {}).items())
             if (live["metadata"].get("labels") or {}).get(k) != v]
     if "spec" in want:
         ls = copy.deepcopy(live.get("spec") or {})
         tmpl = (ls.get("template") or {}).get("spec")
         if isinstance(tmpl, dict):
+            diff += _drop_mirrored_service_account((want["spec"].get("template") or {}).get("spec") or {}, tmpl,
+                                                   "/spec/template/spec")
             wt = ((want["spec"].get("template") or {}).get("spec") or {}).get("tolerations") or []
             tol = [t for t in tmpl.get("tolerations") or [] if not (t in ADMISSION_TOLERATIONS and t not in wt)]
             if tol or "tolerations" in ((want["spec"].get("template") or {}).get("spec") or {}):
@@ -2338,6 +2523,12 @@ def object_problems(kind: str, want: Dict, live: Dict, ignore: Tuple = ()) -> Li
         diff += strict_diff(want["spec"], ls, "/spec", defaults, ignore)
     if "data" in want:
         diff += [] if live.get("data") == want["data"] and not live.get("binaryData") else ["/data"]
+    if kind in RBAC_KINDS:
+        for k in RBAC_FIELDS:
+            if k in want:
+                diff += strict_diff(want[k], live.get(k, _MISSING), f"/{k}", RBAC_DEFAULTS)
+            elif k in live:
+                diff.append(f"/{k} (not in the reviewed rendering)")
     return diff
 
 
@@ -2409,10 +2600,36 @@ def live_raw(ctx: Context, source: str, expected: List[str], regex: str, label: 
     return f"raw {source}: {why}" if why else ""
 
 
+def discovery_problems(ctx: Context, role: Optional[str]) -> List[str]:
+    """The live discovery gate (contract v2): the ingress reports synced 1 and stale 0 from a fresh scrape, and (with
+    an active variant) its current READY-endpoint membership is exactly that variant's live fixture pods (the pods
+    this calibration owns through the UID chain, the identities the trial binds). Before load, await_observer polls
+    it until it holds (bounded: a timeout refuses the trial); during the measurement a violation stops the trial as
+    incomplete evidence; evaluate_trial re-checks every evaluation of the window from the recorded series."""
+    con, now = ctx.con, ctx.now()
+    span = 4 * con["observer"]["step_s"]
+    pods = owned_pods(ctx.kube, ctx.ns, ctx.own())
+    ing = sorted(p["metadata"]["name"] for p in pods.get("ingress", []))
+    if len(ing) != 1:
+        return [f"discovery: not exactly one live ingress pod ({ing})"]
+    target = ctx.nm["variants"][int(role[1:])] if role else ""
+    q = {k: query_range(ctx.fetch, con, resolve_discovery(con, k, target, ctx.nm["ingress_pods"]), now - span, now)
+         for k in ("synced", "stale", "scrape_timestamp")}
+    if role:
+        q["endpoints"] = query_range(ctx.fetch, con, resolve_discovery(con, "endpoints", target), now - span, now)
+        expected = sorted(p["metadata"]["name"] for p in pods.get(role, [])
+                          if not (p.get("metadata") or {}).get("deletionTimestamp"))
+    else:
+        q["endpoints"], expected = {"response": {"data": {"result": []}}}, []
+    why, _ = discovery_verdict(con, q, ing[0], expected, now - span, now, live=True)
+    return [f"observer: {w}" for w in why]
+
+
 def observer_problems(ctx: Context, role: Optional[str]) -> List[str]:
     """Proof that the queries see the intended LIVE pods with fresh data (not token substitution alone): ingress_up
     and (with an active variant) fixture_up select exactly the live pods, each series fresh and up; the ingress and
-    fixture CPU queries answer one fresh series."""
+    fixture CPU queries answer one fresh series; and (contract v2) the ingress's endpoint discovery is synced, not
+    stale and routes to exactly the live fixture pods (discovery_problems)."""
     con, step, now = ctx.con, ctx.con["observer"]["step_s"], ctx.now()
     span, out = 4 * step, []
     pods = owned_pods(ctx.kube, ctx.ns, ctx.own())
@@ -2435,6 +2652,8 @@ def observer_problems(ctx: Context, role: Optional[str]) -> List[str]:
             why = live_raw(ctx, source, live, regex)
             if why:
                 out.append(f"observer: {why}")
+    if "discovery" in con["observer"]:
+        out += discovery_problems(ctx, role)
     return out
 
 
@@ -2645,6 +2864,8 @@ def _role(o: Dict, nm: Dict) -> str:
         return f"w{nm['variants'].index(name)}"
     if kind in ("Deployment", "Service") and name == nm["ingress"]:
         return "ingress"
+    if kind in RBAC_KINDS and name == nm["ingress"]:
+        return "ingress-rbac"
     return {"ConfigMap": "script"}.get(kind, "scrape")
 
 
@@ -2797,6 +3018,11 @@ def run_trial(ctx: Context, meta: Dict, decision_sha: str, guard: Optional[Dict]
         for source, regex_ in raw_re.items():
             observations[f"raw_{source}"] = query_range(ctx.fetch, con, resolve_fresh(con, source, regex_),
                                                         window["start"], window["end"])
+        if "discovery" in con["observer"]:
+            observations["discovery_window"] = {
+                k: query_range(ctx.fetch, con, resolve_discovery(con, k, meta["target"], ctx.nm["ingress_pods"]),
+                               window["start"], window["end"])
+                for k in ("synced", "stale", "scrape_timestamp", "endpoints")}
     pods_end = _snapshot(owned_pods(ctx.kube, ctx.ns, ctx.own()))
     remove_jobs(ctx, [{"name": job["metadata"]["name"], "uid": juid}])
     files += [ctx.write(f"{tdir}/generator-pod.json", gsnap), ctx.write(f"{tdir}/observations.json", observations),
@@ -2888,7 +3114,7 @@ def cleanup(ctx: Context) -> List[str]:
         remove_jobs(ctx, [o for o in own if o["kind"] == "Job" and not o["deleted"]])
     except X.StagingError as e:
         return [f"generator cleanup: {e}"]        # never touch the fixture while arrivals may continue
-    order = {"scrape": 0, "ingress": 1, "w0": 2, "w1": 2, "script": 3}
+    order = {"scrape": 0, "ingress": 1, "w0": 2, "w1": 2, "script": 3, "ingress-rbac": 4}
     for o in sorted((o for o in own if o["kind"] != "Job" and not o["deleted"]),
                     key=lambda o: (order.get(o["role"], 9), o["kind"] != "Service", o["name"])):
         live = ctx.kube.get(o["kind"], o["name"], o["namespace"])

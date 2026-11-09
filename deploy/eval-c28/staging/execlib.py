@@ -9,7 +9,8 @@ legacy_allowlist names the legacy API group. This module only adds what part 2 n
   * Record: the loaded record with evidence_dir made absolute and the helper's own file paths resolved against the
     record's directory.
   * Kube: typed access by kind over the raw API (the extra kinds part 2 touches: ConfigMaps, ResourceQuotas,
-    ReplicaSets, PriorityClasses, StorageClasses, NetworkPolicies, scrape objects), with client-side filtering only
+    ReplicaSets, PriorityClasses, StorageClasses, NetworkPolicies, scrape objects, the ingress's ServiceAccount, Role and
+    RoleBinding), with client-side filtering only
     (nothing is selected server-side by label or name substring), update = read, mutate a copy, then replace with the
     read resourceVersion and UID (optimistic concurrency; a replaced or concurrently edited object is refused), and
     require_cluster before every create/replace/delete. Secrets are never read.
@@ -67,6 +68,10 @@ EXTRA_KINDS = {
     # kubernetes-cronhpa-controller's scheduled replica writer, and the Vertical Pod Autoscaler (a resource writer)
     "cronhpas": ("/apis/autoscaling.alibabacloud.com/v1beta1", "cronhorizontalpodautoscalers", True),
     "vpas": ("/apis/autoscaling.k8s.io/v1", "verticalpodautoscalers", True),
+    # the ingress's namespaced identity (endpoints-rr routing: get/list/watch EndpointSlices only)
+    "serviceaccounts": ("/api/v1", "serviceaccounts", True),
+    "roles": ("/apis/rbac.authorization.k8s.io/v1", "roles", True),
+    "rolebindings": ("/apis/rbac.authorization.k8s.io/v1", "rolebindings", True),
 }
 # Object kind -> table key.
 KIND_KEY = {
@@ -80,6 +85,7 @@ KIND_KEY = {
     "PriorityClass": "priorityclasses", "StorageClass": "storageclasses", "NetworkPolicy": "networkpolicies",
     "PodMonitor": "podmonitors", "VMPodScrape": "vmpodscrapes", "VolumeAttachment": "volumeattachments",
     "CronHorizontalPodAutoscaler": "cronhpas", "VerticalPodAutoscaler": "vpas",
+    "ServiceAccount": "serviceaccounts", "Role": "roles", "RoleBinding": "rolebindings",
 }
 if C.KINDS["pa-legacy"][0] != f"/apis/{legacy_allowlist.LEGACY_GROUP}/v1alpha1":     # pragma: no cover
     raise ImportError("common_records and legacy_allowlist disagree on the legacy API group")

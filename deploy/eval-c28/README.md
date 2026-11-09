@@ -6,10 +6,10 @@ evidence by itself. The executor uses it under a locked run-lock and the change 
 
 | Path | What it is |
 |---|---|
-| `fixture/` | The HTTP fixture: one binary in three modes. `server` is the workload: fixed CPU work, a fixed response, a bounded queue, a measured startup delay and `/ready`, `/metrics`. `ingress` counts offered demand per target before the target can reject it, with a 2 s timeout and no retries. `tcpproxy` is the evaluation-owned metrics and forecast routes, with scheduled outages. `Dockerfile` builds a static, non-root image. |
+| `fixture/` | The HTTP fixture: one binary in three modes. `server` is the workload: fixed CPU work, a fixed response, a bounded queue, a measured startup delay and `/ready`, `/metrics`. `ingress` counts offered demand per target before the target can reject it, with a 2 s timeout and no retries; with `ROUTING=endpoints-rr` (what every evaluation and calibration rendering sets) it sends each request to the next READY pod of the target in a strict per-request round-robin, discovered by a namespaced LIST + WATCH of the target Services' EndpointSlices (`endpoints.go`: per-pod dispatch counters, endpoint-set generation and ready count, discovery errors, last-sync age and a stale flag; a stale discovery keeps the last known set and says so), instead of through the Service ClusterIP, where the cluster balances per kept-alive connection. `ROUTING=service` (the binary's default, no API access needed) is the earlier behaviour. `tcpproxy` is the evaluation-owned metrics and forecast routes, with scheduled outages. `Dockerfile` builds a static, non-root image. |
 | `load/c28.js` | The k6 open-loop generator (ramping-arrival-rate, one request per iteration), driven by a plan from `python -m c28 plan`. |
 | `load/c28-calibrate.js` | The k6 script of the S5a capacity calibration (`staging/calibrate.py`): settle and measure scenarios at one constant arrival rate, per-scenario counts and latencies in the pod's termination message. |
-| `harness/c28/` | `render` (fixture, ingress, routes, quota and the five arms for both startup profiles, with an exclusive-writer audit, a sidecar-free audit and the residency budget), `schedule` (programs, k6 plans, fault timetable, the frozen session order), `runlock`, `collect` (hashed evidence bundle), `reduce` (per-window metrics), `score` (paired day-block bootstrap, Holm correction, the section 8 classification), `inject` (the guarded quota fault). `frozen.py` holds every value the manifest freezes. |
+| `harness/c28/` | `render` (fixture, ingress with its namespaced EndpointSlice-reader ServiceAccount/Role/RoleBinding, routes, quota and the five arms for both startup profiles, with an exclusive-writer audit, a sidecar-free audit, an RBAC least-privilege audit and the residency budget), `schedule` (programs, k6 plans, fault timetable, the frozen session order), `runlock`, `collect` (hashed evidence bundle), `reduce` (per-window metrics), `score` (paired day-block bootstrap, Holm correction, the section 8 classification), `inject` (the guarded quota fault). `frozen.py` holds every value the manifest freezes. |
 | `trace/` | PROPOSAL (draft contract v2, pending Codex review): the pre-declared selection and transformation of the Azure Functions 2019 trace (CC BY 4.0) for a separate public-trace demonstration. Not part of C2.8 scoring and no replacement for the manifest's ordinary warm-up. `azure_functions_2019.py select|prepare|plan|rules` (standard library, one file, run with `python -I`): each stage checks the reviewed sha256 of its input and records the hashes it was built from (source, selection, prepared, plan), validates schema, membership, length and transformation consistency, and never overwrites an output. `plan` emits exactly the `c28-k6-plan/v1` that `load/c28.js` accepts (kind `trace-demo`), one constant rate per trace minute, so each minute's scheduled count equals its intended count; `tests/c28js_loader.js` runs the real `c28.js` validator on it under node. Generated requests are "derived from per-minute invocation counts", never real arrival timestamps or real traffic. `k6_points.py` sums k6 counter samples into per-minute "metric-point buckets" anchored to a declared scenario start (emission/completion time, so not dispatch or ingress receipt times). It never runs a forecaster. |
 | `params/` | `kind-smoke.json` for the kind smoke. `prodcluster.template.json` lists what the run-lock must resolve; it cannot be rendered until every placeholder is replaced (the calibrated fixture resources and the W/S residency inputs included). |
 | `smoke/kind.sh` | The aspire kind-bed smoke, on its own cluster and kubeconfig only. `--render-only` renders and audits offline; `scripts/verify.sh` runs that mode. |
@@ -229,12 +229,12 @@ calibrate.py reduce --bundle evidence/calibrate/<id>      # offline: recompute c
 ```
 
 Manifest section 3's capacity calibration at fixed replicas with no autoscaler, never against a confirmation target.
-The record's `calibrate` section names a **calibration contract** (`c28-calibration-contract/v1`), frozen independently of
+The record's `calibrate` section names a **calibration contract** (`c28-calibration-contract/v2`; v1 contracts, which predate the endpoints-rr ingress and its discovery gate, are refused, while recorded v1 bundles still reduce), frozen independently of
 the unfinished params (only their reservation stage is read): cluster and node UIDs, namespace, source commit and the
 hash of `load/c28-calibrate.js`, the S1 `images.json` with its fixture and generator digests (taken from the record,
 never hardcoded), the candidate (CPU/memory requests and limits, max_inflight, max_queue, queue timeout, GOMAXPROCS,
 response size, startup delay), the work_iterations selection, ingress and generator resources, the observer (query API,
-the evaluation's 15 s scrape cadence, staleness, scrape kind, the exact queries), the criteria (the manifest's numbers,
+the evaluation's 15 s scrape cadence, staleness, scrape kind, the exact queries, and `observer.discovery`: the ingress's synced and stale gauges, its scrape timestamp, its endpoint membership and per-endpoint dispatch), the criteria (the manifest's numbers,
 which cannot be changed, the queue rule, the limit bounds, the 1.2 ceiling factor), the search bounds and limits
 (maximum trials, total deadline, seed, timeouts), the admission budget and the rollout guard. Placeholders, non-finite
 numbers and unknown fields are refused. The calibration ID is `c28cal-<10 hex of the contract digest>`: any change to
@@ -281,7 +281,14 @@ change during it stops the trial. Every expected source (each fixture pod, the i
 W and S for steal) must show a fresh raw sample (a `timestamp()` query per source, `observer.freshness`) at every
 evaluation (every step present, the newest raw sample judged against the gate time), so one pod's missing series cannot
 hide inside a sum. New pods get a bounded observer warm-up (`observer.readiness_timeout_s`, safety guards active)
-before any idle interval or load begins. Dispatched, received and answered arrivals reconcile
+before any idle interval or load begins. The ingress's endpoint discovery is a gate (contract v2): before any load it
+must report synced 1 and stale 0 from a fresh scrape and route to exactly the variant's live fixture pods (its
+`c28_ingress_endpoint` series from that same scrape), or the trial is refused when the warm-up times out; during the
+measurement a stale flag, a missing or old discovery metric, or a membership mismatch stops the trial as incomplete
+evidence, and the result re-checks every evaluation of the measurement window from the recorded series (a blip between
+two live polls invalidates it too). Each trial records the per-endpoint dispatch (`c28_ingress_dispatched_total` by
+`endpoint_pod`): every arrival dispatched exactly once (sum = received) and only to the trial's fixture pods, with the
+round-robin's spread reported, never judged. Dispatched, received and answered arrivals reconcile
 with tolerance 0/0. The idle CPU baseline is averaged only after a washout of the 60 s rate window plus one CPU scrape
 interval.
 

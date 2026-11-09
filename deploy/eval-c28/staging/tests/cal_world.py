@@ -57,6 +57,18 @@ FRESHNESS = {
     "steal": ('min by (nodename) (timestamp(node_cpu_seconds_total{job="node-exporter",mode="steal",cpu="0"}) '
               '* on (instance) group_left (nodename) (0 * node_uname_info{job="node-exporter",' + NODES_RE + '} + 1))'),
 }
+# The ingress's endpoint discovery (contract v2): its own gauges per ingress pod, the membership series' raw timestamps
+# and the per-endpoint dispatch counters (label endpoint_pod; the scrape's pod label names the ingress pod).
+DISC_SEL = 'namespace="__NAMESPACE__",pod=~"__PODS__"'
+DISCOVERY = {
+    "synced": "max by (pod) (c28_ingress_discovery_synced{" + DISC_SEL + "})",
+    "stale": "max by (pod) (c28_ingress_discovery_stale{" + DISC_SEL + "})",
+    "scrape_timestamp": "min by (pod) (timestamp(c28_ingress_discovery_stale{" + DISC_SEL + "}))",
+    "endpoints": ('max by (endpoint_pod) (timestamp(c28_ingress_endpoint{namespace="__NAMESPACE__",'
+                  'target="__TARGET__"}))'),
+    "dispatched": ('sum by (endpoint_pod) (c28_ingress_dispatched_total{namespace="__NAMESPACE__",'
+                   'target="__TARGET__"})'),
+}
 
 
 def contract(tmp, **over):
@@ -80,7 +92,7 @@ def contract(tmp, **over):
         "observer": {"query_api": "http://vmselect.monitoring.svc:8481/select/0/prometheus", "step_s": 15,
                      "max_staleness_s": 60, "scrape": "VMPodScrape", "queries": dict(QUERIES), "pods": [],
                      "pod_label": "pod", "freshness": dict(FRESHNESS), "cpu_scrape_interval_s": 30,
-                     "readiness_timeout_s": 300},
+                     "readiness_timeout_s": 300, "discovery": dict(DISCOVERY)},
         "stops": {"steal_query": STEAL, "node_label": "nodename", "steal_percent": 5, "steal_bins": 5},
         "criteria": {"p95_ms": 200, "p99_ms": 500, "max_failure_fraction": 0.001, "max_dropped_arrivals": 0,
                      "linearity_min": 0.90, "ceiling_factor": 1.2,
@@ -141,6 +153,17 @@ class World:
         self.windows = []             # [{target, start, end, rate_rps, wi, ok}]
         self.hooks = []
         self.linger = False           # generator pods survive their Job's deletion (failed cleanup)
+        # the ingress's endpoint discovery: stale from this time on (None: never); synced only from this time on;
+        # fixture pods the ingress does not route to (hidden) or extra endpoints it routes to; the discovery metrics
+        # absent altogether; arrivals dispatched (per target, per fixture pod) and a dispatch shortfall
+        self.disc_stale_from = None
+        self.disc_synced_from = None
+        self.disc_hidden, self.disc_extra = set(), set()
+        self.disc_extra_window = None     # (start, end): the extra endpoints exist only then (a blip between polls)
+        self.disc_missing = False
+        self.dispatched = {}
+        self.rr_next = {}
+        self.dispatch_short = 0
         api.on_poll.append(self.poll)
 
     # --- the cluster ---
@@ -236,6 +259,7 @@ class World:
         spec.setdefault("dnsPolicy", "ClusterFirst")
         spec.setdefault("schedulerName", "default-scheduler")
         spec.setdefault("serviceAccountName", "default")
+        spec.setdefault("serviceAccount", spec["serviceAccountName"])     # the deprecated mirror the API server sets
         spec.setdefault("enableServiceLinks", True)
         for c in spec.get("containers", []):
             c.setdefault("terminationMessagePath", "/dev/termination-log")
@@ -278,6 +302,15 @@ class World:
             c = self.counters.setdefault(target, {"req": 0, "resp": 0})
             c["req"] += total + (self.extra_arrivals if s == "measure" else 0)
             c["resp"] += total + (self.extra_arrivals if s == "measure" else 0)
+            # strict round-robin over the variant's pods, as the endpoints-rr ingress dispatches
+            arrivals = int(total + (self.extra_arrivals if s == "measure" else 0)) - \
+                (self.dispatch_short if s == "measure" else 0)
+            fx = self._variant_pods(target)
+            d = self.dispatched.setdefault(target, {})
+            off = self.rr_next.get(target, 0) % len(fx)           # the rotation continues across scenarios
+            for i, name in enumerate(fx):
+                d[name] = d.get(name, 0) + arrivals // len(fx) + (1 if (i - off) % len(fx) < arrivals % len(fx) else 0)
+            self.rr_next[target] = off + arrivals
         summary = {"schema": K.K6_SCHEMA, "trial": env["C28CAL_TRIAL"], "target": target, "rate_per_min": rate,
                    "settle_s": settle, "measure_s": measure, "seed": int(env["C28CAL_SEED"]), "scenarios": scen}
         ws = started + self.init_delay + settle
@@ -308,6 +341,8 @@ class World:
             return {"status": "success", "data": {"result": [
                 {"metric": {"nodename": n}, "values": [[t, str(self.steal.get(n, 1.0))] for t in g60]}
                 for n in ("worker-w", "worker-s")]}}
+        if "c28_ingress_discovery" in query or "c28_ingress_endpoint{" in query or "c28_ingress_dispatched" in query:
+            return self._discovery(query, grid, target, pods)
         if "timestamp(" in query:
             return self._raw(query, grid, pods)
         self._q_pods = pods
@@ -383,6 +418,47 @@ class World:
                                                      for t in grid if label == "nodename" or self._born_ok(n, t)]}
                    for n in names if n not in self.raw_missing]
         return {"status": "success", "data": {"result": [x for x in series_ if x["values"]]}}
+
+    def _variant_pods(self, target):
+        return sorted(o["metadata"]["name"] for (k, _, n), o in self.api.objects.items()
+                      if k == "pods" and n.startswith(f"{target}-") and "-ing-" not in n and "-gen-" not in n)
+
+    def _discovery(self, query, grid, target, pods):
+        """The ingress's discovery metrics: per live ingress pod synced/stale (and the raw timestamp of its scrape);
+        per endpoint the membership series' raw timestamps (the same scrape) and the dispatch counters."""
+        if self.disc_missing:
+            return {"status": "success", "data": {"result": []}}
+        ing = [n for (k, _, n) in self.api.objects if k == "pods" and "-ing-" in n]
+        if "c28_ingress_dispatched" in query:
+            d = self.dispatched.get(target) or {}
+            g = [t for t in grid if self._alive(lambda n: "-ing-" in n, t)]
+            return {"status": "success", "data": {"result": [
+                {"metric": {"endpoint_pod": n}, "values": [[t, str(v)] for t in g]} for n, v in sorted(d.items())
+                if g]}}
+        if "c28_ingress_endpoint{" in query:
+            names = (set(self._variant_pods(target)) - self.disc_hidden) | self.disc_extra
+            return {"status": "success", "data": {"result": [x for x in (
+                {"metric": {"endpoint_pod": n}, "values": [[t, str(t - self.raw_age)] for t in grid
+                                                           if self._alive(lambda m: "-ing-" in m, t) and
+                                                           (self._extra_at(n, t) if n in self.disc_extra
+                                                            else self._born_ok(n, t))]}
+                for n in sorted(names)) if x["values"]]}}
+        timestamp = "timestamp(" in query
+        synced = "discovery_synced" in query
+
+        def value(t):
+            if timestamp:
+                return t - self.raw_age
+            if synced:
+                return 0 if self.disc_synced_from is not None and t < self.disc_synced_from else 1
+            return 1 if self.disc_stale_from is not None and t >= self.disc_stale_from else 0
+        return {"status": "success", "data": {"result": [x for x in (
+            {"metric": {"pod": n}, "values": [[t, str(value(t))] for t in grid if self._born_ok(n, t)]}
+            for n in sorted(ing) if re.fullmatch(pods, n)) if x["values"]]}}
+
+    def _extra_at(self, name, t):
+        w = self.disc_extra_window
+        return w is None or w[0] <= t <= w[1]
 
     def _born_ok(self, name, t):
         """A pod has samples only from its creation plus the first scrape delay on (never before it existed)."""

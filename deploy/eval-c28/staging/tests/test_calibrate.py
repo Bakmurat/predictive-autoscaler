@@ -568,6 +568,8 @@ def test_plan_is_read_only_and_authorizes_bounded_objects(cal, api):
     assert kinds == sorted([("Deployment", ctx.nm["variants"][0]), ("Service", ctx.nm["variants"][0]),
                             ("Deployment", ctx.nm["variants"][1]), ("Service", ctx.nm["variants"][1]),
                             ("Deployment", ctx.nm["ingress"]), ("Service", ctx.nm["ingress"]),
+                            ("ServiceAccount", ctx.nm["ingress"]), ("Role", ctx.nm["ingress"]),
+                            ("RoleBinding", ctx.nm["ingress"]),
                             ("ConfigMap", ctx.nm["script"]), ("VMPodScrape", ctx.cal)])
     assert p["search"]["max_rate_per_min"] == 30 * 4 * 60 and p["work_selection"]["values"] == [600, 900]
     assert p["admission"]["workload"]["footprint"][0] == {"what": "fixture", "pods": 6, "cpu": "50m",
@@ -642,7 +644,7 @@ def test_fixture_keeps_the_arms_container_shape_and_is_sidecar_free(cal):
     job = K.generator_job(ctx.con, ctx.cal, ctx.params, K.trial_meta(ctx, 7, "search", "w0", 2, 1200, 1))
     R.audit_sidecar_free([job])
     assert job["spec"]["activeDeadlineSeconds"] == 300 + 900 + 120 and X.RUN_LABEL not in job["metadata"]["labels"]
-    ing = next(o for o in objs if o["metadata"]["name"] == ctx.nm["ingress"])
+    ing = next(o for o in objs if o["metadata"]["name"] == ctx.nm["ingress"] and o["kind"] == "Deployment")
     ups = {e["name"]: e["value"] for e in ing["spec"]["template"]["spec"]["containers"][0]["env"]}["UPSTREAMS"]
     assert ups == ",".join(f"{v}=http://{v}.demo.svc" for v in ctx.nm["variants"])
     assert not set(ctx.nm["variants"]) & {R.target_name(a_, p_) for a_ in X.import_harness().frozen.ARMS
@@ -935,6 +937,14 @@ def test_certificate_states_the_pending_experiment_admission(cal):
     assert any("maximum-arrival admission stays PENDING" in s for s in cert(ctx)["scope_limits"])
 
 
+def _bump_dispatch(raw, delta):
+    """Change the after-reading of one of THIS trial's pods (earlier pods' series are in the reading too)."""
+    pods = {p["metadata"]["name"] for p in raw["pods_begin"][raw["trial"]["variant"]]}
+    res = raw["observations"]["ingress_after"]["dispatched"]["response"]["data"]["result"]
+    for v in next(x for x in res if x["metric"]["endpoint_pod"] in pods)["values"]:
+        v[1] = str(float(v[1]) + delta)
+
+
 def test_k6_boundary_iteration_is_accepted_but_never_a_missing_dispatch(cal):
     """The kind smoke showed real k6 starting ONE iteration beyond rate x duration (300 -> 301, 1000 -> 1001)."""
     ctx = cal()
@@ -950,6 +960,7 @@ def test_k6_boundary_iteration_is_accepted_but_never_a_missing_dispatch(cal):
         for v in r["observations"]["ingress_after"]["requests"]["response"]["data"]["result"][0]["values"] + \
                 r["observations"]["ingress_after"]["responses"]["response"]["data"]["result"][0]["values"]:
             v[1] = str(float(v[1]) + extra)
+        _bump_dispatch(r, extra)                        # the extra arrival was dispatched to a pod as well
         assert K.evaluate_trial(ctx.con, r)["verdict"] == verdict, extra
     assert K.offered_ok(300, 300) and K.offered_ok(300, 301) and not K.offered_ok(300, 299) \
         and not K.offered_ok(300, 302)
@@ -1052,6 +1063,7 @@ def test_r3_a_settling_drop_is_censored(cal):
     for side in ("requests", "responses"):
         for v in raw["observations"]["ingress_after"][side]["response"]["data"]["result"][0]["values"]:
             v[1] = str(float(v[1]) - 1)
+    _bump_dispatch(raw, -1)                            # the dropped arrival was never dispatched to a pod either
     r = K.evaluate_trial(ctx.con, raw)
     assert r["verdict"] == "LIMIT" and r["delivery"] == "censored" and any(w.startswith("settle:") for w in r["limits"])
 
@@ -1709,3 +1721,282 @@ def test_w5_pre_job_stop_reports_a_foreign_job_of_that_name(cal, api, monkeypatc
     stopped = [e["data"] for e in ctx.entries() if e["event"] == "trial-stopped"]
     assert out["verdict"] == "NOT READY" and "that this calibration did not create" in stopped[0]["reason"]
     assert ("jobs", "demo", K.job_name(ctx.cal, 3)) in api.objects               # never touched
+
+
+# --- the endpoints-rr ingress: per-request round-robin, least-privilege RBAC --------------------------------------------
+
+def _ingress_pod_and_template(ctx):
+    dep = next(o for o in K.render_ingress(ctx.con, ctx.cal, ctx.params) if o["kind"] == "Deployment")
+    tmpl = dep["spec"]["template"]
+    pod = {"metadata": {"name": "p", "labels": {**tmpl["metadata"]["labels"], "pod-template-hash": "abc"},
+                        "annotations": dict(tmpl["metadata"]["annotations"])},
+           "spec": CW.World._admit({**copy.deepcopy(tmpl["spec"]), "nodeName": "worker-w"})}
+    return dep, tmpl, pod
+
+
+def test_the_calibration_ingress_routes_per_request_with_least_privilege(cal):
+    ctx = cal()
+    R = X.import_harness().render
+    objs = K.render_objects(ctx.con, ctx.cal, ctx.params, "script")
+    order = [(o["kind"], o["metadata"]["name"]) for o in objs]
+    ing = ctx.nm["ingress"]
+    # the identity exists before the ingress Deployment that runs as it
+    assert order.index(("RoleBinding", ing)) < order.index(("Deployment", ing))
+    rbac = {o["kind"]: o for o in objs if o["kind"] in K.RBAC_KINDS}
+    assert set(rbac) == {"ServiceAccount", "Role", "RoleBinding"}
+    assert all(o["metadata"]["name"] == ing and o["metadata"]["namespace"] == "demo" for o in rbac.values())
+    assert rbac["Role"]["rules"] == [{"apiGroups": ["discovery.k8s.io"], "resources": ["endpointslices"],
+                                      "verbs": ["get", "list", "watch"]}]
+    assert rbac["RoleBinding"]["subjects"] == [{"kind": "ServiceAccount", "name": ing, "namespace": "demo"}]
+    assert rbac["RoleBinding"]["roleRef"] == {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": ing}
+    assert rbac["ServiceAccount"]["automountServiceAccountToken"] is False
+    assert not [o for o in objs if o["kind"] in ("ClusterRole", "ClusterRoleBinding")]
+    assert {K._role(o, ctx.nm) for o in rbac.values()} == {"ingress-rbac"}
+    dep = next(o for o in objs if o["kind"] == "Deployment" and o["metadata"]["name"] == ing)
+    spec = dep["spec"]["template"]["spec"]
+    env = {e["name"]: e["value"] for e in spec["containers"][0]["env"]}
+    assert env["ROUTING"] == "endpoints-rr" and env["DISCOVERY_RESYNC_SECONDS"] == "30" and \
+        env["DISCOVERY_STALE_SECONDS"] == "90"
+    assert spec["serviceAccountName"] == ing and spec["automountServiceAccountToken"] is False
+    vol, mount = R.ingress_token()
+    assert spec["volumes"] == [vol] and spec["containers"][0]["volumeMounts"] == [mount]
+    # the evaluation ingress has the same shape (render_common), names apart
+    common = R.render_common(PF.base_params())
+    cdep = next(o for o in common if o["kind"] == "Deployment" and o["metadata"]["name"] == "c28-ingress")
+    cspec = cdep["spec"]["template"]["spec"]
+    assert set(cspec) == set(spec) and cspec["volumes"] == spec["volumes"]
+    cenv = {e["name"]: e["value"] for e in cspec["containers"][0]["env"]}
+    assert set(cenv) == set(env) and all(cenv[k] == env[k] for k, _ in R.INGRESS_ROUTING_ENV)
+    # a broader grant is refused at rendering
+    broad = copy.deepcopy(objs)
+    next(o for o in broad if o["kind"] == "Role")["rules"][0]["verbs"].append("create")
+    with pytest.raises(R.ParamsError, match="RBAC"):
+        R.audit_rbac(broad)
+
+
+def test_rbac_objects_are_compared_strictly(cal):
+    ctx = cal()
+    rbac = {o["kind"]: o for o in K.render_ingress(ctx.con, ctx.cal, ctx.params) if o["kind"] in K.RBAC_KINDS}
+    for kind, want in rbac.items():
+        assert K.object_problems(kind, want, copy.deepcopy(want)) == [], kind
+    live = copy.deepcopy(rbac["RoleBinding"])
+    live["subjects"][0]["apiGroup"] = ""                                    # the API default for a ServiceAccount
+    assert K.object_problems("RoleBinding", rbac["RoleBinding"], live) == []
+    cases = [("Role", lambda o: o["rules"][0]["verbs"].append("delete")),
+             ("Role", lambda o: o["rules"].append({"apiGroups": [""], "resources": ["secrets"], "verbs": ["get"]})),
+             ("Role", lambda o: o["rules"][0]["resources"].append("endpoints")),
+             ("RoleBinding", lambda o: o["subjects"].append({"kind": "ServiceAccount", "name": "default",
+                                                            "namespace": "demo"})),
+             ("RoleBinding", lambda o: o["subjects"][0].update(apiGroup="rbac.authorization.k8s.io")),
+             ("RoleBinding", lambda o: o["roleRef"].update(kind="ClusterRole")),
+             ("ServiceAccount", lambda o: o.update(automountServiceAccountToken=True)),
+             ("ServiceAccount", lambda o: o.update(imagePullSecrets=[{"name": "x"}])),
+             ("ServiceAccount", lambda o: o.pop("automountServiceAccountToken"))]
+    for kind, mutate in cases:
+        live = copy.deepcopy(rbac[kind])
+        mutate(live)
+        assert K.object_problems(kind, rbac[kind], live), (kind, live)
+
+
+def test_the_ingress_pod_runs_as_its_service_account_and_nothing_else(cal):
+    ctx = cal()
+    dep, tmpl, pod = _ingress_pod_and_template(ctx)
+    assert pod["spec"]["serviceAccount"] == ctx.nm["ingress"]               # the API server's deprecated mirror
+    assert K.pod_problems("p", tmpl, pod) == []
+    live = copy.deepcopy(dep)
+    live["spec"]["template"]["spec"]["serviceAccount"] = ctx.nm["ingress"]
+    assert K.object_problems("Deployment", dep, live) == []
+    live["spec"]["template"]["spec"]["serviceAccount"] = "default"
+    assert K.object_problems("Deployment", dep, live)
+    for mutate in (lambda s: s.update(serviceAccount="default"),
+                   lambda s: s.update(serviceAccountName="default", serviceAccount="default"),
+                   lambda s: s.update(automountServiceAccountToken=True),
+                   lambda s: s["volumes"].append({"name": "kube-api-access-x7k2p", "projected": {"sources": [
+                       {"serviceAccountToken": {"path": "token", "expirationSeconds": 3607}}]}}),
+                   lambda s: s["volumes"][0]["projected"]["sources"][0]["serviceAccountToken"].update(audience="x"),
+                   lambda s: s["containers"][0]["env"].pop()):
+        bad = copy.deepcopy(pod)
+        mutate(bad["spec"])
+        assert K.pod_problems("p", tmpl, bad), mutate
+    # fixture pods still run as default, without a token
+    ftmpl, fpod = _fixture_pod_and_template(ctx, None)
+    assert fpod["spec"]["serviceAccount"] == "default" and K.pod_problems("p", ftmpl, fpod) == []
+
+
+def test_cleanup_removes_the_ingress_identity_after_the_ingress(cal, api):
+    ctx = cal()
+    assert run(ctx)["verdict"] == "READY"
+    deletes = [(e["data"]["kind"], e["data"]["name"]) for e in ctx.entries()
+               if e["event"].startswith("intent") and e["data"].get("op") == "delete"
+               and (e["data"].get("context") or {}).get("phase") == "cleanup"]
+    ing = ctx.nm["ingress"]
+    assert deletes.index(("Deployment", ing)) < min(deletes.index((k, ing)) for k in K.RBAC_KINDS)
+    assert not [k for (k, _, n) in api.objects if n == ing]
+
+
+# --- Codex review of PR #51, finding 3: the ingress's endpoint discovery is a gate ---------------------------------------
+
+def _no_load(ctx):
+    return not any(e["event"] == "trial-begin" for e in ctx.entries())
+
+
+def test_v1_contracts_are_refused_and_discovery_queries_are_validated(cal):
+    ctx = cal()
+    path = K.record_contract_path(ctx.record)
+    con = json.load(open(path))
+    old = copy.deepcopy(con)
+    old["schema"] = "c28-calibration-contract/v1"
+    old["observer"].pop("discovery")
+    open(path, "w").write(json.dumps(old))
+    with pytest.raises(X.StagingError, match="predates the endpoints-rr ingress"):
+        K.load_contract(ctx.record, ctx.params)
+    cases = [(lambda o: o.pop("discovery"), "observer must be exactly"),
+             (lambda o: o["discovery"].pop("dispatched"), "observer.discovery must be exactly"),
+             (lambda o: o["discovery"].update(endpoints='max by (endpoint_pod) (c28_ingress_endpoint{target="__TARGET__"})'),
+              "must be a timestamp"),
+             (lambda o: o["discovery"].update(stale="timestamp(c28_ingress_discovery_stale{pod=~\"__PODS__\"})"),
+              "must not be a timestamp"),
+             (lambda o: o["discovery"].update(dispatched='sum(c28_ingress_dispatched_total{target="__TARGET__"})'),
+              "endpoint_pod"),
+             (lambda o: o["discovery"].update(synced="max(c28_ingress_discovery_synced)"), "using __PODS__")]
+    for mutate, msg in cases:
+        bad = copy.deepcopy(con)
+        mutate(bad["observer"])
+        open(path, "w").write(json.dumps(bad))
+        with pytest.raises(X.StagingError, match=msg):
+            K.load_contract(ctx.record, ctx.params)
+
+
+def test_stale_discovery_before_load_refuses_the_trial(cal, api):
+    ctx = cal()
+    ctx.world.disc_stale_from = CW.T0                 # the ingress reports stale discovery throughout
+    out = run(ctx)
+    nr = [e["data"] for e in ctx.entries() if e["event"] == "observer-not-ready"]
+    assert out["verdict"] == "NOT READY" and cert(ctx)["halted"]["category"] == "incomplete"
+    assert nr and any("stale discovery" in p for p in nr[0]["problems"]) and _no_load(ctx)
+    assert live_calibration_objects(api, ctx.cal) == []
+
+
+def test_never_synced_discovery_refuses_the_trial(cal):
+    ctx = cal()
+    ctx.world.disc_synced_from = CW.T0 + 10 ** 8
+    run(ctx)
+    nr = [e["data"] for e in ctx.entries() if e["event"] == "observer-not-ready"]
+    assert nr and any("never synced" in p for p in nr[0]["problems"]) and _no_load(ctx)
+
+
+def test_missing_discovery_metrics_refuse_the_trial(cal):
+    ctx = cal()
+    ctx.world.disc_missing = True                     # e.g. a ROUTING=service image: no discovery series at all
+    out = run(ctx)
+    nr = [e["data"] for e in ctx.entries() if e["event"] == "observer-not-ready"]
+    assert out["verdict"] == "NOT READY" and _no_load(ctx)
+    assert nr and any("discovery metrics missing or old" in p for p in nr[0]["problems"])
+
+
+def test_a_membership_mismatch_before_load_refuses_the_trial(cal):
+    ctx = cal()
+
+    def hide(world, api_):                           # the ingress does not route to one of the live fixture pods
+        pods = world._variant_pods(ctx.nm["variants"][0])
+        if pods:
+            world.disc_hidden = {pods[0]}
+    ctx.world.hooks.append(hide)
+    run(ctx)
+    nr = [e["data"] for e in ctx.entries() if e["event"] == "observer-not-ready"]
+    assert nr and any("discovery membership" in p for p in nr[0]["problems"]) and _no_load(ctx)
+
+
+def test_stale_discovery_mid_measurement_stops_the_trial(cal, api):
+    ctx = cal()
+
+    def go_stale(world, api_):
+        if world.disc_stale_from is None and any(k == "jobs" and n.endswith("t003") for (k, _, n) in api_.objects):
+            world.disc_stale_from = world.clock.now() + 30
+    ctx.world.hooks.append(go_stale)
+    out = run(ctx)
+    stopped = [e["data"] for e in ctx.entries() if e["event"] == "trial-stopped"]
+    assert out["verdict"] == "NOT READY" and cert(ctx)["halted"]["category"] == "incomplete"
+    assert stopped and stopped[0]["category"] == "incomplete" and "stale discovery" in stopped[0]["reason"]
+    assert stopped[0]["trial"]["id"] == "t003" and live_calibration_objects(api, ctx.cal) == []
+
+
+def test_an_extra_endpoint_mid_measurement_stops_the_trial(cal):
+    ctx = cal()
+
+    def rogue(world, api_):
+        if not world.disc_extra and any(k == "jobs" and n.endswith("t003") for (k, _, n) in api_.objects):
+            world.disc_extra = {"someone-elses-pod"}
+    ctx.world.hooks.append(rogue)
+    run(ctx)
+    stopped = [e["data"] for e in ctx.entries() if e["event"] == "trial-stopped"]
+    assert stopped and stopped[0]["category"] == "incomplete" and "discovery membership" in stopped[0]["reason"]
+
+
+def test_a_membership_blip_between_polls_invalidates_the_trial_from_the_window(cal):
+    """poll_s is 300 s: a blip between two live gates is caught by evaluate_trial over the recorded window."""
+    ctx = cal()
+
+    def blip(world, api_):
+        if world.disc_extra_window is None and any(k == "jobs" and n.endswith("t003") for (k, _, n) in api_.objects):
+            now = world.clock.now()
+            # inside the measurement window, between the live polls (the Job starts now; settle 60 s)
+            world.disc_extra, world.disc_extra_window = {"someone-elses-pod"}, (now + 400, now + 430)
+    ctx.world.hooks.append(blip)
+    run(ctx)
+    r = json.load(open(os.path.join(ctx.dir, "trials", "t003", "result.json")))
+    assert r["verdict"] == "INCOMPLETE" and any(w.startswith("discovery over the window: discovery membership")
+                                                for w in r["incomplete"]), r["incomplete"]
+    assert r["criteria"]["discovery"]["membership"]["mismatches"]
+    assert K.reduce_bundle(ctx.dir)["reproduced"]
+
+
+def test_per_endpoint_dispatch_is_recorded_per_trial_and_reconciled(cal):
+    ctx = cal()
+    out = run(ctx)
+    assert out["verdict"] == "READY"
+    seen = 0
+    for t in sorted(os.listdir(os.path.join(ctx.dir, "trials"))):
+        r = json.load(open(os.path.join(ctx.dir, "trials", t, "result.json")))
+        pods = sorted(p["metadata"]["name"] for p in json.load(open(os.path.join(
+            ctx.dir, "trials", t, "pods-begin.json")))[r["variant"]])
+        d = r["criteria"]["dispatch"]
+        assert sorted(d["by_endpoint"]) == pods and len(pods) == r["n"]
+        assert d["total"] == r["criteria"]["ingress"]["received"] and max(d["by_endpoint"].values()) - min(
+            d["by_endpoint"].values()) <= 1                       # the round-robin's evenness, measurable
+        assert r["criteria"]["discovery"]["membership"]["expected"] == pods
+        assert not r["criteria"]["discovery"]["membership"]["mismatches"]
+        seen += 1
+    assert seen > 3 and K.reduce_bundle(ctx.dir)["reproduced"]
+
+
+def test_a_dispatch_that_does_not_reconcile_is_incomplete(cal):
+    ctx = cal()
+    ctx.world.dispatch_short = 5                       # arrivals received but never dispatched to a pod
+    out = run(ctx)
+    r = json.load(open(os.path.join(ctx.dir, "trials", "t001", "result.json")))
+    assert out["verdict"] == "NOT READY" and r["verdict"] == "INCOMPLETE"
+    assert any("does not reconcile" in w for w in r["incomplete"])
+
+
+def test_discovery_verdict_is_pure_and_judges_every_evaluation():
+    con = CW.contract("/nonexistent")
+    step = con["observer"]["step_s"]
+    grid = list(range(1000, 1000 + 10 * step, step))
+
+    def rng(metric, fn, label="pod", names=("ing-1",)):
+        return {"start": grid[0], "end": grid[-1], "response": {"data": {"result": [
+            {"metric": {label: n}, "values": [[t, str(fn(n, t))] for t in grid]} for n in names]}}}
+    obs = {"synced": rng("s", lambda n, t: 1), "stale": rng("s", lambda n, t: 0),
+           "scrape_timestamp": rng("s", lambda n, t: t - 5),
+           "endpoints": rng("e", lambda n, t: t - 5, "endpoint_pod", ("fx-a", "fx-b"))}
+    why, d = K.discovery_verdict(con, obs, "ing-1", ["fx-a", "fx-b"], grid[0], grid[-1])
+    assert why == [] and d["membership"]["evaluations"] == 10
+    # an endpoint series left from an OLDER scrape is not current membership (a pod that left the set)
+    old = dict(obs, endpoints=rng("e", lambda n, t: t - 5 if n == "fx-a" or t < grid[5] else grid[4] - 5,
+                                  "endpoint_pod", ("fx-a", "fx-b")))
+    why, d = K.discovery_verdict(con, old, "ing-1", ["fx-a", "fx-b"], grid[0], grid[-1])
+    assert why and len(d["membership"]["mismatches"]) == 5
+    # the live gate looks at the newest evaluation only
+    assert K.discovery_verdict(con, old, "ing-1", ["fx-a"], grid[0], grid[-1], live=True)[0] == []
+

@@ -5,6 +5,9 @@
 //	                dependency; /ready becomes ready only after the startup delay; /healthz; /metrics.
 //	MODE=ingress    the independent ingress before the targets: counts every arrival per target (offered demand) before
 //	                forwarding, so a target that rejects or drops work cannot hide demand; 2 s timeout, no retries.
+//	                ROUTING=service (the default) forwards to the target Service (the cluster balances per connection);
+//	                ROUTING=endpoints-rr sends every request to the next READY pod of the target in a strict
+//	                round-robin, discovered from EndpointSlices (endpoints.go).
 //	MODE=tcpproxy   an evaluation-owned TCP route (the metrics query route or the forecast API route) that refuses and
 //	                cuts connections during scheduled outage windows; TLS passes through untouched.
 //
@@ -12,7 +15,7 @@
 // every decision uses the process clock, so ConfigMap propagation delay never moves a fault boundary. Updating the file
 // does not change the pod template (no trust reset is caused by the fault mechanism itself).
 //
-// Standard library only.
+// Standard library only (endpoints-rr speaks to the in-cluster API over net/http; no client-go).
 package main
 
 import (
@@ -346,6 +349,9 @@ func (s *server) mux() *http.ServeMux {
 type ingress struct {
 	upstreams map[string]string // target -> base URL
 	client    *http.Client
+	timeout   time.Duration
+	routing   string    // routingService or routingEndpointsRR
+	rr        *rrRouter // endpoints-rr only
 	now       func() time.Time
 	arrivals  counterVec
 	responses counterVec
@@ -375,10 +381,20 @@ func parseUpstreams(spec string) (map[string]string, error) {
 
 func newIngress(upstreams map[string]string, timeout time.Duration, now func() time.Time) *ingress {
 	tr := &http.Transport{MaxIdleConnsPerHost: 1024, IdleConnTimeout: 90 * time.Second}
-	return &ingress{upstreams: upstreams, now: now, latency: map[string]*histogram{},
-		client: &http.Client{Timeout: timeout, Transport: tr,
-			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
+	return &ingress{upstreams: upstreams, now: now, latency: map[string]*histogram{}, timeout: timeout,
+		routing: routingService, client: &http.Client{Timeout: timeout, Transport: tr, CheckRedirect: noRedirect}}
 }
+
+func noRedirect(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
+// withEndpointsRR switches the ingress to per-request round-robin over the router's ready endpoints.
+func (g *ingress) withEndpointsRR(r *rrRouter) *ingress {
+	g.routing, g.rr = routingEndpointsRR, r
+	return g
+}
+
+// ready: always in service mode; in endpoints-rr mode only after the first successful EndpointSlice LIST.
+func (g *ingress) ready() bool { return g.rr == nil || g.rr.synced() }
 
 func (g *ingress) hist(target string) *histogram {
 	g.mu.Lock()
@@ -398,6 +414,10 @@ func (g *ingress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/healthz" || r.URL.Path == "/ready" {
+		if r.URL.Path == "/ready" && !g.ready() {
+			http.Error(w, "endpoint discovery has not synced", http.StatusServiceUnavailable)
+			return
+		}
 		_, _ = io.WriteString(w, "ok\n")
 		return
 	}
@@ -419,13 +439,32 @@ func (g *ingress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		g.hist(target + "|" + outcome).observe(g.now().Sub(t0).Seconds())
 	}()
-	req, err := http.NewRequestWithContext(r.Context(), r.Method, base+"/"+path, nil)
+	client, dest := g.client, base+"/"+path
+	var ep *endpoint
+	if g.rr != nil {
+		t := g.rr.targets[target]
+		if ep = t.pick(); ep == nil {
+			code = http.StatusServiceUnavailable
+			g.rr.noReady.inc(label("target", target))
+			http.Error(w, "no ready endpoint", code)
+			return
+		}
+		g.rr.dispatched.inc(dispatchLabel(target, ep.pod)) // counted at dispatch, before the pod can fail
+		client = &http.Client{Timeout: g.timeout, Transport: ep.tr, CheckRedirect: noRedirect}
+		dest = "http://" + ep.key + "/" + path
+	}
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, dest, nil)
 	if err != nil {
 		code = http.StatusBadGateway
 		http.Error(w, err.Error(), code)
 		return
 	}
-	resp, err := g.client.Do(req)
+	if ep != nil {
+		defer ep.release() // runs last: after the body is read and closed
+		req.Host = g.rr.targets[target].host
+		req.Body, req.GetBody, req.ContentLength = noReplayBody{}, nil, 0 // never replayed by the Transport
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		code = http.StatusBadGateway
 		var ne net.Error
@@ -445,6 +484,7 @@ func (g *ingress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (g *ingress) metrics(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	fmt.Fprintf(w, "# TYPE c28_ingress_routing gauge\nc28_ingress_routing{%s} 1\n", label("mode", g.routing))
 	fmt.Fprintln(w, "# TYPE c28_ingress_requests_total counter")
 	g.arrivals.write(w, "c28_ingress_requests_total")
 	fmt.Fprintln(w, "# TYPE c28_ingress_responses_total counter")
@@ -460,6 +500,9 @@ func (g *ingress) metrics(w http.ResponseWriter) {
 	for _, key := range targets {
 		t, outcome, _ := strings.Cut(key, "|")
 		g.hist(key).write(w, "c28_ingress_duration_seconds", label("target", t)+","+label("outcome", outcome))
+	}
+	if g.rr != nil {
+		g.rr.writeMetrics(w)
 	}
 }
 
@@ -582,6 +625,13 @@ func envSeconds(name string, def float64) time.Duration {
 	return time.Duration(def * float64(time.Second))
 }
 
+func envString(name, def string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return def
+}
+
 func main() {
 	addr := ":" + strconv.Itoa(envInt("PORT", 8080))
 	switch mode := os.Getenv("MODE"); mode {
@@ -601,6 +651,27 @@ func main() {
 			log.Fatal(err)
 		}
 		g := newIngress(ups, envSeconds("TIMEOUT_SECONDS", 2), time.Now)
+		switch routing := envString("ROUTING", routingService); routing {
+		case routingService:
+		case routingEndpointsRR:
+			api, ns, err := inClusterAPI()
+			if err != nil {
+				log.Fatal(err)
+			}
+			resync, stale := envSeconds("DISCOVERY_RESYNC_SECONDS", 30), envSeconds("DISCOVERY_STALE_SECONDS", 90)
+			if resync < time.Second || stale <= resync {
+				log.Fatal("DISCOVERY_RESYNC_SECONDS must be at least 1 and DISCOVERY_STALE_SECONDS larger than it")
+			}
+			r, err := newRRRouter(ups, ns, stale, time.Now)
+			if err != nil {
+				log.Fatal(err)
+			}
+			g.withEndpointsRR(r)
+			go r.run(context.Background(), api, resync)
+		default:
+			log.Fatalf("unknown ROUTING %q (service or endpoints-rr)", routing)
+		}
+		log.Printf("ingress: routing %s", g.routing)
 		log.Fatal((&http.Server{Addr: addr, Handler: g, ReadHeaderTimeout: 5 * time.Second}).ListenAndServe())
 	case "tcpproxy":
 		p := &tcpProxy{upstream: os.Getenv("UPSTREAM"), now: time.Now, conns: map[net.Conn]struct{}{},
