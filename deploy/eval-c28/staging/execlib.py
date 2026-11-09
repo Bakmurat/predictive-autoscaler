@@ -85,6 +85,41 @@ if C.KINDS["pa-legacy"][0] != f"/apis/{legacy_allowlist.LEGACY_GROUP}/v1alpha1":
     raise ImportError("common_records and legacy_allowlist disagree on the legacy API group")
 
 
+def validate_discovery(doc) -> Dict[str, List[str]]:
+    """{group: [versions]} (plus the core group) from a raw /apis document, refusing anything but a well-formed
+    APIGroupList: a JSON object (kind APIGroupList when a kind is given) whose groups is a list; every group an object
+    with a non-empty string name, no name twice, and versions a non-empty list of objects each with a non-empty string
+    version or groupVersion."""
+    bad = lambda why: C.ApiError(f"API discovery (/apis) returned a malformed document: {why}")  # noqa: E731
+    if not isinstance(doc, dict):
+        raise bad("not a JSON object (or no answer)")
+    if "kind" in doc and doc["kind"] != "APIGroupList":
+        raise bad(f"kind {doc['kind']!r} is not APIGroupList")
+    groups = doc.get("groups")
+    if not isinstance(groups, list):
+        raise bad("groups is not a list")
+    out: Dict[str, List[str]] = {"": ["v1"]}
+    for g in groups:
+        if not isinstance(g, dict) or not isinstance(g.get("name"), str) or not g["name"]:
+            raise bad("a group without a non-empty string name")
+        if g["name"] in out:
+            raise bad(f"group {g['name']!r} listed twice")
+        versions = g.get("versions")
+        if not isinstance(versions, list) or not versions:
+            raise bad(f"group {g['name']!r} has no versions list")
+        vs = []
+        for v in versions:
+            name = v.get("version") if isinstance(v, dict) else None
+            gv = v.get("groupVersion") if isinstance(v, dict) else None
+            if not ((isinstance(name, str) and name) or (isinstance(gv, str) and gv)) or \
+                    (name is not None and not (isinstance(name, str) and name)) or \
+                    (gv is not None and not (isinstance(gv, str) and gv)):
+                raise bad(f"group {g['name']!r} has a version without a non-empty version/groupVersion")
+            vs.append(name or gv.rsplit("/", 1)[-1])
+        out[g["name"]] = sorted(vs)
+    return out
+
+
 def table(key: str):
     return C.KINDS.get(key) or EXTRA_KINDS[key]
 
@@ -269,7 +304,7 @@ def reconcile(kube: "Kube", d: Dict, record: Optional["Record"] = None) -> Dict:
     live = kube.get(d["kind"], d["name"], d["namespace"])
     if d["op"] == "create":
         if live is None:
-            return {"observed": "not-done", "why": "absent"}
+            return {"observed": "not-done", "state": "not-applied", "why": "absent"}
         if (live["metadata"].get("annotations") or {}).get(INTENT_ANNOTATION) == d["mark"]:
             return {"observed": "done", "uid": live["metadata"]["uid"]}
         return {"observed": "unresolved", "why": "an object of that name exists without this intent's annotation"}
@@ -354,15 +389,10 @@ class Kube:
 
     def discover_fresh(self) -> Dict[str, List[str]]:
         """UNCACHED API discovery (GET /apis now; served() keeps its per-instance cache). Only a successful, well-formed
-        answer is returned: a failed request (auth, timeout, not found) or a malformed document raises ApiError, so an
-        absent group in the result is proven absent by discovery, never inferred from a failure."""
-        try:
-            groups = C.discover_groups(self.api)
-        except (KeyError, TypeError, AttributeError) as e:
-            raise C.ApiError(f"API discovery (/apis) returned a malformed document ({type(e).__name__})") from e
-        if not all(isinstance(k, str) and isinstance(v, list) for k, v in groups.items()):
-            raise C.ApiError("API discovery (/apis) returned a malformed document")
-        return groups
+        answer is returned; the RAW document is validated before anything is normalized (validate_discovery). A failed
+        request (auth, timeout, not found) or a malformed document raises ApiError, so an absent group in the result
+        is proven absent by discovery, never inferred from a failure."""
+        return validate_discovery(self.api.get("/apis"))
 
     def get(self, kind: str, name: str, namespace: Optional[str] = None) -> Optional[Dict]:
         o = self.api.get(path(kind, namespace, name))
@@ -371,8 +401,13 @@ class Kube:
         return o
 
     def list(self, kind: str, namespace: Optional[str] = None, labels: Optional[Dict[str, str]] = None,
-             node_name: str = "") -> List[Dict]:
+             node_name: str = "", strict: bool = False) -> List[Dict]:
+        """Client-side filtered list. strict: the API must answer with a real list (a JSON object carrying an items
+        array); a missing answer (KubectlApi returns None for 404) or a malformed one raises instead of reading as an
+        empty list. The writer censuses use strict; other callers keep the lenient default."""
         doc = self.api.get(path(kind, namespace))
+        if strict and not (isinstance(doc, dict) and isinstance(doc.get("items"), list)):
+            raise C.ApiError(f"list {kind}: no list response from a served API (missing endpoint or malformed answer)")
         items = (doc or {}).get("items", [])
         if not isinstance(items, list):
             raise C.ApiError(f"list {kind}: not a list")
@@ -387,13 +422,18 @@ class Kube:
             out.append(o)
         return out
 
-    def create(self, obj: Dict) -> Dict:
+    def create(self, obj: Dict, pre_write: Optional[Callable[[str], None]] = None) -> Dict:
+        """Create through the journal. pre_write(mark), when given, runs INSIDE the journalled operation (after the
+        intent, immediately before the request) and may raise to refuse: nothing is sent, the intent stays unresolved
+        and recover finds the object absent (not applied)."""
         j = self._journal()
         m = obj["metadata"]
         C.require_cluster(self.api, self.cluster_uid)
         result: Dict = {}
 
         def do(mark):
+            if pre_write is not None:
+                pre_write(mark)
             body = copy.deepcopy(obj)
             body["metadata"].setdefault("annotations", {})[INTENT_ANNOTATION] = mark
             result["out"] = self.api.create(path(obj["kind"], m.get("namespace")), body)
@@ -710,14 +750,14 @@ def writer_inventory(kube: Kube, namespace: str, names: Iterable[str], groups: O
     served = (lambda kind: group_of(kind) in groups) if groups is not None else kube.served
     if served("ScaledObject"):
         scaled = {(o["metadata"].get("namespace"), o["metadata"]["name"]): o["metadata"].get("uid")
-                  for o in kube.list("ScaledObject", None)}
+                  for o in kube.list("ScaledObject", None, strict=True)}
     for kind in WRITER_KINDS:
         if not served(kind):
             if kind in OPTIONAL_WRITERS or absent_ok:
                 continue
             raise StagingError(f"the {group_of(kind)} API is not served: the writer inventory cannot be complete")
         cross = kind in ("PredictiveAutoscaler", "LegacyPredictiveAutoscaler")
-        for o in kube.list(kind, None):
+        for o in kube.list(kind, None, strict=True):         # a served writer API must answer with a real list
             as_writer = dict(o, kind="PredictiveAutoscaler" if cross else kind)
             targets = _cronhpa_targets(o) if kind == "CronHorizontalPodAutoscaler" else \
                 c28.render._writer_targets(as_writer)
@@ -758,7 +798,7 @@ def resource_writer_inventory(kube: Kube, namespace: str, names: Iterable[str],
     served = (lambda kind: group_of(kind) in groups) if groups is not None else kube.served
     if not served("VerticalPodAutoscaler"):
         return found
-    for o in kube.list("VerticalPodAutoscaler", None):
+    for o in kube.list("VerticalPodAutoscaler", None, strict=True):
         spec, m = o.get("spec") or {}, o.get("metadata") or {}
         ref = spec.get("targetRef") or {}
         if m.get("namespace") != namespace or (ref.get("kind") or "") != "Deployment" or ref.get("name") not in names:

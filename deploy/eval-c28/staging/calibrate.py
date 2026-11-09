@@ -2106,14 +2106,17 @@ def writer_apis(kube: X.Kube) -> Tuple[Dict[str, str], Dict]:
             for k in X.WRITER_KINDS + X.RESOURCE_WRITER_KINDS}, groups
 
 
-def writer_problems(ctx: Context) -> List[str]:
-    """No writer of a fixture variant or the ingress, from FRESH discovery at every call: served writer APIs are listed
-    strictly (a listing failure refuses); an unserved group counts only as API discovery-proven absent. Once a plan is
-    bound (apply), any change of that availability (an absent API appearing, a served one disappearing) is a stop."""
+def writer_census(ctx: Context) -> Dict:
+    """ONE writer census from FRESH discovery: {"problems", "writer_apis", "resource_writers", "ok"}. Served writer
+    APIs are listed strictly (a missing or malformed list response refuses); an unserved group counts only as API
+    discovery-proven absent; a failed or malformed discovery refuses and records writer_apis {"discovery": "failed"}.
+    Once a plan is bound (apply), any change of the availability (an absent API appearing, a served one disappearing)
+    is a problem. The plan uses one census for both its validation and its recorded evidence."""
     try:
         apis, groups = writer_apis(ctx.kube)
     except C.StagingError as e:
-        return [f"writer census: API discovery failed ({e}): absence is never assumed"]
+        return {"ok": False, "writer_apis": {"discovery": "failed"}, "resource_writers": {},
+                "problems": [f"writer census: API discovery failed ({e}): absence is never assumed"]}
     out = []
     bound = getattr(ctx, "writer_apis_bound", None)
     if bound is not None and apis != bound:
@@ -2125,15 +2128,34 @@ def writer_problems(ctx: Context) -> List[str]:
         inv = X.writer_inventory(ctx.kube, ctx.ns, targets, groups=groups, absent_ok=True)
         vpas = X.resource_writer_inventory(ctx.kube, ctx.ns, targets, groups=groups)
     except C.StagingError as e:
-        return out + [f"writer census: listing a served writer API failed ({e})"]
+        return {"ok": False, "writer_apis": apis, "resource_writers": {},
+                "problems": out + [f"writer census: listing a served writer API failed ({e})"]}
     for name, vs in sorted(vpas.items()):           # an "Off" VPA writes nothing; any other mode rewrites resources
         writing = [f"{X.ident_str(v)}#{v['uid']} (updateMode {v['update_mode']})" for v in vs
                    if v["update_mode"] != "Off"]
         if writing:
             out.append(f"{name}: VerticalPodAutoscaler resource writer(s) {writing}: only updateMode Off is allowed "
                        "during the calibration")
-    return out + [f"{name}: replica writer(s) {[X.ident_str(w) + '#' + str(w['uid']) for w in ws]}: the calibration "
-                  "runs at fixed replicas with no writer" for name, ws in sorted(inv.items()) if ws]
+    out += [f"{name}: replica writer(s) {[X.ident_str(w) + '#' + str(w['uid']) for w in ws]}: the calibration runs "
+            "at fixed replicas with no writer" for name, ws in sorted(inv.items()) if ws]
+    return {"ok": True, "writer_apis": apis, "resource_writers": vpas, "problems": out}
+
+
+def writer_problems(ctx: Context) -> List[str]:
+    """The problems of one fresh writer census (writer_census)."""
+    return writer_census(ctx)["problems"]
+
+
+def _census_pre_write(ctx: Context, what: str) -> Callable[[str], None]:
+    """A pre_write hook for a journalled create: a fresh writer census immediately before the request, inside the
+    operation; a refusal is recorded as create-write not-submitted (nothing was sent) and raises."""
+    def check(mark: str) -> None:
+        why = writer_problems(ctx)
+        if why:
+            X.receipt(ctx.record, HELPER, "create-write", {"calibration": ctx.cal, "mark": mark, "what": what,
+                                                            "result": "not-submitted", "why": "; ".join(why)[:300]})
+            raise X.StagingError(f"pre-write check refused creating {what}: {'; '.join(why)}")
+    return check
 
 
 def ownership_problems(ctx: Context) -> List[str]:
@@ -2463,7 +2485,8 @@ def plan(ctx: Context) -> Dict:
         n = ctx.kube.get("Node", want["name"])
         if n is None or n["metadata"].get("uid") != want["uid"]:
             problems.append(f"{role} node {want['name']} is missing or replaced (UID differs from the contract)")
-    problems += writer_problems(ctx) + node_problems(ctx) + steal_problems(ctx) + rollout_problems(ctx) + \
+    census = writer_census(ctx)                       # ONE census: validation and recorded evidence alike
+    problems += census["problems"] + node_problems(ctx) + steal_problems(ctx) + rollout_problems(ctx) + \
         activity_problems(ctx) + reservation_problems(ctx)
     adm, adm_problems = admission(ctx)
     problems += adm_problems
@@ -2476,11 +2499,9 @@ def plan(ctx: Context) -> Dict:
         problems.append("the total deadline leaves no room for one plateau")
     rates = {str(n): dict(zip(("min", "max", "initial"), bounds(ctx.con, n)))
              for n in ctx.con["search"]["replica_counts"]}
-    try:
-        apis, groups = writer_apis(ctx.kube)
-        recorded = X.resource_writer_inventory(ctx.kube, ctx.ns, ctx.nm["variants"] + [ctx.nm["ingress"]], groups)
-    except C.StagingError:
-        apis, recorded = {"discovery": "failed"}, {}   # writer_problems already refuses the plan
+    apis, recorded = census["writer_apis"], census["resource_writers"]
+    if not census["ok"] and not census["problems"]:        # pragma: no cover - a failed census always explains itself
+        problems.append("writer census: incomplete")
     return X.new_plan(HELPER, ctx.record, [{"op": "create", "kind": o["kind"], "name": o["metadata"]["name"],
                                             "sha256": X.json_digest(o)} for o in objs],
                       calibration_id=ctx.cal, contract_sha256=ctx.sha, contract=ctx.con,
@@ -2706,9 +2727,15 @@ def run_trial(ctx: Context, meta: Dict, decision_sha: str, guard: Optional[Dict]
                                 "guard_sha256": X.json_digest(guard), "files": files})
     wp = writer_problems(ctx)                    # fresh discovery immediately before the load write
     if wp:
-        stop_trial(ctx, meta, "", "before the generator Job: " + "; ".join(wp), "stopped", files)
+        # No Job was created. stop_trial with an empty UID deletes nothing; its pod proof covers only this
+        # calibration's OWN generator Jobs, so it does not show that no foreign Job of this name exists: check that
+        # name explicitly and report what is there.
+        foreign = ctx.kube.get("Job", job["metadata"]["name"], ctx.ns)
+        note = "" if foreign is None else (f"; a Job named {job['metadata']['name']} exists (UID "
+                                           f"{foreign['metadata'].get('uid')}) that this calibration did not create")
+        stop_trial(ctx, meta, "", "before the generator Job: " + "; ".join(wp) + note, "stopped", files)
     ctx.kube.journal.context = {"calibration": ctx.cal, "phase": "trial", "trial": trial, "role": "generator"}
-    created = ctx.kube.create(job)
+    created = ctx.kube.create(job, pre_write=_census_pre_write(ctx, f"Job/{job['metadata']['name']}"))
     juid = created["metadata"]["uid"]
     hard = ctx.now() + job["spec"]["activeDeadlineSeconds"] + 120
     gen_re = f"{job['metadata']['name']}-[a-z0-9]+"
@@ -2968,9 +2995,13 @@ def apply(ctx: Context, reviewed: Dict, reviewed_digest: str) -> Dict:
             with open(record_contract_path(ctx.record), "rb") as fh:
                 C.write_once(os.path.join(ctx.dir, "contract.json"), fh.read())
             for o in render_objects(ctx.con, ctx.cal, ctx.params, _load_script()):
+                what = f"{o['kind']}/{o['metadata']['name']}"
+                why = writer_problems(ctx)               # before the intent: a refusal leaves nothing to recover
+                if why:
+                    raise X.StagingError(f"the writer census refused creating {what}: {'; '.join(why)}")
                 ctx.write(f"objects/{o['kind']}-{o['metadata']['name']}.json", o)
                 ctx.kube.journal.context = {"calibration": ctx.cal, "phase": "create", "role": _role(o, ctx.nm)}
-                ctx.kube.create(o)
+                ctx.kube.create(o, pre_write=_census_pre_write(ctx, what))       # and again inside the operation
             ing = _variant(ctx, "ingress")
             _wait(ctx, "the calibration ingress did not become ready",
                   lambda: converged(ctx, ing["name"], ing["uid"], 1), ctx.con["search"]["converge_timeout_s"])
