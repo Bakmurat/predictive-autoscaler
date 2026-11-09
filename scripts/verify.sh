@@ -90,6 +90,9 @@ if [ "$run_py" = 1 ]; then
   # The C2.8 prod staging helpers (deploy/eval-c28/staging), offline against fake API fixtures.
   ( cd deploy/eval-c28/staging && KUBECONFIG=/dev/null "$PYTHON" -m pytest -q -p no:cacheprovider tests ) 2>&1 | tee -a "$LOG"; rc=${PIPESTATUS[0]}
   status_line "c28 staging" "$rc" | tee -a "$LOG"; [ "$rc" -eq 0 ] || overall=1
+  # The C2.8 public-trace demonstration's selection/transformation (deploy/eval-c28/trace), on synthetic inputs only.
+  ( cd deploy/eval-c28/trace && KUBECONFIG=/dev/null "$PYTHON" -m pytest -q -p no:cacheprovider tests ) 2>&1 | tee -a "$LOG"; rc=${PIPESTATUS[0]}
+  status_line "c28 trace" "$rc" | tee -a "$LOG"; [ "$rc" -eq 0 ] || overall=1
   PYTHON="$PYTHON" deploy/eval-c28/smoke/kind.sh --render-only 2>&1 | tee -a "$LOG"; rc=${PIPESTATUS[0]}
   status_line "c28 render-only smoke" "$rc" | tee -a "$LOG"; [ "$rc" -eq 0 ] || overall=1
   # The operator's forecast contract v2 fixtures must be what ml-engine/forecasting/contracts.py generates now.
