@@ -64,6 +64,9 @@ EXTRA_KINDS = {
     "podmonitors": ("/apis/monitoring.coreos.com/v1", "podmonitors", True),
     "vmpodscrapes": ("/apis/operator.victoriametrics.com/v1beta1", "vmpodscrapes", True),
     "volumeattachments": ("/apis/storage.k8s.io/v1", "volumeattachments", False),
+    # kubernetes-cronhpa-controller's scheduled replica writer, and the Vertical Pod Autoscaler (a resource writer)
+    "cronhpas": ("/apis/autoscaling.alibabacloud.com/v1beta1", "cronhorizontalpodautoscalers", True),
+    "vpas": ("/apis/autoscaling.k8s.io/v1", "verticalpodautoscalers", True),
 }
 # Object kind -> table key.
 KIND_KEY = {
@@ -76,9 +79,45 @@ KIND_KEY = {
     "ConfigMap": "configmaps", "ResourceQuota": "resourcequotas", "ReplicaSet": "replicasets",
     "PriorityClass": "priorityclasses", "StorageClass": "storageclasses", "NetworkPolicy": "networkpolicies",
     "PodMonitor": "podmonitors", "VMPodScrape": "vmpodscrapes", "VolumeAttachment": "volumeattachments",
+    "CronHorizontalPodAutoscaler": "cronhpas", "VerticalPodAutoscaler": "vpas",
 }
 if C.KINDS["pa-legacy"][0] != f"/apis/{legacy_allowlist.LEGACY_GROUP}/v1alpha1":     # pragma: no cover
     raise ImportError("common_records and legacy_allowlist disagree on the legacy API group")
+
+
+def validate_discovery(doc) -> Dict[str, List[str]]:
+    """{group: [versions]} (plus the core group) from a raw /apis document, refusing anything but a well-formed
+    APIGroupList: a JSON object (kind APIGroupList when a kind is given) whose groups is a list; every group an object
+    with a non-empty string name, no name twice, and versions a non-empty list of objects each with a non-empty string
+    version or groupVersion."""
+    bad = lambda why: C.ApiError(f"API discovery (/apis) returned a malformed document: {why}")  # noqa: E731
+    if not isinstance(doc, dict):
+        raise bad("not a JSON object (or no answer)")
+    if "kind" in doc and doc["kind"] != "APIGroupList":
+        raise bad(f"kind {doc['kind']!r} is not APIGroupList")
+    groups = doc.get("groups")
+    if not isinstance(groups, list):
+        raise bad("groups is not a list")
+    out: Dict[str, List[str]] = {"": ["v1"]}
+    for g in groups:
+        if not isinstance(g, dict) or not isinstance(g.get("name"), str) or not g["name"]:
+            raise bad("a group without a non-empty string name")
+        if g["name"] in out:
+            raise bad(f"group {g['name']!r} listed twice")
+        versions = g.get("versions")
+        if not isinstance(versions, list) or not versions:
+            raise bad(f"group {g['name']!r} has no versions list")
+        vs = []
+        for v in versions:
+            name = v.get("version") if isinstance(v, dict) else None
+            gv = v.get("groupVersion") if isinstance(v, dict) else None
+            if not ((isinstance(name, str) and name) or (isinstance(gv, str) and gv)) or \
+                    (name is not None and not (isinstance(name, str) and name)) or \
+                    (gv is not None and not (isinstance(gv, str) and gv)):
+                raise bad(f"group {g['name']!r} has a version without a non-empty version/groupVersion")
+            vs.append(name or gv.rsplit("/", 1)[-1])
+        out[g["name"]] = sorted(vs)
+    return out
 
 
 def table(key: str):
@@ -265,7 +304,7 @@ def reconcile(kube: "Kube", d: Dict, record: Optional["Record"] = None) -> Dict:
     live = kube.get(d["kind"], d["name"], d["namespace"])
     if d["op"] == "create":
         if live is None:
-            return {"observed": "not-done", "why": "absent"}
+            return {"observed": "not-done", "state": "not-applied", "why": "absent"}
         if (live["metadata"].get("annotations") or {}).get(INTENT_ANNOTATION) == d["mark"]:
             return {"observed": "done", "uid": live["metadata"]["uid"]}
         return {"observed": "unresolved", "why": "an object of that name exists without this intent's annotation"}
@@ -348,6 +387,13 @@ class Kube:
             self._groups = C.discover_groups(self.api)
         return group_of(kind) in self._groups
 
+    def discover_fresh(self) -> Dict[str, List[str]]:
+        """UNCACHED API discovery (GET /apis now; served() keeps its per-instance cache). Only a successful, well-formed
+        answer is returned; the RAW document is validated before anything is normalized (validate_discovery). A failed
+        request (auth, timeout, not found) or a malformed document raises ApiError, so an absent group in the result
+        is proven absent by discovery, never inferred from a failure."""
+        return validate_discovery(self.api.get("/apis"))
+
     def get(self, kind: str, name: str, namespace: Optional[str] = None) -> Optional[Dict]:
         o = self.api.get(path(kind, namespace, name))
         if o is not None:
@@ -355,8 +401,13 @@ class Kube:
         return o
 
     def list(self, kind: str, namespace: Optional[str] = None, labels: Optional[Dict[str, str]] = None,
-             node_name: str = "") -> List[Dict]:
+             node_name: str = "", strict: bool = False) -> List[Dict]:
+        """Client-side filtered list. strict: the API must answer with a real list (a JSON object carrying an items
+        array); a missing answer (KubectlApi returns None for 404) or a malformed one raises instead of reading as an
+        empty list. The writer censuses use strict; other callers keep the lenient default."""
         doc = self.api.get(path(kind, namespace))
+        if strict and not (isinstance(doc, dict) and isinstance(doc.get("items"), list)):
+            raise C.ApiError(f"list {kind}: no list response from a served API (missing endpoint or malformed answer)")
         items = (doc or {}).get("items", [])
         if not isinstance(items, list):
             raise C.ApiError(f"list {kind}: not a list")
@@ -371,13 +422,18 @@ class Kube:
             out.append(o)
         return out
 
-    def create(self, obj: Dict) -> Dict:
+    def create(self, obj: Dict, pre_write: Optional[Callable[[str], None]] = None) -> Dict:
+        """Create through the journal. pre_write(mark), when given, runs INSIDE the journalled operation (after the
+        intent, immediately before the request) and may raise to refuse: nothing is sent, the intent stays unresolved
+        and recover finds the object absent (not applied)."""
         j = self._journal()
         m = obj["metadata"]
         C.require_cluster(self.api, self.cluster_uid)
         result: Dict = {}
 
         def do(mark):
+            if pre_write is not None:
+                pre_write(mark)
             body = copy.deepcopy(obj)
             body["metadata"].setdefault("annotations", {})[INTENT_ANNOTATION] = mark
             result["out"] = self.api.create(path(obj["kind"], m.get("namespace")), body)
@@ -660,8 +716,11 @@ def injection_problems(kube: "Kube", params: Dict, owner_uids: Optional[set] = N
     return c28.render.unexpected_injection(pods)
 
 
-WRITER_KINDS = ("HorizontalPodAutoscaler", "ScaledObject", "PredictiveAutoscaler", "LegacyPredictiveAutoscaler")
-OPTIONAL_WRITERS = ("ScaledObject", "LegacyPredictiveAutoscaler")
+WRITER_KINDS = ("HorizontalPodAutoscaler", "ScaledObject", "PredictiveAutoscaler", "LegacyPredictiveAutoscaler",
+                "CronHorizontalPodAutoscaler")
+OPTIONAL_WRITERS = ("ScaledObject", "LegacyPredictiveAutoscaler", "CronHorizontalPodAutoscaler")
+RESOURCE_WRITER_KINDS = ("VerticalPodAutoscaler",)
+VPA_DEFAULT_MODE = "Auto"          # the VPA API's default updateMode when spec.updatePolicy omits it
 
 
 def ident(kind: str, obj: Dict) -> Dict:
@@ -673,28 +732,36 @@ def ident_str(i: Dict) -> str:
     return f"{i['kind']}/{i['namespace']}/{i['name']}"
 
 
-def writer_inventory(kube: Kube, namespace: str, names: Iterable[str]) -> Dict[str, List[Dict]]:
+def writer_inventory(kube: Kube, namespace: str, names: Iterable[str], groups: Optional[Dict] = None,
+                     absent_ok: bool = False) -> Dict[str, List[Dict]]:
     """Every replica writer of each named Deployment, as FULL identities {kind, namespace, name, uid}: HPAs,
     ScaledObjects and PredictiveAutoscalers of BOTH API groups, from any namespace that can target these Deployments
     (an optional API is skipped only when discovery shows it absent; the others are required). An HPA counts as a
     ScaledObject only when its controller owner reference names a LIVE ScaledObject of that name in its namespace
-    with exactly that UID; any other HPA is its own writer."""
+    with exactly that UID; any other HPA is its own writer.
+
+    `groups` (optional): a discovery result that decides what is served (e.g. Kube.discover_fresh()) instead of the
+    cached Kube.served; with `absent_ok` a writer API group this discovery shows unserved is skipped (API
+    discovery-proven absent) instead of refused. The defaults keep the original behaviour for every other caller."""
     c28 = import_harness()
     names = set(names)
     found: Dict[str, List[Dict]] = {n: [] for n in names}
     scaled = {}
-    if kube.served("ScaledObject"):
+    served = (lambda kind: group_of(kind) in groups) if groups is not None else kube.served
+    if served("ScaledObject"):
         scaled = {(o["metadata"].get("namespace"), o["metadata"]["name"]): o["metadata"].get("uid")
-                  for o in kube.list("ScaledObject", None)}
+                  for o in kube.list("ScaledObject", None, strict=True)}
     for kind in WRITER_KINDS:
-        if not kube.served(kind):
-            if kind in OPTIONAL_WRITERS:
+        if not served(kind):
+            if kind in OPTIONAL_WRITERS or absent_ok:
                 continue
             raise StagingError(f"the {group_of(kind)} API is not served: the writer inventory cannot be complete")
         cross = kind in ("PredictiveAutoscaler", "LegacyPredictiveAutoscaler")
-        for o in kube.list(kind, None):
+        for o in kube.list(kind, None, strict=True):         # a served writer API must answer with a real list
             as_writer = dict(o, kind="PredictiveAutoscaler" if cross else kind)
-            for ns, name in c28.render._writer_targets(as_writer):
+            targets = _cronhpa_targets(o) if kind == "CronHorizontalPodAutoscaler" else \
+                c28.render._writer_targets(as_writer)
+            for ns, name in targets:
                 if ns != namespace or name not in names:
                     continue
                 w = ident(kind, o)
@@ -709,6 +776,36 @@ def writer_inventory(kube: Kube, namespace: str, names: Iterable[str]) -> Dict[s
                     found[name].append(w)
     return {k: sorted(v, key=lambda i: (i["kind"], i["namespace"] or "", i["name"], i["uid"] or ""))
             for k, v in found.items()}
+
+
+def _cronhpa_targets(o: Dict) -> List[tuple]:
+    """A CronHorizontalPodAutoscaler writes the replica count of its scaleTargetRef (a Deployment by default) in its own
+    namespace on its schedule: a replica writer like an HPA."""
+    ref = (o.get("spec") or {}).get("scaleTargetRef") or {}
+    if (ref.get("kind") or "Deployment") != "Deployment" or not ref.get("name"):
+        return []
+    return [((o.get("metadata") or {}).get("namespace"), ref["name"])]
+
+
+def resource_writer_inventory(kube: Kube, namespace: str, names: Iterable[str],
+                              groups: Optional[Dict] = None) -> Dict[str, List[Dict]]:
+    """Every VerticalPodAutoscaler whose targetRef is one of the named Deployments in `namespace`, with its effective
+    updateMode (VPA_DEFAULT_MODE when unset): {name: [{kind, namespace, name, uid, update_mode}]}. Only "Off" writes
+    nothing; Auto, Recreate, Initial and InPlaceOrRecreate write the pods' resources. The VPA API is optional: skipped
+    only when discovery (`groups`, else the cached Kube.served) shows it absent; a listing failure raises."""
+    names = set(names)
+    found: Dict[str, List[Dict]] = {n: [] for n in names}
+    served = (lambda kind: group_of(kind) in groups) if groups is not None else kube.served
+    if not served("VerticalPodAutoscaler"):
+        return found
+    for o in kube.list("VerticalPodAutoscaler", None, strict=True):
+        spec, m = o.get("spec") or {}, o.get("metadata") or {}
+        ref = spec.get("targetRef") or {}
+        if m.get("namespace") != namespace or (ref.get("kind") or "") != "Deployment" or ref.get("name") not in names:
+            continue
+        mode = ((spec.get("updatePolicy") or {}).get("updateMode")) or VPA_DEFAULT_MODE
+        found[ref["name"]].append(dict(ident("VerticalPodAutoscaler", o), update_mode=mode))
+    return {k: sorted(v, key=lambda i: (i["namespace"] or "", i["name"])) for k, v in found.items()}
 
 
 def subset_diff(want, live, path_: str = "", ignore: Iterable[str] = ()) -> List[str]:

@@ -284,6 +284,12 @@ before any idle interval or load begins. Dispatched, received and answered arriv
 with tolerance 0/0. The idle CPU baseline is averaged only after a washout of the 60 s rate window plus one CPU scrape
 interval.
 
+The writer census uses fresh discovery every time: a writer API group that a successful discovery does not serve (on
+prod today, the new PredictiveAutoscaler group) is recorded as "API discovery-proven absent" in the reviewed plan and
+the receipts, a failed or malformed discovery refuses, and any change of that availability during the calibration
+stops it. CronHorizontalPodAutoscalers count as replica writers (also in the shared inventory session and
+prepare use); a VerticalPodAutoscaler on a calibration object is allowed only in updateMode Off and recorded.
+
 Before and during every trial, and once more before a completed trial is accepted: the measured configuration equal
 to the reviewed rendering, compared strictly (owned objects, the trial's Job, every admitted pod: every container and pod
 field, a field the rendering omits must be absent unless it is a listed API default, and admission may add only the

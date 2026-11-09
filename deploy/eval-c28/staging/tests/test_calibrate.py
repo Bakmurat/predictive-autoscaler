@@ -1332,3 +1332,380 @@ def test_t2_safety_guards_stay_active_during_the_warmup(cal, api):
     assert out["verdict"] == "NOT READY" and cert(ctx)["halted"]["category"] == "stopped"
     assert stopped and any("replica writer" in p for p in stopped[0]["problems"])
     assert not any(e["event"] == "observer-not-ready" for e in ctx.entries())
+
+
+# --- c2.8t: writer API groups that discovery proves absent -----------------------------------------------------------
+
+PA_GROUP = "autoscaling.devkuban.com"
+CRON_GROUP = "autoscaling.alibabacloud.com"
+VPA_GROUP = "autoscaling.k8s.io"
+
+
+def _absent(api, group=PA_GROUP):
+    api.groups = [g for g in api.groups if g != group]
+
+
+def test_u1_absent_writer_api_is_discovery_proven_absent_and_bound(cal, api):
+    """prod: the new PredictiveAutoscaler CRD is not installed yet (circular with S3)."""
+    ctx = cal()
+    served = K.plan(ctx)["writer_apis"]
+    assert {g: served[g] for g in ("autoscaling", "keda.sh", PA_GROUP, "autoscaler.example.com")} == \
+        dict.fromkeys(("autoscaling", "keda.sh", PA_GROUP, "autoscaler.example.com"), "served")
+    assert served[CRON_GROUP] == served[VPA_GROUP] == K.ABSENT          # not served by the fake by default
+    _absent(api)
+    p = K.plan(ctx)
+    assert p["problems"] == [], p["problems"]
+    assert p["writer_apis"][PA_GROUP] == K.ABSENT == "API discovery-proven absent"
+    assert p["writer_apis"]["autoscaling"] == "served"
+    out = run(ctx)
+    assert out["verdict"] == "READY"
+    begin = [e["data"] for e in ctx.entries() if e["event"] == "calibration-begin"][0]
+    assert begin["writer_apis"] == p["writer_apis"]
+    assert K.reduce_bundle(ctx.dir)["reproduced"]
+
+
+def test_u1_without_the_opt_in_other_helpers_still_refuse(cal, api):
+    ctx = cal()
+    _absent(api)
+    with pytest.raises(X.StagingError, match="not served"):
+        X.writer_inventory(record_kube(ctx), "demo", ["x"])           # the original, strict behaviour
+
+
+def record_kube(ctx):
+    return ctx.record.kube(ctx.world.api)
+
+
+@pytest.mark.parametrize("start_absent,toggle,why", [
+    (True, PA_GROUP, f"{PA_GROUP} API discovery-proven absent -> served"),
+    (False, "keda.sh", "keda.sh served -> API discovery-proven absent"),
+])
+def test_u2_writer_api_change_mid_trial_stops(cal, api, start_absent, toggle, why):
+    ctx = cal()
+    if start_absent:
+        _absent(api)
+
+    def flip(world, api_):
+        if any(k == "jobs" and n.endswith("t003") for (k, _, n) in api_.objects) and not world.__dict__.get("f"):
+            world.f = True
+            if toggle in api_.groups:
+                api_.groups = [g for g in api_.groups if g != toggle]
+            else:
+                api_.groups = api_.groups + [toggle]
+    ctx.world.hooks.append(flip)
+    out = run(ctx)
+    stopped = [e["data"] for e in ctx.entries() if e["event"] == "trial-stopped"]
+    assert out["verdict"] == "NOT READY" and stopped and why in stopped[0]["reason"], stopped
+
+
+def test_u2_api_appearing_between_the_scale_intent_and_the_write(cal, api, monkeypatch):
+    ctx = cal()
+    _absent(api)
+    real = C.append_receipt
+
+    def append(rec, helper, event, data, *a, **kw):
+        out = real(rec, helper, event, data, *a, **kw)
+        if helper == K.HELPER and event.startswith("intent-") and data.get("op") == "calibrate-scale" and \
+                PA_GROUP not in api.groups:
+            api.groups = api.groups + [PA_GROUP]
+        return out
+    monkeypatch.setattr(C, "append_receipt", append)
+    with pytest.raises(X.StagingError, match="pre-write check refused"):
+        run(ctx)
+    monkeypatch.setattr(C, "append_receipt", real)
+    assert [e["data"]["result"] for e in ctx.entries() if e["event"] == "scale-write"] == ["not-submitted"]
+    assert (api.objects[("deployments", "demo", ctx.nm["variants"][0])]["spec"].get("replicas") or 0) == 0
+    rp = X.recover_plan(ctx.record, ctx.kube)
+    assert [(a["observed"], a.get("state")) for a in rp["actions"]] == [("not-done", "not-applied")]
+    PF.recover(ctx.record, ctx.kube)
+    plan, digest = CW.reviewed(ctx, K.plan_stop, K.STOP, "stop-plan")
+    K.stop(ctx, plan, digest, "a writer API appeared")
+    assert not lock_held(ctx)
+
+
+def test_u2_api_appearing_right_before_the_generator_job(cal, api, monkeypatch):
+    ctx = cal()
+    _absent(api)
+    real = C.append_receipt
+
+    def append(rec, helper, event, data, *a, **kw):
+        out = real(rec, helper, event, data, *a, **kw)
+        if event == "trial-begin" and data["trial"]["id"] == "t003" and PA_GROUP not in api.groups:
+            api.groups = api.groups + [PA_GROUP]
+        return out
+    monkeypatch.setattr(C, "append_receipt", append)
+    out = run(ctx)
+    monkeypatch.setattr(C, "append_receipt", real)
+    stopped = [e["data"] for e in ctx.entries() if e["event"] == "trial-stopped"]
+    assert out["verdict"] == "NOT READY" and stopped[0]["reason"].startswith("before the generator Job")
+    creates = [e["data"] for e in ctx.entries() if e["event"].startswith("intent-") and e["data"]["op"] == "create"
+               and e["data"]["kind"] == "Job"]
+    assert not any(c["name"].endswith("t003") for c in creates)            # the load was never written
+
+
+def test_u3_only_successful_discovery_proves_absence(cal, api):
+    ctx = cal()
+    _absent(api)
+    real = api.get
+
+    for failure in (C.ApiError("get /apis: failed (forbidden, exit 1)", 403),
+                    C.ApiError("get /apis: failed (timeout, exit 1)", 504), {"groups": [{"versions": []}]},
+                    {"kind": "Status"}, None):
+        def get(path, failure=failure):
+            if path == "/apis":
+                if isinstance(failure, Exception):
+                    raise failure
+                return failure
+            return real(path)
+        api.get = get
+        assert any("API discovery failed" in p for p in K.plan(ctx)["problems"]), failure
+    api.get = real
+    # a served writer API that cannot be listed stays a refusal
+    api.groups = api.groups + [PA_GROUP]
+
+    def get(path):
+        if path.startswith("/apis/autoscaling.devkuban.com/"):
+            raise C.ApiError("list: failed (forbidden, exit 1)", 403)
+        return real(path)
+    api.get = get
+    assert any("listing a served writer API failed" in p for p in K.plan(ctx)["problems"])
+    api.get = real
+
+
+def test_u3_availability_change_between_review_and_apply_is_refused(cal, api):
+    ctx = cal()
+    _absent(api)
+    plan, digest = CW.reviewed(ctx)
+    api.groups = api.groups + [PA_GROUP]
+    with pytest.raises(X.StagingError, match="no longer produces the reviewed plan"):
+        K.apply(ctx, plan, digest)
+
+
+def _cronhpa(target, name="nightly"):
+    return {"apiVersion": "autoscaling.alibabacloud.com/v1beta1", "kind": "CronHorizontalPodAutoscaler",
+            "metadata": {"name": name, "namespace": "demo"},
+            "spec": {"scaleTargetRef": {"apiVersion": "apps/v1", "kind": "Deployment", "name": target},
+                     "jobs": [{"name": "up", "schedule": "0 0 8 * * *", "targetSize": 4}]}}
+
+
+def _vpa(target, mode=None, name="vpa"):
+    spec = {"targetRef": {"apiVersion": "apps/v1", "kind": "Deployment", "name": target}}
+    if mode is not None:
+        spec["updatePolicy"] = {"updateMode": mode}
+    return {"apiVersion": "autoscaling.k8s.io/v1", "kind": "VerticalPodAutoscaler",
+            "metadata": {"name": name, "namespace": "demo"}, "spec": spec}
+
+
+def test_v1_cronhpa_is_a_replica_writer_served_or_absent(cal, api):
+    ctx = cal()
+    api.groups = api.groups + [CRON_GROUP]
+    assert K.plan(ctx)["writer_apis"][CRON_GROUP] == "served" and K.plan(ctx)["problems"] == []
+    api.put(_cronhpa(ctx.nm["variants"][0]))
+    assert any("CronHorizontalPodAutoscaler/demo/nightly" in p for p in K.plan(ctx)["problems"])
+    api.put(_cronhpa("some-other-app", name="other"))          # not ours: ignored
+    api.objects.pop(("cronhpas", "demo", "nightly"))
+    assert K.plan(ctx)["problems"] == []
+    # the shared inventory (session/prepare) sees it as a writer too, once its API is served
+    inv = X.writer_inventory(record_kube(ctx), "demo", ["some-other-app"])
+    assert [w["kind"] for w in inv["some-other-app"]] == ["CronHorizontalPodAutoscaler"]
+    # an unserved group is discovery-proven absent: its objects are not listed
+    api.groups = [g for g in api.groups if g != CRON_GROUP]
+    assert K.plan(ctx)["writer_apis"][CRON_GROUP] == K.ABSENT
+
+
+def test_v1_cronhpa_appearing_mid_trial_stops(cal, api):
+    ctx = cal()
+    api.groups = api.groups + [CRON_GROUP]
+
+    def cron(world, api_):
+        if any(k == "jobs" and n.endswith("t003") for (k, _, n) in api_.objects) and \
+                ("cronhpas", "demo", "nightly") not in api_.objects:
+            api_.put(_cronhpa(ctx.nm["variants"][0]))
+    ctx.world.hooks.append(cron)
+    out = run(ctx)
+    stopped = [e["data"] for e in ctx.entries() if e["event"] == "trial-stopped"]
+    assert out["verdict"] == "NOT READY" and "CronHorizontalPodAutoscaler" in stopped[0]["reason"]
+
+
+@pytest.mark.parametrize("mode", [None, "Auto", "Recreate", "Initial", "InPlaceOrRecreate"])
+def test_v2_a_writing_vpa_refuses(cal, api, mode):
+    ctx = cal()
+    api.groups = api.groups + [VPA_GROUP]
+    api.put(_vpa(ctx.nm["variants"][1], mode))
+    want = mode or "Auto"                                     # the VPA API's default updateMode
+    assert any(f"updateMode {want}" in p for p in K.plan(ctx)["problems"])
+
+
+def test_v2_an_off_vpa_is_recorded_and_allowed_until_its_mode_changes(cal, api):
+    ctx = cal()
+    api.groups = api.groups + [VPA_GROUP]
+    api.put(_vpa(ctx.nm["variants"][0], "Off", name="goldilocks-fixture"))
+    p = K.plan(ctx)
+    assert p["problems"] == [] and p["writer_apis"][VPA_GROUP] == "served"
+    assert [v["update_mode"] for v in p["resource_writers"][ctx.nm["variants"][0]]] == ["Off"]
+
+    def flip(world, api_):
+        if any(k == "jobs" and n.endswith("t003") for (k, _, n) in api_.objects):
+            api_.objects[("vpas", "demo", "goldilocks-fixture")]["spec"]["updatePolicy"]["updateMode"] = "Auto"
+    ctx.world.hooks.append(flip)
+    out = run(ctx)
+    stopped = [e["data"] for e in ctx.entries() if e["event"] == "trial-stopped"]
+    assert out["verdict"] == "NOT READY" and "updateMode Auto" in stopped[0]["reason"]
+
+
+def test_v2_vpa_api_absent_or_disappearing(cal, api):
+    ctx = cal()
+    assert K.plan(ctx)["writer_apis"][VPA_GROUP] == K.ABSENT and K.plan(ctx)["problems"] == []
+    api.groups = api.groups + [VPA_GROUP]
+
+    def gone(world, api_):
+        if any(k == "jobs" and n.endswith("t003") for (k, _, n) in api_.objects):
+            api_.groups = [g for g in api_.groups if g != VPA_GROUP]
+    ctx.world.hooks.append(gone)
+    out = run(ctx)
+    stopped = [e["data"] for e in ctx.entries() if e["event"] == "trial-stopped"]
+    assert out["verdict"] == "NOT READY" and f"{VPA_GROUP} served -> API discovery-proven absent" in \
+        stopped[0]["reason"]
+
+
+# --- Codex review of PR #49 -------------------------------------------------------------------------------------------
+
+def test_w1_api_appearing_at_begin_creates_nothing(cal, api, monkeypatch):
+    """Codex repro: the PA API appearing at calibration-begin still let all eight objects be created."""
+    ctx = cal()
+    _absent(api)
+    plan, digest = CW.reviewed(ctx)
+    real = C.append_receipt
+
+    def append(rec, helper, event, data, *a, **kw):
+        out = real(rec, helper, event, data, *a, **kw)
+        if event == "calibration-begin" and PA_GROUP not in api.groups:
+            api.groups.append(PA_GROUP)
+        return out
+    monkeypatch.setattr(C, "append_receipt", append)
+    with pytest.raises(X.StagingError, match="writer census refused creating"):
+        K.apply(ctx, plan, digest)
+    monkeypatch.setattr(C, "append_receipt", real)
+    created = [e["data"] for e in ctx.entries() if e["event"].startswith("intent-") and e["data"].get("op") == "create"]
+    assert created == [] and not lock_held(ctx)
+    assert cert(ctx)["verdict"] == "NOT READY"                    # closed as stopped, nothing to clean
+
+
+def test_w1_api_appearing_after_a_create_intent_is_not_submitted(cal, api, monkeypatch):
+    ctx = cal()
+    _absent(api)
+    plan, digest = CW.reviewed(ctx)
+    real = C.append_receipt
+
+    def append(rec, helper, event, data, *a, **kw):
+        out = real(rec, helper, event, data, *a, **kw)
+        if helper == K.HELPER and event.startswith("intent-") and data.get("op") == "create" and \
+                data.get("kind") == "Service" and PA_GROUP not in api.groups:
+            api.groups.append(PA_GROUP)                           # after the first Service's intent, before its POST
+        return out
+    monkeypatch.setattr(C, "append_receipt", append)
+    with pytest.raises(X.StagingError, match="pre-write check refused creating Service/"):
+        K.apply(ctx, plan, digest)
+    monkeypatch.setattr(C, "append_receipt", real)
+    writes = [e["data"] for e in ctx.entries() if e["event"] == "create-write"]
+    assert [w["result"] for w in writes] == ["not-submitted"] and writes[0]["what"].startswith("Service/")
+    svc = writes[0]["what"].split("/", 1)[1]
+    assert ("services", "demo", svc) not in api.objects                 # nothing was sent
+    assert lock_held(ctx)
+    rp = X.recover_plan(ctx.record, ctx.kube)
+    assert [(a["kind"], a["observed"], a.get("state")) for a in rp["actions"]] == [("Service", "not-done",
+                                                                                     "not-applied")]
+    PF.recover(ctx.record, ctx.kube)
+    plan2, digest2 = CW.reviewed(ctx, K.plan_stop, K.STOP, "stop-plan")
+    K.stop(ctx, plan2, digest2, "a writer API appeared during creation")
+    assert live_calibration_objects(api, ctx.cal) == [] and not lock_held(ctx)
+
+
+def test_w2_a_failing_second_discovery_never_gives_a_clean_plan(cal, api):
+    """Codex repro: the plan's second discovery failing gave writer_apis {"discovery": "failed"} with no problems."""
+    ctx = cal()
+    real, calls = api.get, []
+
+    def get(path):
+        if path == "/apis":
+            calls.append(path)
+            if len(calls) >= 2:
+                raise C.ApiError("test discovery failure", 503)
+        return real(path)
+    api.get = get
+    p = K.plan(ctx)
+    api.get = real
+    assert len(calls) == 1 and p["problems"] == [] and set(p["writer_apis"].values()) <= {"served", K.ABSENT}
+    # and a failing (only) census is recorded AND refused: never a clean plan with failed evidence
+    def failing(path):
+        if path == "/apis":
+            raise C.ApiError("test discovery failure", 503)
+        return real(path)
+    api.get = failing
+    p = K.plan(ctx)
+    api.get = real
+    assert p["writer_apis"] == {"discovery": "failed"} and any("API discovery failed" in x for x in p["problems"])
+
+
+@pytest.mark.parametrize("doc,why", [
+    ({"groups": [{"name": "", "versions": [{"version": None}]}]}, "non-empty string name"),
+    ({"groups": [{"name": "apps", "versions": [{"version": None}]}]}, "non-empty version"),
+    ({"groups": [{"name": "apps", "versions": []}]}, "no versions list"),
+    ({"groups": [{"name": "apps"}]}, "no versions list"),
+    ({"groups": [{"name": "apps", "versions": [{"version": "v1"}]}, {"name": "apps", "versions": [{"version": "v1"}]}]},
+     "listed twice"),
+    ({"kind": "Status", "groups": []}, "not APIGroupList"),
+    ({"groups": "apps"}, "groups is not a list"),
+    ({"groups": [["apps"]]}, "non-empty string name"),
+    (None, "not a JSON object"),
+    ([], "not a JSON object"),
+])
+def test_w3_malformed_discovery_is_refused(cal, api, doc, why):
+    ctx = cal()
+    real = api.get
+    api.get = lambda path: doc if path == "/apis" else real(path)
+    with pytest.raises(C.ApiError, match=why):
+        ctx.kube.discover_fresh()
+    assert any("API discovery failed" in p for p in K.plan(ctx)["problems"])
+    api.get = real
+    good = X.validate_discovery({"kind": "APIGroupList", "groups": [
+        {"name": "apps", "versions": [{"groupVersion": "apps/v1", "version": "v1"}]},
+        {"name": "autoscaling", "versions": [{"groupVersion": "autoscaling/v2"}]}]})
+    assert good == {"": ["v1"], "apps": ["v1"], "autoscaling": ["v2"]}
+
+
+@pytest.mark.parametrize("kind", ["PredictiveAutoscaler", "HorizontalPodAutoscaler", "ScaledObject",
+                                  "VerticalPodAutoscaler", "CronHorizontalPodAutoscaler"])
+@pytest.mark.parametrize("answer", [None, {"kind": "Status"}, {"items": "x"}])
+def test_w4_a_served_writer_api_must_answer_with_a_list(cal, api, kind, answer):
+    """Codex repro: a served PA endpoint answering None (KubectlApi's 404) read as an empty list."""
+    ctx = cal()
+    api.groups = api.groups + [g for g in (VPA_GROUP, CRON_GROUP) if g not in api.groups]
+    real, missing = api.get, X.path(kind, None)
+    api.get = lambda path: answer if path == missing else real(path)
+    probs = K.writer_problems(ctx)
+    api.get = real
+    assert any("listing a served writer API failed" in p and "no list response" in p for p in probs), probs
+    # other callers keep the lenient list
+    api.get = lambda path: None if path == missing else real(path)
+    assert ctx.kube.list(kind, None) == []
+    api.get = real
+
+
+def test_w5_pre_job_stop_reports_a_foreign_job_of_that_name(cal, api, monkeypatch):
+    ctx = cal()
+    _absent(api)
+    real = C.append_receipt
+
+    def append(rec, helper, event, data, *a, **kw):
+        out = real(rec, helper, event, data, *a, **kw)
+        if event == "trial-begin" and data["trial"]["id"] == "t003" and PA_GROUP not in api.groups:
+            api.groups.append(PA_GROUP)
+            api.put({"apiVersion": "batch/v1", "kind": "Job", "metadata": {
+                "name": K.job_name(ctx.cal, 3), "namespace": "demo"}, "spec": {}})
+        return out
+    monkeypatch.setattr(C, "append_receipt", append)
+    out = run(ctx)
+    monkeypatch.setattr(C, "append_receipt", real)
+    stopped = [e["data"] for e in ctx.entries() if e["event"] == "trial-stopped"]
+    assert out["verdict"] == "NOT READY" and "that this calibration did not create" in stopped[0]["reason"]
+    assert ("jobs", "demo", K.job_name(ctx.cal, 3)) in api.objects               # never touched
