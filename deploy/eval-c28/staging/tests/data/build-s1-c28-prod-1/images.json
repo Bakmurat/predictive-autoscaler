@@ -1,0 +1,32 @@
+{
+ "at": "2026-11-08T13:55:48Z",
+ "images": {
+  "fixture": {
+   "ref": "harbor.devkuban.com/autoscaler/c28-fixture@sha256:309a99ba0fa489f10662f2c4c5e07d077ac89250eb16917c1a22af5422ddc22b",
+   "tag": "harbor.devkuban.com/autoscaler/c28-fixture:c28-c28-prod-1"
+  },
+  "generator": {
+   "ref": "grafana/k6@sha256:70af91f86cd8e142e0544a4edaf79835a80033f71974b92edd5ac36fd4442a7b"
+  },
+  "operator": {
+   "ref": "harbor.devkuban.com/autoscaler/operator@sha256:feee2c455d720c893ed1f36f7e583e55baf99f70a617504352a69e3b2fc41ed0",
+   "tag": "harbor.devkuban.com/autoscaler/operator:c28-c28-prod-1"
+  },
+  "statistical": {
+   "ref": "harbor.devkuban.com/autoscaler/statistical-evaluation@sha256:6ec4f06c01c76113af8f93eb0158dc4eae0de08e2c05907debfc2472f6e4a473",
+   "tag": "harbor.devkuban.com/autoscaler/statistical-evaluation:c28-c28-prod-1"
+  }
+ },
+ "plan_sha256": "a8dc4d9a3178eb9f221a3642c025d12afd1b2da14e923920125db6cd386a8393",
+ "run_id": "c28-prod-1",
+ "sbom": {
+  "statistical": "pass"
+ },
+ "schema": "c28-images/v1",
+ "source_commit": "6742e2d3b994f766074155b8036ab2eb40d043eb",
+ "tools": {
+  "docker": "29.9.0",
+  "git": "git version 2.34.1"
+ },
+ "verified": true
+}

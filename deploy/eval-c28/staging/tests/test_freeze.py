@@ -239,3 +239,20 @@ def test_cli_live_plan(world, capsys):
         "99999999-0000-4000-8000-000000000001"
     assert freeze.main(["--record", record.path, "plan", "--live"], api=world["api"]) == 0
     assert any("quota's live UID differs" in p for p in json.loads(capsys.readouterr().out)["problems"])
+
+
+def test_freeze_reads_a_rebuild_images_json_by_digest(tmp_path, make_record):
+    """build_images.py build.attempt: freeze takes refs (digests) and the source commit, never a tag or attempt."""
+    from part2_fixtures import COMMIT
+    h = "ab" * 32
+    doc = {"schema": "c28-images/v1", "run_id": RUN, "source_commit": COMMIT, "verified": True, "attempt": "r2",
+           "images": {k: {"ref": f"harbor.example/autoscaler/{n}@sha256:{h}",
+                          "tag": f"harbor.example/autoscaler/{n}:c28-{RUN}-r2"}
+                      for k, n in (("operator", "operator"), ("statistical", "statistical-evaluation"),
+                                   ("fixture", "c28-fixture"))}}
+    doc["images"]["generator"] = {"ref": "grafana/k6@sha256:" + h}
+    (tmp_path / "evidence").mkdir()
+    (tmp_path / "evidence" / "images.json").write_text(json.dumps(doc))
+    record = X.load_record(make_record())
+    refs, commit = freeze._images(record, {"images": "evidence/images.json"})
+    assert commit == COMMIT and refs == {k: v["ref"] for k, v in sorted(doc["images"].items())}

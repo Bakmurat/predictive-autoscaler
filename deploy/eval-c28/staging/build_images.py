@@ -9,20 +9,31 @@
                                                        write images.json (a new file)
   build_images.py --record R verify                    read-only: re-resolve every images.json digest in the registry
 
-Images: <harbor>/<project>/operator, statistical-evaluation and c28-fixture, each tagged c28-<run id> (a tag that
-already exists locally or in the registry is refused: never reused, never overwritten), plus the upstream generator
-pinned by digest. The operator and fixture build from `git archive <commit>` of a clean checkout at exactly the
-record's source.commit (never a working tree); the statistical image is built by hack/build-statistical-evaluation.sh, whose
-Dockerfile verify stage checks every copied file against the commit's source manifest. A pushed digest is accepted only
-when the registry's own manifest bytes hash to it (docker buildx imagetools inspect --raw) and a pull by digest yields
-an image carrying exactly that RepoDigest; a stale local tag or a first RepoDigest is never trusted. Credentials come
-only from the existing docker credential helper: a plaintext auth entry for the registry is refused, and nothing here
-passes or prints a credential. No image, tag or container that existed before is removed; no cluster is contacted.
+Images: <harbor>/<project>/operator, statistical-evaluation and c28-fixture, each tagged c28-<run id>, or
+c28-<run id>-<attempt> when the record sets build.attempt (a tag that already exists locally or in the registry is
+refused: never reused, never overwritten), plus the upstream generator pinned by digest. The operator and fixture
+build from `git archive <commit>` of a clean checkout at exactly the record's source.commit (never a working tree); the
+statistical image is built by hack/build-statistical-evaluation.sh, whose Dockerfile verify stage checks every copied
+file against the commit's source manifest. A pushed digest is accepted only when the registry's own manifest bytes
+hash to it (docker buildx imagetools inspect --raw) and a pull by digest yields an image carrying exactly that
+RepoDigest; a stale local tag or a first RepoDigest is never trusted. Credentials come only from the existing docker
+credential helper: a plaintext auth entry for the registry is refused, and nothing here passes or prints a credential.
+No image, tag or container that existed before is removed; no cluster is contacted.
 
 The record's "build" section:
   {"checkout": "<clean checkout of source.commit>", "harbor": "<registry host>",
    "project": "autoscaler", "build_dir": "<new empty directory>", "generator_image": "<repo>@sha256:...",
-   "docker_config": "<dir, default ~/.docker>"}
+   "docker_config": "<dir, default ~/.docker>", "attempt": "<optional: r2, r3, ...>"}
+
+A rebuild of the same run (build.attempt): the run's first build has no attempt and keeps its tags (c28-<run id>);
+every later build of that run sets build.attempt to a new slug matching ^r[0-9]{1,3}$ (e.g. "r2"), which gives new
+tags c28-<run id>-<attempt>, so nothing that exists is reused or overwritten. The run id stays the run's
+(images.json's run_id must equal the record's for calibrate.py and the other consumers, which read refs by digest and
+never rebuild a tag from the run id). Each attempt needs its own record with a fresh build_dir (empty or absent, as
+for every build) and a fresh evidence_dir: plan refuses an evidence_dir that already holds an images.json or a build
+receipt chain (any earlier build's, with or without an attempt). The plan and images.json carry the attempt (only when
+set: a record without one gives exactly the documents it always gave) and the tags; verify checks that images.json is
+this record's run, attempt and tags.
 """
 
 from __future__ import annotations
@@ -35,6 +46,7 @@ import subprocess
 import sys
 from typing import Callable, Dict, List, Optional
 
+import common_records as C
 import execlib as X
 
 HELPER = "build"
@@ -42,6 +54,7 @@ _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _HOST = re.compile(r"^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]+)?$")
 _DIGEST_REF = re.compile(r"^([a-z0-9][a-z0-9./:-]*)@(sha256:[0-9a-f]{64})$")
 _PUSH_DIGEST = re.compile(r"digest: (sha256:[0-9a-f]{64})")
+_ATTEMPT = re.compile(r"^r[0-9]{1,3}$")
 NAMES = {"operator": "operator", "statistical": "statistical-evaluation", "fixture": "c28-fixture"}
 
 
@@ -84,11 +97,38 @@ def _section(record: X.Record) -> Dict:
     for k in ("checkout", "build_dir"):
         if not s.get(k):
             raise X.StagingError(f"build.{k} is required")
+    if "attempt" in s and not (isinstance(s["attempt"], str) and _ATTEMPT.fullmatch(s["attempt"])):
+        raise X.StagingError("build.attempt, when set, must be a rebuild slug matching ^r[0-9]{1,3}$ (e.g. \"r2\"); "
+                             "leave it out for the run's first build")
     return s
 
 
+def tag_suffix(record: X.Record, s: Dict) -> str:
+    """c28-<run id>, or c28-<run id>-<attempt> for a later build of the same run."""
+    return f"c28-{record.run_id}" + (f"-{s['attempt']}" if s.get("attempt") else "")
+
+
 def tags(record: X.Record, s: Dict) -> Dict[str, str]:
-    return {k: f"{s['harbor']}/{s['project']}/{n}:c28-{record.run_id}" for k, n in NAMES.items()}
+    return {k: f"{s['harbor']}/{s['project']}/{n}:{tag_suffix(record, s)}" for k, n in NAMES.items()}
+
+
+def evidence_problems(record: X.Record) -> List[str]:
+    """A fresh evidence_dir per build: one that already holds an images.json or a build receipt chain belongs to an
+    earlier build (another attempt, or this one already applied), whose evidence is never mixed with or overwritten."""
+    out = []
+    images = os.path.join(record.evidence_dir, "images.json")
+    if os.path.lexists(images):
+        try:
+            with open(images) as fh:
+                doc = json.load(fh)
+            held = f"run {doc.get('run_id')!r}, attempt {doc.get('attempt') or 'none'}"
+        except (OSError, ValueError):
+            held = "unreadable"
+        out.append(f"{images} already exists ({held}): each build attempt needs a fresh evidence_dir")
+    chain = C.receipts_path(record.doc, HELPER)
+    if os.path.lexists(chain) and (not os.path.isfile(chain) or os.path.getsize(chain) > 0):
+        out.append(f"{chain} already holds a build receipt chain: each build attempt needs a fresh evidence_dir")
+    return out
 
 
 def docker_config_dir(s: Dict) -> str:
@@ -144,6 +184,7 @@ def plan(record: X.Record, t: Tools) -> Dict:
     bd = record.resolve(s["build_dir"])
     if os.path.exists(bd) and os.listdir(bd):
         problems.append(f"{bd} is not empty (a new build directory per run)")
+    problems += evidence_problems(record)
     problems += credential_problems(s)
     tg = tags(record, s)
     state = {}
@@ -168,9 +209,10 @@ def plan(record: X.Record, t: Tools) -> Dict:
     versions = {"docker": t(["docker", "version", "--format", "{{.Server.Version}}"], check=False).stdout.strip(),
                 "git": t(["git", "--version"], check=False).stdout.strip()}
     actions = [{"build": k, "tag": ref} for k, ref in sorted(tg.items())] + [{"push": ref} for _, ref in sorted(tg.items())]
+    extra = {"attempt": s["attempt"]} if s.get("attempt") else {}      # absent: the plan stays exactly as before
     return X.new_plan(HELPER, record, actions, commit=s["commit"], tags=tg, remote_state=state, generator=gen,
                       build_dir=bd, tools=versions, problems=problems,
-                      never=["remove a pre-existing image or tag", "pass a credential", "contact a cluster"])
+                      never=["remove a pre-existing image or tag", "pass a credential", "contact a cluster"], **extra)
 
 
 def _verify_pushed(t: Tools, tag: str, digest: str) -> str:
@@ -226,10 +268,15 @@ def apply(record: X.Record, t: Tools, reviewed: Dict, reviewed_digest: str) -> D
     doc = {"schema": "c28-images/v1", "run_id": record.run_id, "source_commit": s["commit"], "verified": True,
            "images": images, "sbom": {"statistical": "pass"}, "tools": p["tools"], "plan_sha256": reviewed_digest,
            "at": X.utcnow()}
+    if s.get("attempt"):
+        doc["attempt"] = s["attempt"]
     path = os.path.join(record.evidence_dir, "images.json")
     sha = X.write_new(path, json.dumps(doc, indent=1, sort_keys=True) + "\n")
-    return X.receipt(record, HELPER, "images-recorded", {"plan_sha256": reviewed_digest, "file": path, "sha256": sha,
-                                                         "images": {k: v["ref"] for k, v in images.items()}})
+    data = {"plan_sha256": reviewed_digest, "file": path, "sha256": sha,
+            "images": {k: v["ref"] for k, v in images.items()}}
+    if s.get("attempt"):
+        data["attempt"] = s["attempt"]
+    return X.receipt(record, HELPER, "images-recorded", data)
 
 
 def verify(record: X.Record, t: Tools) -> Dict:
@@ -237,6 +284,16 @@ def verify(record: X.Record, t: Tools) -> Dict:
     with open(path) as fh:
         doc = json.load(fh)
     problems = []
+    s = _section(record)
+    if doc.get("run_id") != record.run_id:
+        problems.append(f"images.json is run {doc.get('run_id')!r}, not this record's run {record.run_id!r}")
+    if doc.get("attempt") != s.get("attempt"):
+        problems.append(f"images.json is attempt {doc.get('attempt') or 'none'}, not this record's "
+                        f"{s.get('attempt') or 'none'}")
+    want = tags(record, s)
+    for k in sorted(want):
+        if ((doc.get("images") or {}).get(k) or {}).get("tag") != want[k]:
+            problems.append(f"{k}: images.json's tag is not this record's {want[k]}")
     for k, v in sorted(doc["images"].items()):
         m = _DIGEST_REF.match(v["ref"])
         try:
