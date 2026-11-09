@@ -568,7 +568,7 @@ def test_plan_is_read_only_and_authorizes_bounded_objects(cal, api):
     assert kinds == sorted([("Deployment", ctx.nm["variants"][0]), ("Service", ctx.nm["variants"][0]),
                             ("Deployment", ctx.nm["variants"][1]), ("Service", ctx.nm["variants"][1]),
                             ("Deployment", ctx.nm["ingress"]), ("Service", ctx.nm["ingress"]),
-                            ("ConfigMap", ctx.nm["script"])])
+                            ("ConfigMap", ctx.nm["script"]), ("VMPodScrape", ctx.cal)])
     assert p["search"]["max_rate_per_min"] == 30 * 4 * 60 and p["work_selection"]["values"] == [600, 900]
     assert p["admission"]["workload"]["footprint"][0] == {"what": "fixture", "pods": 6, "cpu": "50m",
                                                           "memory": "32Mi"}          # per pod, 4 + 2 overlap
@@ -839,14 +839,14 @@ def test_f3_steal_inside_the_measurement_window_is_evidence(cal):
     assert K.evaluate_trial(ctx.con, raw)["criteria"]["steal"]["workload"]["longest_run_over"] == 0
     bad = copy.deepcopy(raw)
     vals = next(r for r in bad["observations"]["steal"]["response"]["data"]["result"]
-                if r["metric"]["node"] == "worker-w")["values"]
+                if r["metric"]["nodename"] == "worker-w")["values"]
     for v in vals[3:8]:
         v[1] = "7.5"
     r = K.evaluate_trial(ctx.con, bad)
     assert r["verdict"] == "INCOMPLETE" and any("interference: guest steal" in w for w in r["incomplete"])
     gap = copy.deepcopy(raw)
     res = gap["observations"]["steal"]["response"]["data"]["result"]
-    next(x for x in res if x["metric"]["node"] == "worker-s")["values"].pop(6)
+    next(x for x in res if x["metric"]["nodename"] == "worker-s")["values"].pop(6)
     assert any("required observation missing" in w for w in K.evaluate_trial(ctx.con, gap)["incomplete"])
 
 
@@ -1054,3 +1054,216 @@ def test_r3_a_settling_drop_is_censored(cal):
             v[1] = str(float(v[1]) - 1)
     r = K.evaluate_trial(ctx.con, raw)
     assert r["verdict"] == "LIMIT" and r["delivery"] == "censored" and any(w.startswith("settle:") for w in r["limits"])
+
+
+# --- c2.8s: guards before the contract freeze ------------------------------------------------------------------------
+
+def _ds(api, name, strategy, ready=True, desired=2, updated=0, gen=6):
+    ds = api.put({"apiVersion": "apps/v1", "kind": "DaemonSet",
+                  "metadata": {"name": name, "namespace": "velero", "generation": gen},
+                  "spec": {"updateStrategy": {"type": strategy}},
+                  "status": {"observedGeneration": gen, "desiredNumberScheduled": desired,
+                             "currentNumberScheduled": desired, "numberReady": desired, "numberAvailable": desired,
+                             **({"updatedNumberScheduled": updated} if updated else {})}})
+    pods = []
+    for i, node in enumerate(("worker-w", "worker-s")[:desired]):
+        p = fake2.pod(f"{name}-{i}", "velero", node, owner=("DaemonSet", name))
+        p["metadata"]["ownerReferences"][0]["uid"] = ds["metadata"]["uid"]
+        p["metadata"]["labels"] = {"controller-revision-hash": "rev-5"}
+        p["status"] = {"phase": "Running", "conditions": [{"type": "Ready", "status": "True" if ready else "False"}],
+                       "containerStatuses": [{"name": "c", "restartCount": 0}]}
+        pods.append(api.put(p))
+    return ds, pods
+
+
+def _allow_ds(ctx, name):
+    ctx.record.doc["reserve"]["allowed"]["daemonsets"].append({"namespace": "velero", "name": name})
+
+
+def test_s1_ondelete_daemonset_with_held_revision_is_settled(cal, api):
+    """velero/node-agent on prod: OnDelete, none of its pods on the current template, all Ready: not a rollout."""
+    ctx = cal()
+    ds, pods = _ds(api, "node-agent", "OnDelete")
+    _allow_ds(ctx, "node-agent")
+    assert not any("rollout guard" in p for p in K.plan(ctx)["problems"])
+    pods[1]["status"]["conditions"][0]["status"] = "False"           # a pod not Ready
+    assert any("node-agent is mid-rollout (OnDelete" in p for p in K.plan(ctx)["problems"])
+    pods[1]["status"]["conditions"][0]["status"] = "True"
+    pods[0]["metadata"]["deletionTimestamp"] = "2026-11-09T00:00:00Z"   # a pod terminating
+    assert any("terminating" in p for p in K.plan(ctx)["problems"])
+    pods[0]["metadata"].pop("deletionTimestamp")
+    ds["status"]["numberReady"] = 1                                     # status short of desired
+    assert any("numberReady" in p for p in K.plan(ctx)["problems"])
+    ds["status"]["numberReady"] = 2
+    ds["metadata"]["generation"] = 7                                    # not yet observed
+    assert any("has not observed" in p for p in K.plan(ctx)["problems"])
+    # a RollingUpdate DaemonSet keeps the strict rule: a revision lag is a rollout
+    ds2, _ = _ds(api, "agent-ru", "RollingUpdate", updated=1)
+    _allow_ds(ctx, "agent-ru")
+    ds["metadata"]["generation"] = 6
+    probs = K.plan(ctx)["problems"]
+    assert any("agent-ru is mid-rollout (updatedNumberScheduled" in p for p in probs)
+    assert not any("node-agent" in p for p in probs)
+
+
+def test_s1_ondelete_statefulsets_in_extra_owners(cal, api):
+    """vmselect/vmstorage/vmalertmanager: OnDelete with a lagging currentRevision, guarded through extra_owners."""
+    ctx = cal({"rollout_guard.extra_owners": [{"kind": "StatefulSet", "namespace": "monitoring",
+                                               "name": "vmselect-vmst"}]})
+    sts = api.put({"apiVersion": "apps/v1", "kind": "StatefulSet",
+                   "metadata": {"name": "vmselect-vmst", "namespace": "monitoring", "generation": 3},
+                   "spec": {"replicas": 2, "updateStrategy": {"type": "OnDelete"}},
+                   "status": {"observedGeneration": 3, "replicas": 2, "readyReplicas": 2, "updatedReplicas": 2,
+                              "currentRevision": "vmselect-a", "updateRevision": "vmselect-b"}})
+    pods = []
+    for i, node in enumerate(("worker-x", "worker-y")):
+        p = fake2.pod(f"vmselect-vmst-{i}", "monitoring", node, owner=("StatefulSet", "vmselect-vmst"))
+        p["metadata"]["ownerReferences"][0]["uid"] = sts["metadata"]["uid"]
+        p["metadata"]["labels"] = {"controller-revision-hash": "vmselect-a"}
+        p["status"] = {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}]}
+        pods.append(api.put(p))
+    assert not any("rollout guard" in p for p in K.plan(ctx)["problems"])
+    api.objects.pop(("pods", "monitoring", "vmselect-vmst-1"))
+    assert any("vmselect-vmst is mid-rollout (OnDelete: 1 pods for 2" in p for p in K.plan(ctx)["problems"])
+    api.put(pods[1])
+    sts["spec"]["updateStrategy"]["type"] = "RollingUpdate"           # the strict rule for RollingUpdate
+    assert any("currentRevision differs" in p for p in K.plan(ctx)["problems"])
+
+
+def _guard_world(ctx, api):
+    ds, pods = _ds(api, "node-agent", "OnDelete")
+    _allow_ds(ctx, "node-agent")
+    return ds, pods
+
+
+@pytest.mark.parametrize("change,why", [
+    ("replace", "replaced pods during the plateau"),
+    ("restart", "restarted during the plateau"),
+    ("revision", "changed revision during the plateau"),
+    ("template", "changed its template"),
+])
+def test_s1_guard_drift_during_a_plateau_stops_the_trial(cal, api, change, why):
+    ctx = cal()
+    ds, pods = _guard_world(ctx, api)
+
+    def drift(world, api_):
+        if any(k == "jobs" and n.endswith("t003") for (k, _, n) in api_.objects) and not world.__dict__.get("d"):
+            world.d = True
+            if change == "replace":
+                old = api_.objects.pop(("pods", "velero", "node-agent-0"))
+                new = copy.deepcopy(old)
+                new["metadata"]["uid"] = fake2.new_uid()
+                new["metadata"]["name"] = "node-agent-9"
+                api_.objects[("pods", "velero", "node-agent-9")] = new
+            elif change == "restart":
+                api_.objects[("pods", "velero", "node-agent-1")]["status"]["containerStatuses"][0]["restartCount"] = 1
+            elif change == "revision":
+                api_.objects[("pods", "velero", "node-agent-1")]["metadata"]["labels"]["controller-revision-hash"] = \
+                    "rev-6"
+            else:
+                d = api_.objects[("daemonsets", "velero", "node-agent")]
+                d["metadata"]["generation"] = 7
+                d["status"]["observedGeneration"] = 7
+    ctx.world.hooks.append(drift)
+    out = run(ctx)
+    stopped = [e["data"] for e in ctx.entries() if e["event"] == "trial-stopped"]
+    assert out["verdict"] == "NOT READY" and stopped and why in stopped[0]["reason"], stopped
+    guards = [e["data"] for e in ctx.entries() if e["event"] == "plateau-guard"]
+    assert guards and "DaemonSet/velero/node-agent" in guards[-1]["guard"]["owners"]
+    assert set(guards[0]["guard"]["owners"]["DaemonSet/velero/node-agent"]["pods"].values().__iter__().__next__()) \
+        == {"name", "revision", "restarts"}
+
+
+def test_s2_a_missing_series_cannot_hide_in_a_sum(cal):
+    ctx = cal()
+    run(ctx)
+    two = next(t for t in sorted(os.listdir(os.path.join(ctx.dir, "trials")))
+               if json.load(open(os.path.join(ctx.dir, "trials", t, "result.json")))["n"] == 2)
+    raw = _raw(ctx, two)
+    r = K.evaluate_trial(ctx.con, raw)
+    assert r["criteria"]["raw_freshness"]["fixture_cpu"] and \
+        len(r["criteria"]["raw_freshness"]["fixture_cpu"]) == 2
+    for source in ("fixture_cpu", "fixture_metrics"):
+        gone = copy.deepcopy(raw)
+        gone["observations"][f"raw_{source}"]["response"]["data"]["result"].pop(0)
+        assert any(f"raw {source}: no raw samples for" in w for w in K.evaluate_trial(ctx.con, gone)["incomplete"])
+    old = copy.deepcopy(raw)
+    for v in old["observations"]["raw_ingress_cpu"]["response"]["data"]["result"][0]["values"][20:24]:
+        v[1] = str(v[0] - 90)                                          # the newest raw sample 90 s old
+    assert any("raw ingress_cpu" in w and "90 s old" in w for w in K.evaluate_trial(ctx.con, old)["incomplete"])
+    steal = copy.deepcopy(raw)
+    steal["observations"]["raw_steal"]["response"]["data"]["result"].pop(1)
+    assert any("raw steal: no raw samples for" in w for w in K.evaluate_trial(ctx.con, steal)["incomplete"])
+
+
+def test_s2_live_raw_freshness(cal, api):
+    ctx = cal()
+    ctx.world.raw_missing = {"worker-s"}
+    assert any("required observation missing: raw steal" in p for p in K.plan(ctx)["problems"])
+    ctx.world.raw_missing = set()
+
+    def stale(world, api_):
+        if any(k == "jobs" and n.endswith("t003") for (k, _, n) in api_.objects):
+            world.raw_stale = {n for (k, _, n) in api_.objects if k == "pods" and "-ing-" in n}
+    ctx.world.hooks.append(stale)
+    out = run(ctx)
+    stopped = [e["data"] for e in ctx.entries() if e["event"] == "trial-stopped"]
+    assert out["verdict"] == "NOT READY" and "raw ingress" in stopped[0]["reason"]
+
+
+def test_s3_reconcile_tolerance_must_be_zero(cal):
+    ctx = cal()
+    path = K.record_contract_path(ctx.record)
+    good = json.load(open(path))
+    for tol in ({"absolute": 2, "relative": 0}, {"absolute": 0, "relative": 0.001}, {"absolute": False, "relative": 0}):
+        bad = copy.deepcopy(good)
+        bad["criteria"]["reconcile_tolerance"] = tol
+        open(path, "w").write(json.dumps(bad))
+        with pytest.raises(X.StagingError, match="reconcile_tolerance must be"):
+            K.load_contract(ctx.record, ctx.params)
+    # with zero tolerance, one arrival the generator never dispatched is unaccounted, never absorbed
+    open(path, "w").write(json.dumps(good))
+    run(ctx)
+    raw = _raw(ctx, "t003")
+    for v in raw["observations"]["ingress_after"]["requests"]["response"]["data"]["result"][0]["values"] + \
+            raw["observations"]["ingress_after"]["responses"]["response"]["data"]["result"][0]["values"]:
+        v[1] = str(float(v[1]) + 1)
+    assert any("unaccounted arrivals" in w for w in K.evaluate_trial(ctx.con, raw)["incomplete"])
+
+
+def test_s4_idle_cpu_is_averaged_after_the_washout(cal):
+    ctx = cal()
+    path = K.record_contract_path(ctx.record)
+    good = json.load(open(path))
+    bad = copy.deepcopy(good)
+    bad["work_selection"]["idle_s"] = 200                 # < 60 s rate window + 30 s scrape + 120 s averaging
+    open(path, "w").write(json.dumps(bad))
+    with pytest.raises(X.StagingError, match="idle_s must be at least the washout"):
+        K.load_contract(ctx.record, ctx.params)
+    open(path, "w").write(json.dumps(good))
+    run(ctx)
+    raw = _raw(ctx, "t001")
+    obs = raw["observations"]
+    assert obs["fixture_cpu_idle"]["start"] == obs["idle_window"]["start"] + 90
+    assert obs["fixture_cpu_idle"]["end"] == obs["idle_window"]["end"] == obs["idle_window"]["start"] + 240
+    assert K.evaluate_trial(ctx.con, raw)["verdict"] == "PASS"
+    early = copy.deepcopy(raw)
+    early["observations"]["fixture_cpu_idle"]["start"] = obs["idle_window"]["start"]     # contaminated beginning
+    assert any("idle averaging window" in w for w in K.evaluate_trial(ctx.con, early)["incomplete"])
+    gone = copy.deepcopy(raw)
+    gone["observations"]["idle_raw_fixture_cpu"]["response"]["data"]["result"] = []
+    assert any("raw fixture_cpu" in w for w in K.evaluate_trial(ctx.con, gone)["incomplete"])
+
+
+def test_s5_example_contract_uses_prod_style_queries(cal):
+    ctx = cal()
+    q, fr = ctx.con["observer"]["queries"], ctx.con["observer"]["freshness"]
+    for name in K.CPU_QUERIES:
+        assert q[name].count('metrics_path="/metrics/cadvisor"') == q[name].count("container_"), name
+    for name in ("fixture_cpu", "ingress_cpu", "generator_cpu"):
+        assert 'metrics_path="/metrics/cadvisor"' in fr[name]
+    assert 'job=~"__NAMESPACE__/c28cal-.+"' in q["ingress_up"] and ctx.con["stops"]["node_label"] == "nodename"
+    assert ctx.con["observer"]["scrape"] == "VMPodScrape" and ctx.con["observer"]["cpu_scrape_interval_s"] == 30
+    bad = copy.deepcopy(ctx.con)
+    bad["observer"]["queries"]["fixture_cpu_cores"] = q["fixture_cpu_cores"].replace("[1m]", "[5m]")
+    assert any("rate window" in p for p in K._observer_problems(bad["observer"], X.import_harness().render))

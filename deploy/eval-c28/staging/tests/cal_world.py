@@ -23,22 +23,40 @@ FIXTURE = "harbor.example/autoscaler/c28-fixture@sha256:" + "a" * 64
 GENERATOR = "grafana/k6@sha256:" + "e" * 64
 T0 = 1_796_000_000
 
-STEAL = 'max by (node) (rate(node_cpu_seconds_total{mode="steal"}[1m])) * 100'
+# Prod-style queries (calibration-observer-20261108T233404Z): the steal query joins node_uname_info for the node name
+# (label nodename); every CPU and throttling query filters metrics_path="/metrics/cadvisor" (prod's kubelet also
+# exposes container_cpu_usage_seconds_total on /metrics/resource, which a bare sum would count twice); up is limited to
+# the calibration's own VMPodScrape job.
+NODES_RE = 'nodename=~"worker-(w|s)"'
+STEAL = ('100 * sum by (nodename) (rate(node_cpu_seconds_total{job="node-exporter",mode="steal"}[1m]) * on (instance) '
+         'group_left (nodename) node_uname_info{job="node-exporter",' + NODES_RE + '}) / count by (nodename) '
+         '(node_cpu_seconds_total{job="node-exporter",mode="idle"} * on (instance) group_left (nodename) '
+         'node_uname_info{job="node-exporter",' + NODES_RE + '})')
+CADV = 'metrics_path="/metrics/cadvisor",namespace="__NAMESPACE__",pod=~"__PODS__",container!=""'
+UP = 'up{namespace="__NAMESPACE__",job=~"__NAMESPACE__/c28cal-.+",pod=~"__PODS__"}'
 QUERIES = {
-    "ingress_up": 'up{namespace="__NAMESPACE__",pod=~"__PODS__"}',
-    "fixture_up": 'up{namespace="__NAMESPACE__",pod=~"__PODS__"}',
+    "ingress_up": UP,
+    "fixture_up": UP,
     "fixture_requests": 'sum(c28_requests_total{namespace="__NAMESPACE__",target="__TARGET__"})',
     "fixture_inflight": 'sum(c28_inflight{namespace="__NAMESPACE__",target="__TARGET__"})',
     "ingress_requests": 'sum(c28_ingress_requests_total{namespace="__NAMESPACE__",target="__TARGET__"})',
     "ingress_responses": 'sum(c28_ingress_responses_total{namespace="__NAMESPACE__",target="__TARGET__"})',
     "fixture_queue": 'sum(c28_queue{namespace="__NAMESPACE__",target="__TARGET__"})',
 }
-CPU = 'sum(rate(container_cpu_usage_seconds_total{namespace="__NAMESPACE__",pod=~"__PODS__",container!=""}[1m]))'
-THR = ('sum(rate(container_cpu_cfs_throttled_periods_total{namespace="__NAMESPACE__",pod=~"__PODS__"}[1m])) / '
-       'sum(rate(container_cpu_cfs_periods_total{namespace="__NAMESPACE__",pod=~"__PODS__"}[1m]))')
+CPU = "sum(rate(container_cpu_usage_seconds_total{" + CADV + "}[1m]))"
+THR = ("sum(rate(container_cpu_cfs_throttled_periods_total{" + CADV + "}[1m])) / "
+       "sum(rate(container_cpu_cfs_periods_total{" + CADV + "}[1m]))")
 for comp in ("fixture", "ingress", "generator"):
     QUERIES[f"{comp}_cpu_cores"] = CPU
     QUERIES[f"{comp}_throttled_fraction"] = THR
+RAW_CPU = "min by (pod) (timestamp(container_cpu_usage_seconds_total{" + CADV + "}))"
+FRESHNESS = {
+    "fixture_metrics": 'min by (pod) (timestamp(c28_queue{namespace="__NAMESPACE__",pod=~"__PODS__"}))',
+    "fixture_cpu": RAW_CPU, "ingress_cpu": RAW_CPU, "generator_cpu": RAW_CPU,
+    "ingress_metrics": "min by (pod) (timestamp(" + UP + "))",
+    "steal": ('min by (nodename) (timestamp(node_cpu_seconds_total{job="node-exporter",mode="steal",cpu="0"}) '
+              '* on (instance) group_left (nodename) (0 * node_uname_info{job="node-exporter",' + NODES_RE + '} + 1))'),
+}
 
 
 def contract(tmp, **over):
@@ -53,22 +71,22 @@ def contract(tmp, **over):
         "candidate": {"cpu_request": "50m", "cpu_limit": "50m", "memory_request": "32Mi", "memory_limit": "32Mi",
                       "response_bytes": 1024, "max_inflight": 1, "max_queue": 32, "queue_timeout_seconds": 1.5,
                       "gomaxprocs": 2, "startup_delay_seconds": 20},
-        "work_selection": {"values": [600, 900], "rate_rps": 8, "idle_s": 120, "settle_s": 60, "measure_s": 300,
+        "work_selection": {"values": [600, 900], "rate_rps": 8, "idle_s": 240, "settle_s": 60, "measure_s": 300,
                            "cpu_ms_per_request": {"min": 2.5, "target": 2.75, "max": 3.0},
                            "tie_break": K.TIE_BREAK},
         "ingress": {"cpu_request": "100m", "cpu_limit": "500m", "memory_request": "64Mi", "memory_limit": "64Mi"},
         "generator": {"k6_version": "0.57.0", "cpu_request": "500m", "cpu_limit": "1", "memory_request": "256Mi",
                       "memory_limit": "512Mi"},
         "observer": {"query_api": "http://vmselect.monitoring.svc:8481/select/0/prometheus", "step_s": 15,
-                     "max_staleness_s": 60, "scrape": "annotations", "queries": dict(QUERIES), "pods": [],
-                     "pod_label": "pod"},
-        "stops": {"steal_query": STEAL, "node_label": "node", "steal_percent": 5, "steal_bins": 5},
+                     "max_staleness_s": 60, "scrape": "VMPodScrape", "queries": dict(QUERIES), "pods": [],
+                     "pod_label": "pod", "freshness": dict(FRESHNESS), "cpu_scrape_interval_s": 30},
+        "stops": {"steal_query": STEAL, "node_label": "nodename", "steal_percent": 5, "steal_bins": 5},
         "criteria": {"p95_ms": 200, "p99_ms": 500, "max_failure_fraction": 0.001, "max_dropped_arrivals": 0,
                      "linearity_min": 0.90, "ceiling_factor": 1.2,
                      "queue_growth": {"bin_s": 60, "edge_bins": 2, "max_increase": 2.0, "max_slope_per_min": 0.2,
                                       "max_end_backlog_per_replica": 4.0},
                      "max_generator_throttled_fraction": 0.05, "max_ingress_throttled_fraction": 0.05,
-                     "reconcile_tolerance": {"absolute": 2, "relative": 0.001}},
+                     "reconcile_tolerance": {"absolute": 0, "relative": 0}},
         "search": {"replica_counts": [1, 2, 4], "repetitions": 3, "settle_s": 300, "measure_s": 900,
                    "rate_min_rps_per_replica": 2, "rate_max_rps_per_replica": 30, "initial_rps_per_replica": 18,
                    "bracket_factor": 1.25, "resolution": 0.05, "max_trials": 80,
@@ -112,6 +130,9 @@ class World:
         self.direct_traffic = False   # requests straight to the fixture (bypassing the ingress) during idle
         self.drop_key_absent = True   # k6 omits dropped_iterations when nothing dropped
         self.up_label = "pod"         # the label the observer's up series name pods with
+        self.raw_age = 10             # age of the newest raw sample behind every series
+        self.raw_missing = set()      # pods/nodes whose raw samples are absent (hidden inside a sum otherwise)
+        self.raw_stale = set()        # pods/nodes whose newest raw sample is 200 s old
         self.missing = set()
         self.counters = {}            # target -> {"req": n, "resp": n}
         self.windows = []             # [{target, start, end, rate_rps, wi, ok}]
@@ -280,8 +301,10 @@ class World:
             if "steal" in self.missing:
                 return {"status": "success", "data": {"result": []}}
             return {"status": "success", "data": {"result": [
-                {"metric": {"node": n}, "values": [[t, str(self.steal.get(n, 1.0))] for t in g60]}
+                {"metric": {"nodename": n}, "values": [[t, str(self.steal.get(n, 1.0))] for t in g60]}
                 for n in ("worker-w", "worker-s")]}}
+        if "timestamp(" in query:
+            return self._raw(query, grid, pods)
         if query.startswith("up{"):
             kind = "up"
         elif "c28_ingress_requests_total" in query:
@@ -334,6 +357,20 @@ class World:
             w = self._window(target=variant, t=t)
             return 0.002 + (w["rate_rps"] * self.cost_ms[w["wi"]] / 1000 if w else 0)
         return self._series(grid, cpu)
+
+    def _raw(self, query, grid, pods):
+        """timestamp() queries: one series per live pod matching the regex (or per node for steal), valued with the
+        raw sample's timestamp: raw_age seconds old, unless the source is in raw_missing or raw_stale."""
+        if "node_cpu_seconds_total" in query:
+            label, names = "nodename", ["worker-w", "worker-s"]
+        else:
+            label = "pod"
+            names = sorted(o["metadata"]["name"] for (k, _, _), o in self.api.objects.items()
+                           if k == "pods" and re.fullmatch(pods, o["metadata"]["name"]))
+        return {"status": "success", "data": {"result": [
+            {"metric": {label: n}, "values": [[t, str(t - (200 if n in self.raw_stale else self.raw_age))]
+                                              for t in grid]}
+            for n in names if n not in self.raw_missing]}}
 
     def _window(self, target, t):
         return next((w for w in self.windows if w["target"] == target and w["start"] <= t <= w["end"]), None)

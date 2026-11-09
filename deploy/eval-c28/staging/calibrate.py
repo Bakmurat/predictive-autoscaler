@@ -132,6 +132,19 @@ the calibration. Every /scale write re-checks the writers, the configuration and
 before the PUT, inside its journalled step, with scale-write receipts not-submitted / submitting / applied / refused /
 unknown, so recover tells a refused pre-write check from a lost response.
 
+Guards added before the contract freeze. The rollout guard judges OnDelete DaemonSets and StatefulSets (which
+deliberately keep pods on an older template) by observed generation, the expected pod count in status and their own
+pods all Running, Ready and non-terminating, never by revision lag; RollingUpdate objects keep the strict rules; the
+contract's extra_owners may list the OnDelete observer StatefulSets (vmselect, vmstorage). At each plateau's start the
+owners' UIDs, generations and pod UID/revision/restart sets are recorded (plateau-guard) and every gate of its trials
+stops on a replacement, restart, revision or template change. Raw samples: for every expected source (each fixture
+pod's own metrics and CPU, the ingress pod, the generator pod while it runs, W and S for steal) a timestamp() query
+(observer.freshness) must return exactly one series per source with its newest raw sample at most max_staleness_s old
+at every evaluation of the window, live at every gate and in the evidence (raw_freshness), so a missing pod cannot
+vanish inside a sum. Dispatched, received and answered arrivals reconcile with tolerance 0/0 (the contract allows
+nothing else). The selection's idle CPU is averaged only after a washout of the 60 s rate window plus one CPU scrape
+interval (observer.cpu_scrape_interval_s), and idle_s must cover the washout plus 120 s of averaging.
+
 Interruption. Everything runs under the shared evaluation lock (execlib.mutating) with intents before and outcomes
 after each create, delete and /scale step; an unknown outcome keeps the lock until `recover`. Trial boundaries
 (trial-begin, trial-result, trial-stopped, trial-interrupted) and every decision are receipts. Cleanup deletes the
@@ -202,6 +215,14 @@ WINDOW_QUERIES = ("fixture_queue", "fixture_inflight", "fixture_cpu_cores", "fix
                   "ingress_cpu_cores", "ingress_throttled_fraction", "generator_cpu_cores",
                   "generator_throttled_fraction")
 ROLLOUT_KINDS = ["DaemonSet", "Deployment", "StatefulSet"]
+# Raw-sample freshness: per expected source, a timestamp() query returning one series per pod (observer.pod_label) or
+# per node (stops.node_label) whose values are the raw samples' own timestamps (MetricsQL timestamp() of a selector).
+FRESHNESS_TOKENS = {"fixture_metrics": "__PODS__", "fixture_cpu": "__PODS__", "ingress_metrics": "__PODS__",
+                    "ingress_cpu": "__PODS__", "generator_cpu": "__PODS__", "steal": ""}
+CPU_QUERIES = ("fixture_cpu_cores", "fixture_throttled_fraction", "ingress_cpu_cores", "ingress_throttled_fraction",
+               "generator_cpu_cores", "generator_throttled_fraction")
+RATE_WINDOW_S = 60               # frozen.RATE_RANGE: every CPU query's rate()/increase() window is [1m]
+MIN_IDLE_AVERAGING_S = 120       # the idle CPU mean needs at least this much washed-out interval
 VERDICTS = ("PASS", "FAIL", "LIMIT", "INCOMPLETE", "STOPPED")
 SCOPE_LIMITS = ["capacity calibration of this fixture candidate only (sidecar-free, fixed replicas, no autoscaler)",
                 "does not qualify the CPU HPA target, the startup profiles or the twelve-replica layout",
@@ -360,6 +381,12 @@ def contract_problems(con, record: X.Record, params: Dict) -> List[str]:
         if not (_num(cand["startup_delay_seconds"]) and 0 <= cand["startup_delay_seconds"] <= 600):
             out.append("candidate.startup_delay_seconds must be a finite number in [0, 600]")
     out += _work_selection_problems(con["work_selection"], con["criteria"])
+    ws, ob = con["work_selection"], con["observer"]
+    if isinstance(ws, dict) and isinstance(ob, dict) and _int(ws.get("idle_s")) and \
+            _int(ob.get("cpu_scrape_interval_s")) and ws["idle_s"] < washout_s(con) + MIN_IDLE_AVERAGING_S:
+        out.append(f"work_selection.idle_s must be at least the washout ({RATE_WINDOW_S} s rate window + "
+                   f"{ob['cpu_scrape_interval_s']} s CPU scrape) + {MIN_IDLE_AVERAGING_S} s of idle averaging = "
+                   f"{washout_s(con) + MIN_IDLE_AVERAGING_S} s")
     out += _resources_problems(con["ingress"], "ingress", R)
     gen = con["generator"]
     if not (isinstance(gen, dict) and "k6_version" in gen):
@@ -420,7 +447,8 @@ def _work_selection_problems(ws, cr) -> List[str]:
 
 
 def _observer_problems(ob, R) -> List[str]:
-    keys = {"query_api", "step_s", "max_staleness_s", "scrape", "queries", "pods", "pod_label"}
+    keys = {"query_api", "step_s", "max_staleness_s", "scrape", "queries", "pods", "pod_label", "freshness",
+            "cpu_scrape_interval_s"}
     if not (isinstance(ob, dict) and set(ob) == keys):
         return [f"observer must be exactly {sorted(keys)}"]
     out = []
@@ -442,6 +470,18 @@ def _observer_problems(ob, R) -> List[str]:
         for name, token in QUERY_TOKENS.items():
             if not (isinstance(q[name], str) and q[name].strip() and token in q[name]):
                 out.append(f"observer.queries.{name} must be a query using {token}")
+            elif name in CPU_QUERIES and "[1m]" not in q[name]:
+                out.append(f"observer.queries.{name} must use the frozen 60 s rate window [1m]")
+    fr = ob["freshness"]
+    if not (isinstance(fr, dict) and set(fr) == set(FRESHNESS_TOKENS)):
+        out.append(f"observer.freshness must be exactly {sorted(FRESHNESS_TOKENS)} (raw-sample timestamp queries)")
+    else:
+        for name, token in FRESHNESS_TOKENS.items():
+            if not (isinstance(fr[name], str) and "timestamp(" in fr[name] and token in fr[name]):
+                out.append(f"observer.freshness.{name} must be a timestamp() query" +
+                           (f" using {token}" if token else ""))
+    if not (_int(ob["cpu_scrape_interval_s"]) and 5 <= ob["cpu_scrape_interval_s"] <= 60):
+        out.append("observer.cpu_scrape_interval_s must be the cAdvisor scrape interval in seconds (5..60)")
     pods = ob["pods"]
     if not isinstance(pods, list):
         out.append("observer.pods must be a list of declared observer pods (or [])")
@@ -485,9 +525,10 @@ def _criteria_problems(cr) -> List[str]:
             if not (_num(qg[k]) and qg[k] > 0):
                 out.append(f"criteria.queue_growth.{k} must be a finite positive number")
     rt = cr["reconcile_tolerance"]
-    if not (isinstance(rt, dict) and set(rt) == {"absolute", "relative"} and _int(rt["absolute"])
-            and 0 <= rt["absolute"] <= 100 and _num(rt["relative"]) and 0 <= rt["relative"] <= 0.01):
-        out.append("criteria.reconcile_tolerance must be {absolute: 0..100, relative: 0..0.01}")
+    if not (isinstance(rt, dict) and set(rt) == {"absolute", "relative"} and rt["absolute"] == 0 and
+            rt["relative"] == 0 and not any(isinstance(v, bool) for v in rt.values())):
+        out.append("criteria.reconcile_tolerance must be {absolute: 0, relative: 0}: dispatched, received and answered "
+                   "arrivals reconcile exactly (only k6's own scheduled count may carry its one boundary iteration)")
     return out
 
 
@@ -538,6 +579,12 @@ def _search_problems(se) -> List[str]:
         if not (_int(se[k]) and lo <= se[k] <= hi):
             out.append(f"search.{k} must be an integer in {lo}..{hi}")
     return out
+
+
+def washout_s(con: Dict) -> int:
+    """The idle CPU average begins only after a full rate window plus one CPU scrape interval of idle: a sample inside
+    that span still carries activity from before the idle interval through its [1m] look-back."""
+    return RATE_WINDOW_S + int(con["observer"]["cpu_scrape_interval_s"])
 
 
 def load_contract(record: X.Record, params: Dict) -> Tuple[Dict, str, str]:
@@ -1137,16 +1184,62 @@ def pods_up(obs: Dict, expected: List[str], at_start: int, at_end: int, con: Dic
     return ""
 
 
+def resolve_fresh(con: Dict, source: str, pods: str = "") -> str:
+    q = con["observer"]["freshness"][source]
+    return q.replace("__NAMESPACE__", con["namespace"]).replace("__PODS__", pods)
+
+
+def raw_freshness(con: Dict, obs: Optional[Dict], expected: List[str], label: str, start: int,
+                  end: int) -> Tuple[str, Dict]:
+    """Raw-sample freshness and coverage of one source over [start, end]: the timestamp() query must return EXACTLY one
+    series per expected pod or node (by `label`; a missing series would otherwise vanish silently inside a sum), each
+    with points covering the interval at the evaluation cadence, and at every evaluation the newest raw sample at most
+    max_staleness_s old (and not from the future). Returns (why, {name: {max_age_s, points}})."""
+    step, stale = con["observer"]["step_s"], con["observer"]["max_staleness_s"]
+    by, why = series_by_label(obs or {}, label)
+    if by is None:
+        return f"raw freshness query unusable ({why})", {}
+    if not expected:
+        return "no expected source to check", {}
+    out, detail = [], {}
+    missing, extra = sorted(set(expected) - set(by)), sorted(set(by) - set(expected))
+    if missing:
+        out.append(f"no raw samples for {missing}")
+    if extra:
+        out.append(f"unexpected sources {extra}")
+    for name in sorted(set(expected) & set(by)):
+        pts = [(t, v) for t, v in by[name] if start - step <= t <= end]
+        gap = covered(pts, start, end, step) if pts else "no samples in the interval"
+        ages = [t - v for t, v in pts]
+        detail[name] = {"max_age_s": max(ages) if ages else None, "points": len(pts)}
+        if gap:
+            out.append(f"{name}: {gap}")
+        elif max(ages) > stale or min(ages) < -step:
+            out.append(f"{name}: a raw sample {max(ages):.0f} s old (max_staleness_s {stale})" if max(ages) > stale
+                       else f"{name}: a raw sample timestamped in the future")
+    return "; ".join(out), detail
+
+
 def idle_verdict(con: Dict, obs: Dict, readings: Dict) -> Tuple[str, Dict]:
     """The selection's idle interval was idle: the ingress counters fresh, quiet and unchanged from its start to the
     trial's before-reading; the fixture's own request counter unchanged over it (no direct-to-fixture traffic; an
     absent counter only while the fixture's scrape is proven up for exactly its pod); the waiting queue and the
-    in-flight gauge 0 throughout."""
-    win = obs.get("fixture_cpu_idle") or {}
+    in-flight gauge 0 throughout; and over its washed-out averaging part, raw samples fresh for the fixture pod's own
+    metrics and CPU and for the ingress."""
+    win = obs.get("idle_window") or {}
     s0, s1 = win.get("start"), win.get("end")
     out, detail = [], {}
     if not (_int(s0) and _int(s1)):
         return "no idle window recorded", detail
+    avg = obs.get("fixture_cpu_idle") or {}
+    fixture_pods = obs.get("idle_fixture_pods")
+    for source, names in (("fixture_metrics", fixture_pods), ("fixture_cpu", fixture_pods),
+                          ("ingress_metrics", obs.get("idle_ingress_pods"))):
+        why, d = raw_freshness(con, obs.get(f"idle_raw_{source}"), names or [], con["observer"]["pod_label"],
+                               avg.get("start") or 0, avg.get("end") or 0)
+        detail[f"raw_{source}"] = d
+        if why:
+            out.append(f"raw {source}: {why}")
     start_reading = obs.get("ingress_idle_start") or {}
     for k in ("requests", "responses"):
         v0, why0 = quiet_value(start_reading.get(k) or {}, int(start_reading.get("at") or 0), con,
@@ -1316,11 +1409,14 @@ def evaluate_trial(con: Dict, raw: Dict) -> Dict:
     obs_stats = {}
     named = [(name, window) for name in WINDOW_QUERIES]
     if kind == "selection":
-        idle = obs.get("fixture_cpu_idle") or {}
+        idle, whole = obs.get("fixture_cpu_idle") or {}, obs.get("idle_window") or {}
         iw = {"start": idle.get("start"), "end": idle.get("end")}
-        if not (_int(iw["start"]) and _int(iw["end"]) and iw["end"] - iw["start"] == con["work_selection"]["idle_s"]
-                and started is not None and iw["end"] <= started):
-            incomplete.append("fixture_cpu_idle: the idle window is not the declared idle_s before the trial")
+        if not (_int(iw["start"]) and _int(iw["end"]) and _int(whole.get("start")) and _int(whole.get("end")) and
+                whole["end"] - whole["start"] == con["work_selection"]["idle_s"] and
+                iw["start"] == whole["start"] + washout_s(con) and iw["end"] == whole["end"] and
+                started is not None and whole["end"] <= started):
+            incomplete.append("fixture_cpu_idle: the idle averaging window is not the declared idle_s before the "
+                              "trial minus its washout")
         else:
             named.append(("fixture_cpu_idle", iw))
     for name, win in named:
@@ -1343,6 +1439,24 @@ def evaluate_trial(con: Dict, raw: Dict) -> Dict:
         crit["steal"] = steal
         if stop:
             incomplete.append(f"interference: {stop}")
+        pb_ = raw.get("pods_begin") or {}
+        names = lambda ps: sorted((p.get("metadata") or {}).get("name") for p in ps or [])  # noqa: E731
+        gen_name = ((raw.get("generator_pod") or {}).get("metadata") or {}).get("name")
+        expect = {"fixture_metrics": names(pb_.get(t["variant"])), "fixture_cpu": names(pb_.get(t["variant"])),
+                  "ingress_metrics": names(pb_.get("ingress")), "ingress_cpu": names(pb_.get("ingress")),
+                  "generator_cpu": [gen_name] if gen_name else [],
+                  "steal": [con["nodes"][r]["name"] for r in ("workload", "support")]}
+        crit["raw_freshness"] = {}
+        for source, exp in expect.items():
+            label = con["stops"]["node_label"] if source == "steal" else con["observer"]["pod_label"]
+            o = obs.get(f"raw_{source}") or {}
+            if (o.get("start"), o.get("end")) != (window["start"], window["end"]):
+                incomplete.append(f"raw {source}: not recorded over the measurement window")
+                continue
+            why_r, d = raw_freshness(con, o, exp, label, window["start"], window["end"])
+            crit["raw_freshness"][source] = d
+            if why_r:
+                incomplete.append(f"raw {source}: {why_r}")
     if kind == "selection":
         idle_why, idle = idle_verdict(con, obs, readings)
         crit["idle"] = idle
@@ -1762,11 +1876,55 @@ def admission(ctx: Context) -> Tuple[Dict, List[str]]:
     return report, problems
 
 
-def _settled(kind: str, o: Dict) -> str:
-    """'' when a Deployment/StatefulSet/DaemonSet has no rollout in progress; otherwise why."""
+def _strategy(kind: str, o: Dict) -> str:
+    spec = o.get("spec") or {}
+    if kind == "Deployment":
+        return ((spec.get("strategy") or {}).get("type")) or "RollingUpdate"
+    return ((spec.get("updateStrategy") or {}).get("type")) or "RollingUpdate"
+
+
+def _ready(p: Dict) -> bool:
+    st = p.get("status") or {}
+    return st.get("phase") == "Running" and any(c.get("type") == "Ready" and c.get("status") == "True"
+                                                for c in st.get("conditions") or [])
+
+
+def _settled(kind: str, o: Dict, pods: Optional[List[Dict]] = None) -> str:
+    """'' when a Deployment/StatefulSet/DaemonSet has no rollout in progress; otherwise why.
+
+    RollingUpdate (and Recreate): the strict status rules (observed generation, every replica updated and available;
+    a StatefulSet's currentRevision equal to its updateRevision). OnDelete DaemonSets and StatefulSets deliberately let
+    existing pods keep an older template, so revision lag alone is not an active rollout: they need the observed
+    generation, the expected pod count in status, and their pods (`pods`, controlled by exactly this object) exactly
+    that many, all Running and Ready, none terminating. The stable pod UID/revision/restart set is then enforced over
+    each plateau by guard_drift."""
     st, spec, gen = o.get("status") or {}, o.get("spec") or {}, (o.get("metadata") or {}).get("generation", 0)
     if int(st.get("observedGeneration") or 0) < int(gen or 0):
         return "its controller has not observed the current generation"
+    strategy = _strategy(kind, o)
+    if kind in ("DaemonSet", "StatefulSet") and strategy == "OnDelete":
+        if pods is None:
+            return "OnDelete: its pods were not read"
+        if kind == "DaemonSet":
+            want = int(st.get("desiredNumberScheduled") or 0)
+            bad = [k for k in ("currentNumberScheduled", "numberReady", "numberAvailable")
+                   if int(st.get(k) or 0) != want]
+            bad += [k for k in ("numberMisscheduled", "numberUnavailable") if int(st.get(k) or 0)]
+        else:
+            want = int(spec.get("replicas", 1) if spec.get("replicas") is not None else 1)
+            bad = [k for k in ("replicas", "readyReplicas") if int(st.get(k) or 0) != want]
+            if "availableReplicas" in st and int(st.get("availableReplicas") or 0) != want:
+                bad.append("availableReplicas")
+        if bad:
+            return f"OnDelete: {', '.join(bad)} differ from {want}"
+        terminating = sorted(p["metadata"]["name"] for p in pods if p["metadata"].get("deletionTimestamp"))
+        unready = sorted(p["metadata"]["name"] for p in pods if not p["metadata"].get("deletionTimestamp")
+                         and not _ready(p))
+        if len(pods) != want or terminating or unready:
+            return (f"OnDelete: {len(pods)} pods for {want} expected" + (f", terminating {terminating}" if terminating
+                                                                         else "") +
+                    (f", not Ready {unready}" if unready else ""))
+        return ""
     if kind == "Deployment":
         want = int(spec.get("replicas", 1) if spec.get("replicas") is not None else 1)
         bad = [k for k in ("replicas", "updatedReplicas", "availableReplicas") if int(st.get(k) or 0) != want]
@@ -1784,13 +1942,12 @@ def _settled(kind: str, o: Dict) -> str:
     return f"{', '.join(bad)} differ from desired {want}" if bad else ""
 
 
-def rollout_problems(ctx: Context) -> List[str]:
-    """No rollout in progress for any workload with a pod on W or S (the calibration's own excepted) nor for the
-    contract's extra_owners (e.g. the observer stack): capacity is never measured during platform rollouts."""
-    view, cache, rs_cache, out, seen = ctx.view(), {}, {}, [], set()
+def _guarded_owners(ctx: Context, pods: List[Dict]) -> List[Tuple[str, str, str, Optional[str]]]:
+    """Every Deployment/StatefulSet/DaemonSet with a live pod on W or S (the calibration's own excepted), and the
+    contract's extra_owners (the observer stack: vmagent, vminsert, vmselect, vmstorage, ...)."""
+    view, cache, rs_cache, owners = ctx.view(), {}, {}, []
     nodes = {ctx.con["nodes"][r]["name"] for r in ("workload", "support")}
-    owners = []
-    for p in ctx.kube.list("Pod"):
+    for p in pods:
         if (p.get("spec") or {}).get("nodeName") not in nodes or \
                 (p.get("status") or {}).get("phase") in ("Succeeded", "Failed") or \
                 reserve.calibration_owned(ctx.kube, p, view, None, cache):
@@ -1799,18 +1956,88 @@ def rollout_problems(ctx: Context) -> List[str]:
         if o["kind"] in ROLLOUT_KINDS:
             owners.append((o["kind"], o["namespace"], o["name"], o["uid"]))
     owners += [(o["kind"], o["namespace"], o["name"], None) for o in ctx.con["rollout_guard"]["extra_owners"]]
+    seen, out = set(), []
     for kind, ns, name, uid in owners:
-        if (kind, ns, name) in seen:
-            continue
-        seen.add((kind, ns, name))
+        if (kind, ns, name) not in seen:
+            seen.add((kind, ns, name))
+            out.append((kind, ns, name, uid))
+    return out
+
+
+def _owned_by(kind: str, o: Dict, pods: List[Dict], replicasets: List[Dict]) -> List[Dict]:
+    """The pods this exact object controls (a Deployment's through its ReplicaSets), terminating ones included."""
+    uid = o["metadata"]["uid"]
+    if kind == "Deployment":
+        rs = {r["metadata"]["uid"] for r in replicasets if _controller_uid(r, "Deployment") == uid}
+        return [p for p in pods if _controller_uid(p, "ReplicaSet") in rs]
+    return [p for p in pods if _controller_uid(p, kind) == uid]
+
+
+def guard_snapshot(ctx: Context) -> Dict:
+    """The guarded owners and their pods now: per owner its UID, generation and strategy, the settled verdict, and per
+    pod (by UID) its name, revision (controller-revision-hash or pod-template-hash) and summed restart count."""
+    pods, replicasets = ctx.kube.list("Pod"), ctx.kube.list("ReplicaSet")
+    owners, problems = {}, []
+    for kind, ns, name, uid in _guarded_owners(ctx, pods):
+        key = f"{kind}/{ns}/{name}"
         live = ctx.kube.get(kind, name, ns)
         if live is None or (uid and live["metadata"].get("uid") != uid):
-            out.append(f"rollout guard: {kind} {ns}/{name} cannot be read (its rollout state is unknown)")
+            problems.append(f"rollout guard: {kind} {ns}/{name} cannot be read (its rollout state is unknown)")
             continue
-        why = _settled(kind, live)
+        mine = _owned_by(kind, live, pods, replicasets)
+        why = _settled(kind, live, mine)
         if why:
-            out.append(f"rollout guard: {kind} {ns}/{name} is mid-rollout ({why})")
+            problems.append(f"rollout guard: {kind} {ns}/{name} is mid-rollout ({why})")
+        labels = lambda p: (p.get("metadata") or {}).get("labels") or {}  # noqa: E731
+        owners[key] = {"uid": live["metadata"]["uid"], "generation": live["metadata"].get("generation"),
+                       "strategy": _strategy(kind, live),
+                       "pods": {p["metadata"]["uid"]: {
+                           "name": p["metadata"]["name"],
+                           "revision": labels(p).get("controller-revision-hash") or labels(p).get("pod-template-hash"),
+                           "restarts": sum(int(c.get("restartCount") or 0) for c in
+                                           ((p.get("status") or {}).get("containerStatuses") or []) +
+                                           ((p.get("status") or {}).get("initContainerStatuses") or []))}
+                           for p in mine}}
+    return {"owners": owners, "problems": problems}
+
+
+def guard_drift(baseline: Dict, now: Dict) -> List[str]:
+    """Changes since the plateau's recorded guard snapshot: an owner gone, replaced or with a new generation (template
+    change), a new guarded owner, a pod replaced (UID set differs), a pod on another revision, or a restart."""
+    out = []
+    b, n = baseline.get("owners") or {}, now.get("owners") or {}
+    for key in sorted(set(b) | set(n)):
+        if key not in n:
+            out.append(f"rollout guard: {key} is gone or unreadable since the plateau began")
+            continue
+        if key not in b:
+            out.append(f"rollout guard: {key} began guarding W/S during the plateau")
+            continue
+        x, y = b[key], n[key]
+        if x["uid"] != y["uid"]:
+            out.append(f"rollout guard: {key} was replaced during the plateau")
+            continue
+        if x["generation"] != y["generation"]:
+            out.append(f"rollout guard: {key} changed its template (generation {x['generation']} -> "
+                       f"{y['generation']}) during the plateau")
+        if set(x["pods"]) != set(y["pods"]):
+            out.append(f"rollout guard: {key} replaced pods during the plateau "
+                       f"({sorted(p['name'] for u, p in x['pods'].items() if u not in y['pods'])} -> "
+                       f"{sorted(p['name'] for u, p in y['pods'].items() if u not in x['pods'])})")
+        for u in sorted(set(x["pods"]) & set(y["pods"])):
+            if x["pods"][u]["revision"] != y["pods"][u]["revision"]:
+                out.append(f"rollout guard: {key} pod {y['pods'][u]['name']} changed revision during the plateau")
+            if y["pods"][u]["restarts"] > x["pods"][u]["restarts"]:
+                out.append(f"rollout guard: {key} pod {y['pods'][u]['name']} restarted during the plateau")
     return out
+
+
+def rollout_problems(ctx: Context, baseline: Optional[Dict] = None) -> List[str]:
+    """No rollout in progress for any workload with a pod on W or S (the calibration's own excepted) nor for the
+    contract's extra_owners (e.g. the observer stack): capacity is never measured during platform rollouts. With the
+    plateau's baseline snapshot, also no replacement, restart or template change since it was recorded."""
+    snap = guard_snapshot(ctx)
+    return snap["problems"] + (guard_drift(baseline, snap) if baseline is not None else [])
 
 
 def reservation_problems(ctx: Context) -> List[str]:
@@ -2084,7 +2311,19 @@ def steal_problems(ctx: Context) -> List[str]:
     end = ctx.now() - ctx.now() % 60
     why, _ = steal_verdict(ctx.con, steal_query(ctx.fetch, ctx.con, end - 60 * bins, end), end - 60 * (bins - 1),
                            end)
-    return [f"interference stop: {why}"] if why else []
+    out = [f"interference stop: {why}"] if why else []
+    raw = live_raw(ctx, "steal", [ctx.con["nodes"][r]["name"] for r in ("workload", "support")], "",
+                   ctx.con["stops"]["node_label"])
+    return out + ([f"interference stop: required observation missing: {raw}"] if raw else [])
+
+
+def live_raw(ctx: Context, source: str, expected: List[str], regex: str, label: Optional[str] = None) -> str:
+    """'' when every expected source has a fresh raw sample now (raw_freshness over the last four evaluations)."""
+    con, now = ctx.con, ctx.now()
+    span = 4 * con["observer"]["step_s"]
+    obs = query_range(ctx.fetch, con, resolve_fresh(con, source, regex), now - span, now)
+    why, _ = raw_freshness(con, obs, expected, label or con["observer"]["pod_label"], now - span, now)
+    return f"raw {source}: {why}" if why else ""
 
 
 def observer_problems(ctx: Context, role: Optional[str]) -> List[str]:
@@ -2108,14 +2347,20 @@ def observer_problems(ctx: Context, role: Optional[str]) -> List[str]:
         pts, why = series(query_range(ctx.fetch, con, resolve_query(con, target, cpu, regex), now - span, now))
         if pts is None or not pts or now - pts[-1][0] > con["observer"]["max_staleness_s"]:
             out.append(f"observer: {cpu} has no fresh series for the live {r} pods ({why or 'stale'})")
+        comp = "ingress" if r == "ingress" else "fixture"
+        for source in (f"{comp}_metrics", f"{comp}_cpu"):
+            why = live_raw(ctx, source, live, regex)
+            if why:
+                out.append(f"observer: {why}")
     return out
 
 
-def gate_problems(ctx: Context, fixture_state: Optional[Dict] = None, reservation: bool = True) -> List[str]:
+def gate_problems(ctx: Context, fixture_state: Optional[Dict] = None, reservation: bool = True,
+                  guard: Optional[Dict] = None) -> List[str]:
     """Everything that must hold before a trial and throughout it (fixture_state: the replicas and generation the
-    fixture must still have)."""
+    fixture must still have; guard: the plateau's recorded rollout-guard snapshot, compared with the live one)."""
     out = writer_problems(ctx) + ownership_problems(ctx) + config_problems(ctx) + node_problems(ctx) + \
-        steal_problems(ctx) + rollout_problems(ctx) + activity_problems(ctx) + injection(ctx)
+        steal_problems(ctx) + rollout_problems(ctx, guard) + activity_problems(ctx) + injection(ctx)
     if reservation:
         out += reservation_problems(ctx)
     _, adm = admission(ctx)
@@ -2323,13 +2568,15 @@ def trial_meta(ctx: Context, index: int, kind: str, role: str, n: int, rate: int
             "seed": trial_seed(ctx.sha, kind, target, n, rate, rep)}
 
 
-def run_trial(ctx: Context, meta: Dict, decision_sha: str) -> Dict:
+def run_trial(ctx: Context, meta: Dict, decision_sha: str, guard: Optional[Dict] = None) -> Dict:
     """One trial: gate (configuration, writers, reservation, steal, observer proof, ...), for a selection the idle
     interval with its proof, a quiet ingress reading, the Job, monitoring every poll_s, a final gate once the Job
     completed, the after reading past the grace period, raw observations over the ACTUAL measurement window (the k6
     measure scenario's recorded start), the Job's deletion with its pods proven gone, then the verdict (evaluate_trial
-    on the raw files). A gate violation stops the trial and raises Halt."""
+    on the raw files). A gate violation stops the trial and raises Halt. `guard`: the plateau's recorded rollout-guard
+    snapshot (guard_snapshot), compared at every gate: a replacement, restart or template change stops the trial."""
     se, con = ctx.con["search"], ctx.con
+    guard = guard if guard is not None else guard_snapshot(ctx)
     trial, n, rate = meta["id"], meta["n"], meta["rate_per_min"]
     if meta["kind"] != "selection":
         rmin, rmax = bounds(con, n)[:2]
@@ -2342,7 +2589,7 @@ def run_trial(ctx: Context, meta: Dict, decision_sha: str) -> Dict:
     observations: Dict = {}
 
     def pre_gate() -> Tuple[List[str], str]:
-        return gate_problems(ctx, fstate) + converged(ctx, fx["name"], fx["uid"], n) + \
+        return gate_problems(ctx, fstate, guard=guard) + converged(ctx, fx["name"], fx["uid"], n) + \
             observer_problems(ctx, meta["variant"]), fresh(ctx.fetch, con, ctx.cal, ctx.now())
     problems, stale = pre_gate()
     if not problems and not stale and meta["kind"] == "selection":
@@ -2354,12 +2601,20 @@ def run_trial(ctx: Context, meta: Dict, decision_sha: str) -> Dict:
         problems, stale = pre_gate()
         q = lambda name, pods="": query_range(ctx.fetch, con, resolve_query(con, meta["target"], name, pods),  # noqa
                                               t0, t1)
+        a0 = t0 + washout_s(con)            # the idle CPU average starts after the rate window's washout
+        rq = lambda src, pods: query_range(ctx.fetch, con, resolve_fresh(con, src, pods), a0, t1)  # noqa: E731
+        owned_now = owned_pods(ctx.kube, ctx.ns, ctx.own())
         observations.update(
-            fixture_cpu_idle=q("fixture_cpu_cores", pods_re(fx["name"])),
+            idle_window={"start": t0, "end": t1, "washout_s": washout_s(con)},
+            fixture_cpu_idle=query_range(ctx.fetch, con, resolve_query(con, meta["target"], "fixture_cpu_cores",
+                                                                       pods_re(fx["name"])), a0, t1),
             idle_fixture_requests=q("fixture_requests"), idle_fixture_up=q("fixture_up", pods_re(fx["name"])),
-            idle_fixture_pods=sorted(p["metadata"]["name"] for p in owned_pods(ctx.kube, ctx.ns, ctx.own()).get(
-                meta["variant"], [])),
-            idle_fixture_queue=q("fixture_queue"), idle_fixture_inflight=q("fixture_inflight"))
+            idle_fixture_pods=sorted(p["metadata"]["name"] for p in owned_now.get(meta["variant"], [])),
+            idle_ingress_pods=sorted(p["metadata"]["name"] for p in owned_now.get("ingress", [])),
+            idle_fixture_queue=q("fixture_queue"), idle_fixture_inflight=q("fixture_inflight"),
+            idle_raw_fixture_metrics=rq("fixture_metrics", pods_re(fx["name"])),
+            idle_raw_fixture_cpu=rq("fixture_cpu", pods_re(fx["name"])),
+            idle_raw_ingress_metrics=rq("ingress_metrics", ctx.nm["ingress_pods"]))
     if problems or stale:
         ctx.receipt("trial-not-started", {"trial": meta, "problems": problems + ([stale] if stale else [])})
         raise Halt("incomplete" if stale and not problems else "stopped", "; ".join(problems + [stale]).strip("; "))
@@ -2373,7 +2628,7 @@ def run_trial(ctx: Context, meta: Dict, decision_sha: str) -> Dict:
     ctx.jobs = dict(getattr(ctx, "jobs", {}) or {}, **{job["metadata"]["name"]: job})
     files = [ctx.write(f"{tdir}/job.json", job), ctx.write(f"{tdir}/pods-begin.json", pods_begin)]
     ctx.receipt("trial-begin", {"trial": meta, "decision_sha256": decision_sha, "job_sha256": X.json_digest(job),
-                                "files": files})
+                                "guard_sha256": X.json_digest(guard), "files": files})
     ctx.kube.journal.context = {"calibration": ctx.cal, "phase": "trial", "trial": trial, "role": "generator"}
     created = ctx.kube.create(job)
     juid = created["metadata"]["uid"]
@@ -2388,14 +2643,19 @@ def run_trial(ctx: Context, meta: Dict, decision_sha: str) -> Dict:
         if not done and ctx.now() >= hard:
             stop_trial(ctx, meta, juid, "the generator Job outlived its deadline", "stopped", files)
         # every poll AND once more after completion: the final interval must also have been clean
-        problems = gate_problems(ctx, fstate)
-        stale = fresh(ctx.fetch, con, ctx.cal, ctx.now())
+        problems = gate_problems(ctx, fstate, guard=guard)
+        stale = fresh(ctx.fetch, con, ctx.cal, ctx.now()) or "; ".join(observer_problems(ctx, meta["variant"]))
         if not done and not stale and ctx.now() - created_at(created, ctx) >= 2 * con["observer"]["max_staleness_s"]:
             pts, why = series(query_range(ctx.fetch, con, resolve_query(con, meta["target"], "generator_cpu_cores",
                                                                         gen_re), ctx.now() - 4 * se_step(con),
                                           ctx.now()))
             if pts is None or not pts or ctx.now() - pts[-1][0] > con["observer"]["max_staleness_s"]:
                 stale = f"observer: generator_cpu_cores has no fresh series for the generator pod ({why or 'stale'})"
+            else:
+                gpods = [p["metadata"]["name"] for p in owned_pods(ctx.kube, ctx.ns, ctx.own())["generator"]
+                         if _controller_uid(p, "Job") == juid]
+                raw_why = live_raw(ctx, "generator_cpu", gpods, gen_re)
+                stale = f"observer: {raw_why}" if raw_why else ""
         if stale:                                   # missing observer data first: incomplete evidence
             stop_trial(ctx, meta, juid, "; ".join([stale] + problems), "incomplete", files)
         if problems:
@@ -2426,6 +2686,12 @@ def run_trial(ctx: Context, meta: Dict, decision_sha: str) -> Dict:
             observations[name] = query_range(ctx.fetch, con, resolve_query(con, meta["target"], name, regex[name]),
                                              window["start"], window["end"])
         observations["steal"] = steal_query(ctx.fetch, con, window["start"] - 60, window["end"] + 60)
+        raw_re = {"fixture_metrics": pods_re(fx["name"]), "fixture_cpu": pods_re(fx["name"]),
+                  "ingress_metrics": ctx.nm["ingress_pods"], "ingress_cpu": ctx.nm["ingress_pods"],
+                  "generator_cpu": gen_re, "steal": ""}
+        for source, regex_ in raw_re.items():
+            observations[f"raw_{source}"] = query_range(ctx.fetch, con, resolve_fresh(con, source, regex_),
+                                                        window["start"], window["end"])
     pods_end = _snapshot(owned_pods(ctx.kube, ctx.ns, ctx.own()))
     remove_jobs(ctx, [{"name": job["metadata"]["name"], "uid": juid}])
     files += [ctx.write(f"{tdir}/generator-pod.json", gsnap), ctx.write(f"{tdir}/observations.json", observations),
@@ -2638,9 +2904,10 @@ def calibrate(ctx: Context) -> Optional[Dict]:
         index += 1
         dec = ctx.receipt("decision", {"stage": "work-selection", "variant": role,
                                        "step": {"action": "test", "rate": selection_rate(ctx.con)}})
+        guard = plateau_guard(ctx, {"stage": "work-selection", "variant": role})
         try:
             res = run_trial(ctx, trial_meta(ctx, index, "selection", role, 1, selection_rate(ctx.con), 0),
-                            dec["sha256"])
+                            dec["sha256"], guard)
         except Halt as h:
             return _halt(ctx, h.category, h.reason)
         scale_to(ctx, role, 0)
@@ -2671,10 +2938,12 @@ def calibrate(ctx: Context) -> Optional[Dict]:
             if ctx.now() + se["repetitions"] * trial_seconds(ctx.con) > _utc(se["deadline_utc"]):
                 return _halt(ctx, "budget", f"the total deadline leaves no room for plateau n={n} rate={step['rate']}")
             verdicts = []
+            guard = plateau_guard(ctx, {"stage": "search", "n": n, "rate_per_min": step["rate"]})
             for rep in range(se["repetitions"]):
                 index += 1
                 try:
-                    res = run_trial(ctx, trial_meta(ctx, index, "search", role, n, step["rate"], rep), dec["sha256"])
+                    res = run_trial(ctx, trial_meta(ctx, index, "search", role, n, step["rate"], rep), dec["sha256"],
+                                    guard)
                 except Halt as h:
                     return _halt(ctx, h.category, h.reason)
                 verdicts.append(res["verdict"])
@@ -2699,14 +2968,23 @@ def calibrate(ctx: Context) -> Optional[Dict]:
     if index + 1 > se["max_trials"]:
         return _halt(ctx, "budget", f"max_trials {se['max_trials']} reached before the ceiling probe")
     index += 1
+    guard = plateau_guard(ctx, {"stage": "ceiling", "n": n, "rate_per_min": rate})
     try:
-        res = run_trial(ctx, trial_meta(ctx, index, "ceiling", role, n, rate, 0), dec["sha256"])
+        res = run_trial(ctx, trial_meta(ctx, index, "ceiling", role, n, rate, 0), dec["sha256"], guard)
     except Halt as h:
         return _halt(ctx, h.category, h.reason)
     if res["delivery"] != "uncensored":
         return _halt(ctx, "limit" if res["delivery"] == "censored" else "incomplete",
                      f"arrivals at the ceiling {rate}/min are {res['delivery']}")
     return None
+
+
+def plateau_guard(ctx: Context, where: Dict) -> Dict:
+    """The rollout-guard snapshot (owners, generations, pod UIDs, revisions, restarts) recorded at a plateau's start:
+    every gate of the plateau's trials compares the live state with it."""
+    snap = guard_snapshot(ctx)
+    ctx.receipt("plateau-guard", {**where, "guard": snap, "guard_sha256": X.json_digest(snap)})
+    return snap
 
 
 def _halt(ctx: Context, category: str, reason: str) -> Dict:
