@@ -353,7 +353,8 @@ func TestRequestsGoStraightToPodsEvenlyAndAreCountedAtDispatch(t *testing.T) {
 	}
 	m := metricsOf(t, srv)
 	for _, want := range []string{`c28_ingress_routing{mode="endpoints-rr"} 1`,
-		`c28_ingress_dispatched_total{target="a",pod="pod-1"} 20`, `c28_ingress_dispatched_total{target="a",pod="pod-2"} 20`,
+		`c28_ingress_dispatched_total{target="a",endpoint_pod="pod-1"} 20`, `c28_ingress_dispatched_total{target="a",endpoint_pod="pod-2"} 20`,
+		`c28_ingress_endpoint{target="a",endpoint_pod="pod-1"} 1`, `c28_ingress_endpoint{target="a",endpoint_pod="pod-2"} 1`,
 		`c28_ingress_requests_total{target="a"} 40`, `c28_ingress_responses_total{target="a",code="200"} 40`,
 		`c28_ingress_endpoints_ready{target="a"} 2`, `c28_ingress_endpoints_generation{target="a"} 1`} {
 		if !strings.Contains(m, want) {
@@ -578,13 +579,13 @@ func TestRetiredDispatchSeriesArePrunedAfterTheKeepTime(t *testing.T) {
 	r.dispatched.inc(dispatchLabel("a", "p1"))
 	mustReplace(t, r, nil) // p1 leaves
 	m := func() string { rec := httptest.NewRecorder(); r.writeMetrics(rec); return rec.Body.String() }
-	if !strings.Contains(m(), `pod="p1"} 1`) {
+	if !strings.Contains(m(), `endpoint_pod="p1"} 1`) || strings.Contains(m(), `c28_ingress_endpoint{`) {
 		t.Fatal("kept right after removal")
 	}
 	mu.Lock()
 	now = now.Add(retiredSeriesKeep)
 	mu.Unlock()
-	if strings.Contains(m(), `pod="p1"`) {
+	if strings.Contains(m(), `endpoint_pod="p1"`) {
 		t.Fatal("pruned after the keep time")
 	}
 }

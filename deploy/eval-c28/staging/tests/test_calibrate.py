@@ -937,6 +937,14 @@ def test_certificate_states_the_pending_experiment_admission(cal):
     assert any("maximum-arrival admission stays PENDING" in s for s in cert(ctx)["scope_limits"])
 
 
+def _bump_dispatch(raw, delta):
+    """Change the after-reading of one of THIS trial's pods (earlier pods' series are in the reading too)."""
+    pods = {p["metadata"]["name"] for p in raw["pods_begin"][raw["trial"]["variant"]]}
+    res = raw["observations"]["ingress_after"]["dispatched"]["response"]["data"]["result"]
+    for v in next(x for x in res if x["metric"]["endpoint_pod"] in pods)["values"]:
+        v[1] = str(float(v[1]) + delta)
+
+
 def test_k6_boundary_iteration_is_accepted_but_never_a_missing_dispatch(cal):
     """The kind smoke showed real k6 starting ONE iteration beyond rate x duration (300 -> 301, 1000 -> 1001)."""
     ctx = cal()
@@ -952,6 +960,7 @@ def test_k6_boundary_iteration_is_accepted_but_never_a_missing_dispatch(cal):
         for v in r["observations"]["ingress_after"]["requests"]["response"]["data"]["result"][0]["values"] + \
                 r["observations"]["ingress_after"]["responses"]["response"]["data"]["result"][0]["values"]:
             v[1] = str(float(v[1]) + extra)
+        _bump_dispatch(r, extra)                        # the extra arrival was dispatched to a pod as well
         assert K.evaluate_trial(ctx.con, r)["verdict"] == verdict, extra
     assert K.offered_ok(300, 300) and K.offered_ok(300, 301) and not K.offered_ok(300, 299) \
         and not K.offered_ok(300, 302)
@@ -1054,6 +1063,7 @@ def test_r3_a_settling_drop_is_censored(cal):
     for side in ("requests", "responses"):
         for v in raw["observations"]["ingress_after"][side]["response"]["data"]["result"][0]["values"]:
             v[1] = str(float(v[1]) - 1)
+    _bump_dispatch(raw, -1)                            # the dropped arrival was never dispatched to a pod either
     r = K.evaluate_trial(ctx.con, raw)
     assert r["verdict"] == "LIMIT" and r["delivery"] == "censored" and any(w.startswith("settle:") for w in r["limits"])
 
@@ -1822,4 +1832,171 @@ def test_cleanup_removes_the_ingress_identity_after_the_ingress(cal, api):
     ing = ctx.nm["ingress"]
     assert deletes.index(("Deployment", ing)) < min(deletes.index((k, ing)) for k in K.RBAC_KINDS)
     assert not [k for (k, _, n) in api.objects if n == ing]
+
+
+# --- Codex review of PR #51, finding 3: the ingress's endpoint discovery is a gate ---------------------------------------
+
+def _no_load(ctx):
+    return not any(e["event"] == "trial-begin" for e in ctx.entries())
+
+
+def test_v1_contracts_are_refused_and_discovery_queries_are_validated(cal):
+    ctx = cal()
+    path = K.record_contract_path(ctx.record)
+    con = json.load(open(path))
+    old = copy.deepcopy(con)
+    old["schema"] = "c28-calibration-contract/v1"
+    old["observer"].pop("discovery")
+    open(path, "w").write(json.dumps(old))
+    with pytest.raises(X.StagingError, match="predates the endpoints-rr ingress"):
+        K.load_contract(ctx.record, ctx.params)
+    cases = [(lambda o: o.pop("discovery"), "observer must be exactly"),
+             (lambda o: o["discovery"].pop("dispatched"), "observer.discovery must be exactly"),
+             (lambda o: o["discovery"].update(endpoints='max by (endpoint_pod) (c28_ingress_endpoint{target="__TARGET__"})'),
+              "must be a timestamp"),
+             (lambda o: o["discovery"].update(stale="timestamp(c28_ingress_discovery_stale{pod=~\"__PODS__\"})"),
+              "must not be a timestamp"),
+             (lambda o: o["discovery"].update(dispatched='sum(c28_ingress_dispatched_total{target="__TARGET__"})'),
+              "endpoint_pod"),
+             (lambda o: o["discovery"].update(synced="max(c28_ingress_discovery_synced)"), "using __PODS__")]
+    for mutate, msg in cases:
+        bad = copy.deepcopy(con)
+        mutate(bad["observer"])
+        open(path, "w").write(json.dumps(bad))
+        with pytest.raises(X.StagingError, match=msg):
+            K.load_contract(ctx.record, ctx.params)
+
+
+def test_stale_discovery_before_load_refuses_the_trial(cal, api):
+    ctx = cal()
+    ctx.world.disc_stale_from = CW.T0                 # the ingress reports stale discovery throughout
+    out = run(ctx)
+    nr = [e["data"] for e in ctx.entries() if e["event"] == "observer-not-ready"]
+    assert out["verdict"] == "NOT READY" and cert(ctx)["halted"]["category"] == "incomplete"
+    assert nr and any("stale discovery" in p for p in nr[0]["problems"]) and _no_load(ctx)
+    assert live_calibration_objects(api, ctx.cal) == []
+
+
+def test_never_synced_discovery_refuses_the_trial(cal):
+    ctx = cal()
+    ctx.world.disc_synced_from = CW.T0 + 10 ** 8
+    run(ctx)
+    nr = [e["data"] for e in ctx.entries() if e["event"] == "observer-not-ready"]
+    assert nr and any("never synced" in p for p in nr[0]["problems"]) and _no_load(ctx)
+
+
+def test_missing_discovery_metrics_refuse_the_trial(cal):
+    ctx = cal()
+    ctx.world.disc_missing = True                     # e.g. a ROUTING=service image: no discovery series at all
+    out = run(ctx)
+    nr = [e["data"] for e in ctx.entries() if e["event"] == "observer-not-ready"]
+    assert out["verdict"] == "NOT READY" and _no_load(ctx)
+    assert nr and any("discovery metrics missing or old" in p for p in nr[0]["problems"])
+
+
+def test_a_membership_mismatch_before_load_refuses_the_trial(cal):
+    ctx = cal()
+
+    def hide(world, api_):                           # the ingress does not route to one of the live fixture pods
+        pods = world._variant_pods(ctx.nm["variants"][0])
+        if pods:
+            world.disc_hidden = {pods[0]}
+    ctx.world.hooks.append(hide)
+    run(ctx)
+    nr = [e["data"] for e in ctx.entries() if e["event"] == "observer-not-ready"]
+    assert nr and any("discovery membership" in p for p in nr[0]["problems"]) and _no_load(ctx)
+
+
+def test_stale_discovery_mid_measurement_stops_the_trial(cal, api):
+    ctx = cal()
+
+    def go_stale(world, api_):
+        if world.disc_stale_from is None and any(k == "jobs" and n.endswith("t003") for (k, _, n) in api_.objects):
+            world.disc_stale_from = world.clock.now() + 30
+    ctx.world.hooks.append(go_stale)
+    out = run(ctx)
+    stopped = [e["data"] for e in ctx.entries() if e["event"] == "trial-stopped"]
+    assert out["verdict"] == "NOT READY" and cert(ctx)["halted"]["category"] == "incomplete"
+    assert stopped and stopped[0]["category"] == "incomplete" and "stale discovery" in stopped[0]["reason"]
+    assert stopped[0]["trial"]["id"] == "t003" and live_calibration_objects(api, ctx.cal) == []
+
+
+def test_an_extra_endpoint_mid_measurement_stops_the_trial(cal):
+    ctx = cal()
+
+    def rogue(world, api_):
+        if not world.disc_extra and any(k == "jobs" and n.endswith("t003") for (k, _, n) in api_.objects):
+            world.disc_extra = {"someone-elses-pod"}
+    ctx.world.hooks.append(rogue)
+    run(ctx)
+    stopped = [e["data"] for e in ctx.entries() if e["event"] == "trial-stopped"]
+    assert stopped and stopped[0]["category"] == "incomplete" and "discovery membership" in stopped[0]["reason"]
+
+
+def test_a_membership_blip_between_polls_invalidates_the_trial_from_the_window(cal):
+    """poll_s is 300 s: a blip between two live gates is caught by evaluate_trial over the recorded window."""
+    ctx = cal()
+
+    def blip(world, api_):
+        if world.disc_extra_window is None and any(k == "jobs" and n.endswith("t003") for (k, _, n) in api_.objects):
+            now = world.clock.now()
+            # inside the measurement window, between the live polls (the Job starts now; settle 60 s)
+            world.disc_extra, world.disc_extra_window = {"someone-elses-pod"}, (now + 400, now + 430)
+    ctx.world.hooks.append(blip)
+    run(ctx)
+    r = json.load(open(os.path.join(ctx.dir, "trials", "t003", "result.json")))
+    assert r["verdict"] == "INCOMPLETE" and any(w.startswith("discovery over the window: discovery membership")
+                                                for w in r["incomplete"]), r["incomplete"]
+    assert r["criteria"]["discovery"]["membership"]["mismatches"]
+    assert K.reduce_bundle(ctx.dir)["reproduced"]
+
+
+def test_per_endpoint_dispatch_is_recorded_per_trial_and_reconciled(cal):
+    ctx = cal()
+    out = run(ctx)
+    assert out["verdict"] == "READY"
+    seen = 0
+    for t in sorted(os.listdir(os.path.join(ctx.dir, "trials"))):
+        r = json.load(open(os.path.join(ctx.dir, "trials", t, "result.json")))
+        pods = sorted(p["metadata"]["name"] for p in json.load(open(os.path.join(
+            ctx.dir, "trials", t, "pods-begin.json")))[r["variant"]])
+        d = r["criteria"]["dispatch"]
+        assert sorted(d["by_endpoint"]) == pods and len(pods) == r["n"]
+        assert d["total"] == r["criteria"]["ingress"]["received"] and max(d["by_endpoint"].values()) - min(
+            d["by_endpoint"].values()) <= 1                       # the round-robin's evenness, measurable
+        assert r["criteria"]["discovery"]["membership"]["expected"] == pods
+        assert not r["criteria"]["discovery"]["membership"]["mismatches"]
+        seen += 1
+    assert seen > 3 and K.reduce_bundle(ctx.dir)["reproduced"]
+
+
+def test_a_dispatch_that_does_not_reconcile_is_incomplete(cal):
+    ctx = cal()
+    ctx.world.dispatch_short = 5                       # arrivals received but never dispatched to a pod
+    out = run(ctx)
+    r = json.load(open(os.path.join(ctx.dir, "trials", "t001", "result.json")))
+    assert out["verdict"] == "NOT READY" and r["verdict"] == "INCOMPLETE"
+    assert any("does not reconcile" in w for w in r["incomplete"])
+
+
+def test_discovery_verdict_is_pure_and_judges_every_evaluation():
+    con = CW.contract("/nonexistent")
+    step = con["observer"]["step_s"]
+    grid = list(range(1000, 1000 + 10 * step, step))
+
+    def rng(metric, fn, label="pod", names=("ing-1",)):
+        return {"start": grid[0], "end": grid[-1], "response": {"data": {"result": [
+            {"metric": {label: n}, "values": [[t, str(fn(n, t))] for t in grid]} for n in names]}}}
+    obs = {"synced": rng("s", lambda n, t: 1), "stale": rng("s", lambda n, t: 0),
+           "scrape_timestamp": rng("s", lambda n, t: t - 5),
+           "endpoints": rng("e", lambda n, t: t - 5, "endpoint_pod", ("fx-a", "fx-b"))}
+    why, d = K.discovery_verdict(con, obs, "ing-1", ["fx-a", "fx-b"], grid[0], grid[-1])
+    assert why == [] and d["membership"]["evaluations"] == 10
+    # an endpoint series left from an OLDER scrape is not current membership (a pod that left the set)
+    old = dict(obs, endpoints=rng("e", lambda n, t: t - 5 if n == "fx-a" or t < grid[5] else grid[4] - 5,
+                                  "endpoint_pod", ("fx-a", "fx-b")))
+    why, d = K.discovery_verdict(con, old, "ing-1", ["fx-a", "fx-b"], grid[0], grid[-1])
+    assert why and len(d["membership"]["mismatches"]) == 5
+    # the live gate looks at the newest evaluation only
+    assert K.discovery_verdict(con, old, "ing-1", ["fx-a"], grid[0], grid[-1], live=True)[0] == []
 

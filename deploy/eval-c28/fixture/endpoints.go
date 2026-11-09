@@ -472,8 +472,9 @@ func sameRefs(cur []*endpoint, refs []epRef) bool {
 	return true
 }
 
+// dispatchLabel: the endpoint's pod is "endpoint_pod", never "pod" (the scrape's own pod label names the ingress pod).
 func dispatchLabel(target, pod string) string {
-	return label("target", target) + "," + label("pod", pod)
+	return label("target", target) + "," + label("endpoint_pod", pod)
 }
 
 func (r *rrRouter) pruneLocked(now time.Time) {
@@ -513,6 +514,13 @@ func (r *rrRouter) writeMetrics(w io.Writer) {
 	fmt.Fprintln(w, "# TYPE c28_ingress_endpoints_ready gauge")
 	for _, n := range names {
 		fmt.Fprintf(w, "c28_ingress_endpoints_ready{%s} %d\n", label("target", n), len(r.targets[n].set.Load().eps))
+	}
+	// membership: one series per READY endpoint now in the set (what the executor compares with the live fixture pods)
+	fmt.Fprintln(w, "# TYPE c28_ingress_endpoint gauge")
+	for _, n := range names {
+		for _, e := range r.targets[n].set.Load().eps {
+			fmt.Fprintf(w, "c28_ingress_endpoint{%s} 1\n", dispatchLabel(n, e.pod))
+		}
 	}
 	fmt.Fprintln(w, "# TYPE c28_ingress_endpoints_generation gauge")
 	for _, n := range names {
