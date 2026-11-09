@@ -75,6 +75,13 @@ func testRouter(t *testing.T, now func() time.Time, targets ...string) *rrRouter
 	return r
 }
 
+func mustReplace(t *testing.T, r *rrRouter, items []endpointSlice) {
+	t.Helper()
+	if err := r.replaceAll(items); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func keys(r *rrRouter, target string) []string {
 	var out []string
 	for _, e := range r.targets[target].set.Load().eps {
@@ -86,7 +93,7 @@ func keys(r *rrRouter, target string) []string {
 func TestRoundRobinIsDeterministicAndEven(t *testing.T) {
 	r := testRouter(t, time.Now, "a")
 	// unsorted input across two slices: the rotation follows the sorted ip:port order
-	r.replaceAll([]endpointSlice{
+	mustReplace(t, r, []endpointSlice{
 		decodeSlice(t, sliceJSON("a-1", "a", 8080, ready("10.0.0.3", "p3"), ready("10.0.0.1", "p1"))),
 		decodeSlice(t, sliceJSON("a-2", "a", 8080, ready("10.0.0.2", "p2")))})
 	want := []string{"10.0.0.1:8080", "10.0.0.2:8080", "10.0.0.3:8080"}
@@ -127,12 +134,7 @@ func TestRoundRobinIsDeterministicAndEven(t *testing.T) {
 
 func TestOnlyReadyNonTerminatingEndpointsCount(t *testing.T) {
 	r := testRouter(t, time.Now, "a", "b")
-	other := sliceJSON("x-1", "not-ours", 8080, ready("10.9.0.1", "x"))
-	foreign := sliceJSON("a-foreign", "a", 8080, ready("10.9.0.2", "y"))
-	foreign["metadata"].(map[string]any)["labels"].(map[string]any)[managedByLabel] = "someone-else"
-	noPort := sliceJSON("b-noport", "b", 8080, ready("10.1.0.9", "z"))
-	noPort["ports"] = []any{map[string]any{"name": "metrics", "port": 9090, "protocol": "TCP"}}
-	r.replaceAll([]endpointSlice{
+	mustReplace(t, r, []endpointSlice{
 		decodeSlice(t, sliceJSON("a-1", "a", 8080,
 			ready("10.0.0.1", "ok"),
 			epSpec{ip: "10.0.0.2", pod: "not-ready", ready: no},
@@ -140,17 +142,100 @@ func TestOnlyReadyNonTerminatingEndpointsCount(t *testing.T) {
 			epSpec{ip: "10.0.0.4", pod: "terminating", ready: yes, terminating: yes}, // never counts
 			epSpec{ip: "10.0.0.5", pod: "term-false", ready: yes, terminating: no})),
 		decodeSlice(t, sliceJSON("a-2", "a", 8080, ready("10.0.0.1", "ok"))), // duplicate across slices
-		decodeSlice(t, other), decodeSlice(t, foreign), decodeSlice(t, noPort)})
+		decodeSlice(t, sliceJSON("b-1", "b", 8080, epSpec{ip: "10.1.0.1", pod: "starting", ready: no}))})
 	if got := keys(r, "a"); strings.Join(got, ",") != "10.0.0.1:8080,10.0.0.5:8080" {
 		t.Fatalf("a: %v", got)
 	}
 	if got := keys(r, "b"); len(got) != 0 {
-		t.Fatalf("b (slice without the http port) must have no endpoints: %v", got)
+		t.Fatalf("b has no ready endpoint: %v", got)
 	}
-	rec := httptest.NewRecorder()
-	r.writeMetrics(rec)
-	if !strings.Contains(rec.Body.String(), `c28_ingress_discovery_errors_total{stage="slice"} 1`) {
-		t.Fatalf("an unaddressable slice is a counted discovery error:\n%s", rec.Body.String())
+	// the controller's placeholder slice of a Service without endpoints (endpoints and ports null) is valid and empty
+	empty := sliceJSON("b-1", "b", 8080)
+	empty["endpoints"], empty["ports"] = nil, nil
+	if err := r.setSlice(decodeSlice(t, empty)); err != nil || len(keys(r, "b")) != 0 {
+		t.Fatalf("placeholder slice: %v", err)
+	}
+}
+
+// Malformed or partly invalid discovery answers install NOTHING (Codex review of PR #51, finding 2).
+func TestAMalformedListIsRefusedAsAWhole(t *testing.T) {
+	good := sliceJSON("a-1", "a", 8080, ready("10.0.0.1", "p1"))
+	enc := func(v any) []byte { b, _ := json.Marshal(v); return b }
+	for name, body := range map[string][]byte{
+		"empty object":            []byte(`{}`),
+		"not an object":           []byte(`[]`),
+		"items not an array":      []byte(`{"metadata":{"resourceVersion":"5"},"items":{}}`),
+		"items null":              []byte(`{"metadata":{"resourceVersion":"5"},"items":null}`),
+		"no items":                []byte(`{"metadata":{"resourceVersion":"5"}}`),
+		"no resourceVersion":      enc(map[string]any{"metadata": map[string]any{}, "items": []any{good}}),
+		"empty resourceVersion":   enc(map[string]any{"metadata": map[string]any{"resourceVersion": ""}, "items": []any{good}}),
+		"numeric resourceVersion": []byte(`{"metadata":{"resourceVersion":5},"items":[]}`),
+		"wrong kind":              enc(map[string]any{"kind": "PodList", "metadata": map[string]any{"resourceVersion": "5"}, "items": []any{}}),
+		"wrong apiVersion":        enc(map[string]any{"apiVersion": "discovery.k8s.io/v1beta1", "metadata": map[string]any{"resourceVersion": "5"}, "items": []any{}}),
+		"item not an object":      []byte(`{"metadata":{"resourceVersion":"5"},"items":[1]}`),
+		"item of a wrong type":    []byte(`{"metadata":{"resourceVersion":"5"},"items":[{"metadata":{"name":"a-1"},"endpoints":{}}]}`),
+		"trailing data":           []byte(`{"metadata":{"resourceVersion":"5"},"items":[]} {}`),
+	} {
+		if _, _, err := parseList(body); err == nil {
+			t.Errorf("%s: must be refused", name)
+		}
+	}
+	items, rv, err := parseList(enc(map[string]any{"kind": "EndpointSliceList", "apiVersion": "discovery.k8s.io/v1",
+		"metadata": map[string]any{"resourceVersion": "5"}, "items": []any{good}}))
+	if err != nil || rv != "5" || len(items) != 1 {
+		t.Fatalf("a well-formed list: %v %q %d", err, rv, len(items))
+	}
+}
+
+func TestOneInvalidSliceFailsTheWholeSyncAndKeepsTheSnapshot(t *testing.T) {
+	r := testRouter(t, time.Now, "a", "b")
+	mustReplace(t, r, []endpointSlice{decodeSlice(t, sliceJSON("a-1", "a", 8080, ready("10.0.0.1", "p1")))})
+	good := sliceJSON("a-2", "a", 8080, ready("10.0.0.2", "p2"))
+	bad := map[string]func() map[string]any{
+		"outside the selector": func() map[string]any { return sliceJSON("x-1", "not-ours", 8080, ready("10.9.0.1", "x")) },
+		"foreign manager": func() map[string]any {
+			m := sliceJSON("a-9", "a", 8080, ready("10.9.0.2", "y"))
+			m["metadata"].(map[string]any)["labels"].(map[string]any)[managedByLabel] = "someone-else"
+			return m
+		},
+		"no http port": func() map[string]any {
+			m := sliceJSON("b-1", "b", 8080, ready("10.1.0.9", "z"))
+			m["ports"] = []any{map[string]any{"name": "metrics", "port": 9090, "protocol": "TCP"}}
+			return m
+		},
+		"port without a number": func() map[string]any {
+			m := sliceJSON("b-1", "b", 8080)
+			m["ports"] = []any{map[string]any{"name": "http", "protocol": "TCP"}}
+			return m
+		},
+		"bad address":      func() map[string]any { return sliceJSON("b-1", "b", 8080, ready("not-an-ip", "z")) },
+		"wrong family":     func() map[string]any { return sliceJSON("b-1", "b", 8080, ready("fd00::1", "z")) },
+		"no addresses":     func() map[string]any { return sliceJSON("b-1", "b", 8080, epSpec{pod: "z", ready: no}) },
+		"FQDN slice":       func() map[string]any { m := sliceJSON("b-1", "b", 8080); m["addressType"] = "FQDN"; return m },
+		"no name":          func() map[string]any { m := sliceJSON("", "b", 8080); return m },
+		"a duplicate name": func() map[string]any { return sliceJSON("a-2", "a", 8080, ready("10.0.0.3", "p3")) },
+	}
+	for name, mk := range bad {
+		m := mk()
+		if name == "no addresses" {
+			m["endpoints"].([]any)[0].(map[string]any)["addresses"] = []string{}
+		}
+		before := r.lastSync.Load()
+		if err := r.replaceAll([]endpointSlice{decodeSlice(t, good), decodeSlice(t, m)}); err == nil {
+			t.Errorf("%s: a list with one invalid slice must fail", name)
+		}
+		if got := strings.Join(keys(r, "a"), ","); got != "10.0.0.1:8080" || r.targets["a"].set.Load().gen != 1 ||
+			r.lastSync.Load() != before {
+			t.Fatalf("%s: something was installed: %s", name, got)
+		}
+		if name != "a duplicate name" {
+			if err := r.setSlice(decodeSlice(t, m)); err == nil {
+				t.Errorf("%s: a watched invalid slice must be refused", name)
+			}
+		}
+	}
+	if strings.Join(keys(r, "a"), ",") != "10.0.0.1:8080" {
+		t.Fatal("the validated snapshot is kept")
 	}
 }
 
@@ -255,7 +340,7 @@ func TestRequestsGoStraightToPodsEvenlyAndAreCountedAtDispatch(t *testing.T) {
 		_, _ = io.WriteString(w, "ok")
 	})
 	r := testRouter(t, time.Now, "a")
-	r.replaceAll([]endpointSlice{b1.slice(t, "a-1", "a", "pod-1"), b2.slice(t, "a-2", "a", "pod-2")})
+	mustReplace(t, r, []endpointSlice{b1.slice(t, "a-1", "a", "pod-1"), b2.slice(t, "a-2", "a", "pod-2")})
 	r.markSynced()
 	_, srv := rrIngress(t, r, 2*time.Second)
 	for i := 0; i < 40; i++ {
@@ -280,7 +365,7 @@ func TestRequestsGoStraightToPodsEvenlyAndAreCountedAtDispatch(t *testing.T) {
 func TestChurnSwapsTheSetAndRemovedEndpointsGetNothingAfterTheSwap(t *testing.T) {
 	b1, b2, b3 := newBackend(t, nil), newBackend(t, nil), newBackend(t, nil)
 	r := testRouter(t, time.Now, "a")
-	r.replaceAll([]endpointSlice{b1.slice(t, "s1", "a", "p1"), b2.slice(t, "s2", "a", "p2")})
+	mustReplace(t, r, []endpointSlice{b1.slice(t, "s1", "a", "p1"), b2.slice(t, "s2", "a", "p2")})
 	r.markSynced()
 	_, srv := rrIngress(t, r, 2*time.Second)
 	const workers = 8
@@ -319,7 +404,9 @@ func TestChurnSwapsTheSetAndRemovedEndpointsGetNothingAfterTheSwap(t *testing.T)
 		}()
 	}
 	time.Sleep(150 * time.Millisecond)
-	r.setSlice(b3.slice(t, "s3", "a", "p3")) // add under load
+	if err := r.setSlice(b3.slice(t, "s3", "a", "p3")); err != nil { // add under load
+		t.Error(err)
+	}
 	time.Sleep(150 * time.Millisecond)
 	r.deleteSlice("s1") // remove under load: p1 leaves the set
 	removed.Store(true)
@@ -375,7 +462,7 @@ func TestNoReadyEndpointIsACounted503AndNotReadyBeforeTheFirstSync(t *testing.T)
 	if c := get(t, srv.URL+"/t/a/work"); c != http.StatusServiceUnavailable {
 		t.Fatalf("no endpoint: %d", c)
 	}
-	r.replaceAll(nil)
+	mustReplace(t, r, nil)
 	r.markSynced()
 	if c := get(t, srv.URL+"/ready"); c != 200 {
 		t.Fatalf("ready after the first sync: %d", c)
@@ -415,7 +502,7 @@ func TestNoRetriesEvenOnAKeptAliveConnection(t *testing.T) {
 	})
 	other := newBackend(t, nil)
 	r := testRouter(t, time.Now, "a", "b")
-	r.replaceAll([]endpointSlice{b.slice(t, "a-1", "a", "p"), other.slice(t, "b-1", "b", "q")})
+	mustReplace(t, r, []endpointSlice{b.slice(t, "a-1", "a", "p"), other.slice(t, "b-1", "b", "q")})
 	r.markSynced()
 	_, srv := rrIngress(t, r, 2*time.Second)
 	if c := get(t, srv.URL+"/t/a/work"); c != 200 { // opens the kept-alive connection
@@ -440,7 +527,7 @@ func TestATimedOutPodIsA504AsBefore(t *testing.T) {
 		}
 	})
 	r := testRouter(t, time.Now, "a")
-	r.replaceAll([]endpointSlice{b.slice(t, "a-1", "a", "p")})
+	mustReplace(t, r, []endpointSlice{b.slice(t, "a-1", "a", "p")})
 	r.markSynced()
 	_, srv := rrIngress(t, r, 100*time.Millisecond)
 	if c := get(t, srv.URL+"/t/a/work"); c != http.StatusGatewayTimeout {
@@ -462,7 +549,7 @@ func TestStaleDiscoveryIsExportedAndTheLastSetIsKept(t *testing.T) {
 		strings.Contains(s, "sync_age") {
 		t.Fatalf("never synced is stale:\n%s", s)
 	}
-	r.replaceAll([]endpointSlice{decodeSlice(t, sliceJSON("a-1", "a", 8080, ready("10.0.0.1", "p")))})
+	mustReplace(t, r, []endpointSlice{decodeSlice(t, sliceJSON("a-1", "a", 8080, ready("10.0.0.1", "p")))})
 	r.markSynced()
 	set(now.Add(90 * time.Second))
 	s := m()
@@ -487,9 +574,9 @@ func TestRetiredDispatchSeriesArePrunedAfterTheKeepTime(t *testing.T) {
 	now := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
 	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
 	r := testRouter(t, clock, "a")
-	r.replaceAll([]endpointSlice{decodeSlice(t, sliceJSON("a-1", "a", 8080, ready("10.0.0.1", "p1")))})
+	mustReplace(t, r, []endpointSlice{decodeSlice(t, sliceJSON("a-1", "a", 8080, ready("10.0.0.1", "p1")))})
 	r.dispatched.inc(dispatchLabel("a", "p1"))
-	r.replaceAll(nil) // p1 leaves
+	mustReplace(t, r, nil) // p1 leaves
 	m := func() string { rec := httptest.NewRecorder(); r.writeMetrics(rec); return rec.Body.String() }
 	if !strings.Contains(m(), `pod="p1"} 1`) {
 		t.Fatal("kept right after removal")
@@ -508,6 +595,7 @@ type fakeAPI struct {
 	list    []map[string]any
 	events  []string // pre-encoded watch events for the next watch
 	status  int      // non-200 answers every request
+	body    []byte   // when set, the raw LIST answer (HTTP 200)
 	queries []string
 	auth    []string
 }
@@ -533,6 +621,10 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = bw.Flush()
 		f.events = nil
 		return // the stream ends: the client re-lists
+	}
+	if f.body != nil {
+		_, _ = w.Write(f.body)
+		return
 	}
 	_ = json.NewEncoder(w).Encode(map[string]any{"kind": "EndpointSliceList",
 		"metadata": map[string]any{"resourceVersion": "100"}, "items": f.list})
@@ -599,5 +691,102 @@ func TestListAndWatchAgainstTheAPI(t *testing.T) {
 	}
 	if len(keys(r, "a")) != 1 {
 		t.Fatal("the last known set is kept through failed lists")
+	}
+}
+
+func TestMalformedAnswersFromTheAPINeverCountAsASync(t *testing.T) {
+	f := &fakeAPI{body: []byte(`{}`)}
+	srv := httptest.NewServer(f)
+	defer srv.Close()
+	api := &kubeAPI{base: srv.URL, client: srv.Client(), token: func() (string, error) { return "t", nil }}
+	m := func(r *rrRouter) string { rec := httptest.NewRecorder(); r.writeMetrics(rec); return rec.Body.String() }
+
+	// a fresh ingress: HTTP 200 {} is not a sync (not ready, stale, the error counted)
+	fresh := testRouter(t, time.Now, "a")
+	ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+	fresh.run(ctx, api, time.Second)
+	cancel()
+	if fresh.synced() || !strings.Contains(m(fresh), "c28_ingress_discovery_stale 1") ||
+		strings.Contains(m(fresh), `c28_ingress_discovery_errors_total{stage="list"} 0`) {
+		t.Fatalf("{} counted as a sync:\n%s", m(fresh))
+	}
+
+	// a synced ingress: a malformed or partly invalid LIST changes nothing (snapshot, lastSync), and is an error
+	f.mu.Lock()
+	f.body = nil
+	f.list = []map[string]any{sliceJSON("a-1", "a", 8080, ready("10.0.0.1", "p1"))}
+	f.mu.Unlock()
+	r := testRouter(t, time.Now, "a")
+	if _, err := r.list(context.Background(), api); err != nil {
+		t.Fatal(err)
+	}
+	synced := r.lastSync.Load()
+	bad := sliceJSON("a-2", "a", 8080, ready("10.0.0.2", "p2"))
+	bad["ports"] = []any{map[string]any{"name": "metrics", "port": 9090}}
+	for name, body := range map[string][]byte{
+		"empty object":       []byte(`{}`),
+		"items not an array": []byte(`{"metadata":{"resourceVersion":"7"},"items":"x"}`),
+		"no resourceVersion": []byte(`{"metadata":{},"items":[]}`),
+		"one invalid slice": func() []byte {
+			b, _ := json.Marshal(map[string]any{"metadata": map[string]any{"resourceVersion": "7"},
+				"items": []any{sliceJSON("a-1", "a", 8080, ready("10.0.0.1", "p1"), ready("10.0.0.3", "p3")), bad}})
+			return b
+		}(),
+	} {
+		f.mu.Lock()
+		f.body = body
+		f.mu.Unlock()
+		time.Sleep(2 * time.Millisecond)
+		if _, err := r.list(context.Background(), api); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+		if r.lastSync.Load() != synced || strings.Join(keys(r, "a"), ",") != "10.0.0.1:8080" {
+			t.Fatalf("%s: installed or counted as a sync", name)
+		}
+	}
+	f.mu.Lock()
+	f.body = []byte(`{}`)
+	f.mu.Unlock()
+	ctx, cancel = context.WithTimeout(context.Background(), 1200*time.Millisecond)
+	r.run(ctx, api, time.Second)
+	cancel()
+	if !strings.Contains(m(r), `c28_ingress_discovery_errors_total{stage="list"} `) ||
+		strings.Contains(m(r), `c28_ingress_discovery_errors_total{stage="list"} 0`) || r.lastSync.Load() != synced {
+		t.Fatalf("the loop counts the malformed lists and keeps lastSync:\n%s", m(r))
+	}
+}
+
+func TestAMalformedWatchEventIsNotAppliedAndEndsTheWatch(t *testing.T) {
+	f := &fakeAPI{list: []map[string]any{sliceJSON("a-1", "a", 8080, ready("10.0.0.1", "p1"))}}
+	srv := httptest.NewServer(f)
+	defer srv.Close()
+	api := &kubeAPI{base: srv.URL, client: srv.Client(), token: func() (string, error) { return "t", nil }}
+	r := testRouter(t, time.Now, "a")
+	rv, err := r.list(context.Background(), api)
+	if err != nil {
+		t.Fatal(err)
+	}
+	noPort := sliceJSON("a-1", "a", 8080, ready("10.0.0.1", "p1"), ready("10.0.0.2", "p2"))
+	noPort["ports"] = nil
+	for name, ev := range map[string]string{
+		"invalid slice":         event("MODIFIED", noPort),
+		"outside the selector":  event("ADDED", sliceJSON("x-1", "x", 8080, ready("10.9.0.1", "x"))),
+		"object not an object":  `{"type":"ADDED","object":"x"}`,
+		"no object":             `{"type":"MODIFIED"}`,
+		"wrong kind":            `{"type":"ADDED","object":{"kind":"Pod","metadata":{"name":"a-1"}}}`,
+		"bookmark without rv":   `{"type":"BOOKMARK","object":{"metadata":{}}}`,
+		"delete without a name": `{"type":"DELETED","object":{"metadata":{}}}`,
+		"not JSON":              `{"type":`,
+	} {
+		f.mu.Lock()
+		f.events = []string{event("BOOKMARK", map[string]any{"metadata": map[string]any{"resourceVersion": "9"}}), ev,
+			event("ADDED", sliceJSON("a-2", "a", 8080, ready("10.0.0.5", "p5")))} // never reached
+		f.mu.Unlock()
+		if err := r.watch(context.Background(), api, rv, 30*time.Second); err == nil {
+			t.Errorf("%s: the watch must end with an error", name)
+		}
+		if got := strings.Join(keys(r, "a"), ","); got != "10.0.0.1:8080" {
+			t.Fatalf("%s: applied: %s", name, got)
+		}
 	}
 }

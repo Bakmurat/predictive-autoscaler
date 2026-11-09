@@ -72,7 +72,9 @@ if [ "$run_go" = 1 ]; then
     ( cd k8s-operator && "$GO" test -race -count=1 ./... ) 2>&1 | tee -a "$LOG"; rc=${PIPESTATUS[0]}
     status_line "go test -race" "$rc" | tee -a "$LOG"; [ "$rc" -eq 0 ] || overall=1
     # The C2.8 evaluation fixture (its own module, standard library only).
-    ( cd deploy/eval-c28/fixture && "$GO" vet ./... && "$GO" test -race -count=1 ./... ) 2>&1 | tee -a "$LOG"; rc=${PIPESTATUS[0]}
+    # check-build-context.sh compiles exactly the files the image's Dockerfile copies (no docker needed).
+    ( cd deploy/eval-c28/fixture && "$GO" vet ./... && "$GO" test -race -count=1 ./... \
+        && GO="$GO" ./check-build-context.sh ) 2>&1 | tee -a "$LOG"; rc=${PIPESTATUS[0]}
     status_line "c28 fixture" "$rc" | tee -a "$LOG"; [ "$rc" -eq 0 ] || overall=1
     # The CRD and deepcopy code must be exactly what the API types' markers generate.
     scripts/gen-manifests.sh check 2>&1 | tee -a "$LOG"; rc=${PIPESTATUS[0]}

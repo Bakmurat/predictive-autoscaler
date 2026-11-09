@@ -1,0 +1,2 @@
+# The build context of the fixture image (docker build deploy/eval-c28/fixture): tests never enter it.
+*_test.go
