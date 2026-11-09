@@ -98,6 +98,7 @@ def setref(role, ref):
     def m(doc): doc["images"][role]["ref"] = ref
     return m
 case("accept-good", lambda doc: None)
+case("accept-rebuild-attempt", lambda doc: doc.update(attempt="r2", run_id="c28-prod-1"))
 case("refuse-tag", setref("generator", "grafana/k6:0.57.0"))
 case("refuse-tag-and-digest", setref("generator", f"grafana/k6:0.57.0@sha256:{h}"))
 case("refuse-short-digest", setref("operator", f"harbor.devkuban.com/autoscaler/operator@sha256:{h[:63]}"))

@@ -1,1 +1,2 @@
 k8s-operator/controllers/testdata/v2-policy-parity.json linguist-generated=true
+deploy/eval-c28/staging/tests/data/** -text

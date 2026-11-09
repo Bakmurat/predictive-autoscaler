@@ -2000,3 +2000,21 @@ def test_discovery_verdict_is_pure_and_judges_every_evaluation():
     # the live gate looks at the newest evaluation only
     assert K.discovery_verdict(con, old, "ing-1", ["fx-a"], grid[0], grid[-1], live=True)[0] == []
 
+
+
+# --- the S1 images.json of a rebuild (build_images.py build.attempt) ------------------------------------------------
+
+def test_a_rebuild_images_json_of_the_same_run_is_accepted(cal):
+    """A later build of the same run carries attempt and suffixed tags; the contract binds refs by digest and the run
+    id, never a tag, so it is accepted exactly like the run's first build."""
+    tagged = {"fixture": {"ref": CW.FIXTURE, "tag": "harbor.example/autoscaler/c28-fixture:c28-" + PF.RUN + "-r2"},
+              "generator": {"ref": CW.GENERATOR}}
+    ctx = cal(images_over={"attempt": "r2", "images": tagged})
+    K.load_contract(ctx.record, ctx.params)
+    assert json.load(open(ctx.record.resolve("evidence/images.json")))["attempt"] == "r2"
+
+
+def test_an_images_json_of_another_run_id_is_refused(cal):
+    """A rebuild keeps the run id: an images.json whose run_id carries the attempt (or any other run) is refused."""
+    with pytest.raises(X.StagingError, match="not this run's verified c28-images/v1 record"):
+        cal(images_over={"run_id": PF.RUN + "-r2"})        # the context loads (and refuses) the contract
