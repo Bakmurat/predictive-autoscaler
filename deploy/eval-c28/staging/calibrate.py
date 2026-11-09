@@ -148,6 +148,14 @@ begins only then. Dispatched, received and answered arrivals reconcile with tole
 else). The selection's idle CPU is averaged only after a washout of the 60 s rate window plus one CPU scrape interval
 (observer.cpu_scrape_interval_s), and idle_s must cover the washout plus 120 s of averaging.
 
+Writer API availability. Every writer census (plan, every gate and poll, immediately before every /scale write inside
+its journalled step and before every generator Job) uses FRESH, uncached discovery (Kube.discover_fresh). A served
+writer API is listed strictly (a listing failure refuses); a group the successful discovery does not serve counts as
+"API discovery-proven absent" (it says nothing about objects that may once have existed); a failed or malformed
+discovery refuses. The availability per group is bound into the reviewed plan and the calibration-begin receipt,
+rechecked under the lock before anything is created, and any change during the calibration (an absent API appearing, a
+served one disappearing) stops it.
+
 Interruption. Everything runs under the shared evaluation lock (execlib.mutating) with intents before and outcomes
 after each create, delete and /scale step; an unknown outcome keeps the lock until `recover`. Trial boundaries
 (trial-begin, trial-result, trial-stopped, trial-interrupted) and every decision are receipts. Cleanup deletes the
@@ -2082,10 +2090,38 @@ def activity_problems(ctx: Context) -> List[str]:
     return out
 
 
+ABSENT = "API discovery-proven absent"
+
+
+def writer_apis(kube: X.Kube) -> Tuple[Dict[str, str], Dict]:
+    """Fresh (uncached) discovery of every replica-writer API group: {group: "served" | "API discovery-proven absent"}
+    plus the discovery result. Only a successful, well-formed discovery proves absence; a failed or malformed one
+    raises (and refuses). It says what discovery shows now, not that such objects could never have existed."""
+    groups = kube.discover_fresh()
+    return {X.group_of(k): ("served" if X.group_of(k) in groups else ABSENT) for k in X.WRITER_KINDS}, groups
+
+
 def writer_problems(ctx: Context) -> List[str]:
-    inv = X.writer_inventory(ctx.kube, ctx.ns, ctx.nm["variants"] + [ctx.nm["ingress"]])
-    return [f"{name}: replica writer(s) {[X.ident_str(w) + '#' + str(w['uid']) for w in ws]}: the calibration runs "
-            "at fixed replicas with no writer" for name, ws in sorted(inv.items()) if ws]
+    """No writer of a fixture variant or the ingress, from FRESH discovery at every call: served writer APIs are listed
+    strictly (a listing failure refuses); an unserved group counts only as API discovery-proven absent. Once a plan is
+    bound (apply), any change of that availability (an absent API appearing, a served one disappearing) is a stop."""
+    try:
+        apis, groups = writer_apis(ctx.kube)
+    except C.StagingError as e:
+        return [f"writer census: API discovery failed ({e}): absence is never assumed"]
+    out = []
+    bound = getattr(ctx, "writer_apis_bound", None)
+    if bound is not None and apis != bound:
+        changed = [g for g in sorted(set(bound) | set(apis)) if bound.get(g) != apis.get(g)]
+        out.append("writer census: the writer APIs changed since the reviewed plan: " +
+                   ", ".join(f"{g} {bound.get(g)} -> {apis.get(g)}" for g in changed))
+    try:
+        inv = X.writer_inventory(ctx.kube, ctx.ns, ctx.nm["variants"] + [ctx.nm["ingress"]], groups=groups,
+                                 absent_ok=True)
+    except C.StagingError as e:
+        return out + [f"writer census: listing a served writer API failed ({e})"]
+    return out + [f"{name}: replica writer(s) {[X.ident_str(w) + '#' + str(w['uid']) for w in ws]}: the calibration "
+                  "runs at fixed replicas with no writer" for name, ws in sorted(inv.items()) if ws]
 
 
 def ownership_problems(ctx: Context) -> List[str]:
@@ -2428,6 +2464,10 @@ def plan(ctx: Context) -> Dict:
         problems.append("the total deadline leaves no room for one plateau")
     rates = {str(n): dict(zip(("min", "max", "initial"), bounds(ctx.con, n)))
              for n in ctx.con["search"]["replica_counts"]}
+    try:
+        apis = writer_apis(ctx.kube)[0]
+    except C.StagingError:
+        apis = {"discovery": "failed"}                 # writer_problems already refuses the plan
     return X.new_plan(HELPER, ctx.record, [{"op": "create", "kind": o["kind"], "name": o["metadata"]["name"],
                                             "sha256": X.json_digest(o)} for o in objs],
                       calibration_id=ctx.cal, contract_sha256=ctx.sha, contract=ctx.con,
@@ -2444,7 +2484,7 @@ def plan(ctx: Context) -> Dict:
                               "deadline_utc": ctx.con["search"]["deadline_utc"], "worst_case": wc,
                               "generator_job_deadline_s": ctx.con["search"]["settle_s"] +
                               ctx.con["search"]["measure_s"] + ctx.con["search"]["job_slack_s"]},
-                      admission=adm, problems=problems,
+                      admission=adm, writer_apis=apis, problems=problems,
                       never=["scale anything but the calibration fixture", "write a writer", "touch a confirmation "
                              "target, the quota or a fault schedule", "resume an interrupted measurement",
                              "a rate outside the plan's bounds"])
@@ -2527,7 +2567,12 @@ def reconcile_scale(kube: X.Kube, d: Dict, record: X.Record) -> Dict:
     live = kube.get("Deployment", d["name"], d["namespace"])
     if live is None or live["metadata"].get("uid") != d["uid"]:
         return {"observed": "unresolved", "why": "the Deployment is gone or replaced"}
-    if X.writer_inventory(kube, d["namespace"], [d["name"]]).get(d["name"]):
+    try:
+        _, groups = writer_apis(kube)
+        writers = X.writer_inventory(kube, d["namespace"], [d["name"]], groups=groups, absent_ok=True).get(d["name"])
+    except C.StagingError as e:
+        return {"observed": "unresolved", "why": f"the writer census failed ({e})"}
+    if writers:
         return {"observed": "unresolved", "why": "a writer targets the calibration fixture"}
     to, pre_gen, pre_rep = d["expect"][0][1], d["pre"].get("generation"), d["pre"].get("replicas")
     gen, cur = live["metadata"].get("generation"), int(live["spec"].get("replicas") or 0)
@@ -2644,6 +2689,9 @@ def run_trial(ctx: Context, meta: Dict, decision_sha: str, guard: Optional[Dict]
     files = [ctx.write(f"{tdir}/job.json", job), ctx.write(f"{tdir}/pods-begin.json", pods_begin)]
     ctx.receipt("trial-begin", {"trial": meta, "decision_sha256": decision_sha, "job_sha256": X.json_digest(job),
                                 "guard_sha256": X.json_digest(guard), "files": files})
+    wp = writer_problems(ctx)                    # fresh discovery immediately before the load write
+    if wp:
+        stop_trial(ctx, meta, "", "before the generator Job: " + "; ".join(wp), "stopped", files)
     ctx.kube.journal.context = {"calibration": ctx.cal, "phase": "trial", "trial": trial, "role": "generator"}
     created = ctx.kube.create(job)
     juid = created["metadata"]["uid"]
@@ -2898,8 +2946,9 @@ def apply(ctx: Context, reviewed: Dict, reviewed_digest: str) -> Dict:
         X.require_live(reviewed, reviewed_digest, HELPER, ctx.record, live)
         if live["problems"]:
             raise X.StagingError("the calibration plan has problems: " + "; ".join(live["problems"]))
+        ctx.writer_apis_bound = dict(live["writer_apis"])      # every later census must find exactly this
         ctx.receipt("calibration-begin", {"plan_sha256": reviewed_digest, "contract_sha256": ctx.sha,
-                                          "algorithm": SEARCH_ALGORITHM})
+                                          "algorithm": SEARCH_ALGORITHM, "writer_apis": ctx.writer_apis_bound})
         try:
             with open(record_contract_path(ctx.record), "rb") as fh:
                 C.write_once(os.path.join(ctx.dir, "contract.json"), fh.read())
@@ -3107,6 +3156,9 @@ def verify(ctx: Context) -> Dict:
         return {"helper": HELPER, "state": state, "bundle": reduce_bundle(ctx.dir)}
     if state != "open":
         return {"helper": HELPER, "state": state, "stops": []}
+    begin = next((e["data"] for e in ctx.entries() if _mine(e, ctx.cal) and e["event"] == "calibration-begin"), {})
+    if begin.get("writer_apis"):
+        ctx.writer_apis_bound = dict(begin["writer_apis"])
     stops = gate_problems(ctx)
     stale = fresh(ctx.fetch, ctx.con, ctx.cal, ctx.now())
     if stale:

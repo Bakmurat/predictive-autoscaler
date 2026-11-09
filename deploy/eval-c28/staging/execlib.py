@@ -348,6 +348,18 @@ class Kube:
             self._groups = C.discover_groups(self.api)
         return group_of(kind) in self._groups
 
+    def discover_fresh(self) -> Dict[str, List[str]]:
+        """UNCACHED API discovery (GET /apis now; served() keeps its per-instance cache). Only a successful, well-formed
+        answer is returned: a failed request (auth, timeout, not found) or a malformed document raises ApiError, so an
+        absent group in the result is proven absent by discovery, never inferred from a failure."""
+        try:
+            groups = C.discover_groups(self.api)
+        except (KeyError, TypeError, AttributeError) as e:
+            raise C.ApiError(f"API discovery (/apis) returned a malformed document ({type(e).__name__})") from e
+        if not all(isinstance(k, str) and isinstance(v, list) for k, v in groups.items()):
+            raise C.ApiError("API discovery (/apis) returned a malformed document")
+        return groups
+
     def get(self, kind: str, name: str, namespace: Optional[str] = None) -> Optional[Dict]:
         o = self.api.get(path(kind, namespace, name))
         if o is not None:
@@ -673,22 +685,28 @@ def ident_str(i: Dict) -> str:
     return f"{i['kind']}/{i['namespace']}/{i['name']}"
 
 
-def writer_inventory(kube: Kube, namespace: str, names: Iterable[str]) -> Dict[str, List[Dict]]:
+def writer_inventory(kube: Kube, namespace: str, names: Iterable[str], groups: Optional[Dict] = None,
+                     absent_ok: bool = False) -> Dict[str, List[Dict]]:
     """Every replica writer of each named Deployment, as FULL identities {kind, namespace, name, uid}: HPAs,
     ScaledObjects and PredictiveAutoscalers of BOTH API groups, from any namespace that can target these Deployments
     (an optional API is skipped only when discovery shows it absent; the others are required). An HPA counts as a
     ScaledObject only when its controller owner reference names a LIVE ScaledObject of that name in its namespace
-    with exactly that UID; any other HPA is its own writer."""
+    with exactly that UID; any other HPA is its own writer.
+
+    `groups` (optional): a discovery result that decides what is served (e.g. Kube.discover_fresh()) instead of the
+    cached Kube.served; with `absent_ok` a writer API group this discovery shows unserved is skipped (API
+    discovery-proven absent) instead of refused. The defaults keep the original behaviour for every other caller."""
     c28 = import_harness()
     names = set(names)
     found: Dict[str, List[Dict]] = {n: [] for n in names}
     scaled = {}
-    if kube.served("ScaledObject"):
+    served = (lambda kind: group_of(kind) in groups) if groups is not None else kube.served
+    if served("ScaledObject"):
         scaled = {(o["metadata"].get("namespace"), o["metadata"]["name"]): o["metadata"].get("uid")
                   for o in kube.list("ScaledObject", None)}
     for kind in WRITER_KINDS:
-        if not kube.served(kind):
-            if kind in OPTIONAL_WRITERS:
+        if not served(kind):
+            if kind in OPTIONAL_WRITERS or absent_ok:
                 continue
             raise StagingError(f"the {group_of(kind)} API is not served: the writer inventory cannot be complete")
         cross = kind in ("PredictiveAutoscaler", "LegacyPredictiveAutoscaler")
