@@ -43,7 +43,10 @@ quota or run-lock ever counts them, and their names c28cal-* never collide with 
     explicit GOMAXPROCS env, sidecar-free (label AND annotation), pinned to W by the run taint toleration and required
     role + hostname affinity, no PriorityClass. The selection never edits a pod template;
   * the pinned calibration ingress <id>-ing and its Service on W (render.render_common's ingress shape, one route per
-    variant), which counts offered demand before the fixture can reject it: every request goes through it;
+    variant), which counts offered demand before the fixture can reject it: every request goes through it. It routes
+    per request in a strict round-robin over the variant's READY pods (render.INGRESS_ROUTING, set explicitly), so
+    its ServiceAccount, Role (get/list/watch EndpointSlices in the namespace, nothing else) and RoleBinding <id>-ing
+    are created before it and removed after it (render.audit_rbac checks the rendering);
   * the k6 script ConfigMap <id>-k6 (load/c28-calibrate.js) and, when the contract's scrape kind is PodMonitor or
     VMPodScrape, one scrape object for the fixture and ingress pods at the 15 s cadence;
   * one k6 Job per trial, <id>-gen-tNNN, on S, backoffLimit 0 and a finite activeDeadlineSeconds (settle + measure +
@@ -698,18 +701,20 @@ def render_fixture(con: Dict, cal: str, params: Dict, k: int) -> List[Dict]:
 
 def render_ingress(con: Dict, cal: str, params: Dict) -> List[Dict]:
     """The pinned calibration ingress (render_common's ingress shape) whose only upstreams are the two calibration
-    fixture variants (one route each)."""
+    fixture variants (one route each), preceded by its ServiceAccount, Role and RoleBinding (endpoints-rr routing)."""
     R = X.import_harness().render
     ns, nm = con["namespace"], names(cal)
     lab = labels(con, cal, "calibration-ingress")
     sel = {CAL_LABEL: cal, X.COMPONENT_LABEL: "calibration-ingress"}
+    token_volume, token_mount = R.ingress_token()
     dep = {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": nm["ingress"], "namespace": ns,
                                                                        "labels": lab},
            "spec": {"replicas": 1, "selector": {"matchLabels": sel}, "strategy": {"type": "Recreate"},
                     "template": {"metadata": {"labels": {**lab, **R.SIDECAR_FREE},
                                               "annotations": {"prometheus.io/scrape": "true",
                                                               "prometheus.io/port": "8080", **R.SIDECAR_FREE}},
-                                 "spec": {"automountServiceAccountToken": False, "securityContext": R._SECURITY,
+                                 "spec": {"serviceAccountName": nm["ingress"],
+                                          "automountServiceAccountToken": False, "securityContext": R._SECURITY,
                                           **_placement(params, "workload"),
                                           "containers": [{"name": "ingress", "image": con["images"]["fixture"],
                                                           "env": [{"name": "MODE", "value": "ingress"},
@@ -717,16 +722,19 @@ def render_ingress(con: Dict, cal: str, params: Dict) -> List[Dict]:
                                                                       f"{v}=http://{v}.{ns}.svc"
                                                                       for v in nm["variants"])},
                                                                   {"name": "TIMEOUT_SECONDS",
-                                                                   "value": str(REQUEST_TIMEOUT_S)}],
+                                                                   "value": str(REQUEST_TIMEOUT_S)},
+                                                                  *R.ingress_routing_env()],
                                                           "ports": [{"name": "http", "containerPort": 8080}],
                                                           "readinessProbe": {"httpGet": {"path": "/ready",
                                                                                          "port": "http"},
                                                                              "periodSeconds": 5},
                                                           "resources": _res(con["ingress"]),
-                                                          "securityContext": R._CONTAINER_SECURITY}]}}}}
+                                                          "securityContext": R._CONTAINER_SECURITY,
+                                                          "volumeMounts": [token_mount]}],
+                                          "volumes": [token_volume]}}}}
     svc = {"apiVersion": "v1", "kind": "Service", "metadata": {"name": nm["ingress"], "namespace": ns, "labels": lab},
            "spec": {"selector": sel, "ports": [{"name": "http", "port": 80, "targetPort": "http"}]}}
-    return [dep, svc]
+    return R.ingress_rbac(ns, nm["ingress"], lab) + [dep, svc]
 
 
 def render_objects(con: Dict, cal: str, params: Dict, script: str) -> List[Dict]:
@@ -751,6 +759,7 @@ def render_objects(con: Dict, cal: str, params: Dict, script: str) -> List[Dict]
                          "podMetricsEndpoints": [{"port": "http", "path": "/metrics",
                                                   "interval": f"{con['observer']['step_s']}s"}]}})
     R.audit_sidecar_free(objs)
+    R.audit_rbac(objs)
     return objs
 
 
@@ -2245,6 +2254,12 @@ OBJECT_DEFAULTS = {
                 "ipFamilies": ANY, "ipFamilyPolicy": "SingleStack", "internalTrafficPolicy": "Cluster",
                 "ports/*/protocol": "TCP"},
 }
+# The behaviour-bearing top-level fields of the ingress's ServiceAccount, Role and RoleBinding (they have no spec),
+# compared strictly like a spec; the only API default among them is a ServiceAccount subject's empty apiGroup.
+RBAC_KINDS = ("ServiceAccount", "Role", "RoleBinding")
+RBAC_FIELDS = ("automountServiceAccountToken", "secrets", "imagePullSecrets", "rules", "aggregationRule", "roleRef",
+               "subjects")
+RBAC_DEFAULTS = {"subjects/*/apiGroup": ""}
 # Labels the controllers add to the pods they create (never behaviour of the workload itself).
 POD_LABEL_DEFAULTS = ("pod-template-hash", "controller-uid", "job-name", "batch.kubernetes.io/controller-uid",
                       "batch.kubernetes.io/job-name")
@@ -2290,10 +2305,22 @@ def strict_diff(want, live, path: str, defaults: Dict, ignore: Tuple = ()) -> Li
     return [] if _scalar_eq(want, live) else [path]
 
 
+def _drop_mirrored_service_account(want: Dict, live: Dict, where: str = "") -> List[str]:
+    """The API server mirrors serviceAccountName into the deprecated serviceAccount field: when the rendering names a
+    ServiceAccount, the live mirror of exactly that name is removed before the comparison (POD_DEFAULTS allows only
+    "default"), and any other value is a difference."""
+    if "serviceAccountName" not in want or "serviceAccount" in want or "serviceAccount" not in live:
+        return []
+    if live.pop("serviceAccount") == want["serviceAccountName"]:
+        return []
+    return [f"{where}/serviceAccount (differs from the rendered serviceAccountName)"]
+
+
 def _pod_spec_diff(want: Dict, live: Dict) -> List[str]:
     """A pod spec against its rendering: the admission-added default tolerations removed (each once, exactly), every
-    other toleration exactly as rendered, then strict_diff under POD_DEFAULTS."""
+    other toleration exactly as rendered, the mirrored serviceAccount dropped, then strict_diff under POD_DEFAULTS."""
     live = copy.deepcopy(live)
+    mirror = _drop_mirrored_service_account(want, live)
     tol = list(live.get("tolerations") or [])
     for d in ADMISSION_TOLERATIONS:
         if d in tol and d not in (want.get("tolerations") or []):
@@ -2302,7 +2329,7 @@ def _pod_spec_diff(want: Dict, live: Dict) -> List[str]:
         live["tolerations"] = tol
     else:
         live.pop("tolerations", None)
-    return strict_diff(want, live, "", POD_DEFAULTS)
+    return mirror + strict_diff(want, live, "", POD_DEFAULTS)
 
 
 def pod_problems(where: str, tmpl: Dict, pod: Dict) -> List[str]:
@@ -2321,13 +2348,17 @@ def pod_problems(where: str, tmpl: Dict, pod: Dict) -> List[str]:
 
 def object_problems(kind: str, want: Dict, live: Dict, ignore: Tuple = ()) -> List[str]:
     """A live workload object against its rendering: labels (rendered ones equal), spec (strictly, OBJECT_DEFAULTS;
-    a pod template's tolerations with the admission defaults removed) and a ConfigMap's data exactly."""
+    a pod template's tolerations with the admission defaults removed, its mirrored serviceAccount dropped), a
+    ConfigMap's data exactly, and a ServiceAccount's, Role's or RoleBinding's RBAC_FIELDS strictly (absent in the
+    rendering means absent)."""
     diff = [f"/metadata/labels/{k}" for k, v in sorted((want["metadata"].get("labels") or {}).items())
             if (live["metadata"].get("labels") or {}).get(k) != v]
     if "spec" in want:
         ls = copy.deepcopy(live.get("spec") or {})
         tmpl = (ls.get("template") or {}).get("spec")
         if isinstance(tmpl, dict):
+            diff += _drop_mirrored_service_account((want["spec"].get("template") or {}).get("spec") or {}, tmpl,
+                                                   "/spec/template/spec")
             wt = ((want["spec"].get("template") or {}).get("spec") or {}).get("tolerations") or []
             tol = [t for t in tmpl.get("tolerations") or [] if not (t in ADMISSION_TOLERATIONS and t not in wt)]
             if tol or "tolerations" in ((want["spec"].get("template") or {}).get("spec") or {}):
@@ -2338,6 +2369,12 @@ def object_problems(kind: str, want: Dict, live: Dict, ignore: Tuple = ()) -> Li
         diff += strict_diff(want["spec"], ls, "/spec", defaults, ignore)
     if "data" in want:
         diff += [] if live.get("data") == want["data"] and not live.get("binaryData") else ["/data"]
+    if kind in RBAC_KINDS:
+        for k in RBAC_FIELDS:
+            if k in want:
+                diff += strict_diff(want[k], live.get(k, _MISSING), f"/{k}", RBAC_DEFAULTS)
+            elif k in live:
+                diff.append(f"/{k} (not in the reviewed rendering)")
     return diff
 
 
@@ -2645,6 +2682,8 @@ def _role(o: Dict, nm: Dict) -> str:
         return f"w{nm['variants'].index(name)}"
     if kind in ("Deployment", "Service") and name == nm["ingress"]:
         return "ingress"
+    if kind in RBAC_KINDS and name == nm["ingress"]:
+        return "ingress-rbac"
     return {"ConfigMap": "script"}.get(kind, "scrape")
 
 
@@ -2888,7 +2927,7 @@ def cleanup(ctx: Context) -> List[str]:
         remove_jobs(ctx, [o for o in own if o["kind"] == "Job" and not o["deleted"]])
     except X.StagingError as e:
         return [f"generator cleanup: {e}"]        # never touch the fixture while arrivals may continue
-    order = {"scrape": 0, "ingress": 1, "w0": 2, "w1": 2, "script": 3}
+    order = {"scrape": 0, "ingress": 1, "w0": 2, "w1": 2, "script": 3, "ingress-rbac": 4}
     for o in sorted((o for o in own if o["kind"] != "Job" and not o["deleted"]),
                     key=lambda o: (order.get(o["role"], 9), o["kind"] != "Service", o["name"])):
         live = ctx.kube.get(o["kind"], o["name"], o["namespace"])

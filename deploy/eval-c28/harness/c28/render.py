@@ -14,6 +14,16 @@ per-pod opt-out); the namespace policy is never changed. audit_sidecar_free() re
 template lacks either, and unexpected_injection() checks admitted pods for istio-proxy/istio-init containers. Results
 therefore concern this sidecar-free fixture, not mesh-enabled workloads.
 
+Ingress routing: the ingress sends every request to the next READY pod of its target in a strict per-request
+round-robin (fixture ROUTING=endpoints-rr), discovered from the target Services' EndpointSlices, instead of through the
+Service's ClusterIP (where the cluster balances per kept-alive CONNECTION, which made one of two fixture pods queue in
+the S5a calibration). It therefore runs as its own ServiceAccount, bound by a namespaced Role to get/list/watch
+EndpointSlices and nothing else; its token is an explicit projected volume (automountServiceAccountToken stays false
+everywhere, so no admission-generated volume appears). audit_rbac() refuses any other RBAC shape: no cluster-scoped
+object, exactly that rule, a binding only to a rendered ServiceAccount of the same namespace, and a token only in an
+endpoints-rr ingress pod. The routing and the discovery bounds are set explicitly (INGRESS_ROUTING_ENV), never left to
+the binary's default.
+
 Residency: when the params carry a `residency` section (required by the prodcluster staging helpers, optional for the
 kind smoke), residency_report() computes the evaluation's maximum resident requests on W and S from the rendered pod
 templates, the evaluation release's chart values (operator and forecaster) and the declared generators and extras, and
@@ -60,6 +70,19 @@ OPERATOR_BUDGET = {"cpu_request": "100m", "memory_request": "128Mi"}
 GENERATOR_BUDGET = {"concurrent": 1, "cpu_request": "500m", "memory_request": "256Mi"}
 CHART_VALUES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", "charts",
                             "predictive-autoscaler", "values.yaml")
+
+# The ingress's routing (fixture ROUTING) and EndpointSlice discovery bounds, always rendered explicitly: a LIST every
+# resync (a WATCH applies changes in between) and c28_ingress_discovery_stale = 1 once the last successful LIST is older
+# than the stale bound (the last known endpoints stay in use; the harness gates on the metric).
+INGRESS_ROUTING = "endpoints-rr"
+INGRESS_ROUTING_ENV = (("ROUTING", INGRESS_ROUTING), ("DISCOVERY_RESYNC_SECONDS", "30"),
+                       ("DISCOVERY_STALE_SECONDS", "90"))
+RBAC_GROUP = "rbac.authorization.k8s.io"
+ENDPOINTSLICE_RULES = [{"apiGroups": ["discovery.k8s.io"], "resources": ["endpointslices"],
+                        "verbs": ["get", "list", "watch"]}]
+SA_TOKEN_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
+SA_TOKEN_VOLUME = "kube-api-access"
+SA_TOKEN_SECONDS = 3600
 
 FIXED_REPLICAS = 2          # every target's fixed replica count outside a session (the common starting count, section 5)
 
@@ -506,6 +529,35 @@ _CONTAINER_SECURITY = {"allowPrivilegeEscalation": False, "readOnlyRootFilesyste
                        "capabilities": {"drop": ["ALL"]}}
 
 
+def ingress_routing_env() -> List[Dict]:
+    return [{"name": k, "value": v} for k, v in INGRESS_ROUTING_ENV]
+
+
+def ingress_rbac(ns: str, name: str, labels: Dict[str, str]) -> List[Dict]:
+    """The ingress's identity: a ServiceAccount (no automatic token), a Role that may only get/list/watch EndpointSlices
+    in its own namespace, and the RoleBinding of the one to the other (all named `name`)."""
+    md = {"name": name, "namespace": ns, "labels": dict(labels)}
+    return [{"apiVersion": "v1", "kind": "ServiceAccount", "metadata": copy.deepcopy(md),
+             "automountServiceAccountToken": False},
+            {"apiVersion": f"{RBAC_GROUP}/v1", "kind": "Role", "metadata": copy.deepcopy(md),
+             "rules": copy.deepcopy(ENDPOINTSLICE_RULES)},
+            {"apiVersion": f"{RBAC_GROUP}/v1", "kind": "RoleBinding", "metadata": copy.deepcopy(md),
+             "roleRef": {"apiGroup": RBAC_GROUP, "kind": "Role", "name": name},
+             "subjects": [{"kind": "ServiceAccount", "name": name, "namespace": ns}]}]
+
+
+def ingress_token() -> Tuple[Dict, Dict]:
+    """(the pod volume, the container mount) of the ingress's API credentials: an explicit projected volume with every
+    field the API server would otherwise default (token expiry, defaultMode, fieldRef apiVersion), so the admitted pod
+    equals its rendering and no admission-generated kube-api-access-<random> volume appears."""
+    vol = {"name": SA_TOKEN_VOLUME, "projected": {"defaultMode": 420, "sources": [
+        {"serviceAccountToken": {"path": "token", "expirationSeconds": SA_TOKEN_SECONDS}},
+        {"configMap": {"name": "kube-root-ca.crt", "items": [{"key": "ca.crt", "path": "ca.crt"}]}},
+        {"downwardAPI": {"items": [{"path": "namespace",
+                                    "fieldRef": {"apiVersion": "v1", "fieldPath": "metadata.namespace"}}]}}]}}
+    return vol, {"name": SA_TOKEN_VOLUME, "mountPath": SA_TOKEN_DIR, "readOnly": True}
+
+
 def rps_query(target: str) -> str:
     """The target's own offered-RPS query at the independent ingress (frozen 60 s range). The PredictiveAutoscaler gets
     the {{ .Name }} form, which the operator compiles to this exact string."""
@@ -652,25 +704,30 @@ def render_common(p: Dict) -> List[Dict]:
                       "scopeSelector": {"matchExpressions": [{"scopeName": "PriorityClass", "operator": "In",
                                                               "values": [p["priority_class"]]}]}}}
     ilabels = {**labels, "app.kubernetes.io/name": "c28-ingress"}
+    token_volume, token_mount = ingress_token()
     ingress = {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "c28-ingress", "namespace": ns, "labels": ilabels},
                "spec": {"replicas": 1, "selector": {"matchLabels": {"app.kubernetes.io/name": "c28-ingress", RUN_LABEL: p["run_id"]}},
                         "template": {"metadata": {"labels": {**ilabels, **SIDECAR_FREE},
                                                   "annotations": {"prometheus.io/scrape": "true", "prometheus.io/port": "8080",
                                                                   **SIDECAR_FREE}},
-                                     "spec": {"automountServiceAccountToken": False, "securityContext": _SECURITY,
+                                     "spec": {"serviceAccountName": "c28-ingress",
+                                              "automountServiceAccountToken": False, "securityContext": _SECURITY,
                                               **_placement(p, "workload"),
                                               "containers": [{"name": "ingress", "image": p["image"],
                                                               "env": [{"name": "MODE", "value": "ingress"},
                                                                       {"name": "UPSTREAMS", "value": ups},
-                                                                      {"name": "TIMEOUT_SECONDS", "value": str(F.REQUEST_TIMEOUT_S)}],
+                                                                      {"name": "TIMEOUT_SECONDS", "value": str(F.REQUEST_TIMEOUT_S)},
+                                                                      *ingress_routing_env()],
                                                               "ports": [{"name": "http", "containerPort": 8080}],
                                                               "readinessProbe": {"httpGet": {"path": "/ready", "port": "http"}, "periodSeconds": 5},
                                                               "resources": _resources(p["ingress"]),
-                                                              "securityContext": _CONTAINER_SECURITY}]}}}}
+                                                              "securityContext": _CONTAINER_SECURITY,
+                                                              "volumeMounts": [token_mount]}],
+                                              "volumes": [token_volume]}}}}
     isvc = {"apiVersion": "v1", "kind": "Service", "metadata": {"name": "c28-ingress", "namespace": ns, "labels": ilabels},
             "spec": {"selector": {"app.kubernetes.io/name": "c28-ingress", RUN_LABEL: p["run_id"]},
                      "ports": [{"name": "http", "port": 80, "targetPort": "http"}]}}
-    out = [pc, quota, ingress, isvc]
+    out = [pc, quota, *ingress_rbac(ns, "c28-ingress", ilabels), ingress, isvc]
     out += _proxy(p, "c28-metrics-route", p["routes"]["metrics_upstream"], 8481)
     out += _proxy(p, "c28-forecast-route", p["routes"]["forecast_upstream"], 8443)
     if p["release_network_policies"]:
@@ -689,6 +746,7 @@ def render_all(p: Dict) -> List[Dict]:
     objs = render_all_unchecked(p)
     audit_rendered(objs)
     audit_sidecar_free(objs)
+    audit_rbac(objs)
     if "residency" in p:
         check_residency(p, objs)
     return objs
@@ -722,6 +780,61 @@ def audit_sidecar_free(objs: List[Dict]) -> None:
     if bad:
         raise ParamsError(f"Pod templates without the {SIDECAR_LABEL}: \"false\" label and annotation (the "
                           f"evaluation is sidecar-free): {', '.join(bad)}")
+
+
+# --- RBAC audit -------------------------------------------------------------------------------------------------------
+
+def _env_of(container: Dict) -> Dict[str, str]:
+    return {e.get("name"): e.get("value") for e in container.get("env") or []}
+
+
+def audit_rbac(objs: List[Dict]) -> None:
+    """Least privilege, refused otherwise: no cluster-scoped RBAC object; every Role grants exactly get/list/watch on
+    EndpointSlices; every RoleBinding binds a rendered Role to exactly one rendered ServiceAccount of its own
+    namespace; no ServiceAccount (and no pod) mounts a token automatically; a pod runs as a non-default ServiceAccount
+    and carries a service-account token only when it is an endpoints-rr ingress, and then exactly ingress_token()'s."""
+    bad = []
+    by = lambda kind: {(o["metadata"].get("namespace"), o["metadata"]["name"]): o  # noqa: E731
+                       for o in objs if o.get("kind") == kind}
+    sas, roles = by("ServiceAccount"), by("Role")
+    for o in objs:
+        kind, md = o.get("kind"), o.get("metadata") or {}
+        where = f"{kind}/{md.get('name')}"
+        if kind in ("ClusterRole", "ClusterRoleBinding"):
+            bad.append(f"{where}: no cluster-scoped RBAC")
+        elif kind == "ServiceAccount" and o.get("automountServiceAccountToken") is not False:
+            bad.append(f"{where}: automountServiceAccountToken must be false")
+        elif kind == "Role" and o.get("rules") != ENDPOINTSLICE_RULES:
+            bad.append(f"{where}: rules must be exactly get/list/watch on discovery.k8s.io endpointslices")
+        elif kind == "RoleBinding":
+            ns, ref, subs = md.get("namespace"), o.get("roleRef") or {}, o.get("subjects") or []
+            if ref != {"apiGroup": RBAC_GROUP, "kind": "Role", "name": ref.get("name")} or (ns, ref.get("name")) not in roles:
+                bad.append(f"{where}: roleRef must be a rendered Role of its namespace")
+            if len(subs) != 1 or set(subs[0]) != {"kind", "name", "namespace"} or subs[0]["kind"] != "ServiceAccount" \
+                    or subs[0]["namespace"] != ns or (ns, subs[0]["name"]) not in sas:
+                bad.append(f"{where}: subjects must be exactly one rendered ServiceAccount of its namespace")
+        for t in pod_templates(o):
+            spec = t.get("spec") or {}
+            if spec.get("automountServiceAccountToken") is not False:
+                bad.append(f"{where}: pods must not mount a token automatically")
+            cs = spec.get("containers") or []
+            ingress = len(cs) == 1 and _env_of(cs[0]).get("MODE") == "ingress"
+            rr = ingress and _env_of(cs[0]).get("ROUTING") == INGRESS_ROUTING
+            sa = spec.get("serviceAccountName", "default")
+            tokens = [v for v in spec.get("volumes") or [] if any("serviceAccountToken" in src for src in
+                                                                   (v.get("projected") or {}).get("sources") or [])]
+            if ingress and [_env_of(cs[0]).get(k) for k, _ in INGRESS_ROUTING_ENV] != [v for _, v in INGRESS_ROUTING_ENV]:
+                bad.append(f"{where}: the ingress must set {dict(INGRESS_ROUTING_ENV)} explicitly")
+            if rr:
+                vol, mount = ingress_token()
+                if (md.get("namespace"), sa) not in sas or tokens != [vol] or \
+                        [m for m in cs[0].get("volumeMounts") or [] if m.get("name") == SA_TOKEN_VOLUME] != [mount]:
+                    bad.append(f"{where}: the endpoints-rr ingress runs as its rendered ServiceAccount with exactly "
+                               "the projected token")
+            elif sa != "default" or tokens:
+                bad.append(f"{where}: only the endpoints-rr ingress runs as a ServiceAccount with a token")
+    if bad:
+        raise ParamsError("RBAC audit: " + "; ".join(bad))
 
 
 def unexpected_injection(pods: List[Dict]) -> List[str]:

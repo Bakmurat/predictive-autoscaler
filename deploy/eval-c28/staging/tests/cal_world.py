@@ -236,6 +236,7 @@ class World:
         spec.setdefault("dnsPolicy", "ClusterFirst")
         spec.setdefault("schedulerName", "default-scheduler")
         spec.setdefault("serviceAccountName", "default")
+        spec.setdefault("serviceAccount", spec["serviceAccountName"])     # the deprecated mirror the API server sets
         spec.setdefault("enableServiceLinks", True)
         for c in spec.get("containers", []):
             c.setdefault("terminationMessagePath", "/dev/termination-log")

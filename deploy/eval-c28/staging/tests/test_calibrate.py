@@ -568,6 +568,8 @@ def test_plan_is_read_only_and_authorizes_bounded_objects(cal, api):
     assert kinds == sorted([("Deployment", ctx.nm["variants"][0]), ("Service", ctx.nm["variants"][0]),
                             ("Deployment", ctx.nm["variants"][1]), ("Service", ctx.nm["variants"][1]),
                             ("Deployment", ctx.nm["ingress"]), ("Service", ctx.nm["ingress"]),
+                            ("ServiceAccount", ctx.nm["ingress"]), ("Role", ctx.nm["ingress"]),
+                            ("RoleBinding", ctx.nm["ingress"]),
                             ("ConfigMap", ctx.nm["script"]), ("VMPodScrape", ctx.cal)])
     assert p["search"]["max_rate_per_min"] == 30 * 4 * 60 and p["work_selection"]["values"] == [600, 900]
     assert p["admission"]["workload"]["footprint"][0] == {"what": "fixture", "pods": 6, "cpu": "50m",
@@ -642,7 +644,7 @@ def test_fixture_keeps_the_arms_container_shape_and_is_sidecar_free(cal):
     job = K.generator_job(ctx.con, ctx.cal, ctx.params, K.trial_meta(ctx, 7, "search", "w0", 2, 1200, 1))
     R.audit_sidecar_free([job])
     assert job["spec"]["activeDeadlineSeconds"] == 300 + 900 + 120 and X.RUN_LABEL not in job["metadata"]["labels"]
-    ing = next(o for o in objs if o["metadata"]["name"] == ctx.nm["ingress"])
+    ing = next(o for o in objs if o["metadata"]["name"] == ctx.nm["ingress"] and o["kind"] == "Deployment")
     ups = {e["name"]: e["value"] for e in ing["spec"]["template"]["spec"]["containers"][0]["env"]}["UPSTREAMS"]
     assert ups == ",".join(f"{v}=http://{v}.demo.svc" for v in ctx.nm["variants"])
     assert not set(ctx.nm["variants"]) & {R.target_name(a_, p_) for a_ in X.import_harness().frozen.ARMS
@@ -1709,3 +1711,115 @@ def test_w5_pre_job_stop_reports_a_foreign_job_of_that_name(cal, api, monkeypatc
     stopped = [e["data"] for e in ctx.entries() if e["event"] == "trial-stopped"]
     assert out["verdict"] == "NOT READY" and "that this calibration did not create" in stopped[0]["reason"]
     assert ("jobs", "demo", K.job_name(ctx.cal, 3)) in api.objects               # never touched
+
+
+# --- the endpoints-rr ingress: per-request round-robin, least-privilege RBAC --------------------------------------------
+
+def _ingress_pod_and_template(ctx):
+    dep = next(o for o in K.render_ingress(ctx.con, ctx.cal, ctx.params) if o["kind"] == "Deployment")
+    tmpl = dep["spec"]["template"]
+    pod = {"metadata": {"name": "p", "labels": {**tmpl["metadata"]["labels"], "pod-template-hash": "abc"},
+                        "annotations": dict(tmpl["metadata"]["annotations"])},
+           "spec": CW.World._admit({**copy.deepcopy(tmpl["spec"]), "nodeName": "worker-w"})}
+    return dep, tmpl, pod
+
+
+def test_the_calibration_ingress_routes_per_request_with_least_privilege(cal):
+    ctx = cal()
+    R = X.import_harness().render
+    objs = K.render_objects(ctx.con, ctx.cal, ctx.params, "script")
+    order = [(o["kind"], o["metadata"]["name"]) for o in objs]
+    ing = ctx.nm["ingress"]
+    # the identity exists before the ingress Deployment that runs as it
+    assert order.index(("RoleBinding", ing)) < order.index(("Deployment", ing))
+    rbac = {o["kind"]: o for o in objs if o["kind"] in K.RBAC_KINDS}
+    assert set(rbac) == {"ServiceAccount", "Role", "RoleBinding"}
+    assert all(o["metadata"]["name"] == ing and o["metadata"]["namespace"] == "demo" for o in rbac.values())
+    assert rbac["Role"]["rules"] == [{"apiGroups": ["discovery.k8s.io"], "resources": ["endpointslices"],
+                                      "verbs": ["get", "list", "watch"]}]
+    assert rbac["RoleBinding"]["subjects"] == [{"kind": "ServiceAccount", "name": ing, "namespace": "demo"}]
+    assert rbac["RoleBinding"]["roleRef"] == {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": ing}
+    assert rbac["ServiceAccount"]["automountServiceAccountToken"] is False
+    assert not [o for o in objs if o["kind"] in ("ClusterRole", "ClusterRoleBinding")]
+    assert {K._role(o, ctx.nm) for o in rbac.values()} == {"ingress-rbac"}
+    dep = next(o for o in objs if o["kind"] == "Deployment" and o["metadata"]["name"] == ing)
+    spec = dep["spec"]["template"]["spec"]
+    env = {e["name"]: e["value"] for e in spec["containers"][0]["env"]}
+    assert env["ROUTING"] == "endpoints-rr" and env["DISCOVERY_RESYNC_SECONDS"] == "30" and \
+        env["DISCOVERY_STALE_SECONDS"] == "90"
+    assert spec["serviceAccountName"] == ing and spec["automountServiceAccountToken"] is False
+    vol, mount = R.ingress_token()
+    assert spec["volumes"] == [vol] and spec["containers"][0]["volumeMounts"] == [mount]
+    # the evaluation ingress has the same shape (render_common), names apart
+    common = R.render_common(PF.base_params())
+    cdep = next(o for o in common if o["kind"] == "Deployment" and o["metadata"]["name"] == "c28-ingress")
+    cspec = cdep["spec"]["template"]["spec"]
+    assert set(cspec) == set(spec) and cspec["volumes"] == spec["volumes"]
+    cenv = {e["name"]: e["value"] for e in cspec["containers"][0]["env"]}
+    assert set(cenv) == set(env) and all(cenv[k] == env[k] for k, _ in R.INGRESS_ROUTING_ENV)
+    # a broader grant is refused at rendering
+    broad = copy.deepcopy(objs)
+    next(o for o in broad if o["kind"] == "Role")["rules"][0]["verbs"].append("create")
+    with pytest.raises(R.ParamsError, match="RBAC"):
+        R.audit_rbac(broad)
+
+
+def test_rbac_objects_are_compared_strictly(cal):
+    ctx = cal()
+    rbac = {o["kind"]: o for o in K.render_ingress(ctx.con, ctx.cal, ctx.params) if o["kind"] in K.RBAC_KINDS}
+    for kind, want in rbac.items():
+        assert K.object_problems(kind, want, copy.deepcopy(want)) == [], kind
+    live = copy.deepcopy(rbac["RoleBinding"])
+    live["subjects"][0]["apiGroup"] = ""                                    # the API default for a ServiceAccount
+    assert K.object_problems("RoleBinding", rbac["RoleBinding"], live) == []
+    cases = [("Role", lambda o: o["rules"][0]["verbs"].append("delete")),
+             ("Role", lambda o: o["rules"].append({"apiGroups": [""], "resources": ["secrets"], "verbs": ["get"]})),
+             ("Role", lambda o: o["rules"][0]["resources"].append("endpoints")),
+             ("RoleBinding", lambda o: o["subjects"].append({"kind": "ServiceAccount", "name": "default",
+                                                            "namespace": "demo"})),
+             ("RoleBinding", lambda o: o["subjects"][0].update(apiGroup="rbac.authorization.k8s.io")),
+             ("RoleBinding", lambda o: o["roleRef"].update(kind="ClusterRole")),
+             ("ServiceAccount", lambda o: o.update(automountServiceAccountToken=True)),
+             ("ServiceAccount", lambda o: o.update(imagePullSecrets=[{"name": "x"}])),
+             ("ServiceAccount", lambda o: o.pop("automountServiceAccountToken"))]
+    for kind, mutate in cases:
+        live = copy.deepcopy(rbac[kind])
+        mutate(live)
+        assert K.object_problems(kind, rbac[kind], live), (kind, live)
+
+
+def test_the_ingress_pod_runs_as_its_service_account_and_nothing_else(cal):
+    ctx = cal()
+    dep, tmpl, pod = _ingress_pod_and_template(ctx)
+    assert pod["spec"]["serviceAccount"] == ctx.nm["ingress"]               # the API server's deprecated mirror
+    assert K.pod_problems("p", tmpl, pod) == []
+    live = copy.deepcopy(dep)
+    live["spec"]["template"]["spec"]["serviceAccount"] = ctx.nm["ingress"]
+    assert K.object_problems("Deployment", dep, live) == []
+    live["spec"]["template"]["spec"]["serviceAccount"] = "default"
+    assert K.object_problems("Deployment", dep, live)
+    for mutate in (lambda s: s.update(serviceAccount="default"),
+                   lambda s: s.update(serviceAccountName="default", serviceAccount="default"),
+                   lambda s: s.update(automountServiceAccountToken=True),
+                   lambda s: s["volumes"].append({"name": "kube-api-access-x7k2p", "projected": {"sources": [
+                       {"serviceAccountToken": {"path": "token", "expirationSeconds": 3607}}]}}),
+                   lambda s: s["volumes"][0]["projected"]["sources"][0]["serviceAccountToken"].update(audience="x"),
+                   lambda s: s["containers"][0]["env"].pop()):
+        bad = copy.deepcopy(pod)
+        mutate(bad["spec"])
+        assert K.pod_problems("p", tmpl, bad), mutate
+    # fixture pods still run as default, without a token
+    ftmpl, fpod = _fixture_pod_and_template(ctx, None)
+    assert fpod["spec"]["serviceAccount"] == "default" and K.pod_problems("p", ftmpl, fpod) == []
+
+
+def test_cleanup_removes_the_ingress_identity_after_the_ingress(cal, api):
+    ctx = cal()
+    assert run(ctx)["verdict"] == "READY"
+    deletes = [(e["data"]["kind"], e["data"]["name"]) for e in ctx.entries()
+               if e["event"].startswith("intent") and e["data"].get("op") == "delete"
+               and (e["data"].get("context") or {}).get("phase") == "cleanup"]
+    ing = ctx.nm["ingress"]
+    assert deletes.index(("Deployment", ing)) < min(deletes.index((k, ing)) for k in K.RBAC_KINDS)
+    assert not [k for (k, _, n) in api.objects if n == ing]
+
