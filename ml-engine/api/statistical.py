@@ -11,7 +11,9 @@ forecasting.contracts) and bounded admission (api/admission.py, the same rule as
 api/serve.py (`python -m api.serve statistical`), which also restarts it when the TLS files rotate.
 
 Configuration (environment): PROMETHEUS_URL (required), FORECAST_STATE_DIR (default /state: the journal and fit
-artifacts, a retained volume), FORECAST_STATE_QUOTA_BYTES, FORECAST_ADMISSION, FORECAST_FIT_MODE (worker | off) and
+artifacts, a retained volume), FORECAST_STATE_QUOTA_BYTES, FORECAST_ADMISSION, FORECAST_FIT_MODE (worker | off),
+FORECAST_MAX_AUTOSCALERS (default 8: the autoscalers registered at once; one more gets 503 AutoscalerLimitReached),
+FORECAST_AUTOSCALER_IDLE_SECONDS (default 86400: a registration without a request this long is released; 0: never) and
 the FORECASTER_AUTH* / FORECASTER_TLS_* settings of api/auth.py. FORECAST_LAB_QUALIFICATION names a reviewed
 lab-qualification/v1 file (forecasting.qualification): honoured only by the evaluation build and image digest
 (FORECAST_IMAGE_DIGEST) it names; in any other image, or malformed, expired or for another source tree, the app does
@@ -57,6 +59,16 @@ def refuse_benchmark_switches(env: Mapping[str, str]) -> None:
                       f"{', '.join(present)}")
 
 
+def _int_env(env: Mapping[str, str], name: str, default: int, minimum: int) -> int:
+    try:
+        value = int(env.get(name, str(default)))
+    except ValueError:
+        value = None
+    if value is None or value < minimum:
+        raise Refused(f"{name} must be an integer of at least {minimum}, got {env.get(name)!r}")
+    return value
+
+
 def default_service(env: Mapping[str, str]):
     from forecasting.service import ForecastService, ServiceConfig
     url = env.get("PROMETHEUS_URL", "")
@@ -84,8 +96,10 @@ def default_service(env: Mapping[str, str]):
         raise Refused(f"the demonstration qualification is refused: {e}") from e
     cfg = ServiceConfig(prometheus_url=url, state_dir=env.get("FORECAST_STATE_DIR", "/state"),
                         quota_bytes=int(env.get("FORECAST_STATE_QUOTA_BYTES", str(1536 << 20))),
-                        fit_mode=env.get("FORECAST_FIT_MODE", "worker"), build=build, lab_qualification=lab,
-                        demonstration_qualification=demo)
+                        fit_mode=env.get("FORECAST_FIT_MODE", "worker"),
+                        max_autoscalers=_int_env(env, "FORECAST_MAX_AUTOSCALERS", 8, 1),
+                        slot_idle_seconds=_int_env(env, "FORECAST_AUTOSCALER_IDLE_SECONDS", 86400, 0),
+                        build=build, lab_qualification=lab, demonstration_qualification=demo)
     if lab is not None:
         logger.warning("LAB QUALIFICATION %s active for cluster %s, namespaces %s, %d targets, until %s (evaluation "
                        "build %s)", lab.sha256, lab.cluster_uid, sorted(lab.namespaces), len(lab.targets),
@@ -156,6 +170,7 @@ def create_app(env: Mapping[str, str] = os.environ, service_factory: Optional[Ca
             basis = getattr(svc, "qualification_metrics", None)
             if basis is not None:
                 extra.register(basis)
+            extra.register(svc.service_metrics)
             body += generate_latest(extra)
         return Response(body, media_type=CONTENT_TYPE_LATEST)
 

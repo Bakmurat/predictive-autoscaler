@@ -44,16 +44,30 @@ resolved settings fingerprint included), and only for an answer whose SELECTED f
 decided after selection (the gate is first evaluated without it) and re-checked on every answer, like the document's
 and the contract's digests. It is never combined with a lab qualification or with passed release gates: the service
 refuses to start. Eligibility is an answer, not an action: nothing here assumes a replica write follows.
+
+The service registers at most ServiceConfig.max_autoscalers (namespace, autoscaler) names at once (its metric series
+and working memory are sized for them); one more is refused with 503 AutoscalerLimitReached. A registration is
+released only on evidence, never because a lookup failed:
+  - the Kubernetes API answers a definite 404 for the autoscaler (on its own request, or when a full registry is
+    checked: every registered name is looked up, at most once per SLOT_SWEEP_SECONDS);
+  - the live object has another UID: the old identity's registration ends and the new UID starts as a new, isolated
+    identity (the evidence key, the journal epoch and the fit artifacts are all bound to the UID);
+  - no request for it for ServiceConfig.slot_idle_seconds (a day by default; 0: never).
+A timeout, a 5xx or a refused read (401/403) proves nothing and releases nothing. A release frees the registration, the
+metric series and the in-memory caches; the journal keeps the autoscaler's evidence under its retention rules, so the
+same object (the same UID) registering again continues exactly where it was.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
+import time
 from dataclasses import dataclass, replace
 from typing import Callable, Dict, Mapping, Optional, Tuple
 
-from api.identity import LookupFailed, ProvenanceRefused
+from api.identity import API_GROUP, API_VERSION, AutoscalerNotFound, LookupFailed, ProvenanceRefused
 from data.bounded_http import bounded_get
 from forecasting import calibration as cal
 from forecasting import demonstration as D
@@ -66,7 +80,7 @@ from forecasting.contracts import FAMILY_MODELS, FORECAST_CONTRACT, UNIT, BoundR
     bind_request, canonical_json, check_response, sha256_hex
 from forecasting.history import HistoryRefused, HistoryUnavailable, read_rps_history
 from forecasting.maturation import candidate, issued_outcome
-from forecasting.metrics import ForecastMetrics, RegistryFull, Snapshot, model_samples
+from forecasting.metrics import ForecastMetrics, RegistryFull, ServiceMetrics, Snapshot, model_samples
 from forecasting.qualification_metrics import QualificationMetrics
 from forecasting.statistical import RECIPE_E1, RECIPE_NAIVE, KernelSettings, KernelUnavailable, Series, fit_e1, \
     forecast_e1, seasonal_naive
@@ -81,6 +95,10 @@ COST_HISTORY_SECONDS = 8 * DAY      # issued bounds kept in memory for cost repl
 # What ties a stored answer to the basis it was issued under (absent keys compare as None: older bundles have fewer).
 _GATE_IDENTITY = ("basis", "lab_qualification_sha256", "demonstration_qualification_sha256",
                   "demonstration_contract_sha256")
+SLOT_SWEEP_SECONDS = 60             # a full registry is checked against the Kubernetes API at most this often
+SLOT_SWEEP_BUDGET_SECONDS = 10      # ... and one check starts no further lookup after this long
+
+logger = logging.getLogger("forecasting.service")
 
 
 class ServiceError(Exception):
@@ -95,7 +113,8 @@ class ServiceConfig:
     state_dir: str
     quota_bytes: int = DEFAULT_QUOTA_BYTES
     fit_mode: str = "worker"             # worker (bounded fit processes) | inline (tests) | off
-    max_autoscalers: int = 8
+    max_autoscalers: int = 8             # (namespace, autoscaler) names registered at once; one more is refused
+    slot_idle_seconds: int = DAY         # a registration without a request for this long is released; 0: never
     store_id: Optional[str] = None       # a fixed journal identity (deterministic tests); None: random at creation
     retention_seconds: int = 7 * DAY     # issuances and outcomes kept online (observations: 28 days)
     compact_every_seconds: int = 3600
@@ -109,6 +128,8 @@ class ForecastService:
     def __init__(self, config: ServiceConfig, *, reader, fetch: Callable = bounded_get, clock=None, worker=None):
         if config.fit_mode not in ("worker", "inline", "off"):
             raise ValueError(f"unknown fit mode {config.fit_mode!r}")
+        if config.max_autoscalers < 1 or config.slot_idle_seconds < 0:
+            raise ValueError("max_autoscalers must be at least 1 and slot_idle_seconds 0 (never) or more")
         q = config.lab_qualification
         if q is not None and not (config.build.evaluation_build and q.source_tree == config.build.source_tree):
             raise Q.QualificationRefused("a lab qualification is honoured only by the evaluation build it names")
@@ -143,11 +164,14 @@ class ForecastService:
             self.worker = FitWorker(self.artifacts)
         self.metrics = ForecastMetrics(max_autoscalers=config.max_autoscalers)
         self.qualification_metrics = QualificationMetrics(self.qualification_status, D.REFUSALS)
+        self.service_metrics = ServiceMetrics(self.metrics)
         self._lock = threading.Lock()                   # one writer of the journal and the epoch states
         self._compacted_s: Optional[int] = None
         self._cluster_uid: Optional[str] = None         # read once it succeeds (a pod never changes cluster)
         self._uppers: Dict = {}                         # (namespace, autoscaler) -> issued bounds of its epoch
         self._costs: Dict = {}                          # (namespace, autoscaler) -> (cache key, costs)
+        self._sweep_lock = threading.Lock()             # one check of a full registry at a time
+        self._swept_ms: Optional[int] = None            # when the last one started
         self.cost_replays = 0                           # cost simulations run (each one replays both families)
 
     # --- status -------------------------------------------------------------------------------------------------
@@ -195,15 +219,17 @@ class ForecastService:
         now_ms = self.clock.now_ms()
         try:
             bound = bind_request(body, self.reader, now_ms=now_ms)
+        except AutoscalerNotFound as e:
+            for ns, name, uid, seen in self.metrics.slots():   # the live lookup's definite 404: it is gone, so the
+                if (ns, name) == (e.namespace, e.name) and seen <= now_ms:     # registration it held then is released
+                    self._release(ns, name, "not_found", uid=uid, seen_ms=seen)
+            raise ServiceError(422, "IdentityMismatch", str(e)) from e
         except (ContractRefused, ProvenanceRefused) as e:
             raise ServiceError(422, "IdentityMismatch", str(e)) from e
         except LookupFailed as e:
             raise ServiceError(503, "IdentityMismatch", f"the autoscaler could not be read: {e}") from e
         sig = bound.signal
-        try:
-            self.metrics.reserve(sig.namespace, bound.autoscaler_name)       # atomic, before any expensive work
-        except RegistryFull as e:
-            raise ServiceError(503, "StateUnavailable", f"the service's registration limit is reached: {e}") from e
+        self._admit(bound, now_ms)                             # atomic, before any expensive work
         if not self.store_healthy:
             raise ServiceError(503, "StateUnavailable", "the forecast journal is unavailable; no issuance")
         if bound.lead is None:
@@ -511,9 +537,79 @@ class ForecastService:
         self.metrics.update(bound.signal.namespace, bound.autoscaler_name,
                             Snapshot(bound.signal.autoscaler_uid, models))
 
-    def forget(self, namespace: str, autoscaler: str) -> None:
-        """After confirmed deletion: drop the autoscaler's series (its journal epoch simply stops growing)."""
-        self.metrics.remove(namespace, autoscaler)
+    # --- registrations ----------------------------------------------------------------------------------------------
+
+    def _admit(self, bound: BoundRequest, now_ms: int) -> None:
+        """Register the request's autoscaler, or refuse it at the limit (503 AutoscalerLimitReached). Registrations
+        idle for slot_idle_seconds are released first; a full registry is then checked against the API once
+        (_sweep_slots). A registration held by another UID becomes the new object's, with nothing carried over."""
+        ns, name, uid = bound.signal.namespace, bound.autoscaler_name, bound.signal.autoscaler_uid
+        idle_ms = self.config.slot_idle_seconds * 1000
+        if idle_ms:
+            for s_ns, s_name, s_uid, seen in self.metrics.slots():
+                if (s_ns, s_name) != (ns, name) and now_ms - seen >= idle_ms:
+                    self._release(s_ns, s_name, "idle", uid=s_uid, seen_ms=seen)
+        try:
+            replaced = self.metrics.reserve(ns, name, uid, now_ms)
+        except RegistryFull:
+            try:
+                if not self._sweep_slots(now_ms):
+                    raise
+                replaced = self.metrics.reserve(ns, name, uid, now_ms)
+            except RegistryFull as e:
+                self.metrics.count_refusal()
+                raise ServiceError(503, "AutoscalerLimitReached", f"the service's registration limit is reached: {e}; "
+                                   "a registration is released when its autoscaler is deleted, replaced or idle") from e
+        if replaced is not None:
+            self._forget(ns, name)
+            logger.info("autoscaler %s/%s was replaced (UID %s, now %s): registered as a new identity", ns, name,
+                        replaced, uid)
+
+    def _sweep_slots(self, now_ms: int) -> bool:
+        """The registry is full: look up every registered autoscaler, the longest without a request first, and release
+        those the API says are gone (a definite 404) or replaced (another UID). A lookup that could not be completed
+        (timeout, 5xx, 401/403) or an unreadable object proves nothing and keeps its registration. One check at a
+        time, at most one per SLOT_SWEEP_SECONDS; True when a registration was released."""
+        if not self._sweep_lock.acquire(blocking=False):
+            return False
+        try:
+            if self._swept_ms is not None and now_ms - self._swept_ms < SLOT_SWEEP_SECONDS * 1000:
+                return False
+            self._swept_ms = now_ms
+            started, freed = time.monotonic(), False
+            for ns, name, uid, seen in self.metrics.slots():
+                if time.monotonic() - started > SLOT_SWEEP_BUDGET_SECONDS:
+                    break
+                try:
+                    pa = self.reader.get(f"/apis/{API_GROUP}/{API_VERSION}/namespaces/{ns}/predictiveautoscalers/"
+                                         f"{name}")
+                except LookupFailed:
+                    continue
+                if pa is None:
+                    reason = "not_found"
+                else:
+                    meta = pa.get("metadata") if isinstance(pa, dict) else None
+                    live = meta.get("uid") if isinstance(meta, dict) else None
+                    if not (isinstance(live, str) and live and uid and live != uid):
+                        continue
+                    reason = "replaced"
+                freed = self._release(ns, name, reason, uid=uid, seen_ms=seen) or freed
+            return freed
+        finally:
+            self._sweep_lock.release()
+
+    def _release(self, namespace: str, autoscaler: str, reason: str, *, uid: Optional[str] = None,
+                 seen_ms: Optional[int] = None) -> bool:
+        """Free an autoscaler's registration and series (with uid/seen_ms: only if it still is that identity, with no
+        request since). Its journal epoch simply stops growing: nothing durable is deleted."""
+        if not self.metrics.release(namespace, autoscaler, reason, uid=uid, seen_ms=seen_ms):
+            return False
+        self._forget(namespace, autoscaler)
+        logger.info("released the registration of autoscaler %s/%s (%s); its journal evidence is kept", namespace,
+                    autoscaler, reason)
+        return True
+
+    def _forget(self, namespace: str, autoscaler: str) -> None:
         with self._lock:
             self._uppers.pop((namespace, autoscaler), None)
             self._costs.pop((namespace, autoscaler), None)

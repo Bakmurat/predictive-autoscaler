@@ -169,3 +169,47 @@ def test_reservation_is_atomic_and_counts_against_the_limit():
     with pytest.raises(M.RegistryFull):
         m.reserve("shop", "api")
     assert m.registered() == [("shop", "web")] and list(registry(m).collect())
+
+
+def test_a_registration_names_its_uid_and_a_new_uid_starts_empty():
+    m = M.ForecastMetrics(max_autoscalers=1)
+    assert m.reserve("shop", "web", "uid-1", 1000) is None
+    m.update("shop", "web", snapshot(uid="uid-1"))
+    assert samples(registry(m), "web")
+    assert m.reserve("shop", "web", "uid-1", 2000) is None             # the same object: its series stay
+    assert samples(registry(m), "web") and m.slots() == [("shop", "web", "uid-1", 2000)]
+    assert m.reserve("shop", "web", "uid-2", 3000) == "uid-1"          # replaced: the slot is the new object's ...
+    assert samples(registry(m), "web") == [] and m.slots() == [("shop", "web", "uid-2", 3000)]   # ... and empty
+    assert m.released == {"not_found": 0, "replaced": 1, "idle": 0}
+
+
+def test_a_release_is_conditional_on_the_identity_and_the_last_request():
+    m = M.ForecastMetrics(max_autoscalers=2)
+    m.reserve("shop", "web", "uid-1", 1000)
+    m.reserve("shop", "api", "uid-2", 1500)
+    assert [s[1] for s in m.slots()] == ["web", "api"]                  # the longest without a request first
+    assert m.release("shop", "web", "not_found", uid="other", seen_ms=1000) is False     # another identity by now
+    m.reserve("shop", "web", "uid-1", 2000)
+    assert m.release("shop", "web", "idle", uid="uid-1", seen_ms=1000) is False          # a request arrived since
+    assert m.registered() == [("shop", "api"), ("shop", "web")] and sum(m.released.values()) == 0
+    assert m.release("shop", "web", "idle", uid="uid-1", seen_ms=2000) is True
+    assert m.release("shop", "web", "idle") is False                    # already gone
+    assert m.registered() == [("shop", "api")] and m.released["idle"] == 1
+    with pytest.raises(ValueError):
+        m.release("shop", "api", "evicted")
+    m.reserve("shop", "new", "uid-3", 3000)                             # the freed slot admits another name
+
+
+def test_the_services_own_series_are_bounded_and_label_free():
+    m = M.ForecastMetrics(max_autoscalers=3)
+    m.reserve("shop", "web", "uid-1", 1000)
+    m.reserve("shop", "api", "uid-2", 1000)
+    m.release("shop", "api", "not_found")
+    m.count_refusal()
+    got = {(s.name, tuple(sorted(s.labels.items()))): s.value for s in samples(registry(M.ServiceMetrics(m)))}
+    p = M.SERVICE_PREFIX
+    assert got == {(p + "autoscaler_slots", ()): 1.0, (p + "autoscaler_slot_limit", ()): 3.0,
+                   (p + "autoscaler_slot_refusals_total", ()): 1.0,
+                   **{(p + "autoscaler_slot_releases_total", (("reason", r),)): float(r == "not_found")
+                      for r in M.RELEASE_REASONS}}
+    assert not p.startswith(M.PREFIX) and not any(n.startswith(M.PREFIX) for n, _ in got)

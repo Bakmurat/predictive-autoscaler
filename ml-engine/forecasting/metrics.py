@@ -9,10 +9,14 @@ that name or meaning.
 
 ForecastMetrics is a prometheus_client collector over immutable per-autoscaler snapshots. update() replaces an
 autoscaler's snapshot whole (a new UID replaces the old one: its counters restart, nothing is mixed across identities);
-remove() drops it after confirmed deletion or registration expiry, and its series disappear. Admission is bounded:
-at most max_autoscalers registered (8) and at most max_series_per_autoscaler series each (256); beyond that update()
-refuses (RegistryFull / CardinalityExceeded) rather than evicting anything. A missing value (no denominator, no bound)
-removes that series instead of exporting 0 or 1.
+release() drops it after confirmed deletion, replacement or registration expiry, and its series disappear. Admission
+is bounded: at most max_autoscalers registered (8 by default) and at most max_series_per_autoscaler series each (256);
+beyond that update() and reserve() refuse (RegistryFull / CardinalityExceeded) rather than evicting anything: the
+caller (forecasting.service) decides what may be released, and only on evidence. A missing value (no denominator, no
+bound) removes that series instead of exporting 0 or 1.
+
+ServiceMetrics is the service's own handful of series (predictive_autoscaler_forecaster_*, no autoscaler or model
+label): the registrations in use, their limit, the refusals at the limit and the releases by reason.
 """
 
 from __future__ import annotations
@@ -37,6 +41,8 @@ COHORTS = ("all", "gate")
 OUTCOME_RESULTS = ("covered", "missed", "unscorable")
 MAX_AUTOSCALERS = 8
 MAX_SERIES_PER_AUTOSCALER = 256
+SERVICE_PREFIX = "predictive_autoscaler_forecaster_"
+RELEASE_REASONS = ("not_found", "replaced", "idle")
 
 # name suffix -> (type, extra label or None, help)
 METRICS: Dict[str, Tuple[str, Optional[str], str]] = {
@@ -139,6 +145,9 @@ class ForecastMetrics(Collector):
                  max_series_per_autoscaler: int = MAX_SERIES_PER_AUTOSCALER):
         self.max_autoscalers, self.max_series = max_autoscalers, max_series_per_autoscaler
         self._snaps: Dict[Tuple[str, str], Snapshot] = {}
+        self._seen: Dict[Tuple[str, str], int] = {}               # the registration's last request (clock ms)
+        self.refused = 0                                          # requests refused at the limit
+        self.released = {r: 0 for r in RELEASE_REASONS}
         self._lock = threading.Lock()
 
     def update(self, namespace: str, autoscaler: str, snapshot: Snapshot) -> None:
@@ -158,25 +167,70 @@ class ForecastMetrics(Collector):
             if key not in self._snaps and len(self._snaps) >= self.max_autoscalers:
                 raise RegistryFull(f"{self.max_autoscalers} autoscalers are already registered")
             self._snaps[key] = snapshot
+            self._seen.setdefault(key, 0)
 
-    def reserve(self, namespace: str, autoscaler: str) -> None:
-        """Admit an autoscaler before any work is done for it (atomic; an empty snapshot until its first update).
+    def reserve(self, namespace: str, autoscaler: str, uid: str = "", now_ms: int = 0) -> Optional[str]:
+        """Admit an autoscaler before any work is done for it (atomic; an empty snapshot until its first update) and
+        note the request's time. A registration held by another UID is replaced by an empty one for `uid` (the same
+        slot, a new identity: none of the old object's series survive) and that old UID is returned; otherwise None.
         Raises RegistryFull when the limit is reached and it is not registered yet."""
         key = (namespace, autoscaler)
         with self._lock:
-            if key in self._snaps:
-                return
-            if len(self._snaps) >= self.max_autoscalers:
-                raise RegistryFull(f"{self.max_autoscalers} autoscalers are already registered")
-            self._snaps[key] = Snapshot("", {})
+            have = self._snaps.get(key)
+            if have is None:
+                if len(self._snaps) >= self.max_autoscalers:
+                    raise RegistryFull(f"{self.max_autoscalers} autoscalers are already registered")
+                self._snaps[key] = Snapshot(uid, {})
+            self._seen[key] = max(now_ms, self._seen.get(key, 0))
+            if have is None or not uid or have.uid == uid:
+                return None
+            if not have.uid:                                      # registered without a UID so far: it is this one's
+                self._snaps[key] = Snapshot(uid, have.models)
+                return None
+            self._snaps[key] = Snapshot(uid, {})
+            self.released["replaced"] += 1
+            return have.uid
+
+    def release(self, namespace: str, autoscaler: str, reason: str, *, uid: Optional[str] = None,
+                seen_ms: Optional[int] = None) -> bool:
+        """Free a registration and drop its series, counted by reason. With `uid` / `seen_ms`, only if it still is that
+        identity and has had no request since (evidence gathered about one registration never frees another)."""
+        if reason not in RELEASE_REASONS:
+            raise ValueError(f"release reason {reason!r} is not one of {RELEASE_REASONS}")
+        key = (namespace, autoscaler)
+        with self._lock:
+            have = self._snaps.get(key)
+            if have is None or (uid is not None and have.uid != uid) or \
+                    (seen_ms is not None and self._seen.get(key, 0) != seen_ms):
+                return False
+            del self._snaps[key]
+            self._seen.pop(key, None)
+            self.released[reason] += 1
+            return True
+
+    def count_refusal(self) -> None:
+        with self._lock:
+            self.refused += 1
 
     def remove(self, namespace: str, autoscaler: str) -> None:
         with self._lock:
             self._snaps.pop((namespace, autoscaler), None)
+            self._seen.pop((namespace, autoscaler), None)
 
     def registered(self) -> List[Tuple[str, str]]:
         with self._lock:
             return sorted(self._snaps)
+
+    def slots(self) -> List[Tuple[str, str, str, int]]:
+        """[(namespace, autoscaler, registered UID, last request ms)], the longest without a request first."""
+        with self._lock:
+            return sorted(((ns, name, snap.uid, self._seen.get((ns, name), 0))
+                           for (ns, name), snap in self._snaps.items()), key=lambda s: (s[3], s[0], s[1]))
+
+    def counts(self) -> Tuple[int, int, Dict[str, int]]:
+        """(registered now, refusals at the limit, releases by reason)."""
+        with self._lock:
+            return len(self._snaps), self.refused, dict(self.released)
 
     def collect(self) -> Iterator:
         with self._lock:
@@ -192,3 +246,25 @@ class ForecastMetrics(Collector):
                 for suffix, extra, value in samples:
                     families[suffix].add_metric([ns, name, model, *extra], value)
         yield from families.values()
+
+
+class ServiceMetrics(Collector):
+    """The service's own series over a ForecastMetrics registry: bounded (one label at most, from a fixed enum)."""
+
+    def __init__(self, registry: ForecastMetrics):
+        self.registry = registry
+
+    def collect(self) -> Iterator:
+        used, refused, released = self.registry.counts()
+        yield GaugeMetricFamily(SERVICE_PREFIX + "autoscaler_slots", "Autoscalers registered with the service now.",
+                                value=float(used))
+        yield GaugeMetricFamily(SERVICE_PREFIX + "autoscaler_slot_limit", "The most autoscalers the service registers "
+                                "(forecaster.statistical.maxAutoscalers).", value=float(self.registry.max_autoscalers))
+        yield CounterMetricFamily(SERVICE_PREFIX + "autoscaler_slot_refusals", "Requests refused because every "
+                                  "registration was in use (AutoscalerLimitReached).", value=float(refused))
+        releases = CounterMetricFamily(SERVICE_PREFIX + "autoscaler_slot_releases", "Registrations released: the "
+                                       "autoscaler was deleted (not_found), replaced by another UID, or idle.",
+                                       labels=["reason"])
+        for reason in RELEASE_REASONS:
+            releases.add_metric([reason], float(released[reason]))
+        yield releases

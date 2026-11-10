@@ -39,6 +39,15 @@ class ProvenanceRefused(Exception):
     """The request does not match the autoscaler's current compiled query (HTTP 422)."""
 
 
+class AutoscalerNotFound(ProvenanceRefused):
+    """The Kubernetes API answered a definite 404 for the PredictiveAutoscaler itself: it does not exist. Never raised
+    for a lookup that could not be completed (that is LookupFailed)."""
+
+    def __init__(self, namespace: str, name: str):
+        super().__init__(f"PredictiveAutoscaler {namespace}/{name} not found")
+        self.namespace, self.name = namespace, name
+
+
 class LookupFailed(Exception):
     """The autoscaler or its target could not be read (HTTP 503)."""
 
@@ -127,7 +136,7 @@ def resolve_autoscaler(reader: KubeReader, pa_ns: str, pa_name: str) -> Resolved
         raise ProvenanceRefused(f"malformed autoscaler reference {pa_ns!r}/{pa_name!r}")
     pa = reader.get(f"/apis/{API_GROUP}/{API_VERSION}/namespaces/{pa_ns}/predictiveautoscalers/{pa_name}")
     if pa is None:
-        raise ProvenanceRefused(f"PredictiveAutoscaler {pa_ns}/{pa_name} not found")
+        raise AutoscalerNotFound(pa_ns, pa_name)
     meta, spec, status = _obj(pa, "metadata"), _obj(pa, "spec"), _obj(pa, "status")
     uid, generation = meta.get("uid"), meta.get("generation")
     if not isinstance(uid, str) or not uid or not isinstance(generation, int) or isinstance(generation, bool):
