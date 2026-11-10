@@ -60,7 +60,7 @@ FRESHNESS = {
 # The ingress's endpoint discovery (contract v2): its own gauges per ingress pod, the membership series' raw timestamps
 # and the per-endpoint dispatch counters (label endpoint_pod; the scrape's pod label names the ingress pod).
 DISC_SEL = 'namespace="__NAMESPACE__",pod=~"__PODS__"'
-DISCOVERY = {
+DISCOVERY_V2 = {
     "synced": "max by (pod) (c28_ingress_discovery_synced{" + DISC_SEL + "})",
     "stale": "max by (pod) (c28_ingress_discovery_stale{" + DISC_SEL + "})",
     "scrape_timestamp": "min by (pod) (timestamp(c28_ingress_discovery_stale{" + DISC_SEL + "}))",
@@ -69,6 +69,10 @@ DISCOVERY = {
     "dispatched": ('sum by (endpoint_pod) (c28_ingress_dispatched_total{namespace="__NAMESPACE__",'
                    'target="__TARGET__"})'),
 }
+# Contract v3 adds the variant's no-ready-endpoint rejections (503s the ingress answers itself, never dispatched).
+NO_READY = 'sum(c28_ingress_no_ready_endpoints_total{namespace="__NAMESPACE__",target="__TARGET__"})'
+DISCOVERY = dict(DISCOVERY_V2, no_ready=NO_READY)
+V2 = "c28-calibration-contract/v2"
 
 
 def contract(tmp, **over):
@@ -108,6 +112,8 @@ def contract(tmp, **over):
         "admission": {"limit_fraction": 0.75, "overlap_pods": 2},
         "rollout_guard": {"kinds": list(K.ROLLOUT_KINDS), "extra_owners": []},
     }
+    if over.get("schema") == V2 and "observer.discovery" not in over:
+        con["observer"]["discovery"] = dict(DISCOVERY_V2)     # the v2 reference contract
     for path, value in over.items():
         cur = con
         keys = path.split(".")
@@ -164,6 +170,10 @@ class World:
         self.dispatched = {}
         self.rr_next = {}
         self.dispatch_short = 0
+        # arrivals the ingress answers 503 "no ready endpoint" (received, never dispatched; k6 sees failures), per
+        # trial id in its measure scenario; the counter per target exists only from its first rejection on
+        self.no_ready_trials = {}
+        self.no_ready = {}
         api.on_poll.append(self.poll)
 
     # --- the cluster ---
@@ -287,7 +297,8 @@ class World:
             sched = rate * dur / 60
             dropped = self.drops if s == "measure" else 0
             disp = sched - dropped
-            failed = 0 if ok else math.ceil(0.05 * disp)
+            rejected = self.no_ready_trials.get(env["C28CAL_TRIAL"], 0) if s == "measure" else 0
+            failed = min(disp, (0 if ok else math.ceil(0.05 * disp)) + rejected)
             scen[s] = {"iterations": {"count": disp, "rate": disp / dur},
                        "dropped_iterations": ({"count": dropped, "rate": dropped / dur}
                                               if dropped or not self.drop_key_absent else None),
@@ -304,7 +315,9 @@ class World:
             c["resp"] += total + (self.extra_arrivals if s == "measure" else 0)
             # strict round-robin over the variant's pods, as the endpoints-rr ingress dispatches
             arrivals = int(total + (self.extra_arrivals if s == "measure" else 0)) - \
-                (self.dispatch_short if s == "measure" else 0)
+                (self.dispatch_short if s == "measure" else 0) - rejected
+            if rejected:
+                self.no_ready[target] = self.no_ready.get(target, 0) + rejected
             fx = self._variant_pods(target)
             d = self.dispatched.setdefault(target, {})
             off = self.rr_next.get(target, 0) % len(fx)           # the rotation continues across scenarios
@@ -324,6 +337,13 @@ class World:
 
     # --- the observer ---
     def fetch(self, url):
+        """A query_range answer as the real API gives it (status success, resultType matrix)."""
+        doc = self._answer(url)
+        doc.setdefault("status", "success")
+        doc.setdefault("data", {}).setdefault("resultType", "matrix")
+        return doc
+
+    def _answer(self, url):
         q = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
         query = q["query"][0]
         start, end, step = int(q["start"][0]), int(q["end"][0]), int(q["step"][0])
@@ -341,6 +361,11 @@ class World:
             return {"status": "success", "data": {"result": [
                 {"metric": {"nodename": n}, "values": [[t, str(self.steal.get(n, 1.0))] for t in g60]}
                 for n in ("worker-w", "worker-s")]}}
+        if "c28_ingress_no_ready_endpoints_total" in query:
+            if target not in self.no_ready:                   # never rejected: the counter does not exist yet
+                return {"status": "success", "data": {"result": []}}
+            return self._series([t for t in grid if self._alive(lambda n: "-ing-" in n, t)],
+                                lambda t: self.no_ready[target])
         if "c28_ingress_discovery" in query or "c28_ingress_endpoint{" in query or "c28_ingress_dispatched" in query:
             return self._discovery(query, grid, target, pods)
         if "timestamp(" in query:

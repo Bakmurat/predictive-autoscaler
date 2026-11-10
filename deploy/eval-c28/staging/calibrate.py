@@ -22,14 +22,17 @@ c = 0.875 c0 (render.capacity_rps). It qualifies nothing else: not the HPA targe
 twelve-replica layout; burst behaviour is fixture characterization only (no claim that autoscaling covers single-pod
 bursts); no prospective history or confirmation evidence starts during calibration.
 
-The calibration contract (record section "calibrate": {"contract": "<file>"}, schema c28-calibration-contract/v2; v1,
-which predates the endpoints-rr ingress and its discovery gate, is refused, while recorded v1 bundles still reduce) is
+The calibration contract (record section "calibrate": {"contract": "<file>"}, schema c28-calibration-contract/v3; v1,
+which predates the endpoints-rr ingress and its discovery gate, is refused, while recorded v1 bundles still reduce; v2,
+whose dispatch identity omits the ingress's no-ready rejections, is read-only: status, verify, stop and recover of its
+own calibration and the reduction of its bundles are unchanged, plan and apply refuse it) is
 frozen independently of the unfinished experiment params (only the reservation stage of the params is read). It binds
 the cluster and node UIDs, the namespace, the source commit and load-script hash, the S1 images.json and its fixture and
 generator digests, the candidate fixture configuration (resources, max_inflight, max_queue, queue timeout, GOMAXPROCS,
 response size, startup delay), the work_iterations selection, the ingress and generator resources, the observer (query
 API, the evaluation's 15 s scrape cadence, staleness, scrape kind, the exact queries, and observer.discovery: the
-ingress's synced/stale gauges, its scrape timestamp, endpoint membership and per-endpoint dispatch), the criteria (the manifest's
+ingress's synced/stale gauges, its scrape timestamp, endpoint membership, per-endpoint dispatch and (v3) its
+no-ready-endpoint rejections), the criteria (the manifest's
 numbers, which may not be changed, the queue rule, the limit bounds, the 1.2 ceiling factor), the search (bounds,
 factor, resolution, maximum trials, total deadline, seed, grace and timeouts), the admission budget and the rollout
 guard. Every consumed value is validated: finite, positive where a count or rate, no placeholders, no unknown keys.
@@ -90,7 +93,7 @@ Measurement (per trial, evaluate_trial, recomputed by the reducer from the raw f
     outcomes), http_req_failed and http_req_duration p95/p99 (ALL requests, timeouts included);
   * the ingress counters before the trial and after it plus completion_grace_s, both read as quiet (three or more
     fresh, equal samples; a target's counter that does not exist yet reads 0 only while the ingress scrape is proven
-    up and fresh): received arrivals and responses;
+    up and fresh): received arrivals and responses (contract v3: and the no-ready rejections, same rule);
   * the observer's range queries over the measurement window [the measure scenario's ACTUAL start as k6 recorded it
     (exec.scenario.startTime, in the summary), + measure_s] at the 15 s cadence, never the container start plus the
     nominal settling: the fixture's WAITING queue, its in-flight gauge (recorded separately), fixture CPU and
@@ -144,8 +147,20 @@ raw sample is from that same scrape, compared with the pods this calibration own
 measurement every poll re-checks it (a stale flag, a missing or old discovery metric or a membership mismatch stops
 the trial as incomplete evidence), and evaluate_trial re-checks every evaluation of the measurement window from the
 recorded series, so a blip between two polls invalidates the result. Each trial records the per-endpoint dispatch:
-every arrival dispatched exactly once (the sum equals the ingress's received arrivals) and only to the trial's fixture
-pods; the spread is reported, never judged.
+every arrival dispatched exactly once or (contract v3) answered 503 by the ingress because its set had no READY
+endpoint (c28_ingress_no_ready_endpoints_total, read before and after with the received counter: the sum of the
+per-endpoint deltas plus the no-ready delta equals the ingress's received arrivals; v2 requires the sum alone to
+equal them) and only to the trial's fixture pods; the spread is reported, never judged. The no-ready 503s are request
+failures k6 already counts (failure fraction, latency), reported in the dispatch detail and never judged again; an
+absent no-ready counter is 0 only from a successful query of the proven fresh, unchanged ingress, while a failed or
+stale reading, a series that disappears or a reset is incomplete evidence. Continuity holds across trials too: once
+an earlier trial observed the counter present (even at 0) on the same ingress pod identity (UID, name, restart
+count), a later absence or a lower value is incomplete; the executor reads that from the earlier trials' recorded
+results and the reducer from its recomputed ones, in journal order. A v3 contract also requires every ingress
+counter reading and its supporting up response to be a successful range response (status success, resultType
+matrix, a well-formed result list) before anything is read from it, so an error answer is never an absent counter
+(v1/v2 readings keep the earlier rule, so their bundles reduce unchanged). This accounting waives no discovery,
+membership or stray-endpoint check.
 
 Guards added before the contract freeze. The rollout guard judges OnDelete DaemonSets and StatefulSets (which
 deliberately keep pods on an older template) by observed generation, the expected pod count in status and their own
@@ -215,11 +230,18 @@ import reserve
 
 HELPER = "calibrate"
 STOP = "calibrate-stop"
-CONTRACT_SCHEMA = "c28-calibration-contract/v2"
+CONTRACT_SCHEMA = "c28-calibration-contract/v3"
 # v1 contracts predate the endpoints-rr ingress and its discovery gate (observer.discovery): refused for new
 # calibrations (a v2 contract is a new calibration ID). Recorded v1 bundles still reduce: evaluate_trial applies the
 # discovery checks only to a contract that carries observer.discovery.
 REFUSED_CONTRACT_SCHEMAS = ("c28-calibration-contract/v1",)
+# v2 contracts reconcile the per-endpoint dispatch with the received arrivals alone, so an arrival the ingress answered
+# 503 "no ready endpoint" (received, never dispatched) left the trial INCOMPLETE (c28cal-614e3450df). v3 adds
+# observer.discovery.no_ready (c28_ingress_no_ready_endpoints_total) to that identity. A v2 contract still loads, so
+# status, verify, stop-plan/stop and recover of its own calibration work unchanged and its bundles reduce exactly as
+# before (evaluate_trial applies the v3 accounting only to a contract that carries observer.discovery.no_ready); plan,
+# and so apply, refuses it: a new calibration writes a v3 contract (a new calibration ID).
+READ_ONLY_CONTRACT_SCHEMAS = ("c28-calibration-contract/v2",)
 CERT_SCHEMA = "c28-calibration-certificate/v1"
 RESULT_SCHEMA = "c28-calibration-trial/v1"
 K6_SCHEMA = "c28-calibration-k6/v1"
@@ -256,9 +278,11 @@ FRESHNESS_TOKENS = {"fixture_metrics": "__PODS__", "fixture_cpu": "__PODS__", "i
 # The ingress's endpoint discovery (contract v2, observer.discovery; fixture ROUTING=endpoints-rr): per ingress pod its
 # synced and stale gauges and the raw timestamp of its newest scrape; per variant the raw timestamps of the
 # c28_ingress_endpoint{target, endpoint_pod} membership series (one per READY endpoint in the ingress's set: current
-# when its raw sample is from the ingress's newest scrape) and the per-endpoint dispatch counters.
+# when its raw sample is from the ingress's newest scrape) and the per-endpoint dispatch counters; and (contract v3)
+# the variant's one counter of arrivals answered 503 because the set had no READY endpoint (never dispatched).
 DISCOVERY_TOKENS = {"synced": "__PODS__", "stale": "__PODS__", "scrape_timestamp": "__PODS__",
-                    "endpoints": "__TARGET__", "dispatched": "__TARGET__"}
+                    "endpoints": "__TARGET__", "dispatched": "__TARGET__", "no_ready": "__TARGET__"}
+DISCOVERY_V2 = tuple(k for k in DISCOVERY_TOKENS if k != "no_ready")
 DISCOVERY_TIMESTAMPS = ("scrape_timestamp", "endpoints")
 ENDPOINT_LABEL = "endpoint_pod"
 CPU_QUERIES = ("fixture_cpu_cores", "fixture_throttled_fraction", "ingress_cpu_cores", "ingress_throttled_fraction",
@@ -358,7 +382,7 @@ def contract_problems(con, record: X.Record, params: Dict) -> List[str]:
     if con["schema"] in REFUSED_CONTRACT_SCHEMAS:
         out.append(f"schema {con['schema']} predates the endpoints-rr ingress and its discovery gate: write a "
                    f"{CONTRACT_SCHEMA} contract with observer.discovery (a new calibration)")
-    elif con["schema"] != CONTRACT_SCHEMA:
+    elif con["schema"] != CONTRACT_SCHEMA and con["schema"] not in READ_ONLY_CONTRACT_SCHEMAS:
         out.append(f"schema must be {CONTRACT_SCHEMA}")
     if con["run_id"] != record.run_id:
         out.append("run_id differs from the record")
@@ -440,7 +464,7 @@ def contract_problems(con, record: X.Record, params: Dict) -> List[str]:
         if not _VERSION.match(str(gen["k6_version"])):
             out.append("generator.k6_version must be x.y.z")
         out += _resources_problems({k: v for k, v in gen.items() if k != "k6_version"}, "generator", R)
-    out += _observer_problems(con["observer"], R)
+    out += _observer_problems(con["observer"], R, con["schema"])
     out += _criteria_problems(con["criteria"])
     out += _stops_problems(con["stops"])
     out += _search_problems(con["search"])
@@ -491,7 +515,7 @@ def _work_selection_problems(ws, cr) -> List[str]:
     return out
 
 
-def _observer_problems(ob, R) -> List[str]:
+def _observer_problems(ob, R, schema: str = CONTRACT_SCHEMA) -> List[str]:
     keys = {"query_api", "step_s", "max_staleness_s", "scrape", "queries", "pods", "pod_label", "freshness",
             "cpu_scrape_interval_s", "readiness_timeout_s", "discovery"}
     if not (isinstance(ob, dict) and set(ob) == keys):
@@ -526,12 +550,14 @@ def _observer_problems(ob, R) -> List[str]:
                 out.append(f"observer.freshness.{name} must be a timestamp() query" +
                            (f" using {token}" if token else ""))
     dq = ob["discovery"]
-    if not (isinstance(dq, dict) and set(dq) == set(DISCOVERY_TOKENS)):
-        out.append(f"observer.discovery must be exactly {sorted(DISCOVERY_TOKENS)} (the ingress's endpoint "
-                   "discovery: synced, stale, its scrape timestamp, endpoint membership and per-endpoint dispatch)")
+    want = DISCOVERY_V2 if schema in READ_ONLY_CONTRACT_SCHEMAS else tuple(DISCOVERY_TOKENS)
+    if not (isinstance(dq, dict) and set(dq) == set(want)):
+        out.append(f"observer.discovery must be exactly {sorted(want)} (the ingress's endpoint discovery: synced, "
+                   "stale, its scrape timestamp, endpoint membership and per-endpoint dispatch" +
+                   (")" if "no_ready" not in want else ", and its no-ready-endpoint rejections)"))
     else:
-        for name, token in DISCOVERY_TOKENS.items():
-            q = dq[name]
+        for name in want:
+            q, token = dq[name], DISCOVERY_TOKENS[name]
             if not (isinstance(q, str) and q.strip() and token in q):
                 out.append(f"observer.discovery.{name} must be a query using {token}")
             elif (name in DISCOVERY_TIMESTAMPS) != ("timestamp(" in q):
@@ -539,6 +565,8 @@ def _observer_problems(ob, R) -> List[str]:
                            "be a timestamp() query")
             elif name in ("endpoints", "dispatched") and ENDPOINT_LABEL not in q:
                 out.append(f"observer.discovery.{name} must keep the {ENDPOINT_LABEL} label (by ({ENDPOINT_LABEL}))")
+            elif name == "no_ready" and (ENDPOINT_LABEL in q or re.search(r"\bby\s*\(", q)):
+                out.append("observer.discovery.no_ready must answer one series per target (a sum without by (...))")
     if not (_int(ob["readiness_timeout_s"]) and 30 <= ob["readiness_timeout_s"] <= 1800):
         out.append("observer.readiness_timeout_s must be the bounded wait for new pods' metrics (30..1800 s)")
     if not (_int(ob["cpu_scrape_interval_s"]) and 5 <= ob["cpu_scrape_interval_s"] <= 60):
@@ -1073,10 +1101,45 @@ def _up(obs: Dict, at: int, con: Dict) -> str:
     return ""
 
 
-def quiet_value(obs: Dict, at: int, con: Dict, up: Optional[Dict] = None) -> Tuple[Optional[float], str]:
+def v3(con: Dict) -> bool:
+    """A contract v3 (observer.discovery.no_ready): the no-ready accounting and the strict response envelopes."""
+    return "no_ready" in (con["observer"].get("discovery") or {})
+
+
+def envelope(obs: Dict) -> str:
+    """'' when a recorded range query answered a successful Prometheus range response: status "success",
+    data.resultType "matrix", data.result a list of {metric: object, values: list}; otherwise why not. Contract v3
+    checks it before any reading (an error answer with an empty result is never an absent counter)."""
+    if not isinstance(obs, dict) or "response" not in obs:
+        return f"the query failed ({obs.get('error', 'not recorded') if isinstance(obs, dict) else 'not recorded'})"
+    resp = obs["response"]
+    data = resp.get("data") if isinstance(resp, dict) else None
+    if not isinstance(resp, dict) or resp.get("status") != "success":
+        return f"the query did not succeed (status {resp.get('status') if isinstance(resp, dict) else None!r})"
+    if not isinstance(data, dict) or data.get("resultType") != "matrix":
+        return "not a range (matrix) response"
+    res = data.get("result")
+    if not isinstance(res, list) or not all(isinstance(r, dict) and isinstance(r.get("metric"), dict) and
+                                            isinstance(r.get("values"), list) for r in res):
+        return "malformed response"
+    return ""
+
+
+def quiet_value(obs: Dict, at: int, con: Dict, up: Optional[Dict] = None,
+                strict: bool = False) -> Tuple[Optional[float], str]:
     """A counter read while nothing flows: at least three samples in the recorded range, all equal, the last fresh.
     A per-target counter that does not exist yet (the ingress has seen no arrival for that target since it started)
-    reads 0 only while the ingress scrape itself is proven fresh and up (`up`, the ingress_up range)."""
+    reads 0 only while the ingress scrape itself is proven fresh and up (`up`, the ingress_up range). strict (contract
+    v3): the counter's response and, for an absent counter, the up response must be successful range responses
+    (envelope) first; v1/v2 readings keep the earlier rule unchanged."""
+    if strict:
+        why = envelope(obs)
+        if why:
+            return None, why
+        if obs["response"]["data"]["result"] == []:
+            why = envelope(up or {})
+            if why:
+                return None, f"no series, and ingress_up: {why}"
     if isinstance(obs, dict) and isinstance(((obs.get("response") or {}).get("data") or {}).get("result"), list) \
             and obs["response"]["data"]["result"] == []:
         why = _up(up or {}, at, con)
@@ -1102,6 +1165,8 @@ def ingress_reading(fetch, con: Dict, cal: str, target: str, at: int) -> Dict:
                             at - span, at)
     if "discovery" in con["observer"]:
         out["dispatched"] = query_range(fetch, con, resolve_discovery(con, "dispatched", target), at - span, at)
+        if "no_ready" in con["observer"]["discovery"]:          # v3: read with the same aligned readings
+            out["no_ready"] = query_range(fetch, con, resolve_discovery(con, "no_ready", target), at - span, at)
     return out
 
 
@@ -1325,7 +1390,7 @@ def idle_verdict(con: Dict, obs: Dict, readings: Dict) -> Tuple[str, Dict]:
     start_reading = obs.get("ingress_idle_start") or {}
     for k in ("requests", "responses"):
         v0, why0 = quiet_value(start_reading.get(k) or {}, int(start_reading.get("at") or 0), con,
-                               start_reading.get("up"))
+                               start_reading.get("up"), v3(con))
         v1 = (readings.get("before") or {}).get(k, (None, ""))[0]
         if start_reading.get("at") != s0:
             out.append("the idle start reading is not at the idle window's start")
@@ -1421,10 +1486,78 @@ def _last_by_label(obs: Dict, label: str, at: int, con: Dict) -> Tuple[Optional[
     return out, ""
 
 
-def dispatch_counts(con: Dict, obs: Dict, expected: List[str], received: Optional[float]) -> Tuple[List[str], Dict]:
+def ingress_key(pods: List[Dict]) -> Optional[List]:
+    """The one ingress pod's counter identity [uid, name, restartCount] (a container restart starts its counters
+    again); None unless exactly one ingress pod."""
+    ident = _pod_identity(pods)
+    if len(ident) != 1:
+        return None
+    uid, (name, restarts, *_rest) = next(iter(ident.items()))
+    return [uid, name, restarts]
+
+
+def no_ready_prior(history: List[Dict], target: str, key: Optional[List]) -> Optional[Dict]:
+    """The latest earlier observation of this target's no-ready counter on the same ingress pod identity, from the
+    earlier trials' results in journal order (their recorded evidence, recomputed by the reducer): {"trial", "value"}
+    when that counter was PRESENT then (even at 0); None when it was never observed on that identity (absent, read
+    as 0, constrains nothing)."""
+    if key is None:
+        return None
+    for r in reversed(list(history or [])):
+        d = ((r.get("criteria") or {}).get("dispatch") or {}).get("no_ready") or {}
+        if d.get("target") == target and d.get("ingress") == key and "after" in d:
+            return {"trial": r.get("trial"), "value": d["after"]} if "after" not in d.get("absent", []) else None
+    return None
+
+
+def no_ready_rejections(con: Dict, obs: Dict, prior: Optional[Dict] = None) -> Tuple[Optional[float], List[str], Dict]:
+    """Contract v3: the arrivals the ingress answered 503 "no ready endpoint" during the trial (after - before of the
+    variant's c28_ingress_no_ready_endpoints_total, read with the same aligned before/after readings as the received
+    counter). Each side is a quiet counter (quiet_value, strict: a successful range response, three or more fresh,
+    equal samples); a counter that has not appeared yet (the ingress has rejected nothing for that target since it
+    started) reads 0 only from a successful query while the ingress scrape is proven fresh and up, the ingress pod
+    being the one evaluate_trial requires unchanged across the trial. A failed or unsuccessful query, a stale or
+    moving sample, a non-finite or negative value, a series present before and absent after (a lost series or a
+    restart) or a negative delta (a reset) is unknown, never 0: (None, problems, detail). So is a counter that an
+    EARLIER trial observed present on the same ingress pod identity (prior, no_ready_prior) and that is now absent or
+    lower before this trial (lost or reset between trials). Otherwise (delta, [], detail)."""
+    side, present = {}, {}
+    for s in ("before", "after"):
+        r = obs.get(f"ingress_{s}") or {}
+        o = r.get("no_ready") or {}
+        v, why = quiet_value(o, int(r.get("at") or 0), con, r.get("up"), strict=True)
+        if v is None:
+            return None, [f"no-ready rejections {s} the trial: {why}"], {}
+        if v < 0:
+            return None, [f"no-ready rejections {s} the trial: a negative counter value {v:g}"], {}
+        present[s] = o["response"]["data"]["result"] != []
+        side[s] = v
+    detail = {"before": side["before"], "after": side["after"], "absent": [s for s in side if not present[s]],
+              "prior": prior}
+    if prior is not None and not present["before"]:
+        return None, [f"the no-ready rejection counter, observed at {prior['value']:g} in {prior['trial']}, is absent "
+                      "before this trial (lost between trials: a lost series or an ingress restart)"], detail
+    if prior is not None and side["before"] < prior["value"]:
+        return None, [f"the no-ready rejection counter went backwards between trials ({prior['value']:g} in "
+                      f"{prior['trial']}, {side['before']:g} before this trial: an ingress restart or reset)"], detail
+    if present["before"] and not present["after"]:
+        return None, ["the no-ready rejection counter disappeared during the trial (a lost series or an ingress "
+                      "restart)"], detail
+    delta = side["after"] - side["before"]
+    if delta < 0:
+        return None, ["the no-ready rejection counter went backwards (an ingress restart or reset)"], detail
+    return delta, [], dict(detail, rejected=delta)
+
+
+def dispatch_counts(con: Dict, obs: Dict, expected: List[str], received: Optional[float],
+                    prior: Optional[Dict] = None) -> Tuple[List[str], Dict]:
     """Per-endpoint dispatch during the trial (after - before of c28_ingress_dispatched_total by endpoint_pod; a
     counter that does not exist yet is 0): every arrival dispatched exactly once (sum = the ingress's received, no
-    retry or duplicate) and only to the trial's fixture pods. Balance is reported, never judged."""
+    retry or duplicate) and only to the trial's fixture pods. Balance is reported, never judged. Contract v3: every
+    arrival is dispatched exactly once OR answered 503 for no ready endpoint (received = sum + no-ready rejections,
+    no_ready_rejections); those 503s are request failures already counted by k6, so they stay inside the failure
+    fraction and latency and are reported here, never judged again. A post-observation accounting term only: every
+    discovery, membership and stray-endpoint check is unchanged."""
     side = {}
     for s in ("before", "after"):
         r = obs.get(f"ingress_{s}") or {}
@@ -1449,17 +1582,25 @@ def dispatch_counts(con: Dict, obs: Dict, expected: List[str], received: Optiona
     stray = sorted(k for k, v in by.items() if v > 0 and k not in expected)
     if stray:
         out.append(f"arrivals were dispatched to pods outside the trial's fixture pods: {stray}")
-    if received is not None and total != received:
+    if "no_ready" in con["observer"]["discovery"]:          # v3
+        rejected, why, detail["no_ready"] = no_ready_rejections(con, obs, prior)
+        out += why
+        if received is not None and rejected is not None and total + rejected != received:
+            out.append(f"per-endpoint dispatch {total:g} plus {rejected:g} no-ready rejections does not reconcile "
+                       f"with the {received:g} arrivals the ingress received (each arrival must be dispatched exactly "
+                       "once or rejected for no ready endpoint)")
+    elif received is not None and total != received:
         out.append(f"per-endpoint dispatch {total:g} does not reconcile with the {received:g} arrivals the ingress "
                    "received (each arrival must be dispatched exactly once)")
     return out, detail
 
 
-def evaluate_trial(con: Dict, raw: Dict) -> Dict:
+def evaluate_trial(con: Dict, raw: Dict, history: Optional[List[Dict]] = None) -> Dict:
     """The verdict of one trial from its raw evidence alone (raw: trial meta, generator_pod, pods_begin, pods_end,
-    observations). INCOMPLETE > LIMIT > FAIL > PASS; every criterion is reported separately. `delivery` says whether
-    the arrivals were uncensored (no incomplete evidence, no generator/ingress limit); a selection trial also reports
-    its CPU cost per request."""
+    observations) and, for a contract v3, the earlier trials' results in journal order (history: the no-ready
+    counter's continuity across trials, no_ready_prior; unused before v3). INCOMPLETE > LIMIT > FAIL > PASS; every
+    criterion is reported separately. `delivery` says whether the arrivals were uncensored (no incomplete evidence, no
+    generator/ingress limit); a selection trial also reports its CPU cost per request."""
     t, cr, ob = raw["trial"], con["criteria"], con["observer"]
     step, rate, n, kind = ob["step_s"], t["rate_per_min"], t["n"], t["kind"]
     settle_s, measure_s = durations(con, kind)
@@ -1515,7 +1656,7 @@ def evaluate_trial(con: Dict, raw: Dict) -> Dict:
     readings = {}
     for side in ("before", "after"):
         r = obs.get(f"ingress_{side}") or {}
-        readings[side] = {k: quiet_value(r.get(k) or {}, int(r.get("at") or 0), con, r.get("up"))
+        readings[side] = {k: quiet_value(r.get(k) or {}, int(r.get("at") or 0), con, r.get("up"), v3(con))
                           for k in ("requests", "responses")}
         for k, (v, why) in readings[side].items():
             if v is None:
@@ -1539,10 +1680,16 @@ def evaluate_trial(con: Dict, raw: Dict) -> Dict:
             limits.append(f"{dispatched - received:g} dispatched arrivals never reached the ingress (a network "
                           "limit; offered demand was censored)")
     crit["ingress"] = ing
-    if "discovery" in con["observer"]:              # v2: per-endpoint dispatch, recorded per trial
+    if "discovery" in con["observer"]:              # v2: per-endpoint dispatch, recorded per trial (v3: + no-ready)
         fx_names = sorted((p.get("metadata") or {}).get("name") for p in (raw.get("pods_begin") or {}).get(
             t["variant"]) or [])
-        why_x, dx = dispatch_counts(con, obs, fx_names, ing.get("received"))
+        prior = None
+        if v3(con):
+            key = ingress_key((raw.get("pods_begin") or {}).get("ingress"))
+            prior = no_ready_prior(history or [], t["target"], key)
+        why_x, dx = dispatch_counts(con, obs, fx_names, ing.get("received"), prior)
+        if v3(con) and dx.get("no_ready") is not None:
+            dx["no_ready"].update(target=t["target"], ingress=key)
         crit["dispatch"] = dx
         incomplete += why_x
     window, why = measurement_window(con, kind, summary, started)
@@ -2694,6 +2841,11 @@ def plan(ctx: Context) -> Dict:
                         "new contract.attempt)")
     if X.open_intents(entries):
         problems.append("the calibrate journal has intents with unknown outcomes: run recover first")
+    if ctx.con["schema"] != CONTRACT_SCHEMA:
+        problems.append(f"contract schema {ctx.con['schema']} is read-only (status, verify, stop and recover of its "
+                        "own calibration; its bundles reduce): it reconciles the per-endpoint dispatch without the "
+                        f"ingress's no-ready rejections; write a {CONTRACT_SCHEMA} contract with "
+                        "observer.discovery.no_ready (a new calibration)")
     script = _load_script()
     objs = render_objects(ctx.con, ctx.cal, ctx.params, script)
     for o in objs:
@@ -2936,7 +3088,8 @@ def run_trial(ctx: Context, meta: Dict, decision_sha: str, guard: Optional[Dict]
         ctx.receipt("trial-not-started", {"trial": meta, "problems": problems + ([stale] if stale else [])})
         raise Halt("incomplete" if stale and not problems else "stopped", "; ".join(problems + [stale]).strip("; "))
     before = ingress_reading(ctx.fetch, con, ctx.cal, meta["target"], ctx.now())
-    if any(quiet_value(before[k], before["at"], con, before["up"])[0] is None for k in ("requests", "responses")):
+    if any(quiet_value(before[k], before["at"], con, before["up"], v3(con))[0] is None
+           for k in ("requests", "responses")):
         ctx.receipt("trial-not-started", {"trial": meta, "problems": ["the ingress is not quiet and fresh before the "
                                                                       "trial"]})
         raise Halt("incomplete", "the ingress counters are not quiet and fresh before the trial")
@@ -3028,7 +3181,8 @@ def run_trial(ctx: Context, meta: Dict, decision_sha: str, guard: Optional[Dict]
     files += [ctx.write(f"{tdir}/generator-pod.json", gsnap), ctx.write(f"{tdir}/observations.json", observations),
               ctx.write(f"{tdir}/pods-end.json", pods_end)]
     result = evaluate_trial(con, {"trial": meta, "generator_pod": gsnap, "pods_begin": pods_begin,
-                                  "pods_end": pods_end, "observations": observations})
+                                  "pods_end": pods_end, "observations": observations},
+                            trial_history(ctx.entries(), ctx.cal, ctx.dir))
     rfile = ctx.write(f"{tdir}/result.json", result)
     ctx.receipt("trial-result", {"trial": meta, "verdict": result["verdict"], "files": files, "result": rfile})
     return result
@@ -3148,6 +3302,17 @@ def _stopped_result(t: Dict, d: Dict) -> Dict:
             "rps_per_replica": t["rate_per_min"] / 60 / t["n"], "verdict": "STOPPED", "delivery": "unknown",
             "stop_reason": d.get("reason", ""), "category": d.get("category", "stopped"),
             "incomplete": [], "limits": [], "failures": [], "criteria": {}}
+
+
+def trial_history(entries: List[Dict], cal: str, base: str, before: Optional[str] = None) -> List[Dict]:
+    """The recorded results of the trials that ended before trial `before` (all when None), in journal order: the
+    evidence evaluate_trial's no-ready continuity reads (the reducer passes its recomputed results instead)."""
+    out = []
+    for r in _trial_records(entries, cal, base)[0]:
+        if r.get("trial") == before:
+            break
+        out.append(r)
+    return out
 
 
 def _trial_records(entries: List[Dict], cal: str, base: str) -> Tuple[List[Dict], List[Dict]]:
@@ -3491,7 +3656,7 @@ def reduce_bundle(bundle: str) -> Dict:
             raw = {"trial": d["trial"], "generator_pod": load(files["generator-pod"]["path"]),
                    "pods_begin": load(files["pods-begin"]["path"]), "pods_end": load(files["pods-end"]["path"]),
                    "observations": load(files["observations"]["path"])}
-            again = evaluate_trial(con, raw)
+            again = evaluate_trial(con, raw, trials)
             if C.digest(again) != C.digest(load(d["result"]["path"])) or again["verdict"] != d["verdict"]:
                 raise X.StagingError(f"trial {d['trial']['id']}: the recomputed result differs from the recorded one")
             trials.append(again)
