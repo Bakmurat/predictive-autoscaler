@@ -123,6 +123,16 @@
                 "configMap": {"type": "string", "pattern": "^([a-z0-9]([-.a-z0-9]*[a-z0-9])?)?$", "maxLength": 253},
                 "key": {"type": "string", "pattern": "^[-._a-zA-Z0-9]+$", "maxLength": 253}
               }
+            },
+            "demonstrationQualification": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "A scoped live demonstration only (not a release, not an evaluation qualification; never beside labQualification): a ConfigMap holding a reviewed demonstration-qualification/v1 file (key) and the demonstration-contract/v1 file it names (contractKey); empty configMap: off.",
+              "properties": {
+                "configMap": {"type": "string", "pattern": "^([a-z0-9]([-.a-z0-9]*[a-z0-9])?)?$", "maxLength": 253},
+                "key": {"type": "string", "pattern": "^[-._a-zA-Z0-9]+$", "maxLength": 253},
+                "contractKey": {"type": "string", "pattern": "^[-._a-zA-Z0-9]+$", "maxLength": 253}
+              }
             }
           }
         },

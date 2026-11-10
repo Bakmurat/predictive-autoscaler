@@ -70,6 +70,18 @@ forecaster:
     labQualification:
       configMap: ""
       key: lab-qualification.json
+    # A scoped LIVE DEMONSTRATION only; never beside labQualification (the chart refuses both). A ConfigMap you create
+    # with two reviewed files: a demonstration-qualification/v1 file and the demonstration-contract/v1 file it names
+    # by sha256 (docs/helm.md). It is not a release and not an evaluation qualification: it records no gate. Same
+    # image rules as above (the evaluation build of the named source tree, pinned by digest), or the forecaster does
+    # not start. It stands in for the release gate for one cluster UID, one namespace and at most two target UIDs,
+    # only while the live autoscaler is configured as the contract says and only for the forecast families it lists;
+    # every runtime trust gate and the operator's own write guards still apply. Also lets the forecaster read the
+    # kube-system Namespace (the cluster UID). Empty: off.
+    demonstrationQualification:
+      configMap: ""
+      key: demonstration-qualification.json
+      contractKey: demonstration-contract.json
   # Only the operator may call the forecasting service: its projected service account token, checked with TokenReview,
   # over TLS. Off: plain HTTP, and the NetworkPolicies are the only boundary.
   auth:

@@ -1,0 +1,17 @@
+# The statistical forecaster in a scoped live demonstration: a reviewed demonstration qualification and the contract it
+# names, mounted from one ConfigMap (the image must be the evaluation build of the source tree the qualification names,
+# or the forecaster refuses to start). Not a release and not an evaluation qualification.
+prometheus:
+  url: http://prometheus:9090
+forecaster:
+  engine: statistical
+  statistical:
+    demonstrationQualification:
+      configMap: pa-demonstration-qualification
+networkPolicy:
+  prometheus:
+    namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: monitoring}}
+images:
+  statisticalForecaster:
+    repository: ghcr.io/bakmurat/predictive-autoscaler-forecaster-statistical
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000

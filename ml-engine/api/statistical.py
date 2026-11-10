@@ -15,7 +15,11 @@ artifacts, a retained volume), FORECAST_STATE_QUOTA_BYTES, FORECAST_ADMISSION, F
 the FORECASTER_AUTH* / FORECASTER_TLS_* settings of api/auth.py. FORECAST_LAB_QUALIFICATION names a reviewed
 lab-qualification/v1 file (forecasting.qualification): honoured only by the evaluation build and image digest
 (FORECAST_IMAGE_DIGEST) it names; in any other image, or malformed, expired or for another source tree, the app does
-not start. The benchmark switches of the legacy service (ALLOW_BENCHMARK_EXPERIMENTS, SEASONAL_EXPERIMENT,
+not start. FORECAST_DEMONSTRATION_QUALIFICATION and FORECAST_DEMONSTRATION_CONTRACT name a reviewed
+demonstration-qualification/v1 file and the demonstration-contract/v1 file it is bound to (forecasting.demonstration):
+both or neither, under the same build and digest rules, never beside a lab qualification and never once the release
+gates have passed; anything else and the app does not start. The benchmark switches of the legacy service
+(ALLOW_BENCHMARK_EXPERIMENTS, SEASONAL_EXPERIMENT,
 ENSEMBLE_EXPERIMENT, ...) are REFUSED: present at all, the app does not start.
 """
 
@@ -58,20 +62,39 @@ def default_service(env: Mapping[str, str]):
     url = env.get("PROMETHEUS_URL", "")
     if not url:
         raise Refused("PROMETHEUS_URL is required")
+    from forecasting import demonstration as D
     from forecasting import qualification as Q
+    from forecasting import service as S
     build = Q.read_build_info()
+    demo_paths = (env.get("FORECAST_DEMONSTRATION_QUALIFICATION") or None,
+                  env.get("FORECAST_DEMONSTRATION_CONTRACT") or None)
+    if any(demo_paths) and env.get("FORECAST_LAB_QUALIFICATION"):
+        raise Refused("a lab qualification and a demonstration qualification are both configured: at most one of the "
+                      "two documents")
+    if any(demo_paths) and S.RELEASE_GATES_PASSED:
+        raise Refused("the release gates have passed: a demonstration qualification is refused (no silent precedence)")
     try:
         lab = Q.load(env.get("FORECAST_LAB_QUALIFICATION") or None, build, int(time.time()),
                      env.get("FORECAST_IMAGE_DIGEST") or None)
     except Q.QualificationRefused as e:
         raise Refused(f"the lab qualification is refused: {e}") from e
+    try:
+        demo = D.load(*demo_paths, build, int(time.time()), env.get("FORECAST_IMAGE_DIGEST") or None)
+    except Q.QualificationRefused as e:
+        raise Refused(f"the demonstration qualification is refused: {e}") from e
     cfg = ServiceConfig(prometheus_url=url, state_dir=env.get("FORECAST_STATE_DIR", "/state"),
                         quota_bytes=int(env.get("FORECAST_STATE_QUOTA_BYTES", str(1536 << 20))),
-                        fit_mode=env.get("FORECAST_FIT_MODE", "worker"), build=build, lab_qualification=lab)
+                        fit_mode=env.get("FORECAST_FIT_MODE", "worker"), build=build, lab_qualification=lab,
+                        demonstration_qualification=demo)
     if lab is not None:
         logger.warning("LAB QUALIFICATION %s active for cluster %s, namespaces %s, %d targets, until %s (evaluation "
                        "build %s)", lab.sha256, lab.cluster_uid, sorted(lab.namespaces), len(lab.targets),
                        lab.expires, build.source_tree)
+    if demo is not None:
+        logger.warning("DEMONSTRATION QUALIFICATION %s (contract %s) active for cluster %s, namespace %s, %d targets, "
+                       "families %s, until %s (evaluation build %s): a demonstration basis, not a release and not an "
+                       "evaluation qualification", demo.sha256, demo.contract_sha256, demo.cluster_uid, demo.namespace,
+                       len(demo.targets), sorted(demo.families), demo.expires, build.source_tree)
     return ForecastService(cfg, reader=KubeReader())
 
 
@@ -130,6 +153,9 @@ def create_app(env: Mapping[str, str] = os.environ, service_factory: Optional[Ca
         if svc is not None:
             extra = CollectorRegistry()
             extra.register(svc.metrics)
+            basis = getattr(svc, "qualification_metrics", None)
+            if basis is not None:
+                extra.register(basis)
             body += generate_latest(extra)
         return Response(body, media_type=CONTENT_TYPE_LATEST)
 
