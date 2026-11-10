@@ -72,7 +72,7 @@ from forecasting.statistical import RECIPE_E1, RECIPE_NAIVE, KernelSettings, Ker
     forecast_e1, seasonal_naive
 from forecasting.store import DEFAULT_QUOTA_BYTES, ForecastStore, IssuanceKey, StoreError, StoreUnavailable
 
-STATE_SCHEMA = "statistical-service-state/v2"       # v2: normalized calibration scores and the scale in force
+STATE_SCHEMA = "statistical-service-state/v3"       # v3: the coverage monitor (ledger v3) and its alarm accounting
 DAY = 86400
 REFIT_SECONDS = 6 * 3600
 RECIPES = {"seasonal_naive": RECIPE_NAIVE, "statistical": RECIPE_E1}
@@ -302,6 +302,7 @@ class ForecastService:
                 raise StoreError(f"the epoch's checkpoint has state schema {state.get('schema')!r}, not {STATE_SCHEMA}")
         state = {**state, "models": {k: dict(v) for k, v in state["models"].items()}, "pairs": dict(state["pairs"])}
         dt = s.sample_interval_seconds
+        limits = T.coverage_limits(s.trust, policy.lead_seconds, policy.nominal_bps, len(s.families))
         for iss in store.issuances_after(ek, state["last_issuance_seq"]):
             b = iss.payload()
             for model in iss.models:
@@ -319,8 +320,7 @@ class ForecastService:
             m = self._model_state(state, o.model, rec.cal.recipe, policy, ek, dt)
             m["calibration"] = cal.apply(m["calibration"], rec.cal, policy)
             m["ledger"] = T.note_outcome(m["ledger"], rec, lead_s=policy.lead_seconds,
-                                         nominal_miscoverage=policy.nominal_ratio,
-                                         recent_n=s.trust.acute_recent_windows)
+                                         nominal_miscoverage=policy.nominal_ratio, limits=limits)
             state["pairs"]["statistical"] = T.note_pair(state["pairs"]["statistical"], rec,
                                                         lead_s=policy.lead_seconds,
                                                         nominal_miscoverage=policy.nominal_ratio)
@@ -414,7 +414,9 @@ class ForecastService:
         policy_sha, costs = self._policy_costs(bound, state, now_ms // 1000, points)
         g = T.Global(now_s=now_ms // 1000, lead_seconds=lead.lead_seconds, nominal_miscoverage=policy.nominal_ratio,
                      identity_ok=True, store_healthy=self.store_healthy, replay_suite_passed=gate["passed"],
-                     startup_budget_valid=True, policy_sha256=policy_sha)
+                     startup_budget_valid=True, policy_sha256=policy_sha,
+                     outcome_deadline_seconds=s.settlement_seconds + s.outcome_grace_seconds,
+                     families=len(s.families))
         pairs = state["pairs"] if "seasonal_naive" in points else {}   # paired evidence needs its naive baseline
         verdict, new_h = T.evaluate(inputs, state["trust"], g, s.trust, pairs=pairs, costs=costs)
         if gate["basis"] == "demonstration" and verdict.selected is not None:
@@ -450,6 +452,7 @@ class ForecastService:
                             "candidates": {m: {"trusted": v.trusted, "phase": v.phase, "reason": v.reason,
                                                "coverage_gate": v.coverage_gate, "availability": v.availability,
                                                "prospective_gate_bounds": v.prospective_gate_bounds,
+                                               "coverage_failing": list(v.coverage_failing),
                                                "evidence_cutoff":
                                                    state["models"][m]["ledger"]["last_prospective_outcome_s"]}
                                            for m, v in verdict.candidates.items()}}}

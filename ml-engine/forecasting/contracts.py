@@ -41,6 +41,11 @@ EVIDENCE_SCHEMA = "forecast-evidence-key/v1"
 # evidence epoch on both sides and can never be read as the old one. Revision 1 (implicit, never named) was the
 # additive score Y - b in RPS. A stable name: other modules pin and compare it.
 CALIBRATION_POLICY_REVISION = "normalized-window-score/two-part-scale/v1"
+# The trust-policy revision (forecasting.trust): what the coverage rules mean. Part of the settings fingerprint (the
+# trust settings' field `policy`) and of the evidence key, so trust earned under other rules is never carried into
+# these. Revision 1 (implicit, never named) was "the last 32 gate windows at least 85 % covered" with an unadjusted
+# worst-day rule on partial days. A stable name: other modules pin and compare it.
+TRUST_POLICY_REVISION = "budgeted-coverage-tests/v1"
 UNIT = "requests/second"
 
 # Minute multiples in 60..600 that divide a UTC day, so a one-day lag lands on the same epoch grid. 7- and 9-minute
@@ -133,6 +138,14 @@ def sha256_hex(data: bytes) -> str:
 
 # --- settings ---------------------------------------------------------------------------------------------------
 
+# Frozen by the threshold-selection procedure of the trust-repair protocol (evaluation/trust_qualification.py).
+ACUTE_RECENT_WINDOWS = 64
+ROLLING_ALARM_PPM = 35_000
+CONSECUTIVE_ALARM_PPM = 7_000
+DAY_ALARM_PPM = 8_000
+COVERAGE_ALARM_BUDGET_PPM = 50_000           # the target: 5 % per target and 7 days, the three rules together
+
+
 @dataclass(frozen=True)
 class RiskSettings:
     miscoverage_bps: int = 1000              # 90% nominal window coverage; 100..2500 (99%..75%)
@@ -158,11 +171,11 @@ class CalibrationSettings:
 class TrustSettings:
     min_shadow_hours: int = 48
     min_prospective_windows: int = 64
-    coverage_tolerance_bps: int = 500        # gate coverage >= nominal - 0.05
-    worst_day_min_outcomes: int = 24
+    coverage_tolerance_bps: int = 500        # 7-day gate coverage >= nominal - 0.05
+    worst_day_min_outcomes: int = 24         # a completed UTC day is tested once it has this many gate outcomes
     min_availability_bps: int = 9500
-    acute_consecutive_misses: int = 5
-    acute_recent_windows: int = 32
+    acute_consecutive_misses: int = 5        # the LEAST run of misses that alarms; more where the budget needs it
+    acute_recent_windows: int = ACUTE_RECENT_WINDOWS          # n of the rolling binomial-tail detector
     repromotion_hours: int = 24
     repromotion_windows: int = 32
     challenger_min_pairs: int = 64
@@ -171,6 +184,13 @@ class TrustSettings:
     challenger_exit_loss_ratio_bps: int = 10000  # leave (no safety failure): only once worse than the naive
     challenger_cost_ratio_bps: int = 10200
     max_fit_age_hours: int = 12
+    # The policy revision and the false-alarm budgets its thresholds are derived from (forecasting.trust). Resolved,
+    # never read from the spec; each is a probability per target and 7 days under independent nominal misses, in ppm,
+    # shared equally by the enabled families.
+    policy: str = TRUST_POLICY_REVISION
+    rolling_alarm_ppm: int = ROLLING_ALARM_PPM
+    consecutive_alarm_ppm: int = CONSECUTIVE_ALARM_PPM
+    day_alarm_ppm: int = DAY_ALARM_PPM
 
 
 @dataclass(frozen=True)
@@ -355,6 +375,8 @@ def _check_feasible(s: ForecastSettings) -> None:
         raise ContractRefused("trust.challengerExitLossRatioBps must not be below challengerLossRatioBps")
     if t.min_shadow_hours > c.retention_days * 24:
         raise ContractRefused("trust.minShadowHours exceeds the retention")
+    if t.rolling_alarm_ppm + t.consecutive_alarm_ppm + t.day_alarm_ppm > COVERAGE_ALARM_BUDGET_PPM:
+        raise ContractRefused("the coverage rules' false-alarm budgets exceed the 5 % target")
 
 
 # --- lead and window --------------------------------------------------------------------------------------------
@@ -448,8 +470,9 @@ def make_window(origin: int, settings: ForecastSettings, lead: LeadSelection) ->
 
 def evidence_key(signal: ResolvedSignal, settings: ForecastSettings, lead_seconds: int) -> str:
     """The identity forecast evidence belongs to. A new PA or Deployment, query, cadence, lead, seasonality, engine,
-    risk, calibration policy or outcome timing starts a new key (a new epoch); a generation that changes only other
-    fields (mode, caps, trust thresholds) keeps it, and callers check the generation separately.
+    risk, calibration policy (its method included), outcome timing or trust-policy REVISION starts a new key (a new
+    epoch); a generation that changes only other fields (mode, caps, trust thresholds) keeps it, and callers check the
+    generation separately.
 
     Keeping forecast evidence is not keeping policy readiness: a change of capacity, predictive-extra caps or trust
     policy must separately invalidate or re-evaluate policy readiness (trust state, C2.5; operator policy, C2.7)."""
@@ -459,7 +482,8 @@ def evidence_key(signal: ResolvedSignal, settings: ForecastSettings, lead_second
             "engine": settings.engine, "seasonality": settings.seasonality, "history_days": settings.history_days,
             "settlement_seconds": settings.settlement_seconds,
             "outcome_grace_seconds": settings.outcome_grace_seconds,
-            "risk": asdict(settings.risk), "calibration": asdict(settings.calibration)}
+            "risk": asdict(settings.risk), "calibration": asdict(settings.calibration),
+            "trust_policy": settings.trust.policy}
     return sha256_hex(canonical_json(body))
 
 

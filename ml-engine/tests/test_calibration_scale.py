@@ -21,12 +21,25 @@ from forecasting import calibration as cal  # noqa: E402
 from forecasting import contracts as c  # noqa: E402
 from forecasting.calibration import CalibrationError, CalibrationPolicy, CalibrationRecord, Scale  # noqa: E402
 from forecasting.clock import ManualClock  # noqa: E402
-from forecasting.service import ForecastService, ServiceConfig, ServiceError  # noqa: E402
+from forecasting.service import STATE_SCHEMA, ForecastService, ServiceConfig, ServiceError  # noqa: E402
 
 L = 600
 EPOCH = "e" * 64
 DAY = 86400
 ADDED_KEYS = ("method", "scale_bins", "scale_floor_bps", "scale_min_season_bps")
+# What trust policy budgeted-coverage-tests/v1 (stacked on this method) added to and changed in the trust settings.
+ADDED_TRUST_KEYS = ("policy", "rolling_alarm_ppm", "consecutive_alarm_ppm", "day_alarm_ppm")
+
+
+def strip_to_additive(canon):
+    """The canonical settings as the additive method's revision hashed them: without the keys of the calibration
+    method and of the trust policy, and with that revision's rolling window."""
+    for k in ADDED_KEYS:
+        canon["settings"]["calibration"].pop(k)
+    for k in ADDED_TRUST_KEYS:
+        canon["settings"]["trust"].pop(k)
+    canon["settings"]["trust"]["acute_recent_windows"] = 32
+    return canon
 # The default statistical settings and the fixture binding's evidence key under the additive method, frozen from
 # k8s-operator/controllers/testdata/v2-contract-fixtures.json at commit 44f65cf (the Go tests use the same constants).
 LEGACY_FINGERPRINT = "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf"
@@ -229,9 +242,7 @@ def legacy_identity(pa, lead_seconds):
     """(settings fingerprint, evidence key) an operator or forecaster of the additive method computes for `pa`: the
     current canonical forms without the keys this method added."""
     s = c.resolve_settings(pa)
-    canon = s.canonical()
-    for k in ADDED_KEYS:
-        canon["settings"]["calibration"].pop(k)
+    canon = strip_to_additive(s.canonical())
     body = {"schema": c.EVIDENCE_SCHEMA, "autoscaler_uid": pa["metadata"]["uid"],
             "target_uid": pa["status"]["metricSource"]["targetUID"],
             "query_sha256": pa["status"]["metricSource"]["sha256"], "signal_contract": svc_helpers.CONTRACT,
@@ -253,8 +264,7 @@ def test_the_method_is_in_the_fingerprint_and_the_evidence_key():
     assert default.calibration.method == cal.CALIBRATION_POLICY_REVISION       # the resolved-settings field
     assert {k: canon["settings"]["calibration"][k] for k in ADDED_KEYS[1:]} == {
         "scale_bins": 8, "scale_floor_bps": 500, "scale_min_season_bps": 8000}
-    for k in ADDED_KEYS:
-        canon["settings"]["calibration"].pop(k)
+    canon = strip_to_additive(canon)
     assert c.sha256_hex(c.canonical_json(canon)) == LEGACY_FINGERPRINT         # nothing else moved the fingerprint
     assert default.fingerprint() != LEGACY_FINGERPRINT
     pa = svc_helpers.pa_object()
@@ -311,7 +321,7 @@ def test_an_old_trusted_state_does_not_survive_the_method_change(tmp_path):
     assert r.trust_state != "Trusted" and r.predictive_eligible is False
     assert (r.calibration_windows, r.prospective_windows, r.upper_window_max_rps) == (0, 0, None)
     state = svc.store.latest_checkpoint(r.calibration_epoch).state
-    assert state["schema"] == "statistical-service-state/v2"
+    assert state["schema"] == STATE_SCHEMA != "statistical-service-state/v1"
     h = state["trust"]["seasonal_naive"]
     assert h["trusted"] is False and h["ever_trusted"] is False
     assert svc.store.latest_checkpoint(old_ek).payload_sha256 == before.payload_sha256      # not migrated, not touched

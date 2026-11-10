@@ -51,6 +51,10 @@ const (
 // that disagree about the score's meaning can never exchange an accepted answer.
 const v2CalibrationPolicyRevision = "normalized-window-score/two-part-scale/v1"
 
+// v2TrustPolicyRevision is contracts.TRUST_POLICY_REVISION: what the forecaster's coverage rules mean. It is part of
+// the settings fingerprint (with the policy's three false-alarm budgets) and of the evidence key.
+const v2TrustPolicyRevision = "budgeted-coverage-tests/v1"
+
 var (
 	v2AllowedIntervals = []int64{60, 120, 180, 240, 300, 360, 480, 600}
 	v2Phases           = []string{"Collecting", "Calibrating", "Shadow", "Trusted", "Degraded"}
@@ -91,7 +95,7 @@ type v2Settings struct {
 	OutcomeGraceSeconds   int64
 	MiscoverageBps        int64
 	Calibration           [9]int64 // v2CalibrationKeys; the last three are the method's scale-fit constants (not in the spec)
-	Trust                 [15]int64
+	Trust                 [18]int64
 	ExtraMaxReplicas      int64
 	ExtraMaxPercent       int64
 	Families              []string // sorted; seasonalNaive always present
@@ -102,10 +106,13 @@ var v2Families = []string{"seasonalNaive", "statistical"}
 
 var v2CalibrationKeys = [9]string{"min_windows", "max_scores", "retention_days", "eta_bps", "min_miscoverage_bps",
 	"max_miscoverage_bps", "scale_bins", "scale_floor_bps", "scale_min_season_bps"}
-var v2TrustKeys = [15]string{"min_shadow_hours", "min_prospective_windows", "coverage_tolerance_bps",
+
+// The last three are the trust policy's false-alarm budgets: resolved, never read from the spec.
+var v2TrustKeys = [18]string{"min_shadow_hours", "min_prospective_windows", "coverage_tolerance_bps",
 	"worst_day_min_outcomes", "min_availability_bps", "acute_consecutive_misses", "acute_recent_windows",
 	"repromotion_hours", "repromotion_windows", "challenger_min_pairs", "challenger_min_hours",
-	"challenger_loss_ratio_bps", "challenger_exit_loss_ratio_bps", "challenger_cost_ratio_bps", "max_fit_age_hours"}
+	"challenger_loss_ratio_bps", "challenger_exit_loss_ratio_bps", "challenger_cost_ratio_bps", "max_fit_age_hours",
+	"rolling_alarm_ppm", "consecutive_alarm_ppm", "day_alarm_ppm"}
 
 const (
 	v2CalMinWindows = iota
@@ -136,7 +143,7 @@ func v2Default() v2Settings {
 	return v2Settings{Engine: autoscalerv1alpha1.EngineStatistical, SampleIntervalSeconds: 300, Seasonality: "daily",
 		HistoryDays: 14, HorizonSeconds: 3600, SettlementSeconds: 120, OutcomeGraceSeconds: 600, MiscoverageBps: 1000,
 		Calibration:      [9]int64{128, 512, 7, 50, 100, 2500, 8, 500, 8000},
-		Trust:            [15]int64{48, 64, 500, 24, 9500, 5, 32, 24, 32, 64, 48, 9500, 10000, 10200, 12},
+		Trust:            [18]int64{48, 64, 500, 24, 9500, 5, 64, 24, 32, 64, 48, 9500, 10000, 10200, 12, 35000, 7000, 8000},
 		ExtraMaxReplicas: 2, ExtraMaxPercent: 50, Families: []string{"seasonalNaive", "statistical"}}
 }
 
@@ -334,13 +341,19 @@ func (s v2Settings) calibrationMap() map[string]interface{} {
 	return m
 }
 
+func (s v2Settings) trustMap() map[string]interface{} {
+	m := s.group(v2TrustKeys[:], s.Trust[:])
+	m["policy"] = v2TrustPolicyRevision
+	return m
+}
+
 // canonical is contracts.ForecastSettings.canonical(): {"schema": ..., "settings": asdict(settings)}.
 func (s v2Settings) canonical() map[string]interface{} {
 	return map[string]interface{}{"schema": v2SettingsSchema, "settings": map[string]interface{}{
 		"engine": s.Engine, "sample_interval_seconds": s.SampleIntervalSeconds, "seasonality": s.Seasonality,
 		"history_days": s.HistoryDays, "horizon_seconds": s.HorizonSeconds, "settlement_seconds": s.SettlementSeconds,
 		"outcome_grace_seconds": s.OutcomeGraceSeconds, "risk": s.riskMap(), "calibration": s.calibrationMap(),
-		"trust":            s.group(v2TrustKeys[:], s.Trust[:]),
+		"trust":            s.trustMap(),
 		"predictive_extra": map[string]interface{}{"max_replicas": s.ExtraMaxReplicas, "max_percent": s.ExtraMaxPercent},
 		"families":         s.Families,
 	}}
@@ -380,7 +393,8 @@ func v2EvidenceKey(paUID, targetUID, querySHA string, s v2Settings, leadSeconds 
 		"query_sha256": querySHA, "signal_contract": metricContract, "forecast_contract": forecastContractV2,
 		"interval_seconds": s.SampleIntervalSeconds, "lead_seconds": leadSeconds, "engine": s.Engine,
 		"seasonality": s.Seasonality, "history_days": s.HistoryDays, "settlement_seconds": s.SettlementSeconds,
-		"outcome_grace_seconds": s.OutcomeGraceSeconds, "risk": s.riskMap(), "calibration": s.calibrationMap()})
+		"outcome_grace_seconds": s.OutcomeGraceSeconds, "risk": s.riskMap(), "calibration": s.calibrationMap(),
+		"trust_policy": v2TrustPolicyRevision})
 }
 
 // --- lead and window ------------------------------------------------------------------------------------------
