@@ -292,6 +292,12 @@ problem as `AuthMisconfigured`. A TokenReview outage is an HTTP 503 like any oth
 forecast is still reused; `AuthMisconfigured` and the 401/403 refusals (`Unauthorized`, `Forbidden`) drop the cache
 when they occur.
 
+**A forecasting service that does not answer is not waited for.** The operator gives each forecast request at most
+5 seconds, and after one request has used them up, only a quarter of a second per request for the next minute. With up
+to 20 autoscalers a round of decisions is therefore at most 10 seconds late, however the service fails; reactive
+scaling goes on in the meantime, and an answer that arrives too late is never used
+([configuration.md](configuration.md#waiting-for-the-forecasting-service)).
+
 Losing the forecast leaves you with reactive scaling. Losing the **request rate** is more serious: the operator then
 holds the current replica count and does not follow demand in either direction until telemetry returns
 (`TelemetryAvailable=False`, `ScalingActive=False` with `TelemetryHold`).

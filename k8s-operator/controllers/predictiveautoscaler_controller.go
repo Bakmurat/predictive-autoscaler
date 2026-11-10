@@ -29,6 +29,7 @@ import (
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 
 	autoscalerv1alpha1 "predictive-autoscaler/api/v1alpha1"
 )
@@ -46,7 +47,7 @@ const (
 	defaultReconcileSeconds = 60                     // Default reconcile interval (fast for reactive)
 	minReconcileSeconds     = 30                     // Minimum reconcile interval
 	vmQueryTimeout          = 10 * time.Second       // VictoriaMetrics query timeout (short — it's lightweight)
-	mlAPITimeout            = 120 * time.Second      // ML API timeout (long — allows for model training)
+	mlAPITimeout            = 30 * time.Second       // The HTTP client's own limit; each request is bounded far below it (forecast_wait.go)
 )
 
 // cachedPrediction stores ML API predictions with a TTL to avoid
@@ -118,6 +119,9 @@ type PredictiveAutoscalerReconciler struct {
 	v2Cache         map[string]*v2CachedForecast
 	v2LastOrigin    map[string]int64 // the grid origin of the last v2 decision (scheduling, see Reconcile)
 	startupTrackers map[string]*startupTracker
+	// forecastFullBudgetAt: until then a request to the forecasting service gets only the probe budget, because one
+	// ran out of the full budget (forecast_wait.go). Zero: the full budget applies.
+	forecastFullBudgetAt time.Time
 }
 
 func (r *PredictiveAutoscalerReconciler) mlAPI() *mlAPIClient {
@@ -1406,8 +1410,10 @@ func (r *PredictiveAutoscalerReconciler) getPredictionObserved(
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	// Call ML API (bounded by mlAPITimeout; authenticated and over TLS when configured, see mlapi_client.go)
+	// Call ML API (bounded by the forecast wait budget, forecast_wait.go; authenticated and over TLS when configured, see
+	// mlapi_client.go)
 	completion, started := r.beginForecastAttempt(lookup, jsonData)
+	ctx, answered := r.forecastContext(ctx)
 	// The closure's normal return is the one completion boundary. Panic/termination
 	// leaves only the start; no deferred success is fabricated.
 	prediction, callErr := func() (*MLPredictionResponse, error) {
@@ -1467,6 +1473,7 @@ func (r *PredictiveAutoscalerReconciler) getPredictionObserved(
 
 		return &prediction, nil
 	}()
+	callErr = answered(callErr)
 	if completion != nil {
 		completion.At = time.Now().UTC().Format(time.RFC3339Nano)
 		completion.ElapsedSeconds = time.Since(started).Seconds()
@@ -1822,6 +1829,12 @@ func (r *PredictiveAutoscalerReconciler) SetupWithManager(mgr ctrl.Manager) erro
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&autoscalerv1alpha1.PredictiveAutoscaler{}).
 		Owns(&appsv1.Deployment{}).
+		// One worker, stated here so that no manager-wide default can raise it: the reconciler's per-autoscaler state
+		// (lastReconcileMap, predictionCache, scaleStates, v2Cache, v2LastOrigin, startupTrackers) lives in plain maps
+		// and forecastFullBudgetAt in a plain field, none of them locked; only the ledger has its own mutex. A second
+		// worker would be safe per key (controller-runtime never runs one key twice at a time) but would race on the
+		// maps themselves. What one reconcile may wait for is bounded instead (forecast_wait.go).
+		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
 		Complete(r)
 }
 

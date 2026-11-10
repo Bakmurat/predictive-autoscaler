@@ -118,6 +118,29 @@ with a capacity it records `capacity_source` (`capacityPerReplica` or `targetRPS
 Recommend mode still writes nothing. Creating or updating an object without a capacity is still accepted, so existing
 objects keep working while they are migrated; a later release will require a capacity for Active mode.
 
+### Waiting for the forecasting service
+The forecast is requested inside the reconcile, before the decision, and one worker reconciles every autoscaler in
+turn. A request to the forecasting service (both engines) therefore runs under a **wait budget**; when it runs out the
+request is cancelled and the decision is made without it, as after any failed request: a cached forecast less than ten
+minutes old may stand in on the legacy engine, otherwise the decision is reactive. Nothing is fetched in the
+background, so a late answer does not exist and cannot be used.
+
+| | value | meaning |
+|---|---|---|
+| full budget | 5 s | the longest one decision waits for a forecast |
+| probe budget | 0.25 s | the wait of every request, of every autoscaler, for one minute after a request ran out of the full budget |
+| sizing | 20 autoscalers per operator, shortest cadence 30 s | `5 s + 20 × 0.25 s = 10 s`, a third of the shortest cadence |
+
+So a forecasting service that accepts requests and does not answer, or cannot be reached at all (dropped packets),
+delays a round of 20 decisions by at most 10 s in the minute it stops answering and by at most 5 s per round after that,
+plus one 5 s wait per minute; a single decision is never delayed by more than 5 s. Each autoscaler beyond 20 adds 0.25 s
+per round. A refused connection and an error status are immediate and cost nothing. An answer that takes longer than
+5 s is treated like an outage; a service that needs longer than 0.25 s is asked with the full budget again within a
+minute. The rule is by time and for all autoscalers together: an answer for one autoscaler does not restore the full
+budget for the others. Without a usable cached forecast the decision shows `ForecastAvailable=False` (`Unavailable`);
+on the statistical engine also `PredictionReady=False` (`DataUnavailable`, "did not answer within …"), and on the
+legacy engine the ledger's attempt record shows a `timeout`. The budgets are fixed in this version.
+
 ### Measuring capacityPerReplica
 `capacityPerReplica` is the rate one replica sustains **while meeting its SLO**, not the most it completes while requests
 time out. Measure it on one replica with the production resources (CPU and memory requests and limits, concurrency
@@ -206,7 +229,9 @@ has the evidence, a calibrated **upper bound** `U` of that peak, in requests per
    echo (autoscaler and target UIDs, generation, query hash, settings fingerprint, origin, lead), the evidence epoch,
    the window and its targets, `valid_until`, finite non-negative rates in requests per second. A cached answer is reused
    only for the same request and only while its own window is still actionable (`now + A` before the first target and
-   before `valid_until`); it is never moved to a later window.
+   before `valid_until`); it is never moved to a later window. The request is bounded by the wait budget
+   ([Waiting for the forecasting service](#waiting-for-the-forecasting-service)); without an answer in time the
+   decision of that origin is reactive.
 3. **Decides eligibility independently** of the service's flag: trust state `Trusted` and reason `Ready`, an upper bound,
    at least `calibration.minWindows` calibration and `trust.minProspectiveWindows` prospective windows, a recent evidence
    cutoff, an issue time not ahead of its clock, and the remaining window.
