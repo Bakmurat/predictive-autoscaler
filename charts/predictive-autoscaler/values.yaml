@@ -158,6 +158,17 @@ dashboards:
   labels:                    # the sidecar loads ConfigMaps with this label; add labels, or set one to null to drop it
     grafana_dashboard: "1"
   annotations: {}            # e.g. {grafana_folder: Predictive Autoscaler} for a sidecar folder annotation
+  # The optional demonstration dashboard (dashboards/demonstration.json), in its own ConfigMap with the labels and
+  # annotations above and its own switch (it does not need `enabled`). Two targets side by side, the forecast path and
+  # the reactive reference on the same traffic: demand, forecast and trust, scale decision, Ready capacity, service
+  # quality. Its demand and service-quality panels read the evaluation fixture's ingress and k6 metrics
+  # (deploy/eval-c28). The four values below only pre-select the dashboard's variables; each can be changed in Grafana.
+  demonstration:
+    enabled: false
+    namespace: ""            # the workloads' namespace
+    forecastTarget: ""       # target A: the PredictiveAutoscaler (and Deployment) on the forecast path
+    reactiveTarget: ""       # target B: the reactive reference
+    capacityPerReplica: ""   # the autoscalers' capacityPerReplica as a plain number, requests per second (e.g. 18.5)
 
 nameOverride: ""
 fullnameOverride: ""

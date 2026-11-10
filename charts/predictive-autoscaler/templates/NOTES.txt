@@ -19,6 +19,12 @@ Grafana dashboard "Predictive Autoscaler — Help & Overview ({{ .Release.Namesp
 ConfigMap {{ include "pa.fullname" . }}-dashboards; the Grafana dashboard sidecar must watch this namespace (or all
 namespaces). Its first panel is the Help / User Guide.
 {{- end }}
+{{- if .Values.dashboards.demonstration.enabled }}
+
+Grafana dashboard "Predictive Autoscaler — Demonstration ({{ .Release.Namespace }}/{{ .Release.Name }})" is in
+ConfigMap {{ include "pa.fullname" . }}-demo-dashboard (the same sidecar rule applies). Choose the workload
+namespace, target A (forecast path), target B (reactive reference) and the capacity per replica at its top.
+{{- end }}
 {{- if .Values.networkPolicy.enabled }}
 
 NetworkPolicies are on: they only work with a CNI that enforces them.

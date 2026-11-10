@@ -33,3 +33,50 @@ data:
   {{ $uid }}.json: |-
     {{- toPrettyJson $d | nindent 4 }}
 {{- end }}
+{{- /* The optional demonstration dashboard (dashboards/demonstration.json): two targets side by side (the forecast
+     path and the reactive reference) from demand to service quality. Its own switch and its own ConfigMap; the labels
+     and annotations are the ones above. The uid, title and data key are derived from this release like the overview's,
+     and the workload namespace, the two targets and the capacity per replica are pre-selected from the values when
+     set. Compact JSON: with both targets' queries the document is large, and a ConfigMap that an apply tool also
+     copies into its last-applied annotation has to stay under that annotation's 256 KiB. */}}
+{{- with .Values.dashboards.demonstration }}
+{{- if .enabled }}
+{{- $id := printf "%s/%s" $.Release.Namespace $.Release.Name }}
+{{- $uid := printf "pa-demo-%s" (sha256sum $id | trunc 12) }}
+{{- $d := $.Files.Get "dashboards/demonstration.json" | fromJson }}
+{{- $_ := set $d "uid" $uid }}
+{{- $_ := set $d "title" (printf "%s (%s)" (get $d "title") $id) }}
+{{- $defaults := dict "install_namespace" $.Release.Namespace "installation" (include "pa.fullname" $) }}
+{{- range $name, $val := dict "namespace" .namespace "target_a" .forecastTarget "target_b" .reactiveTarget "capacity_per_replica" (default "" .capacityPerReplica | toString) }}
+{{- if $val }}
+{{- $_ := set $defaults $name $val }}
+{{- end }}
+{{- end }}
+{{- range $v := $d.templating.list }}
+{{- if hasKey $defaults $v.name }}
+{{- $val := get $defaults $v.name }}
+{{- $_ := set $v "current" (dict "selected" true "text" $val "value" $val) }}
+{{- if eq $v.type "textbox" }}
+{{- $_ := set $v "query" $val }}
+{{- end }}
+{{- end }}
+{{- end }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pa.fullname" $ }}-demo-dashboard
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "pa.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: demo-dashboard
+    {{- with $.Values.dashboards.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with $.Values.dashboards.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+data:
+  {{ $uid }}.json: {{ toJson $d | quote }}
+{{- end }}
+{{- end }}
