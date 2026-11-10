@@ -902,6 +902,70 @@ def test_a_lab_qualification_is_opt_in_read_only_and_statistical_only(render):
                   check=False).returncode != 0
 
 
+def test_a_demonstration_qualification_is_opt_in_read_only_statistical_only_and_never_beside_a_lab_one(render):
+    # A scoped live demonstration only: off by default; when set, two read-only files from one ConfigMap (the
+    # qualification and the contract it names) and get on the kube-system Namespace; never with a lab qualification.
+    base = render(STAT)
+    assert not [r for r in by_kind(base, "ClusterRole") if r["metadata"]["name"].endswith("cluster-identity")]
+    (c0,) = forecaster_of(base)["spec"]["template"]["spec"]["containers"]
+    assert not [e for e in c0["env"] if "QUALIFICATION" in e["name"] or "DEMONSTRATION" in e["name"]]
+    demo = _merge(STAT, {"forecaster": {"statistical": {"demonstrationQualification": {
+        "configMap": "pa-demo", "key": "q.json", "contractKey": "c.json"}}}})
+    undigested = render(demo, check=False)                             # the evaluation image must be pinned by digest
+    assert undigested.returncode != 0 and "needs images.statisticalForecaster.digest" in undigested.stderr
+    digest = "sha256:" + "d" * 64
+    demo = _merge(demo, {"images": {"statisticalForecaster": {"digest": digest}}})
+    docs = render(demo)
+    assert rules_of(docs, "pa-predictive-autoscaler-forecaster-cluster-identity") == {
+        (("",), ("namespaces",), ("kube-system",), ("get",))}
+    (binding,) = [b for b in by_kind(docs, "ClusterRoleBinding") if b["metadata"]["name"].endswith("cluster-identity")]
+    assert binding["subjects"] == [{"kind": "ServiceAccount", "name": "pa-predictive-autoscaler-forecaster",
+                                    "namespace": NS}]
+    pod = forecaster_of(docs)["spec"]["template"]["spec"]
+    (c,) = pod["containers"]
+    assert len({e["name"] for e in c["env"]}) == len(c["env"])                       # no variable set twice
+    env = {e["name"]: e.get("value") for e in c["env"]}
+    where = "/etc/predictive-autoscaler/demonstration-qualification"
+    assert env["FORECAST_DEMONSTRATION_QUALIFICATION"] == f"{where}/demonstration-qualification.json"
+    assert env["FORECAST_DEMONSTRATION_CONTRACT"] == f"{where}/demonstration-contract.json"
+    assert env["FORECAST_IMAGE_DIGEST"] == digest and c["image"].endswith("@" + digest)
+    assert "FORECAST_LAB_QUALIFICATION" not in env
+    mounts = {m["mountPath"]: m.get("readOnly", False) for m in c["volumeMounts"]}
+    assert mounts[where] is True and "/etc/predictive-autoscaler/lab-qualification" not in mounts
+    vol = next(v for v in pod["volumes"] if v["name"] == "demonstration-qualification")
+    assert vol["configMap"] == {"name": "pa-demo", "items": [
+        {"key": "q.json", "path": "demonstration-qualification.json"},
+        {"key": "c.json", "path": "demonstration-contract.json"}]}
+    assert not [v for v in pod["volumes"] if v["name"] == "lab-qualification"]
+    # The default keys; and nothing else in the release differs from the plain statistical install with that digest.
+    defaults = render(_merge(demo, {"forecaster": {"statistical": {"demonstrationQualification": {
+        "configMap": "pa-demo", "key": "demonstration-qualification.json",
+        "contractKey": "demonstration-contract.json"}}}}))
+    vol = next(v for v in forecaster_of(defaults)["spec"]["template"]["spec"]["volumes"]
+               if v["name"] == "demonstration-qualification")
+    assert [i["key"] for i in vol["configMap"]["items"]] == ["demonstration-qualification.json",
+                                                             "demonstration-contract.json"]
+    plain = render(_merge(STAT, {"images": {"statisticalForecaster": {"digest": digest}}}))
+    def other(ds):                      # everything but the forecaster Deployment, the identity read and the TLS Secret
+        return [d for d in ds if d["kind"] != "Secret" and not d["metadata"]["name"].endswith("cluster-identity")
+                and not (d["kind"] == "Deployment" and d["metadata"]["name"].endswith("-forecaster"))]
+    assert other(docs) == other(plain) and len(other(docs)) == len(docs) - 4
+    # Mutually exclusive with a lab qualification, whatever else is set.
+    both = render(_merge(demo, {"forecaster": {"statistical": {"labQualification": {"configMap": "pa-lab"}}}}),
+                  check=False)
+    assert both.returncode != 0 and "at most one of the two documents" in both.stderr
+    legacy = render({"forecaster": {"statistical": {"demonstrationQualification": {"configMap": "pa-demo"}}}},
+                    check=False)
+    assert legacy.returncode != 0 and "needs forecaster.engine: statistical" in legacy.stderr
+    same_key = render(_merge(demo, {"forecaster": {"statistical": {"demonstrationQualification": {
+        "contractKey": "q.json"}}}}), check=False)
+    assert same_key.returncode != 0 and "two different keys" in same_key.stderr
+    for bad in ({"configMap": "Bad_Name"}, {"key": "a/b"}, {"contractKey": ""}, {"contract": "c.json"},
+                {"gates": "pass"}):
+        assert render(_merge(demo, {"forecaster": {"statistical": {"demonstrationQualification": bad}}}),
+                      check=False).returncode != 0, bad
+
+
 def test_pod_labels_reach_the_pods_and_never_replace_the_selector(render):
     opt_out = {"sidecar.istio.io/inject": "false"}
     docs = render({"operator": {"podLabels": opt_out}, "forecaster": {"podLabels": opt_out}})

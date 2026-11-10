@@ -40,7 +40,8 @@ subjects:
     namespace: {{ $.Release.Namespace }}
 ---
 {{- end }}
-{{- if include "pa.labQualification" . }}
+{{- /* The same read serves a demonstration qualification's scope (one cluster UID); the two are never both set. */}}
+{{- if or (include "pa.labQualification" .) (include "pa.demonstrationQualification" .) }}
 # C2.8 lab evaluation only: the forecaster reads the cluster's identity (the kube-system Namespace UID) to check a lab
 # qualification's scope. One named object, get only.
 apiVersion: rbac.authorization.k8s.io/v1

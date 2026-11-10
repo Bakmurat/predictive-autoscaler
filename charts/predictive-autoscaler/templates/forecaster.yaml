@@ -81,6 +81,14 @@ spec:
             - name: FORECAST_IMAGE_DIGEST
               value: {{ .Values.images.statisticalForecaster.digest | quote }}
             {{- end }}
+            {{- if include "pa.demonstrationQualification" . }}
+            - name: FORECAST_DEMONSTRATION_QUALIFICATION
+              value: /etc/predictive-autoscaler/demonstration-qualification/demonstration-qualification.json
+            - name: FORECAST_DEMONSTRATION_CONTRACT
+              value: /etc/predictive-autoscaler/demonstration-qualification/demonstration-contract.json
+            - name: FORECAST_IMAGE_DIGEST
+              value: {{ .Values.images.statisticalForecaster.digest | quote }}
+            {{- end }}
             {{- end }}
             {{- if .Values.forecaster.auth.enabled }}
             - name: FORECASTER_AUTH
@@ -125,6 +133,9 @@ spec:
             {{- if include "pa.labQualification" . }}
             - {name: lab-qualification, mountPath: /etc/predictive-autoscaler/lab-qualification, readOnly: true}
             {{- end }}
+            {{- if include "pa.demonstrationQualification" . }}
+            - {name: demonstration-qualification, mountPath: /etc/predictive-autoscaler/demonstration-qualification, readOnly: true}
+            {{- end }}
       volumes:
         {{- if $stat }}
         - name: state
@@ -146,6 +157,14 @@ spec:
           configMap:
             name: {{ .Values.forecaster.statistical.labQualification.configMap | quote }}
             items: [{key: {{ .Values.forecaster.statistical.labQualification.key | quote }}, path: lab-qualification.json}]
+        {{- end }}
+        {{- if include "pa.demonstrationQualification" . }}
+        - name: demonstration-qualification
+          configMap:
+            name: {{ .Values.forecaster.statistical.demonstrationQualification.configMap | quote }}
+            items:
+              - {key: {{ .Values.forecaster.statistical.demonstrationQualification.key | quote }}, path: demonstration-qualification.json}
+              - {key: {{ .Values.forecaster.statistical.demonstrationQualification.contractKey | quote }}, path: demonstration-contract.json}
         {{- end }}
       {{- with .Values.forecaster.nodeSelector }}
       nodeSelector: {{- toYaml . | nindent 8 }}

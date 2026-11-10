@@ -89,6 +89,21 @@ true
 {{- end -}}
 {{- end -}}
 
+{{/*
+"true" when a demonstration qualification and its contract are mounted (a scoped live demonstration only: not a
+release and not an evaluation qualification); it exists only for the statistical engine, only with the image pinned by
+digest, and never beside a lab qualification.
+*/}}
+{{- define "pa.demonstrationQualification" -}}
+{{- if .Values.forecaster.statistical.demonstrationQualification.configMap -}}
+{{- if .Values.forecaster.statistical.labQualification.configMap }}{{ fail "forecaster.statistical.demonstrationQualification and forecaster.statistical.labQualification are both set: at most one of the two documents" }}{{ end -}}
+{{- if not (include "pa.statistical" .) }}{{ fail "forecaster.statistical.demonstrationQualification needs forecaster.engine: statistical" }}{{ end -}}
+{{- if not .Values.images.statisticalForecaster.digest }}{{ fail "forecaster.statistical.demonstrationQualification needs images.statisticalForecaster.digest (the evaluation image the qualification names)" }}{{ end -}}
+{{- if eq .Values.forecaster.statistical.demonstrationQualification.key .Values.forecaster.statistical.demonstrationQualification.contractKey }}{{ fail "forecaster.statistical.demonstrationQualification.key and contractKey must be two different keys (the qualification and the contract it names)" }}{{ end -}}
+true
+{{- end -}}
+{{- end -}}
+
 {{/* The statistical journal's byte budget from forecaster.statistical.stateQuota (Mi or Gi). */}}
 {{- define "pa.stateQuotaBytes" -}}
 {{- $q := .Values.forecaster.statistical.stateQuota -}}

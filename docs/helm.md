@@ -227,6 +227,75 @@ The forecasting service and the trainer share the model volume.
   a retry included, re-checks it: once the qualification has expired or been removed or replaced, even a stored
   issuance is not eligible, and a lab-qualified answer whose `valid_until` falls after the expiry is never eligible.
   `/health` shows the build and the qualification.
+- **Demonstration qualification (a scoped live demonstration only):**
+  `forecaster.statistical.demonstrationQualification.configMap` mounts two reviewed files from one ConfigMap and lets
+  the forecaster read the `kube-system` Namespace (the cluster UID). It is a demonstration basis. It is **not** a
+  release and **not** an evaluation (lab) qualification: it records no gate and grants no G0-G5 pass, and neither file
+  has a `gates` field (a document that carries one is refused). What it does is exactly what the lab qualification
+  does, for a narrower scope: it stands in for the release gate and nothing else. Identity, settings, calibration,
+  coverage, availability, prospective evidence, selection, the issuance deadline, caps, telemetry and the operator's
+  own verdict and write guards apply as always. An eligible answer is an answer, not an action: the operator still
+  needs Active mode and the RBAC write (`operator.rbac.scaleWrite`), so the document can be mounted while every
+  replica write is denied.
+  - **The two files** (`ml-engine/forecasting/demonstration.py`), each one JSON object with exactly these keys:
+
+    | File (value key) | Keys |
+    |---|---|
+    | `demonstration-qualification/v1` (`key`, default `demonstration-qualification.json`) | `schema`, `source_tree`, `image_digest`, `contract_sha256`, `reviewers`, `not_before`, `expires`, `families`, `scope` {`cluster_uid`, `namespace`, `targets` [{`namespace`, `name`, `uid`}]} |
+    | `demonstration-contract/v1` (`contractKey`, default `demonstration-contract.json`) | `schema`, `checked` {`qualification` {`expires_not_after`}, `families`, `cadence` {`grid_seconds`, `update_interval_seconds`}, `targets` [{`namespace`, `name`, `uid`, `min_replicas`, `max_replicas`, `capacity_per_replica`, `settings_sha256`}]}, optionally `unchecked` (any object: the rest of the reviewed contract, hashed with the file, never interpreted) |
+
+    `settings_sha256` is the resolved forecast settings fingerprint of the target's autoscaler (the
+    `settings_sha256` the operator sends with every request: risk, calibration, trust, predictive extra, grid,
+    history, horizon and families), so a reviewed trust or calibration setting cannot change under the same contract.
+    `capacity_per_replica` is compared as **exact text** with `spec.metrics.requests.capacityPerReplica`: a
+    numerically equal spelling (`5.50` for `5.5`) is refused. Generate the contract from the admitted
+    PredictiveAutoscaler object as the API server returns it, never from a number typed again. Two more keys of
+    `checked` are **reserved and not enforced by this build**: `calibration_policy_revision` and
+    `trust_policy_revision`. A contract that carries either is refused, so that nobody takes them for compared before
+    they are. Every digest, time, name and number in both files is matched whole: no trailing newline passes.
+
+  - **At start-up** the forecaster refuses to start unless all of this holds: the image is the evaluation build of
+    the `source_tree` the qualification names, run by the `image_digest` it names
+    (`images.statisticalForecaster.digest`, required with this option); the mounted contract's sha256 equals
+    `contract_sha256`; the qualification's families and targets equal the contract's and it expires no later than the
+    contract's `expires_not_after`; at least two distinct reviewers; a validity window that is positive, at most 21
+    days and not yet over; reviewers compared without surrounding whitespace and without regard to case; one cluster
+    UID, one namespace (a DNS-1123 label) and one or two targets, each by namespace, name and UID;
+    families from `seasonalNaive` and `statistical` (the names of `spec.prediction.families`); a cadence of exactly
+    60 s grid and 60 s update interval; replica bounds and a plain decimal `capacity_per_replica` for each target.
+    The chart refuses `demonstrationQualification` together with `labQualification`, and the forecaster refuses it
+    when the release gates have passed (no silent precedence between the three bases).
+  - **For each request** the demonstration basis holds only when: both mounted files still hold exactly the bytes
+    admitted at start-up; the live cluster, the autoscaler's namespace and its target (name and UID) are in scope;
+    the document is valid now and at the answer's `valid_until`; the live autoscaler is configured as the contract
+    says (`spec.prediction.families` within the listed families, `sampleIntervalSeconds` 60 and
+    `updateIntervalSeconds` 60 set explicitly, the resolved settings fingerprint, `minReplicas`, `maxReplicas`, and
+    the exact text of `spec.metrics.requests.capacityPerReplica` without `targetRPS`); and the family that was
+    actually **selected** for that answer is listed. Otherwise the answer is not eligible under it, with the first
+    failing check recorded.
+  - **The mounted files are checked at every authorization.** Both files are read through their paths and hashed
+    again each time an answer is issued or a stored answer is served (no cache and no reliance on modification
+    times, so the delay is zero: the next authorization after a change sees it). A missing, unreadable, oversized or
+    changed file withdraws the basis (`qualification-file` or `contract-file`). What is found there is never loaded:
+    a replacement document is admitted only by restarting the forecaster. If the mounted bytes are again exactly the
+    admitted ones, the same authority applies again to answers issued from then on.
+  - **Withdrawing is not revoking.** Removing or changing the mounted qualification stops further authorization by
+    the forecaster, but it does not instantly recall an answer the operator has already received and holds until its
+    `valid_until`. The emergency stop is revoking the scale permission (`operator.rbac.scaleWrite: false`, or the
+    autoscaler back to Recommend).
+  - **What is recorded and shown:** every issuance's `release_gate` holds `basis: demonstration`, the qualification's
+    and the contract's sha256 and, when it did not pass, `refused` (`release`, `qualification-file`, `contract-file`,
+    `cluster`, `namespace`, `target`, `validity`, `families`, `cadence`, `settings`, `bounds`, `capacity` or
+    `family`). Every answer, a retry of a stored one
+    included, re-checks the basis, both digests, the live configuration and the selected family: after expiry,
+    removal, replacement or drift a stored issuance is not eligible. `/health` shows `demonstration_qualification`
+    (with `withdrawn`: the mounted file that no longer matches, if any) and `qualification_basis`. `/metrics` has
+    `predictive_autoscaler_forecaster_qualification_basis{basis="none|lab|demonstration|release"}` (1 for the basis in
+    force for the process, by validity window; scope is per request),
+    `predictive_autoscaler_forecaster_qualification_expires_timestamp_seconds{document="lab|demonstration"}` (it stays
+    exported after the expiry) and `predictive_autoscaler_forecaster_demonstration_refusals_total{reason}`.
+  - Authority is admitted once, at start-up: after changing the ConfigMap the running forecaster authorizes nothing
+    under the demonstration basis until it is restarted with the new files (or the admitted files are back).
 
 ## Monitoring
 

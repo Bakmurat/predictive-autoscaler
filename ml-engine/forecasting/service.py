@@ -35,18 +35,28 @@ ineligible, and a lab-qualified issuance is eligible only if its valid_until is 
 so a cached eligible answer never outlives it. A journal
 that cannot be opened or written answers 503 (StateUnavailable) and never issues; a lost journal starts empty, so trust
 has to be earned again from nothing.
+
+A DEMONSTRATION qualification (forecasting.demonstration) is the second, separate basis: it records no gate, is bound
+to a mounted and hash-verified demonstration contract, and stands in for the release gate only for its cluster, one
+namespace and at most two target UIDs, only while both mounted files still hold the admitted bytes (read again at
+every answer; nothing new is loaded without a restart), only while the live configuration is the contract's (the
+resolved settings fingerprint included), and only for an answer whose SELECTED family it lists. That last rule is
+decided after selection (the gate is first evaluated without it) and re-checked on every answer, like the document's
+and the contract's digests. It is never combined with a lab qualification or with passed release gates: the service
+refuses to start. Eligibility is an answer, not an action: nothing here assumes a replica write follows.
 """
 
 from __future__ import annotations
 
 import os
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Dict, Mapping, Optional, Tuple
 
 from api.identity import LookupFailed, ProvenanceRefused
 from data.bounded_http import bounded_get
 from forecasting import calibration as cal
+from forecasting import demonstration as D
 from forecasting import policy_sim as P
 from forecasting import qualification as Q
 from forecasting import trust as T
@@ -57,6 +67,7 @@ from forecasting.contracts import FAMILY_MODELS, FORECAST_CONTRACT, UNIT, BoundR
 from forecasting.history import HistoryRefused, HistoryUnavailable, read_rps_history
 from forecasting.maturation import candidate, issued_outcome
 from forecasting.metrics import ForecastMetrics, RegistryFull, Snapshot, model_samples
+from forecasting.qualification_metrics import QualificationMetrics
 from forecasting.statistical import RECIPE_E1, RECIPE_NAIVE, KernelSettings, KernelUnavailable, Series, fit_e1, \
     forecast_e1, seasonal_naive
 from forecasting.store import DEFAULT_QUOTA_BYTES, ForecastStore, IssuanceKey, StoreError, StoreUnavailable
@@ -67,6 +78,9 @@ REFIT_SECONDS = 6 * 3600
 RECIPES = {"seasonal_naive": RECIPE_NAIVE, "statistical": RECIPE_E1}
 RELEASE_GATES_PASSED = False        # C2.8: until the G0-G5 evidence exists, nothing is PredictionReady
 COST_HISTORY_SECONDS = 8 * DAY      # issued bounds kept in memory for cost replays (paired evidence: 7 days)
+# What ties a stored answer to the basis it was issued under (absent keys compare as None: older bundles have fewer).
+_GATE_IDENTITY = ("basis", "lab_qualification_sha256", "demonstration_qualification_sha256",
+                  "demonstration_contract_sha256")
 
 
 class ServiceError(Exception):
@@ -87,6 +101,8 @@ class ServiceConfig:
     compact_every_seconds: int = 3600
     build: Q.BuildInfo = Q.BuildInfo("unknown", False)               # the image's build record
     lab_qualification: Optional[Q.LabQualification] = None          # verified by forecasting.qualification.load
+    # verified, with its contract, by forecasting.demonstration.load; never beside a lab qualification
+    demonstration_qualification: Optional[D.DemonstrationQualification] = None
 
 
 class ForecastService:
@@ -96,6 +112,18 @@ class ForecastService:
         q = config.lab_qualification
         if q is not None and not (config.build.evaluation_build and q.source_tree == config.build.source_tree):
             raise Q.QualificationRefused("a lab qualification is honoured only by the evaluation build it names")
+        d = config.demonstration_qualification
+        if d is not None and q is not None:
+            raise Q.QualificationRefused("at most one of a lab qualification and a demonstration qualification")
+        if d is not None and RELEASE_GATES_PASSED:
+            raise Q.QualificationRefused("the release gates have passed: a demonstration qualification is refused "
+                                         "(no silent precedence between release and demonstration)")
+        if d is not None and not (config.build.evaluation_build and d.source_tree == config.build.source_tree):
+            raise Q.QualificationRefused("a demonstration qualification is honoured only by the evaluation build it "
+                                         "names")
+        if d is not None and d.mounted is None:
+            raise Q.QualificationRefused("a demonstration qualification is honoured only from its two mounted files "
+                                         "(forecasting.demonstration.load): their bytes are checked at every answer")
         self.config, self.reader, self.fetch = config, reader, fetch
         self.clock = clock or ReceiptClock()
         os.makedirs(config.state_dir, exist_ok=True)
@@ -114,6 +142,7 @@ class ForecastService:
             from forecasting.worker import FitWorker
             self.worker = FitWorker(self.artifacts)
         self.metrics = ForecastMetrics(max_autoscalers=config.max_autoscalers)
+        self.qualification_metrics = QualificationMetrics(self.qualification_status, D.REFUSALS)
         self._lock = threading.Lock()                   # one writer of the journal and the epoch states
         self._compacted_s: Optional[int] = None
         self._cluster_uid: Optional[str] = None         # read once it succeeds (a pod never changes cluster)
@@ -133,13 +162,26 @@ class ForecastService:
 
     def health(self) -> Dict:
         problem = self.store_problem or (self.store.problem if self.store is not None else None)
-        q = self.config.lab_qualification
+        q, d = self.config.lab_qualification, self.config.demonstration_qualification
         return {"status": "healthy", "state": "healthy" if self.store_healthy else "unavailable",
                 "state_problem": problem, "forecast_contract": FORECAST_CONTRACT,
                 "release_gates_passed": RELEASE_GATES_PASSED,
                 "build": {"source_tree": self.config.build.source_tree,
                           "evaluation_build": self.config.build.evaluation_build},
-                "lab_qualification": None if q is None else q.summary()}
+                "lab_qualification": None if q is None else q.summary(),
+                "demonstration_qualification": None if d is None else {**d.summary(), "withdrawn": d.mount_refusal()},
+                "qualification_basis": self.qualification_status()[0]}
+
+    def qualification_status(self) -> Tuple[str, Dict[str, int]]:
+        """(the release-gate basis in force for this process now: release, lab, demonstration or none; the mounted
+        documents' expiries). A document's scope is checked per request; this is what the metric and /health show.
+        A demonstration qualification whose mounted files no longer hold the admitted bytes is withdrawn: none."""
+        now_s = self.clock.now_ms() // 1000
+        docs = {"lab": self.config.lab_qualification, "demonstration": self.config.demonstration_qualification}
+        valid = [k for k, doc in docs.items() if doc is not None and doc.not_before <= now_s < doc.expires
+                 and (k != "demonstration" or doc.mount_refusal() is None)]
+        basis = "release" if RELEASE_GATES_PASSED else valid[0] if valid else "none"
+        return basis, {k: doc.expires for k, doc in docs.items() if doc is not None}
 
     def close(self) -> None:
         if self.worker is not None:
@@ -351,6 +393,15 @@ class ForecastService:
                      startup_budget_valid=True, policy_sha256=policy_sha)
         pairs = state["pairs"] if "seasonal_naive" in points else {}   # paired evidence needs its naive baseline
         verdict, new_h = T.evaluate(inputs, state["trust"], g, s.trust, pairs=pairs, costs=costs)
+        if gate["basis"] == "demonstration" and verdict.selected is not None:
+            # A demonstration covers only the families it lists, and the family is known only now: decide the gate
+            # again for the selected one. Outside the list this forecast has no release gate at all, so the verdict is
+            # the one of a service without a qualification (selection and hysteresis never read the gate).
+            decided = self._release_gate(bound, now_ms // 1000, window.valid_until(lead), verdict.selected)
+            if not decided["passed"]:
+                gate = decided
+                verdict, new_h = T.evaluate(inputs, state["trust"], replace(g, replay_suite_passed=False), s.trust,
+                                            pairs=pairs, costs=costs)
         state["trust"] = new_h
         through = max(at for at, v in zip(grid.received_at_ms, grid.values) if v is not None)   # actual receipts
         return {"schema": "forecast-issuance/v1", "evidence_mode": "prospective",
@@ -381,13 +432,14 @@ class ForecastService:
     def _authorized(self, bound: BoundRequest, b: Dict) -> bool:
         """The bundle's release-gate basis still holds NOW, for this request: the same basis and the same qualification
         digest, re-checked on every answer (an issuance stored under a lab qualification is not eligible once it has
-        expired, been removed or replaced)."""
+        expired, been removed or replaced). Under a demonstration qualification the same holds for its digest and its
+        contract's, and the bundle's SELECTED family must be one the document lists: this is where eligibility is
+        finally decided, for a first answer and for every stored one."""
         issued = b.get("release_gate") or {}
-        if issued.get("passed") is not True:
+        if issued.get("passed") is not True or not b.get("selected"):
             return False
-        now = self._release_gate(bound, self.clock.now_ms() // 1000, b["valid_until"])
-        return now["passed"] and (now["basis"], now["lab_qualification_sha256"]) == \
-            (issued.get("basis"), issued.get("lab_qualification_sha256"))
+        now = self._release_gate(bound, self.clock.now_ms() // 1000, b["valid_until"], b["selected"])
+        return now["passed"] and all(now.get(k) == issued.get(k) for k in _GATE_IDENTITY)
 
     def _response(self, bound: BoundRequest, b: Dict) -> Dict:
         sig = bound.signal
@@ -447,11 +499,16 @@ class ForecastService:
     def _models(bound: BoundRequest) -> tuple:
         return tuple(FAMILY_MODELS[f] for f in bound.settings.families)
 
-    def _release_gate(self, bound: BoundRequest, now_s: int, valid_until: int) -> Dict:
+    def _release_gate(self, bound: BoundRequest, now_s: int, valid_until: int, selected: Optional[str] = None) -> Dict:
         """The release gate's basis for this request: the product release (RELEASE_GATES_PASSED), a lab qualification
         whose scope covers the live cluster, namespace and target right now and that is still valid at the answer's
-        valid_until, or none. Only Global.replay_suite_passed reads it; every runtime gate is evaluated as always."""
+        valid_until, or none. Only Global.replay_suite_passed reads it; every runtime gate is evaluated as always.
+        A demonstration qualification is the only basis that reads `selected` (the selected model family, once known):
+        see _demonstration_gate."""
         q = self.config.lab_qualification
+        d = self.config.demonstration_qualification
+        if d is not None:
+            return self._demonstration_gate(d, bound, now_s, valid_until, selected)
         if RELEASE_GATES_PASSED:
             return {"passed": True, "basis": "release", "lab_qualification_sha256": None}
         if q is None:
@@ -462,6 +519,27 @@ class ForecastService:
         ok = q.covers(self._cluster_uid, bound.autoscaler_namespace, sig.namespace, sig.name, sig.target_uid, now_s) \
             and valid_until <= q.expires
         return {"passed": ok, "basis": "lab" if ok else None, "lab_qualification_sha256": q.sha256}
+
+    def _demonstration_gate(self, d: D.DemonstrationQualification, bound: BoundRequest, now_s: int, valid_until: int,
+                            selected: Optional[str]) -> Dict:
+        """The gate under a demonstration qualification: passed only when both mounted files still hold the admitted
+        bytes (read and hashed now, at every call), the live cluster, namespace and target are in its scope, it is
+        valid now and at the answer's valid_until, the live autoscaler is configured as its contract says (families,
+        cadence, resolved settings fingerprint, replica bounds, capacity) and, once a family is selected, that family
+        is listed. The record names the document and its contract and, when it did not pass, the first reason."""
+        if self._cluster_uid is None:
+            self._cluster_uid = Q.cluster_uid(self.reader)
+        sig = bound.signal
+        why = "release" if RELEASE_GATES_PASSED else d.mount_refusal() or d.refusal(
+            cluster_uid=self._cluster_uid, autoscaler_namespace=bound.autoscaler_namespace, namespace=sig.namespace,
+            name=sig.name, uid=sig.target_uid, now_s=now_s, valid_until=valid_until, spec=bound.spec,
+            families=bound.settings.families, sample_interval_seconds=bound.settings.sample_interval_seconds,
+            settings_sha256=bound.settings.fingerprint(), selected=selected)
+        if why is not None:
+            self.qualification_metrics.refused(why)
+        return {"passed": why is None, "basis": "demonstration" if why is None else None,
+                "lab_qualification_sha256": None, "demonstration_qualification_sha256": d.sha256,
+                "demonstration_contract_sha256": d.contract_sha256, "refused": why}
 
     def _issued_uppers(self, bound: BoundRequest, lo: int) -> Dict[int, tuple]:
         """{decision origin: (naive bound, E1 bound, input_end, seq)} of the epoch's issuances, folded incrementally from
