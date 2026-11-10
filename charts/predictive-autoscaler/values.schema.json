@@ -262,7 +262,7 @@
           "prometheusRule": {"type": "object", "additionalProperties": false, "properties": {"enabled": {"type": "boolean"}}},
           "vmRule": {"type": "object", "additionalProperties": false, "properties": {"enabled": {"type": "boolean"}}},
           "labels": {"type": "object", "additionalProperties": {"type": "string"}},
-          "notReadyFor": {"type": "string", "pattern": "^[0-9]+(ms|s|m|h|d)$"}, "telemetryFor": {"type": "string", "pattern": "^[0-9]+(ms|s|m|h|d)$"}, "forecastFor": {"type": "string", "pattern": "^[0-9]+(ms|s|m|h|d)$"}, "conflictFor": {"type": "string", "pattern": "^[0-9]+(ms|s|m|h|d)$"}, "absentFor": {"type": "string", "pattern": "^[0-9]+(ms|s|m|h|d)$"},
+          "notReadyFor": {"type": "string", "pattern": "^[0-9]+(ms|s|m|h|d)$"}, "telemetryFor": {"type": "string", "pattern": "^[0-9]+(ms|s|m|h|d)$"}, "forecastFor": {"type": "string", "pattern": "^[0-9]+(ms|s|m|h|d)$"}, "conflictFor": {"type": "string", "pattern": "^[0-9]+(ms|s|m|h|d)$"}, "absentFor": {"type": "string", "pattern": "^[0-9]+(ms|s|m|h|d)$"}, "journalFor": {"type": "string", "pattern": "^[0-9]+(ms|s|m|h|d)$"},
           "modelStaleHours": {"type": "integer", "minimum": 1}}}
       }
     },

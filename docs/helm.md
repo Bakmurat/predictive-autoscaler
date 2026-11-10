@@ -182,8 +182,28 @@ The forecasting service and the trainer share the model volume.
 - **State:** a retained 2Gi claim (`<release>-forecast-state`, `forecaster.statistical.persistence`) mounted at
   `/state` holds the forecast journal (SQLite, WAL) and the fit artifacts, with a journal budget of
   `forecaster.statistical.stateQuota` (1536Mi). Issuances and outcomes are kept 7 days online, then compacted into
-  per-epoch counts. A lost or corrupt journal never carries evidence over: the service answers 503 until it can write
-  again, and a new journal starts every trust epoch from nothing.
+  per-epoch counts. The quota must be at most 80 % of `persistence.size` (the chart refuses more: the volume also
+  holds the fit artifacts, and a journal that fills the volume fails); with an `existingClaim` the chart cannot see
+  the capacity, so keep the quota at or below 80 % of that claim's capacity yourself. A write that would exceed the
+  quota first lets retention free what it may (expired windows and samples); nothing still in retention is deleted to
+  make room.
+- **Journal failures and recovery:** when the journal cannot be written or trusted (the quota or the volume is full,
+  an I/O error, a record that fails its checksum), nothing is issued: `/v2/predict` answers 503 `StateUnavailable`,
+  `/ready` answers 503 with the reason, and the autoscalers are reactive meanwhile. The service then recovers in place,
+  without a restart: it reopens the journal 5 s after the failure and, while that fails, 15 s, 1 min, 5 min and 15 min
+  after the previous attempt (each attempt: SQLite's checks, every record against its checksum, room for the write
+  that did not fit, one durable commit). After those five attempts the failure is **permanent and needs an operator**;
+  the service stays up, stays not ready, and tries again every 30 minutes. A recovery that does not last an hour keeps
+  its place in this schedule, so a journal that fails again at once is never retried in a tight loop. What to do:
+  - *full:* enlarge the volume, raise `stateQuota` (applied by the pod's restart), or wait: retention frees expired
+    windows and the next attempt uses the room;
+  - *corrupt:* move `/state/journal.sqlite*` away; the next attempt starts an empty journal. A lost or corrupt journal
+    never carries evidence over: a new journal starts every trust epoch from nothing.
+
+  Watch it with `predictive_autoscaler_forecaster_journal_unhealthy_since_seconds` (present only while unhealthy),
+  `..._journal_permanent_failure` (1 once the five attempts are used up), `..._journal_failures_total`,
+  `..._journal_recovery_attempts_total` and `..._journal_recoveries_total`, and the alert
+  `PredictiveAutoscalerForecastJournalUnhealthy` (`metrics.alerts.journalFor`, 15m).
 - **No trainers:** fits run inside the service on a bounded worker (one process, 30 s, 384 MiB address space); the
   training CronJobs are not rendered, and `training.targets` with this engine is refused.
 - **Switching:** the Deployment, Service and operator URL stay the same in both profiles, and each profile's claim is
@@ -196,8 +216,10 @@ The forecasting service and the trainer share the model volume.
   inside the built image under the profile's limits (512 MiB, 1 CPU, read-only root) with the fit worker on and 8
   days of history, and fails on an OOM kill, a budget breach, any failed fit, no issuance that used a fitted artifact,
   or a missing cgroup measurement: the gate for the 384 MiB fit limit and these resources.
-- **Readiness:** `/ready` answers 503 while the journal cannot support issuance (and before start-up); `/health`
-  stays the liveness probe. Young history or untrusted models do not make the service unready.
+- **Readiness:** `/ready` answers 503 while the journal cannot support issuance (and before start-up), naming the
+  reason; `/health` stays the liveness probe and stays 200 through a journal failure, because restarting the pod
+  repairs neither a full nor a corrupt volume and would only loop. Young history or untrusted models do not make the
+  service unready.
 - **Autoscaler limit:** the service registers at most `forecaster.statistical.maxAutoscalers` autoscalers
   (namespace/name) at once, 8 by default (1 to 64); its resources and `stateQuota` are sized for 8, so raise them
   together. A request for one more is refused with HTTP 503, error `AutoscalerLimitReached`: that autoscaler stays
@@ -364,6 +386,7 @@ installation's metrics (its `job` and `pa_install_namespace`), and every alert c
 | `PredictiveAutoscalerModelStale` | forecasts in the last hour came from a model whose training cutoff is older than `modelStaleHours` (26) | 15m | warning |
 | `PredictiveAutoscalerOperatorDown` | no operator scrape target is up (down or missing); a healthy scrape does not prove reconciles succeed, which `NotReady` covers | `absentFor` 10m | critical |
 | `PredictiveAutoscalerForecasterDown` | no forecaster scrape target is up | `absentFor` 10m | warning |
+| `PredictiveAutoscalerForecastJournalUnhealthy` | the statistical forecaster's journal has been unhealthy (`predictive_autoscaler_forecaster_journal_unhealthy_since_seconds` present) although the service retries by itself; never with `forecaster.engine: legacyLstm` | `journalFor` 15m | warning |
 
 `metrics.alerts.labels` adds labels (for example a team label for routing) to every alert. `make chart-check` runs
 the rules' unit tests with promtool (`hack/alerts/alerts-test.yaml`): each alert firing, recovering and staying silent,
