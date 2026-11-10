@@ -373,6 +373,10 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	// --- STARTUP DELAY AND BLOCKED SCALE-OUTS (startup.go; every engine) ---
 	now := r.now()
 	startup := r.observeStartup(ctx, key, deployment, now)
+	if startup.PendingEvidence == pendingUncertain {
+		log.Info("A pod that is not Ready does not show whether it was Ready before; counting it as a pending start",
+			"pod", startup.PendingPod, "pendingSeconds", *startup.Pending)
+	}
 
 	// --- FORECAST CONTRACT V2 (engine statistical; forecast_v2.go, v2_reconcile.go) ---
 	// The settings, the startup budget and the lead are resolved, and the lead is published in status.prediction before

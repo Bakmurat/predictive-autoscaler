@@ -455,7 +455,11 @@ forecast windows is not a latency or error-rate guarantee.
 **What the operator does with it** (`spec.prediction.engine: statistical`). It never takes the service's word for a
 write. It publishes the lead it needs: a startup budget (pod creation to Ready of the current ReplicaSet's pods once 20
 starts are measured, otherwise `spec.behavior.startup.fallbackDelaySeconds`), plus a decision interval and an allowance
-that also covers the time from the scale request to the pod's creation. It asks for the window starting at the current
+that also covers the time from the scale request to the pod's creation. A pod that has never been Ready and is already
+older than the budget raises it; a pod that was Ready and failed a readiness probe, an evicted pod and a terminating pod
+do not. The lead never gets shorter by itself, and a start too slow for the forecast horizon switches the forecast off
+(`LeadInsufficient`) while reactive scaling continues; changing `spec.behavior.startup` starts again from the current
+budget. It asks for the window starting at the current
 grid time and checks the answer itself: identity, settings, window, an upper bound backed by enough evidence, and enough
 time left in the window, checked again right before the write. Only then does the bound count:
 `ceil(bound / capacityPerReplica)` replicas, but never more than `spec.prediction.predictiveExtra` above the reactive need
