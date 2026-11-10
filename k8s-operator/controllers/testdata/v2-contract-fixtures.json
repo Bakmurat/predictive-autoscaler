@@ -152,9 +152,9 @@
    }
   },
   {
-   "evidence_key": "894b38a84faa7aab2d7e2c55058c596211f4382c83c5740b1bf87ec3e81d5716",
-   "lead_seconds": 240,
-   "settings_case": "everything",
+   "evidence_key": "3a34644601ea4ee77b65dc92f1a8ca148d499b2b4c06c981b8f5ddc2fa226f6b",
+   "lead_seconds": 1200,
+   "settings_case": "legacy-lstm-history-one-day",
    "signal": {
     "autoscaler_uid": "pa-uid",
     "query_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -162,9 +162,9 @@
    }
   },
   {
-   "evidence_key": "afb7e312b036e905d44f2296fda1b51cc0bdab2f28f34153b626fe2e6ff718c0",
-   "lead_seconds": 2400,
-   "settings_case": "everything",
+   "evidence_key": "6134399a305d42191207a64cd996b728ac7a34a13283cec3318f86e8756870b5",
+   "lead_seconds": 3600,
+   "settings_case": "legacy-lstm-history-one-day",
    "signal": {
     "autoscaler_uid": "pa-uid",
     "query_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -3510,6 +3510,21 @@
    "steps": 6
   },
   {
+   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"legacyLstm\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":1,\"horizon_seconds\":3600,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":600,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":32,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"coverage_tolerance_bps\":500,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"repromotion_hours\":24,\"repromotion_windows\":32,\"worst_day_min_outcomes\":24}}}",
+   "fingerprint": "3530c7c70d523d6e666578194eb6dd280a2164ffccecf5f4f51e769fc7ac3379",
+   "name": "legacy-lstm-history-one-day",
+   "prediction": {
+    "enabled": true,
+    "engine": "legacyLstm",
+    "historyDays": 1,
+    "horizonMinutes": 60,
+    "leadTimeMinutes": 15,
+    "sampleIntervalSeconds": 600,
+    "updateIntervalSeconds": 300
+   },
+   "steps": 6
+  },
+  {
    "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":25,\"max_miscoverage_bps\":2000,\"max_scores\":600,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":50,\"min_windows\":200,\"retention_days\":10,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":21,\"horizon_seconds\":2400,\"outcome_grace_seconds\":900,\"predictive_extra\":{\"max_percent\":25,\"max_replicas\":0},\"risk\":{\"miscoverage_bps\":500},\"sample_interval_seconds\":120,\"seasonality\":\"daily\",\"settlement_seconds\":90,\"trust\":{\"acute_consecutive_misses\":4,\"acute_recent_windows\":40,\"challenger_cost_ratio_bps\":10100,\"challenger_exit_loss_ratio_bps\":10500,\"challenger_loss_ratio_bps\":9000,\"challenger_min_hours\":60,\"challenger_min_pairs\":70,\"coverage_tolerance_bps\":300,\"max_fit_age_hours\":6,\"min_availability_bps\":9000,\"min_prospective_windows\":80,\"min_shadow_hours\":72,\"repromotion_hours\":12,\"repromotion_windows\":20,\"worst_day_min_outcomes\":30}}}",
    "fingerprint": "aac5b4f7e27d53c99e86be5e19a076045f7ab35e01445a1c4af7f7f3d666c201",
    "name": "everything",
@@ -3876,7 +3891,7 @@
     "leadTimeMinutes": 15,
     "updateIntervalSeconds": 300
    },
-   "refused": "historyDays must be at least 2: the calibration scale is fitted from residuals one day apart"
+   "refused": "historyDays must be at least 2 with engine statistical: the calibration scale is fitted from residuals one day apart"
   }
  ],
  "settings_schema": "forecast-settings/v1",

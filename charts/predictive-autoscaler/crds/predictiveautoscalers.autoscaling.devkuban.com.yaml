@@ -306,8 +306,9 @@ spec:
                     type: array
                     x-kubernetes-list-type: set
                   historyDays:
-                    description: HistoryDays is the history the models learn from
-                      (default 14).
+                    description: |-
+                      HistoryDays is the history the models learn from (default 14). Engine statistical needs at least 2 (its
+                      calibration scale is fitted from residuals one day apart); the legacy engine accepts 1.
                     format: int32
                     maximum: 28
                     minimum: 1
@@ -480,6 +481,11 @@ spec:
                     minimum: 60
                     type: integer
                 type: object
+                x-kubernetes-validations:
+                - message: historyDays must be at least 2 with engine statistical
+                    (the calibration scale is fitted from residuals one day apart)
+                  rule: '!has(self.engine) || self.engine != ''statistical'' || !has(self.historyDays)
+                    || self.historyDays >= 2'
               resources:
                 description: Resources configuration for replica calculation
                 properties:

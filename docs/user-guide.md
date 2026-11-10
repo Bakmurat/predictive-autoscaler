@@ -420,7 +420,7 @@ The upper bound is the point peak plus a calibrated multiple of a **scale** that
 `max(s_min, a + beta x peak)`, fitted once a day (at the first forecast of each UTC day) from how much the signal
 differed from the same time one day earlier at each load level, so the margin is wider at high load when the noise is.
 The fit needs samples one day apart for at least 80 % of a day, so about 1.8 days of history
-(`prediction.historyDays` below 2 is refused): a younger signal gets point forecasts without a bound. Each forecast
+(with engine `statistical`, `prediction.historyDays` below 2 is refused, at admission and by the forecaster): a younger signal gets point forecasts without a bound. Each forecast
 records the scale it was issued with.
 
 Its series (all listed here) carry `namespace`, `autoscaler` and `model` (`seasonal_naive`, `statistical` or `lstm`),

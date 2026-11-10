@@ -40,6 +40,7 @@ SETTINGS_CASES = [
     ("ten-minute-grid-50min", {"engine": "statistical", "sampleIntervalSeconds": 600, "horizonMinutes": 50}),
     ("eight-minute-grid-56min", {"engine": "statistical", "sampleIntervalSeconds": 480, "horizonMinutes": 56}),
     ("legacy-lstm", {"engine": "legacyLstm", "sampleIntervalSeconds": 600}),
+    ("legacy-lstm-history-one-day", {"engine": "legacyLstm", "sampleIntervalSeconds": 600, "historyDays": 1}),
     ("everything", {"engine": "statistical", "sampleIntervalSeconds": 120, "seasonality": "daily", "historyDays": 21,
                     "settlementSeconds": 90, "outcomeGraceSeconds": 900, "horizonMinutes": 40,
                     "risk": {"miscoverageBps": 500},

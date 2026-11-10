@@ -15,9 +15,12 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from evaluation import datasets as ds  # noqa: E402
+from evaluation import forecast_replay as replay_mod  # noqa: E402
 from evaluation.forecast_replay import (ReplayConfig, ReplayError, VisibleHistory, daily_naive, last_value,  # noqa: E402
                                         replay_keys, run_replay)
+from forecasting import calibration as cal  # noqa: E402
 from forecasting.clock import ManualClock, ReceiptClock  # noqa: E402
+from forecasting.contracts import canonical_json, sha256_hex  # noqa: E402
 from forecasting.store import ForecastStore  # noqa: E402
 
 ML_ENGINE = Path(__file__).resolve().parent.parent
@@ -128,6 +131,33 @@ def test_issuances_are_replay_labelled_and_bound_to_the_dataset(tmp_path):
     assert first["input_received_through_ms"] == (START + DAY - DT + 120) * 1000
     assert (r.evidence_key, r.settings_sha256) == replay_keys(d, config())
     assert replay_keys(d, config(lead=1200))[0] != r.evidence_key   # a lead change is a new epoch
+    assert first["calibration_baseline"] == replay_mod.REPLAY_CALIBRATION == "additive-baseline/declared-unit-scale/v1"
+
+
+def test_the_replay_identity_distinguishes_calibration_semantics(tmp_path, monkeypatch):
+    """The replay is an additive baseline (declared unit scale), and says so in its identity: the schema revision,
+    the calibration method and the scale are in the settings hash and the evidence key. State written under another
+    calibration meaning (the earlier forecast-replay/v1 identity, another method, another scale) has another key."""
+    d = make(tmp_path)
+    ek, settings = replay_keys(d, config())
+    ident = replay_mod.calibration_identity(config())
+    assert ident == {"baseline": "additive-baseline/declared-unit-scale/v1",
+                     "method": cal.CALIBRATION_POLICY_REVISION, "scale": cal.UNIT_SCALE.to_wire()}
+    # The identity of forecast-replay/v1, recomputed: no calibration semantics in it, and never equal to today's.
+    v1_settings = sha256_hex(canonical_json({"schema": "forecast-replay/v1", "config": dataclasses.asdict(config()),
+                                             "interval_seconds": d.interval_seconds}))
+    v1_key = sha256_hex(canonical_json({"schema": "forecast-replay/v1", "dataset": d.manifest_sha256,
+                                        "settings": v1_settings, "forecast_contract": replay_mod.FORECAST_CONTRACT}))
+    assert replay_mod.REPLAY_SCHEMA == "forecast-replay/v2" and (ek, settings) != (v1_key, v1_settings)
+    assert ek != v1_key and settings != v1_settings
+    # Another baseline revision, or another scale, is another identity.
+    monkeypatch.setattr(replay_mod, "REPLAY_CALIBRATION", "shared-scale-fit/v1")
+    assert replay_keys(d, config())[0] != ek
+    monkeypatch.undo()
+    monkeypatch.setattr(cal, "UNIT_SCALE", cal.Scale(2.0, 2.0, 0.0))
+    assert replay_keys(d, config())[0] != ek
+    monkeypatch.undo()
+    assert replay_keys(d, config()) == (ek, settings)
 
 
 # --- leakage: mutate all future values ----------------------------------------------------------------------------

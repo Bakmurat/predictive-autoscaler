@@ -268,10 +268,17 @@ def test_the_method_is_in_the_fingerprint_and_the_evidence_key():
             c.resolve_settings({"spec": {"prediction": {"calibration": {key: 1}}}})
 
 
-def test_a_one_day_history_is_refused():
-    with pytest.raises(c.ContractRefused, match="historyDays must be at least 2"):
-        c.resolve_settings({"spec": {"prediction": {"historyDays": 1}}})
+def test_a_one_day_history_is_refused_for_the_statistical_engine_only():
+    """The scale fit needs residuals one day apart, so the statistical engine refuses historyDays 1; the legacy
+    engine has no such fit and keeps it. The CRD's admission rule and the operator's resolver decide the same
+    (k8s-operator: TestEnvtestV2HistoryDaysAdmissionMatchesResolver, and the shared settings fixtures)."""
+    for explicit in ({}, {"engine": "statistical"}):
+        with pytest.raises(c.ContractRefused, match="historyDays must be at least 2 with engine statistical"):
+            c.resolve_settings({"spec": {"prediction": {**explicit, "historyDays": 1}}})
     assert c.resolve_settings({"spec": {"prediction": {"historyDays": 2}}}).history_days == 2
+    legacy = c.resolve_settings({"spec": {"prediction": {"engine": "legacyLstm", "sampleIntervalSeconds": 600,
+                                                         "historyDays": 1}}})
+    assert (legacy.engine, legacy.history_days) == ("legacyLstm", 1)
 
 
 def test_a_peer_of_the_additive_method_gets_no_forecast(tmp_path):
@@ -465,6 +472,33 @@ def test_the_acceptance_declarations_are_fixed():
     assert acceptance.TERCILES["mixed"] == pytest.approx((18.3333, 50.6667), abs=1e-3)
     ci = acceptance.interval([0.90, 0.91, 0.89, 0.90])
     assert ci["mean"] == pytest.approx(0.90) and ci["lo"] < 0.90 < ci["hi"]
+    assert acceptance.interval([0.90, 0.91, 0.89, 0.90], ratio=True) == ci      # inside [0, 1]: unchanged
+
+
+def test_sparse_coverage_is_reported_with_counts_and_an_interval_inside_zero_to_one():
+    """A group that few replications have (windows with a zero forecast) is reported with its counts, and a coverage
+    interval never leaves [0, 1]: the plain t interval of three sparse replications does."""
+    sparse = [1.0, 1.0, 0.5]
+    plain, cut = acceptance.interval(sparse), acceptance.interval(sparse, ratio=True)
+    assert plain["hi"] > 1.0 and cut["hi"] == 1.0 and 0.0 <= cut["lo"] == plain["lo"]
+    assert acceptance.interval([0.0, 0.0, 0.4], ratio=True)["lo"] == 0.0
+    assert acceptance.interval([0.97], ratio=True) == {"mean": 0.97, "lo": 0.0, "hi": 1.0, "n": 1}
+    assert acceptance.interval([None, None], ratio=True) is None
+    rows = [{f"windows_{g}": 0, f"coverage_{g}": None} for g in acceptance.GROUPS]
+    rows = [dict(kv for r in rows for kv in r.items()) for _ in range(4)]
+    rows[0].update(windows_zero_forecast=2, coverage_zero_forecast=1.0)
+    rows[2].update(windows_zero_forecast=4, coverage_zero_forecast=0.5)
+    pooled = acceptance.pooled_counts(rows)
+    assert pooled["zero_forecast"] == {"windows": 6, "covered": 4, "replications": 2}
+    assert pooled["low"] == {"windows": 0, "covered": 0, "replications": 0}
+    # The acceptance run carries the counts, and its table shows them for the zero-forecast windows.
+    doc = acceptance.run([101], configs=((60, 180, True),), models=("discrete_zero",), days=5, kernel="fast")
+    cell = next(c for c in doc["cells"] if c["method"] == "two_part")
+    z = cell["pooled"]["zero_forecast"]
+    assert doc["schema"] == "calibration-acceptance/v2" and z["windows"] > 0 and 0 <= z["covered"] <= z["windows"]
+    s = cell["summary"]["coverage_zero_forecast"]
+    assert 0.0 <= s["lo"] <= s["mean"] <= s["hi"] <= 1.0
+    assert f"{z['covered']} / {z['windows']} windows in 1 replications" in acceptance.table(doc)
     assert acceptance.reading({"mean": 0.90, "lo": 0.89, "hi": 0.91, "n": 4}, 0.02) == "MET"
     assert acceptance.reading({"mean": 0.90, "lo": 0.87, "hi": 0.93, "n": 4}, 0.02) == "INCONCLUSIVE"
     assert acceptance.reading({"mean": 0.86, "lo": 0.85, "hi": 0.87, "n": 4}, 0.02) == "NOT MET"

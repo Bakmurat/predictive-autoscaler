@@ -302,8 +302,10 @@ func (s v2Settings) feasible() error {
 			"exceeds the sample count")
 	case c[v2CalRetentionDays]*86400/s.HorizonSeconds < c[v2CalMinWindows]:
 		return fmt.Errorf("calibration.retentionDays cannot hold minWindows nonoverlapping windows at this horizon")
-	case s.HistoryDays < 2:
-		return fmt.Errorf("historyDays must be at least 2: the calibration scale is fitted from residuals one day apart")
+	case s.Engine == autoscalerv1alpha1.EngineStatistical && s.HistoryDays < 2:
+		// The legacy engine fits no scale and keeps its one-day minimum (the CRD's rule on spec.prediction agrees).
+		return fmt.Errorf("historyDays must be at least 2 with engine statistical: the calibration scale is fitted " +
+			"from residuals one day apart")
 	case s.Trust[v2TrustAcuteRecentWindows] > c[v2CalMaxScores] || s.Trust[v2TrustMinProspectiveWindows] > c[v2CalMaxScores]:
 		return fmt.Errorf("trust window counts exceed the calibration buffer")
 	case s.Trust[v2TrustChallengerExitLossRatio] < s.Trust[v2TrustChallengerLossRatio]:

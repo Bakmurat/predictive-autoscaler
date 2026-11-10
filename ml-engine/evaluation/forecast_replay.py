@@ -23,6 +23,14 @@ The forecasters here (last_value, daily_naive) are simple stand-ins with fixed r
 forecasting.statistical). Each issuance carries the window bound from forecasting.calibration, computed at issue time
 from the cohort scores that had matured by then (null until enough exist); each outcome is folded into the
 calibration state exactly once, through the journal, so the level moves only for bounds actually issued.
+
+Calibration semantics of a replay (REPLAY_CALIBRATION). The replay is an ADDITIVE BASELINE: it declares the unit scale
+(sigma = 1 RPS at every level, so the score is Y - b in RPS) instead of fitting the service's two-part scale
+(forecasting.calibration.fit_scale needs the service's history reader and its daily refit, which the skeleton does not
+reproduce). That choice is part of the replay's identity: the schema revision, the calibration method and the declared
+scale are hashed into the settings hash and so into the evidence key (replay_keys), and every bundle records the
+baseline. A journal or checkpoint written under another calibration meaning (forecast-replay/v1 kept the raw additive
+score with no scale in its identity) therefore belongs to another key and can never be resumed or read as this one.
 """
 
 from __future__ import annotations
@@ -40,7 +48,9 @@ from forecasting.history import watermark
 from forecasting.maturation import issued_outcome
 from forecasting.store import ForecastStore, IssuanceKey, Outcome
 
-REPLAY_SCHEMA = "forecast-replay/v1"
+REPLAY_SCHEMA = "forecast-replay/v2"
+# What the replay's scores mean (module docstring). A replay that fits the shared scale would be another revision.
+REPLAY_CALIBRATION = "additive-baseline/declared-unit-scale/v1"
 ISSUANCE_SCHEMA = "forecast-issuance/v1"
 DAY = 86400
 
@@ -171,6 +181,7 @@ def _issue(store: ForecastStore, ek: str, settings_sha: str, dataset: Dataset, c
                 "sample_interval_seconds": view.interval, "point_rps": points, "base_window_max_rps": base,
                 "upper_window_max_rps": upper, "nominal_miscoverage_bps": config.miscoverage_bps,
                 "calibration": {**info, "in_cohort": cal.in_cohort(t, config.lead_seconds)},
+                "calibration_baseline": REPLAY_CALIBRATION,
                 "issued_at_ms": view.now_ms, "input_end": input_end, "input_received_through_ms": through}
     _, created = store.get_or_issue(key, build, models=(config.model_family,))
     return int(created)
@@ -202,10 +213,18 @@ def fold(state: dict, o: Outcome, issuance, policy: cal.CalibrationPolicy) -> di
     return s
 
 
+def calibration_identity(config: ReplayConfig) -> dict:
+    """What a replay's scores mean: the baseline revision, the calibration method and the scale every bundle uses."""
+    return {"baseline": REPLAY_CALIBRATION, "method": config.policy().method, "scale": cal.UNIT_SCALE.to_wire()}
+
+
 def replay_keys(dataset: Dataset, config: ReplayConfig) -> Tuple[str, str]:
-    """(evidence key, settings hash) of a replay: bound to the dataset digest and every replay parameter."""
+    """(evidence key, settings hash) of a replay: bound to the dataset digest, every replay parameter and the
+    calibration semantics (the method revision and the declared scale), so state of another calibration meaning is
+    never reused."""
     settings = sha256_hex(canonical_json({"schema": REPLAY_SCHEMA, "config": asdict(config),
-                                          "interval_seconds": dataset.interval_seconds}))
+                                          "interval_seconds": dataset.interval_seconds,
+                                          "calibration": calibration_identity(config)}))
     evidence = sha256_hex(canonical_json({"schema": REPLAY_SCHEMA, "dataset": dataset.manifest_sha256,
                                           "settings": settings, "forecast_contract": FORECAST_CONTRACT}))
     return evidence, settings

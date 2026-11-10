@@ -343,10 +343,11 @@ def _check_feasible(s: ForecastSettings) -> None:
     # The nonoverlap cohort has one window per lead L <= horizon; retention must be able to hold minWindows of them.
     if (c.retention_days * 86400) // s.horizon_seconds < c.min_windows:
         raise ContractRefused("calibration.retentionDays cannot hold minWindows nonoverlapping windows at this horizon")
-    # The scale is fitted from residuals one season apart: a one-day history never holds such a pair.
-    if s.history_days < 2:
-        raise ContractRefused("historyDays must be at least 2: the calibration scale is fitted from residuals one "
-                              "day apart")
+    # The scale is fitted from residuals one season apart: a one-day history never holds such a pair. The legacy
+    # engine has no such fit and keeps its one-day minimum (the CRD's rule and the operator's resolver say the same).
+    if s.engine == "statistical" and s.history_days < 2:
+        raise ContractRefused("historyDays must be at least 2 with engine statistical: the calibration scale is "
+                              "fitted from residuals one day apart")
     t = s.trust
     if t.acute_recent_windows > c.max_scores or t.min_prospective_windows > c.max_scores:
         raise ContractRefused("trust window counts exceed the calibration buffer")

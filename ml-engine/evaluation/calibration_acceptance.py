@@ -355,16 +355,37 @@ def t975(df: int) -> float:
     return _T975[max(below)] if below else float("inf")       # fewer degrees of freedom: the wider (safe) quantile
 
 
-def interval(values: Sequence[Optional[float]]) -> Optional[Dict[str, float]]:
-    """Mean over replications with its 95 % t interval; None when no replication has the statistic."""
+def interval(values: Sequence[Optional[float]], *, ratio: bool = False) -> Optional[Dict[str, float]]:
+    """Mean over replications with its 95 % t interval; None when no replication has the statistic. n is the number
+    of replications that have it. With ratio=True the statistic is a share (a coverage): its interval is cut to
+    [0, 1], which a t interval of few or sparse replications otherwise leaves (a single replication gives [0, 1])."""
     v = [x for x in values if x is not None]
     if not v:
         return None
     n, mean = len(v), sum(v) / len(v)
-    if n < 2:
-        return {"mean": mean, "lo": -math.inf, "hi": math.inf, "n": n}
-    half = t975(n - 1) * math.sqrt(sum((x - mean) ** 2 for x in v) / (n - 1) / n)
-    return {"mean": mean, "lo": mean - half, "hi": mean + half, "n": n}
+    lo, hi = -math.inf, math.inf
+    if n >= 2:
+        half = t975(n - 1) * math.sqrt(sum((x - mean) ** 2 for x in v) / (n - 1) / n)
+        lo, hi = mean - half, mean + half
+    if ratio:
+        lo, hi = max(0.0, lo), min(1.0, hi)
+    return {"mean": mean, "lo": lo, "hi": hi, "n": n}
+
+
+GROUPS = ("low", "mid", "high", "ramp", "plateau", "near_zero", "zero_forecast")
+RATIO_STATS = ("coverage",) + tuple(f"coverage_{g}" for g in GROUPS) + ("unbounded_share",)
+
+
+def pooled_counts(rows: Sequence[Dict[str, Optional[float]]]) -> Dict[str, Dict[str, int]]:
+    """Per group, over all replications: the windows, the covered ones, and the replications that have any. A sparse
+    group (zero forecasts in a few replications only) is read from these counts, not from a mean alone."""
+    out = {}
+    for g in GROUPS:
+        have = [r for r in rows if r.get(f"windows_{g}")]
+        out[g] = {"windows": sum(r[f"windows_{g}"] for r in have),
+                  "covered": sum(int(round(r[f"coverage_{g}"] * r[f"windows_{g}"])) for r in have),
+                  "replications": len(have)}
+    return out
 
 
 def reading(ci: Optional[Dict[str, float]], tolerance: float) -> str:
@@ -403,7 +424,7 @@ def run(seeds: Sequence[int], configs: Sequence[Tuple[int, int, bool]] = CONFIGS
                 if progress:
                     progress(name, grid, lead, seed)
             for method, rows in reps.items():
-                summary = {s: interval([r.get(s) for r in rows]) for s in STATS}
+                summary = {s: interval([r.get(s) for r in rows], ratio=s in RATIO_STATS) for s in STATS}
                 verdicts = {"marginal": reading(summary["coverage"], MARGINAL_TOLERANCE)}
                 for g in ("low", "mid", "high"):
                     verdicts[f"tercile_{g}"] = reading(summary[f"coverage_{g}"], TERCILE_TOLERANCE)
@@ -411,8 +432,9 @@ def run(seeds: Sequence[int], configs: Sequence[Tuple[int, int, bool]] = CONFIGS
                     verdicts[g] = reading(summary[f"coverage_{g}"], TERCILE_TOLERANCE)
                 cells.append({"model": name, "criterion": model.criterion and criterion, "grid": grid, "lead": lead,
                               "method": method, "kernel": kern, "replications": rows, "summary": summary,
-                              "verdicts": verdicts, "windows": sum(r["windows"] for r in rows)})
-    doc = {"schema": "calibration-acceptance/v1", "calibration_method": cal.CALIBRATION_POLICY_REVISION,
+                              "verdicts": verdicts, "windows": sum(r["windows"] for r in rows),
+                              "pooled": pooled_counts(rows)})
+    doc = {"schema": "calibration-acceptance/v2", "calibration_method": cal.CALIBRATION_POLICY_REVISION,
            "seeds": list(seeds), "configs": [list(c) for c in configs], "days": days,
            "measure_from_day": MEASURE_FROM_DAY, "nominal_bps": NOMINAL_BPS, "kernel": kernel, "terciles": TERCILES,
            "tolerances": {"marginal": MARGINAL_TOLERANCE, "tercile": TERCILE_TOLERANCE}, "cells": cells}
@@ -426,17 +448,28 @@ def _fmt(ci: Optional[Dict[str, float]], scale: float = 100.0, digits: int = 1) 
     return f"{ci['mean'] * scale:.{digits}f} [{ci['lo'] * scale:.{digits}f}, {ci['hi'] * scale:.{digits}f}]"
 
 
+def _counts(c: dict, group: str) -> str:
+    """A sparse group with its counts: mean coverage [95 %, within 0..100], covered / windows, replications."""
+    p = c.get("pooled", {}).get(group)
+    if not p or not p["windows"]:
+        return "no window"
+    return (f"{_fmt(c['summary'][f'coverage_{group}'])}; {p['covered']} / {p['windows']} windows in "
+            f"{p['replications']} replications")
+
+
 def table(doc: dict) -> str:
-    """The acceptance table as Markdown: coverage in percent with its 95 % interval; pinball and width in RPS."""
+    """The acceptance table as Markdown: coverage in percent with its 95 % interval (never outside 0..100); the
+    zero-forecast windows with their counts; pinball and width in RPS."""
     head = ("| Model | Grid / lead | Method | Marginal | Low tercile | Mid tercile | High tercile | Ramp | Plateau | "
-            "Near zero | Pinball (RPS) | Width (RPS) | Criteria |")
-    out = [head, "|" + "---|" * 13]
+            "Near zero | Zero forecast | Pinball (RPS) | Width (RPS) | Criteria |")
+    out = [head, "|" + "---|" * 14]
     for c in doc["cells"]:
         s, v = c["summary"], c["verdicts"]
         crit = ", ".join(f"{k} {v[k]}" for k in ("marginal", "tercile_low", "tercile_mid", "tercile_high"))
         out.append(f"| {c['model']} | {c['grid']} / {c['lead']} s | {c['method']} | {_fmt(s['coverage'])} | "
                    f"{_fmt(s['coverage_low'])} | {_fmt(s['coverage_mid'])} | {_fmt(s['coverage_high'])} | "
                    f"{_fmt(s['coverage_ramp'])} | {_fmt(s['coverage_plateau'])} | {_fmt(s['coverage_near_zero'])} | "
+                   f"{_counts(c, 'zero_forecast')} | "
                    f"{_fmt(s['pinball_rps'], 1.0, 4)} | {_fmt(s['width_rps'], 1.0, 3)} | "
                    f"{crit if c['criterion'] else 'reported separately'} |")
     return "\n".join(out)
