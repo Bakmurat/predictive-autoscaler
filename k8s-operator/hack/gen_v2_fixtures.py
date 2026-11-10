@@ -79,7 +79,15 @@ SETTINGS_CASES = [
                                                              "challengerExitLossRatioBps": 9000}}),
     ("history-too-long", {"engine": "statistical", "historyDays": 29}),
     ("settlement-too-long", {"engine": "statistical", "settlementSeconds": 901}),
+    ("history-one-day", {"engine": "statistical", "historyDays": 1}),
 ]
+
+# The identity of the calibration method BEFORE normalized-window-score/two-part-scale/v1 (the additive score Y - b),
+# frozen from the fixtures of commit 44f65cf: the fingerprint of the default statistical settings and the evidence key
+# of the fixture binding. An operator or a forecaster of that revision presents these; the current side must refuse.
+LEGACY_ADDITIVE = {"settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
+                   "evidence_key": "58daefce56ef9b2b7244d2d565538b5edc5ce0bf78d09cc9a51c882cc4478c00"}
+_ADDED_CALIBRATION_KEYS = ("method", "scale_bins", "scale_floor_bps", "scale_min_season_bps")
 
 SIGNAL = ResolvedSignal(namespace="shop", name="web", metric="requests", query="q", sha256=SHA, contract=CONTRACT,
                         autoscaler_uid="pa-uid", target_uid="dep-uid", generation=3)
@@ -120,6 +128,29 @@ def evidence_cases():
                                    "query_sha256": SIGNAL.sha256},
                         "evidence_key": c.evidence_key(SIGNAL, s, lead)})
     return out
+
+
+def legacy_identity():
+    """The frozen pre-change identity, re-derived: the current canonical settings and evidence-key body WITHOUT the
+    keys this method added hash to exactly the frozen values, so nothing else moved the identity."""
+    s = c.resolve_settings(pa_with({"engine": "statistical"}))
+    canon = s.canonical()
+    for k in _ADDED_CALIBRATION_KEYS:
+        canon["settings"]["calibration"].pop(k)
+    cal = dict(canon["settings"]["calibration"])
+    body = {"schema": c.EVIDENCE_SCHEMA, "autoscaler_uid": SIGNAL.autoscaler_uid, "target_uid": SIGNAL.target_uid,
+            "query_sha256": SIGNAL.sha256, "signal_contract": SIGNAL.contract,
+            "forecast_contract": c.FORECAST_CONTRACT, "interval_seconds": s.sample_interval_seconds,
+            "lead_seconds": 1200, "engine": s.engine, "seasonality": s.seasonality, "history_days": s.history_days,
+            "settlement_seconds": s.settlement_seconds, "outcome_grace_seconds": s.outcome_grace_seconds,
+            "risk": dataclasses.asdict(s.risk), "calibration": cal}
+    got = {"settings_sha256": c.sha256_hex(c.canonical_json(canon)),
+           "evidence_key": c.sha256_hex(c.canonical_json(body))}
+    if got != LEGACY_ADDITIVE:
+        raise SystemExit(f"the legacy additive identity no longer re-derives: {got}")
+    if s.fingerprint() == got["settings_sha256"] or c.evidence_key(SIGNAL, s, 1200) == got["evidence_key"]:
+        raise SystemExit("the calibration method does not change the settings fingerprint and the evidence key")
+    return {**LEGACY_ADDITIVE, "method": "additive-window-score (revision 1, unnamed)"}
 
 
 def lead_cases():
@@ -254,6 +285,9 @@ def response_cases():
         "other-settings": _mutate(wire, settings_sha256="f" * 64),
         "other-risk": _mutate(wire, nominal_miscoverage_bps=500),
         "other-epoch": _mutate(wire, calibration_epoch="0" * 64),
+        # A forecaster of the additive method answering this operator: its fingerprint, or its evidence epoch.
+        "legacy-additive-settings": _mutate(wire, settings_sha256=LEGACY_ADDITIVE["settings_sha256"]),
+        "legacy-additive-epoch": _mutate(wire, calibration_epoch=LEGACY_ADDITIVE["evidence_key"]),
     }
     # A different lead and origin must be internally coherent to reach the binding check.
     shifted = dataclasses.replace(r, decision_origin=ORIGIN + 300, window_start=ORIGIN + 300,
@@ -287,6 +321,7 @@ def generate() -> str:
     doc = {"generated_by": "k8s-operator/hack/gen_v2_fixtures.py from ml-engine/forecasting/contracts.py",
            "forecast_contract": c.FORECAST_CONTRACT, "settings_schema": c.SETTINGS_SCHEMA,
            "evidence_schema": c.EVIDENCE_SCHEMA, "unit": c.UNIT, "allowed_intervals": list(c.ALLOWED_INTERVALS),
+           "calibration_method": c.CALIBRATION_POLICY_REVISION, "legacy_additive": legacy_identity(),
            "phases": list(c.PHASES), "reasons": list(c.REASONS), "model_families": list(c.MODEL_FAMILIES),
            "settings": settings_cases(), "evidence": evidence_cases(), "lead": lead_cases(),
            "responses": response_cases()}

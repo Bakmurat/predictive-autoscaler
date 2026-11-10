@@ -36,6 +36,11 @@ from api.identity import API_GROUP, API_VERSION, CONTRACT as SIGNAL_CONTRACT, Ku
 FORECAST_CONTRACT = "window-max-rps/v1"
 SETTINGS_SCHEMA = "forecast-settings/v1"
 EVIDENCE_SCHEMA = "forecast-evidence-key/v1"
+# The calibration-policy revision (the calibration method): part of the settings fingerprint AND of the evidence key
+# (through the calibration settings, as their field `method`), so a change of the score's meaning starts a new
+# evidence epoch on both sides and can never be read as the old one. Revision 1 (implicit, never named) was the
+# additive score Y - b in RPS. A stable name: other modules pin and compare it.
+CALIBRATION_POLICY_REVISION = "normalized-window-score/two-part-scale/v1"
 UNIT = "requests/second"
 
 # Minute multiples in 60..600 that divide a UTC day, so a one-day lag lands on the same epoch grid. 7- and 9-minute
@@ -141,6 +146,12 @@ class CalibrationSettings:
     eta_bps: int = 50                        # adaptive step 0.005
     min_miscoverage_bps: int = 100           # adaptive level bounds 0.01..0.25
     max_miscoverage_bps: int = 2500
+    # The method and the constants of its scale-fitting rule (forecasting.calibration). They are resolved, never read
+    # from the spec: an autoscaler cannot choose them, and changing one changes the fingerprint and the evidence key.
+    method: str = CALIBRATION_POLICY_REVISION
+    scale_bins: int = 8                      # equal-count level bins of the scale fit
+    scale_floor_bps: int = 500               # s_min = 5 % of the pooled residual scale
+    scale_min_season_bps: int = 8000         # the fit needs day-lag pairs for 80 % of one season
 
 
 @dataclass(frozen=True)
@@ -332,6 +343,10 @@ def _check_feasible(s: ForecastSettings) -> None:
     # The nonoverlap cohort has one window per lead L <= horizon; retention must be able to hold minWindows of them.
     if (c.retention_days * 86400) // s.horizon_seconds < c.min_windows:
         raise ContractRefused("calibration.retentionDays cannot hold minWindows nonoverlapping windows at this horizon")
+    # The scale is fitted from residuals one season apart: a one-day history never holds such a pair.
+    if s.history_days < 2:
+        raise ContractRefused("historyDays must be at least 2: the calibration scale is fitted from residuals one "
+                              "day apart")
     t = s.trust
     if t.acute_recent_windows > c.max_scores or t.min_prospective_windows > c.max_scores:
         raise ContractRefused("trust window counts exceed the calibration buffer")

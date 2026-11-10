@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -96,6 +97,11 @@ type v2Fixtures struct {
 			Why   string          `json:"why"`
 		} `json:"invalid"`
 	} `json:"responses"`
+	CalMethod      string `json:"calibration_method"`
+	LegacyAdditive struct {
+		SettingsSHA256 string `json:"settings_sha256"`
+		EvidenceKey    string `json:"evidence_key"`
+	} `json:"legacy_additive"`
 }
 
 func loadV2Fixtures(t *testing.T) *v2Fixtures {
@@ -147,6 +153,49 @@ func TestV2FixtureConstantsMatch(t *testing.T) {
 		if !reflect.DeepEqual(pair[0], pair[1]) {
 			t.Fatalf("enumeration differs from contracts.py: %v vs %v", pair[0], pair[1])
 		}
+	}
+}
+
+// The calibration method is part of the bound identity on both sides: the operator computes the same revision as
+// contracts.py, and the identity of the earlier additive method (frozen in the fixtures) is neither what this operator
+// sends nor something it accepts back, so an old/new operator-forecaster pair can never reach predictive eligibility.
+func TestV2CalibrationMethodIsPartOfTheBoundIdentity(t *testing.T) {
+	f := loadV2Fixtures(t)
+	if f.CalMethod != v2CalibrationPolicyRevision {
+		t.Fatalf("calibration method %q, contracts.py has %q", v2CalibrationPolicyRevision, f.CalMethod)
+	}
+	b := fixtureBinding(t, f)
+	legacy := f.LegacyAdditive
+	if !v2SHA256.MatchString(legacy.SettingsSHA256) || !v2SHA256.MatchString(legacy.EvidenceKey) {
+		t.Fatalf("the legacy identity is missing from the fixtures: %+v", legacy)
+	}
+	if b.SettingsSHA == legacy.SettingsSHA256 || b.request().SettingsSHA256 == legacy.SettingsSHA256 {
+		t.Fatal("the operator still sends the additive method's settings fingerprint")
+	}
+	if b.EvidenceKey == legacy.EvidenceKey {
+		t.Fatal("the operator still expects the additive method's evidence epoch")
+	}
+	canon, _ := v2CanonicalJSON(b.Settings.canonical())
+	if !strings.Contains(string(canon), `"method":"`+v2CalibrationPolicyRevision+`"`) {
+		t.Fatalf("the canonical settings do not name the calibration method: %s", canon)
+	}
+	refused := map[string]bool{}
+	for _, c := range f.Responses.Invalid {
+		if c.Name != "legacy-additive-settings" && c.Name != "legacy-additive-epoch" {
+			continue
+		}
+		r, err := decodeV2Response(c.Wire)
+		if err != nil {
+			t.Fatalf("%s: must reach the binding check: %v", c.Name, err)
+		}
+		// fetchV2 returns this error instead of the answer, so no verdict (and no predictive replica) is ever built.
+		if err := r.bound(b); !errors.Is(err, errV2Refused) {
+			t.Errorf("%s: an answer of the additive method was not refused: %v", c.Name, err)
+		}
+		refused[c.Name] = true
+	}
+	if len(refused) != 2 {
+		t.Fatalf("the legacy answers are missing from the fixtures: %v", refused)
 	}
 }
 

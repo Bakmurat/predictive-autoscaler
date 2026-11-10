@@ -158,7 +158,9 @@ def _issue(store: ForecastStore, ek: str, settings_sha: str, dataset: Dataset, c
     key = IssuanceKey(ek, t, t, targets[-1], settings_sha)
     input_end, through = view.latest(), view.received_through_ms()
     base = max(points)
-    upper, info = cal.upper_bound(state["calibration"], config.policy(), base, t)
+    # The offline replay DECLARES the additive unit scale (sigma = 1 RPS, the score Y - b) and records it in every
+    # bundle; it does not fit the service's two-part scale (forecasting.calibration.fit_scale).
+    upper, info = cal.upper_bound(state["calibration"], config.policy(), base, t, cal.UNIT_SCALE)
 
     def build(issuance_id: str) -> dict:
         return {"schema": ISSUANCE_SCHEMA, "evidence_mode": "replay", "forecast_contract": FORECAST_CONTRACT,

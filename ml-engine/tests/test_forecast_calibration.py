@@ -38,10 +38,13 @@ def policy(**kw):
     return CalibrationPolicy(**base)
 
 
-def rec(seq, y, base=0.0, upper=None, origin=None, status="scored", epoch=EPOCH):
+UNIT = cal.UNIT_SCALE            # sigma = 1 RPS: the additive score, so the hand-computed RPS figures below hold
+
+
+def rec(seq, y, base=0.0, upper=None, origin=None, status="scored", epoch=EPOCH, scale=UNIT):
     origin = seq * L if origin is None else origin
     return CalibrationRecord(seq, epoch, "m", "r", f"iss-{seq}", origin, origin + L, base, upper, status,
-                             y if status == "scored" else None)
+                             y if status == "scored" else None, scale)
 
 
 def seeded(scores, p=None, **kw):
@@ -61,32 +64,32 @@ NOW = 200 * L                    # every seeded window has ended and is within t
 def test_hand_computed_positive_and_negative_residuals():
     scores = [-3.0, -1.0, 0.5, 2.0, 4.0, -2.0, 1.0, 3.0, -0.5]           # sorted: -3 -2 -1 -0.5 0.5 1 2 3 4
     s, p = seeded(scores)
-    u, info = cal.upper_bound(s, p, 10.0, NOW)                          # a = 0.10: k = ceil(10 x 0.9) = 9
-    assert (info["n"], info["rank"], info["quantile_rps"], u) == (9, 9, 4.0, 14.0)
+    u, info = cal.upper_bound(s, p, 10.0, NOW, UNIT)                          # a = 0.10: k = ceil(10 x 0.9) = 9
+    assert (info["n"], info["rank"], info["quantile"], u) == (9, 9, 4.0, 14.0)
     s2, p2 = seeded(scores, nominal_bps=2000)                           # a = 0.20: k = ceil(10 x 0.8) = 8
-    u2, info2 = cal.upper_bound(s2, p2, 10.0, NOW)
-    assert (info2["rank"], info2["quantile_rps"], u2) == (8, 3.0, 13.0)
+    u2, info2 = cal.upper_bound(s2, p2, 10.0, NOW, UNIT)
+    assert (info2["rank"], info2["quantile"], u2) == (8, 3.0, 13.0)
     s3, p3 = seeded([-5.0, -4.0, -3.0, -2.0, -1.0], nominal_bps=2500)   # a = 0.25: k = ceil(6 x 0.75) = 5
-    u3, info3 = cal.upper_bound(s3, p3, 3.0, NOW)
-    assert (info3["quantile_rps"], u3) == (-1.0, 2.0)                    # a negative quantile lowers the bound
-    assert cal.upper_bound(s3, p3, 0.5, NOW)[0] == 0.0                   # ... clipped at zero demand, never below
+    u3, info3 = cal.upper_bound(s3, p3, 3.0, NOW, UNIT)
+    assert (info3["quantile"], u3) == (-1.0, 2.0)                    # a negative quantile lowers the bound
+    assert cal.upper_bound(s3, p3, 0.5, NOW, UNIT)[0] == 0.0                   # ... clipped at zero demand, never below
 
 
 def test_ties_are_values_not_positions():
     scores = [1.0, 3.0, 1.0, 2.0, 1.0, 3.0, 1.0, 3.0]                   # sorted: 1 1 1 1 2 3 3 3
     for order in (scores, sorted(scores), sorted(scores, reverse=True)):
         s, p = seeded(order, nominal_bps=2500)                           # k = ceil(9 x 0.75) = 7 -> 3
-        assert cal.upper_bound(s, p, 0.0, NOW)[1]["quantile_rps"] == 3.0
+        assert cal.upper_bound(s, p, 0.0, NOW, UNIT)[1]["quantile"] == 3.0
     s, p = seeded([2.0] * 6, nominal_bps=2500)
-    assert cal.upper_bound(s, p, 1.0, NOW)[0] == 3.0
+    assert cal.upper_bound(s, p, 1.0, NOW, UNIT)[0] == 3.0
 
 
 def test_rank_overflow_gives_no_bound():
     s, p = seeded([float(i) for i in range(9)], nominal_bps=500, min_bps=100)   # k = ceil(10 x 0.95) = 10 > 9
-    u, info = cal.upper_bound(s, p, 1.0, NOW)
+    u, info = cal.upper_bound(s, p, 1.0, NOW, UNIT)
     assert u is None and info["unavailable"] == "RankOverflow" and info["rank"] == 10
     s, p = seeded([float(i) for i in range(19)], nominal_bps=500, min_bps=100)  # k = ceil(20 x 0.95) = 19
-    assert cal.upper_bound(s, p, 1.0, NOW)[0] == 19.0
+    assert cal.upper_bound(s, p, 1.0, NOW, UNIT)[0] == 19.0
     assert cal.rank(128, 1_000_000) == 128 and cal.rank(128, 500_000) == 129    # a = 0.01 fits 128; 0.005 does not
 
 
@@ -95,14 +98,14 @@ def test_cold_start_seeds_scores_but_claims_nothing():
     s = cal.initial(p, EPOCH, "m", "r")
     for i in range(1, 5):
         s = cal.apply(s, rec(i, y=2.0, base=1.0), p)                     # issued without a bound
-        assert cal.upper_bound(s, p, 1.0, NOW) == (None, {"n": i, "rank": cal.rank(i, s["a_e8"]),
-                                                           "working_miscoverage": 0.1,
+        assert cal.upper_bound(s, p, 1.0, NOW, UNIT) == (None, {"n": i, "rank": cal.rank(i, s["a_e8"]),
+                                                           "working_miscoverage": 0.1, "scale": UNIT.to_wire(),
                                                            "unavailable": "CalibrationInsufficient"})
     assert s["level_updates"] == 0 and s["a_e8"] == 10_000_000 and cal.coverage(s)["ratio"] is None
     s = cal.apply(s, rec(5, y=2.0, base=1.0), p)
-    assert cal.upper_bound(s, p, 1.0, NOW)[0] is None                    # k = ceil(6 x 0.9) = 6 > 5: overflow
+    assert cal.upper_bound(s, p, 1.0, NOW, UNIT)[0] is None                    # k = ceil(6 x 0.9) = 6 > 5: overflow
     s25, p25 = seeded([1.0] * 6, min_windows=5, nominal_bps=2500)       # k = ceil(7 x 0.75) = 6 <= 6
-    assert cal.upper_bound(s25, p25, 1.0, NOW)[0] == 2.0
+    assert cal.upper_bound(s25, p25, 1.0, NOW, UNIT)[0] == 2.0
 
 
 # --- the adaptive level -------------------------------------------------------------------------------------------
@@ -152,11 +155,11 @@ def test_delayed_outcomes_apply_when_they_mature_and_never_rewrite_issued_bounds
     s = cal.apply(s, rec(1, y=1.0, base=0.0, origin=1 * L), p)
     s = cal.apply(s, rec(2, y=3.0, base=0.0, origin=3 * L), p)
     s = cal.apply(s, rec(3, y=2.0, base=0.0, origin=5 * L), p)
-    issued_before, _ = cal.upper_bound(s, p, 0.0, NOW)                                # k = ceil(4 x 0.75) = 3
+    issued_before, _ = cal.upper_bound(s, p, 0.0, NOW, UNIT)                                # k = ceil(4 x 0.75) = 3
     late = cal.apply(s, rec(4, y=9.0, base=0.0, origin=2 * L), p)                    # matured late, older window
     assert [x[0] for x in late["scores"]] == [2 * L, 3 * L, 4 * L, 6 * L]           # in window-end place
     assert issued_before == 3.0                                                      # the earlier bound stays
-    assert cal.upper_bound(late, p, 0.0, NOW)[0] == 9.0                              # k = ceil(5 x 0.75) = 4
+    assert cal.upper_bound(late, p, 0.0, NOW, UNIT)[0] == 9.0                              # k = ceil(5 x 0.75) = 4
     # Scores leave the buffer by window end: older than the retention before now (or than the newest window).
     assert cal.buffered_scores(late, p, 4 * L + 7 * 86400 - 1) == [3.0, 2.0]        # windows ending 4L and 6L
     stale = cal.apply(late, rec(5, y=1.0, base=0.0, origin=6 * L + 8 * 86400), p)
@@ -193,7 +196,8 @@ def journal_pair(upper=4.0, scored_upper=None, extra=None, status="scored", y=5.
     targets = [origin + L]
     bundle = {"decision_origin": origin, "target_timestamps": targets, "sample_interval_seconds": L,
               "model_family": "m", "model_recipe": "r", "point_rps": [1.0],
-              "base_window_max_rps": 1.0, "upper_window_max_rps": upper, **(extra or {})}
+              "base_window_max_rps": 1.0, "upper_window_max_rps": upper, "calibration": {"scale": UNIT.to_wire()},
+              **(extra or {})}
     data = c.canonical_json(bundle)
     key = IssuanceKey(EPOCH, origin, origin, origin + L, "5" * 64)
     iss = Issuance(1, "iss-1", key, data, c.sha256_hex(data), ("m",), 0)
@@ -210,7 +214,7 @@ def test_records_come_only_from_an_issuance_and_its_matured_outcome():
     assert (r.seq, r.base_rps, r.upper_rps, r.y_rps, r.decision_origin) == (7, 1.0, 4.0, 5.0, 100 * L)
     assert set(CalibrationRecord.__dataclass_fields__) == {"seq", "epoch", "model", "recipe", "issuance_id",
                                                            "decision_origin", "window_end", "base_rps", "upper_rps",
-                                                           "status", "y_rps"}
+                                                           "status", "y_rps", "scale"}
     other = dataclasses.replace(out, issuance_id="iss-2")
     with pytest.raises(CalibrationError):
         CalibrationRecord.from_journal(iss, other)
@@ -258,11 +262,11 @@ def simulate(eta_bps, shift_at, n=3000, phi=0.8, shift=3.0, seed=1, measure_from
             s = cal.apply(s, pending, p)
         z = phi * z + rng.gauss(0, 1)
         y = z + (shift if i >= shift_at else 0.0) + 10.0
-        u, _ = cal.upper_bound(s, p, 10.0, t)
+        u, _ = cal.upper_bound(s, p, 10.0, t, UNIT)
         if u is not None and i > measure_from:
             total += 1
             hits += int(y <= u)
-        pending = CalibrationRecord(i, EPOCH, "m", "r", f"iss-{i}", t - L, t, 10.0, u, "scored", y)
+        pending = CalibrationRecord(i, EPOCH, "m", "r", f"iss-{i}", t - L, t, 10.0, u, "scored", y, UNIT)
     return hits / total, s
 
 
@@ -371,7 +375,8 @@ def two_model_pair(i, y, uppers, seq0):
     """An issuance with two candidates on the same window, and each model's outcome matured from the bundle."""
     origin = i * L
     targets = [origin + L]
-    cands = {m: {"recipe": f"{m}/v1", "point_rps": [1.0], "base_window_max_rps": 1.0, "upper_window_max_rps": u}
+    cands = {m: {"recipe": f"{m}/v1", "point_rps": [1.0], "base_window_max_rps": 1.0, "upper_window_max_rps": u,
+                 "calibration": {"scale": UNIT.to_wire()}}
              for m, u in zip(TWO, uppers)}
     bundle = {"decision_origin": origin, "target_timestamps": targets, "sample_interval_seconds": L,
               "candidates": cands}
@@ -402,7 +407,7 @@ def test_two_models_never_pool_their_windows():
             with pytest.raises(CalibrationError):                 # never across models
                 cal.apply(states[other], r, p)
     for m in TWO:
-        assert len(states[m]["scores"]) == 64 and cal.upper_bound(states[m], p, 1.0, 100 * L)[0] is None
+        assert len(states[m]["scores"]) == 64 and cal.upper_bound(states[m], p, 1.0, 100 * L, UNIT)[0] is None
 
 
 def test_each_model_has_its_own_level_and_bound():
@@ -445,7 +450,7 @@ def grid_pair(scored_targets, truth=(100.0, 1.0), upper=4.0):
     targets = [origin + L, origin + 2 * L]
     bundle = {"decision_origin": origin, "target_timestamps": targets, "sample_interval_seconds": L,
               "model_family": "m", "model_recipe": "r", "point_rps": [1.0, 1.0], "base_window_max_rps": 1.0,
-              "upper_window_max_rps": upper}
+              "upper_window_max_rps": upper, "calibration": {"scale": UNIT.to_wire()}}
     data = c.canonical_json(bundle)
     iss = Issuance(1, "iss-1", IssuanceKey(EPOCH, origin, origin, origin + 2 * L, "5" * 64), data, c.sha256_hex(data),
                    ("m",), 0)
