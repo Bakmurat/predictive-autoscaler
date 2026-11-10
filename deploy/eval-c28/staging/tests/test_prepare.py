@@ -344,21 +344,27 @@ TOKEN = "anon-token-value-never-recorded"
 class FakeRegistry:
     """fetch(method, url, headers): a v2 registry that challenges with Bearer and hands out anonymous tokens."""
 
-    def __init__(self, manifest_status=200, challenge=True, token_status=200, served=None):
+    def __init__(self, manifest_status=200, challenge=True, token_status=200, served=None, token=TOKEN):
         self.manifest_status, self.challenge, self.token_status = manifest_status, challenge, token_status
-        self.served = served or {}
+        self.served = served or {}          # digest -> the Docker-Content-Digest served (None: no header)
+        self.token = token
         self.calls = []
 
     def __call__(self, method, url, headers):
         self.calls.append((method, url, dict(headers)))
         if url.startswith("https://harbor.example/service/token"):
-            return self.token_status, {}, json.dumps({"token": TOKEN}).encode() if self.token_status == 200 else b""
+            body = json.dumps({"token": self.token}).encode() if self.token_status == 200 else b""
+            return self.token_status, {}, body
         assert method == "HEAD" and "/v2/autoscaler/" in url and "/manifests/sha256:" in url, url
-        if self.challenge and headers.get("Authorization") != f"Bearer {TOKEN}":
+        auth = headers.get("Authorization")
+        if auth is not None and "\n" in auth:      # what http.client does: the message quotes the header value
+            raise ValueError(f"Invalid header value {auth.encode()!r}")
+        if self.challenge and auth != f"Bearer {self.token}":
             return 401, {"www-authenticate": 'Bearer realm="https://harbor.example/service/token",'
                                              'service="harbor-registry",scope="repository:autoscaler/x:pull"'}, b""
         dig = url.rsplit("/", 1)[1]
-        return self.manifest_status, {"docker-content-digest": self.served.get(dig, dig)}, b""
+        served = self.served.get(dig, dig)
+        return self.manifest_status, ({"Docker-Content-Digest": served} if served else {}), b""
 
 
 def anonymous_section():
@@ -375,8 +381,9 @@ def test_anonymous_pull_renders_no_pull_secret_and_records_each_check(api, make_
     assert p["values"]["images"]["pullSecrets"] == []
     checks = p["image_pull"]["verification"]
     assert p["image_pull"]["mode"] == "anonymous"
-    assert [(c["image"], c["digest"], c["status"], c["anonymous_challenge"]) for c in checks] == [
-        (OP_IMAGE, "sha256:" + "b" * 64, 200, True), (ST_IMAGE, "sha256:" + "c" * 64, 200, True)]
+    assert [(c["image"], c["digest"], c["status"], c["anonymous_challenge"], c["digest_confirmed"], c["error"])
+            for c in checks] == [(OP_IMAGE, "sha256:" + "b" * 64, 200, True, True, ""),
+                                 (ST_IMAGE, "sha256:" + "c" * 64, 200, True, True, "")]
     assert checks[0]["url"] == "https://harbor.example/v2/autoscaler/operator/manifests/sha256:" + "b" * 64
     assert all(c["checked_at"].endswith("Z") for c in checks)
     for method, url, headers in reg.calls:              # no credentials ever: only Accept, or the anonymous token
@@ -397,17 +404,20 @@ def test_anonymous_pull_without_a_challenge_needs_no_token(api, make_record):
     assert all("Authorization" not in h for _, _, h in reg.calls)
 
 
-@pytest.mark.parametrize("reg, want", [
-    (lambda: FakeRegistry(token_status=401), "returned 401"),        # the project is private: no anonymous token
-    (lambda: FakeRegistry(manifest_status=401), "returned 401"),     # token issued, the pull still refused
-    (lambda: FakeRegistry(manifest_status=404), "returned 404"),     # the digest is not in the registry
-    (lambda: FakeRegistry(served={"sha256:" + "b" * 64: "sha256:" + "d" * 64}), "served digest sha256:dddd"),
+@pytest.mark.parametrize("reg, want, both", [
+    (lambda: FakeRegistry(token_status=401), "token-handshake-failed (HTTP 401)", True),   # private: no token
+    (lambda: FakeRegistry(manifest_status=401), "http-401 (HTTP 401)", True),   # token issued, the pull still refused
+    (lambda: FakeRegistry(manifest_status=404), "http-404 (HTTP 404)", True),   # the digest is not in the registry
+    (lambda: FakeRegistry(served={"sha256:" + "b" * 64: "sha256:" + "d" * 64}), "digest-mismatch (HTTP 200)", False),
+    (lambda: FakeRegistry(served={"sha256:" + "b" * 64: None}), "digest-missing (HTTP 200)", False),  # 200 alone: no
 ])
-def test_anonymous_pull_refusals_are_plan_problems(api, make_record, reg, want):
+def test_anonymous_pull_refusals_are_plan_problems(api, make_record, reg, want, both):
     record, kube = setup(api, make_record, anonymous_section())
     p = prepare.plan(record, kube, "values", fetch=reg())
-    assert any(x.startswith("anonymous pull: harbor.example/autoscaler/operator@") and want in x
-               for x in p["problems"]), p["problems"]
+    assert p["problems"] == [f"anonymous pull: {i}: {want}" for i in ((OP_IMAGE, ST_IMAGE) if both else (OP_IMAGE,))]
+    (op, st) = p["image_pull"]["verification"]
+    assert op["digest_confirmed"] is False and op["error"] == want.split(" ")[0]
+    assert st["digest_confirmed"] is not both and st["error"] == (op["error"] if both else "")
     saved = X.save_plan(record, "prepare", p, "plan-values")
     with pytest.raises(X.StagingError, match="problems"):
         prepare.apply(record, kube, "values", X.load_plan(saved["plan"]), saved["plan_digest"], fetch=reg())
@@ -420,7 +430,68 @@ def test_an_unreachable_registry_is_a_plan_problem(api, make_record):
     def down(method, url, headers):
         raise OSError("connection refused")
     p = prepare.plan(record, kube, "values", fetch=down)
-    assert sum("returned None (OSError: connection refused)" in x for x in p["problems"]) == 2
+    assert p["problems"] == [f"anonymous pull: {i}: network-error" for i in (OP_IMAGE, ST_IMAGE)]
+    assert "refused" not in json.dumps(p["image_pull"])            # the exception text is never recorded
+
+
+def test_a_bare_200_without_the_content_digest_is_not_a_confirmation(api, make_record):
+    """Codex PR #55: a stub returning (200, {}) passed. The digest must be confirmed by the registry's header."""
+    record, kube = setup(api, make_record, anonymous_section())
+    p = prepare.plan(record, kube, "values", fetch=lambda m, u, h: (200, {}, b""))
+    assert p["problems"] == [f"anonymous pull: {i}: digest-missing (HTTP 200)" for i in (OP_IMAGE, ST_IMAGE)]
+    ok = prepare.plan(record, kube, "values", fetch=lambda m, u, h: (200, {"docker-content-digest": u.rsplit("/", 1)[1]},
+                                                                      b""))
+    assert ok["problems"] == [] and all(c["digest_confirmed"] for c in ok["image_pull"]["verification"])
+
+
+EVIL = "LEAKME-anon-token\nX-Injected: LEAKME-anon-token"
+
+
+def _all_persisted(record):
+    out = []
+    for root, _, files in os.walk(record.evidence_dir):
+        for f in files:
+            with open(os.path.join(root, f), errors="replace") as fh:
+                out.append(fh.read())
+    return "\n".join(out)
+
+
+def test_a_token_with_a_newline_never_reaches_any_output(api, make_record, capsys, caplog):
+    """Codex PR #55: a token with a newline made the header validator raise with the token in its message, which was
+    persisted. The token is refused before use (not a b64token), and nothing it contains is recorded or printed."""
+    record, kube = setup(api, make_record, anonymous_section())
+    reg = FakeRegistry(token=EVIL)
+    p = prepare.plan(record, kube, "values", fetch=reg)
+    assert p["problems"] == [f"anonymous pull: {i}: token-handshake-failed (HTTP 401)" for i in (OP_IMAGE, ST_IMAGE)]
+    assert not any("Authorization" in h for _, _, h in reg.calls)       # never sent
+    assert prepare.main(["--record", record.path, "plan", "--phase", "values"], api=api,
+                        fetch=FakeRegistry(token=EVIL)) == 0
+    out = capsys.readouterr()
+    for text in (json.dumps(p), out.out, out.err, caplog.text, _all_persisted(record)):
+        assert "LEAKME" not in text
+
+
+def test_exception_text_quoting_the_token_is_never_recorded(api, make_record, capsys, caplog):
+    """The HTTP layer's own errors can quote the request's headers: only the category is kept."""
+    record, kube = setup(api, make_record, anonymous_section())
+
+    def quoting(method, url, headers):
+        if "Authorization" not in headers and "/service/token" not in url:
+            return 401, {"www-authenticate": 'Bearer realm="https://harbor.example/service/token"'}, b""
+        if "/service/token" in url:
+            return 200, {}, json.dumps({"token": "LEAKME.token"}).encode()
+        raise ValueError(f"Invalid header value {headers['Authorization']!r}")
+    p = prepare.plan(record, kube, "values", fetch=quoting)
+    assert p["problems"] == [f"anonymous pull: {i}: invalid-header" for i in (OP_IMAGE, ST_IMAGE)]
+    assert [c["error"] for c in p["image_pull"]["verification"]] == ["invalid-header"] * 2
+
+    def oserror(method, url, headers):
+        raise OSError(f"proxy said no to {headers}")
+    q = prepare.plan(record, kube, "values", fetch=oserror)
+    assert prepare.main(["--record", record.path, "plan", "--phase", "values"], api=api, fetch=quoting) == 0
+    out = capsys.readouterr()
+    for text in (json.dumps(p), json.dumps(q), out.out, out.err, caplog.text, _all_persisted(record)):
+        assert "LEAKME" not in text and "proxy said no" not in text and "Accept" not in text
 
 
 def test_anonymous_apply_checks_again_and_keeps_the_reviewed_plan(api, make_record):
@@ -482,6 +553,45 @@ def test_secret_mode_is_unchanged_and_never_fetches(api, make_record):
     assert p["problems"] == []
     assert p["values"]["images"]["pullSecrets"] == [{"name": "harbor-pull"}]
     assert p["image_pull"] == {"mode": "secret"}
+
+
+@pytest.mark.parametrize("rbac, ok", [({"scaleWrite": False}, True), ({"scaleWrite": True}, False), ({}, False),
+                                      (None, False), ({"scaleWrite": "false"}, False)])
+def test_the_overlay_must_withhold_scale_writes(api, make_record, rbac, ok):
+    record, kube = setup(api, make_record)
+    params, s = X.load_params(record), prepare._section(record)
+    v = prepare.staging_values(record, params, s)
+    assert v["operator"]["rbac"] == {"scaleWrite": False}
+    if rbac is None:
+        del v["operator"]["rbac"]
+    else:
+        v["operator"]["rbac"] = rbac
+    want = [] if ok else ["operator.rbac.scaleWrite must be false: a shadow preparation authorizes no replica write"]
+    assert prepare.values_problems(v, params) == want
+
+
+def test_the_actual_overlay_renders_no_scale_write(api, make_record, tmp_path):
+    """Codex PR #55: the generated overlay, rendered through the chart, must grant deployments/scale get only."""
+    import shutil
+    import subprocess
+    if not shutil.which("helm"):
+        if os.environ.get("CI"):
+            pytest.fail("helm is required in CI")
+        pytest.skip("helm not installed")
+    s = prepare_section()
+    s["release"]["network_policy"] = {"enabled": True, "prometheus": {"namespaceSelector": {
+        "matchLabels": {"kubernetes.io/metadata.name": "monitoring"}}}}
+    record, kube = setup(api, make_record, s)
+    run_phase(record, kube, "values")
+    overlay = os.path.join(record.evidence_dir, "release-staging.yaml")
+    chart = os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "charts", "predictive-autoscaler")
+    p = subprocess.run(["helm", "template", "pa-eval", chart, "-n", "pa-eval-system", "--kube-version", "1.35.0",
+                        "-f", overlay], capture_output=True, text=True, timeout=60,
+                       env={**os.environ, "KUBECONFIG": "/dev/null"})
+    assert p.returncode == 0, p.stderr
+    scale = [r for d in yaml.safe_load_all(p.stdout) if d and d["kind"] in ("ClusterRole", "Role")
+             for r in d.get("rules", []) if any(res.endswith("/scale") for res in r["resources"])]
+    assert scale == [{"apiGroups": ["apps"], "resources": ["deployments/scale"], "verbs": ["get"]}]
 
 
 def test_a_pa_not_in_recommend_is_refused_at_plan(api, make_record, monkeypatch):

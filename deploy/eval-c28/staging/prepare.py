@@ -11,8 +11,9 @@ Phases, in order (each a separate reviewed plan; nothing is applied as one unatt
               (its reclaimPolicy must be Retain); the chart then uses them as existingClaim
   values      the reviewed staging overlay for the evaluation release (a new local file, release-staging.yaml):
               digest-pinned images, statistical engine, no training, watched namespace only, one operator with the
-              ledger claim, retained state claim, S placement, auth and TLS on with the route's name in the certificate,
-              and NO lab qualification (labQualification.configMap "")
+              ledger claim and NO replica write (operator.rbac.scaleWrite false: deployments/scale get only),
+              retained state claim, S placement, auth and TLS on with the route's name in the certificate, and NO lab
+              qualification (labQualification.configMap "")
   common      the run-wide fixture objects (PriorityClass, scoped ResourceQuota, ingress, the two fault routes, their
               EMPTY fault schedules, route NetworkPolicies, the scrape object)
   targets     the ten target Deployments (fixed replicas), Services and EMPTY fault ConfigMaps; their UIDs are captured
@@ -40,7 +41,8 @@ read as anonymous. Secret mode references the Secret by name in images.pullSecre
 images.pullSecrets as [] and the values plan verifies every required image digest anonymously: a registry v2 manifest
 HEAD by digest (OCI and Docker manifest Accept headers, no credentials; a Bearer challenge is answered only with an
 anonymous token from the challenge's realm, which is never recorded). Each check (image, digest, URL, HTTP status,
-time) is recorded in the plan; any status but 200, or a Docker-Content-Digest that differs, is a plan problem, and apply
+time; failures only as fixed categories, never exception text or header values) is recorded in the plan; anything but
+HTTP 200 with a Docker-Content-Digest equal to the expected digest (missing or different) is a plan problem, and apply
 checks again. A manifest HEAD from the checker proves that the registry serves the manifest anonymously to THIS host
 only: the nodes' pulls (their network path, mirrors, containerd configuration) remain an installation check.
 """
@@ -142,58 +144,88 @@ def _bearer_challenge(value: str) -> Dict[str, str]:
     return {k.lower(): v for k, v in re.findall(r'(\w+)="([^"]*)"', rest)}
 
 
-def _anonymous_token(fetch: Fetch, challenge: Dict[str, str]) -> Optional[str]:
-    """An anonymous token from the challenge's realm (no Authorization header); None when the realm refuses one."""
+# The only error texts a check ever records: fixed categories, never exception text or header values (an exception
+# from the HTTP layer can quote the request's headers, the anonymous token included).
+PULL_ERRORS = ("network-error", "invalid-header", "token-handshake-failed", "digest-missing", "digest-mismatch")
+_B64TOKEN = re.compile(r"^[A-Za-z0-9._~+/-]+=*$")               # RFC 6750 b64token: no whitespace, no control bytes
+
+
+class _PullError(Exception):
+    def __init__(self, category: str):
+        super().__init__(category)
+        self.category = category
+
+
+def _call(fetch: Fetch, method: str, url: str, headers: Dict[str, str]) -> Tuple[int, Dict[str, str], bytes]:
+    """fetch, with every failure reduced to its category (the exception itself is dropped, never formatted)."""
+    try:
+        status, rh, body = fetch(method, url, headers)
+    except ValueError:
+        raise _PullError("invalid-header") from None
+    except Exception:                                          # noqa: BLE001 - URLError, timeouts, TLS, HTTP framing
+        raise _PullError("network-error") from None
+    return status, {str(k).lower(): v for k, v in (rh or {}).items()}, body or b""
+
+
+def _anonymous_token(fetch: Fetch, challenge: Dict[str, str]) -> str:
+    """An anonymous token from the challenge's https realm (no Authorization header). Anything else - no realm, a
+    refusal, a malformed answer, a token that is not a plain b64token - is token-handshake-failed."""
     realm = challenge.get("realm", "")
     if not realm.startswith("https://"):
-        return None
+        raise _PullError("token-handshake-failed")
     q = urllib.parse.urlencode({k: challenge[k] for k in ("service", "scope") if k in challenge})
-    status, _, body = fetch("GET", realm + ("&" if "?" in realm else "?") + q if q else realm, {})
-    if status != 200:
-        return None
     try:
-        doc = json.loads(body.decode() or "{}")
-    except ValueError:
-        return None
-    token = doc.get("token") or doc.get("access_token")
-    return token if isinstance(token, str) and token else None
+        status, _, body = _call(fetch, "GET", realm + ("&" if "?" in realm else "?") + q if q else realm, {})
+        doc = json.loads(body.decode() or "{}") if status == 200 else {}
+    except (_PullError, ValueError):
+        raise _PullError("token-handshake-failed") from None
+    token = doc.get("token") or doc.get("access_token") if isinstance(doc, dict) else None
+    if not isinstance(token, str) or not _B64TOKEN.match(token):
+        raise _PullError("token-handshake-failed")
+    return token
 
 
 def verify_anonymous_pull(images: List[str], fetch: Fetch, now: Callable[[], str] = X.utcnow) -> List[Dict]:
-    """One manifest HEAD by digest per image, without credentials; returns the checks (no token, no header values but
-    the content digest). Proves anonymous access from the checking host only (see the module docstring)."""
+    """One manifest HEAD by digest per image, without credentials. A check passes only with HTTP 200 AND a
+    Docker-Content-Digest equal to the expected digest. Each check records image, digest, URL, status, whether a Bearer
+    challenge was answered anonymously, whether the digest was confirmed, a fixed error category (PULL_ERRORS or
+    http-<status>; "" when it passed) and the time - never the token, a header value or exception text. Proves anonymous
+    access from the checking host only (see the module docstring)."""
     out = []
     for image in images:
         host, path, dig = _image_parts(image)
         url = f"https://{host}/v2/{path}/manifests/{dig}"
         headers = {"Accept": MANIFEST_ACCEPT}
-        answered = False
+        status, answered, error = None, False, ""
         try:
-            status, rh, _ = fetch("HEAD", url, headers)
+            status, rh, _ = _call(fetch, "HEAD", url, headers)
             if status == 401:
-                token = _anonymous_token(fetch, _bearer_challenge(rh.get("www-authenticate", "")))
-                if token is not None:
-                    answered = True
-                    status, rh, _ = fetch("HEAD", url, {**headers, "Authorization": f"Bearer {token}"})
-            error = ""
-        except (OSError, ValueError) as e:                     # URLError, timeouts, TLS: no status
-            status, rh, error = None, {}, f"{type(e).__name__}: {e}"
-        check = {"image": image, "digest": dig, "url": url, "status": status, "anonymous_challenge": answered,
-                 "content_digest": rh.get("docker-content-digest", ""), "checked_at": now()}
-        if error:
-            check["error"] = error
-        out.append(check)
+                challenge = _bearer_challenge(str(rh.get("www-authenticate", "")))
+                if challenge:
+                    token = _anonymous_token(fetch, challenge)
+                    answered, status = True, None             # a failed retry has no status of its own
+                    status, rh, _ = _call(fetch, "HEAD", url, {**headers, "Authorization": f"Bearer {token}"})
+            if status != 200:
+                raise _PullError(f"http-{int(status)}" if isinstance(status, int) else "network-error")
+            got = rh.get("docker-content-digest")
+            if not got:
+                raise _PullError("digest-missing")
+            if got != dig:
+                raise _PullError("digest-mismatch")
+        except _PullError as e:
+            error = e.category
+        out.append({"image": image, "digest": dig, "url": url, "status": status if isinstance(status, int) else None,
+                    "anonymous_challenge": answered, "digest_confirmed": error == "", "error": error,
+                    "checked_at": now()})
     return out
 
 
 def pull_problems(checks: List[Dict]) -> List[str]:
     out = []
     for c in checks:
-        if c["status"] != 200:
-            out.append(f"anonymous pull: {c['image']}: manifest HEAD returned {c['status']}"
-                       + (f" ({c['error']})" if c.get("error") else "") + ", not 200")
-        elif c["content_digest"] and c["content_digest"] != c["digest"]:
-            out.append(f"anonymous pull: {c['image']}: the registry served digest {c['content_digest']}")
+        if c["error"] or c["status"] != 200 or not c["digest_confirmed"]:
+            out.append(f"anonymous pull: {c['image']}: {c['error'] or 'unconfirmed'}"
+                       + (f" (HTTP {c['status']})" if c["status"] is not None else ""))
     return out
 
 
@@ -250,6 +282,7 @@ def staging_values(record: X.Record, params: Dict, s: Dict) -> Dict:
                    "pullPolicy": "IfNotPresent", "pullSecrets": pull_secrets},
         "prometheus": routes["prometheus"],
         "operator": {"replicas": 1, "watchNamespaces": [params["namespace"]],
+                     "rbac": {"scaleWrite": False},       # a shadow preparation: no replica write is authorized
                      "forecasterAddress": routes["operator"]["forecasterAddress"],
                      "forecastLedger": {"enabled": True, "persistence": {"existingClaim": st["ledger_claim"]["name"]}},
                      "podLabels": dict(routes["operator"]["podLabels"]),
@@ -278,6 +311,8 @@ def values_problems(v: Dict, params: Dict) -> List[str]:
         out.append("engine must be statistical with no training targets")
     if v["operator"]["watchNamespaces"] != [params["namespace"]] or v["operator"]["replicas"] != 1:
         out.append("one operator watching only the fixture namespace")
+    if (v["operator"].get("rbac") or {}).get("scaleWrite") is not False:
+        out.append("operator.rbac.scaleWrite must be false: a shadow preparation authorizes no replica write")
     if not v["operator"]["forecastLedger"]["enabled"] or not v["operator"]["forecastLedger"]["persistence"]["existingClaim"]:
         out.append("the forecast ledger must be on, on its existing claim")
     if not v["forecaster"]["statistical"]["persistence"]["existingClaim"]:
