@@ -1,0 +1,11 @@
+# A shadow (Recommend-only) install: no replica write is authorized (operator.rbac.scaleWrite false).
+prometheus:
+  url: http://prometheus-server.monitoring.svc.cluster.local:80
+networkPolicy:
+  prometheus:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: monitoring
+operator:
+  rbac:
+    scaleWrite: false

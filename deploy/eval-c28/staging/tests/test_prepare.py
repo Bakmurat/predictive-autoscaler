@@ -332,3 +332,170 @@ def test_a_record_without_reservation_is_refused(api, make_record):
     record = X.load_record(make_record({"prepare": prepare_section()}), ("prepare",))
     p = prepare.plan(record, record.kube(api), "namespaces")
     assert "reservation gate: the record has no reserve section (reserve.py first)" in p["problems"]
+
+
+# --- explicit image pull mode: secret or anonymous (never defaulted) -------------------------------------------------
+
+OP_IMAGE = "harbor.example/autoscaler/operator@sha256:" + "b" * 64
+ST_IMAGE = "harbor.example/autoscaler/statistical-evaluation@sha256:" + "c" * 64
+TOKEN = "anon-token-value-never-recorded"
+
+
+class FakeRegistry:
+    """fetch(method, url, headers): a v2 registry that challenges with Bearer and hands out anonymous tokens."""
+
+    def __init__(self, manifest_status=200, challenge=True, token_status=200, served=None):
+        self.manifest_status, self.challenge, self.token_status = manifest_status, challenge, token_status
+        self.served = served or {}
+        self.calls = []
+
+    def __call__(self, method, url, headers):
+        self.calls.append((method, url, dict(headers)))
+        if url.startswith("https://harbor.example/service/token"):
+            return self.token_status, {}, json.dumps({"token": TOKEN}).encode() if self.token_status == 200 else b""
+        assert method == "HEAD" and "/v2/autoscaler/" in url and "/manifests/sha256:" in url, url
+        if self.challenge and headers.get("Authorization") != f"Bearer {TOKEN}":
+            return 401, {"www-authenticate": 'Bearer realm="https://harbor.example/service/token",'
+                                             'service="harbor-registry",scope="repository:autoscaler/x:pull"'}, b""
+        dig = url.rsplit("/", 1)[1]
+        return self.manifest_status, {"docker-content-digest": self.served.get(dig, dig)}, b""
+
+
+def anonymous_section():
+    s = prepare_section()
+    s["release"]["image_pull"] = {"mode": "anonymous"}
+    return s
+
+
+def test_anonymous_pull_renders_no_pull_secret_and_records_each_check(api, make_record):
+    record, kube = setup(api, make_record, anonymous_section())
+    reg = FakeRegistry()
+    p = prepare.plan(record, kube, "values", fetch=reg)
+    assert p["problems"] == []
+    assert p["values"]["images"]["pullSecrets"] == []
+    checks = p["image_pull"]["verification"]
+    assert p["image_pull"]["mode"] == "anonymous"
+    assert [(c["image"], c["digest"], c["status"], c["anonymous_challenge"]) for c in checks] == [
+        (OP_IMAGE, "sha256:" + "b" * 64, 200, True), (ST_IMAGE, "sha256:" + "c" * 64, 200, True)]
+    assert checks[0]["url"] == "https://harbor.example/v2/autoscaler/operator/manifests/sha256:" + "b" * 64
+    assert all(c["checked_at"].endswith("Z") for c in checks)
+    for method, url, headers in reg.calls:              # no credentials ever: only Accept, or the anonymous token
+        assert set(headers) <= {"Accept", "Authorization"}
+        assert headers.get("Authorization", f"Bearer {TOKEN}") == f"Bearer {TOKEN}"
+        if method == "HEAD":
+            assert "application/vnd.oci.image.index.v1+json" in headers["Accept"]
+            assert "application/vnd.docker.distribution.manifest.v2+json" in headers["Accept"]
+    assert TOKEN not in json.dumps(p)                    # the token is used, never recorded
+    assert api.mutations() == []
+
+
+def test_anonymous_pull_without_a_challenge_needs_no_token(api, make_record):
+    record, kube = setup(api, make_record, anonymous_section())
+    reg = FakeRegistry(challenge=False)
+    p = prepare.plan(record, kube, "values", fetch=reg)
+    assert p["problems"] == [] and not any(c["anonymous_challenge"] for c in p["image_pull"]["verification"])
+    assert all("Authorization" not in h for _, _, h in reg.calls)
+
+
+@pytest.mark.parametrize("reg, want", [
+    (lambda: FakeRegistry(token_status=401), "returned 401"),        # the project is private: no anonymous token
+    (lambda: FakeRegistry(manifest_status=401), "returned 401"),     # token issued, the pull still refused
+    (lambda: FakeRegistry(manifest_status=404), "returned 404"),     # the digest is not in the registry
+    (lambda: FakeRegistry(served={"sha256:" + "b" * 64: "sha256:" + "d" * 64}), "served digest sha256:dddd"),
+])
+def test_anonymous_pull_refusals_are_plan_problems(api, make_record, reg, want):
+    record, kube = setup(api, make_record, anonymous_section())
+    p = prepare.plan(record, kube, "values", fetch=reg())
+    assert any(x.startswith("anonymous pull: harbor.example/autoscaler/operator@") and want in x
+               for x in p["problems"]), p["problems"]
+    saved = X.save_plan(record, "prepare", p, "plan-values")
+    with pytest.raises(X.StagingError, match="problems"):
+        prepare.apply(record, kube, "values", X.load_plan(saved["plan"]), saved["plan_digest"], fetch=reg())
+    assert not os.path.exists(os.path.join(record.evidence_dir, "release-staging.yaml"))
+
+
+def test_an_unreachable_registry_is_a_plan_problem(api, make_record):
+    record, kube = setup(api, make_record, anonymous_section())
+
+    def down(method, url, headers):
+        raise OSError("connection refused")
+    p = prepare.plan(record, kube, "values", fetch=down)
+    assert sum("returned None (OSError: connection refused)" in x for x in p["problems"]) == 2
+
+
+def test_anonymous_apply_checks_again_and_keeps_the_reviewed_plan(api, make_record):
+    record, kube = setup(api, make_record, anonymous_section())
+    p = prepare.plan(record, kube, "values", fetch=FakeRegistry())
+    saved = X.save_plan(record, "prepare", p, "plan-values")
+    plan, digest = X.load_plan(saved["plan"]), saved["plan_digest"]
+    reg = FakeRegistry()
+    r = prepare.apply(record, kube, "values", plan, digest, fetch=reg)   # a later check: only its time differs
+    assert len([c for c in reg.calls if c[0] == "HEAD"]) == 4            # both images checked again (401, then 200)
+    assert [c["status"] for c in r["data"]["image_pull"]["verification"]] == [200, 200]
+    assert TOKEN not in json.dumps(r)
+    v = yaml.safe_load(open(os.path.join(record.evidence_dir, "release-staging.yaml")))
+    assert v["images"]["pullSecrets"] == []
+
+
+def test_anonymous_pull_gone_between_review_and_apply_writes_nothing(api, make_record):
+    record, kube = setup(api, make_record, anonymous_section())
+    p = prepare.plan(record, kube, "values", fetch=FakeRegistry())
+    saved = X.save_plan(record, "prepare", p, "plan-values")
+    with pytest.raises(X.StagingError, match="changed since review"):
+        prepare.apply(record, kube, "values", X.load_plan(saved["plan"]), saved["plan_digest"],
+                      fetch=FakeRegistry(manifest_status=404))
+    assert not os.path.exists(os.path.join(record.evidence_dir, "release-staging.yaml"))
+
+
+@pytest.mark.parametrize("pull, want", [
+    (None, "must be set explicitly"),                                   # missing: never silently anonymous
+    ({}, "must be set explicitly"),
+    ({"mode": "Anonymous"}, "must be set explicitly"),
+    ({"mode": "secret"}, "exactly pull_ref"),
+    ({"mode": "secret", "pull_ref": "Bad_Name"}, "exactly pull_ref"),
+    ({"mode": "anonymous", "pull_ref": "harbor-pull"}, "takes no other field"),
+])
+def test_the_pull_mode_is_explicit(api, make_record, pull, want):
+    s = prepare_section()
+    del s["release"]["image_pull"]
+    if pull is not None:
+        s["release"]["image_pull"] = pull
+    record, kube = setup(api, make_record, s)
+    with pytest.raises(X.StagingError, match=want):
+        prepare.plan(record, kube, "values", fetch=FakeRegistry())
+
+
+def test_the_retired_pull_ref_is_refused(api, make_record):
+    s = prepare_section()
+    s["release"]["registry_pull_ref"] = "harbor-pull"
+    record, kube = setup(api, make_record, s)
+    with pytest.raises(X.StagingError, match="registry_pull_ref is retired"):
+        prepare.plan(record, kube, "values")
+
+
+def test_secret_mode_is_unchanged_and_never_fetches(api, make_record):
+    record, kube = setup(api, make_record)
+
+    def no_network(method, url, headers):
+        raise AssertionError("secret mode never contacts the registry")
+    p = prepare.plan(record, kube, "values", fetch=no_network)
+    assert p["problems"] == []
+    assert p["values"]["images"]["pullSecrets"] == [{"name": "harbor-pull"}]
+    assert p["image_pull"] == {"mode": "secret"}
+
+
+def test_a_pa_not_in_recommend_is_refused_at_plan(api, make_record, monkeypatch):
+    record, kube = setup(api, make_record)
+    run_phase(record, kube, "namespaces")
+    real = prepare.split
+
+    def active_split(params):
+        parts = real(params)
+        parts["pas"][0]["spec"]["mode"] = "Active"
+        del parts["pas"][1]["spec"]["mode"]                 # a missing mode is refused too (never assumed)
+        return parts
+    monkeypatch.setattr(prepare, "split", active_split)
+    p = prepare.plan(record, kube, "pas")
+    names = [o["metadata"]["name"] for o in active_split(prepare.X.load_params(record))["pas"][:2]]
+    assert [x for x in p["problems"] if "Recommend" in x] == [f"PredictiveAutoscaler/{n} is not in Recommend"
+                                                              for n in names]

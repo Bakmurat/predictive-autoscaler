@@ -101,7 +101,8 @@ def prepare_section():
                         "state_claim": {"name": "pa-eval-forecast-state", "size": "2Gi"}},
             "release": {"operator_image": "harbor.example/autoscaler/operator@sha256:" + "b" * 64,
                         "statistical_image": "harbor.example/autoscaler/statistical-evaluation@sha256:" + "c" * 64,
-                        "registry_pull_ref": "harbor-pull", "network_policy": {"enabled": True}}}
+                        "image_pull": {"mode": "secret", "pull_ref": "harbor-pull"},
+                        "network_policy": {"enabled": True}}}
 
 
 def freeze_inputs():
