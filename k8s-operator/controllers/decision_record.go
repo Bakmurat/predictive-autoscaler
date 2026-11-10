@@ -49,10 +49,10 @@ type decisionRecord struct {
 	MinReplicas        int32    `json:"min_replicas"`
 	MaxReplicas        int32    `json:"max_replicas"`
 	DesiredReplicas    int32    `json:"desired_replicas"`
-	DesiredSource      string   `json:"desired_source"` // prediction|reactive|tie|min_replicas|max_replicas|keep_current
+	DesiredSource      string   `json:"desired_source"` // prediction|reactive|tie|min_replicas|max_replicas|keep_current|paused
 	CurrentReplicas    int32    `json:"current_replicas"`
 	AppliedReplicas    int32    `json:"applied_replicas"`
-	Action             string   `json:"action"` // scale_up|scale_down|hold_stabilizing|hold_cooldown|hold_headroom|at_target|keep_current|scale_error|recommend|conflict_hold|guard_abort
+	Action             string   `json:"action"` // scale_up|scale_down|hold_stabilizing|hold_cooldown|hold_headroom|at_target|keep_current|scale_error|recommend|conflict_hold|guard_abort|paused
 	// ScaleDownHeadroomFloor is the smallest count that keeps spec.behavior.scaleDown.headroomPercent of spare capacity at
 	// the measured rate (Active scale-down decisions only; absent otherwise).
 	ScaleDownHeadroomFloor *int32 `json:"scale_down_headroom_floor,omitempty"`
@@ -118,6 +118,10 @@ func (d *decisionRecord) setForecast(p *MLPredictionResponse, det predictedDetai
 // setDecision records the unified decision and which component set it. The prediction "sets" the
 // decision only when a USED forecast's value strictly exceeds the reactive floor and minReplicas and
 // was not cut to maxReplicas; equality with the reactive value is a tie, never a prediction win.
+// A hold (keepCurrent) is keep_current only when the held count is the current one: when the bounds moved it, the
+// bound set the decision (min_replicas or max_replicas, with the safeguard bounds_enforced), and the action says
+// what became of the write (scale_up, scale_down, a hold_* before a scale-down, scale_error, guard_abort,
+// conflict_hold or recommend).
 func (d *decisionRecord) setDecision(predicted, desired int32, keepCurrent bool) {
 	d.PredictedReplicas, d.DesiredReplicas = predicted, desired
 	used := d.ForecastStatus == "used"
@@ -130,6 +134,10 @@ func (d *decisionRecord) setDecision(predicted, desired int32, keepCurrent bool)
 		top = d.ReactiveReplicas
 	}
 	switch {
+	case keepCurrent && desired > d.CurrentReplicas:
+		d.DesiredSource = "min_replicas"
+	case keepCurrent && desired < d.CurrentReplicas:
+		d.DesiredSource = "max_replicas"
 	case keepCurrent:
 		d.DesiredSource = "keep_current"
 	case top > d.MaxReplicas, used && p > d.ReactiveReplicas && p == d.MaxReplicas && d.hasSafeguard("max_clamp"):

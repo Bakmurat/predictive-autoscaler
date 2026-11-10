@@ -20,7 +20,8 @@
    `max(ceil(10 %), 2)` pods per step).
 5. **Fallbacks:** no usable forecast → reactive only; no measured request rate (failed, partial or empty metrics answer)
    → hold the current replica count, forecast or not; no configured capacity → hold as well, with no forecast requested
-   and no calculated count (`configuration.md`, Decision rule).
+   and no calculated count (`configuration.md`, Decision rule). A held count outside `[minReplicas, maxReplicas]` is
+   still brought inside them, recorded as bounds enforcement; a target at 0 replicas is paused and never written.
 
 ## Signals and units
 - The request rate is in **requests per minute** internally; `capacityPerReplica` (and the deprecated `targetRPS`) in

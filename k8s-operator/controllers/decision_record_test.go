@@ -77,6 +77,17 @@ func TestDecisionRecord_SourceCases(t *testing.T) {
 			t.Errorf("%s: source %q, want %q", c.name, d.DesiredSource, c.want)
 		}
 	}
+	// A hold whose count the bounds moved is not keep_current: the bound set the decision (R3-02).
+	for _, c := range []struct {
+		current, desired int32
+		want             string
+	}{{5, 5, "keep_current"}, {1, 3, "min_replicas"}, {15, 12, "max_replicas"}} {
+		d := &decisionRecord{ForecastStatus: "unavailable", MinReplicas: 3, MaxReplicas: 12, CurrentReplicas: c.current}
+		d.setDecision(0, c.desired, true)
+		if d.DesiredSource != c.want {
+			t.Errorf("held at %d, desired %d: source %q, want %q", c.current, c.desired, d.DesiredSource, c.want)
+		}
+	}
 }
 
 // recordDecision appends one "event":"decision" JSON line with the applied action.

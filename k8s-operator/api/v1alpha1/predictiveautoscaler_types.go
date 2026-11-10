@@ -298,8 +298,10 @@ type PredictiveAutoscalerStatus struct {
 	ForecastReplicas int32 `json:"forecastReplicas,omitempty"`
 
 	// CalculatedReplicas is the decision rule's result: clamp(max(forecast, reactive), min, max), or the held count
-	// when the current request rate is unavailable. Absent while no per-replica capacity is configured: the
-	// recommendation is then incomplete (CapacityConfigured=False) and the decision holds the current count.
+	// when the current request rate is unavailable (the nearest bound when that count is outside minReplicas and
+	// maxReplicas). Absent while no per-replica capacity is configured: the recommendation is then incomplete
+	// (CapacityConfigured=False) and the decision holds the current count. Absent too while the target is paused
+	// (0 desired replicas): nothing is wanted of it.
 	CalculatedReplicas int32 `json:"calculatedReplicas,omitempty"`
 
 	// StabilizedReplicas is what Active mode applies after the scale-down stabilization and cooldown (Active only:
@@ -337,7 +339,14 @@ type PredictiveAutoscalerStatus struct {
 	// LastScaleTime is the timestamp of the last scaling action
 	LastScaleTime *metav1.Time `json:"lastScaleTime,omitempty"`
 
-	// Conditions represent the latest available observations
+	// Conditions represent the latest available observations: Ready, CapacityConfigured, TelemetryAvailable,
+	// ForecastAvailable, ScalingActive, ConflictDetected, VPAInterference, ScaleOutBlocked, ScaleDownHeadroom and,
+	// with engine statistical, PredictionReady. ScalingActive is True with reason Active; when False its reason
+	// names why scaling on demand is off: RecommendMode, TargetPaused (the target Deployment has 0 desired
+	// replicas: nothing is written in any mode until its count is positive again; the operator never writes 0),
+	// Conflict, CheckFailed, GuardAborted, CapacityMissing or TelemetryHold (the current count is held),
+	// BoundsEnforced (no need could be computed and the count was outside minReplicas and maxReplicas: it is brought
+	// inside them, and the message says whether that was written), or the failure reason of Ready.
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
