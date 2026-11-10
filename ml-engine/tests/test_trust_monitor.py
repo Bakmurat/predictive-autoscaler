@@ -215,6 +215,29 @@ def test_a_sustained_forty_percent_miscoverage_is_detected_within_64_outcomes(le
     assert Q.wall_seconds(lim.consecutive, lead, 60) == lim.consecutive * lead + 180
 
 
+def test_detection_is_conditional_on_an_eligible_state_at_the_change():
+    """Protocol amendment 1: a path on which a rule failed before the change is excluded from the denominator and
+    reported, never counted as a detection. With limits that often alarm at the nominal rate and (almost) no miss
+    after the change, nothing can be detected on an eligible path: the earlier reading counted the paths that were
+    already failing."""
+    loose = dataclasses.replace(limits(180, 2), recent_n=8, rolling_misses=2, consecutive=2)
+    d = Q.detection(loose, 1e-9, trials=4_000, seed=20261110)
+    assert d["excluded"] > 0 and d["eligible"] > 0 and d["eligible"] + d["excluded"] == d["trials"] == 4_000
+    assert d["failing_before_change"] > 0.05                  # many paths fail AT the change ...
+    assert d["unconditional"] >= d["failing_before_change"] * 0.5 > 0     # ... and the earlier reading counted them
+    assert d["detected"] == 0 and d["probability"] == 0.0     # none of them is a detection of the change
+    # The interval is over the eligible paths only.
+    assert (d["lo"], d["hi"]) == Q.wilson(0, d["eligible"])
+    # A real change is detected on the eligible paths, and only they are counted.
+    step = Q.detection(loose, 1.0, trials=4_000, seed=20261110)
+    assert step["eligible"] == d["eligible"] and step["detected"] == step["eligible"] and step["probability"] == 1.0
+    # With the frozen limits almost every path is eligible, and the two readings differ by at most the excluded share.
+    lim = limits(180, 2)
+    f = Q.detection(lim, 0.4, trials=20_000, seed=20261110)
+    assert f["excluded"] <= 0.01 * f["trials"] and f["failing_before_change"] <= f["excluded"] / f["trials"]
+    assert abs(f["probability"] - f["unconditional"]) <= f["excluded"] / f["eligible"]
+
+
 def test_the_simulated_detection_is_the_products_own_rule():
     """The vectorized detection simulation and trust.note_outcome agree miss sequence by miss sequence."""
     lim = limits(180, 2)
