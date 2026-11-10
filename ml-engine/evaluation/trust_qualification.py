@@ -27,7 +27,10 @@ Declared before any validation result exists:
     first trust, the same demotions with the same rules and the same re-promotions on the same paths.
   - Detection. Gate misses that are independent at the nominal rate up to a change point and at 40 % (also 50 %,
     and 100 %: an abrupt all-miss step) after it; detection = a coverage rule failing at one of the first 64
-    outcomes after the change. The serially dependent variant thresholds a latent Gaussian AR(1) series whose
+    outcomes after the change, CONDITIONAL ON AN ELIGIBLE STATE AT THE CHANGE (protocol amendment 1): a path on which
+    a rule failed at any outcome of the pre-change stretch is not eligible there (it is alarmed, or demoted with its
+    re-promotion dwell possibly still running); it is excluded from the denominator and reported separately, never
+    counted as a detection. The serially dependent variant thresholds a latent Gaussian AR(1) series whose
     coefficient is AR_RHO ** (lead / 60 s), the dependence the declared AR(1) noise leaves between consecutive cohort
     windows. Wall time from the change to the demotion being visible: outcomes x lead + settlement + one request
     interval.
@@ -309,8 +312,13 @@ def _normal_quantile(p: float) -> float:
 def detection(lim: T.CoverageLimits, miss_rate: float, *, trials: int, seed: int, phi: float = 0.0,
               outcomes: int = DETECTION_OUTCOMES) -> Dict[str, object]:
     """P(a rolling or consecutive alarm state at one of the first `outcomes` gate outcomes after the miss rate
-    changes from nominal to miss_rate), and the distribution of the first such outcome. Misses are the exceedances of
-    a latent Gaussian AR(1) series with coefficient phi (0: independent)."""
+    changes from nominal to miss_rate | the path is ELIGIBLE at the change), and the distribution of the first such
+    outcome. Eligible: no rule failed at any outcome of the pre-change stretch (4 n outcomes), so the candidate is
+    trusted and not alarmed at the change. The other paths are excluded from the denominator and reported
+    ("excluded"; "failing_before_change" is the share failing at the change itself): a rule that already fails is
+    not a detection of the change. "unconditional" is the earlier reading (every path, the already failing ones
+    counted as detected), kept for comparison only. Misses are the exceedances of a latent Gaussian AR(1) series
+    with coefficient phi (0: independent)."""
     rng = np.random.default_rng(seed)
     nominal = lim.miss_bps / T.BPS
     pre = 4 * lim.recent_n
@@ -325,6 +333,7 @@ def detection(lim: T.CoverageLimits, miss_rate: float, *, trials: int, seed: int
     first = np.full(trials, outcomes + 1, dtype=np.int32)
     by_rule = {"rolling": np.zeros(trials, dtype=bool), "consecutive": np.zeros(trials, dtype=bool)}
     already = np.zeros(trials, dtype=bool)
+    alarmed_before = np.zeros(trials, dtype=bool)
     for i in range(pre + outcomes):
         z = phi * z + innov * rng.standard_normal(trials)
         miss = (z > (cut0 if i < pre else cut1)).astype(np.int8)
@@ -333,22 +342,29 @@ def detection(lim: T.CoverageLimits, miss_rate: float, *, trials: int, seed: int
         ring[:, col] = miss
         run = np.where(miss == 1, run + 1, 0)
         rolling, consecutive = count >= lim.rolling_misses, run >= lim.consecutive
+        if i < pre:
+            alarmed_before |= rolling | consecutive         # not eligible at the change: never a detection of it
         if i == pre - 1:
-            already = rolling | consecutive                 # failing before the change: not a detection of it
+            already = rolling | consecutive
         if i >= pre:
             hit = (rolling | consecutive) & (first > outcomes)
             first[hit] = i - pre + 1
             by_rule["rolling"] |= rolling
             by_rule["consecutive"] |= consecutive
-    detected = int((first <= outcomes).sum())
-    lo, hi = wilson(detected, trials)
-    got = np.sort(first[first <= outcomes])
-    return {"miss_rate": miss_rate, "phi": phi, "trials": trials, "detected": detected,
-            "probability": detected / trials, "lo": lo, "hi": hi,
+    eligible = ~alarmed_before
+    count_eligible = int(eligible.sum())
+    detected = int(((first <= outcomes) & eligible).sum())
+    lo, hi = wilson(detected, count_eligible)
+    got = np.sort(first[(first <= outcomes) & eligible])
+    share = (lambda v: float(v[eligible].mean())) if count_eligible else (lambda v: None)
+    return {"miss_rate": miss_rate, "phi": phi, "trials": trials, "eligible": count_eligible,
+            "excluded": trials - count_eligible, "detected": detected,
+            "probability": detected / count_eligible if count_eligible else None, "lo": lo, "hi": hi,
             "failing_before_change": float(already.mean()),
+            "unconditional": float((first <= outcomes).mean()),
             "median_outcomes": int(got[len(got) // 2]) if len(got) else None,
             "p95_outcomes": int(got[min(len(got) - 1, int(0.95 * len(got)))]) if len(got) else None,
-            "by_rolling": float(by_rule["rolling"].mean()), "by_consecutive": float(by_rule["consecutive"].mean())}
+            "by_rolling": share(by_rule["rolling"]), "by_consecutive": share(by_rule["consecutive"])}
 
 
 def wall_seconds(outcomes: int, lead: int, grid: int) -> int:
