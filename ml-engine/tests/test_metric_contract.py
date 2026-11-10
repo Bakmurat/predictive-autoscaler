@@ -515,33 +515,52 @@ def test_the_deadline_interrupts_a_tls_header_trickle(tmp_path):
         close()
 
 
+def resolver_slots_held(bh):
+    taken = 0
+    while bh._resolver_slots.acquire(blocking=False):
+        taken += 1
+    for _ in range(taken):
+        bh._resolver_slots.release()
+    return bh.RESOLVER_SLOTS - taken
+
+
 def test_abandoned_lookups_never_queue_up(monkeypatch):
     # Codex r17: lookups abandoned at the deadline keep their slot until they finish; when every slot is taken the
     # call fails at once instead of queueing another lookup.
+    #
+    # Synchronised on state, not on time (it failed once on a loaded host): a call whose short deadline has already
+    # passed when it reaches the resolver raises DeadlineExceeded without taking a slot, so "one call per slot" did not
+    # always saturate the resolver, and the next call then found a free slot and waited out its own deadline. The
+    # stuck lookups now stay stuck until the test releases them, saturation is established by counting the slots held,
+    # and a refusal is recognised by what it is (no DeadlineExceeded although its deadline is far away, and no further
+    # lookup started), not by how fast it came.
     import data.bounded_http as bh
     release, executed = threading.Event(), []
 
     def stuck(*a, **kw):
         executed.append(a[0])
-        release.wait(10)
+        release.wait()   # until the test lets go: no time limit that a slow host could outlast
         return socket.getaddrinfo("127.0.0.1", 80, 0, socket.SOCK_STREAM)
 
     wait_for_free_resolver_slots(bh)   # an earlier test's slow lookup may still hold one
     monkeypatch.setattr(bh, "_getaddrinfo", stuck)
     try:
-        for _ in range(bh.RESOLVER_SLOTS):
+        calls = 0
+        while resolver_slots_held(bh) < bh.RESOLVER_SLOTS:   # each call that reaches the resolver abandons one lookup
+            calls += 1
+            assert calls <= 50 * bh.RESOLVER_SLOTS, "the resolver never saturated"
             with pytest.raises(DeadlineExceeded):
                 bounded_get("http://stuck.invalid/x", deadline_s=0.05, max_bytes=100)
-        for _ in range(5):   # repeated timeouts: refused at once, nothing queued behind the stuck lookups
-            t0 = time.monotonic()
+        for _ in range(5):   # refused at once, nothing queued behind the stuck lookups: with every slot held a call
+            # that queued or started a lookup would run into its 60 s deadline instead
             with pytest.raises(TransportFailure) as exc:
-                bounded_get("http://stuck.invalid/x", deadline_s=0.5, max_bytes=100)
-            assert not isinstance(exc.value, DeadlineExceeded) and time.monotonic() - t0 < 0.2
-        assert len(executed) == bh.RESOLVER_SLOTS
+                bounded_get("http://stuck.invalid/x", deadline_s=60, max_bytes=100)
+            assert not isinstance(exc.value, DeadlineExceeded) and "saturated" in str(exc.value)
+            assert resolver_slots_held(bh) == bh.RESOLVER_SLOTS
     finally:
         release.set()
     wait_for_free_resolver_slots(bh)   # slots return only when the stuck lookups really end
-    assert len(executed) == bh.RESOLVER_SLOTS
+    assert len(executed) == bh.RESOLVER_SLOTS   # exactly one lookup per slot was ever started
 
 
 def wait_for_free_resolver_slots(bh, timeout=10.0):
