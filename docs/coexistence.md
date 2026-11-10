@@ -83,7 +83,9 @@ Keep a KEDA ScaledObject for the same Deployment, **paused**, as a ready-made re
 3. **Hand-over to KEDA:** first stop the PredictiveAutoscaler from writing:
    - set `mode: Recommend` (or delete the CR);
    - wait one reconcile interval;
-   - check that `ScalingActive` shows `RecommendMode` and that the ledger shows no further writes.
+   - check that `ScalingActive` shows `RecommendMode` and that no further writes happen: `status.lastScaleTime` stays
+     unchanged and no new `ScaledUp`/`ScaledDown` event appears (and, where the forecast ledger is enabled, it shows no
+     further `scale_up`/`scale_down` action; see [helm.md](helm.md#the-forecast-ledger)).
 
    Then remove the annotation and confirm that KEDA's HPA (`keda-hpa-<scaledobject>`) exists and is active. Had you
    skipped the first step, the operator would have refused to scale once KEDA became active (`ConflictDetected`). It

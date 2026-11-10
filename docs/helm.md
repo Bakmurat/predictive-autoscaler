@@ -14,8 +14,8 @@ and 1.35, the operator's envtest on 1.35; the chart's `kubeVersion` admits any v
 untested), and a Prometheus-compatible query API with the request metrics of your
 workloads. Install **one release per cluster**, or give several releases disjoint `operator.watchNamespaces`: each
 release elects its own leader in its own namespace, so two releases watching the same namespace would both scale its
-autoscalers. With Helm 3, `helm template` needs `--kube-version` (its offline default is older than 1.33). Argo CD passes
-the cluster's version itself.
+autoscalers. `helm template` renders offline against Helm's built-in default Kubernetes version: pass `--kube-version`
+when your Helm's default is older than 1.33 (Helm 3.19 renders without it). Argo CD passes the cluster's version itself.
 
 ## The values you must set
 
@@ -25,6 +25,7 @@ prometheus:
 networkPolicy:
   prometheus:                                        # where Prometheus runs (or set networkPolicy.enabled: false)
     namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: monitoring}}
+    ports: [9090]                                    # the query API's pod port (default [9090]; vmselect: 8481)
 training:
   targets:                                           # one training CronJob per autoscaler
     - {namespace: shop, name: web-pa, schedule: "0 */6 * * *"}   # the PredictiveAutoscaler's name (TRAINING_TARGET=shop/web-pa)
@@ -48,6 +49,42 @@ seccomp `RuntimeDefault`. HOME, TMPDIR, the XDG and Keras directories point into
 Pods or read Secrets; Pods and ReplicaSets are only read (get/list), by the operator, where it scales. The chart has no cold start: retrain by hand with
 `kubectl -n <ns> create job --from=cronjob/<cronjob> <name>` (the CronJob's annotation
 `autoscaling.devkuban.com/training-target` names its autoscaler).
+
+## Shadow (Recommend-only) installs
+
+`operator.rbac.scaleWrite: false` installs the operator without permission to change any replica count: its role keeps
+only `get` on `deployments/scale`. Its status updates, events and the leader-election Lease are unchanged.
+
+- Keep every autoscaler in `mode: Recommend` on such an install. Recommend never writes, so nothing is refused.
+- An autoscaler set to `Active` still decides, but whenever its decision differs from the current count the write is
+  refused by the API server (Forbidden). The autoscaler then reports `Ready=False` and `ScalingActive=False` with reason
+  `ScalingError`, and the operator tries again after a minute. With the chart's alerts on,
+  `PredictiveAutoscalerNotReady` fires after `notReadyFor` (15 minutes).
+- To allow scaling later, set `operator.rbac.scaleWrite: true` and run `helm upgrade`.
+
+## The forecast ledger
+
+`operator.forecastLedger.enabled: true` makes the operator append its evidence log to
+`/var/lib/predictive-autoscaler/forecasts.jsonl` (`FORECAST_LOG`), one JSON object per line:
+
+| Line | Written |
+|---|---|
+| a forecast record (no `event` field; `issued_at`, `issuance_id`, the model's identity and one `forecasts` entry per step) | for each newly issued v1 forecast |
+| `"event": "decision"` | for each decision (one per reconcile that reaches a decision): the inputs, the safeguards applied and the `action` (`recommend`, `scale_up`, `scale_down`, `hold_stabilizing`, `hold_cooldown`, `hold_headroom`, `at_target`, `keep_current`, `conflict_hold`, `guard_abort` or `scale_error`); on the v2 path it carries the forecast in a `v2` block |
+| `"event": "forecast_attempt_started"` / `"forecast_attempt_completed"` | for each fresh v1 request to the forecasting service |
+| `"event": "forecast_ledger_session"` | once per operator run, before its first attempt record (it names the run's `operator_run_id`) |
+| `"event": "sanity_rejected"` | when a recorded forecast is discarded by the sanity check |
+
+- **Where it is stored:** an `emptyDir` by default, which is lost when the operator pod is replaced. For a ledger that
+  survives, set `operator.forecastLedger.persistence.existingClaim`; that needs `operator.replicas: 1`, and the chart
+  then uses the `Recreate` strategy.
+- **How to read it:** the operator image has no shell or `tar` (`gcr.io/distroless/static`), so `kubectl exec ... cat`
+  and `kubectl cp` do not work on it. With an `existingClaim`, mount the claim in a pod of your own (on the operator's
+  node when the claim is ReadWriteOnce). With the default `emptyDir`, the file can be reached only from an ephemeral
+  debug container attached to the operator pod (`kubectl debug`).
+- **Size:** the file is append-only and the operator neither rotates nor truncates it, and the default `emptyDir` has
+  no size limit. It grows by about one decision line per reconcile per autoscaler, plus the forecast lines. Size the
+  claim for it, and prune or rotate the file yourself.
 
 ## The CRD
 
@@ -73,7 +110,7 @@ Pods or read Secrets; Pods and ReplicaSets are only read (get/list), by the oper
   Revisions: 1 = the first `autoscaling.devkuban.com` schema; 2 = adds `spec.behavior.scaleDown.headroomPercent`;
   3 = adds `spec.metrics.requests.capacityPerReplica` and deprecates `targetRPS` ([upgrading.md](upgrading.md));
   4 = adds the forecast contract v2 settings (`spec.prediction.engine` and the keys after it), `spec.behavior.startup`
-  and `status.prediction`.
+  and `status.prediction`; 5 = adds `spec.prediction.families`. The current operator requires revision 5.
   While the installed CRD is older than it needs, the operator starts no controller and does not campaign for
   leadership: its liveness probe passes and its readiness probe fails, with the reason in the log.
 - `helm uninstall` keeps the CRD, and with it every PredictiveAutoscaler. Delete the CRD by hand only if you want them
@@ -101,6 +138,11 @@ They are on by default, and work only with a CNI that enforces them.
   port).
 - The trainer accepts none.
 - All three may reach DNS, the Kubernetes API and Prometheus. The operator may also reach the forecasting service.
+- The Prometheus rule allows the peers in `networkPolicy.prometheus` (`namespaceSelector`, `podSelector`, `ipBlocks`)
+  on TCP `networkPolicy.prometheus.ports` only, and the default is `[9090]`. Set it to the port your query API's pods
+  listen on (the pod port, not a Service port that maps to it): for example 8481 for VictoriaMetrics vmselect. With an
+  enforcing CNI a wrong port blocks every query: autoscalers report `TelemetryAvailable=False` and hold their replica
+  count, and trainings fail.
 
 Enforcement depends on the CNI. Some implementations apply a new pod's policies only once their agent has learned the
 pod, and let its first connections through (kind's kube-network-policies did for about ten seconds in the smoke test).
@@ -140,10 +182,17 @@ The forecasting service and the trainer share the model volume.
   `SEASONAL_EXPERIMENT`, ...) stop it from starting.
 - **A Recommend-only preview:** it issues shadow forecasts, calibrates them on matured windows and reports their quality
   (the `predictive_autoscaler_forecast_*` metrics), but every answer has `predictive_eligible: false` until its release
-  gates pass. The current operator does not call `/v2/predict` yet.
+  gates pass. The operator calls `/v2/predict` only for autoscalers with `spec.prediction.engine: statistical`
+  ([configuration.md](configuration.md#forecast-contract-v2-engine-statistical-preview)); because no answer is
+  eligible, `PredictionReady` stays False and their decisions stay reactive: no forecast adds replicas.
+- **Two switches that belong together:** the chart value `forecaster.engine: statistical` installs this service, and
+  `spec.prediction.engine: statistical` on an autoscaler makes the operator use it. This profile does not serve the v1
+  `/predict`, and the default `legacyLstm` profile does not serve `/v2/predict`, so an autoscaler whose engine does
+  not match the installed profile gets no forecast and runs on the reactive rule.
 - **Resources:** `forecaster.statistical.resources` (requests 256Mi and 250m CPU, limits 512Mi and 1 CPU) instead of
   `forecaster.resources`; one replica, `Recreate`.
-- **State:** a retained 2Gi claim (`<release>-forecast-state`, `forecaster.statistical.persistence`) mounted at
+- **State:** a retained 2Gi claim (`<release>-predictive-autoscaler-forecast-state`,
+  `forecaster.statistical.persistence`) mounted at
   `/state` holds the forecast journal (SQLite, WAL) and the fit artifacts, with a journal budget of
   `forecaster.statistical.stateQuota` (1536Mi). Issuances and outcomes are kept 7 days online, then compacted into
   per-epoch counts. A lost or corrupt journal never carries evidence over: the service answers 503 until it can write
@@ -156,7 +205,7 @@ The forecasting service and the trainer share the model volume.
 - **Checks:** `hack/sbom-check-statistical.py` checks the pinned requirements and the Dockerfile offline (part of the
   test suite); with `--image <ref>` it lists the built image's packages and shared libraries and imports the service
   with TensorFlow blocked (needs docker: a release gate). `hack/statistical-envelope.py` estimates memory, CPU, latency
-  and journal growth offline. `hack/statistical-container-envelope.sh` (docker, on the aspire kind bed host) runs it
+  and journal growth offline. `hack/statistical-container-envelope.sh` (needs docker) runs it
   inside the built image under the profile's limits (512 MiB, 1 CPU, read-only root) with the fit worker on and 8
   days of history, and fails on an OOM kill, a budget breach, any failed fit, no issuance that used a fitted artifact,
   or a missing cgroup measurement: the gate for the 384 MiB fit limit and these resources.
@@ -199,7 +248,8 @@ The forecasting service and the trainer share the model volume.
 ## Monitoring
 
 `metrics.serviceMonitor.enabled` (Prometheus Operator) or `metrics.vmServiceScrape.enabled` (VictoriaMetrics
-Operator) scrapes the operator (port 8080) and the forecasting service (port 8000). Both scrapes keep the metrics' own
+Operator) scrapes the operator (port 8080) and the forecasting service (port 8443 over HTTPS by default; port 8000
+over HTTP with `forecaster.auth.enabled: false`). Both scrapes keep the metrics' own
 `namespace` label (the autoscaler's and its workload's namespace; `honorLabels`), so it is not renamed to
 `exported_namespace` even for a workload outside the chart's namespace. Both add `pa_install_namespace`, the namespace
 the chart is installed in; together with `job` (the Service name) it identifies one installation.
@@ -259,8 +309,8 @@ The certificate comes from `forecaster.tls.source`:
 
 | Source | Use it for | Renewal |
 |---|---|---|
-| `selfSigned` (default) | plain Helm, the quickstart | valid `selfSigned.validityDays` (365); it is **not** renewed automatically (the install notes say so): renew before it expires by deleting the Secret `<release>-predictive-autoscaler-forecaster-tls` and running `helm upgrade`; prefer `certManager` in production. The Secret's `ca.crt` does not tell you the served certificate's expiry: check `tls.crt` or the served certificate. `helm upgrade` keeps it through `lookup`, which Argo CD and `helm template` cannot do, so **do not use it with Argo CD** |
-| `certManager` | Argo CD, production | cert-manager renews it (`duration`, `renewBefore`); the Issuer must put its CA into the Secret's `ca.crt` (a CA issuer does) |
+| `selfSigned` (default) | plain Helm, the quickstart | valid `selfSigned.validityDays` (365); it is **not** renewed automatically (the install notes say so): renew before it expires by deleting the Secret `<release>-predictive-autoscaler-forecaster-tls` and running `helm upgrade`; prefer `certManager` for long-running installs. The Secret's `ca.crt` does not tell you the served certificate's expiry: check `tls.crt` or the served certificate. `helm upgrade` keeps it through `lookup`, which Argo CD and `helm template` cannot do, so **do not use it with Argo CD** |
+| `certManager` | Argo CD, long-running installs | cert-manager renews it (`duration`, `renewBefore`); the Issuer must put its CA into the Secret's `ca.crt` (a CA issuer does) |
 | `existingSecret` | certificates managed elsewhere | yours: a Secret with `tls.crt`, `tls.key` and `ca.crt` |
 
 When the certificate files change, the forecasting service restarts itself within about a minute to load them, and

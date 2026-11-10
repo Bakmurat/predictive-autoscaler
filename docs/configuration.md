@@ -25,10 +25,10 @@ brackets (20 and 60). The same applies to `metrics.requests`. Set these fields e
 | `metrics.requests.source.query` | string ≤ 2 KiB | with `prometheus` only | — | yes | An instant PromQL expression returning **exactly one series, in requests per second**, for the target. It may use only `{{ .Namespace }}` and `{{ .Name }}` (the target Deployment), escaped as PromQL string content. No other template features are allowed: no functions, conditions or variables. An invalid query sets `Ready=False` (reason `InvalidMetricQuery`), and nothing is written. Example for ingress-nginx: `sum(rate(nginx_ingress_controller_requests{namespace="{{ .Namespace }}",service="{{ .Name }}"}[1m]))`. `{{ .Name }}` is the Deployment's name: if the Service is named differently, write the Service's name into the query. Check which namespace label your scrape keeps (`namespace` or `exported_namespace`), and that the series counts this Deployment's traffic only. |
 | `metrics.cpu.*`, `metrics.memory.*` | — | no | enabled, 70 / 60 % | **no** | Accepted, ignored: only the request rate is used. |
 | `prediction.enabled` | bool | no | true | yes | `false` = reactive-only. |
-| `prediction.horizonMinutes` | int ≥ 5 | no | 60 [60] | yes | How far ahead the forecaster predicts. |
+| `prediction.horizonMinutes` | int ≥ 5 | no | 60 [60] | yes | How far ahead the forecaster predicts. The CRD admits 5, but the v1 forecasting service refuses a horizon below 10 minutes (HTTP 400), which leaves the decision reactive: use at least 10. |
 | `prediction.leadTimeMinutes` | int ≥ 1 | no | **15** [20] | yes | The operator sizes for the highest forecast in the next `leadTimeMinutes` (see the decision rule). Set it explicitly; the quickstart uses 15. |
 | `prediction.updateIntervalSeconds` | int ≥ 60 | no | **300** [60] | yes | Reconcile period. Examples set 60. |
-| `prediction.engine` | `statistical` \| `legacyLstm` | no | — (the v1 path) | yes | `statistical` selects forecast contract v2 ([below](#forecast-contract-v2-engine-statistical-preview)); absent or `legacyLstm` keeps the v1 path unchanged. |
+| `prediction.engine` | `statistical` \| `legacyLstm` | no | — (the v1 path) | yes | `statistical` selects forecast contract v2 ([below](#forecast-contract-v2-engine-statistical-preview)) and needs the chart installed with `forecaster.engine: statistical`; absent or `legacyLstm` keeps the v1 path unchanged. |
 | `prediction.sampleIntervalSeconds`, `seasonality`, `historyDays`, `settlementSeconds`, `outcomeGraceSeconds`, `risk.miscoverageBps`, `calibration.*`, `trust.*` | see the CRD | no | the forecasting service's defaults (300 s grid, daily, 14 days, 120 s, 600 s, 1000 bps, ...) | yes (engine `statistical`) | The v2 forecast settings. The forecasting service derives them from the live object and the operator hashes them the same way (the settings fingerprint both sides check). Cross-field limits (for example a horizon that is a multiple of the grid, at most 60 minutes and 60 steps) make the settings invalid: `PredictionReady=False`, reason `SettingsInvalid`, and decisions stay reactive. |
 | `prediction.predictiveExtra.maxReplicas`, `maxPercent` | int 0–1000 | no | 2, 50 | yes (engine `statistical`) | The most replicas a verified forecast may add above the reactive need: `min(maxReplicas, ceil(maxPercent × max(reactive, minReplicas) / 100))`. `0` in either disables predictive excess. |
 | `behavior.startup.fallbackDelaySeconds` | int 1–3600 | no | **none** | yes (engine `statistical`) | Scale-out-to-Ready budget used until enough starts are measured (20 completed starts of the current pod template in 7 days). Without it, and without measurements, no predictive lead is chosen and decisions stay reactive (`LeadInsufficient`). |
@@ -152,7 +152,17 @@ measured as a real zero and scales normally.
 With `spec.prediction.engine: statistical` the operator uses the statistical forecasting service's contract v2
 (`POST /v2/predict`, `window-max-rps/v1`) instead of the v1 forecast. The service forecasts the **peak request rate
 over a fixed future window** `W = {t+Δ, ..., t+L}` (Δ the grid, `t` the current grid origin, `L` the lead) and, once it
-has the evidence, a calibrated **upper bound** `U` of that peak, in requests per second. The operator:
+has the evidence, a calibrated **upper bound** `U` of that peak, in requests per second.
+
+**The engine needs the matching chart profile, and in this preview it never adds replicas.** `/v2/predict` is served
+only by the statistical forecasting service, which the chart installs with `forecaster.engine: statistical`
+([helm.md](helm.md#statistical-forecaster-profile-preview)). That profile serves no v1 forecasts, so on such an install
+autoscalers without `engine: statistical` are reactive-only, and on a default (`legacyLstm`) install an autoscaler with
+`engine: statistical` gets no forecast. The service marks every answer `predictive_eligible: false` until its release
+gates pass, which they have not (only a lab-qualified evaluation build differs), so `PredictionReady` stays False and
+every decision stays reactive. The steps below describe what the operator does with an eligible answer.
+
+The operator:
 
 1. **Chooses the lead.** Startup budget `D`: the 90th percentile of measured starts plus 25 % once 20 completed starts
    exist in the last 7 days, otherwise `behavior.startup.fallbackDelaySeconds`; at least `minimumDelaySeconds`; and a
@@ -216,7 +226,7 @@ is measured and only the configured budget applies.
 |---|---|---|
 | `ML_API_URL` | `http://ml-api-service.ml-engine.svc.cluster.local:8000` | Forecasting service. |
 | `PROMETHEUS_URL` | `http://vmselect-vmst.monitoring.svc.cluster.local:8481/select/0/prometheus` | Prometheus-compatible query endpoint (any Prometheus API works). `VICTORIAMETRICS_URL` is still read as a deprecated fallback. |
-| `FORECAST_LOG` | unset | Path of the append-only forecast/decision ledger (JSONL). |
+| `FORECAST_LOG` | unset | Path of the append-only forecast/decision ledger (JSONL). The chart sets it with `operator.forecastLedger.enabled`; its line types, how to read it and its growth are in [helm.md](helm.md#the-forecast-ledger). |
 | `WATCH_NAMESPACES` | all | Comma-separated namespaces to watch. |
 | `ML_API_TOKEN_FILE` | unset | A projected service account token for the forecasting service's audience, read on every request and sent as `Authorization: Bearer`. With it set, `ML_API_URL` must be https, and a missing or empty file sends nothing (forecast status `auth_misconfigured`, reactive rule). |
 | `ML_API_CA_FILE` | unset | The forecasting service's CA bundle. It is reloaded when it changes (checked at most every 60 s); a configured file that is missing or invalid sends nothing. Redirects are never followed. |

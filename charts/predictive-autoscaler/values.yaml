@@ -37,6 +37,7 @@ operator:
     enabled: false
     persistence:
       existingClaim: ""      # empty: an emptyDir (lost on restart); a claim needs replicas: 1 (the chart uses Recreate)
+      # The file (/var/lib/predictive-autoscaler/forecasts.jsonl) is append-only and never rotated: see docs/helm.md
   resources:
     requests: {cpu: 100m, memory: 128Mi}
     limits: {memory: 256Mi}
@@ -132,7 +133,7 @@ networkPolicy:
     namespaceSelector: {}
     podSelector: {}
     ipBlocks: []             # ["10.0.0.0/8"]
-    ports: [9090]
+    ports: [9090]            # the pod port(s) of the query API; egress to other ports is blocked (vmselect: 8481)
   metricsFrom: []            # peers allowed to scrape the metrics ports: [{namespaceSelector: {...}, podSelector: {...}}]
 
 metrics:
