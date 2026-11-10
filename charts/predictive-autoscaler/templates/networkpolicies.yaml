@@ -1,6 +1,8 @@
 {{- if .Values.networkPolicy.enabled }}
 {{- $np := .Values.networkPolicy }}
-# Forecaster: reached only by the operator (and the configured scrapers); talks only to DNS, the API server, Prometheus.
+# Forecaster: reached only by the operator (and the configured scrapers); egress only to DNS, the configured Prometheus
+# peers and ports, and the Kubernetes API rule (with networkPolicy.kubeAPI.cidrs empty, the default, that rule allows
+# ANY destination on kubeAPI.ports; see docs/helm.md).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

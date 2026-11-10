@@ -5,7 +5,9 @@ explains every feature you can see or change. It is written for an operator who 
 pages hold the full details; this guide links them where they matter.
 
 > **Status:** a research prototype, tested only in test environments with generated load. It has no published
-> performance figures. Try it on a test cluster first, and keep a reactive autoscaler you trust ready as a fallback.
+> live-benchmark results; the only published figures come from offline evaluations on synthetic traffic
+> ([README](../README.md#what-the-measurements-say)). Try it on a test cluster first, and keep a reactive autoscaler you
+> trust ready as a fallback.
 
 Contents:
 [1. What it does](#1-what-it-does-and-when-to-use-it) ·
@@ -102,6 +104,7 @@ prometheus:
 networkPolicy:
   prometheus:                                               # where it runs (or networkPolicy.enabled: false)
     namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: monitoring}}
+    ports: [9090]                                           # its pod port (default [9090]; vmselect: 8481)
 training:
   targets:                                                  # one entry per PredictiveAutoscaler to train for
     - {namespace: shop, name: web-pa, schedule: "0 */6 * * *"}
@@ -118,7 +121,9 @@ cluster, or give several releases disjoint `operator.watchNamespaces`. Other opt
 | Value | What it does |
 |---|---|
 | `operator.watchNamespaces` | Limit the operator to these namespaces (empty: all). |
-| `operator.forecastLedger.enabled` | Keep an append-only JSON-lines ledger of every forecast attempt and decision, for auditing; on an emptyDir unless you give `persistence.existingClaim`. |
+| `operator.rbac.scaleWrite` | `false` makes a shadow install: the operator cannot change any replica count. Keep every autoscaler in Recommend there; one set to Active reports `Ready=False` (`ScalingError`, Forbidden) whenever it would write ([helm.md](helm.md#shadow-recommend-only-installs)). |
+| `operator.forecastLedger.enabled` | Keep an append-only JSON-lines ledger of every forecast attempt and decision, for auditing; on an emptyDir unless you give `persistence.existingClaim`. Its path, its line types, how to read it and its unbounded growth: [helm.md](helm.md#the-forecast-ledger). |
+| `forecaster.engine` | `legacyLstm` (the default) or `statistical`, the preview forecasting service that autoscalers with `spec.prediction.engine: statistical` need ([helm.md](helm.md#statistical-forecaster-profile-preview)). |
 | `forecaster.persistence.*` | The model volume: size, storage class, access mode (`ReadWriteOnce` or `ReadWriteMany`, never `ReadWriteOncePod`), `retain` (`true` by default: the chart-created claim is kept on uninstall), or your own `existingClaim`. |
 | `forecaster.auth.*`, `forecaster.tls.*` | Authentication and TLS between the operator and the forecasting service (on by default; see [Security](#12-security)). |
 | `training.hours`, `training.epochs`, `training.activeDeadlineSeconds` | History per training (168 h), epochs, and the time limit of a training run. |
@@ -403,18 +408,21 @@ Most series carry `application` (the target Deployment's name) and `namespace`:
 - **Guard rails:** `predictive_autoscaler_sanity_rejections_total`, `predictive_autoscaler_overestimate_overrides_total`
   and `predictive_autoscaler_overestimate_streak`.
 
-Two series carry `namespace` and `autoscaler` (the PredictiveAutoscaler's name) instead:
+Five series carry `namespace` and `autoscaler` (the PredictiveAutoscaler's name) instead:
 `predictive_autoscaler_condition{type, status}` (1 for each condition's current status, 0 for the other two) and
-`predictive_autoscaler_forecasting_enabled` (1 unless `spec.prediction.enabled` is false). They disappear with the
-autoscaler. The forecasting service exports its own metrics as well.
+`predictive_autoscaler_forecasting_enabled` (1 unless `spec.prediction.enabled` is false), which disappear with the
+autoscaler, and the three series of engine `statistical` described below
+(`predictive_autoscaler_predictive_extra_replicas`, `predictive_autoscaler_predictive_capped` and
+`predictive_autoscaler_prediction_gate`). The forecasting service exports its own metrics as well.
 
 ### Forecast quality (forecast contract v2, preview)
 
-The statistical forecasting service (forecast contract v2, `window-max-rps/v1`; in development, not in the current
-forecaster image) measures its forecasts against what actually happened. Each forecast covers a fixed future window and
-issues a point peak and, once calibrated, an upper bound for the window's peak request rate. When the window has passed
-and every sample in it has arrived, the window **matures**: its realised peak is compared with what was issued. Windows
-whose data never arrives are **unscorable** and stay in the availability count; nothing is filled in.
+The statistical forecasting service (forecast contract v2, `window-max-rps/v1`; a preview with its own image, installed
+only with the chart's `forecaster.engine: statistical`) measures its forecasts against what actually happened. Each
+forecast covers a fixed future window and issues a point peak and, once calibrated, an upper bound for the window's peak
+request rate. When the window has passed and every sample in it has arrived, the window **matures**: its realised peak
+is compared with what was issued. Windows whose data never arrives are **unscorable** and stay in the availability
+count; nothing is filled in.
 
 Its series (all listed here) carry `namespace`, `autoscaler` and `model` (`seasonal_naive`, `statistical` or `lstm`),
 and at most one more fixed label:
@@ -452,19 +460,25 @@ reactive. Time windows are counted in whole hours ("the last day" starts at the 
 up to an hour shorter). "Ready" here means ready to activate: Recommend mode still makes no writes, and coverage of
 forecast windows is not a latency or error-rate guarantee.
 
-**What the operator does with it** (`spec.prediction.engine: statistical`). It never takes the service's word for a
-write. It publishes the lead it needs: a startup budget (pod creation to Ready of the current ReplicaSet's pods once 20
-starts are measured, otherwise `spec.behavior.startup.fallbackDelaySeconds`), plus a decision interval and an allowance
-that also covers the time from the scale request to the pod's creation. It asks for the window starting at the current
-grid time and checks the answer itself: identity, settings, window, an upper bound backed by enough evidence, and enough
-time left in the window, checked again right before the write. Only then does the bound count:
-`ceil(bound / capacityPerReplica)` replicas, but never more than `spec.prediction.predictiveExtra` above the reactive need
-(2 replicas or 50 % by default). Everything else stays as described here: the reactive need, the hold on missing
-telemetry, headroom, stabilization and every write check; Recommend never writes. `kubectl get pa -o yaml` shows it in
-`status.prediction`; `PredictionReady` says whether it would be used; the decision ledger links each decision to the
-forecast's `issuance_id`. The operator exports `predictive_autoscaler_predictive_extra_replicas`,
-`predictive_autoscaler_predictive_capped` and `predictive_autoscaler_prediction_gate`. A scale-out that cannot
-complete (unschedulable pods, an exceeded quota) shows as `ScaleOutBlocked` on every autoscaler. Details:
+**What the operator does with it** (`spec.prediction.engine: statistical`). The engine needs the chart installed with
+`forecaster.engine: statistical`; that profile serves no v1 forecasts, so autoscalers without the engine are
+reactive-only there, and an autoscaler with the engine gets no forecast from the default `legacyLstm` install. **In this
+preview no forecast adds replicas:** the service marks every answer ineligible until its release gates pass, so
+`PredictionReady` stays False and decisions stay reactive (the only exception is the lab-qualified evaluation build
+described in [helm.md](helm.md#statistical-forecaster-profile-preview)). The rest of this paragraph describes what the
+operator checks once an answer is eligible. It never takes the service's word for a write. It publishes the lead it
+needs: a startup budget (pod creation to Ready of the current ReplicaSet's pods once 20 starts are measured, otherwise
+`spec.behavior.startup.fallbackDelaySeconds`), plus a decision interval and an allowance that also covers the time from
+the scale request to the pod's creation. It asks for the window starting at the current grid time and checks the answer
+itself: identity, settings, window, an upper bound backed by enough evidence, and enough time left in the window,
+checked again right before the write. Only then does the bound count: `ceil(bound / capacityPerReplica)` replicas, but
+never more than `spec.prediction.predictiveExtra` above the reactive need (2 replicas or 50 % by default). Everything
+else stays as described here: the reactive need, the hold on missing telemetry, headroom, stabilization and every write
+check; Recommend never writes. `kubectl get pa -o yaml` shows it in `status.prediction`; `PredictionReady` says whether
+it would be used; the decision ledger links each decision to the forecast's `issuance_id`. The operator exports
+`predictive_autoscaler_predictive_extra_replicas`, `predictive_autoscaler_predictive_capped` and
+`predictive_autoscaler_prediction_gate`. A scale-out that cannot complete (unschedulable pods, an exceeded quota) shows
+as `ScaleOutBlocked` on every autoscaler. Details:
 [configuration.md](configuration.md#forecast-contract-v2-engine-statistical-preview).
 
 ### The Help & Overview dashboard
@@ -527,7 +541,7 @@ Reference: [helm.md, Monitoring](helm.md#monitoring).
   configured API ports (443 and 6443)**; set it to your API server's addresses.
 - **Permissions:** each part has its own service account. The operator reads autoscalers, Deployments and the other
   scalers, and writes only `deployments/scale`, its status, events and its leader-election Lease; with
-  `operator.watchNamespaces` set, those writes are granted only in the listed namespaces (its own namespace keeps just the Lease and its events). The forecasting
+  `operator.watchNamespaces` set, those writes are granted only in the listed namespaces (its own namespace keeps just the Lease and its events). With `operator.rbac.scaleWrite: false` (a shadow install) it may not write `deployments/scale` at all. The forecasting
   service and the trainer only read autoscalers and Deployments (plus TokenReviews for the service). No role can read
   Secrets or create Pods or Jobs. Every container runs non-root with a read-only root filesystem and no capabilities.
 - The plain manifests in `k8s-manifests/` do not have these protections; use the chart.
@@ -556,8 +570,10 @@ hand a capacity-only object back to an older Active operator
 
 **Forecast contract v2 (CRD revision 4).** Revision 4 adds the v2 settings under `spec.prediction`,
 `spec.behavior.startup` and `status.prediction`. Nothing changes for an autoscaler without `engine: statistical`. To try
-the statistical engine, set `spec.behavior.startup.fallbackDelaySeconds` too (or wait for 20 measured starts): without a
-startup budget there is no lead, and decisions stay reactive.
+the statistical engine, install the chart with `forecaster.engine: statistical` and set
+`spec.behavior.startup.fallbackDelaySeconds` too (or wait for 20 measured starts): without a startup budget there is no
+lead. In this preview decisions stay reactive either way: no forecast is eligible to add replicas
+([section 11](#forecast-quality-forecast-contract-v2-preview)).
 
 **Forecast families (CRD revision 5).** `spec.prediction.families` restricts the statistical forecaster's candidates;
 `[seasonalNaive]` never forecasts or selects E1-product. Apply the CRD before the operator
@@ -588,7 +604,8 @@ With Argo CD the CRD (and, with `retain: true`, the model claim) are also protec
 | `Ready=False`, `CrossNamespaceTarget` | `targetDeployment.namespace` differs from the autoscaler's namespace. | Create the autoscaler in the Deployment's namespace. |
 | `Ready=False`, `DeploymentNotFound` | Wrong Deployment name, or it does not exist yet. | Fix `targetDeployment.name`. |
 | `Ready=False`, `InvalidMetricQuery` | The query uses template features other than `{{ .Namespace }}` / `{{ .Name }}`, or is too long. | Rewrite the query ([configuration.md](configuration.md)). |
-| `TelemetryAvailable=False`, `MetricsUnavailable`; replicas do not change | The query returns no series, several series or an error; or the metrics store is down. | Run `status.metricSource.query` against your metrics store; aggregate to one series; check label names (`namespace` vs `exported_namespace`) and that a Service name differs from the Deployment name. |
+| `Ready=False`, `ScalingError` | The write to `/scale` failed. With a Forbidden message on a shadow install (`operator.rbac.scaleWrite: false`), the operator has no permission to scale. | Set the autoscaler back to `mode: Recommend`, or install with `operator.rbac.scaleWrite: true` ([helm.md](helm.md#shadow-recommend-only-installs)). Otherwise read the condition message and the operator's RBAC. |
+| `TelemetryAvailable=False`, `MetricsUnavailable`; replicas do not change | The query returns no series, several series or an error; the metrics store is down; or the NetworkPolicy port does not match the metrics store (`networkPolicy.prometheus.ports`, default 9090). | Run `status.metricSource.query` against your metrics store; aggregate to one series; check label names (`namespace` vs `exported_namespace`) and that a Service name differs from the Deployment name; set `networkPolicy.prometheus.ports` to the store's pod port. |
 | Calculated is empty, `CapacityConfigured=False` (`CapacityMissing`) | Neither `capacityPerReplica` nor `targetRPS` is set. The operator calculates nothing and holds the current count; it no longer assumes a capacity. | Measure the capacity ([how](configuration.md#measuring-capacitypereplica)) and set `metrics.requests.capacityPerReplica`. |
 | `CapacityConfigured=True`, `DeprecatedTargetRPS` | The capacity comes from the deprecated `targetRPS`. | Replace `targetRPS: N` with `capacityPerReplica: "N"` in one change (setting both is rejected). |
 | Calculated is always `minReplicas` | `capacityPerReplica` far too high, or the query counts another workload's traffic or is in the wrong unit (it must be per second). | Check `predictive_autoscaler_current_rpm` against what you expect (requests per minute = 60 × per second). |

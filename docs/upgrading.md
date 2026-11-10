@@ -14,13 +14,16 @@ Revision 4 adds the statistical engine's settings (`spec.prediction.engine` and 
 (`spec.behavior.startup`) and `status.prediction`. Apply the CRD before the operator, as for every revision (the operator
 waits, unready, on an older one). Autoscalers without `engine: statistical` behave exactly as before.
 
-An autoscaler switched to `engine: statistical` needs a startup budget for its forecasts to count: set
+An autoscaler switched to `engine: statistical` needs the chart installed with `forecaster.engine: statistical` (the
+default `legacyLstm` forecasting service does not serve `/v2/predict`) and a startup budget: set
 `spec.behavior.startup.fallbackDelaySeconds` to a conservative scale-out-to-Ready time, or let the operator measure 20
-starts. It also reads the target's ReplicaSets and pods (`get`/`list`) to measure starts and to report
-`ScaleOutBlocked`. The chart grants these with a new role, `<release>-operator-targets`, bound like the write role (only
-in `operator.watchNamespaces` when set); the plain manifests in `k8s-manifests/` grant them cluster-wide. Where they are
-not granted it reports `PodsUnreadable` and uses only the configured budget. Switching back (`engine: legacyLstm` or no
-engine) returns to the v1 path; `status.prediction` and `PredictionReady` are removed.
+starts. In this preview its forecasts are published and scored but never add replicas: no answer is eligible until the
+forecasting service's release gates pass, so decisions stay reactive. It also reads the target's ReplicaSets and pods
+(`get`/`list`) to measure starts and to report `ScaleOutBlocked`. The chart grants these with a new role,
+`<release>-predictive-autoscaler-operator-targets`, bound like the write role (only in `operator.watchNamespaces` when
+set); the plain manifests in `k8s-manifests/` grant them cluster-wide. Where they are not granted it reports
+`PodsUnreadable` and uses only the configured budget. Switching back (`engine: legacyLstm` or no engine) returns to the
+v1 path; `status.prediction` and `PredictionReady` are removed.
 
 ## capacityPerReplica replaces the hidden defaults
 
@@ -192,5 +195,6 @@ Exit status of the tool: 0 done, 1 a check failed (nothing further was changed),
 (default `kubectl`) and `--context`.
 
 ### History
-The 2026-10 benchmark campaign on prodcluster ran on `autoscaler.example.com`. To reproduce a past run, check out its
+The 2026-10 benchmark campaign on `prodcluster` (the name of the author's self-hosted test cluster, not a production
+environment) ran on `autoscaler.example.com`. To reproduce a past run, check out its
 pinned commit rather than the renamed tree.
