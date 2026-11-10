@@ -20,8 +20,8 @@ Built by [Bakmurat Kubanaliev](#author). Apache-2.0.
 |---|---|
 | **Demand forecasting** | A three-layer bidirectional LSTM (128/64/32 units) forecasts the next 60 minutes of request rate in six 10-minute steps from the last 24 hours of history. |
 | **Asymmetric training objective** | The loss penalizes under-prediction twice as heavily as over-prediction, because scaling too late costs more than scaling too early. |
-| **Hybrid forecast** | Model output is blended with the workload's own previous-day time-of-day pattern, looked up by timestamp over up to seven prior days (pattern weight 0.70 at the first step rising to 0.908 at the sixth), so forecasts keep the shape of the daily peak instead of regressing to the mean. When less than a day of history is available the pattern is unavailable and the network is served alone, which the response reports. |
-| **Seasonal-ensemble forecaster (opt-in)** | A second forecasting path that needs no neural network: the equal-weight average of an additive daily Holt-Winters model and a seven-day same-slot profile with an AR(3) residual correction, refitted on 00/06/12/18 UTC, plus a capacity margin equal to the 90th percentile of its own recent lead-window errors (never negative). It is selected per application through `ENSEMBLE_EXPERIMENT` (`ml-engine/models/seasonal_ensemble.py`), stateless per request, and refuses a partial forecast so the operator falls back to its reactive rule. |
+| **Hybrid forecast** | Model output is blended with the workload's own previous-day time-of-day pattern, looked up by timestamp over up to seven prior days (the pattern weight is selected at every training on held-out data: the pattern alone unless a blend with a network share does measurably better there; the earlier fixed schedule, 0.70 at the first step rising to 0.908 at the sixth, is one of the candidates), so forecasts keep the shape of the daily peak instead of regressing to the mean. When less than a day of history is available the pattern is unavailable and the network is served alone, which the response reports. |
+| **Seasonal-ensemble forecaster (benchmark tooling only)** | A second forecasting path that needs no neural network: the equal-weight average of an additive daily Holt-Winters model and a seven-day same-slot profile with an AR(3) residual correction, refitted on 00/06/12/18 UTC, plus a capacity margin equal to the 90th percentile of its own recent lead-window errors (never negative). It is an experiment arm of the benchmark tooling, not a selectable product feature: the forecasting service accepts `ENSEMBLE_EXPERIMENT` (`ml-engine/models/seasonal_ensemble.py`) only with `ALLOW_BENCHMARK_EXPERIMENTS=1`, the Helm chart exposes neither variable, and its answers carry no query attestation, so the product operator refuses them and applies its reactive rule. It is stateless per request and refuses a partial forecast. |
 | **Continuous learning** | A scheduled job retrains every six hours on the previous seven days and publishes the model to the forecasting service without downtime. |
 | **Declarative operator** | A Go operator (controller-runtime) driven by a `PredictiveAutoscaler` custom resource: target Deployment, replica bounds, per-pod targets, horizon, lead time, and reconcile interval. |
 | **Additive safety model** | Replicas are set to the **highest** of the forecast baseline, the live reactive requirement, and the configured minimum. The forecast can only add capacity. |
@@ -52,7 +52,7 @@ VictoriaMetrics ──► Collector ──► Training job (every 6 h) ──►
 
 Predictive Autoscaler was developed and evaluated in a dedicated Kubernetes environment with a purpose-built harness: a k6 traffic generator replaying a full 24-hour daily traffic profile against a stock nginx Deployment with a 1 to 40 replica range, run side by side with an identical Deployment scaled by KEDA alone as the control. The harness ships in `examples/` so anyone can reproduce the setup. Across a dozen operator releases (v3.1.1 to v4.3.0) this loop drove every design decision listed under [Lessons learned](#lessons-learned).
 
-Accuracy figures are deliberately not published yet. A controlled, repeatable benchmark with held-out days and a documented metric is the first item on the roadmap, and numbers will be published with it.
+No live-benchmark result is published. The figures under [What the measurements say](#what-the-measurements-say) come from offline evaluations on synthetic traffic: they are limited in scope and are not a controlled live benchmark. A controlled, repeatable benchmark with held-out days and a documented metric is on the roadmap, and its numbers will be published with it.
 
 ## Getting started
 
@@ -116,7 +116,7 @@ The operator's `predictive_autoscaler_predicted_rpm` gauge reports the raw peak 
 
 ```sh
 cd k8s-operator && go test -race ./...
-cd ml-engine    && pip install -r requirements.txt && python -m pytest tests
+cd ml-engine    && pip install -r requirements.txt -r requirements-dev.txt && python -m pytest tests
 ```
 
 **Publication is gated on `make verify` returning 0.** `scripts/verify.sh` is the one checked
@@ -151,7 +151,7 @@ Both suites pass. Last full run 2026-09-20: Go `go vet` + `go test -race` green;
 | Path | Contents |
 |---|---|
 | `ml-engine/` | Forecasting service: FastAPI application (`api/`), model code (`models/lstm_model.py`), VictoriaMetrics collector (`data/`), training scripts (`training/`), unit tests (`tests/`), `Dockerfile`. |
-| `ml-engine/forecasting/` | Forecast contract v2 (`window-max-rps/v1`, design C2), in progress and not yet served: typed v2 request/response and settings fingerprint (`contracts.py`), the strict parameterized RPS history reader (`history.py`), the SQLite WAL issuance/outcome journal (`store.py`), receipt clocks (`clock.py`), window maturation (`maturation.py`), the seasonal-naive and E1-product kernels (`statistical.py`), pickle-free fit artifacts with atomic promotion (`artifacts.py`), the bounded fit worker (`worker.py`), window-maximum calibration (`calibration.py`), evidence gates with fallback and hysteresis (`trust.py`), the same-policy cost simulator held to the operator's Go replay by a generated fixture (`policy_sim.py`), the lab-only qualification of a pinned evaluation build (`qualification.py`), bounded forecast-quality metrics (`metrics.py`) and the service that ties them together (`service.py`), served by the TensorFlow-free app `api/statistical.py` (image `ml-engine/Dockerfile.statistical`, chart `forecaster.engine: statistical`). Free of TensorFlow, pandas and scikit-learn by test. |
+| `ml-engine/forecasting/` | Forecast contract v2 (`window-max-rps/v1`, design C2), in progress: typed v2 request/response and settings fingerprint (`contracts.py`), the strict parameterized RPS history reader (`history.py`), the SQLite WAL issuance/outcome journal (`store.py`), receipt clocks (`clock.py`), window maturation (`maturation.py`), the seasonal-naive and E1-product kernels (`statistical.py`), pickle-free fit artifacts with atomic promotion (`artifacts.py`), the bounded fit worker (`worker.py`), window-maximum calibration (`calibration.py`), evidence gates with fallback and hysteresis (`trust.py`), the same-policy cost simulator held to the operator's Go replay by a generated fixture (`policy_sim.py`), the lab-only qualification of a pinned evaluation build (`qualification.py`), bounded forecast-quality metrics (`metrics.py`) and the service that ties them together (`service.py`), served by the TensorFlow-free app `api/statistical.py` (image `ml-engine/Dockerfile.statistical`, chart `forecaster.engine: statistical`). Free of TensorFlow, pandas and scikit-learn by test. |
 | `ml-engine/evaluation/` | The network-free chronological replay runner for v2 (`forecast_replay.py`) and content-hashed dataset manifests with synthetic series (`datasets.py`). |
 | `k8s-operator/` | Go operator: CRD types (`api/v1alpha1/`), reconciler and overestimate logic (`controllers/`), sample custom resources (`config/samples/`), `Dockerfile`. |
 | `k8s-manifests/base/` | Kustomize base: namespace, CRD, RBAC, both Deployments, the training CronJob, the model volume, and VictoriaMetrics scrape objects. |
@@ -175,9 +175,9 @@ Both suites pass. Last full run 2026-09-20: Go `go vet` + `go test -race` green;
    and a production-equivalent training configuration, judged against the strongest baseline.
    Reject invalid forecasts through a documented fallback and report raw and guarded outputs
    separately.
-2. The live benchmark (`deploy/eks-benchmark/`) now runs five arms on identical traffic (the neural/seasonal hybrid, reactive-only, KEDA, seasonal-only and the seasonal ensemble with its margin), and from 2026-09-28 a declared challenge workload (`deploy/eks-benchmark/workload/challenge-v1/`: the same daily cycle with bounded correlated noise, drift and level shifts). Results will be published with their method after a human-declared start of scoring and complete scored days, whatever they show.
+2. A live benchmark of several arms on identical traffic (among them the neural/seasonal hybrid, reactive-only, KEDA, seasonal-only and the seasonal ensemble with its margin), with a declared challenge workload (`deploy/eks-benchmark/workload/challenge-v1/`: the same daily cycle with bounded correlated noise, drift and level shifts). The EKS environment that ran it (`deploy/eks-benchmark/`) was torn down on 2026-10-02. The same benchmark was later deployed as a new campaign on a self-hosted cluster in the author's own test environment (`deploy/prodcluster/`; "prodcluster" is that cluster's name, not a production environment), and nothing measured on EKS is pooled with it. Results will be published with their method after a human-declared start of scoring and complete scored days, whatever they show.
 3. Validation of the newest forecasting model (five input features, direct six-step output, robust scaling) against the benchmark.
-4. Adaptive blend weights in place of the fixed 0.70-to-0.908 schedule.
+4. Adaptive blend weights in place of the fixed 0.70-to-0.908 schedule: a per-training selection on held-out data is implemented (`ml-engine/training/blend_selection.py`); no benchmark result for it is published.
 5. A training-time validation gate so a new model can never replace a better one.
 6. Broader training and storage support, CPU and memory forecasting, and a signed release. The generated CRD, source Helm chart and kind installation checks are available now.
 
@@ -207,15 +207,15 @@ A bounded stabilisation experiment ([`eval/RESULTS-stabilization-2026-09-22.md`]
 Treat the neural component as experimental and optional. It is not the reason this system
 works, and the project should not be described as though it were.
 
-Every number is from synthetic traffic: the benchmark cluster has not accumulated enough real
-history to score. Nothing here measures latency — the replay models capacity arriving, not
+Every number is from synthetic traffic: when this evaluation was run, the benchmark cluster had
+not accumulated enough real history to score. Nothing here measures latency — the replay models capacity arriving, not
 response time. An earlier version of this section, built on a run whose stress scenarios never
 entered the scored window, has been withdrawn.
 
 ## Limitations
 
-- Not deployed to production anywhere; evaluated so far only against synthetic traffic in the author's own environments. The first controlled evaluation is published in `eval/RESULTS-2026-09-22-corrected.md` (the 2026-09-21 run was withdrawn) and it does not support the neural component; a live benchmark is running (`deploy/eks-benchmark/`) and its results will be published the same way, whatever they show.
-- The LSTM's training is not numerically stable: on identical data, separate runs produced errors ten orders of magnitude apart. The cause is not established -- the `relu` activation in the LSTM layers is one hypothesis, and the unseeded initialisation is another. Until it is understood, an invalid forecast has no documented rejection path.
+- Not deployed to production anywhere; evaluated so far only against synthetic traffic in the author's own environments. The first controlled evaluation is published in `eval/RESULTS-2026-09-22-corrected.md` (the 2026-09-21 run was withdrawn) and it does not support the neural component. No live-benchmark result is published (the EKS benchmark environment, `deploy/eks-benchmark/`, was torn down on 2026-10-02); any such result will be published the same way, whatever it shows.
+- The LSTM's training is not numerically stable: on identical data, separate runs produced errors ten orders of magnitude apart. The cause is not established -- the `relu` activation that the LSTM layers used at the time is one hypothesis, and the unseeded initialisation is another. The trainer now defaults to `tanh`, which was not shown to remove the divergence outright (see above). The operator discards a forecast whose first step exceeds ten times the live rate and applies the reactive rule (see Guard rails).
 - The seasonal ensemble implements Holt-Winters on NumPy/SciPy (the serving image has no statsmodels). Tests match its initial states and recursion to statsmodels and require an equal or lower fit error, but it is not the statsmodels code. Its margin is empirical, not a coverage guarantee, and a refit that lands inside a traffic burst can make it over-forecast for a while.
 - One target metric in practice (request rate per pod); CPU and memory paths exist in the schema but are not trained.
 - Model files live on a ReadWriteOnce volume, so a single forecasting replica is supported.
