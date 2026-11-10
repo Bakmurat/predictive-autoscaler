@@ -39,7 +39,7 @@ and new autoscalers run in Recommend mode (they publish recommendations and chan
 
 | Component | Runs as | Can do | Writes to |
 |---|---|---|---|
-| operator (Deployment; leader election always on; one replica and Recreate when the ledger uses a claim) | uid 65532 | read autoscalers and Deployments; write replicas only through `deployments/scale` (none with `operator.rbac.scaleWrite: false`, a shadow Recommend-only install: the operator may then only get `deployments/scale`, and an Active autoscaler's write fails with Forbidden), its status and events, cluster-wide when every namespace is watched, otherwise only in `operator.watchNamespaces` (the reads stay cluster-wide; the release namespace gets only the Lease and its events). The watched namespaces must exist before install, and when you narrow or change them on an upgrade, check that the old write bindings are gone (with pruning off, Argo CD keeps them); read HPAs, KEDA ScaledObjects, VPAs and legacy-group autoscalers (coexistence); get/list the ReplicaSets and Pods of its targets (startup measurement, `ScaleOutBlocked`), bound like the writes; read its own CRD (revision gate); emit events; a Lease in the release namespace | nothing (or `/var/lib/predictive-autoscaler` with `operator.forecastLedger.enabled`) |
+| operator (Deployment; leader election always on; one replica and Recreate when the ledger uses a claim) | uid 65532 | read autoscalers and Deployments; write replicas only through `deployments/scale` (none with `operator.rbac.scaleWrite: false`, a shadow Recommend-only install: the operator may then only get `deployments/scale`, and an Active autoscaler's write fails with Forbidden; with `operator.rbac.scaleTargets`, a list of Deployment names, `update` on `deployments/scale` carries `resourceNames` with exactly those names while `get` stays unrestricted, see below), its status and events, cluster-wide when every namespace is watched, otherwise only in `operator.watchNamespaces` (the reads stay cluster-wide; the release namespace gets only the Lease and its events). The watched namespaces must exist before install, and when you narrow or change them on an upgrade, check that the old write bindings are gone (with pruning off, Argo CD keeps them); read HPAs, KEDA ScaledObjects, VPAs and legacy-group autoscalers (coexistence); get/list the ReplicaSets and Pods of its targets (startup measurement, `ScaleOutBlocked`), bound like the writes; read its own CRD (revision gate); emit events; a Lease in the release namespace | nothing (or `/var/lib/predictive-autoscaler` with `operator.forecastLedger.enabled`) |
 | forecasting service (Deployment, 1 replica) | uid 10001 | get autoscalers and Deployments; create TokenReviews when authentication is enabled | `/models` (the model volume), `/tmp` (an emptyDir with a size limit) |
 | trainer (one CronJob per `training.targets` entry) | uid 10001 | get autoscalers and Deployments | `/models`, `/tmp` |
 
@@ -48,6 +48,34 @@ seccomp `RuntimeDefault`. HOME, TMPDIR, the XDG and Keras directories point into
 Pods or read Secrets; Pods and ReplicaSets are only read (get/list), by the operator, where it scales. The chart has no cold start: retrain by hand with
 `kubectl -n <ns> create job --from=cronjob/<cronjob> <name>` (the CronJob's annotation
 `autoscaling.devkuban.com/training-target` names its autoscaler).
+
+### Limiting the replica write to named Deployments
+
+`operator.rbac.scaleTargets` (a list of Deployment names, empty by default) narrows the one replica write the operator
+has:
+
+| `scaleWrite` | `scaleTargets` | Rules on `apps` `deployments/scale` in the write role |
+|---|---|---|
+| `true` (default) | `[]` (default) | `get`, `update` in one rule, no names: every Deployment where the role is bound (unchanged) |
+| `true` | `[web, api]` | `get` in its own rule, no names; `update` with `resourceNames: [web, api]` |
+| `false` | `[]` | `get` only (a shadow install) |
+| `false` | not empty | refused at render time (the intent is ambiguous) |
+
+- For a subresource, `resourceNames` holds the parent object's name, so the entries are the Deployments' names. Only
+  the write verb the chart grants (`update`) carries them; no `patch` is granted. Names must be distinct DNS-1123
+  names.
+- The names apply in every namespace the write role is bound in: each of `operator.watchNamespaces` (one RoleBinding
+  per namespace), or the whole cluster when no namespace is watched. To allow `web` in `shop` only, set both
+  `watchNamespaces: [shop]` and `scaleTargets: [web]`; with several watched namespaces a Deployment of that name is
+  writable in each of them.
+- RBAC binds names, not objects. A Deployment deleted and recreated under an allowed name is still authorized by RBAC;
+  the operator's own target-UID guard still refuses to write the replaced object.
+- An autoscaler whose target is not listed keeps working in Recommend mode; in Active mode its write fails with
+  Forbidden, as in a shadow install.
+- After changing the list, check the effective permissions as the operator's ServiceAccount, for example
+  `kubectl auth can-i update deployments/web --subresource=scale -n shop --as system:serviceaccount:<release namespace>:<operator ServiceAccount>`
+  (expect `yes` for a listed name and `no` for any other name or namespace). Bindings made outside the chart can
+  grant more than the chart renders, so check the answer, not only the rendered role.
 
 ## The CRD
 

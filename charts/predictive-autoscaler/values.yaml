@@ -29,6 +29,11 @@ operator:
     # change any replica count even if an autoscaler is set to Active (that write fails with Forbidden). Status,
     # events and the leader-election Lease are unchanged.
     scaleWrite: true
+    # With scaleWrite true: the Deployments, by name, the operator may write through deployments/scale. Empty: every
+    # Deployment where the write role is bound (each of watchNamespaces, or the whole cluster). The names apply in
+    # every bound namespace, so pair them with watchNamespaces to limit writes to named Deployments in named
+    # namespaces. Reading /scale stays unrestricted. Not allowed with scaleWrite false.
+    scaleTargets: []
   # host:port the operator dials instead of the forecaster Service (empty: the Service). For an evaluation-owned route
   # in front of the forecaster (C2.8's scheduled forecast outages). With authentication on, the host must be listed in
   # forecaster.tls.extraDNSNames, so certificate verification stays on.

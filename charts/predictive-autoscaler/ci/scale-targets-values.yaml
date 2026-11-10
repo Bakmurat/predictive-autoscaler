@@ -1,0 +1,14 @@
+# Replica writes limited to named Deployments in named namespaces: update on deployments/scale carries resourceNames
+# (operator.rbac.scaleTargets), bound only in operator.watchNamespaces; reading /scale stays unrestricted.
+prometheus:
+  url: http://prometheus-server.monitoring.svc.cluster.local:80
+networkPolicy:
+  prometheus:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: monitoring
+operator:
+  watchNamespaces: [shop]
+  rbac:
+    scaleWrite: true
+    scaleTargets: [web, api]
