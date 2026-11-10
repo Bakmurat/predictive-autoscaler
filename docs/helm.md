@@ -52,14 +52,24 @@ Pods or read Secrets; Pods and ReplicaSets are only read (get/list), by the oper
 
 ## Shadow (Recommend-only) installs
 
-`operator.rbac.scaleWrite: false` installs the operator without permission to change any replica count: its role keeps
-only `get` on `deployments/scale`. Its status updates, events and the leader-election Lease are unchanged.
+With `operator.rbac.scaleWrite: false` the chart grants only `get` on `deployments/scale`. Verify that no other
+binding grants the operator ServiceAccount replica-write permissions: the chart controls only its own roles. The
+operator's status updates, events and the leader-election Lease are unchanged.
+
+```
+kubectl auth can-i update deployments.apps/<name> --subresource=scale -n <namespace> \
+  --as=system:serviceaccount:<release-namespace>:<release>-predictive-autoscaler-operator
+```
+
+The answer should be `no` for every target Deployment. (Write the resource as `deployments.apps/<name>` with
+`--subresource=scale`: `deployments/scale` is read as a Deployment named "scale".)
 
 - Keep every autoscaler in `mode: Recommend` on such an install. Recommend never writes, so nothing is refused.
-- An autoscaler set to `Active` still decides, but whenever its decision differs from the current count the write is
-  refused by the API server (Forbidden). The autoscaler then reports `Ready=False` and `ScalingActive=False` with reason
-  `ScalingError`, and the operator tries again after a minute. With the chart's alerts on,
-  `PredictiveAutoscalerNotReady` fires after `notReadyFor` (15 minutes).
+- An autoscaler set to `Active` still decides and still attempts the write whenever its decision differs from the
+  current count. If no other binding grants the write, the API server refuses it (Forbidden): the autoscaler then
+  reports `Ready=False` and `ScalingActive=False` with reason `ScalingError`, and the operator tries again after a
+  minute; with the chart's alerts on, `PredictiveAutoscalerNotReady` fires after `notReadyFor` (15 minutes). If another
+  binding does grant it, the write succeeds and the Deployment is scaled.
 - To allow scaling later, set `operator.rbac.scaleWrite: true` and run `helm upgrade`.
 
 ## The forecast ledger
@@ -79,12 +89,12 @@ only `get` on `deployments/scale`. Its status updates, events and the leader-ele
   survives, set `operator.forecastLedger.persistence.existingClaim`; that needs `operator.replicas: 1`, and the chart
   then uses the `Recreate` strategy.
 - **How to read it:** the operator image has no shell or `tar` (`gcr.io/distroless/static`), so `kubectl exec ... cat`
-  and `kubectl cp` do not work on it. With an `existingClaim`, mount the claim in a pod of your own (on the operator's
-  node when the claim is ReadWriteOnce). With the default `emptyDir`, the file can be reached only from an ephemeral
-  debug container attached to the operator pod (`kubectl debug`).
+  and `kubectl cp` do not work on it, and the chart provides no reader. Reading the ledger requires access that you
+  configure and authorize separately. The recommended setup is a retained claim (`existingClaim`) and a reader pod of
+  your own that mounts it read-only (on the operator's node when the claim is ReadWriteOnce).
 - **Size:** the file is append-only and the operator neither rotates nor truncates it, and the default `emptyDir` has
   no size limit. It grows by about one decision line per reconcile per autoscaler, plus the forecast lines. Size the
-  claim for it, and prune or rotate the file yourself.
+  claim for it. Rotation and pruning are yours to do: preserve or archive the evidence first.
 
 ## The CRD
 
