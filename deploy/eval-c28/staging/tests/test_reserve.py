@@ -146,6 +146,19 @@ def test_verify_reports_unplanned_stateful_and_broad_tolerations(api, make_recor
     assert "ops/Deployment/agent tolerates the run taint" in text
 
 
+def test_verify_never_reads_an_unanswered_pod_list_as_no_occupants(api, make_record):
+    """Review 2026-11-10 R2-16: a pod LIST answered "not found" made reserve.verify see no occupants on W and S."""
+    record, kube = setup(api, make_record)
+    do_apply(record, kube)
+    api.put(F.pod("shop-1", "shop", "worker-w", owner=("Deployment", "shop")))
+    real = api.get
+    api.get = lambda path: None if path == "/api/v1/pods" else real(path)
+    with pytest.raises(X.ReadFailed, match="no list response"):
+        reserve.verify(record, kube)
+    api.get = real
+    assert reserve.verify(record, kube)["result"] == "FAIL"
+
+
 def test_verify_passes_with_only_allowed_and_evaluation_pods(api, make_record):
     record, kube = setup(api, make_record)
     do_apply(record, kube)

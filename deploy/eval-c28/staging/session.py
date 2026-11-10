@@ -1517,13 +1517,17 @@ def acknowledgment(c: Context, fetch: Callable[[str], Dict], begin: int, k6: str
 
 
 def watch(c: Context, start_digest: str, fetch: Callable[[str], Dict] = _http_json, interval: int = 30,
-          max_checks: int = 10 ** 6) -> Dict:
+          max_checks: int = 10 ** 6, retry: C.RetryPolicy = C.READ_RETRY) -> Dict:
     """Check every `interval` seconds; on a stop condition, an observation or API failure, or the deadline, stop the
     session's own objects (authorised by the digest of the reviewed start plan that created them). A stop that cannot
-    complete is recorded as unresolved and reported, never as success."""
+    complete is recorded as unresolved and reported, never as success. One failed read is not yet a failure: the
+    query API's reads are retried per `retry` (C.RetryingFetch; kubectl reads carry the same policy in KubectlApi),
+    and only a read that stays failed is the observation or API failure that stops the session. A contract violation
+    that was read successfully stops at once, as before."""
     state = session_state(X.receipts(c.record, HELPER), c.session_id)
     if state is None or state["begin"]["data"].get("plan_sha256") != start_digest:
         raise X.StagingError("the watchdog needs the digest of the reviewed start plan of the open session")
+    fetch = C.RetryingFetch(fetch, retry, c.sleep)
     for _ in range(max_checks):
         try:
             v = verify(c, fetch)

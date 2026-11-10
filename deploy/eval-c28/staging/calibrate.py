@@ -190,12 +190,28 @@ VerticalPodAutoscalers as resource writers: a VPA on a calibration object is all
 Off (the plan's resource_writers); any other mode, including the API's default Auto, or a change away from Off, is a
 stop.
 
+Failed reads. Every Kubernetes read (KubectlApi.get) and every observer query (Context.fetch) is retried a bounded
+number of times (common_records.READ_RETRY: three attempts over 20 s; a refusal such as 403 or an HTTP 4xx is an answer
+and is not retried); a mutation is never retried. Each failed attempt is kept as a fixed category (timeout, connection,
+...; never the error's text) and journalled as a read-retried receipt with the executor's next receipt; a retried
+evidence query also carries failed_attempts in its own record. An observer query that still fails stays a missing
+observation (the trial stops as incomplete, as before). A Kubernetes read that still fails inside a trial stops that
+trial as incomplete evidence (trial-stopped, or trial-not-started before its begin; Halt incomplete), not as an
+executor error that closes the calibration STOPPED; a failed read between trials, inside a journalled scale step or
+during cleanup keeps its earlier handling, and a failed writer discovery or reservation read stays the gate problem
+it was.
+
 Interruption. Everything runs under the shared evaluation lock (execlib.mutating) with intents before and outcomes
 after each create, delete and /scale step; an unknown outcome keeps the lock until `recover`. Trial boundaries
 (trial-begin, trial-result, trial-stopped, trial-interrupted) and every decision are receipts. Cleanup deletes the
 generator Jobs first and proves their pods gone before touching the fixture; an ambiguous write or an unproven cleanup
 keeps the lock. An interrupted measurement stays recorded as interrupted and is never resumed: after a crash, recover
-and stop close the calibration as STOPPED; a new attempt is a new contract.attempt and a new ID. `status` (read-only)
+and stop close the calibration as STOPPED; a new attempt is a new contract.attempt and a new ID. A journal whose last
+line is a torn append (the executor killed inside a receipt's write) refuses plan, apply, verify, stop and stop-plan
+(TornReceipt, a StagingError naming the line and byte offset); status and request-stop read past it and status reports
+it (journal.torn_tail); recover-plan lists it and recover, once the executor is proven ended, copies the torn bytes
+into the evidence (receipts/calibrate.jsonl.torn-<offset>-<sha12>), cuts them off the log, records
+journal-tail-repaired and reconciles the half-recorded step like any unresolved intent. `status` (read-only)
 reports an unfinished trial as running only while the calibrate executor that took the lock before its trial-begin is
 still alive (executor_liveness: same host and boot, PID and process start time, not a zombie), as unverified when
 that cannot be established here (another host, an unreadable lock or process, an ambiguous lock/begin time order), and
@@ -1099,9 +1115,12 @@ def resolve_query(con: Dict, target: str, name: str, pods: str = "") -> str:
     return q.replace("__NAMESPACE__", con["namespace"]).replace("__TARGET__", target).replace("__PODS__", pods)
 
 
-def query_range(fetch: Callable[[str], Dict], con: Dict, query: str, start: int, end: int) -> Dict:
-    """One raw range query, recorded as asked and as answered (a failure is recorded, never a value)."""
-    step = con["observer"]["step_s"]
+def query_range(fetch: Callable[[str], Dict], con: Dict, query: str, start: int, end: int,
+                step: Optional[int] = None) -> Dict:
+    """One raw range query, recorded as asked and as answered (a failure is recorded, never a value). Through
+    Context.fetch a failed read is retried (C.RetryingFetch); the failed attempts of this query are recorded with it
+    as fixed categories (failed_attempts), whether it then answered or stayed a missing observation."""
+    step = con["observer"]["step_s"] if step is None else step
     q = urllib.parse.urlencode({"query": query, "start": start, "end": end, "step": step})
     rec = {"query": query, "start": start, "end": end, "step": step}
     try:
@@ -1109,6 +1128,8 @@ def query_range(fetch: Callable[[str], Dict], con: Dict, query: str, start: int,
         rec["response"] = json.loads(json.dumps(doc, allow_nan=False))
     except Exception as e:          # noqa: BLE001 - any failure is a missing observation
         rec["error"] = type(e).__name__
+    if getattr(fetch, "last", None):
+        rec["failed_attempts"] = list(fetch.last)
     return rec
 
 
@@ -1355,14 +1376,7 @@ def steal_verdict(con: Dict, obs: Optional[Dict], start: int, end: int) -> Tuple
 
 
 def steal_query(fetch, con: Dict, start: int, end: int) -> Dict:
-    q = urllib.parse.urlencode({"query": con["stops"]["steal_query"], "start": start, "end": end, "step": 60})
-    rec = {"query": con["stops"]["steal_query"], "start": start, "end": end, "step": 60}
-    try:
-        rec["response"] = json.loads(json.dumps(fetch(f"{con['observer']['query_api'].rstrip('/')}"
-                                                      f"/api/v1/query_range?{q}"), allow_nan=False))
-    except Exception as e:          # noqa: BLE001 - any failure is a missing observation
-        rec["error"] = type(e).__name__
-    return rec
+    return query_range(fetch, con, con["stops"]["steal_query"], start, end, step=60)
 
 
 def pods_up(obs: Dict, expected: List[str], at_start: int, at_end: int, con: Dict) -> str:
@@ -2166,9 +2180,16 @@ def summarize(con: Dict, cal: str, con_sha: str, trials: List[Dict], halt: Optio
 # --- the live context -----------------------------------------------------------------------------------------------
 
 class Context:
+    """The live calibration: record, cluster, observer, clock. `retry` is the policy of the observer's reads (fetch
+    is wrapped in C.RetryingFetch; the Kubernetes reads carry their own in KubectlApi); tests pass their own policy
+    and clock, so nothing sleeps for real."""
+
     def __init__(self, record: X.Record, kube: X.Kube, fetch: Callable[[str], Dict] = _http_json,
-                 now: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep):
-        self.record, self.kube, self.fetch, self.sleep = record, kube, fetch, sleep
+                 now: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep,
+                 retry: C.RetryPolicy = C.READ_RETRY):
+        self.record, self.kube, self.sleep, self.retry = record, kube, sleep, retry
+        self.read_failures: List[Dict] = []     # failed observer read attempts not yet journalled
+        self.fetch = fetch
         self._now = now
         self.c28 = X.import_harness()
         if self.c28.frozen.REQUEST_TIMEOUT_S != REQUEST_TIMEOUT_S:      # pragma: no cover
@@ -2180,6 +2201,14 @@ class Context:
         self.nm = names(self.cal)
         self.dir = os.path.join(record.evidence_dir, "calibrate", self.cal)
 
+    @property
+    def fetch(self) -> Callable[[str], Dict]:
+        return self._fetch
+
+    @fetch.setter
+    def fetch(self, fn: Callable[[str], Dict]) -> None:
+        self._fetch = C.RetryingFetch(fn, self.retry, lambda s: self.sleep(s), self.read_failures)
+
     def now(self) -> int:
         return int(self._now())
 
@@ -2187,7 +2216,26 @@ class Context:
         return X.receipts(self.record, HELPER)
 
     def receipt(self, event: str, data: Dict) -> Dict:
+        self.journal_read_failures()
         return X.receipt(self.record, HELPER, event, {"calibration": self.cal, **data})
+
+    def journal_read_failures(self) -> None:
+        """A read-retried receipt for the failed read attempts since the last one (Kubernetes: KubectlApi's
+        read_failures; observer: this context's), as counts per fixed category, so the evidence shows that a retry
+        happened. Written with the executor's next receipt; the read-only commands never call it."""
+        api_log = getattr(self.kube.api, "read_failures", None) or []
+        logs = {"kubernetes": list(api_log), "observer": list(self.read_failures)}
+        del api_log[:], self.read_failures[:]
+        if not any(logs.values()):
+            return
+        data = {"calibration": self.cal}
+        for source, log in logs.items():
+            by: Dict[str, int] = {}
+            for f in log:
+                by[f["category"]] = by.get(f["category"], 0) + 1
+            data[source] = {"failed_attempts": len(log), "by_category": dict(sorted(by.items()))}
+        data["kubernetes"]["paths"] = sorted({f["path"] for f in logs["kubernetes"]})[:20]
+        X.receipt(self.record, HELPER, "read-retried", data)
 
     def own(self) -> List[Dict]:
         return owned_objects(self.entries(), self.cal)
@@ -3095,12 +3143,30 @@ def trial_meta(ctx: Context, index: int, kind: str, role: str, n: int, rate: int
 
 
 def run_trial(ctx: Context, meta: Dict, decision_sha: str, guard: Optional[Dict] = None) -> Dict:
+    """One trial (_trial). A Kubernetes read that still fails after its retries (X.ReadFailed: no answer, nothing
+    written) is incomplete evidence about this trial, never an executor error: before trial-begin it is recorded as
+    trial-not-started, after it the trial is stopped like any other (stop_trial: arrivals first, its pods proven
+    gone), and either way Halt("incomplete") ends the search through the usual path. A failed MUTATION is not
+    converted: its unknown outcome still keeps the lock for recover."""
+    state: Dict = {"begun": False, "juid": "", "files": []}
+    try:
+        return _trial(ctx, meta, decision_sha, guard, state)
+    except X.ReadFailed as e:
+        reason = f"a Kubernetes read failed after its retries ({e}): incomplete evidence, not a measured outcome"
+        if state["begun"]:
+            stop_trial(ctx, meta, state["juid"], reason, "incomplete", state["files"])
+        ctx.receipt("trial-not-started", {"trial": meta, "problems": [reason]})
+        raise Halt("incomplete", reason) from e
+
+
+def _trial(ctx: Context, meta: Dict, decision_sha: str, guard: Optional[Dict], state: Dict) -> Dict:
     """One trial: gate (configuration, writers, reservation, steal, observer proof, ...), for a selection the idle
     interval with its proof, a quiet ingress reading, the Job, monitoring every poll_s, a final gate once the Job
     completed, the after reading past the grace period, raw observations over the ACTUAL measurement window (the k6
     measure scenario's recorded start), the Job's deletion with its pods proven gone, then the verdict (evaluate_trial
     on the raw files). A gate violation stops the trial and raises Halt. `guard`: the plateau's recorded rollout-guard
-    snapshot (guard_snapshot), compared at every gate: a replacement, restart or template change stops the trial."""
+    snapshot (guard_snapshot), compared at every gate: a replacement, restart or template change stops the trial.
+    `state` tells run_trial how far the trial got (begun, the Job's UID, its evidence files)."""
     se, con = ctx.con["search"], ctx.con
     guard = guard if guard is not None else guard_snapshot(ctx)
     trial, n, rate = meta["id"], meta["n"], meta["rate_per_min"]
@@ -3158,6 +3224,7 @@ def run_trial(ctx: Context, meta: Dict, decision_sha: str, guard: Optional[Dict]
     files = [ctx.write(f"{tdir}/job.json", job), ctx.write(f"{tdir}/pods-begin.json", pods_begin)]
     ctx.receipt("trial-begin", {"trial": meta, "decision_sha256": decision_sha, "job_sha256": X.json_digest(job),
                                 "guard_sha256": X.json_digest(guard), "files": files})
+    state.update(begun=True, files=files)
     wp = writer_problems(ctx)                    # fresh discovery immediately before the load write
     if wp:
         # No Job was created. stop_trial with an empty UID deletes nothing; its pod proof covers only this
@@ -3169,7 +3236,7 @@ def run_trial(ctx: Context, meta: Dict, decision_sha: str, guard: Optional[Dict]
         stop_trial(ctx, meta, "", "before the generator Job: " + "; ".join(wp) + note, "stopped", files)
     ctx.kube.journal.context = {"calibration": ctx.cal, "phase": "trial", "trial": trial, "role": "generator"}
     created = ctx.kube.create(job, pre_write=_census_pre_write(ctx, f"Job/{job['metadata']['name']}"))
-    juid = created["metadata"]["uid"]
+    juid = state["juid"] = created["metadata"]["uid"]
     hard = ctx.now() + job["spec"]["activeDeadlineSeconds"] + 120
     gen_re = f"{job['metadata']['name']}-[a-z0-9]+"
     while True:
@@ -3624,7 +3691,8 @@ def stop(ctx: Context, reviewed: Dict, reviewed_digest: str, reason: str = "oper
 
 
 def request_stop(ctx: Context, reason: str) -> Dict:
-    if calibration_state(ctx.entries(), ctx.cal) != "open":
+    # read past a torn last line: this runs beside the live executor, whose append in progress must not refuse a stop
+    if calibration_state(X.receipts_scan(ctx.record, HELPER)[0], ctx.cal) != "open":
         raise X.StagingError(f"calibration {ctx.cal} is not open")
     out = ctx.write("stop-request.json", {"reason": reason[:300], "at": _ts(ctx.now())})
     return {"calibration_id": ctx.cal, "stop_request": out}
@@ -3744,8 +3812,10 @@ def _orders_before(lock_at, begin_at) -> bool:
 def status(ctx: Context) -> Dict:
     """Read-only. interrupted lists the unfinished trials whose executor has ended (or cannot have written them);
     running the one trial a live executor is measuring now; unverified one whose executor cannot be established here
-    as alive or ended (unfinished_trials, executor_liveness)."""
-    entries = ctx.entries()
+    as alive or ended (unfinished_trials, executor_liveness). A torn last journal line (an append cut by a kill, or
+    one being written this instant) is read past and reported under journal.torn_tail; every other command refuses
+    it until recover has set it aside."""
+    entries, torn = X.receipts_scan(ctx.record, HELPER)
     trials, _ = _trial_records(entries, ctx.cal, ctx.dir) if os.path.isdir(ctx.dir) else ([], [])
     state = calibration_state(entries, ctx.cal)
     liveness = executor_liveness(ctx.record) if state == "open" else None
@@ -3760,7 +3830,10 @@ def status(ctx: Context) -> Dict:
             "running": unfinished["running"], "unverified": unfinished["unverified"],
             "interrupted": unfinished["interrupted"], "executor": liveness,
             "decisions": [e["data"]["step"] for e in entries if _mine(e, ctx.cal) and e["event"] == "decision"],
-            "closed": closed, "open_intents": X.open_intents(entries)}
+            "closed": closed, "open_intents": X.open_intents(entries),
+            "journal": {"receipts": len(entries), "torn_tail": None if torn is None else dict(
+                torn, note="the last line is a torn append and is ignored here" if torn["state"] == "partial" else
+                "the last receipt is complete but lacks its line end; it is counted here")}}
 
 
 def verify(ctx: Context) -> Dict:

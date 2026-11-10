@@ -57,6 +57,105 @@ def test_the_kubectl_client_is_explicit_and_fails_closed():
         C.KubectlApi({"path": "k", "context": "c"}, run=Run(rc=1, err="not found")).delete("/x", "u")
 
 
+class Answers:
+    """A kubectl stub that answers each call in turn from (returncode, stdout, stderr); the last answer repeats."""
+
+    def __init__(self, *answers):
+        self.answers, self.calls = answers, []
+
+    def __call__(self, args, input=None, capture_output=True, text=True):
+        self.calls.append(args)
+        rc, out, err = self.answers[min(len(self.calls), len(self.answers)) - 1]
+        return type("P", (), {"returncode": rc, "stdout": out, "stderr": err})()
+
+
+def test_a_failed_read_is_retried_a_bounded_number_of_times_and_a_mutation_never():
+    """Review 2026-11-10 F4: every kubectl read was single-shot, so one hiccup ended a calibration. A get is retried
+    per the policy (three attempts over 20 s by default), each failed attempt kept as a fixed category; a refusal or a
+    404 is an answer; replace, create and delete are attempted exactly once whatever the error."""
+    kc, slept = {"path": "k", "context": "c"}, []
+    timeout = (1, "", "Unable to connect to the server: net/http: TLS handshake timeout; Bearer hunter2")
+    run = Answers(timeout, (1, "", "error: unexpected EOF hunter2"), (0, '{"items": []}', ""))
+    api = C.KubectlApi(kc, run=run, sleep=slept.append)
+    assert (C.READ_RETRY.attempts, C.READ_RETRY.delays) == (3, (5, 15))
+    assert api.get("/api/v1/pods") == {"items": []} and len(run.calls) == 3 and slept == [5, 15]
+    assert api.read_failures == [{"path": "/api/v1/pods", "attempt": 1, "category": "timeout"},
+                                 {"path": "/api/v1/pods", "attempt": 2, "category": "error"}]
+    assert "hunter2" not in json.dumps(api.read_failures)
+    run, slept = Answers(timeout), []                            # the API stays away: three attempts, then the error
+    api = C.KubectlApi(kc, run=run, sleep=slept.append)
+    with pytest.raises(C.ApiError) as e:
+        api.get("/api/v1/pods")
+    assert e.value.status == 504 and len(run.calls) == 3 and slept == [5, 15] and "hunter2" not in str(e.value)
+    assert [f["attempt"] for f in api.read_failures] == [1, 2, 3]
+    run = Answers((0, '{"items": [', ""), (0, "{}", ""))         # a cut answer is a failed read, not an object
+    api = C.KubectlApi(kc, run=run, sleep=slept.append)
+    assert api.get("/api/v1/pods") == {} and api.read_failures[0]["category"] == "malformed"
+    for err, attempts in (("Error from server (NotFound): pods \"x\" not found", 1),      # an answer: absent
+                          ("Error from server (Forbidden): no", 1), ("Error from server (InternalError): x", 3)):
+        run = Answers((1, "", err))
+        api = C.KubectlApi(kc, run=run, sleep=lambda s: None)
+        try:
+            assert api.get("/x") is None
+        except C.ApiError:
+            pass
+        assert len(run.calls) == attempts, err
+    single = C.KubectlApi(kc, run=(run := Answers(timeout)), retry=C.NO_RETRY, sleep=slept.append)
+    with pytest.raises(C.ApiError):
+        single.get("/x")
+    assert len(run.calls) == 1
+    for write in (lambda a: a.replace("/x", {"spec": {}}), lambda a: a.create("/x", {"spec": {}}),
+                  lambda a: a.delete("/x", "uid-1")):
+        run, slept = Answers(timeout, (0, "{}", "")), []
+        api = C.KubectlApi(kc, run=run, sleep=slept.append)
+        with pytest.raises(C.ApiError):
+            write(api)
+        assert len(run.calls) == 1 and slept == [] and api.read_failures == []
+
+
+def test_a_read_is_absent_only_on_the_api_servers_own_not_found():
+    """Review 2026-11-10 R2-16: any kubectl stderr containing "not found" made a GET return None ("absent"). Only the
+    API server's NotFound answer does; the same words from the client side (a missing host, context or binary) are a
+    failed read: retried, then an error."""
+    kc = {"path": "k", "context": "c"}
+    for err in ('Unable to connect to the server: dial tcp: lookup rancher.example: host not found',
+                'error: context "prodcluster" not found', "kubectl: command not found"):
+        run = Answers((1, "", err))
+        api = C.KubectlApi(kc, run=run, sleep=lambda s: None)
+        with pytest.raises(C.ApiError) as e:
+            api.get("/api/v1/pods")
+        assert e.value.status is None and len(run.calls) == 3, err
+    absent = C.KubectlApi(kc, run=Answers((1, "", 'Error from server (NotFound): pods "x" not found')))
+    assert absent.get("/api/v1/namespaces/demo/pods/x") is None
+    with pytest.raises(C.NotFound):                                      # a write's 404 is unchanged
+        C.KubectlApi(kc, run=Answers((1, "", "not found"))).delete("/x", "u")
+
+
+def test_a_failed_query_read_is_retried_and_only_its_category_is_kept():
+    import urllib.error
+    calls, slept, log = [], [], []
+
+    def flaky(url):
+        calls.append(url)
+        if len(calls) < 3:
+            raise urllib.error.URLError("refused: http://user:hunter2@host")
+        return {"status": "success"}
+    fetch = C.RetryingFetch(flaky, sleep=slept.append, failures=log)
+    assert fetch("http://q") == {"status": "success"} and slept == [5, 15] and fetch.last == ["connection"] * 2
+    assert log == [{"attempt": 1, "category": "connection"}, {"attempt": 2, "category": "connection"}]
+
+    def bad_query(url):
+        calls.append(url)
+        raise urllib.error.HTTPError(url, 422, "hunter2", {}, None)
+    calls.clear()
+    fetch = C.RetryingFetch(bad_query, sleep=slept.append)
+    with pytest.raises(urllib.error.HTTPError):
+        fetch("http://q")
+    assert len(calls) == 1 and fetch.last == ["http-422"]          # the API's answer: not retried
+    assert [C.fetch_category(e) for e in (TimeoutError(), ConnectionResetError(), ValueError("x"), KeyError("x"))] == \
+        ["timeout", "connection", "malformed", "error"]
+
+
 def test_a_mutation_needs_the_reviewed_plan(tmp_path):
     rec = record(tmp_path)
     plan = C.make_plan("legacy", rec, [{"step": 1, "op": "scale"}])
@@ -87,6 +186,69 @@ def test_evidence_is_written_once_and_receipts_are_chained(tmp_path):
     open(path, "w").write("\n".join(lines) + "\n")
     with pytest.raises(C.StagingError, match="hash chain"):
         C.read_receipts(path)
+
+
+def test_a_torn_last_receipt_line_is_refused_reported_and_set_aside_never_dropped(tmp_path):
+    """Review 2026-11-10 F5: an executor killed inside append_receipt's write left a JSONDecodeError traceback in
+    every command. A torn LAST line is a TornReceipt (a StagingError) for every mutating reader, a read-only scan
+    reads past it and says so, and a recovery copies the torn bytes aside before it cuts them off the log."""
+    rec = record(tmp_path)
+    C.append_receipt(rec, "legacy", "one", {"n": 1})
+    b = C.append_receipt(rec, "legacy", "two", {"n": 2})
+    path = C.receipts_path(rec, "legacy")
+    whole = open(path, "rb").read()
+    torn = b'{"data": {"calibration": "c28cal-x", "trial": {"id": "t0'
+    open(path, "ab").write(torn)
+    with pytest.raises(C.TornReceipt, match="torn append") as e:
+        C.read_receipts(path)
+    assert isinstance(e.value, C.StagingError) and e.value.tail["byte_offset"] == len(whole)
+    with pytest.raises(C.TornReceipt):                       # nothing is ever appended after a torn line
+        C.append_receipt(rec, "legacy", "three", {"n": 3})
+    entries, tail = C.scan_receipts(path)
+    assert [r["event"] for r in entries] == ["one", "two"]
+    assert tail == {"state": "partial", "line": 3, "byte_offset": len(whole), "bytes": len(torn),
+                    "sha256": C.hashlib.sha256(torn).hexdigest()}
+    with pytest.raises(C.StagingError, match="no longer the reviewed torn tail"):
+        C.set_aside_torn_tail(rec, "legacy", dict(tail, bytes=1))
+    assert open(path, "rb").read() == whole + torn           # a refused repair changes nothing
+    r = C.set_aside_torn_tail(rec, "legacy", tail)
+    saved = f"{path}.torn-{len(whole)}-{tail['sha256'][:12]}"
+    assert open(saved, "rb").read() == torn and r["data"]["saved"] == saved.rsplit("/", 1)[1]
+    after = C.read_receipts(path)
+    assert [x["event"] for x in after] == ["one", "two", "journal-tail-repaired"] and after[2]["prev"] == b["sha256"]
+    assert open(path, "rb").read().startswith(whole)         # the complete receipts are byte-for-byte untouched
+    # a torn line that also got a newline (lost blocks) is still the torn LAST line
+    open(path, "ab").write(b'{"half": \n')
+    assert C.scan_receipts(path)[1]["state"] == "partial"
+
+
+def test_only_the_last_line_can_be_torn_and_a_complete_receipt_is_never_dropped(tmp_path):
+    rec = record(tmp_path)
+    C.append_receipt(rec, "legacy", "one", {"n": 1})
+    C.append_receipt(rec, "legacy", "two", {"n": 2})
+    path = C.receipts_path(rec, "legacy")
+    whole = open(path, "rb").read()
+    lines = whole.split(b"\n")
+    # an unparsable line that is NOT the last one is corruption: every reader refuses, the tolerant scan included
+    open(path, "wb").write(lines[0][:40] + b"\n" + lines[1] + b"\n")
+    for read in (C.read_receipts, C.scan_receipts):
+        with pytest.raises(C.StagingError, match="corrupt") as e:
+            read(path)
+        assert not isinstance(e.value, C.TornReceipt)
+    # the append cut before its final newline: the receipt is complete, kept, and reported as unterminated
+    open(path, "wb").write(whole[:-1])
+    entries, tail = C.scan_receipts(path)
+    assert [r["event"] for r in entries] == ["one", "two"] and tail["state"] == "unterminated" and tail["line"] == 2
+    with pytest.raises(C.TornReceipt, match="without its line end"):
+        C.read_receipts(path)
+    C.set_aside_torn_tail(rec, "legacy", tail)                # completes the line; nothing is cut or copied
+    assert [r["event"] for r in C.read_receipts(path)] == ["one", "two", "journal-tail-repaired"]
+    assert open(path, "rb").read().startswith(whole) and sorted(p.name for p in (tmp_path / "evidence" / "receipts")
+                                                                .iterdir()) == ["legacy.jsonl"]
+    # a last line that parses but breaks the chain is not a torn append
+    open(path, "ab").write(b'{"prev": "00", "sha256": "11"}')
+    with pytest.raises(C.StagingError, match="hash chain"):
+        C.scan_receipts(path)
 
 
 def test_the_cluster_identity_is_checked(tmp_path):

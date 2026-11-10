@@ -423,6 +423,190 @@ def test_crash_mid_trial_is_recorded_interrupted_and_never_resumed(cal, api):
     assert K.reduce_bundle(ctx.dir)["reproduced"]
 
 
+def test_torn_journal_line_after_a_kill_is_reported_refused_and_recovered(cal, api, capsys):
+    """Review 2026-11-10 F5: killed inside a receipt's write, the executor left a torn last journal line and every
+    command (status, recover, stop) died with a JSONDecodeError traceback. status reads past it and reports it;
+    request-stop still works; every other command refuses with a StagingError; recover (owner proven ended) keeps the
+    torn bytes in the evidence and repairs the log; stop then closes the calibration and the bundle reduces."""
+    ctx = cal()
+    real_sleep = ctx.clock.sleep
+
+    def sleep(s):
+        if any(k == "jobs" and n.endswith("t003") for (k, _, n) in api.objects):
+            raise Crash()
+        real_sleep(s)
+    ctx.sleep = sleep
+    with pytest.raises(Crash):
+        run(ctx)
+    ctx.sleep = real_sleep
+    path = C.receipts_path(ctx.record.doc, K.HELPER)
+    whole = open(path, "rb").read()
+    torn = b'{"at": "2026-11-30T00:00:00Z", "data": {"calibration": "' + ctx.cal.encode() + b'", "guard": {"own'
+    open(path, "ab").write(torn)
+    _write_lock(ctx)
+    PF.crash_owner(ctx.record)                                # the lock a killed executor leaves behind
+    st = K.status(ctx)
+    assert st["state"] == "open" and [t["id"] for t in st["interrupted"]] == ["t003"]
+    assert st["journal"]["torn_tail"]["state"] == "partial" and "ignored" in st["journal"]["torn_tail"]["note"]
+    assert st["journal"]["torn_tail"]["byte_offset"] == len(whole) and \
+        st["journal"]["receipts"] == len(whole.splitlines())
+    for refused in (K.plan, K.plan_stop, K.verify):
+        with pytest.raises(C.TornReceipt, match="torn append"):
+            refused(ctx)
+    args = dict(api=api, fetch=ctx.world.fetch, now=ctx.clock.now, sleep=ctx.clock.sleep)
+    assert K.main(["--record", ctx.record.path, "stop-plan"], **args) == 1          # refused, not a traceback
+    assert "refused" in capsys.readouterr().err and open(path, "rb").read() == whole + torn
+    assert K.main(["--record", ctx.record.path, "status"], **args) == 0
+    assert K.request_stop(ctx, "operator")["stop_request"]["path"] == "stop-request.json"
+    rp = X.recover_plan(ctx.record, ctx.kube)
+    assert [(t["helper"], t["state"]) for t in rp["torn_tails"]] == [(K.HELPER, "partial")]
+    assert PF.recover(ctx.record, ctx.kube)["event"] == "lock-recovered" and not lock_held(ctx)
+    kept = [f for f in os.listdir(os.path.dirname(path)) if ".torn-" in f]
+    assert len(kept) == 1 and open(os.path.join(os.path.dirname(path), kept[0]), "rb").read() == torn
+    assert open(path, "rb").read().startswith(whole) and "journal-tail-repaired" in events(ctx)
+    assert K.status(ctx)["journal"]["torn_tail"] is None
+    plan, digest = CW.reviewed(ctx, K.plan_stop, K.STOP, "stop-plan")
+    out = K.stop(ctx, plan, digest, "after a torn journal line")
+    assert out["outcome"] == "STOPPED" and live_calibration_objects(api, ctx.cal) == []
+    assert K.reduce_bundle(ctx.dir)["reproduced"]
+
+
+def _stop_after(ctx, trial):
+    """Ask the executor to stop once `trial` has its result (keeps a simulated run short)."""
+    def hook(world, api_):
+        if os.path.exists(os.path.join(ctx.dir, "trials", trial, "result.json")) and \
+                not os.path.exists(os.path.join(ctx.dir, "stop-request.json")):
+            K.request_stop(ctx, "test: enough")
+    ctx.world.hooks.append(hook)
+
+
+def _in_trial(ctx, trial):
+    return os.path.exists(os.path.join(ctx.dir, "trials", trial, "job.json")) and \
+        not os.path.exists(os.path.join(ctx.dir, "trials", trial, "result.json"))
+
+
+@pytest.mark.parametrize("phase", ["poll", "before-begin"])
+def test_a_failed_kubernetes_read_inside_a_trial_is_incomplete_evidence_not_an_executor_error(cal, api, monkeypatch,
+                                                                                               phase):
+    """Review 2026-11-10 F4: one failed kubectl read at one poll left run_trial as an ApiError, so apply recorded
+    apply-error and closed the calibration STOPPED. A read that still fails after its retries stops THAT trial as
+    incomplete evidence through the usual path (arrivals first, journalled), and the search halts "incomplete"."""
+    ctx = cal()
+    state = {"failed": 0, "armed": False}
+    real_get, real_await = api.get, K.await_observer
+
+    def get(path):
+        if not state["failed"] and path.endswith("/pods") and \
+                (state["armed"] if phase == "before-begin" else _in_trial(ctx, "t005") and state["polls"] >= 2):
+            state["failed"] += 1
+            raise C.ApiError(f"get {path}: failed (timeout, exit 1)", 504)      # what KubectlApi raises at the end
+        return real_get(path)
+
+    def await_observer(ctx_, meta, fstate, guard):
+        state["armed"] = meta["id"] == "t005"
+        return real_await(ctx_, meta, fstate, guard)
+    state["polls"] = 0
+    real_sleep = ctx.clock.sleep
+
+    def sleep(s):
+        state["polls"] += s == ctx.con["search"]["poll_s"] and _in_trial(ctx, "t005")
+        real_sleep(s)
+    api.get, ctx.sleep = get, sleep
+    monkeypatch.setattr(K, "await_observer", await_observer)
+    out = run(ctx)
+    ev, c = events(ctx), cert(ctx)
+    assert state["failed"] == 1 and "apply-error" not in ev and "trial-interrupted" not in ev
+    assert c["outcome"] == "HALTED" and out["verdict"] == "NOT READY" and c["halted"]["category"] == "incomplete"
+    [halt] = [e["data"] for e in ctx.entries() if e["event"] == "search-halted"]
+    assert halt["category"] == "incomplete" and "a Kubernetes read failed after its retries" in halt["reason"]
+    if phase == "poll":
+        [stopped] = [e["data"] for e in ctx.entries() if e["event"] == "trial-stopped"]
+        assert stopped["trial"]["id"] == "t005" and stopped["category"] == "incomplete"
+        assert ev.index("trial-stopping") < ev.index("trial-stopped")
+    else:
+        [not_started] = [e["data"] for e in ctx.entries() if e["event"] == "trial-not-started"]
+        assert not_started["trial"]["id"] == "t005" and "trial-stopped" not in ev
+    assert live_calibration_objects(api, ctx.cal) == [] and not lock_held(ctx)
+    assert K.reduce_bundle(ctx.dir)["reproduced"]
+
+
+def test_a_failed_mutation_inside_a_trial_is_never_read_as_a_failed_read(cal, api):
+    ctx = cal()
+    real = api.create
+
+    def create(path, body):
+        if body["kind"] == "Job":
+            raise C.ApiError("create: failed (timeout)", 504)          # unknown outcome
+        return real(path, body)
+    api.create = create
+    with pytest.raises(X.StagingError):
+        run(ctx)
+    assert lock_held(ctx) and X.open_intents(ctx.entries()) and "trial-stopped" not in events(ctx)
+
+
+def _refuse(ctx, when, times):
+    """The query API refuses `times` connections for the queries `when(url)` selects (below the retry layer)."""
+    import urllib.error
+    seen = {"refused": 0}
+    world_fetch = ctx.world.fetch
+
+    def fetch(url):
+        if seen["refused"] < times and when(urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)):
+            seen["refused"] += 1
+            raise urllib.error.URLError("connection refused")
+        return world_fetch(url)
+    ctx.fetch = fetch
+    return seen
+
+
+def test_one_refused_observer_query_is_retried_and_the_retry_is_in_the_evidence(cal):
+    """Review 2026-11-10 F4 (observer half): one refused query at one poll (the port-forward restarting) stopped the
+    trial and with it the calibration. The read is retried; the journal's read-retried receipt and the evidence
+    query's own failed_attempts show that it was."""
+    ctx = cal()
+    live = _refuse(ctx, lambda q: _in_trial(ctx, "t005") and "node_cpu_seconds_total" in q["query"][0], 1)
+    _stop_after(ctx, "t005")
+    run(ctx)
+    r = json.load(open(os.path.join(ctx.dir, "trials", "t005", "result.json")))
+    assert live["refused"] == 1 and r["verdict"] in ("PASS", "FAIL") and "trial-stopped" not in events(ctx)
+    [retried] = [e["data"] for e in ctx.entries() if e["event"] == "read-retried"]
+    assert retried["observer"] == {"failed_attempts": 1, "by_category": {"connection": 1}}
+    assert retried["kubernetes"]["failed_attempts"] == 0
+    # an evidence query (the measurement window's queue series) that needed a second attempt says so itself
+    ctx = cal({"attempt": 2})
+    window = _refuse(ctx, lambda q: "c28_queue" in q["query"][0] and "timestamp(" not in q["query"][0]
+                     and int(q["end"][0]) - int(q["start"][0]) == 900, 2)
+    _stop_after(ctx, "t003")
+    run(ctx)
+    obs = json.load(open(os.path.join(ctx.dir, "trials", "t003", "observations.json")))
+    assert window["refused"] == 2 and obs["fixture_queue"]["failed_attempts"] == ["connection", "connection"]
+    assert "response" in obs["fixture_queue"] and "failed_attempts" not in obs["fixture_cpu_cores"]
+    assert json.load(open(os.path.join(ctx.dir, "trials", "t003", "result.json")))["incomplete"] == []
+    assert K.reduce_bundle(ctx.dir)["reproduced"]
+
+
+def test_an_observer_query_that_keeps_failing_is_still_a_missing_observation(cal):
+    ctx = cal()
+    seen = _refuse(ctx, lambda q: _in_trial(ctx, "t005") and "node_cpu_seconds_total" in q["query"][0], 10 ** 6)
+    out = run(ctx)
+    [stopped] = [e["data"] for e in ctx.entries() if e["event"] == "trial-stopped"]
+    assert stopped["trial"]["id"] == "t005" and stopped["category"] in ("incomplete", "stopped")
+    assert "required observation missing: steal" in stopped["reason"] and "(URLError)" in stopped["reason"]
+    assert out["verdict"] == "NOT READY" and seen["refused"] >= ctx.retry.attempts
+    retried = [e["data"] for e in ctx.entries() if e["event"] == "read-retried"]
+    assert sum(r["observer"]["failed_attempts"] for r in retried) == seen["refused"]
+    # the policy is the context's: with none, the first refusal is final
+    single = K.Context(ctx.record, ctx.kube, fetch=ctx.world.fetch, now=ctx.clock.now, sleep=ctx.clock.sleep,
+                       retry=C.NO_RETRY)
+    calls = []
+
+    def refused(url):
+        calls.append(url)
+        raise OSError("refused")
+    single.fetch = refused
+    assert "error" in K.query_range(single.fetch, single.con, "up", 0, 60) and len(calls) == 1
+
+
 def _bundle_bytes(ctx):
     out = {}
     for root, _, fs in os.walk(ctx.dir):
@@ -1908,9 +2092,10 @@ def test_w4_a_served_writer_api_must_answer_with_a_list(cal, api, kind, answer):
     probs = K.writer_problems(ctx)
     api.get = real
     assert any("listing a served writer API failed" in p and "no list response" in p for p in probs), probs
-    # other callers keep the lenient list
+    # every other caller's list is strict too (review 2026-11-10 R2-16): no list answer is never "no objects"
     api.get = lambda path: None if path == missing else real(path)
-    assert ctx.kube.list(kind, None) == []
+    with pytest.raises(X.ReadFailed, match="no list response"):
+        ctx.kube.list(kind, None)
     api.get = real
 
 

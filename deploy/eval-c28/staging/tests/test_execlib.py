@@ -141,6 +141,70 @@ def test_lost_response_keeps_the_shared_lock_until_recovery(api, make_record):
     assert X.open_intents(X.receipts(record, "prepare")) == []
 
 
+def test_a_list_that_is_not_answered_is_never_read_as_no_objects(api, make_record):
+    """Review 2026-11-10 R2-16: Rancher answering one LIST with "not found" (a proxy or agent hiccup) made Kube.list
+    return [] outside the writer census: no generator pods, no occupants. Every list is strict: an empty collection is
+    {"items": []}; no list answer is a failed read (ReadFailed), retried per the API client's read policy."""
+    record = X.load_record(make_record())
+    k = record.kube(api)
+    assert k.list("Pod", "demo") == []                                   # the collection exists and is empty
+    real = api.get
+    api.get = lambda path: None if path.endswith("/pods") else real(path)    # every LIST of pods: "not found"
+    for call in (lambda: k.list("Pod"), lambda: k.list("Pod", "demo", labels={"a": "b"})):
+        with pytest.raises(X.ReadFailed, match="no list response"):
+            call()
+    api.get = lambda path: {"kind": "Status", "status": "Failure"} if path.endswith("/pods") else real(path)
+    with pytest.raises(X.ReadFailed, match="no list response"):
+        k.list("Pod")
+    # through kubectl: the 404 for a collection is tried again like any failed read, then raised; a recovery is used
+    from test_common import Answers
+    nf = (1, "", "Error from server (NotFound): the server could not find the requested resource")
+    slept = []
+    run = Answers(nf)
+    kube = X.Kube(C.KubectlApi({"path": "k", "context": "c"}, run=run, sleep=slept.append), record.cluster_uid)
+    with pytest.raises(X.ReadFailed, match="no list response"):
+        kube.list("Pod")
+    assert len(run.calls) == 3 and slept == [5, 15]
+    assert [f["category"] for f in kube.api.read_failures] == ["not a list"] * 3
+    run = Answers(nf, (0, '{"items": [{"metadata": {"name": "p"}}]}', ""))
+    kube = X.Kube(C.KubectlApi({"path": "k", "context": "c"}, run=run, sleep=slept.append), record.cluster_uid)
+    assert [p["metadata"]["name"] for p in kube.list("Pod")] == ["p"] and len(run.calls) == 2
+    one = X.Kube(C.KubectlApi({"path": "k", "context": "c"}, run=Answers(nf)), record.cluster_uid)
+    assert one.get("Pod", "x", "demo") is None                           # a single object's 404 stays "absent"
+
+
+def test_a_torn_outcome_receipt_is_set_aside_by_recover_and_its_step_reconciled(api, make_record):
+    """Review 2026-11-10 F5: the executor was killed inside the write of a step's outcome receipt. Every mutating
+    command refuses the journal before it takes a lock; recover-plan reads past the torn line and lists it; recover
+    needs the owner proven ended, keeps the torn bytes in the evidence, and reconciles the half-recorded step."""
+    record = X.load_record(make_record())
+    k = record.kube(api)
+    with X.mutating(record, k, "prepare"):
+        k.create({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "c28-x", "namespace": "demo"}})
+    path = C.receipts_path(record.doc, "prepare")
+    intent, step = open(path, "rb").read().split(b"\n")[:2]
+    open(path, "wb").write(intent + b"\n" + step[:len(step) // 2])       # killed inside the step-1 append
+    lock = PF.lock_file(record)
+    with pytest.raises(C.TornReceipt), X.mutating(record, k, "session"):   # ANY part-2 helper, before the lock
+        pass
+    assert not os.path.exists(lock)
+    C.exclusive_lock(record.doc, X.LOCK_SCOPE, holder="prepare").__enter__()    # the lock the dead executor left
+    rp = X.recover_plan(record, k)
+    assert [(t["helper"], t["state"], t["line"]) for t in rp["torn_tails"]] == [("prepare", "partial", 2)]
+    [a] = rp["actions"]
+    assert a["step"] == "1" and a["observed"] == "done"                  # the create happened; its outcome was torn
+    before = open(path, "rb").read()
+    with pytest.raises(X.StagingError, match="still running"):           # never while its writer may live
+        saved = X.save_plan(record, "recover", rp, "recover-plan")
+        X.recover(record, k, X.load_plan(saved["plan"]), saved["plan_digest"])
+    assert open(path, "rb").read() == before
+    PF.recover(record, k)
+    kept = [f for f in os.listdir(os.path.dirname(path)) if ".torn-" in f]
+    assert len(kept) == 1 and open(os.path.join(os.path.dirname(path), kept[0]), "rb").read() == step[:len(step) // 2]
+    assert [e["event"] for e in X.receipts(record, "prepare")] == ["intent-1", "journal-tail-repaired", "reconciled-1"]
+    assert not os.path.exists(lock) and X.open_intents(X.receipts(record, "prepare")) == []
+
+
 def test_swallowed_unknown_outcome_still_keeps_the_lock(api, make_record):
     record = X.load_record(make_record())
     k = record.kube(api)
