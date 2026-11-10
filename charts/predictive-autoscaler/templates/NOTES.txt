@@ -36,7 +36,7 @@ least the required one.
 TLS: the forecasting service uses a self-signed certificate (Secret {{ include "pa.fullname" . }}-forecaster-tls). It is
 NOT renewed automatically, and changing selfSigned.validityDays does not renew an existing one (upgrades keep it).
 Check the real expiry (notAfter) of the certificate in that Secret's tls.crt; before it, delete the Secret and run
-helm upgrade. For production prefer forecaster.tls.source=certManager (automatic renewal).
+helm upgrade. For long-running installs prefer forecaster.tls.source=certManager (automatic renewal).
 {{- end }}
 {{- if and (not .Values.forecaster.persistence.existingClaim) (not .Values.forecaster.persistence.retain) }}
 

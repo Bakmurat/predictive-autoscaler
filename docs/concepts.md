@@ -29,4 +29,6 @@
 
 ## Evidence trail
 The ledger (`FORECAST_LOG`) records every forecast attempt (issued, refused, unavailable) and every decision with its
-inputs, which makes each scaling action auditable afterwards. The research evaluation in this repository uses it.
+inputs, which makes each scaling action auditable afterwards. The research evaluation in this repository uses it. With
+the chart it is off by default; its path, its line types and how to read it are in
+[helm.md](helm.md#the-forecast-ledger).

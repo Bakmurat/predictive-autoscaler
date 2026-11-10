@@ -1,8 +1,11 @@
 # C2.8 evaluation fixture and harness
 
-Offline code for the C2.8 study (`agent-coordination/09-real-world-research/EVAL-C28-MANIFEST.md`, sections 3–9 and
-the prodcluster adaptation in section 11). Nothing here runs an experiment, deploys to a lab cluster or produces C2.8
-evidence by itself. The executor uses it under a locked run-lock and the change gates of manifest section 11.4.
+Offline code for the C2.8 study (the study manifest `EVAL-C28-MANIFEST.md`, sections 3–9 and the prodcluster
+adaptation in section 11). The manifest and its staging plan are kept outside this repository; "manifest section N"
+and "STAGING Sn" below refer to them. `prodcluster` is the name of the author's self-hosted test cluster, not a
+production environment ("prod" below is short for it). Nothing here runs an experiment, deploys to a lab cluster or
+produces C2.8 evidence by itself. The executor uses it under a locked run-lock and the change gates of manifest section
+11.4.
 
 | Path | What it is |
 |---|---|
@@ -12,20 +15,21 @@ evidence by itself. The executor uses it under a locked run-lock and the change 
 | `harness/c28/` | `render` (fixture, ingress with its namespaced EndpointSlice-reader ServiceAccount/Role/RoleBinding, routes, quota and the five arms for both startup profiles, with an exclusive-writer audit, a sidecar-free audit, an RBAC least-privilege audit and the residency budget), `schedule` (programs, k6 plans, fault timetable, the frozen session order), `runlock`, `collect` (hashed evidence bundle), `reduce` (per-window metrics), `score` (paired day-block bootstrap, Holm correction, the section 8 classification), `inject` (the guarded quota fault). `frozen.py` holds every value the manifest freezes. |
 | `trace/` | PROPOSAL (draft contract v2, pending Codex review): the pre-declared selection and transformation of the Azure Functions 2019 trace (CC BY 4.0) for a separate public-trace demonstration. Not part of C2.8 scoring and no replacement for the manifest's ordinary warm-up. `azure_functions_2019.py select|prepare|plan|rules` (standard library, one file, run with `python -I`): each stage checks the reviewed sha256 of its input and records the hashes it was built from (source, selection, prepared, plan), validates schema, membership, length and transformation consistency, and never overwrites an output. `plan` emits exactly the `c28-k6-plan/v1` that `load/c28.js` accepts (kind `trace-demo`), one constant rate per trace minute, so each minute's scheduled count equals its intended count; `tests/c28js_loader.js` runs the real `c28.js` validator on it under node. Generated requests are "derived from per-minute invocation counts", never real arrival timestamps or real traffic. `k6_points.py` sums k6 counter samples into per-minute "metric-point buckets" anchored to a declared scenario start (emission/completion time, so not dispatch or ingress receipt times). It never runs a forecaster. |
 | `params/` | `kind-smoke.json` for the kind smoke. `prodcluster.template.json` lists what the run-lock must resolve; it cannot be rendered until every placeholder is replaced (the calibrated fixture resources and the W/S residency inputs included). |
-| `smoke/kind.sh` | The aspire kind-bed smoke, on its own cluster and kubeconfig only. `--render-only` renders and audits offline; `scripts/verify.sh` runs that mode. |
+| `smoke/kind.sh` | The kind smoke (a host with docker and kind), on its own cluster and kubeconfig only. `--render-only` renders and audits offline; `scripts/verify.sh` runs that mode. |
 | `smoke/calibrate-kind.sh` | The kind smoke of the calibration path (`--images images.json --out report.json`, own cluster and kubeconfig only, reviewed digests pulled on the nodes): non-root summary delivery through the termination message, the actual scenario timing, zero drops reconciled against the ingress's own counters, reported drops with starved VUs, refusal of truncated or malformed summaries, UID-bound stop, `activeDeadlineSeconds` expiry, cleanup and image identity (`calibrate_kind.py`). Required before any prod calibration; not C2.8 evidence. |
 
 ```sh
 cd deploy/eval-c28/harness
 python -m c28 render --params ../params/kind-smoke.json --out /tmp/c28.yaml
-python -m c28 plan --kind scored --seed 201 --capacity 35 --target c28-pa-n-s20 --out plan.json
+python -m c28 plan --kind scored --seed 201 --capacity 35 --target c28-pa-n-s20 --out plan-201-c28-pa-n-s20.json
 python -m c28 order
 python -m c28 runlock lock runlock.json && python -m c28 runlock verify runlock.json --manifest-root <dir>
 python -m c28 release-values --params P --out release-values.yaml   # the evaluation release's routes and TLS name
 python -m c28 residency --params P          # W/S maximum resident requests against 75 % of allocatable (exit 1 when over)
 python -m c28 collect --runlock runlock.json --targets c28-pa-n-s20 --start 2026-11-20T00:00:00Z \
   --end 2026-11-21T00:00:00Z --out bundle/ --file plan=plan-201-c28-pa-n-s20.json --file ledgers=decisions.jsonl
-python -m c28 reduce --runlock runlock.json --bundle bundle/ --target c28-pa-n-s20 --block-start 2026-11-20T00:00:00Z
+python -m c28 reduce --runlock runlock.json --bundle bundle/ --target c28-pa-n-s20 --block-start 2026-11-20T00:00:00Z \
+  --seed 201
 python -m c28 score --runlock runlock.json --study study.json
 ```
 
