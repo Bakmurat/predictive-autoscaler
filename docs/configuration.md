@@ -139,7 +139,8 @@ stays at 0 until you set a positive count again; the HorizontalPodAutoscaler tre
 paused:
 
 - `ScalingActive` is False with reason `TargetPaused` (a Normal event `TargetPaused`, not a warning), `Ready` stays True
-  with `calculated=paused`, and `calculatedReplicas` is absent;
+  with `calculated=paused`, `calculatedReplicas` is absent, and `currentReplicas: 0` is published (a known zero is
+  written out, not left out of the status);
 - the ledger records `action: paused`, `desired_source: paused`, `desired_replicas: 0`, `applied_replicas: 0` and the
   safeguard `target_paused`; the measured rate, the reactive need and the forecast are still recorded as they were;
 - the metric source, the conflict checks and the forecast requests continue, so nothing has to be rebuilt afterwards.

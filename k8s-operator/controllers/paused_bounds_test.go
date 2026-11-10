@@ -2,11 +2,13 @@ package controllers
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -80,6 +82,36 @@ func TestATargetWithZeroReplicasIsPausedAndNeverWritten(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// A known zero is published: status.currentReplicas (and readyReplicas) must be in the serialized status at 0, as the
+// documentation says ("a zero is reported"). With omitempty the field dropped out exactly when the target was paused.
+func TestAZeroReplicaCountIsSerialized(t *testing.T) {
+	raw, err := json.Marshal(autoscalerv1alpha1.PredictiveAutoscalerStatus{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]interface{}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"currentReplicas", "readyReplicas"} {
+		if v, ok := got[field]; !ok || v != float64(0) {
+			t.Fatalf("%s must be serialized as 0, got %v in %s", field, v, raw)
+		}
+	}
+	// And through the reconcile of a paused target: the object the API client stores carries the zero.
+	r, req, path, _ := recommendHarness(t, autoscalerv1alpha1.ModeActive, "3000")
+	setReplicas(t, r, req, 0)
+	runRPMReconcile(t, r, req, path)
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(autoscalerv1alpha1.GroupVersion.WithKind("PredictiveAutoscaler"))
+	if err := r.Get(context.Background(), req.NamespacedName, u); err != nil {
+		t.Fatal(err)
+	}
+	if v, found, err := unstructured.NestedInt64(u.Object, "status", "currentReplicas"); err != nil || !found || v != 0 {
+		t.Fatalf("status.currentReplicas of a paused target: %v found=%v err=%v", v, found, err)
 	}
 }
 

@@ -646,7 +646,9 @@ spec:
                 type: array
                 x-kubernetes-list-type: atomic
               currentReplicas:
-                description: CurrentReplicas is the current number of replicas
+                description: |-
+                  CurrentReplicas is the target's desired replica count observed in the last reconcile. A zero is reported, not
+                  left out: it is what a paused target shows.
                 format: int32
                 type: integer
               forecastReplicas:

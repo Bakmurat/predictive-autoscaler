@@ -281,8 +281,10 @@ type ResourcesConfig struct {
 
 // PredictiveAutoscalerStatus defines the observed state of PredictiveAutoscaler
 type PredictiveAutoscalerStatus struct {
-	// CurrentReplicas is the current number of replicas
-	CurrentReplicas int32 `json:"currentReplicas,omitempty"`
+	// CurrentReplicas is the target's desired replica count observed in the last reconcile. A zero is reported, not
+	// left out: it is what a paused target shows.
+	// +optional
+	CurrentReplicas int32 `json:"currentReplicas"`
 
 	// PredictedReplicas is the last calculated (desired) replica count. Deprecated: kept with its historical meaning
 	// for compatibility until the API-group migration; use calculatedReplicas and forecastReplicas.

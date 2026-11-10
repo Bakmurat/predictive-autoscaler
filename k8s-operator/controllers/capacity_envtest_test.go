@@ -154,6 +154,15 @@ func TestEnvtestATargetAtZeroReplicasIsPausedAndResumes(t *testing.T) {
 	if err := f.c.Get(ctx, f.req.NamespacedName, &pa); err != nil {
 		t.Fatal(err)
 	}
+	// The serialized API response carries the known zero (it used to drop out of the JSON at 0).
+	raw := &unstructured.Unstructured{}
+	raw.SetGroupVersionKind(autoscalerv1alpha1.GroupVersion.WithKind("PredictiveAutoscaler"))
+	if err := f.c.Get(ctx, f.req.NamespacedName, raw); err != nil {
+		t.Fatal(err)
+	}
+	if v, found, err := unstructured.NestedInt64(raw.Object, "status", "currentReplicas"); err != nil || !found || v != 0 {
+		t.Fatalf("status.currentReplicas in the API response: %v found=%v err=%v", v, found, err)
+	}
 	if sa := meta.FindStatusCondition(pa.Status.Conditions, "ScalingActive"); sa == nil || sa.Status != "False" || sa.Reason != "TargetPaused" ||
 		pa.Status.AppliedReplicas != 0 || pa.Status.CalculatedReplicas != 0 {
 		t.Fatalf("status: %+v / applied %d calculated %d", sa, pa.Status.AppliedReplicas, pa.Status.CalculatedReplicas)
