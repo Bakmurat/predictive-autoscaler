@@ -1,0 +1,145 @@
+{
+ "schema": "c28-params/v1",
+ "run_id": "c28-demo-1",
+ "namespace": "demo",
+ "control_namespace": "pa-eval-system",
+ "image": "<registry>/c28-fixture@sha256:<digest of the pushed image>",
+ "nodes": {
+  "workload": "<W node name from the fresh inventory>",
+  "support": "<S node name>"
+ },
+ "reservation": {
+  "taint_key": "c28.devkuban.com/reserved",
+  "taint_value": "<the reservation owner's run id, e.g. c28-prod-1 (never the demonstration's)>",
+  "role_label": "c28.devkuban.com/role"
+ },
+ "fixture": {
+  "work_iterations": "<tuned once so twelve replicas fit W>",
+  "response_bytes": 512,
+  "max_inflight": "<bounded>",
+  "max_queue": "<bounded>",
+  "queue_timeout_seconds": 1.5,
+  "cpu_request": "<calibrated and reviewed (section 3), identical for every arm; never lowered to fit the residency budget>",
+  "cpu_limit": "<calibrated and reviewed, same for every arm>",
+  "memory_request": "<calibrated and reviewed, same for every arm>",
+  "memory_limit": "<calibrated and reviewed, same for every arm>"
+ },
+ "ingress": {
+  "cpu_request": "<sized for 120 % of maximum planned arrivals>",
+  "cpu_limit": "<>",
+  "memory_request": "<>",
+  "memory_limit": "<>"
+ },
+ "proxy": {
+  "cpu_request": "50m",
+  "cpu_limit": "200m",
+  "memory_request": "32Mi",
+  "memory_limit": "64Mi"
+ },
+ "routes": {
+  "metrics_upstream": "<host:port of the cluster VictoriaMetrics query API (vmselect)>",
+  "metrics_query_path": "/select/0/prometheus",
+  "forecast_upstream": "<host:port of the evaluation forecaster>"
+ },
+ "priority_class": "c28-demo-fixture",
+ "quota": {
+  "name": "c28-demo-fixture-quota",
+  "pods_normal": 64
+ },
+ "scrape": "<VMPodScrape | PodMonitor | annotations, per the observer>",
+ "release": "<evaluation Helm release name, e.g. pa-eval>",
+ "release_network_policies": "<true when the release enforces NetworkPolicies>",
+ "residency": {
+  "workload": {
+   "allocatable": {
+    "cpu": "<W allocatable CPU from the fresh dated inventory, e.g. 4000m>",
+    "memory": "<W allocatable memory, e.g. 7.75Gi>"
+   },
+   "system_requests": {
+    "cpu": "<summed CPU requests of the system pods that stay on W (DaemonSets, agents)>",
+    "memory": "<their summed memory requests>"
+   }
+  },
+  "support": {
+   "allocatable": {
+    "cpu": "<S allocatable CPU>",
+    "memory": "<S allocatable memory>"
+   },
+   "system_requests": {
+    "cpu": "<summed CPU requests of the system pods that stay on S>",
+    "memory": "<their summed memory requests>"
+   }
+  },
+  "overlap_pods": 2,
+  "operator": {
+   "cpu_request": "100m",
+   "memory_request": "128Mi"
+  },
+  "forecaster": {
+   "cpu_request": "1",
+   "memory_request": "512Mi"
+  },
+  "support_extra": "<every other demonstration pod on S as [{name, replicas, cpu_request, memory_request}], or [] when none (the generator is rendered and counted by itself)>"
+ },
+ "demonstration": {
+  "run_id": "c28-demo-1",
+  "reservation_ref": {
+   "run_id": "<the reservation owner's run id, e.g. c28-prod-1>",
+   "taint_value": "<the same run id>",
+   "nodes": {
+    "workload": {
+     "name": "<W node name>",
+     "uid": "<W node UID from the owner's reservation record>"
+    },
+    "support": {
+     "name": "<S node name>",
+     "uid": "<S node UID>"
+    }
+   }
+  },
+  "targets": [
+   {
+    "name": "c28-demo-pa-n",
+    "role": "forecast",
+    "families": [
+     "seasonalNaive"
+    ]
+   },
+   {
+    "name": "c28-demo-pa-r",
+    "role": "reactive"
+   }
+  ],
+  "profile": "s20",
+  "shadow_replicas": 12,
+  "bounds": {
+   "min": 1,
+   "max": 12
+  },
+  "capacity_per_replica_rps": "<0.875 x the reviewed provisional per-replica rate (LIVE-DEMO-PLAN section 7), a number>",
+  "capacity_label": "provisional",
+  "capacity_source_calibration": "<the calibration id it comes from, c28cal-...>",
+  "cadence": {
+   "grid_seconds": 60,
+   "update_interval_seconds": 60
+  },
+  "schedule_origin_utc": "<a UTC midnight, set ONCE at the start of history: YYYY-MM-DDT00:00:00Z>",
+  "peak_multiple": 9,
+  "program": {
+   "kind": "ordinary",
+   "seed": 301
+  },
+  "generator": {
+   "image": "grafana/k6@sha256:70af91f86cd8e142e0544a4edaf79835a80033f71974b92edd5ac36fd4442a7b",
+   "k6_version": "0.57.0",
+   "resources": {
+    "cpu_request": "500m",
+    "cpu_limit": "1",
+    "memory_request": "256Mi",
+    "memory_limit": "512Mi"
+   },
+   "segment_hours": 24,
+   "remote_write_url": "<the observer's remote-write URL (vminsert), http(s)://host:port/path>"
+  }
+ }
+}

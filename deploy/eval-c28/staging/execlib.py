@@ -650,7 +650,7 @@ def import_harness():
     if hp not in sys.path:
         sys.path.insert(0, hp)
     import c28
-    from c28 import frozen, render, runlock, schedule  # noqa: F401  (loads the submodules)
+    from c28 import demo, frozen, render, runlock, schedule  # noqa: F401  (loads the submodules)
     return c28
 
 

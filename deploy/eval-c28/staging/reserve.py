@@ -155,8 +155,22 @@ def calibration_owned(kube: X.Kube, pod: Dict, calibration: Optional[Dict], role
     return False
 
 
+def occupant_owned(pod: Dict, occupant: Optional[Dict]) -> bool:
+    """Whether a pod belongs to an AUTHORIZED OCCUPANT of this reservation: another run that occupies the reserved
+    nodes by explicit, validated reference (the demonstration stage; prepare.demonstration_gate builds `occupant` only
+    after checking that reference against this reservation's record). `occupant`: {"run_id", "namespaces"}. The pod
+    must carry that run's label AND sit in one of its namespaces: the same evidence the reservation accepts for its
+    own run's pods (the run label), narrowed by namespace. Nothing is recognized when `occupant` is None (the default:
+    reserve's own CLI, calibration, sessions and the experiment's preparation see such pods as unplanned occupants)."""
+    if not occupant:
+        return False
+    m = pod.get("metadata") or {}
+    return (m.get("labels") or {}).get(X.RUN_LABEL) == occupant.get("run_id") and \
+        m.get("namespace") in (occupant.get("namespaces") or ())
+
+
 def classify(kube: X.Kube, record: X.Record, params: Dict, s: Dict, role: str, pod: Dict, cache: Dict,
-             calibration: Optional[Dict] = None) -> Dict:
+             calibration: Optional[Dict] = None, occupant: Optional[Dict] = None) -> Dict:
     m, spec = pod["metadata"], pod.get("spec", {})
     owner = _owner(kube, pod, cache)
     allowed = s.get("allowed") or {}
@@ -172,6 +186,8 @@ def classify(kube: X.Kube, record: X.Record, params: Dict, s: Dict, role: str, p
         entry["class"] = "evaluation"
     elif calibration_owned(kube, pod, calibration, role, cache):
         entry["class"] = "calibration"
+    elif occupant_owned(pod, occupant):
+        entry["class"] = "authorized-occupant"
     elif role == "support" and m.get("namespace") == params["control_namespace"] and \
             labels.get("app.kubernetes.io/instance") == params["release"]:
         entry["class"] = "evaluation"
@@ -183,19 +199,19 @@ def classify(kube: X.Kube, record: X.Record, params: Dict, s: Dict, role: str, p
 
 
 def _occupants(kube: X.Kube, record: X.Record, params: Dict, s: Dict,
-               calibration: Optional[Dict] = None) -> Dict[str, List[Dict]]:
+               calibration: Optional[Dict] = None, occupant: Optional[Dict] = None) -> Dict[str, List[Dict]]:
     out, cache = {}, {}
     pods = kube.list("Pod")
     for role in ROLES:
         live = [p for p in pods if (p.get("spec") or {}).get("nodeName") == s["nodes"][role]["name"]
                 and p.get("status", {}).get("phase") not in ("Succeeded", "Failed")]
-        out[role] = sorted((classify(kube, record, params, s, role, p, cache, calibration) for p in live),
+        out[role] = sorted((classify(kube, record, params, s, role, p, cache, calibration, occupant) for p in live),
                            key=lambda e: (e["namespace"] or "", e["pod"]))
     return out
 
 
 def _broad_tolerations(kube: X.Kube, record: X.Record, s: Dict, taint: Dict,
-                       calibration: Optional[Dict] = None) -> List[Dict]:
+                       calibration: Optional[Dict] = None, occupant: Optional[Dict] = None) -> List[Dict]:
     """Owners of pods anywhere that would tolerate the run taint, other than allowed DaemonSets, the run's own pods,
     the open calibration's verified own pods (calibration_owned) and reviewed exceptions: they could land on W/S
     later."""
@@ -206,7 +222,7 @@ def _broad_tolerations(kube: X.Kube, record: X.Record, s: Dict, taint: Dict,
     for p in kube.list("Pod"):
         if (p["metadata"].get("labels") or {}).get(X.RUN_LABEL) == record.run_id:
             continue
-        if calibration_owned(kube, p, calibration, None, cache):
+        if calibration_owned(kube, p, calibration, None, cache) or occupant_owned(p, occupant):
             continue
         if not any(_tolerates(t, taint) for t in p.get("spec", {}).get("tolerations", []) or []):
             continue
@@ -403,10 +419,14 @@ def rendered_placement_problems(params: Dict) -> List[str]:
     return out
 
 
-def verify(record: X.Record, kube: X.Kube, calibration: Optional[Dict] = None) -> Dict:
+def verify(record: X.Record, kube: X.Kube, calibration: Optional[Dict] = None,
+           occupant: Optional[Dict] = None) -> Dict:
     """`calibration`: only calibrate.py passes it (its open calibration's journal-derived ownership, see
     calibration_owned); those pods then classify as "calibration" occupants, which the reservation accepts. Without it
-    (the CLI, prepare, session) a calibration pod is an unplanned occupant and the reservation fails."""
+    (the CLI, prepare, session) a calibration pod is an unplanned occupant and the reservation fails.
+    `occupant`: only prepare.py's demonstration gate passes it, for ANOTHER run that occupies this reservation by
+    explicit reference (occupant_owned); its pods then classify as "authorized-occupant". The nodes, their taint and
+    their labels stay this record's: nothing is retagged, and without it such pods are unplanned occupants."""
     params = X.load_params_stage(record, STAGE)
     s = _section(record, params)
     taint = _taint(s, record.run_id)
@@ -430,13 +450,14 @@ def verify(record: X.Record, kube: X.Kube, calibration: Optional[Dict] = None) -
             problems.append(f"{role} {n['metadata']['name']}: cordon state changed from {a['unschedulable']}")
         nodes.append({"role": role, "name": n["metadata"]["name"], "uid": n["metadata"]["uid"], "taints": taints,
                       "role_label": labels.get(s["role_label"]), "unschedulable": unsched, "conditions": conds})
-    occ = _occupants(kube, record, params, s, calibration)
+    occ = _occupants(kube, record, params, s, calibration, occupant)
+    accepted = ("allowed-system", "evaluation", "calibration") + (("authorized-occupant",) if occupant else ())
     for role, entries in occ.items():
         for e in entries:
-            if e["class"] not in ("allowed-system", "evaluation", "calibration"):
+            if e["class"] not in accepted:
                 problems.append(f"{role}: {e['namespace']}/{e['pod']} ({e['owner']['kind']} {e['owner']['name']}) is "
                                 f"{e['class']}")
-    broad = _broad_tolerations(kube, record, s, taint, calibration)
+    broad = _broad_tolerations(kube, record, s, taint, calibration, occupant)
     for b in broad:
         problems.append(f"{b['namespace']}/{b['kind']}/{b['name']} tolerates the run taint and is not allowlisted")
     incomplete = X.experiment_params_problems(params)

@@ -19,6 +19,22 @@
   Commands that take --runlock also take --manifest-root DIR (default: the run-lock's directory).
   python -m c28 audit    --params P --live FILE                exclusive-writer check of live writer objects (JSON list)
   python -m c28 quota    --runlock FILE --params P deny_new_pods|restore [--apply]
+
+The demonstration stage (LIVE-DEMO-PLAN sections 5-6; its own params stage, never the comparison experiment):
+  python -m c28 validate --params P --stage reservation|demonstration   the stage's problems (JSON; exit 1 when any)
+  python -m c28 render   --params P --stage demonstration [--part common|targets|pas|generator] [--out FILE]
+  python -m c28 release-values --params P --stage demonstration [--out FILE]
+  python -m c28 residency --params P --stage demonstration [--out FILE]  both targets at max + overlap, the release,
+                                                               the generator and system requests vs 75 %
+  python -m c28 demo-plan --params P [--out FILE]              the continuous generator's configuration: ONE schedule
+                                                               origin and the day's per-minute arrivals (JSON)
+                         (--smoke-segment-minutes N, here and with render --part generator: the kind smoke's short
+                         segment; the configuration is then labelled smoke, never a demonstration)
+  python -m c28 demo-sizing --params P                         the generator's limits against the peak rate and the
+                                                               timeout, with the arithmetic (JSON)
+  python -m c28 demo-reduce --config FILE --log FILE [--log FILE ...] --ingress FILE --start S --end E [--out FILE]
+                         per-minute rows from the generator's pod logs and the ingress's RAW counter samples
+                         ({"<target>": [[t_seconds, value], ...]}), binned from the config's recorded origin
 """
 
 from __future__ import annotations
@@ -32,7 +48,7 @@ from datetime import datetime, timezone
 
 import yaml
 
-from . import collect, inject, reduce, render, runlock, schedule, score
+from . import collect, demo, demo_reduce, inject, reduce, render, runlock, schedule, score
 
 
 def _write(text: str, out: str) -> None:
@@ -168,8 +184,22 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="c28", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("render"); r.add_argument("--params", required=True); r.add_argument("--out", default="")
+    r.add_argument("--part", default="", choices=["", "common", "targets", "pas", "generator"])
     rv = sub.add_parser("release-values"); rv.add_argument("--params", required=True); rv.add_argument("--out", default="")
     rs = sub.add_parser("residency"); rs.add_argument("--params", required=True); rs.add_argument("--out", default="")
+    for sp in (r, rv, rs):
+        sp.add_argument("--stage", default="experiment", choices=["experiment", demo.STAGE])
+    va = sub.add_parser("validate"); va.add_argument("--params", required=True)
+    va.add_argument("--stage", required=True, choices=sorted(render.STAGE_FIELDS))
+    dp = sub.add_parser("demo-plan"); dp.add_argument("--params", required=True); dp.add_argument("--out", default="")
+    for sp in (r, dp):
+        sp.add_argument("--smoke-segment-minutes", type=int, default=None,
+                        help="kind smoke only: a short generator segment; the configuration is labelled smoke")
+    ds = sub.add_parser("demo-sizing"); ds.add_argument("--params", required=True)
+    dr = sub.add_parser("demo-reduce"); dr.add_argument("--config", required=True)
+    dr.add_argument("--log", action="append", required=True, help="a pod log file, repeatable")
+    dr.add_argument("--ingress", required=True); dr.add_argument("--start", required=True)
+    dr.add_argument("--end", required=True); dr.add_argument("--out", default="")
     p = sub.add_parser("plan")
     p.add_argument("--kind", required=True, choices=["ordinary", "scored"]); p.add_argument("--seed", type=int, required=True)
     p.add_argument("--capacity", type=float, required=True); p.add_argument("--target", required=True)
@@ -200,7 +230,45 @@ def main(argv=None) -> int:
     q.add_argument("action", choices=["deny_new_pods", "restore"]); q.add_argument("--apply", action="store_true")
     args = ap.parse_args(argv)
 
-    if args.cmd == "render":
+    if args.cmd == "validate":
+        probs = render.stage_problems(_load(args.params), args.stage)
+        print(_json({"stage": args.stage, "problems": probs}), end="")
+        return 1 if probs else 0
+    elif args.cmd in ("render", "release-values", "residency") and args.stage == demo.STAGE:
+        params = _load(args.params)
+        if args.cmd == "render":
+            if args.smoke_segment_minutes is not None and args.part != "generator":
+                raise render.ParamsError("--smoke-segment-minutes renders only --part generator")
+            objs = demo.render(params, args.smoke_segment_minutes)[args.part] if args.part else demo.render_all(params)
+            _write(yaml.safe_dump_all(objs, sort_keys=True), args.out)
+        elif args.cmd == "release-values":
+            _write(yaml.safe_dump(demo.release_values(params), sort_keys=True), args.out)
+        else:
+            out = demo.residency_report(params)
+            _write(_json(out), args.out)
+            return 1 if out["problems"] else 0
+    elif args.cmd == "demo-plan":
+        _write(_json(demo.generator_config(_load(args.params), args.smoke_segment_minutes)), args.out)
+    elif args.cmd == "demo-sizing":
+        params = _load(args.params)
+        demo.validate(params)
+        print(_json(demo.generator_sizing(params)), end="")
+    elif args.cmd == "demo-reduce":
+        cfg = _load(args.config)
+        if cfg.get("schema") != demo.GENERATOR_CONFIG_SCHEMA or schedule.digest(cfg) != cfg.get("digest"):
+            raise render.ParamsError("--config is not an intact c28-demo-generator/v1 configuration (its digest differs)")
+        lines = []
+        for path in args.log:
+            with open(path, errors="replace") as fh:
+                lines += fh.read().splitlines()
+        records, stats = demo_reduce.parse_lines(lines)
+        out = demo_reduce.reduce(cfg, records, _load(args.ingress), int(_utc(args.start).timestamp()) * 1000,
+                                 int(_utc(args.end).timestamp()) * 1000)
+        out["log"] = stats
+        _write(_json(out), args.out)
+    elif args.cmd == "render":
+        if args.part or args.smoke_segment_minutes is not None:
+            raise render.ParamsError("--part and --smoke-segment-minutes belong to --stage demonstration")
         _write(yaml.safe_dump_all(render.render_all(_load(args.params)), sort_keys=True), args.out)
     elif args.cmd == "release-values":
         _write(yaml.safe_dump(render.eval_release_values(_load(args.params)), sort_keys=True), args.out)
