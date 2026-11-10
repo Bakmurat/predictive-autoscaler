@@ -19,10 +19,20 @@
 # may read deployments/scale and nothing more; the forecast/decision ledger on, here on an emptyDir), a second
 # accelerated k6 run drives demand at one Recommend arm (c28-pa-r-s90, which no other check touches), and five more
 # checks run:
-#   S1. effective permissions: the live release roles give deployments/scale exactly [get] and no role of the release
-#       may write a scale subresource; the API server's authorizer, asked as the operator's ServiceAccount (kubectl auth
-#       can-i --subresource=scale under impersonation), answers no to update and to patch and yes to get. Only the exact
-#       answers count: an impersonation or API error is "unproven" and fails;
+#   S1. effective permissions, once the autoscalers exist (after check 2). The live release roles give
+#       deployments/scale exactly [get] and none of them may write a scale subresource. The API server's authorizer,
+#       asked as the operator's ServiceAccount (kubectl auth can-i --subresource=scale under impersonation), answers no
+#       to update and to patch and yes to get, for the question without a name AND for the Deployment NAME of every
+#       PredictiveAutoscaler target (a grant restricted by resourceNames answers only the named question). Only the
+#       exact answers count: an impersonation or API error is "unproven" and fails, never a no. And every RoleBinding
+#       and ClusterRoleBinding of the cluster whose subjects name that ServiceAccount, its username or one of its
+#       groups (system:serviceaccounts, system:serviceaccounts:<namespace>, system:authenticated), whatever its labels,
+#       is resolved to its role: no rule there may write a scale subresource of Deployments, named or not.
+#       S1's own negative self-test follows: a Role WITHOUT the release's labels that grants update on
+#       deployments/scale for one named target (c28-pa-n-s90), bound to the operator's ServiceAccount, is created in
+#       this cluster; S1 must then REFUSE (the named question answers yes while the unnamed one still answers no, and
+#       the binding scan finds the grant); the Role and RoleBinding are deleted and S1 must pass again, all before any
+#       load;
 #   S2. under that demand the arm's PredictiveAutoscaler recommends at least 4 replicas (status.calculatedReplicas; the
 #       current count is 2) while its Deployment keeps spec.replicas 2, its UID and its metadata.generation from before
 #       the load; status.mode is Recommend, ScalingActive is False with reason RecommendMode, Ready and
@@ -53,8 +63,9 @@
 #                                               scripts/verify.sh runs it); with --images it also validates that file;
 #                                               with --shadow it also renders the chart (helm template, no cluster)
 #                                               with and without the shadow values and self-tests S1's rule check
-#                                               (get only with them, get and update without) and S2's and S4's
-#                                               classifiers (needs helm)
+#                                               (get only with them, get and update without), S1's verdict (per-name
+#                                               answers and the binding scan, a name-restricted outside grant
+#                                               included) and S2's and S4's classifiers (needs helm)
 #   deploy/eval-c28/smoke/kind.sh --images images.json
 #                                               run the EXACT reviewed images of a c28-images/v1 file (schema
 #                                               c28-images/v1, verified true, all four of operator, statistical,
@@ -90,11 +101,15 @@ done
 # SHADOW_ARM gets the second load: a PA-R arm, because no forecast qualifies within a smoke and the reactive rule
 # recommends from the request rate alone; the s90 one, because check 6 scales c28-pa-r-s20 by hand. SHADOW_MIN is the
 # recommendation S2 waits for: twice the fixed 2 replicas, so never a rounding of the program's low 2c phase.
+# SHADOW_SELFTEST_TARGET is the one target S1's negative self-test grants a scale update for, for a few seconds: another
+# Recommend arm than the one S2 measures.
 SHADOW_OPERATOR_VALUES='  rbac: {scaleWrite: false}
   forecastLedger: {enabled: true}'
 RELEASE_FULLNAME=pa-eval-predictive-autoscaler
 SHADOW_ARM=c28-pa-r-s90
 SHADOW_MIN=4
+SHADOW_SELFTEST_TARGET=c28-pa-n-s90
+SHADOW_SELFTEST_GRANT=c28-shadow-selftest-scale-writer
 
 # images_read <images.json>: print "<role> <ref>" for operator, statistical, fixture and generator (in that order), or
 # refuse (exit 1, reason on stderr). The file is the c28-images/v1 record of the reviewed build (extra fields such as
@@ -400,6 +415,91 @@ print(f"ClusterRole {write_role} gives deployments/scale exactly {verbs}; of {le
 PY
 }
 
+# shadow_permission_verdict <answers> <targets> <ServiceAccount namespace> <ServiceAccount name> <out.json> <RBAC
+# list>...: S1's verdict on the operator ServiceAccount's permission to write replicas.
+#   answers: one "<target or -> <verb> <answer>" line per question asked of the authorizer (sa_can; "-" is the question
+#     without a name, anything other than yes or no is an unclear answer);
+#   targets: the PredictiveAutoscalers' target Deployment names, one per line;
+#   RBAC lists: EVERY ClusterRole, Role, ClusterRoleBinding and RoleBinding of the cluster (kubectl Lists as JSON),
+#     whatever their labels.
+# "-" and every target need update no, patch no and get yes (the control: the release's own scale rule grants it, so a
+# no there means the question did not reach the scale rule). Every binding with a subject that is the ServiceAccount,
+# its username or one of its groups is resolved to its role (a RoleBinding's Role in its own namespace), and a rule
+# there that reaches a scale subresource of apps Deployments (named or by wildcard) with a write verb is a finding,
+# with or without resourceNames: a name-restricted grant is still a grant.
+# REFUSED (exit 1): a yes to update or patch, or such a grant. UNPROVEN (exit 3): no target, a missing or unclear
+# answer, or a failed control. The answers, the identity's bindings, the grants and the reasons go to out.json.
+shadow_permission_verdict() {
+  "$PY" - "$@" <<'PY'
+import json, sys
+answers_p, targets_p, sa_ns, sa_name, out = sys.argv[1:6]
+targets = [line.strip() for line in open(targets_p) if line.strip()]
+answers = {}
+for line in open(answers_p):
+    parts = line.split()
+    if len(parts) == 3:
+        answers.setdefault(parts[0], {})[parts[1]] = parts[2]
+refused, unproven = [], []
+if not targets:
+    unproven.append("no PredictiveAutoscaler target to ask about")
+for name in ["-"] + targets:
+    label = "of any Deployment (no name)" if name == "-" else f"of Deployment {name}"
+    for verb in ("update", "patch", "get"):
+        got = answers.get(name, {}).get(verb)
+        if got not in ("yes", "no"):
+            unproven.append(f"{verb} deployments/scale {label}: no clear answer ({got})")
+        elif verb != "get" and got == "yes":
+            refused.append(f"the authorizer allows {verb} on deployments/scale {label}")
+        elif verb == "get" and got == "no":
+            unproven.append(f"get deployments/scale {label} answered no: the control failed")
+objs = []
+for path in sys.argv[6:]:
+    doc = json.load(open(path))
+    objs.extend(doc.get("items") or [] if str(doc.get("kind", "")).endswith("List") else [doc])
+user = f"system:serviceaccount:{sa_ns}:{sa_name}"
+groups = {"system:serviceaccounts", f"system:serviceaccounts:{sa_ns}", "system:authenticated"}
+def names_identity(subject, binding_ns):
+    kind, name = subject.get("kind"), subject.get("name")
+    if kind == "ServiceAccount":
+        return name == sa_name and (subject.get("namespace") or binding_ns) == sa_ns
+    return (kind == "User" and name == user) or (kind == "Group" and name in groups)
+def reaches_scale(rule):
+    rule_groups, res = set(rule.get("apiGroups") or []), set(rule.get("resources") or [])
+    return bool(rule_groups & {"apps", "*"}) and bool(res & {"deployments/scale", "*/scale", "*"})
+WRITES = {"update", "patch", "create", "delete", "deletecollection", "*"}
+roles = {(o["kind"], o["metadata"].get("namespace") or "", o["metadata"]["name"]): o
+         for o in objs if o.get("kind") in ("ClusterRole", "Role")}
+bindings, grants = [], []
+for b in objs:
+    if b.get("kind") not in ("ClusterRoleBinding", "RoleBinding"):
+        continue
+    ns = b["metadata"].get("namespace") or ""
+    subjects = [s for s in b.get("subjects") or [] if names_identity(s, ns)]
+    if not subjects:
+        continue
+    ref = b.get("roleRef") or {}
+    role = roles.get((ref.get("kind"), ns if ref.get("kind") == "Role" else "", ref.get("name")))
+    bid = f'{b["kind"]}/{ns + "/" if ns else ""}{b["metadata"]["name"]}'
+    rid = f'{ref.get("kind")}/{ns + "/" if ref.get("kind") == "Role" and ns else ""}{ref.get("name")}'
+    bindings.append({"binding": bid, "role": rid, "role_found": role is not None,
+                     "subjects": sorted(f'{s.get("kind")}:{s.get("name")}' for s in subjects)})
+    for rule in (role or {}).get("rules") or []:
+        if reaches_scale(rule) and WRITES & set(rule.get("verbs") or []):
+            g = {"binding": bid, "role": rid, "where": ns or "(every namespace)", "verbs": rule.get("verbs"),
+                 "resources": rule.get("resources"), "resourceNames": rule.get("resourceNames") or []}
+            grants.append(g)
+            refused.append(f'{bid} -> {rid} authorizes {g["verbs"]} on {g["resources"]} in {g["where"]}'
+                           + (f', resourceNames {g["resourceNames"]}' if g["resourceNames"] else ""))
+verdict = "refused" if refused else "unproven" if unproven else "pass"
+json.dump({"identity": user, "groups": sorted(groups), "targets": targets, "answers": answers,
+           "bindings_of_the_identity": sorted(bindings, key=lambda x: x["binding"]), "scale_write_grants": grants,
+           "verdict": verdict, "refused": refused, "unproven": unproven}, open(out, "w"), indent=1)
+for m in refused + unproven:
+    print(("REFUSED " if m in refused else "UNPROVEN ") + m, file=sys.stderr)
+sys.exit(1 if refused else 3 if unproven else 0)
+PY
+}
+
 # shadow_verdict <pa.json> <deployment.json> <generation before the load> <uid before the load> <minimum
 # recommendation>: S2's verdict on one snapshot of the shadow arm, printed as one JSON line (the observed values, the
 # conditions, hard and soft). HARD (exit 1) is anything a replica write or a broken shadow would leave: a Deployment
@@ -518,7 +618,11 @@ PY
 # the values the smoke installs (c28 release-values and smoke_values, placeholder images) must give the scale rule get
 # only with the shadow values and get and update without them
 # (scale_rules, which must also refuse each rendering under the other expectation), the shadow rendering alone carries
-# the ledger, and S2's and S4's classifiers give the exit status each synthetic case is named after.
+# the ledger, and S1's verdict and S2's and S4's classifiers give the exit status each synthetic case is named after
+# (for S1: the release's own bindings pass; a write grant reaching the identity through its ServiceAccount, its
+# username or a group is refused, name-restricted and unlabelled included, whether the answers or only the bindings
+# show it; another identity's grant, a read-only grant and an unresolved roleRef are not; a missing or unclear answer
+# and a failed control are unproven).
 shadow_self_test() {
   local dir bad=0 f want rc kind write="$RELEASE_FULLNAME-operator-write"
   dir="$(mktemp -d)"
@@ -597,7 +701,85 @@ ledgers = {
 for name, (a, b) in ledgers.items():
     open(os.path.join(d, name + ".first.jsonl"), "wb").write(a)
     open(os.path.join(d, name + ".second.jsonl"), "wb").write(b)
+
+# S1: the identity is ServiceAccount ctl/op; targets arm-a and arm-b in namespace demo.
+def role(kind, name, rules, ns=None):
+    return {"kind": kind, "metadata": {"name": name, **({"namespace": ns} if ns else {})}, "rules": rules}
+def bind(kind, name, ref_kind, ref, subjects, ns=None):
+    return {"kind": kind, "metadata": {"name": name, **({"namespace": ns} if ns else {})},
+            "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": ref_kind, "name": ref}, "subjects": subjects}
+def scale(verbs, names=None, resources=("deployments/scale",), groups=("apps",)):
+    return {"apiGroups": list(groups), "resources": list(resources), "verbs": list(verbs),
+            **({"resourceNames": list(names)} if names else {})}
+SA = {"kind": "ServiceAccount", "name": "op", "namespace": "ctl"}
+base = [role("ClusterRole", "rel-operator", [{"apiGroups": ["apps"], "resources": ["deployments"], "verbs": ["get", "list", "watch"]}]),
+        bind("ClusterRoleBinding", "rel-operator", "ClusterRole", "rel-operator", [SA]),
+        role("ClusterRole", "rel-operator-write", [scale(["get"])]),
+        bind("RoleBinding", "rel-operator-write", "ClusterRole", "rel-operator-write", [SA], ns="demo"),
+        role("ClusterRole", "system:basic-user", [{"apiGroups": ["authorization.k8s.io"], "resources": ["selfsubjectaccessreviews"], "verbs": ["create"]}]),
+        bind("ClusterRoleBinding", "system:basic-user", "ClusterRole", "system:basic-user", [{"kind": "Group", "name": "system:authenticated"}]),
+        role("ClusterRole", "hpa", [scale(["get", "update"], resources=("*/scale",), groups=("*",))]),
+        bind("ClusterRoleBinding", "hpa", "ClusterRole", "hpa", [{"kind": "ServiceAccount", "name": "horizontal-pod-autoscaler", "namespace": "kube-system"}])]
+good = {n: {"update": "no", "patch": "no", "get": "yes"} for n in ("-", "arm-a", "arm-b")}
+def answered(**change):   # answered(arm_b={"update": "yes"}): the good answers with that target's changed
+    a = copy.deepcopy(good)
+    for key, v in change.items():
+        a[{"none": "-"}.get(key, key.replace("_", "-"))].update(v)
+    return a
+ext = lambda rule: [role("Role", "ext", [rule], ns="demo"), bind("RoleBinding", "ext", "Role", "ext", [SA], ns="demo")]
+perm = {
+    "0-release-only": (good, base),
+    "1-named-outside-grant": (answered(arm_b={"update": "yes"}), base + ext(scale(["update"], names=["arm-b"]))),
+    "1-answer-only": (answered(arm_b={"update": "yes"}), base),
+    "1-patch-answer": (answered(arm_a={"patch": "yes"}), base),
+    "1-unnamed-answer": (answered(none={"update": "yes"}), base),
+    "1-binding-only-other-name": (good, base + ext(scale(["update"], names=["not-a-target"]))),
+    "1-patch-grant": (good, base + ext(scale(["patch"], names=["arm-b"]))),
+    "1-through-username": (good, base + [role("Role", "ext", [scale(["update"])], ns="demo"), bind(
+        "RoleBinding", "ext", "Role", "ext", [{"kind": "User", "name": "system:serviceaccount:ctl:op"}], ns="demo")]),
+    "1-through-namespace-group": (good, base + [bind("ClusterRoleBinding", "ext", "ClusterRole", "hpa",
+                                                     [{"kind": "Group", "name": "system:serviceaccounts:ctl"}])]),
+    "1-through-all-serviceaccounts": (good, base + [bind("RoleBinding", "ext", "ClusterRole", "hpa",
+                                                         [{"kind": "Group", "name": "system:serviceaccounts"}], ns="demo")]),
+    "1-through-authenticated-wildcard": (good, base + [
+        role("ClusterRole", "ext", [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]),
+        bind("ClusterRoleBinding", "ext", "ClusterRole", "ext", [{"kind": "Group", "name": "system:authenticated"}])]),
+    "1-grant-and-unclear-answer": (answered(arm_b={"update": "unproven"}), base + ext(scale(["update"], names=["arm-b"]))),
+    "0-other-serviceaccount": (good, base + [role("Role", "ext", [scale(["update"])], ns="demo"), bind(
+        "RoleBinding", "ext", "Role", "ext", [{"kind": "ServiceAccount", "name": "op", "namespace": "elsewhere"}], ns="demo")]),
+    "0-other-namespace-group": (good, base + [bind("ClusterRoleBinding", "ext", "ClusterRole", "hpa",
+                                                   [{"kind": "Group", "name": "system:serviceaccounts:kube-system"}])]),
+    "0-named-read-only": (good, base + ext(scale(["get"], names=["arm-b"]))),
+    "0-unresolved-role": (good, base + [bind("RoleBinding", "ext", "Role", "ext", [SA], ns="demo")]),
+    "0-role-of-another-namespace": (good, base + [role("Role", "ext", [scale(["update"])], ns="elsewhere"),
+                                                  bind("RoleBinding", "ext", "Role", "ext", [SA], ns="demo")]),
+    "3-unclear-answer": (answered(arm_b={"update": "unproven"}), base),
+    "3-missing-answer": ({k: v for k, v in good.items() if k != "arm-b"}, base),
+    "3-control-failed": (answered(arm_a={"get": "no"}), base),
+}
+for name, (ans, rbac) in perm.items():
+    with open(os.path.join(d, name + ".answers"), "w") as fh:
+        fh.writelines(f"{t} {verb} {a}\n" for t, verbs in ans.items() for verb, a in verbs.items())
+    open(os.path.join(d, name + ".targets"), "w").write("arm-a\narm-b\n")
+    json.dump({"kind": "List", "items": rbac}, open(os.path.join(d, name + ".rbac.json"), "w"))
+open(os.path.join(d, "3-no-target.answers"), "w").write("- update no\n- patch no\n- get yes\n")
+open(os.path.join(d, "3-no-target.targets"), "w").write("")
+json.dump({"kind": "List", "items": base}, open(os.path.join(d, "3-no-target.rbac.json"), "w"))
 PY
+  for f in "$dir"/*.answers; do
+    want="${f##*/}"; want="${want%%-*}"
+    rc=0; shadow_permission_verdict "$f" "${f%.answers}.targets" ctl op "$dir/out.json" "${f%.answers}.rbac.json" 2>/dev/null || rc=$?
+    [ "$rc" = "$want" ] || { echo "shadow self-test: S1 ${f##*/} gave exit $rc, want $want" >&2; bad=1; }
+  done
+  # The named outside grant must be refused for both reasons: the named answer and the binding scan.
+  shadow_permission_verdict "$dir/1-named-outside-grant.answers" "$dir/1-named-outside-grant.targets" ctl op "$dir/out.json" \
+    "$dir/1-named-outside-grant.rbac.json" 2>/dev/null || true
+  "$PY" -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["verdict"] == "refused" and len(d["refused"]) == 2 and d["answers"]["-"]["update"] == "no", d
+assert [(g["binding"], g["role"], g["resourceNames"]) for g in d["scale_write_grants"]] == [("RoleBinding/demo/ext", "Role/demo/ext", ["arm-b"])], d
+' "$dir/out.json" || { echo "shadow self-test: S1 does not report the named outside grant by both its answer and its binding" >&2; bad=1; }
   for f in "$dir"/*.pa.json; do
     want="${f##*/}"; want="${want%%-*}"
     rc=0; shadow_verdict "$f" "${f%.pa.json}.deploy.json" 1 u-1 "$SHADOW_MIN" >/dev/null 2>&1 || rc=$?
@@ -638,7 +820,7 @@ PY
   if [ "$SHADOW" = 1 ]; then
     command -v helm >/dev/null || { echo "render-only: --shadow needs helm (helm template; no cluster is contacted)" >&2; exit 1; }
     shadow_self_test || { echo "render-only: the shadow checks' self-test failed" >&2; exit 1; }
-    echo "render-only: shadow: deployments/scale is get only with the shadow values and get, update without them; the ledger is on only with them; S2 and S4 refuse a write, a changed Deployment and a ledger that does not advance"
+    echo "render-only: shadow: deployments/scale is get only with the shadow values and get, update without them; the ledger is on only with them; S1 refuses a write grant that reaches the operator's identity, a name-restricted unlabelled one included, and calls an unclear answer unproven; S2 and S4 refuse a write, a changed Deployment and a ledger that does not advance"
   fi
   exit 0
 fi
@@ -694,22 +876,56 @@ wait_for() {
     sleep 5
   done
 }
-# sa_can <verb>: S1's effective-permission question, answered by the API server's authorizer (a SubjectAccessReview
-# under impersonation): may the operator's ServiceAccount <verb> the scale subresource of Deployments in the fixture
-# namespace? The subresource is named with --subresource: "deployments/scale" as an argument would mean a Deployment
-# NAMED scale, which the operator may never update, so that question answers no for any install. Prints yes or no only
-# when kubectl printed exactly that with the matching exit status (0 yes, 1 no); an impersonation or API error prints
-# nothing or something else, and is unproven (return 1), never a no.
+# sa_can <verb> [Deployment name]: S1's effective-permission question, answered by the API server's authorizer (a
+# SubjectAccessReview under impersonation): may the operator's ServiceAccount <verb> the scale subresource of
+# Deployments, or of that one Deployment, in the fixture namespace? The subresource is named with --subresource:
+# "deployments/scale" as an argument would mean a Deployment NAMED scale, which the operator may never update, so that
+# question answers no for any install. The name matters: a rule with resourceNames answers only the question that
+# names one of them. Prints yes or no only when kubectl printed exactly that with the matching exit status (0 yes,
+# 1 no); an impersonation or API error prints nothing or something else, and is unproven (return 1), never a no.
 sa_can() {
   local out rc=0
-  out="$(k auth can-i "$1" deployments.apps --subresource=scale -n "$NS" --as="system:serviceaccount:$CTRL:$OPERATOR_SA" \
-    --as-group=system:serviceaccounts --as-group="system:serviceaccounts:$CTRL" --as-group=system:authenticated \
-    2>"$WORK/shadow-can-i-$1.err")" || rc=$?
+  out="$(k auth can-i "$1" "deployments.apps${2:+/$2}" --subresource=scale -n "$NS" \
+    --as="system:serviceaccount:$CTRL:$OPERATOR_SA" --as-group=system:serviceaccounts \
+    --as-group="system:serviceaccounts:$CTRL" --as-group=system:authenticated 2>"$WORK/shadow-can-i.err")" || rc=$?
   case "$rc:$out" in
     0:yes|1:no) echo "$out" ;;
-    *) log "can-i $1 deployments/scale as the operator ServiceAccount: exit $rc, stdout '$out', stderr: $(tr '\n' ' ' < "$WORK/shadow-can-i-$1.err" | cut -c1-300)" >&2
+    *) log "can-i $1 deployments/scale ${2:-(no name)} as the operator ServiceAccount: exit $rc, stdout '$out', stderr: $(tr '\n' ' ' < "$WORK/shadow-can-i.err" | cut -c1-300)" >&2
        return 1 ;;
   esac
+}
+# shadow_permissions <tag>: S1's whole reading, into $WORK/shadow-permissions-<tag>.json (and .answers, .targets, the
+# four RBAC lists): update, patch and get asked without a name and for the target Deployment of every live
+# PredictiveAutoscaler (an unclear answer is recorded as unproven, never as no), and every ClusterRole, Role,
+# ClusterRoleBinding and RoleBinding of the cluster, judged by shadow_permission_verdict (above). Returns its status:
+# 0 pass, 1 refused, 3 unproven (also when the cluster could not be read).
+shadow_permissions() {
+  local base="$WORK/shadow-permissions-$1" name verb answer kind
+  k -n "$NS" get predictiveautoscalers.autoscaling.devkuban.com \
+    -o jsonpath='{range .items[*]}{.spec.targetDeployment.name}{"\n"}{end}' | sort -u > "$base.targets" || return 3
+  if grep -Evq '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$' "$base.targets"; then log "a target name is not a DNS label"; return 3; fi
+  : > "$base.answers"
+  while read -r name; do
+    for verb in update patch get; do
+      answer="$(sa_can "$verb" "${name#-}")" || answer=unproven
+      echo "$name $verb $answer" >> "$base.answers"
+    done
+  done < <(echo -; cat "$base.targets")
+  for kind in clusterroles roles clusterrolebindings rolebindings; do
+    k get "$kind" -A -o json > "$base.$kind.json" || return 3
+  done
+  shadow_permission_verdict "$base.answers" "$base.targets" "$CTRL" "$OPERATOR_SA" "$base.json" \
+    "$base.clusterroles.json" "$base.roles.json" "$base.clusterrolebindings.json" "$base.rolebindings.json"
+}
+# permissions_line <shadow-permissions json>: its answers on one line, for the log.
+permissions_line() {
+  "$PY" -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+row = lambda n: "{}: update={} patch={} get={}".format("(no name)" if n == "-" else n, *(d["answers"].get(n, {}).get(v) for v in ("update", "patch", "get")))
+print("; ".join(row(n) for n in ["-"] + d["targets"]) + "; bindings naming the identity: {}; scale write grants among them: {}".format(
+    len(d["bindings_of_the_identity"]), len(d["scale_write_grants"])))
+' "$1"
 }
 # operator_pods: "<name> <uid> <node> <restarts>" for every pod of the release's operator.
 operator_pods() {
@@ -967,30 +1183,6 @@ h install pa-eval "$ROOT/charts/predictive-autoscaler" -n "$CTRL" -f "$WORK/rele
   || die "evaluation release install"
 pass "evaluation release in $CTRL watching $NS only"
 
-if [ "$SHADOW" = 1 ]; then
-  # --- S1. shadow: the operator's ServiceAccount cannot write replicas -------------------------------------------------
-  # Two views. The release's live roles (every ClusterRole and Role it labels): the write role's scale rule is get only
-  # and no role of the release may write a scale subresource (scale_rules, above). And the effective permission, which
-  # also covers anything bound outside the release: the authorizer's own answers for the ServiceAccount the operator
-  # Deployment runs as (sa_can, above). The yes to get is the control: it is granted by the same rule, so it shows the
-  # question reaches the scale rule under this identity.
-  guard
-  OPERATOR_SA="$(k -n "$CTRL" get deploy "$RELEASE_FULLNAME-operator" -o jsonpath='{.spec.template.spec.serviceAccountName}')" \
-    || die "S1. reading the operator Deployment"
-  [ "$OPERATOR_SA" = "$RELEASE_FULLNAME-operator" ] || die "S1. the operator runs as '$OPERATOR_SA', not $RELEASE_FULLNAME-operator"
-  { k get clusterroles -l app.kubernetes.io/instance=pa-eval -o yaml && echo --- \
-      && k get roles -A -l app.kubernetes.io/instance=pa-eval -o yaml; } > "$WORK/shadow-rbac.yaml" || die "S1. reading the release's roles"
-  SCALE_RULE="$(scale_rules shadow "$WORK/shadow-rbac.yaml" "$RELEASE_FULLNAME-operator-write")" || die "S1. the live scale rule is not get only"
-  CAN_UPDATE="$(sa_can update)" || die "S1. unproven: no clear answer for update on deployments/scale"
-  CAN_PATCH="$(sa_can patch)" || die "S1. unproven: no clear answer for patch on deployments/scale"
-  CAN_GET="$(sa_can get)" || die "S1. unproven: no clear answer for get on deployments/scale"
-  [ "$CAN_UPDATE" = no ] || die "S1. system:serviceaccount:$CTRL:$OPERATOR_SA may update deployments/scale in $NS"
-  [ "$CAN_PATCH" = no ] || die "S1. system:serviceaccount:$CTRL:$OPERATOR_SA may patch deployments/scale in $NS"
-  [ "$CAN_GET" = yes ] || die "S1. system:serviceaccount:$CTRL:$OPERATOR_SA may not get deployments/scale in $NS (the control: the question did not reach the scale rule)"
-  log "S1 saw: $SCALE_RULE"
-  pass "S1. shadow: system:serviceaccount:$CTRL:$OPERATOR_SA on deployments/scale in $NS: update=$CAN_UPDATE patch=$CAN_PATCH get=$CAN_GET (the authorizer's answers); the live scale rule is get only"
-fi
-
 # --- the fixture and the five arms (both profiles) --------------------------------------------------------------------
 c28 render --params "$jq_params" --out "$WORK/all.yaml"
 guard
@@ -1026,6 +1218,87 @@ wait_for 120 "KEDA created its HPAs" sh -c "[ \"\$(kubectl --kubeconfig '$KCFG' 
 } > "$WORK/live.json"
 c28 audit --params "$jq_params" --live "$WORK/live.json" || die "exclusive-writer audit"
 pass "2. every target has exactly its one writer"
+
+if [ "$SHADOW" = 1 ]; then
+  # --- S1. shadow: the operator's ServiceAccount cannot write replicas -------------------------------------------------
+  # Now that the autoscalers exist. Three views. The release's live roles (every ClusterRole and Role it labels): the
+  # write role's scale rule is get only and no role of the release may write a scale subresource (scale_rules, above).
+  # The effective permission, which also covers anything granted outside the release: the authorizer's own answers for
+  # the ServiceAccount the operator Deployment runs as, without a name and for every autoscaler's target by name
+  # (sa_can, above); the yes to get is the control, granted by the release's own scale rule. And every binding of the
+  # cluster that names that identity, resolved to its role (shadow_permissions and shadow_permission_verdict, above).
+  guard
+  OPERATOR_SA="$(k -n "$CTRL" get deploy "$RELEASE_FULLNAME-operator" -o jsonpath='{.spec.template.spec.serviceAccountName}')" \
+    || die "S1. reading the operator Deployment"
+  [ "$OPERATOR_SA" = "$RELEASE_FULLNAME-operator" ] || die "S1. the operator runs as '$OPERATOR_SA', not $RELEASE_FULLNAME-operator"
+  { k get clusterroles -l app.kubernetes.io/instance=pa-eval -o yaml && echo --- \
+      && k get roles -A -l app.kubernetes.io/instance=pa-eval -o yaml; } > "$WORK/shadow-rbac.yaml" || die "S1. reading the release's roles"
+  SCALE_RULE="$(scale_rules shadow "$WORK/shadow-rbac.yaml" "$RELEASE_FULLNAME-operator-write")" || die "S1. the live scale rule is not get only"
+  rc=0; shadow_permissions real || rc=$?
+  [ "$rc" = 0 ] || die "S1. system:serviceaccount:$CTRL:$OPERATOR_SA on deployments/scale in $NS: $([ "$rc" = 1 ] && echo REFUSED || echo "UNPROVEN (exit $rc)") (the reasons are above; $WORK/shadow-permissions-real.json)"
+  grep -qx "$SHADOW_SELFTEST_TARGET" "$WORK/shadow-permissions-real.targets" || die "S1. $SHADOW_SELFTEST_TARGET is not an autoscaler target"
+  log "S1 saw: $SCALE_RULE"
+  log "S1 saw: $(permissions_line "$WORK/shadow-permissions-real.json")"
+  pass "S1. shadow: system:serviceaccount:$CTRL:$OPERATOR_SA may not write deployments/scale in $NS: update=no patch=no get=yes without a name and for each of the $(grep -c . "$WORK/shadow-permissions-real.targets") autoscaler targets by name (the authorizer's answers); no binding that names the identity grants a scale write; the live scale rule is get only"
+
+  # --- S1's negative self-test: a name-restricted grant from outside the release must be refused ----------------------
+  # What a check without names misses: a Role that carries none of the release's labels and grants update on
+  # deployments/scale for ONE named Deployment, bound to the operator's ServiceAccount. S1 must refuse it (the named
+  # question answers yes, the unnamed one still no, and the binding scan finds the Role). The grant exists for a few
+  # seconds, on an arm whose autoscaler is in Recommend, before any load; it is deleted before the verdict is judged,
+  # S1 must pass again, and check 3 then finds every Recommend arm still at 2 replicas.
+  guard
+  k apply -f - >/dev/null <<EOF || die "S1 self-test. creating the outside grant"
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: $SHADOW_SELFTEST_GRANT, namespace: $NS}
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    resourceNames: ["$SHADOW_SELFTEST_TARGET"]
+    verbs: ["update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: $SHADOW_SELFTEST_GRANT, namespace: $NS}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: $SHADOW_SELFTEST_GRANT}
+subjects: [{kind: ServiceAccount, name: $OPERATOR_SA, namespace: $CTRL}]
+EOF
+  attempt=0
+  while :; do   # the authorizer follows the new binding within moments; look again for up to 30 s
+    attempt=$((attempt + 1))
+    rc=0; shadow_permissions negative 2>"$WORK/shadow-permissions-negative.err" || rc=$?
+    { [ "$rc" != 1 ] && [ "$attempt" -lt 6 ]; } || break
+    sleep 5
+  done
+  k -n "$NS" delete rolebinding "$SHADOW_SELFTEST_GRANT" >/dev/null || die "S1 self-test. deleting the outside RoleBinding"
+  k -n "$NS" delete role "$SHADOW_SELFTEST_GRANT" >/dev/null || die "S1 self-test. deleting the outside Role"
+  sed 's/^/S1 self-test (grant present): /' "$WORK/shadow-permissions-negative.err"
+  [ "$rc" = 1 ] || die "S1 self-test. the name-restricted outside grant was NOT refused (exit $rc; $WORK/shadow-permissions-negative.json)"
+  "$PY" - "$WORK/shadow-permissions-negative.json" "$SHADOW_SELFTEST_TARGET" "$NS" "$SHADOW_SELFTEST_GRANT" <<'PY' || die "S1 self-test. the refusal is not the expected one"
+import json, sys
+d, target, ns, grant = json.load(open(sys.argv[1])), *sys.argv[2:5]
+a = d["answers"]
+assert a[target] == {"update": "yes", "patch": "no", "get": "yes"}, f"answers for {target}: {a[target]}"
+others = {n: v for n, v in a.items() if n != target}
+assert len(others) == len(d["targets"]) and all(v == {"update": "no", "patch": "no", "get": "yes"} for v in others.values()), others
+grants = [(g["binding"], g["role"], g["where"], g["verbs"], g["resourceNames"]) for g in d["scale_write_grants"]]
+assert grants == [(f"RoleBinding/{ns}/{grant}", f"Role/{ns}/{grant}", ns, ["update"], [target])], grants
+assert d["verdict"] == "refused" and len(d["refused"]) == 2 and not d["unproven"], (d["refused"], d["unproven"])
+PY
+  log "S1 self-test saw (grant present): $(permissions_line "$WORK/shadow-permissions-negative.json")"
+  attempt=0
+  while :; do   # and forgets the deleted one as quickly
+    attempt=$((attempt + 1))
+    rc=0; shadow_permissions after || rc=$?
+    { [ "$rc" != 0 ] && [ "$attempt" -lt 6 ]; } || break
+    sleep 5
+  done
+  [ "$rc" = 0 ] || die "S1 self-test. after deleting the outside grant S1 does not pass again (exit $rc; $WORK/shadow-permissions-after.json)"
+  [ -z "$(k -n "$NS" get roles,rolebindings -o name | grep -F "$SHADOW_SELFTEST_GRANT" || true)" ] || die "S1 self-test. the outside grant is still there"
+  log "S1 self-test saw (grant deleted): $(permissions_line "$WORK/shadow-permissions-after.json")"
+  pass "S1 self-test. shadow: with Role $NS/$SHADOW_SELFTEST_GRANT (no release label; update on deployments/scale, resourceNames [$SHADOW_SELFTEST_TARGET]) bound to the operator's ServiceAccount, S1 REFUSED: update=yes for $SHADOW_SELFTEST_TARGET by name while the question without a name still answered no, and the binding scan named the Role; the Role and RoleBinding are deleted and S1 passes again"
+fi
 
 # --- 3. Recommend writes nothing ----------------------------------------------------------------------------------------
 sleep 90
@@ -1311,16 +1584,22 @@ if bad or len(items) != 6:
 print(len(items))
 PY
 )" || die "S5. a PredictiveAutoscaler left Recommend or records a write"
-  "$PY" - "$WORK" "$SHADOW_ARM" "$SHADOW_GEN" "$CAN_UPDATE" "$CAN_PATCH" "$CAN_GET" "$SCALE_RULE" "$LOG_LINES" \
-    "$LOG_FORBIDDEN" "$LOG_SCALE" "$LOG_RECOMMEND" "$OPERATOR_RESTARTS" "$ARMS_FINAL" "$SHADOW_BEFORE" "$LOG_QUOTA" "$LOG_FIRST" <<'PY'
+  "$PY" - "$WORK" "$SHADOW_ARM" "$SHADOW_GEN" "$SCALE_RULE" "$LOG_LINES" "$LOG_FORBIDDEN" "$LOG_SCALE" "$LOG_RECOMMEND" \
+    "$OPERATOR_RESTARTS" "$ARMS_FINAL" "$SHADOW_BEFORE" "$LOG_QUOTA" "$LOG_FIRST" "$SHADOW_SELFTEST_TARGET" <<'PY'
 import json, os, sys
-work, arm, gen, upd, patch, get, rule, lines, forbidden, scale, recommend, restarts, arms, before, quota, log_first = sys.argv[1:17]
+work, arm, gen, rule, lines, forbidden, scale, recommend, restarts, arms, before, quota, log_first, selftest_target = sys.argv[1:15]
 load = lambda name: json.load(open(os.path.join(work, name)))
 rec, final, ledger = load("shadow-recommend.json"), load("shadow-final.json"), load("shadow-ledger.json")
+perm, neg, after = (load(f"shadow-permissions-{t}.json") for t in ("real", "negative", "after"))
+keep = lambda p: {k: p[k] for k in ("verdict", "answers", "scale_write_grants", "refused", "unproven")}
 summary = {
     "arm": arm, "operator_values": {"rbac.scaleWrite": False, "forecastLedger.enabled": True},
-    "S1_permissions": {"can_i_update_deployments_scale": upd, "can_i_patch_deployments_scale": patch,
-                       "can_i_get_deployments_scale": get, "live_scale_rule": rule},
+    "S1_permissions": {"identity": perm["identity"], "impersonated_groups": perm["groups"],
+                       "question": "kubectl auth can-i <verb> deployments.apps[/<name>] --subresource=scale; '-' is the question without a name",
+                       "targets": perm["targets"], **keep(perm),
+                       "bindings_of_the_identity": perm["bindings_of_the_identity"], "live_scale_rule": rule},
+    "S1_negative_self_test": {"outside_grant": f"Role and RoleBinding without the release's labels: update on deployments/scale, resourceNames [{selftest_target}], bound to the operator ServiceAccount",
+                              "with_the_grant": keep(neg), "after_deleting_it": keep(after)},
     "S2_recommendation": {"before_the_load": before, "calculatedReplicas": rec["calculatedReplicas"],
                           "currentReplicas": rec["currentReplicas"], "mode": rec["mode"], "conditions": rec["conditions"],
                           "deployment": rec["deployment"], "generation_before_the_load": int(gen),
