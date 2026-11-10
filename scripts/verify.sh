@@ -106,6 +106,9 @@ if [ "$run_py" = 1 ]; then
   else
     echo "verify: helm not found; the c28 shadow render-only smoke is skipped (it runs in CI)" | tee -a "$LOG"
   fi
+  # The demonstration stage's offline smoke: its params stage and refusals, rendering audits, generator logic (node).
+  PYTHON="$PYTHON" deploy/eval-c28/smoke/demo-kind.sh --render-only 2>&1 | tee -a "$LOG"; rc=${PIPESTATUS[0]}
+  status_line "c28 demo render-only" "$rc" | tee -a "$LOG"; [ "$rc" -eq 0 ] || overall=1
   # The operator's forecast contract v2 fixtures must be what ml-engine/forecasting/contracts.py generates now.
   "$PYTHON" k8s-operator/hack/gen_v2_fixtures.py check 2>&1 | tee -a "$LOG"; rc=${PIPESTATUS[0]}
   status_line "v2 contract fixtures" "$rc" | tee -a "$LOG"; [ "$rc" -eq 0 ] || overall=1

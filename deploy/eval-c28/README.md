@@ -8,11 +8,13 @@ evidence by itself. The executor uses it under a locked run-lock and the change 
 |---|---|
 | `fixture/` | The HTTP fixture: one binary in three modes. `server` is the workload: fixed CPU work, a fixed response, a bounded queue, a measured startup delay and `/ready`, `/metrics`. `ingress` counts offered demand per target before the target can reject it, with a 2 s timeout and no retries; with `ROUTING=endpoints-rr` (what every evaluation and calibration rendering sets) it sends each request to the next READY pod of the target in a strict per-request round-robin, discovered by a namespaced LIST + WATCH of the target Services' EndpointSlices (`endpoints.go`: per-pod dispatch counters, endpoint-set generation and ready count, discovery errors, last-sync age and a stale flag; a stale discovery keeps the last known set and says so), instead of through the Service ClusterIP, where the cluster balances per kept-alive connection. `ROUTING=service` (the binary's default, no API access needed) is the earlier behaviour. `tcpproxy` is the evaluation-owned metrics and forecast routes, with scheduled outages. `Dockerfile` builds a static, non-root image. |
 | `load/c28.js` | The k6 open-loop generator (ramping-arrival-rate, one request per iteration), driven by a plan from `python -m c28 plan`. |
+| `load/c28-demo.js` | The demonstration's continuous generator (k6; a NEW script, the two above stay pinned): one single-VU scenario per target runs an event loop that times arrivals against wall-clock time from ONE recorded origin and sends them asynchronously (open loop, targets independent), resumes at the current position after any restart, and writes one JSON record per target and minute. See "The demonstration stage" below. |
 | `load/c28-calibrate.js` | The k6 script of the S5a capacity calibration (`staging/calibrate.py`): settle and measure scenarios at one constant arrival rate, per-scenario counts and latencies in the pod's termination message. |
 | `harness/c28/` | `render` (fixture, ingress with its namespaced EndpointSlice-reader ServiceAccount/Role/RoleBinding, routes, quota and the five arms for both startup profiles, with an exclusive-writer audit, a sidecar-free audit, an RBAC least-privilege audit and the residency budget), `schedule` (programs, k6 plans, fault timetable, the frozen session order), `runlock`, `collect` (hashed evidence bundle), `reduce` (per-window metrics), `score` (paired day-block bootstrap, Holm correction, the section 8 classification), `inject` (the guarded quota fault). `frozen.py` holds every value the manifest freezes. |
 | `trace/` | PROPOSAL (draft contract v2, pending Codex review): the pre-declared selection and transformation of the Azure Functions 2019 trace (CC BY 4.0) for a separate public-trace demonstration. Not part of C2.8 scoring and no replacement for the manifest's ordinary warm-up. `azure_functions_2019.py select|prepare|plan|rules` (standard library, one file, run with `python -I`): each stage checks the reviewed sha256 of its input and records the hashes it was built from (source, selection, prepared, plan), validates schema, membership, length and transformation consistency, and never overwrites an output. `plan` emits exactly the `c28-k6-plan/v1` that `load/c28.js` accepts (kind `trace-demo`), one constant rate per trace minute, so each minute's scheduled count equals its intended count; `tests/c28js_loader.js` runs the real `c28.js` validator on it under node. Generated requests are "derived from per-minute invocation counts", never real arrival timestamps or real traffic. `k6_points.py` sums k6 counter samples into per-minute "metric-point buckets" anchored to a declared scenario start (emission/completion time, so not dispatch or ingress receipt times). It never runs a forecaster. |
-| `params/` | `kind-smoke.json` for the kind smoke. `prodcluster.template.json` lists what the run-lock must resolve; it cannot be rendered until every placeholder is replaced (the calibrated fixture resources and the W/S residency inputs included). |
+| `params/` | `kind-demo.json` and `demonstration.template.json` for the demonstration stage (no `c0_rps`, HPA target or KEDA setting). `kind-smoke.json` for the kind smoke. `prodcluster.template.json` lists what the run-lock must resolve; it cannot be rendered until every placeholder is replaced (the calibrated fixture resources and the W/S residency inputs included). |
 | `smoke/kind.sh` | The aspire kind-bed smoke, on its own cluster and kubeconfig only. `--render-only` renders and audits offline; `scripts/verify.sh` runs that mode. `--images images.json` runs the exact reviewed digests of a `c28-images/v1` file (pulled by digest, no build) and fails on any other running image. `--shadow` (with or without `--images`) installs the release as the S3 shadow install runs it (`operator.rbac.scaleWrite: false`, the forecast ledger on) and adds checks S1–S5: the live scale rule is `get` only; the API server's authorizer answers no to `update` and `patch` (yes to `get`) on `deployments/scale` for the operator's ServiceAccount, asked without a name and for the Deployment name of every PredictiveAutoscaler target (a grant restricted by `resourceNames` answers only the named question), an error counting as unproven, never as no; and no RoleBinding or ClusterRoleBinding of the cluster that names that ServiceAccount, its username or one of its groups, whatever its labels, resolves to a rule that may write a scale subresource. S1 then tests itself: a Role without the release's labels granting `update` on `deployments/scale` for one named target, bound to the operator's ServiceAccount, must make it refuse, and after the Role and RoleBinding are deleted it must pass again, all before any load. Under a second accelerated load a Recommend arm recommends at least 4 replicas while its Deployment keeps 2 replicas and its generation, with `ScalingActive=False/RecommendMode` (an unavailable forecast is expected and only reported); the operator log has no `deployments/scale` line at any time and no `forbidden` line up to the point before the quota check (check 6), after which the only `forbidden` lines allowed are the smoke's own quota denial as the operator's ScaleOutBlocked event quotes it (`pods … is forbidden: exceeded quota: c28-fixture-quota`), counted separately and reported, any other failing; the ledger advances and holds only `recommend` decisions; and at the end no autoscaler left Recommend or records a write. `--render-only --shadow` renders the chart with and without the shadow values (`helm template`, no cluster) and self-tests those checks' classifiers, the name-restricted outside grant included; `scripts/verify.sh` runs it where helm is installed (always in CI). |
+| `smoke/demo-kind.sh` | The demonstration-stage smoke. `--render-only` (offline; `scripts/verify.sh` runs it): the params stage and its refusals, the rendering audits, and the real generator script under node through `demo-reduce`. `--k6-local`: the real k6 binary against a dummy server on 127.0.0.1. Without a flag: a throwaway kind cluster with its own kubeconfig. |
 | `smoke/calibrate-kind.sh` | The kind smoke of the calibration path (`--images images.json --out report.json`, own cluster and kubeconfig only, reviewed digests pulled on the nodes): non-root summary delivery through the termination message, the actual scenario timing, zero drops reconciled against the ingress's own counters, reported drops with starved VUs, refusal of truncated or malformed summaries, UID-bound stop, `activeDeadlineSeconds` expiry, cleanup and image identity (`calibrate_kind.py`). Required before any prod calibration; not C2.8 evidence. |
 
 ```sh
@@ -178,6 +180,181 @@ available) equal to it, and exactly that many Pods owned through its ReplicaSets
 Deployment's UID), none of them terminating and every one Running and Ready. A session never scales a target, and a
 stopped session leaves its target at whatever count its writer last set; the start refusal names those targets and
 points to the restore.
+
+## The demonstration stage
+
+"Predictive scaling on live synthetic diurnal traffic" (`LIVE-DEMO-PLAN.md` sections 5 and 6): two fixture targets
+under their own run id, fed the same ordinary diurnal program by one continuous generator. It shows a running system.
+It is not real business demand, not a comparison result, and it earns no confirmation or qualification credit for the
+study. It is a stage of these tools (`harness/c28/demo.py`, `demo_reduce.py`, `load/c28-demo.js`,
+`staging/prepare.py` with `prepare.stage: "demonstration"`), with no experiment-only field and no dummy value.
+
+**Not in this stage:** the Active transition, the demonstration qualification and its mount, the chart's
+`operator.rbac.scaleTargets`, the dashboard, and the admission exercise's executor. Every PredictiveAutoscaler is
+rendered in Recommend and the release overlay withholds the scale write.
+
+### Params stage `demonstration`
+
+`render.validate_stage(params, "demonstration")` (`python -m c28 validate --params P --stage demonstration`) checks
+exactly `render.STAGE_FIELDS["demonstration"]` with the full validation's strictness: schema, run id, namespaces,
+release, the fixture image and its calibrated resources, W and S, the reservation keys, ingress and proxy resources,
+routes and query path, priority class and quota, the scrape kind, `release_network_policies`, `residency` (required),
+and the `demonstration` block. It never reads `c0_rps`, `hpa_cpu_target_percent` or `keda.*`
+(`render.EXPERIMENT_ONLY`): they may be absent or still placeholders. Passing it says nothing about the comparison
+experiment (`full_validation_problems`).
+
+| Field of `demonstration` | Rule |
+|---|---|
+| `run_id` | The params' `run_id` (objects, receipts and journals use it; `c28.devkuban.com/run` carries it). |
+| `reservation_ref` | `{run_id, taint_value, nodes: {workload: {name, uid}, support: {name, uid}}}`: the reservation's OWNER. `taint_value` is the owner's run id and equals `reservation.taint_value`; the node names equal `nodes.*`; the UIDs are UUIDs and differ. The stage never retags a node. |
+| `targets` | Exactly two, exactly the roles `forecast` and `reactive`: `{name, role, families}` and `{name, role}`. Names are `c28-*` DNS labels, different, and never a comparison arm's or a run-wide object's name. `families` must be `["seasonalNaive"]`; the reactive reference runs the same families. |
+| `profile` | `"s20"`: one startup profile. |
+| `bounds`, `shadow_replicas` | Bounds exactly `{min: 1, max: 12}`; the fixed shadow replica count an integer within them. |
+| `capacity_per_replica_rps`, `capacity_label`, `capacity_source_calibration` | A positive number (the PredictiveAutoscaler's `capacityPerReplica`, already 0.875 x the reviewed rate), the literal `"provisional"`, and the calibration id it comes from (`c28cal-<10 hex>`). |
+| `cadence` | Exactly `{grid_seconds: 60, update_interval_seconds: 60}`. Any other combination is refused, and the rendering is checked against it. |
+| `schedule_origin_utc` | ONE UTC midnight (`YYYY-MM-DDT00:00:00Z`), set once at the start of history. Every reader bins from it. |
+| `peak_multiple` | `9`, the ordinary program's peak in units of c. |
+| `program` | `{kind: "ordinary", seed}`; the seed is none of the comparison's tuning or confirmation seeds. The same 24-hour program repeats daily. |
+| `generator` | `{image, k6_version, resources, segment_hours, remote_write_url}`: the reviewed k6 image by digest (`sha256:70af91f8…`, any mirror repository), `0.57.0`, requests at most limits, a whole number of days in hours (24 … 672), an http(s) URL without user-info. The memory limit must cover the estimate of `demo-sizing`. |
+
+Unknown fields are refused; so is any `<...>` or `__...__` placeholder in a consumed field.
+
+`demo.active_values_problems(values, params)` validates the scale-write part of the release's chart values for both
+configurations and produces neither: shadow (`scaleWrite: false`) may name no `scaleTargets`; Active
+(`scaleWrite: true`) must name exactly the two targets, and an empty or missing list (the chart's namespace-wide
+default) is refused.
+
+### What is rendered
+
+`python -m c28 render --params P --stage demonstration [--part common|targets|pas|generator]`. Every name is `c28-*`
+and every object and pod carries `c28.devkuban.com/run=<the demonstration's run id>`; pods tolerate the OWNER's taint.
+
+| Phase | Objects |
+|---|---|
+| common | PriorityClass and scoped ResourceQuota (the params' names), the ingress with its ServiceAccount, Role and RoleBinding (routing `/t/<target>/` to the two targets only), `c28-metrics-route` and `c28-forecast-route` with their EMPTY fault ConfigMaps, the route NetworkPolicies when the release enforces them, the scrape object (`render.common_objects`). |
+| targets | Per target an EMPTY fault ConfigMap, the Deployment at `shadow_replicas` and the Service, exactly as the s20 arms are rendered (`render.target_objects`: image by digest, the calibrated resources, probes, placement). |
+| pas | Two PredictiveAutoscalers in Recommend through the arms' own rendering (`render.pa_object`): engine statistical, `prediction.families` from the params, sample and update interval 60 s. The reactive reference is the same object with `predictiveExtra` an explicit `{maxReplicas: 0, maxPercent: 0}`, as PA-R. |
+| generator | ConfigMap `c28-demo-generator` (the script and its configuration) and Deployment `c28-demo-generator`: one replica, strategy Recreate, on S, `k6 run` of the reviewed image. |
+
+`python -m c28 residency --params P --stage demonstration` is the stage's admission audit, on
+`render.residency_report`'s machinery and the same 75 % rule: on W both targets at `maxReplicas` plus `overlap_pods`
+each and the ingress; on S the two routes, the rendered generator, and the operator and forecaster as the release's
+final chart values request them; each node's system requests on top.
+
+### `prepare.py` for the stage
+
+The record's `prepare` section gets `"stage": "demonstration"` and `"reservation": {"record", "sha256"}`, the
+reservation OWNER's preparation record. The phases are the experiment's six (`namespaces`, `storage`, `values`,
+`common`, `targets`, `pas`) plus `generator`. Every existing refusal stays: an existing name (cluster-scoped ones
+included), a name outside `c28-*`, a writer that references a target, a PredictiveAutoscaler not in Recommend, a
+non-empty fault schedule, the residency audit and the reservation gate in every plan and again under the lock at apply.
+
+- **The reservation is another run's.** `demonstration_gate` loads the owner's record (bound by sha256) and checks the
+  reference against it: owner run id, taint key and value, role label, both node names and UIDs, the same cluster and
+  lock directory, the same release and control namespace. Then it requires the owner's LIVE verdict with the
+  demonstration as an authorized occupant (`reserve.verify(owner, occupant={run_id, namespaces})`: a pod with the
+  demonstration's run label in its namespaces classifies as `authorized-occupant`; any other pod is still unplanned)
+  and the placement of the demonstration's rendered pods. Without that reference, reserve.py's own `verify`,
+  calibration and sessions see the demonstration's pods as unplanned occupants, as before.
+- **Values.** The overlay as before (`operator.rbac.scaleWrite: false`, no lab qualification), plus the release's own
+  scrape object from `params.scrape`: `VMPodScrape` → `metrics.vmServiceScrape.enabled: true`, `PodMonitor` →
+  `metrics.serviceMonitor.enabled: true`, `annotations` refused for the release. `values_problems` requires exactly
+  one. Stage `experiment` writes the overlay it wrote before, unchanged.
+- **Generator.** Created only after `targets` and `pas` (this run's objects, same UIDs, both PAs in Recommend), with the
+  schedule origin not in the future, and only when no other Deployment or Pod carries the generator's name label
+  (strict listings: a failed list is never "no generator"). `verify` checks the fixed shadow count, one replica,
+  strategy Recreate and at most one generator pod.
+
+### The continuous generator (`load/c28-demo.js`)
+
+- **Program.** `python -m c28 demo-plan --params P` writes its configuration (`c28-demo-generator/v1`): the origin and
+  the intended arrivals of each of the day's 1,440 minutes, `round(u × capacity_per_replica_rps × 60)` of the ordinary
+  program, the same for every target. Minute m = floor((t − origin) / 60 s); its count is `per_minute[m mod 1440]`;
+  its arrivals are evenly spaced inside the minute, the targets interleaved by a phase.
+- **Open loop, independent targets.** One k6 scenario per target with ONE virtual user, whose single iteration runs
+  an event loop: arrivals are timed by `setTimeout` against wall-clock time and sent with `http.asyncRequest`, so no
+  arrival waits for a response and a slow or failing target cannot delay the other (separate VUs and event loops).
+  The script, not a k6 arrival-rate executor, schedules the arrivals: per-minute accounting needs state shared by all
+  of a target's requests, which k6's VUs do not have, and the VU count would otherwise grow with rate × timeout.
+- **Resume, no replay, no reset.** The position is a pure function of wall-clock time and the origin. A process that
+  starts at any time sends only what is scheduled from then on. An arrival more than 1 s late (a stalled process, a
+  clock step) is dropped with reason `late`; one that would exceed `max_inflight` requests in flight is dropped with
+  reason `inflight`. Nothing is retried or caught up.
+- **Segments and incarnations.** One k6 process is one incarnation, id `<pod UID>/<start, epoch ms>`. It runs to the
+  next multiple of `segment_hours` from the origin (a UTC midnight, the program's lowest demand; the one after it when
+  closer than 5 minutes), writes its end record, and k6 exits 0; the kubelet restarts the container and the next
+  incarnation resumes. That bounds anything that could grow with run time.
+- **Single generator.** One Deployment, one replica, strategy Recreate (the old pod is gone before a new one exists);
+  `prepare.py` refuses a second generator and `verify` counts the pods. Detection does not rely on that: every record
+  names its incarnation, records of two incarnations active in the same part of a minute are `duplicate_generators`,
+  and a generator whose log is missing shows as received ≫ dispatched (`unreconciled`).
+- **Limits (review finding R2-18).** `python -m c28 demo-sizing --params P` states the arithmetic: 3 VUs (one per
+  target and k6's setup VU), `max_inflight = ceil(peak arrivals per second × 2 s × 1.5) + 10` per target, and a memory
+  ESTIMATE from assumed constants (128 MiB base, 16 MiB per VU, 128 KiB per request in flight) that the memory limit
+  must cover. For 17.5 rps per replica the peak is about 165 arrivals per second per target, `max_inflight` 505, the
+  estimate about 302 MiB against a 512 MiB limit. The constants are assumptions, not measurements: the kind smoke's
+  full mode prints the generator's `memory.current` so they can be replaced.
+- **Records.** One JSON line per target and minute (`c28-demo-minute/v1`, under 800 bytes), written 2.5 s after the
+  minute ends, when every request dispatched in it has its outcome; a start and an end record
+  (`c28-demo-incarnation/v1`) frame each incarnation. Two targets write at most 2 × 1,440 × 800 B ≈ 2.3 MiB a day,
+  32 MiB in 14 days. They are the pod's log and do not depend on remote-write delivery. **The API serves only the
+  current and the previous container's log**, and each segment is a new container: with 24-hour segments the logs
+  must be collected at least daily (or kept by the cluster's log pipeline).
+- **Remote write** (dashboards only): counters `c28d_scheduled`, `c28d_dispatched`, `c28d_dropped{reason}` and
+  `c28d_completed{outcome}` per `c28_target`, tagged `c28_run` and `c28_pod`. `c28d_completed` and k6's own
+  `http_reqs` are stamped at completion and are never dispatch counts. A missing series is unknown, never zero.
+- **Clock.** Each minute's record carries the first response's `Date` header with the local receive time: evidence of
+  the offset between the generator's and the ingress's clocks. The schedule is never corrected by it.
+
+| Count | Timestamp it uses |
+|---|---|
+| `intended` | none: the plan's count for the minute |
+| `due` | the arrival's scheduled time, inside the incarnation's active span (`active: [from, to]` ms of the minute) |
+| `dispatched` | the generator's clock immediately before the send (dispatch time) |
+| `carried` | `[in, out]`: dispatched in this minute but scheduled in the previous one / due here but dispatched in the next |
+| `dropped.late`, `dropped.inflight` | the scheduled time of an arrival the generator did not send |
+| `ok`, `failed`, `failed_by`, `unresolved` | the outcome of the requests dispatched in the minute (never the completion time); status `0` is no HTTP response |
+| received (reducer) | the ingress's clock at arrival (`c28_ingress_requests_total`) |
+
+Every line satisfies `due = dispatched − carried[0] + carried[1] + dropped.late + dropped.inflight` and
+`dispatched = ok + failed + unresolved`.
+
+### The reducer (`python -m c28 demo-reduce`)
+
+`demo_reduce.reduce(config, records, ingress, start, end)` returns per-minute rows of every target, binned from the
+configuration's recorded origin and nothing else, so a late or restarted generator costs only the minutes it did not
+cover (review finding R2-01). Its inputs are the pod logs (any number of pulls; a line read twice is dropped; k6's
+raw, JSON and text log formats and `kubectl logs --timestamps` are read) and the ingress's RAW counter samples with
+their own timestamps, `{"<target>": [[t_seconds, value], ...]}` (a range-vector query such as
+`c28_ingress_requests_total{target="…"}[1d]` or an export; a stepped range query would hide scrape gaps, R2-19).
+`reduce.py` and the study's scoring are unchanged.
+
+| State | Meaning |
+|---|---|
+| `observed` | One incarnation covered the whole minute, its record is self-consistent and equals the plan, the ingress count is known, the clocks agree within the limit, and the running balance reconciles. |
+| `partial` | Trustworthy but not a whole, fully observed minute: an incarnation started or ended inside it (`incarnation_boundary`, with the exact active span and counts), the generator was provably absent between an end record and the next start (`generator_gap`), or the ingress count is unknown (`ingress_gap`, `ingress_reset`, `ingress_absent`). |
+| `unknown` | The generator's side is missing or cannot be trusted: no record yet for the range's first minutes (`before_first_record`), a killed incarnation's unrecorded tail up to the next start (`unrecorded_tail`), a lost line (`generator_record_missing`), two incarnations at once (`duplicate_generators`), `inconsistent_line`, `plan_mismatch`, `config_mismatch`, `conflicting_lines`, `generator_counter_reset`, `unresolved_outcomes`, a clock offset beyond the limit or no clock evidence (`clock_offset`, `clock_unverified`), or a balance that does not reconcile (`unreconciled`). Never zero, never healthy. |
+
+- The ingress count of a minute is the counter's difference between its two boundaries, each estimated from the
+  adjacent raw samples (`received`, with hard `received_bounds` and a stated `received_err`); two missed scrapes
+  (more than 35 s between samples) are a gap, a decrease is a reset, no series is `ingress_absent`.
+- Received and dispatched are not required to match inside a minute. A running balance of dispatched minus received
+  may hold what can be in flight (the timeout plus 1.1 s of arrivals, plus two) and the ingress estimate's error;
+  requests without any HTTP response explain a positive imbalance up to their number. Beyond that the minute is
+  `unreconciled` and the balance restarts.
+- A clock offset is detected with certainty only beyond the limit plus about one second (the `Date` header has whole
+  seconds); the limit (default 2 s) is recorded in the output.
+- The newest minutes of a running incarnation are `unrecorded_tail` until their lines exist: end the range at least
+  three minutes before the log was pulled.
+- Summary totals cover observed minutes only.
+
+### Smoke and what was run
+
+`smoke/demo-kind.sh --render-only` runs in `scripts/verify.sh`. The generator's logic (position in the day, arrival
+times, resume, segments, bookkeeping, drops) and the reducer are tested on the real script under node with a virtual
+clock (`harness/tests/demo_sim.js`). **k6 itself has not run this script yet**: its event loop, `http.asyncRequest`,
+`k6/timers`, the log format and the exit status at a segment end are first exercised by `demo-kind.sh --k6-local`
+(k6 on PATH, a dummy server on 127.0.0.1) and by the full mode on a throwaway kind cluster.
 
 ## Restore to the common starting count
 
