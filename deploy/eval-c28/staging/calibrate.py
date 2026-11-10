@@ -153,7 +153,13 @@ per-endpoint deltas plus the no-ready delta equals the ingress's received arriva
 equal them) and only to the trial's fixture pods; the spread is reported, never judged. The no-ready 503s are request
 failures k6 already counts (failure fraction, latency), reported in the dispatch detail and never judged again; an
 absent no-ready counter is 0 only from a successful query of the proven fresh, unchanged ingress, while a failed or
-stale reading, a series that disappears or a reset is incomplete evidence. This accounting waives no discovery,
+stale reading, a series that disappears or a reset is incomplete evidence. Continuity holds across trials too: once
+an earlier trial observed the counter present (even at 0) on the same ingress pod identity (UID, name, restart
+count), a later absence or a lower value is incomplete; the executor reads that from the earlier trials' recorded
+results and the reducer from its recomputed ones, in journal order. A v3 contract also requires every ingress
+counter reading and its supporting up response to be a successful range response (status success, resultType
+matrix, a well-formed result list) before anything is read from it, so an error answer is never an absent counter
+(v1/v2 readings keep the earlier rule, so their bundles reduce unchanged). This accounting waives no discovery,
 membership or stray-endpoint check.
 
 Guards added before the contract freeze. The rollout guard judges OnDelete DaemonSets and StatefulSets (which
@@ -1095,10 +1101,45 @@ def _up(obs: Dict, at: int, con: Dict) -> str:
     return ""
 
 
-def quiet_value(obs: Dict, at: int, con: Dict, up: Optional[Dict] = None) -> Tuple[Optional[float], str]:
+def v3(con: Dict) -> bool:
+    """A contract v3 (observer.discovery.no_ready): the no-ready accounting and the strict response envelopes."""
+    return "no_ready" in (con["observer"].get("discovery") or {})
+
+
+def envelope(obs: Dict) -> str:
+    """'' when a recorded range query answered a successful Prometheus range response: status "success",
+    data.resultType "matrix", data.result a list of {metric: object, values: list}; otherwise why not. Contract v3
+    checks it before any reading (an error answer with an empty result is never an absent counter)."""
+    if not isinstance(obs, dict) or "response" not in obs:
+        return f"the query failed ({obs.get('error', 'not recorded') if isinstance(obs, dict) else 'not recorded'})"
+    resp = obs["response"]
+    data = resp.get("data") if isinstance(resp, dict) else None
+    if not isinstance(resp, dict) or resp.get("status") != "success":
+        return f"the query did not succeed (status {resp.get('status') if isinstance(resp, dict) else None!r})"
+    if not isinstance(data, dict) or data.get("resultType") != "matrix":
+        return "not a range (matrix) response"
+    res = data.get("result")
+    if not isinstance(res, list) or not all(isinstance(r, dict) and isinstance(r.get("metric"), dict) and
+                                            isinstance(r.get("values"), list) for r in res):
+        return "malformed response"
+    return ""
+
+
+def quiet_value(obs: Dict, at: int, con: Dict, up: Optional[Dict] = None,
+                strict: bool = False) -> Tuple[Optional[float], str]:
     """A counter read while nothing flows: at least three samples in the recorded range, all equal, the last fresh.
     A per-target counter that does not exist yet (the ingress has seen no arrival for that target since it started)
-    reads 0 only while the ingress scrape itself is proven fresh and up (`up`, the ingress_up range)."""
+    reads 0 only while the ingress scrape itself is proven fresh and up (`up`, the ingress_up range). strict (contract
+    v3): the counter's response and, for an absent counter, the up response must be successful range responses
+    (envelope) first; v1/v2 readings keep the earlier rule unchanged."""
+    if strict:
+        why = envelope(obs)
+        if why:
+            return None, why
+        if obs["response"]["data"]["result"] == []:
+            why = envelope(up or {})
+            if why:
+                return None, f"no series, and ingress_up: {why}"
     if isinstance(obs, dict) and isinstance(((obs.get("response") or {}).get("data") or {}).get("result"), list) \
             and obs["response"]["data"]["result"] == []:
         why = _up(up or {}, at, con)
@@ -1349,7 +1390,7 @@ def idle_verdict(con: Dict, obs: Dict, readings: Dict) -> Tuple[str, Dict]:
     start_reading = obs.get("ingress_idle_start") or {}
     for k in ("requests", "responses"):
         v0, why0 = quiet_value(start_reading.get(k) or {}, int(start_reading.get("at") or 0), con,
-                               start_reading.get("up"))
+                               start_reading.get("up"), v3(con))
         v1 = (readings.get("before") or {}).get(k, (None, ""))[0]
         if start_reading.get("at") != s0:
             out.append("the idle start reading is not at the idle window's start")
@@ -1445,27 +1486,60 @@ def _last_by_label(obs: Dict, label: str, at: int, con: Dict) -> Tuple[Optional[
     return out, ""
 
 
-def no_ready_rejections(con: Dict, obs: Dict) -> Tuple[Optional[float], List[str], Dict]:
+def ingress_key(pods: List[Dict]) -> Optional[List]:
+    """The one ingress pod's counter identity [uid, name, restartCount] (a container restart starts its counters
+    again); None unless exactly one ingress pod."""
+    ident = _pod_identity(pods)
+    if len(ident) != 1:
+        return None
+    uid, (name, restarts, *_rest) = next(iter(ident.items()))
+    return [uid, name, restarts]
+
+
+def no_ready_prior(history: List[Dict], target: str, key: Optional[List]) -> Optional[Dict]:
+    """The latest earlier observation of this target's no-ready counter on the same ingress pod identity, from the
+    earlier trials' results in journal order (their recorded evidence, recomputed by the reducer): {"trial", "value"}
+    when that counter was PRESENT then (even at 0); None when it was never observed on that identity (absent, read
+    as 0, constrains nothing)."""
+    if key is None:
+        return None
+    for r in reversed(list(history or [])):
+        d = ((r.get("criteria") or {}).get("dispatch") or {}).get("no_ready") or {}
+        if d.get("target") == target and d.get("ingress") == key and "after" in d:
+            return {"trial": r.get("trial"), "value": d["after"]} if "after" not in d.get("absent", []) else None
+    return None
+
+
+def no_ready_rejections(con: Dict, obs: Dict, prior: Optional[Dict] = None) -> Tuple[Optional[float], List[str], Dict]:
     """Contract v3: the arrivals the ingress answered 503 "no ready endpoint" during the trial (after - before of the
     variant's c28_ingress_no_ready_endpoints_total, read with the same aligned before/after readings as the received
-    counter). Each side is a quiet counter (quiet_value: three or more fresh, equal samples); a counter that has not
-    appeared yet (the ingress has rejected nothing for that target since it started) reads 0 only from a successful
-    query while the ingress scrape is proven fresh and up, the ingress pod being the one evaluate_trial requires
-    unchanged across the trial. A failed query, a stale or moving sample, a non-finite or negative value, a series
-    present before and absent after (a lost series or a restart) or a negative delta (a reset) is unknown, never 0:
-    (None, problems, detail). Otherwise (delta, [], detail)."""
+    counter). Each side is a quiet counter (quiet_value, strict: a successful range response, three or more fresh,
+    equal samples); a counter that has not appeared yet (the ingress has rejected nothing for that target since it
+    started) reads 0 only from a successful query while the ingress scrape is proven fresh and up, the ingress pod
+    being the one evaluate_trial requires unchanged across the trial. A failed or unsuccessful query, a stale or
+    moving sample, a non-finite or negative value, a series present before and absent after (a lost series or a
+    restart) or a negative delta (a reset) is unknown, never 0: (None, problems, detail). So is a counter that an
+    EARLIER trial observed present on the same ingress pod identity (prior, no_ready_prior) and that is now absent or
+    lower before this trial (lost or reset between trials). Otherwise (delta, [], detail)."""
     side, present = {}, {}
     for s in ("before", "after"):
         r = obs.get(f"ingress_{s}") or {}
         o = r.get("no_ready") or {}
-        present[s] = ((o.get("response") or {}).get("data") or {}).get("result") not in (None, [])
-        v, why = quiet_value(o, int(r.get("at") or 0), con, r.get("up"))
+        v, why = quiet_value(o, int(r.get("at") or 0), con, r.get("up"), strict=True)
         if v is None:
             return None, [f"no-ready rejections {s} the trial: {why}"], {}
         if v < 0:
             return None, [f"no-ready rejections {s} the trial: a negative counter value {v:g}"], {}
+        present[s] = o["response"]["data"]["result"] != []
         side[s] = v
-    detail = {"before": side["before"], "after": side["after"], "absent": [s for s in side if not present[s]]}
+    detail = {"before": side["before"], "after": side["after"], "absent": [s for s in side if not present[s]],
+              "prior": prior}
+    if prior is not None and not present["before"]:
+        return None, [f"the no-ready rejection counter, observed at {prior['value']:g} in {prior['trial']}, is absent "
+                      "before this trial (lost between trials: a lost series or an ingress restart)"], detail
+    if prior is not None and side["before"] < prior["value"]:
+        return None, [f"the no-ready rejection counter went backwards between trials ({prior['value']:g} in "
+                      f"{prior['trial']}, {side['before']:g} before this trial: an ingress restart or reset)"], detail
     if present["before"] and not present["after"]:
         return None, ["the no-ready rejection counter disappeared during the trial (a lost series or an ingress "
                       "restart)"], detail
@@ -1475,7 +1549,8 @@ def no_ready_rejections(con: Dict, obs: Dict) -> Tuple[Optional[float], List[str
     return delta, [], dict(detail, rejected=delta)
 
 
-def dispatch_counts(con: Dict, obs: Dict, expected: List[str], received: Optional[float]) -> Tuple[List[str], Dict]:
+def dispatch_counts(con: Dict, obs: Dict, expected: List[str], received: Optional[float],
+                    prior: Optional[Dict] = None) -> Tuple[List[str], Dict]:
     """Per-endpoint dispatch during the trial (after - before of c28_ingress_dispatched_total by endpoint_pod; a
     counter that does not exist yet is 0): every arrival dispatched exactly once (sum = the ingress's received, no
     retry or duplicate) and only to the trial's fixture pods. Balance is reported, never judged. Contract v3: every
@@ -1508,7 +1583,7 @@ def dispatch_counts(con: Dict, obs: Dict, expected: List[str], received: Optiona
     if stray:
         out.append(f"arrivals were dispatched to pods outside the trial's fixture pods: {stray}")
     if "no_ready" in con["observer"]["discovery"]:          # v3
-        rejected, why, detail["no_ready"] = no_ready_rejections(con, obs)
+        rejected, why, detail["no_ready"] = no_ready_rejections(con, obs, prior)
         out += why
         if received is not None and rejected is not None and total + rejected != received:
             out.append(f"per-endpoint dispatch {total:g} plus {rejected:g} no-ready rejections does not reconcile "
@@ -1520,11 +1595,12 @@ def dispatch_counts(con: Dict, obs: Dict, expected: List[str], received: Optiona
     return out, detail
 
 
-def evaluate_trial(con: Dict, raw: Dict) -> Dict:
+def evaluate_trial(con: Dict, raw: Dict, history: Optional[List[Dict]] = None) -> Dict:
     """The verdict of one trial from its raw evidence alone (raw: trial meta, generator_pod, pods_begin, pods_end,
-    observations). INCOMPLETE > LIMIT > FAIL > PASS; every criterion is reported separately. `delivery` says whether
-    the arrivals were uncensored (no incomplete evidence, no generator/ingress limit); a selection trial also reports
-    its CPU cost per request."""
+    observations) and, for a contract v3, the earlier trials' results in journal order (history: the no-ready
+    counter's continuity across trials, no_ready_prior; unused before v3). INCOMPLETE > LIMIT > FAIL > PASS; every
+    criterion is reported separately. `delivery` says whether the arrivals were uncensored (no incomplete evidence, no
+    generator/ingress limit); a selection trial also reports its CPU cost per request."""
     t, cr, ob = raw["trial"], con["criteria"], con["observer"]
     step, rate, n, kind = ob["step_s"], t["rate_per_min"], t["n"], t["kind"]
     settle_s, measure_s = durations(con, kind)
@@ -1580,7 +1656,7 @@ def evaluate_trial(con: Dict, raw: Dict) -> Dict:
     readings = {}
     for side in ("before", "after"):
         r = obs.get(f"ingress_{side}") or {}
-        readings[side] = {k: quiet_value(r.get(k) or {}, int(r.get("at") or 0), con, r.get("up"))
+        readings[side] = {k: quiet_value(r.get(k) or {}, int(r.get("at") or 0), con, r.get("up"), v3(con))
                           for k in ("requests", "responses")}
         for k, (v, why) in readings[side].items():
             if v is None:
@@ -1607,7 +1683,13 @@ def evaluate_trial(con: Dict, raw: Dict) -> Dict:
     if "discovery" in con["observer"]:              # v2: per-endpoint dispatch, recorded per trial (v3: + no-ready)
         fx_names = sorted((p.get("metadata") or {}).get("name") for p in (raw.get("pods_begin") or {}).get(
             t["variant"]) or [])
-        why_x, dx = dispatch_counts(con, obs, fx_names, ing.get("received"))
+        prior = None
+        if v3(con):
+            key = ingress_key((raw.get("pods_begin") or {}).get("ingress"))
+            prior = no_ready_prior(history or [], t["target"], key)
+        why_x, dx = dispatch_counts(con, obs, fx_names, ing.get("received"), prior)
+        if v3(con) and dx.get("no_ready") is not None:
+            dx["no_ready"].update(target=t["target"], ingress=key)
         crit["dispatch"] = dx
         incomplete += why_x
     window, why = measurement_window(con, kind, summary, started)
@@ -3006,7 +3088,8 @@ def run_trial(ctx: Context, meta: Dict, decision_sha: str, guard: Optional[Dict]
         ctx.receipt("trial-not-started", {"trial": meta, "problems": problems + ([stale] if stale else [])})
         raise Halt("incomplete" if stale and not problems else "stopped", "; ".join(problems + [stale]).strip("; "))
     before = ingress_reading(ctx.fetch, con, ctx.cal, meta["target"], ctx.now())
-    if any(quiet_value(before[k], before["at"], con, before["up"])[0] is None for k in ("requests", "responses")):
+    if any(quiet_value(before[k], before["at"], con, before["up"], v3(con))[0] is None
+           for k in ("requests", "responses")):
         ctx.receipt("trial-not-started", {"trial": meta, "problems": ["the ingress is not quiet and fresh before the "
                                                                       "trial"]})
         raise Halt("incomplete", "the ingress counters are not quiet and fresh before the trial")
@@ -3098,7 +3181,8 @@ def run_trial(ctx: Context, meta: Dict, decision_sha: str, guard: Optional[Dict]
     files += [ctx.write(f"{tdir}/generator-pod.json", gsnap), ctx.write(f"{tdir}/observations.json", observations),
               ctx.write(f"{tdir}/pods-end.json", pods_end)]
     result = evaluate_trial(con, {"trial": meta, "generator_pod": gsnap, "pods_begin": pods_begin,
-                                  "pods_end": pods_end, "observations": observations})
+                                  "pods_end": pods_end, "observations": observations},
+                            trial_history(ctx.entries(), ctx.cal, ctx.dir))
     rfile = ctx.write(f"{tdir}/result.json", result)
     ctx.receipt("trial-result", {"trial": meta, "verdict": result["verdict"], "files": files, "result": rfile})
     return result
@@ -3218,6 +3302,17 @@ def _stopped_result(t: Dict, d: Dict) -> Dict:
             "rps_per_replica": t["rate_per_min"] / 60 / t["n"], "verdict": "STOPPED", "delivery": "unknown",
             "stop_reason": d.get("reason", ""), "category": d.get("category", "stopped"),
             "incomplete": [], "limits": [], "failures": [], "criteria": {}}
+
+
+def trial_history(entries: List[Dict], cal: str, base: str, before: Optional[str] = None) -> List[Dict]:
+    """The recorded results of the trials that ended before trial `before` (all when None), in journal order: the
+    evidence evaluate_trial's no-ready continuity reads (the reducer passes its recomputed results instead)."""
+    out = []
+    for r in _trial_records(entries, cal, base)[0]:
+        if r.get("trial") == before:
+            break
+        out.append(r)
+    return out
 
 
 def _trial_records(entries: List[Dict], cal: str, base: str) -> Tuple[List[Dict], List[Dict]]:
@@ -3561,7 +3656,7 @@ def reduce_bundle(bundle: str) -> Dict:
             raw = {"trial": d["trial"], "generator_pod": load(files["generator-pod"]["path"]),
                    "pods_begin": load(files["pods-begin"]["path"]), "pods_end": load(files["pods-end"]["path"]),
                    "observations": load(files["observations"]["path"])}
-            again = evaluate_trial(con, raw)
+            again = evaluate_trial(con, raw, trials)
             if C.digest(again) != C.digest(load(d["result"]["path"])) or again["verdict"] != d["verdict"]:
                 raise X.StagingError(f"trial {d['trial']['id']}: the recomputed result differs from the recorded one")
             trials.append(again)

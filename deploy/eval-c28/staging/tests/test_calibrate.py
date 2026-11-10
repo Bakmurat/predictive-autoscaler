@@ -1,6 +1,7 @@
 import copy
 import json
 import os
+import urllib.parse
 
 import pytest
 
@@ -2054,12 +2055,16 @@ def test_v3_an_empty_endpoint_set_at_pass_level_reconciles_and_counts_the_failur
     assert m["failed"] == 2 and ff["measured"] == 2 / m["scheduled"] and ff["pass"]
     # the variant never rejected anything: an absent counter on both sides of the proven fresh ingress is 0
     r2 = _result(ctx, "t002")
-    assert r2["criteria"]["dispatch"]["no_ready"] == {"before": 0.0, "after": 0.0, "absent": ["before", "after"],
-                                                      "rejected": 0.0}
-    # later trials of the same variant read the existing counter on both sides (no new rejection)
+    nr2 = r2["criteria"]["dispatch"]["no_ready"]
+    assert {k: nr2[k] for k in ("before", "after", "absent", "rejected", "prior")} == {
+        "before": 0.0, "after": 0.0, "absent": ["before", "after"], "rejected": 0.0, "prior": None}
+    assert nr2["target"] == ctx.nm["variants"][1] and nr2["ingress"][1].startswith(ctx.nm["ingress"])
+    # later trials of the same variant read the existing counter on both sides (no new rejection), continuing from
+    # the observation t001 recorded on the same ingress pod identity
     r3 = _result(ctx, "t003")
-    assert r3["variant"] == r["variant"] and r3["criteria"]["dispatch"]["no_ready"]["rejected"] == 0.0
-    assert r3["criteria"]["dispatch"]["no_ready"]["absent"] == []
+    nr3 = r3["criteria"]["dispatch"]["no_ready"]
+    assert r3["variant"] == r["variant"] and nr3["rejected"] == 0.0 and nr3["absent"] == []
+    assert nr3["prior"] == {"trial": "t001", "value": 2.0} and nr3["ingress"] == d["no_ready"]["ingress"]
     assert K.reduce_bundle(ctx.dir)["reproduced"]
 
 
@@ -2082,7 +2087,7 @@ def _reading(at, dispatched, no_ready, step=15):
 
     def doc(result):
         return {"start": grid[0], "end": at, "step": step, "response": {"status": "success", "data": {
-            "result": result}}}
+            "resultType": "matrix", "result": result}}}
     return {"at": at,
             "up": doc([{"metric": {"pod": "ing-1"}, "values": [[t, "1"] for t in grid]}]),
             "dispatched": doc([{"metric": {"endpoint_pod": k}, "values": [[t, str(v)] for t in grid]}
@@ -2124,6 +2129,28 @@ def test_v3_the_t006_numbers_reconcile_and_v2_keeps_its_verdict():
      "no-ready rejections before the trial: a negative counter value"),
     ("t002", lambda raw: raw["observations"]["ingress_after"].update(up={"error": "URLError"}),
      "no-ready rejections after the trial: no series, and ingress_up"),
+    # an unsuccessful answer with an empty result is never an absent counter (Codex review of 80529bf, finding 2)
+    ("t002", lambda raw: raw["observations"]["ingress_after"]["no_ready"].update(
+        response={"status": "error", "data": {"resultType": "matrix", "result": []}}),
+     "no-ready rejections after the trial: the query did not succeed (status 'error')"),
+    ("t002", lambda raw: raw["observations"]["ingress_after"]["no_ready"].update(
+        response={"status": "success", "data": {"result": []}}),
+     "no-ready rejections after the trial: not a range (matrix) response"),
+    ("t002", lambda raw: raw["observations"]["ingress_after"]["up"]["response"]["data"].update(resultType="vector"),
+     "no-ready rejections after the trial: no series, and ingress_up: not a range (matrix) response"),
+    ("t002", lambda raw: raw["observations"]["ingress_after"]["up"]["response"].update(status="error"),
+     "no-ready rejections after the trial: no series, and ingress_up: the query did not succeed"),
+    ("t002", lambda raw: raw["observations"]["ingress_after"]["up"]["response"]["data"].update(result={}),
+     "no-ready rejections after the trial: no series, and ingress_up: malformed response"),
+    # the received counter's reading is held to the same envelope under v3
+    ("t002", lambda raw: raw["observations"]["ingress_after"]["requests"]["response"].update(status="error"),
+     "ingress requests after the trial: the query did not succeed"),
+    # continuity across trials: t001 observed the counter at 2 on the same ingress pod (finding 1)
+    ("t003", lambda raw: [_no_ready_values(raw, s).clear() for s in ("before", "after")],
+     "the no-ready rejection counter, observed at 2 in t001, is absent before this trial"),
+    ("t003", lambda raw: [v.__setitem__(1, "1") for s in ("before", "after") for v in
+                          _no_ready_values(raw, s)[0]["values"]],
+     "the no-ready rejection counter went backwards between trials (2 in t001, 1 before this trial"),
 ])
 def test_v3_an_unknown_no_ready_reading_is_incomplete(cal, trial, mutate, why):
     """Absent is 0 only from a successful query of the proven fresh ingress whose counter has not appeared; a failed
@@ -2131,11 +2158,11 @@ def test_v3_an_unknown_no_ready_reading_is_incomplete(cal, trial, mutate, why):
     ctx = cal()
     ctx.world.no_ready_trials = {"t001": 2}
     run(ctx)
-    raw = _raw(ctx, trial)
-    assert K.evaluate_trial(ctx.con, raw) == _result(ctx, trial)
+    raw, history = _raw(ctx, trial), K.trial_history(ctx.entries(), ctx.cal, ctx.dir, trial)
+    assert K.evaluate_trial(ctx.con, raw, history) == _result(ctx, trial)
     bad = copy.deepcopy(raw)
     mutate(bad)
-    r = K.evaluate_trial(ctx.con, bad)
+    r = K.evaluate_trial(ctx.con, bad, history)
     assert r["verdict"] == "INCOMPLETE" and any(w.startswith(why) for w in r["incomplete"]), r["incomplete"]
     assert not any("does not reconcile" in w for w in r["incomplete"])        # unknown, never reconciled as 0
 
@@ -2215,3 +2242,49 @@ def test_v3_validation_requires_the_no_ready_query(cal):
     ok = _con_v2(con)
     open(path, "w").write(json.dumps(ok))
     assert K.load_contract(ctx.record, ctx.params)[0]["schema"] == CW.V2
+
+
+@pytest.mark.parametrize("change,why", [
+    (lambda world, target: world.no_ready.pop(target), "is absent before this trial (lost between trials"),
+    (lambda world, target: world.no_ready.__setitem__(target, 1), "went backwards between trials (2 in t001, 1"),
+])
+def test_v3_continuity_across_trials_at_runtime_and_in_the_replay(cal, change, why):
+    """The counter t001 observed (2) is lost or lowered on the same ingress pod before t003 (while t002 runs on the
+    other variant): the executor's result is INCOMPLETE from the earlier trial's recorded evidence, and the offline
+    reducer reaches the same verdict from the bundle alone."""
+    ctx = cal()
+    ctx.world.no_ready_trials = {"t001": 2}
+    target = ctx.nm["variants"][0]
+
+    def between(world, api_):
+        if not getattr(world, "_changed", False) and any(k == "jobs" and n.endswith("t002")
+                                                         for (k, _, n) in api_.objects):
+            change(world, target)
+            world._changed = True
+    ctx.world.hooks.append(between)
+    out = run(ctx)
+    assert _result(ctx, "t002")["verdict"] == "PASS"
+    r = _result(ctx, "t003")
+    assert out["verdict"] == "NOT READY" and r["verdict"] == "INCOMPLETE"
+    assert any(why in w for w in r["incomplete"]), r["incomplete"]
+    assert K.evaluate_trial(ctx.con, _raw(ctx, "t003"))["verdict"] == "PASS"     # what no history would have said
+    assert K.reduce_bundle(ctx.dir)["reproduced"]
+    assert K.verify(CW.context(ctx.record, ctx.world.api))["bundle"]["verdict"] == "NOT READY"
+
+
+def test_v3_an_error_envelope_is_never_an_absent_counter_at_runtime(cal):
+    """Codex repro: an unsuccessful no_ready answer with an empty result kept a whole trial PASS."""
+    ctx = cal()
+    real = ctx.world._answer
+
+    def answer(url):
+        doc = real(url)
+        if "c28_ingress_no_ready_endpoints_total" in urllib.parse.unquote_plus(url):
+            doc = {"status": "error", "errorType": "execution", "data": {"resultType": "matrix", "result": []}}
+        return doc
+    ctx.world._answer = answer
+    out = run(ctx)
+    r = _result(ctx, "t001")
+    assert out["verdict"] == "NOT READY" and r["verdict"] == "INCOMPLETE"
+    assert any(w.startswith("no-ready rejections before the trial: the query did not succeed") for w in r["incomplete"])
+    assert K.reduce_bundle(ctx.dir)["reproduced"]

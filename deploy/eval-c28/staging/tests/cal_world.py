@@ -337,6 +337,13 @@ class World:
 
     # --- the observer ---
     def fetch(self, url):
+        """A query_range answer as the real API gives it (status success, resultType matrix)."""
+        doc = self._answer(url)
+        doc.setdefault("status", "success")
+        doc.setdefault("data", {}).setdefault("resultType", "matrix")
+        return doc
+
+    def _answer(self, url):
         q = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
         query = q["query"][0]
         start, end, step = int(q["start"][0]), int(q["end"][0]), int(q["step"][0])

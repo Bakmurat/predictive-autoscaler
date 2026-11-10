@@ -292,8 +292,12 @@ target had no READY endpoint (sum + the `no_ready` delta = received, read with t
 v2: sum = received) and only to the trial's fixture pods, with the round-robin's spread reported, never judged. The
 no-ready 503s stay inside the failure fraction and latency that k6 measures and are reported in the dispatch detail,
 never judged again; an absent `no_ready` counter is 0 only from a successful query of the proven fresh, unchanged
-ingress, while a failed or stale reading, a series that disappears or a reset is incomplete evidence. No discovery,
-membership or stray-endpoint check is waived. Dispatched, received and answered arrivals reconcile
+ingress, while a failed or stale reading, a series that disappears or a reset is incomplete evidence, also across
+trials (once an earlier trial saw the counter on the same ingress pod identity, a later absence or a lower value is
+incomplete, derived from the earlier trials' recorded results, so the reducer replays it). Under v3 every ingress
+counter reading and its supporting `up` response must be a successful range response (status `success`, resultType
+`matrix`) before it is read, so an error answer is never an absent counter. No discovery, membership or
+stray-endpoint check is waived. Dispatched, received and answered arrivals reconcile
 with tolerance 0/0. The idle CPU baseline is averaged only after a washout of the 60 s rate window plus one CPU scrape
 interval.
 
