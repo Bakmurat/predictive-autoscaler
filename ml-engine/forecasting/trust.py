@@ -22,13 +22,40 @@ Gates per candidate (all thresholds are TrustSettings parameters, fingerprinted 
   calibration       an upper bound is available now (>= min_windows scores, rank feasible)  else CalibrationInsufficient
   prospective       >= min_shadow_hours since the first prospective bound and >= min_prospective_windows prospective
                     gate bounds                                                                else ShadowInsufficient
-  coverage          7-day prospective gate coverage >= nominal - tolerance; the worst UTC day with >= worst_day_min
-                    outcomes too; acute: no acute_consecutive_misses in a row, and the last acute_recent_windows
-                    bounds (once that many exist) at or above the threshold                    else CoverageLow
+  coverage          the four budgeted coverage rules below, all holding                       else CoverageLow
   availability      over the last day, >= min_availability of (a) the matured-or-overdue issued windows scorable
                     (scored / (scored + unscorable + overdue)) and (b) the expected forecast opportunities issued
                     (issued origins / grid origins since the first issuance); None (nothing to count) fails
                                                                                                else DataUnavailable
+Coverage rules (policy budgeted-coverage-tests/v1). Each is a test of "the bound misses at the nominal rate a" on
+prospective gate outcomes (cohort windows with an issued bound), and their false-alarm probabilities share one budget:
+P(any false coverage demotion of a target within 7 days) under independent misses at the nominal rate.
+  rolling      the last acute_recent_windows (n) gate outcomes hold at least k misses, with k the smallest count whose
+               union bound over the N = 7 d / lead looks of 7 days, N * a * P(Bin(n - 1, a) >= k - 1), is within the
+               rule's budget (rolling_alarm_ppm / enabled families). The bound is exact arithmetic (integers), valid
+               for any overlap of the windows; it is evaluated on the misses among the outcomes seen so far, so fewer
+               than n outcomes can already alarm (k misses in fewer trials is the stronger evidence).
+  consecutive  c gate outcomes in a row missed, with c the smallest count, not below acute_consecutive_misses (5),
+               whose bound (N (1 - a) + 1) a^c on the probability of such a run within 7 days is within the rule's
+               budget (consecutive_alarm_ppm / families). At lead 180 s and a = 0.1 the bound is 3.0 % for c = 5 and
+               0.30 % for c = 6, so the rule stays at five only where the budget holds (long leads) and is six at the
+               evaluation leads.
+  day          a COMPLETED UTC day (inside the 7-day window, past its outcome deadline: day end + settlement + grace,
+               with at least worst_day_min_outcomes gate outcomes) holds at least k_m misses among its m outcomes,
+               k_m the smallest count with P(Bin(m, a) >= k_m) <= (day_alarm_ppm / families) / 7: one test per day,
+               seven days in the window. The evidence of a completed day is final, so every later evaluation reads
+               the same answer: the day is looked at once. A failed day keeps the rule failed while it is inside the
+               7-day window (until an hour before its start leaves it), as the worst-day rule always did. The
+               current, partial day is never tested.
+  seven_day    prospective gate coverage over the trailing 7 days >= nominal - coverage_tolerance (unchanged).
+A statistical LOOK of the rolling and consecutive rules happens when a new gate outcome is folded into the ledger
+(exactly once, by its journal sequence number), never at a poll: the ledger's monitor counts each ALARM (a rule going
+from holding to failing at a look) and remembers the last one. An evaluation between two looks reads the same ledger
+and so the same state; an alarm that came and went between two evaluations is still seen by the next one (the
+hysteresis remembers how many alarms it has seen), so a demotion cannot be skipped, repeated or counted twice, and
+both parts are in the checkpointed state (restart and replay give the same alarms). Missing outcomes are not misses:
+they stay an availability matter.
+
 Hysteresis (per candidate, bound to its epoch and recipe): a trusted candidate failing any gate is demoted at once (Degraded).
 Once demoted, it is promoted again only after its gates have held for repromotion_hours and >= repromotion_windows new
 prospective gate bounds have matured since the demotion; never in the same evaluation as the demotion.
@@ -57,15 +84,19 @@ budget): it means "ready to activate"; Recommend still makes no writes, and it s
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 from forecasting.calibration import CalibrationRecord, in_cohort, pinball_rps
-from forecasting.contracts import TrustSettings
+from forecasting.contracts import TRUST_POLICY_REVISION, TrustSettings
 from forecasting.maturation import candidate
 
-LEDGER_SCHEMA = "evidence-ledger/v2"
+LEDGER_SCHEMA = "evidence-ledger/v3"
+PPM = 1_000_000
+BPS = 10_000
+COVERAGE_RULES = ("rolling", "consecutive", "day", "seven_day")
 HOUR = 3600
 DAY = 86400
 FALLBACK_ORDER = ("lstm", "statistical", "seasonal_naive")
@@ -86,6 +117,89 @@ _FIELDS = ("iss", "g_iss", "sc", "un", "g_sc", "g_un", "a_bd", "a_cv", "g_bd", "
 
 class TrustError(Exception):
     pass
+
+
+# --- coverage limits: exact binomial arithmetic ----------------------------------------------------------------------
+
+@functools.lru_cache(maxsize=4096)
+def binomial_tail(n: int, miss_bps: int, k: int) -> int:
+    """The numerator of P(Bin(n, miss_bps / 10^4) >= k) over the denominator 10^(4 n): an exact integer."""
+    if k <= 0:
+        return BPS ** n
+    a, b = miss_bps, BPS - miss_bps
+    total, term = 0, None
+    for j in range(n, k - 1, -1):                      # C(n, j) a^j b^(n-j), from j = n down
+        term = a ** n if j == n else term * (j + 1) * b // ((n - j) * a)
+        total += term
+    return total
+
+
+@functools.lru_cache(maxsize=1024)
+def rolling_limit(n: int, miss_bps: int, looks: int, budget_ppm: int, families: int) -> int:
+    """The smallest k in 1..n with looks * a * P(Bin(n - 1, a) >= k - 1) <= budget_ppm / families (per 7 days), or
+    n + 1 when there is none (the rule then never alarms). The left side bounds the probability that some look of
+    7 days is an alarm ONSET (the newest outcome a miss with at least k - 1 misses among the n - 1 before it)."""
+    for k in range(1, n + 1):
+        if looks * miss_bps * binomial_tail(n - 1, miss_bps, k - 1) * PPM * families <= budget_ppm * BPS ** n:
+            return k
+    return n + 1
+
+
+@functools.lru_cache(maxsize=4096)
+def day_limit(m: int, miss_bps: int, budget_ppm: int, families: int) -> int:
+    """The smallest k with P(Bin(m, a) >= k) <= (budget_ppm / families) / 7 for a day of m gate outcomes (m + 1: no
+    count of misses is that unlikely, so the day cannot fail)."""
+    for k in range(0, m + 1):
+        if binomial_tail(m, miss_bps, k) * PPM * families * 7 <= budget_ppm * BPS ** m:
+            return k
+    return m + 1
+
+
+@functools.lru_cache(maxsize=1024)
+def consecutive_limit(least: int, miss_bps: int, looks: int, budget_ppm: int, families: int) -> int:
+    """The smallest c >= least with (looks (1 - a) + 1) a^c <= budget_ppm / families (per 7 days): a bound on the
+    probability that a run of c misses starts at some look of 7 days. Exact integers."""
+    c = max(1, least)
+    while (looks * (BPS - miss_bps) + BPS) * miss_bps ** c * PPM * families > budget_ppm * BPS ** (c + 1):
+        c += 1
+        if c > 4096:
+            raise TrustError("no run length fits the consecutive rule's budget")
+    return c
+
+
+def consecutive_bound_ppm(c: int, miss_bps: int, looks: int) -> float:
+    """An upper bound, in ppm, of P(c consecutive misses somewhere in `looks` outcomes) under independent misses."""
+    a = miss_bps / BPS
+    return (looks * (1.0 - a) + 1.0) * a ** c * PPM
+
+
+@dataclass(frozen=True)
+class CoverageLimits:
+    """The thresholds of the coverage rules for one candidate: derived from the trust settings, the lead (looks per
+    7 days), the nominal miscoverage and the number of enabled families that share the target's budget."""
+    policy: str
+    recent_n: int
+    rolling_misses: int                 # alarm at this many misses among the last recent_n gate outcomes
+    consecutive: int                    # alarm at this many gate outcomes missed in a row (budget-derived)
+    looks: int                          # gate outcomes per 7 days
+    miss_bps: int
+    day_alarm_ppm: int
+    families: int
+
+    def day_misses(self, outcomes: int) -> int:
+        return day_limit(outcomes, self.miss_bps, self.day_alarm_ppm, self.families)
+
+
+def coverage_limits(t: TrustSettings, lead_seconds: int, miss_bps: int, families: int) -> CoverageLimits:
+    if t.policy != TRUST_POLICY_REVISION:
+        raise TrustError(f"unknown trust policy {t.policy!r}")
+    if lead_seconds <= 0 or not 0 < miss_bps < BPS or families < 1:
+        raise TrustError("coverage limits need a lead, a nominal miscoverage and at least one family")
+    looks = max(1, 7 * DAY // lead_seconds)
+    return CoverageLimits(t.policy, t.acute_recent_windows,
+                          rolling_limit(t.acute_recent_windows, miss_bps, looks, t.rolling_alarm_ppm, families),
+                          consecutive_limit(t.acute_consecutive_misses, miss_bps, looks, t.consecutive_alarm_ppm,
+                                            families), looks, miss_bps, t.day_alarm_ppm, families)
 
 
 # --- evidence records and ledgers -----------------------------------------------------------------------------------
@@ -120,6 +234,7 @@ def new_ledger(epoch: str, model: str, recipe: str, interval_s: int) -> dict:
             "buckets": {}, "pending": {}, "recent": [], "consecutive_misses": 0, "first_prospective_s": None,
             "first_issue_s": None, "last_prospective_outcome_s": None, "last_outcome_seq": 0, "last_issuance_seq": 0,
             "newest_s": None,
+            "monitor": {"looks": 0, "alarms": {"rolling": 0, "consecutive": 0}, "last_alarm": None},
             "totals": {"issued": 0, "covered": 0, "missed": 0, "unscorable": 0, "prospective_gate_bounded": 0,
                        "replay_gate_bounded": 0}}
 
@@ -142,11 +257,21 @@ def _prune(ledger: dict, now_s: int, retention_s: int) -> None:
 
 
 def _copy(ledger: dict) -> dict:
+    mon = ledger["monitor"]
     return {**ledger, "buckets": {k: dict(v) for k, v in ledger["buckets"].items()}, "recent": list(ledger["recent"]),
-            "pending": dict(ledger["pending"]), "totals": dict(ledger["totals"])}
+            "pending": dict(ledger["pending"]), "totals": dict(ledger["totals"]),
+            "monitor": {**mon, "alarms": dict(mon["alarms"])}}
+
+
+def _same_policy(ledger: dict) -> None:
+    """A ledger of another trust policy (another schema: no monitor, other rules) is never read as this one's."""
+    if ledger.get("schema") != LEDGER_SCHEMA:
+        raise TrustError(f"the evidence ledger has schema {ledger.get('schema')!r}, not {LEDGER_SCHEMA}: evidence "
+                         "of another trust policy is not carried over")
 
 
 def _same_identity(ledger: dict, epoch: str, model: str, recipe: str) -> None:
+    _same_policy(ledger)
     if (epoch, model, recipe) != (ledger["epoch"], ledger["model"], ledger["recipe"]):
         raise TrustError("the evidence belongs to another epoch, model or recipe")
 
@@ -179,9 +304,16 @@ def note_issuance(ledger: dict, *, seq: int, issuance_id: str, epoch: str, model
     return s
 
 
-def note_outcome(ledger: dict, r: EvidenceRecord, *, lead_s: int, nominal_miscoverage: float, recent_n: int,
+def rolling_state(recent: Sequence[int], consecutive_misses: int, limits: CoverageLimits) -> Dict[str, bool]:
+    """Whether the rolling and the consecutive rule FAIL on this evidence (module docstring)."""
+    return {"rolling": len(recent) - sum(recent) >= limits.rolling_misses,
+            "consecutive": consecutive_misses >= limits.consecutive}
+
+
+def note_outcome(ledger: dict, r: EvidenceRecord, *, lead_s: int, nominal_miscoverage: float, limits: CoverageLimits,
                  retention_s: int = 7 * DAY) -> dict:
-    """A matured outcome of this candidate (exactly once by its journal sequence number)."""
+    """A matured outcome of this candidate (exactly once by its journal sequence number). A prospective gate outcome
+    with a bound is one statistical look of the rolling and consecutive coverage rules."""
     c = r.cal
     _same_identity(ledger, c.epoch, c.model, c.recipe)
     if c.seq <= ledger["last_outcome_seq"]:
@@ -225,9 +357,19 @@ def note_outcome(ledger: dict, r: EvidenceRecord, *, lead_s: int, nominal_miscov
             b["g_cv"] += int(covered)
             b["pin"] += pinball_rps(y, u, nominal_miscoverage)
             s["totals"]["prospective_gate_bounded"] += 1
-            s["recent"] = (s["recent"] + [int(covered)])[-recent_n:]
+            before = rolling_state(s["recent"], s["consecutive_misses"], limits)
+            s["recent"] = (s["recent"] + [int(covered)])[-limits.recent_n:]
             s["consecutive_misses"] = 0 if covered else s["consecutive_misses"] + 1
             s["last_prospective_outcome_s"] = c.window_end
+            after = rolling_state(s["recent"], s["consecutive_misses"], limits)
+            mon = s["monitor"]
+            mon["looks"] += 1
+            for rule in ("rolling", "consecutive"):
+                if after[rule] and not before[rule]:              # the rule starts failing at this look: one alarm
+                    mon["alarms"][rule] += 1
+                    mon["last_alarm"] = {"rule": rule, "window_end": c.window_end, "look": mon["looks"],
+                                         "misses": len(s["recent"]) - sum(s["recent"]), "of": len(s["recent"]),
+                                         "consecutive": s["consecutive_misses"]}
     _prune(s, c.window_end, retention_s)
     return s
 
@@ -278,6 +420,24 @@ def availability(ledger: dict, now_s: int, seconds: int = DAY) -> Dict[str, Opti
 
 def _ratio(num, den) -> Optional[float]:
     return num / den if den else None
+
+
+def completed_days(ledger: dict, now_s: int, deadline_s: int, seconds: int = 7 * DAY) -> List[Tuple[int, int, int]]:
+    """[(utc_day, gate_bounded, gate_covered)] for the UTC days that lie wholly inside the trailing window AND are
+    complete: the outcome deadline of the day's last window (day end + deadline_s) has passed, so every window that
+    ended in the day is terminal and the counts are final. The current day is never among them. A day counts as
+    inside only while it starts AFTER the window's oldest hour bucket: that bucket is the one retention drops next
+    (_prune), and a day must never be judged on counts that have started to expire."""
+    lo, _ = _hours(now_s, seconds)
+    first, last = -(-((lo + 1) * HOUR) // DAY), (now_s - deadline_s) // DAY - 1
+    days: Dict[int, List[int]] = {}
+    for k, v in ledger["buckets"].items():
+        d = int(k) * HOUR // DAY
+        if first <= d <= last:
+            got = days.setdefault(d, [0, 0])
+            got[0] += v["g_bd"]
+            got[1] += v["g_cv"]
+    return [(d, bd, cv) for d, (bd, cv) in sorted(days.items())]
 
 
 def daily_gate_coverage(ledger: dict, now_s: int, seconds: int = 7 * DAY) -> List[Tuple[int, int, int]]:
@@ -378,6 +538,12 @@ class Global:
     replay_suite_passed: bool = False
     startup_budget_valid: bool = False
     policy_sha256: Optional[str] = None       # the policy the costs must have been simulated under
+    outcome_deadline_seconds: int = 720       # settlement + outcome grace: when a UTC day's outcomes are final
+    families: int = 2                         # enabled families: they share the target's false-alarm budget
+
+    @property
+    def miss_bps(self) -> int:
+        return round(self.nominal_miscoverage * BPS)
 
 
 @dataclass(frozen=True)
@@ -396,6 +562,7 @@ class CandidateVerdict:
     prospective_gate_bounds: int
     replay_gate_bounds: int
     eta_seconds: Optional[int]
+    coverage_failing: Tuple[str, ...] = ()        # the coverage rules failing now ("alarm": one seen since the last look)
 
 
 @dataclass(frozen=True)
@@ -410,7 +577,7 @@ class Verdict:
 
 def new_hysteresis(recipe: str, epoch: str) -> dict:
     return {"epoch": epoch, "recipe": recipe, "trusted": False, "ever_trusted": False, "demoted_at_s": None, "bounds_at_demotion": 0,
-            "gates_ok_since_s": None}
+            "gates_ok_since_s": None, "alarms_seen": 0, "demotions": 0, "last_demotion": None}
 
 
 def new_selection(epoch: str) -> dict:
@@ -419,6 +586,7 @@ def new_selection(epoch: str) -> dict:
 
 def candidate_gates(ci: CandidateInputs, g: Global, t: TrustSettings) -> Tuple[Dict[str, bool], dict]:
     led, now = ci.ledger, g.now_s
+    _same_policy(led)
     threshold = (1.0 - g.nominal_miscoverage) - t.coverage_tolerance_bps / 10_000
     w7 = window_sums(led, now, 7 * DAY)
     av = availability(led, now)
@@ -427,18 +595,27 @@ def candidate_gates(ci: CandidateInputs, g: Global, t: TrustSettings) -> Tuple[D
     first = led["first_prospective_s"]
     shadow_ok = first is not None and now - first >= t.min_shadow_hours * HOUR and \
         w7["g_bd"] >= t.min_prospective_windows
-    worst_ok = all(cv / bd >= threshold for _, bd, cv in daily_gate_coverage(led, now)
-                   if bd >= t.worst_day_min_outcomes)
+    limits = coverage_limits(t, g.lead_seconds, g.miss_bps, g.families)
     recent = led["recent"]
-    acute_ok = led["consecutive_misses"] < t.acute_consecutive_misses and \
-        (len(recent) < t.acute_recent_windows or sum(recent) / len(recent) >= threshold)
+    acute = rolling_state(recent, led["consecutive_misses"], limits)
+    days = [[d, bd, cv, limits.day_misses(bd)] for d, bd, cv in completed_days(led, now, g.outcome_deadline_seconds)
+            if bd >= t.worst_day_min_outcomes]
+    failing = {"rolling": acute["rolling"], "consecutive": acute["consecutive"],
+               "day": any(bd - cv >= k for _, bd, cv, k in days),
+               "seven_day": cov_gate is None or cov_gate < threshold}
+    coverage = {"failing": [r for r in COVERAGE_RULES if failing[r]],
+                "rolling": [len(recent) - sum(recent), len(recent), limits.rolling_misses],
+                "consecutive": [led["consecutive_misses"], limits.consecutive],
+                "days": days, "failed_days": [d for d, bd, cv, k in days if bd - cv >= k],
+                "seven_day": [int(w7["g_cv"]), int(w7["g_bd"])], "looks": led["monitor"]["looks"],
+                "alarms": sum(led["monitor"]["alarms"].values())}
     fresh_fit = ci.fit_age_seconds is None or ci.fit_age_seconds <= t.max_fit_age_hours * HOUR
     floor = t.min_availability_bps / 10_000
     gates = {
         "identity": g.identity_ok, "state": g.store_healthy, "data": ci.data_fresh and fresh_fit,
         "history": ci.history_seconds >= ci.required_history_seconds,
         "calibration": ci.bound_available, "prospective": shadow_ok,
-        "coverage": cov_gate is not None and cov_gate >= threshold and worst_ok and acute_ok,
+        "coverage": not coverage["failing"],
         "availability": all(v is not None and v >= floor for v in (av["outcomes"], av["predictions"])),
     }
     missing = max(ci.min_calibration_windows - ci.calibration_windows,
@@ -450,7 +627,7 @@ def candidate_gates(ci: CandidateInputs, g: Global, t: TrustSettings) -> Tuple[D
         eta = None
     return gates, {"coverage_gate": cov_gate, "coverage_all": cov_all, "availability": av["outcomes"],
                    "prediction_availability": av["predictions"], "overdue": av["overdue"],
-                   "prospective": int(w7["g_bd"]), "replay": int(w7["r_bd"]), "eta": eta}
+                   "prospective": int(w7["g_bd"]), "replay": int(w7["r_bd"]), "eta": eta, "coverage": coverage}
 
 
 _GATE_REASON = (("identity", "IdentityMismatch"), ("state", "StateUnavailable"), ("data", "DataUnavailable"),
@@ -459,14 +636,25 @@ _GATE_REASON = (("identity", "IdentityMismatch"), ("state", "StateUnavailable"),
                 ("availability", "DataUnavailable"))
 
 
-def step(hyst: dict, gates_ok: bool, ledger: dict, now_s: int, t: TrustSettings) -> dict:
-    """The hysteresis transition for one evaluation (a state of another epoch or recipe starts over)."""
+def unseen_alarm(hyst: Optional[dict], ledger: dict) -> bool:
+    """A rolling or consecutive alarm was counted in the ledger since this hysteresis last looked (it may have come
+    and gone between two evaluations; it still demotes, once)."""
+    same = hyst is not None and (hyst.get("epoch"), hyst.get("recipe")) == (ledger["epoch"], ledger["recipe"])
+    return sum(ledger["monitor"]["alarms"].values()) > (hyst.get("alarms_seen", 0) if same else 0)
+
+
+def step(hyst: dict, gates_ok: bool, ledger: dict, now_s: int, t: TrustSettings, why: Optional[dict] = None) -> dict:
+    """The hysteresis transition for one evaluation (a state of another epoch or recipe starts over). `gates_ok` is
+    False as well when an unseen alarm is pending (evaluate folds it into the coverage gate); `why` is recorded with
+    a demotion."""
     same = (hyst.get("epoch"), hyst.get("recipe")) == (ledger["epoch"], ledger["recipe"])
     h = dict(hyst) if same else new_hysteresis(ledger["recipe"], ledger["epoch"])
+    h["alarms_seen"] = sum(ledger["monitor"]["alarms"].values())
     bounds = ledger["totals"]["prospective_gate_bounded"]
     if h["trusted"]:
         if not gates_ok:                                  # demote at once
-            h.update(trusted=False, demoted_at_s=now_s, bounds_at_demotion=bounds, gates_ok_since_s=None)
+            h.update(trusted=False, demoted_at_s=now_s, bounds_at_demotion=bounds, gates_ok_since_s=None,
+                     demotions=h.get("demotions", 0) + 1, last_demotion={"at_s": now_s, **(why or {})})
         return h
     if not gates_ok:
         h["gates_ok_since_s"] = None
@@ -610,8 +798,14 @@ def evaluate(cands: Sequence[CandidateInputs], hyst: Mapping[str, dict], g: Glob
     new_h, verdicts = {}, {}
     for model, ci in by_model.items():
         gates, info = candidate_gates(ci, g, t)
+        prior_h = hyst.get(model, new_hysteresis(ci.recipe, epoch))
+        latched = unseen_alarm(prior_h, ci.ledger)
+        if latched:                                       # an alarm since the last evaluation fails the coverage gate now
+            gates = {**gates, "coverage": False}
         ok = all(gates.values())
-        h = step(hyst.get(model, new_hysteresis(ci.recipe, epoch)), ok, ci.ledger, g.now_s, t)
+        why = {"gates": [k for k, v in gates.items() if not v], "coverage": info["coverage"],
+               "latched_alarm": ci.ledger["monitor"]["last_alarm"] if latched else None}
+        h = step(prior_h, ok, ci.ledger, g.now_s, t, why)
         new_h[model] = h
         reason = next((r for gname, r in _GATE_REASON if not gates[gname]), "Ready")
         if h["trusted"]:
@@ -629,7 +823,8 @@ def evaluate(cands: Sequence[CandidateInputs], hyst: Mapping[str, dict], g: Glob
         verdicts[model] = CandidateVerdict(model, ci.recipe, gates, reason, phase, h["trusted"], info["coverage_gate"],
                                            info["coverage_all"], info["availability"],
                                            info["prediction_availability"], info["overdue"], info["prospective"],
-                                           info["replay"], None if h["trusted"] else info["eta"])
+                                           info["replay"], None if h["trusted"] else info["eta"],
+                                           tuple(info["coverage"]["failing"]) + (("alarm",) if latched else ()))
     prior = hyst.get(SELECTION)
     if prior is None or prior.get("epoch") != epoch:          # a new epoch: no selection carries over
         prior = new_selection(epoch)

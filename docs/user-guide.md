@@ -445,13 +445,19 @@ and at most one more fixed label:
 
 A model is trusted only on **prospective** evidence (forecasts issued live before their outcome; offline replays warm up
 calibration but never count, not even in availability or error figures): at least 48 hours and 64 non-overlapping
-windows with an issued bound, 7-day coverage at least the target minus 5 points (and on the worst day), no 5 misses in a
-row, enough calibration history, fresh input, the history minimum (1 day for seasonal-naive, 7 days for the statistical
+windows with an issued bound, 7-day coverage at least the target minus 5 points, no completed UTC day with far more
+misses than the target allows (the day in progress is never judged), no long run of misses in a row and not too many
+misses among the last 64 windows, enough calibration history, fresh input, the history minimum (1 day for seasonal-naive, 7 days for the statistical
 model), and over the last day at least 95 % of the due windows scored and 95 % of the forecast opportunities issued. A
 window whose outcome is overdue (its data deadline passed without one) counts as not scored, and an origin without a
 forecast counts as a missed opportunity. Evidence belongs to one model version (recipe): a new recipe starts again. A
 trusted model that fails a gate is demoted at once; it is trusted again only after its gates have held for 24 hours and
-32 new windows. The statistical model is used only when it is trusted **and** has beaten a trusted seasonal-naive
+32 new windows. The three miss limits are not fixed percentages: each is the smallest count that a correctly calibrated
+forecast reaches by chance with at most a budgeted probability, so that all of them together demote such a forecast
+in at most 5 % of weeks (shared by the enabled model families). They depend on the lead: at a 180-second lead with
+the default 90 % target and both families enabled, 19 misses among the last 64 windows or 6 in a row; a day of 480
+windows fails at 72 misses.
+A new window result is one look of these tests; asking again without a new result changes nothing. The statistical model is used only when it is trusted **and** has beaten a trusted seasonal-naive
 forecast on the same windows (spanning at least 48 hours) for 24 hours in a row; it is then kept until it does worse
 than the seasonal-naive forecast, so small differences do not make the choice flip back and forth, but any safety
 failure falls back at once. Otherwise the seasonal-naive forecast is used when trusted, and otherwise scaling stays

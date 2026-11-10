@@ -102,6 +102,11 @@ type v2Fixtures struct {
 		SettingsSHA256 string `json:"settings_sha256"`
 		EvidenceKey    string `json:"evidence_key"`
 	} `json:"legacy_additive"`
+	TrustPolicy    string `json:"trust_policy"`
+	PreTrustPolicy struct {
+		SettingsSHA256 string `json:"settings_sha256"`
+		EvidenceKey    string `json:"evidence_key"`
+	} `json:"pre_trust_policy"`
 }
 
 func loadV2Fixtures(t *testing.T) *v2Fixtures {
@@ -196,6 +201,55 @@ func TestV2CalibrationMethodIsPartOfTheBoundIdentity(t *testing.T) {
 	}
 	if len(refused) != 2 {
 		t.Fatalf("the legacy answers are missing from the fixtures: %v", refused)
+	}
+}
+
+// The trust-policy revision and its budgets are part of the fingerprint, the revision part of the evidence key: the
+// identity one revision back (the calibration change without this trust policy, frozen in the fixtures) is neither
+// sent nor accepted, so trust earned under the earlier rules can never be presented to this operator as current.
+func TestV2TrustPolicyIsPartOfTheBoundIdentity(t *testing.T) {
+	f := loadV2Fixtures(t)
+	if f.TrustPolicy != v2TrustPolicyRevision {
+		t.Fatalf("trust policy %q, contracts.py has %q", v2TrustPolicyRevision, f.TrustPolicy)
+	}
+	b := fixtureBinding(t, f)
+	pre := f.PreTrustPolicy
+	if !v2SHA256.MatchString(pre.SettingsSHA256) || !v2SHA256.MatchString(pre.EvidenceKey) {
+		t.Fatalf("the pre-policy identity is missing from the fixtures: %+v", pre)
+	}
+	if b.SettingsSHA == pre.SettingsSHA256 || b.EvidenceKey == pre.EvidenceKey {
+		t.Fatal("the operator still presents the identity of the earlier trust policy")
+	}
+	canon, _ := v2CanonicalJSON(b.Settings.canonical())
+	for _, want := range []string{`"policy":"` + v2TrustPolicyRevision + `"`, `"rolling_alarm_ppm":`, `"consecutive_alarm_ppm":`, `"day_alarm_ppm":`} {
+		if !strings.Contains(string(canon), want) {
+			t.Fatalf("the canonical settings lack %s: %s", want, canon)
+		}
+	}
+	other := b.Settings
+	other.Trust[len(other.Trust)-3]++ // another rolling budget: another fingerprint, the same evidence epoch
+	if other.fingerprint() == b.Settings.fingerprint() {
+		t.Fatal("a trust budget does not change the settings fingerprint")
+	}
+	if v2EvidenceKey(b.AutoscalerUID, b.TargetUID, b.QuerySHA, other, int64(b.Lead.Seconds)) != b.EvidenceKey {
+		t.Fatal("a trust threshold alone must keep the evidence epoch")
+	}
+	refused := 0
+	for _, c := range f.Responses.Invalid {
+		if c.Name != "pre-trust-policy-settings" && c.Name != "pre-trust-policy-epoch" {
+			continue
+		}
+		r, err := decodeV2Response(c.Wire)
+		if err != nil {
+			t.Fatalf("%s: must reach the binding check: %v", c.Name, err)
+		}
+		if err := r.bound(b); !errors.Is(err, errV2Refused) {
+			t.Errorf("%s: an answer of the earlier trust policy was not refused: %v", c.Name, err)
+		}
+		refused++
+	}
+	if refused != 2 {
+		t.Fatalf("the pre-policy answers are missing from the fixtures: %d", refused)
 	}
 }
 
