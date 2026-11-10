@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -667,5 +668,143 @@ func TestForecastFailuresThatAnswerAtOnceLeaveTheAllowance(t *testing.T) {
 	}
 	if left, ok := r.forecastWait.grant(req.NamespacedName.String()); !ok || left < forecastWaitPolicy.Request-2*time.Second {
 		t.Fatalf("three immediate failures left only %s of the allowance", left)
+	}
+}
+
+// The reviewer's repro on PR #65 (second review): done(nil) after the request's context had expired returned nil, so a
+// request that completed successfully after its deadline counted as answered. The deadline decides, not the result.
+func TestACompletionAfterTheDeadlineIsATimeoutNotAnAnswer(t *testing.T) {
+	p := waitPolicy{Request: 10 * time.Millisecond, Fleet: time.Second, Key: time.Second, Minimum: time.Millisecond}
+	a := waitAllowance{policy: &p}
+	ctx, done, err := a.bounded(context.Background(), "pa", "forecast")
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-ctx.Done()
+	got := done(nil)
+	if !errors.Is(got, context.DeadlineExceeded) || !timeoutError(got) || !strings.Contains(got.Error(), "did not answer within") {
+		t.Fatalf("expired request accepted as successful: context=%v done(nil)=%v", ctx.Err(), got)
+	}
+	if a.waited < p.Request {
+		t.Fatalf("the late completion was charged %s, less than its deadline %s", a.waited, p.Request)
+	}
+	// A late error stays the error it is: only a late success becomes a timeout.
+	refused := &forecastRefusedError{status: 422}
+	b := waitAllowance{policy: &p}
+	if ctx, done, err = b.bounded(context.Background(), "pa", "forecast"); err != nil {
+		t.Fatal(err)
+	}
+	<-ctx.Done()
+	if got := done(refused); got != error(refused) {
+		t.Fatalf("a late refusal must stay a refusal: %v", got)
+	}
+	// In time, nothing changes: done(nil) is nil.
+	q := waitPolicy{Request: time.Minute, Fleet: time.Minute, Key: time.Minute, Minimum: time.Millisecond}
+	c := waitAllowance{policy: &q}
+	if _, done, err = c.bounded(context.Background(), "pa", "forecast"); err != nil {
+		t.Fatal(err)
+	}
+	if got := done(nil); got != nil {
+		t.Fatalf("an answer in time: %v", got)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+// deliverLate makes the transport hand over the service's complete, valid answer only after the request's deadline
+// has passed, and without an error: a transport that no longer looks at the context once the answer is on its way,
+// or a last byte that races the deadline. The service really answers (and, for a forecast, issues).
+func (f *serviceWaits) deliverLate() {
+	direct := f.direct
+	f.via = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		<-req.Context().Done()
+		return direct.RoundTrip(req.WithContext(context.Background()))
+	})
+}
+
+// A forecast that is complete and valid but arrives after the deadline is recorded as a timeout, in the v1 attempt
+// record and in the v2 ledger block alike, and is neither cached nor used: the decision is reactive. Before the fix
+// the v1 attempt said decoded_response and v2.request said answered, and both decisions used the forecast.
+func TestAForecastDeliveredAfterTheDeadlineIsRecordedAsATimeoutAndNeverUsed(t *testing.T) {
+	t.Run("v1", func(t *testing.T) {
+		shortWaits(t, testWaits)
+		r, req, path, _ := recommendHarness(t, autoscalerv1alpha1.ModeActive, "3000") // reactive: 5
+		var served sync.WaitGroup
+		served.Add(1)
+		srv := httptest.NewServer(echoProvenance(func(w http.ResponseWriter, _ *http.Request) {
+			defer served.Done()
+			b := componentResponse(time.Now().UTC().Truncate(10 * time.Minute))
+			b["predictions"] = []interface{}{6000.0, 6000.0, 6000.0, 6000.0, 6000.0, 6000.0} // 10 replicas when used
+			fmt.Fprint(w, componentBody(t, b))
+		}))
+		t.Cleanup(srv.Close)
+		t.Setenv("ML_API_URL", srv.URL)
+		watchService(t, srv.URL).deliverLate()
+		d := runRPMReconcile(t, r, req, path)
+		served.Wait() // the service answered in full: issued there, not received here in time
+		ends := attemptEvents(attemptRows(t, path), "forecast_attempt_completed")
+		if len(ends) != 1 {
+			t.Fatalf("attempts completed: %v", ends)
+		}
+		last := ends[0]
+		if last["outcome"] != "timeout" || last["error_class"] != "timeout" || last["error_stage"] != "decode" ||
+			last["http_status"] != float64(200) || last["served_predictions_status"] != "array" {
+			t.Fatalf("the attempt must be a timeout that keeps what was read: %v", last)
+		}
+		if d.ForecastStatus != "unavailable" || d.ForecastLookup == nil || d.ForecastLookup.Resolution != "unavailable" ||
+			d.ForecastLookup.ReturnedIssuanceID != "" || d.DesiredSource != "reactive" || d.AppliedReplicas != 5 {
+			t.Fatalf("the late forecast must not be used: %+v / %+v", d, d.ForecastLookup)
+		}
+		if _, cached := r.predictionCache[req.NamespacedName.String()]; cached {
+			t.Fatal("the late answer reached the cache")
+		}
+	})
+	t.Run("v2", func(t *testing.T) {
+		shortWaits(t, testWaits)
+		f := v2Harness(t, autoscalerv1alpha1.ModeActive, "3000") // R = 5
+		f.stub.set("eligible", 1000)                             // P = 7 when it is used
+		watchService(t, mlAPIBaseURL()).deliverLate()
+		d := f.reconcile(t)
+		if f.stub.requests.Load() != 1 {
+			t.Fatalf("the service must have answered once: %d", f.stub.requests.Load())
+		}
+		if d.V2 == nil || d.V2.Request != "timeout" || d.V2.Accepted || d.V2.Cached || d.V2.IssuanceID != nil ||
+			d.ForecastStatus != "unavailable" || d.DesiredSource != "reactive" || d.AppliedReplicas != 5 {
+			t.Fatalf("the late forecast must be a timeout and unused: %+v / %+v", d, d.V2)
+		}
+		if _, cached := f.r.v2Cache[f.req.NamespacedName.String()]; cached {
+			t.Fatal("the late answer reached the cache")
+		}
+		if c := f.cond(t, "PredictionReady"); c.Status != "False" || c.Reason != "DataUnavailable" || !strings.Contains(c.Message, "did not answer within") {
+			t.Fatalf("PredictionReady: %+v", c)
+		}
+	})
+}
+
+// The metrics path the same way: a complete, valid sample that arrives after the query's deadline is not a
+// measurement. The rate is unavailable and the count is held; before the fix the late 3000 rpm scaled the target to 5.
+func TestARateDeliveredAfterTheDeadlineIsUnavailableAndTheDecisionHolds(t *testing.T) {
+	shortWaits(t, testWaits)
+	r, req, path, _ := recommendHarness(t, autoscalerv1alpha1.ModeActive, "3000") // in time: 1 to 5
+	watchService(t, prometheusURL()).deliverLate()
+	writes := countScaleWrites(r)
+	d := runRPMReconcile(t, r, req, path)
+	if d.Action != "keep_current" || d.DesiredSource != "keep_current" || d.AppliedReplicas != 1 ||
+		d.TelemetryStatus != "unavailable" || d.TelemetryError == nil || !hasString(d.Safeguards, "telemetry_unavailable_hold") {
+		t.Fatalf("the decision must hold on a rate that came too late: %+v", d)
+	}
+	if msg := *d.TelemetryError; !strings.Contains(msg, "the metrics backend did not answer within") {
+		t.Fatalf("telemetry error %q", msg)
+	}
+	if _, present := gaugeValue(t, currentRpmGauge, req.Name, req.Namespace); present {
+		t.Fatal("a rate is published although none was measured in time")
+	}
+	if c := condition(t, r, req.NamespacedName, "TelemetryAvailable"); c.Status != "False" || c.Reason != "MetricsUnavailable" {
+		t.Fatalf("TelemetryAvailable: %+v", c)
+	}
+	if len(writes) != 0 || r.metricsWait.waited < testWaits.Request {
+		t.Fatalf("writes %v; charged %s", writes, r.metricsWait.waited)
 	}
 }

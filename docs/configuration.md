@@ -143,7 +143,9 @@ allowance has regained. Recovery needs nothing special: quick answers cost littl
 and the next request has a full deadline again.
 
 When a request is **not sent** or **runs out of its deadline** (it is then cancelled), the decision is made without
-it, as after any failed request:
+it, as after any failed request. The deadline decides, not the result: a complete answer that arrives after the
+deadline is a timeout too (legacy attempt record `outcome: timeout`, statistical ledger `v2.request: timeout`), and
+it is neither cached nor used.
 
 - **Forecast:** on the legacy engine a cached forecast less than ten minutes old may stand in, otherwise the decision
   is reactive; on the statistical engine the decision of that origin is reactive. Nothing is fetched in the background.
@@ -222,7 +224,10 @@ has the evidence, a calibrated **upper bound** `U` of that peak, in requests per
    change, or a pod that started between two reconciles) gives no sample, and neither does a pod that lost readiness
    and recovered: a pod's `Ready` condition keeps only its latest transition, which says nothing reliable about the
    first. So samples accumulate more slowly than pods start, slow starts are more likely to be watched than fast
-   ones, and until 20 watched starts exist the configured fallback applies. Only Ready pods count as serving, and
+   ones, and until 20 watched starts exist the configured fallback applies. The samples are **observed starts only**
+   (pods the operator watched from never Ready to Ready), not an unbiased sample of the startup distribution: they
+   skew towards slow starts, so the measured budget tends to be longer than the typical start, never a fair estimate
+   of it. Only Ready pods count as serving, and
    pods of other owners or older ReplicaSets that share the selector are ignored. It does not include the time from the scale request to the pod's creation, which the actuation
    allowance `A` covers (`status.prediction.startup.measures: podCreationToReady`); the configured fallback should cover
    the whole scale request to Ready. When the current ReplicaSet cannot be identified with certainty, nothing is

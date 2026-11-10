@@ -290,9 +290,9 @@ type v2DecisionDetail struct {
 	Cached         bool    `json:"cached"`
 	// Request says what became of this decision's request to the service: answered (a complete, verified answer was
 	// received before the deadline), cached (no request: the verified answer of this origin was reused), timeout (no
-	// answer within the deadline; the request was cancelled, and the service may or may not have issued), not_sent (the
-	// wait allowance was used up), failed (any other error or a refused answer) or none (nothing to ask with). Only
-	// accepted says that a forecast was used.
+	// answer within the deadline, also when a complete one arrived after it; the request was cancelled, and the service
+	// may or may not have issued), not_sent (the wait allowance was used up), failed (any other error or a refused
+	// answer) or none (nothing to ask with). Only accepted says that a forecast was used.
 	Request             string   `json:"request"`
 	TrustState          *string  `json:"trust_state"`
 	ServiceReason       *string  `json:"service_reason"`

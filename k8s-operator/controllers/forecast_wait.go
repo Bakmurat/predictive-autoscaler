@@ -55,6 +55,11 @@ import (
 //
 // A request that ran out of its deadline is outcome "timeout" (v1) or v2.request "timeout"; one that was not sent is
 // "not_sent". Neither says anything about 1.
+//
+// The deadline decides, not the result: a request that returns a complete, valid answer after its deadline has passed
+// (the transport delivered it although the context had expired, or the last byte and the deadline raced) ran out of its
+// deadline like any other. It is a timeout in both records, it is not cached and never used: 2 did not happen. Only a
+// late success is turned into a timeout; a late error stays the error it is (a refusal is still a refusal).
 type waitPolicy struct {
 	Request time.Duration // the longest one request waits, and what each allowance holds when full
 	Fleet   time.Duration // the fleet allowance refills completely in this time
@@ -156,8 +161,9 @@ var errNotAsked = stderrors.New("not asked: the wait allowance is used up")
 
 // bounded gives one request of the autoscaler key to a service its deadline. The caller passes the request's error to
 // done when it returns (also nil): done releases the context, charges the time waited, and names the deadline in the
-// error of a request that ran out of it. Without enough allowance no context is returned and the error wraps
-// errNotAsked.
+// error of a request that ran out of it. That includes a request that returned without an error after its deadline:
+// done(nil) is then an error that wraps context.DeadlineExceeded, and the caller must drop the answer. Without enough
+// allowance no context is returned and the error wraps errNotAsked.
 func (a *waitAllowance) bounded(ctx context.Context, key, service string) (context.Context, func(error) error, error) {
 	budget, ok := a.grant(key)
 	if !ok {
@@ -167,8 +173,17 @@ func (a *waitAllowance) bounded(ctx context.Context, key, service string) (conte
 	start := a.clock()
 	bctx, cancel := context.WithTimeout(ctx, budget)
 	return bctx, func(err error) error {
+		// Read before the context is released: after cancel() its error no longer says whether the deadline had passed.
+		// The deadline itself is compared too, for the moment between its passing and its timer firing.
+		late := stderrors.Is(bctx.Err(), context.DeadlineExceeded)
+		if deadline, has := bctx.Deadline(); has && !time.Now().Before(deadline) {
+			late = true
+		}
 		cancel()
 		a.charge(key, a.clock().Sub(start))
+		if err == nil && late {
+			err = context.DeadlineExceeded // completed, but after the deadline: a timeout, not a delivery
+		}
 		if !timeoutError(err) {
 			return err // answered (also with an error status) or failed at once; the time it took is charged all the same
 		}
@@ -197,7 +212,7 @@ func (r *PredictiveAutoscalerReconciler) measureRPM(ctx context.Context, key, qu
 	}
 	rpm, err := r.queryCurrentRPM(mctx, query)
 	if err = done(err); err != nil {
-		return 0, err
+		return 0, err // also a sample that arrived after the deadline: it is not a measurement of this decision
 	}
 	return rpm, nil
 }

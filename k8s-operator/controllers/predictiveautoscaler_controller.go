@@ -1480,7 +1480,14 @@ func (r *PredictiveAutoscalerReconciler) getPredictionObserved(
 		return &prediction, nil
 	}()
 	if answered != nil {
-		callErr = answered(callErr)
+		complete := callErr == nil
+		if callErr = answered(callErr); complete && callErr != nil {
+			// A complete, valid answer, but after the deadline (forecast_wait.go): not received in time. The attempt is a
+			// timeout, not a decoded_response; the status and the served values stay as read. Nothing of it is returned,
+			// so it is neither cached nor used.
+			completion.failure("timeout", "timeout", "decode", callErr)
+			prediction = nil
+		}
 	}
 	if completion != nil {
 		completion.At = time.Now().UTC().Format(time.RFC3339Nano)

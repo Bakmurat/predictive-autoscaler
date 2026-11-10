@@ -1005,7 +1005,7 @@ func (r *PredictiveAutoscalerReconciler) fetchV2(ctx context.Context, key string
 	}
 	out, err := r.requestV2(fctx, b, body)
 	if err = answered(err); err != nil {
-		return nil, false, err
+		return nil, false, err // also a verified answer that arrived after the deadline: v2.request is then "timeout"
 	}
 	r.v2Cache[key] = &v2CachedForecast{resp: out, binding: b.key()}
 	return out, false, nil
