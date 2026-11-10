@@ -32,7 +32,8 @@ operator:
     # With scaleWrite true: the Deployments, by name, the operator may write through deployments/scale. Empty: every
     # Deployment where the write role is bound (each of watchNamespaces, or the whole cluster). The names apply in
     # every bound namespace, so pair them with watchNamespaces to limit writes to named Deployments in named
-    # namespaces. Reading /scale stays unrestricted. Not allowed with scaleWrite false.
+    # namespaces. Reading /scale stays unrestricted. Not allowed with scaleWrite false. RBAC binds the name, not
+    # the object: a Deployment recreated under a listed name can be scaled after the operator's next reconcile.
     scaleTargets: []
   # host:port the operator dials instead of the forecaster Service (empty: the Service). For an evaluation-owned route
   # in front of the forecaster (C2.8's scheduled forecast outages). With authentication on, the host must be listed in

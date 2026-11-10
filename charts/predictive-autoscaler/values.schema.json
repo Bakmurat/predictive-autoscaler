@@ -85,7 +85,7 @@
               "description": "Deployment names the operator may write through deployments/scale (needs scaleWrite true); empty: every Deployment where the write role is bound.",
               "uniqueItems": true,
               "maxItems": 64,
-              "items": {"type": "string", "pattern": "^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$", "minLength": 1, "maxLength": 253}
+              "items": {"type": "string", "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$", "minLength": 1, "maxLength": 253}
             }
           }
         },

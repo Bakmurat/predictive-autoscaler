@@ -63,13 +63,17 @@ has:
 
 - For a subresource, `resourceNames` holds the parent object's name, so the entries are the Deployments' names. Only
   the write verb the chart grants (`update`) carries them; no `patch` is granted. Names must be distinct DNS-1123
-  names.
+  subdomains (lower-case alphanumeric labels that may contain `-`, joined by single dots, at most 253 characters; so
+  `web..api`, `web.-api` and `Web` are refused), at most 64 of them; the schema and the template both check.
 - The names apply in every namespace the write role is bound in: each of `operator.watchNamespaces` (one RoleBinding
   per namespace), or the whole cluster when no namespace is watched. To allow `web` in `shop` only, set both
   `watchNamespaces: [shop]` and `scaleTargets: [web]`; with several watched namespaces a Deployment of that name is
   writable in each of them.
-- RBAC binds names, not objects. A Deployment deleted and recreated under an allowed name is still authorized by RBAC;
-  the operator's own target-UID guard still refuses to write the replaced object.
+- RBAC binds the **name**, not the object. A Deployment deleted and recreated under an allowed name is still
+  authorized by RBAC. The operator refuses a replaced target only within the reconcile that read the old object (its
+  fresh Scale read and identity guard compare UIDs); on its next reconcile it reads the replacement, starts its state
+  again for the new UID, and can then scale it reactively. Restricting writes to reviewed UIDs needs an operator-side
+  check, which this chart value does not provide.
 - An autoscaler whose target is not listed keeps working in Recommend mode; in Active mode its write fails with
   Forbidden, as in a shadow install.
 - After changing the list, check the effective permissions as the operator's ServiceAccount, for example

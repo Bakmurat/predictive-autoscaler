@@ -247,6 +247,42 @@ def test_scale_targets_need_scale_write_and_valid_distinct_names(render):
     assert render({"operator": {"rbac": {"scaleWrite": False, "scaleTargets": []}}}, check=False).returncode == 0
 
 
+# Kubernetes' DNS-1123 subdomain, label by label: each label [a-z0-9]([-a-z0-9]*[a-z0-9])?, single dots between them.
+MALFORMED_NAMES = ["web..api", "web.-api", "web-.api", ".web", "web.", "web.api.", "-web", "web-", "web.Api", "web_api",
+                   "web api", "web/api", "web\n", "web\r", "web\t", "\nweb", "web.\napi", "*", "", ".", "x" * 254,
+                   ".".join(["a" * 63] * 4) + "b"]
+WELL_FORMED_NAMES = ["web", "web-1", "web.api", "a.b.c", "0", "web-api.v2.shop-1", "x" * 253, ".".join(["a" * 63] * 3)]
+
+
+@pytest.mark.parametrize("skip_schema", [False, True], ids=["schema", "template"])
+def test_scale_target_names_are_dns_1123_subdomains_label_by_label(tmp_path, skip_schema):
+    # The schema refuses a malformed name, and so does the template when schema validation is skipped.
+    def run(names):
+        f = tmp_path / "values.yaml"
+        f.write_text(yaml.safe_dump(_merge(BASE, {"operator": {"rbac": {"scaleTargets": names}}})))
+        cmd = ["helm", "template", "pa", str(CHART), "-n", NS, "--kube-version", "1.35.0", "-f", str(f),
+               "--show-only", "templates/operator-rbac.yaml"] + (["--skip-schema-validation"] if skip_schema else [])
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        except OSError as e:
+            if os.environ.get("CI"):
+                pytest.fail(f"helm is required in CI: {e}")
+            pytest.skip(f"helm not usable here: {e}")
+    for name in MALFORMED_NAMES:
+        p = run([name])
+        assert p.returncode != 0 and "scaleTargets" in p.stderr, repr(name)
+        assert run(["web", name]).returncode != 0, repr(name)                 # wherever it stands in the list
+    ok = run(WELL_FORMED_NAMES)
+    assert ok.returncode == 0, ok.stderr
+    (rule,) = [r for d in yaml.safe_load_all(ok.stdout) if d and d["kind"] == "ClusterRole"
+               for r in d["rules"] if r.get("resourceNames") and r["resources"] == ["deployments/scale"]]
+    assert rule["resourceNames"] == WELL_FORMED_NAMES and rule["verbs"] == ["update"]
+    for bad in (["web", "web"], [f"d{i}" for i in range(65)], [7], ["web", None]):   # distinct, at most 64, strings
+        p = run(bad)
+        assert p.returncode != 0 and "scaleTargets" in p.stderr, bad
+    assert run([f"d{i}" for i in range(64)]).returncode == 0
+
+
 def test_the_scale_targets_ci_value_set_renders_the_named_write():
     text = _operator_rbac_text(CHART / "ci" / "scale-targets-values.yaml")
     assert ('  - apiGroups: ["apps"]\n    resources: ["deployments/scale"]\n    verbs: ["get"]\n'
