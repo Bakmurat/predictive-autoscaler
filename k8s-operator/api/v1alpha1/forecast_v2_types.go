@@ -250,7 +250,9 @@ type StartupStatus struct {
 	// Method is configured, measured or none.
 	// +optional
 	Method string `json:"method,omitempty"`
-	// SampleCount is the number of completed starts of the current ReplicaSet's pods in the last 7 days.
+	// SampleCount is the number of completed starts of the current ReplicaSet's pods in the last 7 days that the
+	// operator watched (it saw the pod before it was Ready, then Ready). Pods that were already Ready when first
+	// seen, for example after an operator restart, and pods that recovered readiness are not samples.
 	SampleCount int32 `json:"sampleCount"`
 	// MeasuredP90Seconds is the 90th percentile of those starts (absent with fewer than 20).
 	// +optional
@@ -261,10 +263,10 @@ type StartupStatus struct {
 	// terminating pods are not pending starts.
 	// +optional
 	PendingSeconds *int32 `json:"pendingSeconds,omitempty"`
-	// PendingEvidence says how the pod behind PendingSeconds was classified: neverReady (its status shows that it has
-	// not been Ready since the kubelet first reported it, or no kubelet has reported it) or uncertain (its status does
-	// not show whether it was Ready before; it is then counted as a pending start, which can lengthen the lead but
-	// never shorten it).
+	// PendingEvidence says how the pod behind PendingSeconds was classified: neverReady (inferred from its status:
+	// not Ready since the kubelet first reported it, or no kubelet has reported it) or uncertain (its status allows
+	// no inference about earlier readiness; it is then counted as a pending start, which can lengthen the lead but
+	// never shorten it). The pod status is not a readiness history: this is a conservative inference.
 	// +kubebuilder:validation:Enum=neverReady;uncertain
 	// +optional
 	PendingEvidence string `json:"pendingEvidence,omitempty"`

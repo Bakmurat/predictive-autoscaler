@@ -22,7 +22,11 @@ import (
 // Startup delay (plan item 4, minimum version; design C2 section 5): how long a scale-out takes to become usable, per
 // target. The operator resolves the target's current ReplicaSet (owned by the Deployment, at the Deployment's revision,
 // with the Deployment's pod template) and reads, uncached, only the pods that ReplicaSet controls. Once per pod it
-// records pod creation to Ready for pods that became Ready without a restart; only Ready pods count as serving. This is
+// records pod creation to Ready for pods it watched start: pods it saw while they had not been Ready yet and then saw
+// Ready, without a restart. A pod that is already Ready when it is first seen (after an operator restart, or because
+// it started between two reconciles) gives no sample, because its Ready condition keeps only its latest transition,
+// which may be a recovery; neither does a pod known to have lost readiness. Fewer samples only mean that the
+// configured budget applies for longer. Only Ready pods count as serving. This is
 // not the whole startup: the time from the scale request to the pod's creation (the ReplicaSet controller's work) is not
 // in it, and the actuation allowance covers it. With at least startupMinSamples such starts in the last 7 days the
 // budget is their 90th percentile plus startupMarginPercent; otherwise the configured
@@ -65,6 +69,9 @@ type startupTracker struct {
 	// leave out restarted pods). It is proof that a pod served, never that another did not: it is empty after an
 	// operator restart.
 	seenReady map[types.UID]struct{}
+	// starting holds the listed pods this process has seen while they had, by classifyNotReady's inference, never been
+	// Ready. Only such a pod's next Ready transition is sampled as a completed start.
+	starting map[types.UID]struct{}
 }
 
 // startupObservation is one reconcile's view of the target's startup and of blocked scale-outs.
@@ -114,15 +121,18 @@ const (
 type notReadyClass int
 
 const (
-	notReadyNeverReady notReadyClass = iota // proven: a start still pending (censored)
-	notReadyWasReady                        // proven: a readiness loss after serving, not a start
-	notReadyUncertain                       // not provable either way: counted as a pending start, marked uncertain
+	notReadyNeverReady notReadyClass = iota // inferred: a start still pending (censored)
+	notReadyWasReady                        // inferred or seen: a readiness loss after serving, not a start
+	notReadyUncertain                       // no inference either way: counted as a pending start, marked uncertain
 )
 
 // classifyNotReady decides whether a pod that is not Ready now (and is neither terminal nor terminating) is still
 // starting or served before. Only a pod that has never been Ready is a pending start. The evidence is bound to the pod
 // (its UID): what this process saw of it, and what the kubelet recorded in the pod object, which also holds after an
-// operator restart. The kubelet's status manager stamps status.startTime and every condition's lastTransitionTime at
+// operator restart. The pod object is not a readiness history: it holds one transition time per condition, and the
+// rows below that read it are a conservative inference from how the kubelet writes them, good for deciding whether a
+// pod that is not Ready now has ever been Ready, and for nothing else (in particular not for when a Ready pod first
+// became Ready: see recordStartups). The kubelet's status manager stamps status.startTime and every condition's lastTransitionTime at
 // its first report of the pod, and afterwards moves a condition's lastTransitionTime only when its status changes; it
 // writes Ready as True or False only (Kubernetes 1.35, pkg/kubelet/status/status_manager.go: updateStatusInternal and
 // updateLastTransitionTime; the node lifecycle controller's MarkPodsNotReady keeps the time of an unchanged status too).
@@ -267,7 +277,7 @@ func (r *PredictiveAutoscalerReconciler) observeStartup(ctx context.Context, key
 	default:
 		obs.Observable = true
 		if tr.rsUID != rs.UID { // a rollout or rollback: per-replica startup may have changed with the template
-			tr.rsUID, tr.samples, tr.seenReady = rs.UID, map[types.UID]startupSample{}, nil
+			tr.rsUID, tr.samples, tr.seenReady, tr.starting = rs.UID, map[types.UID]startupSample{}, nil, nil
 		}
 		r.recordStartups(tr, rs.UID, pods.Items, now, &obs)
 	}
@@ -305,8 +315,16 @@ func (r *PredictiveAutoscalerReconciler) observeStartup(ctx context.Context, key
 // recordStartups adds the completed starts of the current ReplicaSet's pods and finds its pending and unschedulable pods.
 // Pods of other owners that share the selector, and of older ReplicaSets, are ignored, and so are terminating and
 // terminal pods (Failed, Succeeded): they are no longer starting, whatever their Ready condition says.
+//
+// A completed start is sampled only for a pod this process watched: in tr.starting (seen while it had never been
+// Ready), not in tr.seenReady (never seen Ready before), and without a restart. Ready's lastTransitionTime is then its
+// first readiness, or at worst a recovery within the one reconcile interval since the pod was last seen starting, so
+// the sample can only be too long by less than that interval, never too short. Without that evidence there is no
+// sample: a Ready pod's lastTransitionTime alone is its latest transition, and after a readiness loss and recovery it
+// is far from the first (a pod that started in 20 s would be sampled as 1200 s).
 func (r *PredictiveAutoscalerReconciler) recordStartups(tr *startupTracker, rsUID types.UID, pods []corev1.Pod, now time.Time, obs *startupObservation) {
-	seenReady := map[types.UID]struct{}{} // rebuilt from the listed pods, so it never outgrows the ReplicaSet
+	// Both sets are rebuilt from the listed pods, so they never outgrow the ReplicaSet.
+	seenReady, starting := map[types.UID]struct{}{}, map[types.UID]struct{}{}
 	for i := range pods {
 		p := &pods[i]
 		created := p.CreationTimestamp.Time
@@ -315,20 +333,24 @@ func (r *PredictiveAutoscalerReconciler) recordStartups(tr *startupTracker, rsUI
 			continue
 		}
 		ready := podCondition(p, corev1.PodReady)
+		_, wasSeenReady := tr.seenReady[p.UID]
 		if ready != nil && ready.Status == corev1.ConditionTrue {
 			seenReady[p.UID] = struct{}{}
-			if _, seen := tr.samples[p.UID]; !seen && podRestarts(p) == 0 && !ready.LastTransitionTime.IsZero() {
+			_, watched := tr.starting[p.UID]
+			if _, sampled := tr.samples[p.UID]; watched && !wasSeenReady && !sampled && podRestarts(p) == 0 && !ready.LastTransitionTime.IsZero() {
 				if d := ready.LastTransitionTime.Sub(created); d >= 0 {
 					tr.samples[p.UID] = startupSample{created: created, seconds: int64(math.Ceil(d.Seconds()))}
 				}
 			}
 			continue
 		}
-		_, seen := tr.seenReady[p.UID]
-		class := classifyNotReady(p, seen)
+		class := classifyNotReady(p, wasSeenReady)
 		if class == notReadyWasReady {
 			seenReady[p.UID] = struct{}{} // a readiness loss: not a start, so neither pending nor a blocked scale-out
 			continue
+		}
+		if class == notReadyNeverReady {
+			starting[p.UID] = struct{}{}
 		}
 		age := int64(math.Ceil(now.Sub(created).Seconds()))
 		if age < 0 {
@@ -345,7 +367,7 @@ func (r *PredictiveAutoscalerReconciler) recordStartups(tr *startupTracker, rsUI
 			obs.Blocked, obs.BlockedMsg = "Unschedulable", fmt.Sprintf("pod %s: %s", p.Name, sc.Message)
 		}
 	}
-	tr.seenReady = seenReady
+	tr.seenReady, tr.starting = seenReady, starting
 }
 
 // startupConfig is spec.behavior.startup with its defaults.

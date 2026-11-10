@@ -158,8 +158,13 @@ has the evidence, a calibrated **upper bound** `U` of that peak, in requests per
    exist in the last 7 days, otherwise `behavior.startup.fallbackDelaySeconds`; at least `minimumDelaySeconds`; and a
    start still pending for longer than the budget becomes the budget. A measured start is **pod creation to Ready** of a
    pod of the target's current ReplicaSet (controlled by the Deployment, at its revision, with its pod template) that
-   never restarted; only Ready pods count as serving, and pods of other owners or older ReplicaSets that share the
-   selector are ignored. It does not include the time from the scale request to the pod's creation, which the actuation
+   never restarted **and that the operator watched start**: it saw the pod while it had not been Ready yet, and then
+   Ready. A pod that is already Ready when the operator first sees it (after an operator restart or a leadership
+   change, or a pod that started between two reconciles) gives no sample, and neither does a pod that lost readiness
+   and recovered: a pod's `Ready` condition keeps only its latest transition, which says nothing reliable about the
+   first. So samples accumulate more slowly than pods start, slow starts are more likely to be watched than fast
+   ones, and until 20 watched starts exist the configured fallback applies. Only Ready pods count as serving, and
+   pods of other owners or older ReplicaSets that share the selector are ignored. It does not include the time from the scale request to the pod's creation, which the actuation
    allowance `A` covers (`status.prediction.startup.measures: podCreationToReady`); the configured fallback should cover
    the whole scale request to Ready. When the current ReplicaSet cannot be identified with certainty, nothing is
    measured and the fallback applies. A new current ReplicaSet (a rollout) discards the samples.
@@ -168,13 +173,16 @@ has the evidence, a calibrated **upper bound** `U` of that peak, in requests per
    creation). A pod that was Ready and is not Ready now (a failed readiness probe, a restarted container) is a
    readiness loss, not a start; a terminal pod (`Failed` or `Succeeded`, for example an evicted pod that stays listed
    until pod garbage collection) and a terminating pod are not starts either. None of them changes the budget or the
-   lead. The operator decides this per pod from what it saw itself and from the pod's status, which also holds after
-   an operator restart: the kubelet stamps `status.startTime` and the first `Ready=False` at its first report and moves
-   the `Ready` condition's `lastTransitionTime` only when the status changes, so `Ready=False` since the first report
-   means never Ready, and a later transition means the pod was Ready before. A restart count proves neither. When the
-   status shows neither (no transition time, no start time, or conditions that contradict each other), the pod counts
-   as a pending start and `pendingEvidence` is `uncertain` instead of `neverReady`: that can lengthen the lead but
-   never shorten it.
+   lead. The operator decides this per pod from what it saw itself and, after an operator restart, from the pod's
+   status. That status is **not a readiness history**: it holds one transition time per condition. The operator makes
+   a conservative inference from how the kubelet writes it (it stamps `status.startTime` and the first `Ready=False` at
+   its first report, and moves the `Ready` condition's `lastTransitionTime` only when the status changes):
+   `Ready=False` with a transition time at `status.startTime` is taken as never Ready, and a later transition as a pod
+   that was Ready before. A restart count is no evidence either way. When the status allows no inference (no
+   transition time, no start time, or conditions that contradict each other), the pod counts as a pending start and
+   `pendingEvidence` is `uncertain` instead of `neverReady`: that can lengthen the lead but never shorten it. The
+   inference is used only for pods that are not Ready now; it is never used to date the first readiness of a Ready
+   pod.
 
    `L = ceil((D + C + A + Δ) / Δ) × Δ`, with `C` the decision interval: the reconcile interval rounded up to the grid,
    plus 5 s for the start offset and queueing jitter. A lead longer than the horizon, or no budget at all, means no

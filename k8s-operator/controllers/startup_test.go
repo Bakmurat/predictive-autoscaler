@@ -131,6 +131,28 @@ func startupReconcilerWith(t *testing.T, sets []client.Object, pods ...*corev1.P
 	return &PredictiveAutoscalerReconciler{Client: c, Scheme: s}
 }
 
+// watchedStarts observes the pods twice with one tracker, the way the operator sees a start it may sample: first
+// while each pod has not been Ready yet (its kubelet has reported it), then as given. It returns the second reconciler.
+func watchedStarts(t *testing.T, key string, pods ...*corev1.Pod) *PredictiveAutoscalerReconciler {
+	t.Helper()
+	var starting []*corev1.Pod
+	for _, p := range pods {
+		q := p.DeepCopy()
+		started := metav1.NewTime(q.CreationTimestamp.Time)
+		q.Status.StartTime = &started
+		q.Status.Conditions = []corev1.PodCondition{{Type: corev1.ContainersReady, Status: corev1.ConditionFalse, LastTransitionTime: started},
+			{Type: corev1.PodReady, Status: corev1.ConditionFalse, LastTransitionTime: started}}
+		starting = append(starting, q)
+	}
+	first := startupReconciler(t, starting...)
+	if obs := first.observeStartup(context.Background(), key, startupDeployment(), startupNow.Add(-time.Minute)); !obs.Observable {
+		t.Fatalf("precondition: %+v", obs)
+	}
+	second := startupReconciler(t, pods...)
+	second.startupTrackers = first.startupTrackers
+	return second
+}
+
 func TestStartupSamplesCountOnlyCompletedStartsOfTheCurrentTemplate(t *testing.T) {
 	var pods []*corev1.Pod
 	for i := 0; i < 20; i++ { // ready after 10..29 s
@@ -142,7 +164,7 @@ func TestStartupSamplesCountOnlyCompletedStartsOfTheCurrentTemplate(t *testing.T
 		startupPod(podSpec{name: "restarted", hash: "h2", createdAgo: time.Hour, readyAfter: 800 * time.Second, restarts: 1}),
 		startupPod(podSpec{name: "terminating", hash: "h2", createdAgo: time.Hour, readyAfter: 700 * time.Second, terminating: true}),
 		startupPod(podSpec{name: "eight-days-old", hash: "h2", createdAgo: 8 * 24 * time.Hour, readyAfter: 600 * time.Second}))
-	r := startupReconciler(t, pods...)
+	r := watchedStarts(t, "shop/web-pa", pods...)
 	obs := r.observeStartup(context.Background(), "shop/web-pa", startupDeployment(), startupNow)
 	if !obs.Observable || obs.SampleCount != 20 || obs.P90 == nil || *obs.P90 != 27 || obs.Pending != nil || obs.Blocked != "" {
 		t.Fatalf("observation: %+v (p90 %v)", obs, obs.P90)
@@ -163,7 +185,7 @@ func TestStartupSamplesCountOnlyCompletedStartsOfTheCurrentTemplate(t *testing.T
 }
 
 func TestStartupBudgetFallsBackAndNeverGuesses(t *testing.T) {
-	r := startupReconciler(t, startupPod(podSpec{name: "a", hash: "h2", createdAgo: time.Hour, readyAfter: 20 * time.Second}))
+	r := watchedStarts(t, "k", startupPod(podSpec{name: "a", hash: "h2", createdAgo: time.Hour, readyAfter: 20 * time.Second}))
 	obs := r.observeStartup(context.Background(), "k", startupDeployment(), startupNow)
 	if obs.SampleCount != 1 || obs.P90 != nil {
 		t.Fatalf("one sample is not a measurement: %+v", obs)
@@ -319,6 +341,80 @@ func TestStartupUncertainHistoryIsAPendingStartUnlessTheOperatorSawThePodReady(t
 	}
 }
 
+// A completed start is sampled only when this process watched it: it saw the pod while it had not been Ready, and
+// then Ready. A pod's Ready condition keeps only its latest transition, so a pod that is already Ready when it is
+// first seen (an operator restart, or a start between two reconciles) says nothing about its first readiness, and a
+// pod known to have lost readiness comes back as a recovery, not as a start (the reviewer's two repros on PR #60).
+func TestStartupSamplesOnlyStartsItWatchedNeverARecovery(t *testing.T) {
+	cfg := func() startupConfig { fb := int64(120); return startupConfig{Fallback: &fb, Allowance: 15} }()
+	// Repro 1: after an operator restart a 20-minute-old pod is not Ready (a proven readiness loss); it recovers.
+	lost := podSpec{name: "web-a", hash: "h2", createdAgo: 20 * time.Minute, readyAfter: 20 * time.Second, lostReadyAgo: time.Minute}
+	r := startupReconciler(t, startupPod(lost))
+	if obs := r.observeStartup(context.Background(), "k", startupDeployment(), startupNow); obs.Pending != nil || obs.SampleCount != 0 {
+		t.Fatalf("a readiness loss: %+v", obs)
+	}
+	recovered := startupPod(podSpec{name: "web-a", hash: "h2", createdAgo: 20 * time.Minute, readyAfter: 20 * time.Minute}) // Ready again now
+	r2 := startupReconciler(t, recovered)
+	r2.startupTrackers = r.startupTrackers
+	obs := r2.observeStartup(context.Background(), "k", startupDeployment(), startupNow)
+	if d, method, _ := startupBudget(obs, cfg); obs.SampleCount != 0 || obs.Pending != nil || d != 120 || method != "configured" {
+		t.Fatalf("a recovery must not be sampled as a 1200 s start: %+v budget %d %s", obs, d, method)
+	}
+	// Repro 2: the operator starts after the recovery. 20 pods first became Ready after 20 s, lost readiness and
+	// recovered a minute ago: their status holds only that last transition, and no container restarted.
+	var pods []*corev1.Pod
+	for i := 0; i < 20; i++ {
+		p := startupPod(podSpec{name: fmt.Sprintf("web-%d", i), hash: "h2", createdAgo: 20 * time.Minute, readyAfter: 20 * time.Second})
+		for j := range p.Status.Conditions {
+			p.Status.Conditions[j].LastTransitionTime = metav1.NewTime(startupNow.Add(-time.Minute))
+		}
+		pods = append(pods, p)
+	}
+	fresh := startupReconciler(t, pods...)
+	for i := 0; i < 2; i++ { // also on the following reconciles: still the same already-Ready pods
+		obs = fresh.observeStartup(context.Background(), "k", startupDeployment(), startupNow.Add(time.Duration(i)*time.Minute))
+		if d, method, _ := startupBudget(obs, cfg); obs.SampleCount != 0 || obs.P90 != nil || d != 120 || method != "configured" {
+			t.Fatalf("already-Ready pods give no sample (the reviewer measured P90 1140 s): %+v budget %d %s", obs, d, method)
+		}
+	}
+	// The same holds for pods that really started 20 s after creation and were never seen starting: no evidence, no
+	// sample, the configured budget.
+	var unseen []*corev1.Pod
+	for i := 0; i < 20; i++ {
+		unseen = append(unseen, startupPod(podSpec{name: fmt.Sprintf("new-%d", i), hash: "h2", createdAgo: time.Minute, readyAfter: 20 * time.Second}))
+	}
+	if obs := startupReconciler(t, unseen...).observeStartup(context.Background(), "k", startupDeployment(), startupNow); obs.SampleCount != 0 {
+		t.Fatalf("a pod first seen Ready is not a watched start: %+v", obs)
+	}
+	// A pod whose history was uncertain while it was not Ready is no watched start either when it turns Ready.
+	bare := startupReconciler(t, startupPod(podSpec{name: "web-x", hash: "h2", createdAgo: 400 * time.Second, bareNotReady: true}))
+	if obs := bare.observeStartup(context.Background(), "k", startupDeployment(), startupNow.Add(-time.Minute)); obs.PendingEvidence != "uncertain" {
+		t.Fatalf("precondition: %+v", obs)
+	}
+	later := startupReconciler(t, startupPod(podSpec{name: "web-x", hash: "h2", createdAgo: 400 * time.Second, readyAfter: 390 * time.Second}))
+	later.startupTrackers = bare.startupTrackers
+	if obs := later.observeStartup(context.Background(), "k", startupDeployment(), startupNow); obs.SampleCount != 0 {
+		t.Fatalf("an uncertain pod turning Ready is not sampled: %+v", obs)
+	}
+	// What it did watch is sampled once, at the pod's Ready transition, and stays when the pod flaps afterwards.
+	slow := podSpec{name: "web-s", hash: "h2", createdAgo: 10 * time.Minute, readyAfter: 300 * time.Second}
+	w := watchedStarts(t, "k", startupPod(slow))
+	if obs := w.observeStartup(context.Background(), "k", startupDeployment(), startupNow); obs.SampleCount != 1 ||
+		w.startupTrackers["k"].samples["uid-web-s"].seconds != 300 {
+		t.Fatalf("a watched start: %+v %+v", obs, w.startupTrackers["k"].samples)
+	}
+	slow.lostReadyAgo = 2 * time.Minute
+	flap := startupReconciler(t, startupPod(slow))
+	flap.startupTrackers = w.startupTrackers
+	flap.observeStartup(context.Background(), "k", startupDeployment(), startupNow)
+	again := startupReconciler(t, startupPod(podSpec{name: "web-s", hash: "h2", createdAgo: 10 * time.Minute, readyAfter: 590 * time.Second}))
+	again.startupTrackers = w.startupTrackers
+	if obs := again.observeStartup(context.Background(), "k", startupDeployment(), startupNow); obs.SampleCount != 1 ||
+		again.startupTrackers["k"].samples["uid-web-s"].seconds != 300 {
+		t.Fatalf("the sample of a watched start must survive a later flap unchanged: %+v", again.startupTrackers["k"].samples)
+	}
+}
+
 func TestStartupSurfacesBlockedScaleOuts(t *testing.T) {
 	r := startupReconciler(t, startupPod(podSpec{name: "stuck", hash: "h2", createdAgo: time.Minute, unschedulable: true}))
 	if obs := r.observeStartup(context.Background(), "k", startupDeployment(), startupNow); obs.Blocked != "Unschedulable" ||
@@ -342,7 +438,7 @@ func TestStartupTemplateChangeDiscardsTheSamples(t *testing.T) {
 	for i := 0; i < 20; i++ {
 		pods = append(pods, startupPod(podSpec{name: fmt.Sprintf("p%02d", i), hash: "h2", createdAgo: time.Hour, readyAfter: 30 * time.Second}))
 	}
-	r := startupReconciler(t, pods...)
+	r := watchedStarts(t, "k", pods...)
 	dep := startupDeployment()
 	if obs := r.observeStartup(context.Background(), "k", dep, startupNow); obs.P90 == nil {
 		t.Fatal("precondition: measured")

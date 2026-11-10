@@ -4,7 +4,9 @@
 
 `status.prediction.startup.pendingEvidence` is new and only informative. The CRD revision stays 5: on a CRD without
 the field the API server drops it from the status and nothing else changes. Apply this release's CRD to see it.
-`pendingSeconds` now counts only pods that have never been Ready; see
+`pendingSeconds` now counts only pods that have never been Ready, and a completed start is sampled only when the
+operator watched it (a pod already Ready when first seen, or one that recovered readiness, is no sample), so
+`sampleCount` grows more slowly and the configured `fallbackDelaySeconds` applies for longer; see
 [configuration.md](configuration.md#forecast-contract-v2-engine-statistical-preview).
 
 ## Forecast families (CRD revision 5)
