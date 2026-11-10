@@ -471,6 +471,41 @@ def test_a_token_with_a_newline_never_reaches_any_output(api, make_record, capsy
         assert "LEAKME" not in text
 
 
+@pytest.mark.parametrize("token", ["LEAKME-anon-token\n", "LEAKME.anon.token\r\n", "LEAKME anon", "\nLEAKME"])
+def test_a_token_with_a_trailing_newline_is_never_sent(api, make_record, token, capsys):
+    """Codex PR #55 (09d1a03): "$" let a token ending in a newline through to the authenticated HEAD. The token must
+    fullmatch the b64token grammar; otherwise no authenticated request is made at all."""
+    record, kube = setup(api, make_record, anonymous_section())
+    calls = []
+
+    def fetch(method, url, headers):
+        calls.append(dict(headers))
+        assert "Authorization" not in headers, "an authenticated request was made"
+        if "/service/token" in url:
+            return 200, {}, json.dumps({"token": token}).encode()
+        return 401, {"www-authenticate": 'Bearer realm="https://harbor.example/service/token"'}, b""
+    p = prepare.plan(record, kube, "values", fetch=fetch)
+    assert not any("Authorization" in h for h in calls) and len(calls) == 4      # 2 x (HEAD, token GET)
+    assert p["problems"] == [f"anonymous pull: {i}: token-handshake-failed (HTTP 401)" for i in (OP_IMAGE, ST_IMAGE)]
+    assert prepare.main(["--record", record.path, "plan", "--phase", "values"], api=api, fetch=fetch) == 0
+    out = capsys.readouterr()
+    for text in (json.dumps(p), out.out, out.err, _all_persisted(record)):
+        assert "LEAKME" not in text
+
+
+@pytest.mark.parametrize("field, value", [
+    ("operator_image", OP_IMAGE + "\n"), ("statistical_image", ST_IMAGE + "\n"),
+    ("image_pull", {"mode": "secret", "pull_ref": "harbor-pull\n"})])
+def test_a_trailing_newline_never_passes_a_record_pattern(api, make_record, field, value):
+    s = prepare_section()
+    s["release"][field] = value
+    api.put({"apiVersion": "storage.k8s.io/v1", "kind": "StorageClass", "metadata": {"name": "retained-ssd"},
+             "reclaimPolicy": "Retain"})
+    with pytest.raises(X.StagingError):
+        record = X.load_record(make_record({"prepare": s, "reserve": reserve_section()}), ("prepare",))
+        prepare.plan(record, record.kube(api), "values", fetch=FakeRegistry())
+
+
 def test_exception_text_quoting_the_token_is_never_recorded(api, make_record, capsys, caplog):
     """The HTTP layer's own errors can quote the request's headers: only the category is kept."""
     record, kube = setup(api, make_record, anonymous_section())

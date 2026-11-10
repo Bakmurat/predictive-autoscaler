@@ -79,14 +79,14 @@ def _section(record: X.Record) -> Dict:
     st, rel = s.get("storage") or {}, s.get("release") or {}
     for c in ("ledger_claim", "state_claim"):
         claim = st.get(c) or {}
-        if not (X._DNS.match(str(claim.get("name", ""))) and _QUANTITY.match(str(claim.get("size", "")))):
+        if not (X._DNS.fullmatch(str(claim.get("name", ""))) and _QUANTITY.fullmatch(str(claim.get("size", "")))):
             raise X.StagingError(f"prepare.storage.{c} needs name and size")
     if st["ledger_claim"]["name"] == st["state_claim"]["name"]:
         raise X.StagingError("the ledger and state claims must differ")
-    if not X._DNS.match(str(st.get("storage_class", ""))) or st.get("access_mode") != "ReadWriteOnce":
+    if not X._DNS.fullmatch(str(st.get("storage_class", ""))) or st.get("access_mode") != "ReadWriteOnce":
         raise X.StagingError("prepare.storage needs storage_class and access_mode ReadWriteOnce (Recreate, one pod)")
     for k in ("operator_image", "statistical_image"):
-        if not _DIGEST_IMAGE.match(str(rel.get(k, ""))):
+        if not _DIGEST_IMAGE.fullmatch(str(rel.get(k, ""))):
             raise X.StagingError(f"prepare.release.{k} must be pinned by digest")
     _image_pull(rel)
     np_ = rel.get("network_policy") or {}
@@ -104,7 +104,7 @@ def _image_pull(rel: Dict) -> Dict:
     if not isinstance(p, dict) or p.get("mode") not in PULL_MODES:
         raise X.StagingError("prepare.release.image_pull.mode must be set explicitly to secret or anonymous (a missing "
                              "setting is never read as anonymous)")
-    if p["mode"] == "secret" and (set(p) != {"mode", "pull_ref"} or not X._DNS.match(str(p["pull_ref"]))):
+    if p["mode"] == "secret" and (set(p) != {"mode", "pull_ref"} or not X._DNS.fullmatch(str(p["pull_ref"]))):
         raise X.StagingError("prepare.release.image_pull secret mode needs exactly pull_ref, the platform-managed "
                              "pull Secret")
     if p["mode"] == "anonymous" and set(p) != {"mode"}:
@@ -130,7 +130,7 @@ def _http_fetch(method: str, url: str, headers: Dict[str, str]) -> Tuple[int, Di
 
 def _image_parts(image: str) -> Tuple[str, str, str]:
     """registry host, repository, digest of a digest-pinned reference (the host is the first path element)."""
-    repo, dig = _DIGEST_IMAGE.match(image).groups()
+    repo, dig = _DIGEST_IMAGE.fullmatch(image).groups()
     host, _, path = repo.partition("/")
     if not path or not ("." in host or ":" in host or host == "localhost"):
         raise X.StagingError(f"{image}: anonymous verification needs the registry host in the image reference")
@@ -147,7 +147,7 @@ def _bearer_challenge(value: str) -> Dict[str, str]:
 # The only error texts a check ever records: fixed categories, never exception text or header values (an exception
 # from the HTTP layer can quote the request's headers, the anonymous token included).
 PULL_ERRORS = ("network-error", "invalid-header", "token-handshake-failed", "digest-missing", "digest-mismatch")
-_B64TOKEN = re.compile(r"^[A-Za-z0-9._~+/-]+=*$")               # RFC 6750 b64token: no whitespace, no control bytes
+_B64TOKEN = re.compile(r"[A-Za-z0-9._~+/-]+=*")   # RFC 6750 b64token (fullmatch: no whitespace, no final newline)
 
 
 class _PullError(Exception):
@@ -180,7 +180,7 @@ def _anonymous_token(fetch: Fetch, challenge: Dict[str, str]) -> str:
     except (_PullError, ValueError):
         raise _PullError("token-handshake-failed") from None
     token = doc.get("token") or doc.get("access_token") if isinstance(doc, dict) else None
-    if not isinstance(token, str) or not _B64TOKEN.match(token):
+    if not isinstance(token, str) or not _B64TOKEN.fullmatch(token):
         raise _PullError("token-handshake-failed")
     return token
 
@@ -272,8 +272,8 @@ def staging_values(record: X.Record, params: Dict, s: Dict) -> Dict:
                    "matchExpressions": [{"key": r["role_label"], "operator": "In", "values": ["support"]},
                                         {"key": "kubernetes.io/hostname", "operator": "In",
                                          "values": [params["nodes"]["support"]]}]}]}}}}
-    op_repo, op_digest = _DIGEST_IMAGE.match(rel["operator_image"]).groups()
-    st_repo, st_digest = _DIGEST_IMAGE.match(rel["statistical_image"]).groups()
+    op_repo, op_digest = _DIGEST_IMAGE.fullmatch(rel["operator_image"]).groups()
+    st_repo, st_digest = _DIGEST_IMAGE.fullmatch(rel["statistical_image"]).groups()
     pull = _image_pull(rel)
     pull_secrets = [{"name": pull["pull_ref"]}] if pull["mode"] == "secret" else []
     return {
