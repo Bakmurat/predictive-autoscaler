@@ -55,6 +55,29 @@ subjects:
 # outside them. Leader-election events in the release namespace come from the Lease Role below. With
 # operator.rbac.scaleWrite false (a shadow, Recommend-only install) the /scale rule keeps only get: no replica write is
 # authorized at all, and an autoscaler set to Active fails its write with Forbidden instead of scaling.
+{{- /*
+With operator.rbac.scaleTargets (Deployment names) the write verb is granted only on those names: for a subresource the
+resourceNames entry is the parent object's name, so the rule names the Deployments. The names apply in every namespace
+the role is bound in (each of operator.watchNamespaces, or every namespace when none is set). get stays in its own rule
+without names. RBAC binds the NAME, not the object: a Deployment recreated under an allowed name is authorized here.
+The operator refuses a replaced target only within the reconcile that read the old one (the fresh Scale read and the
+identity guard compare UIDs); on a later reconcile it adopts the replacement and can scale it reactively. Restricting
+writes to reviewed UIDs needs an operator-side check, which this value does not provide. An empty list renders exactly
+the single rule below. The names are validated here as well as in values.schema.json (schema validation can be
+skipped): Kubernetes' DNS-1123 subdomain, label by label, at most 253 characters, distinct, at most 64.
+*/}}
+{{- $scaleTargets := .Values.operator.rbac.scaleTargets }}
+{{- range $scaleTargets }}
+{{- if not (kindIs "string" .) }}{{ fail "operator.rbac.scaleTargets must list Deployment names (strings)" }}{{ end }}
+{{- if or (gt (len .) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*\\z" .)) }}
+{{- fail (printf "operator.rbac.scaleTargets: %q is not a DNS-1123 subdomain (lower-case alphanumeric labels that may contain '-', joined by single dots, at most 253 characters)" .) }}
+{{- end }}
+{{- end }}
+{{- if ne (len $scaleTargets) (len ($scaleTargets | uniq)) }}{{ fail "operator.rbac.scaleTargets must list each Deployment name once" }}{{ end }}
+{{- if gt (len $scaleTargets) 64 }}{{ fail "operator.rbac.scaleTargets lists more than 64 names" }}{{ end }}
+{{- if and $scaleTargets (not .Values.operator.rbac.scaleWrite) }}
+{{- fail "operator.rbac.scaleTargets names Deployments the operator may scale, but operator.rbac.scaleWrite is false (no replica write at all): set scaleWrite true or empty scaleTargets" }}
+{{- end }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -64,9 +87,19 @@ rules:
   - apiGroups: ["autoscaling.devkuban.com"]
     resources: ["predictiveautoscalers/status"]
     verbs: ["get", "update", "patch"]
+  {{- if $scaleTargets }}
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    verbs: ["get"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    resourceNames: {{ toJson $scaleTargets }}
+    verbs: ["update"]
+  {{- else }}
   - apiGroups: ["apps"]
     resources: ["deployments/scale"]
     verbs: {{ if .Values.operator.rbac.scaleWrite }}["get", "update"]{{ else }}["get"]{{ end }}
+  {{- end }}
   - apiGroups: ["", "events.k8s.io"]
     resources: ["events"]
     verbs: ["create", "patch"]

@@ -163,6 +163,134 @@ def test_scale_write_must_be_a_boolean(render):
     assert render({"operator": {"rbac": {"scaleWrites": False}}}, check=False).returncode != 0
 
 
+# --- operator.rbac.scaleTargets: the replica write limited to named Deployments ----------------------------------------
+
+WRITE_ROLE = "pa-predictive-autoscaler-operator-write"
+CI_VALUES = sorted((CHART / "ci").glob("*-values.yaml"))
+LEGACY_SCALE_RULE = ('  - apiGroups: ["apps"]\n    resources: ["deployments/scale"]\n    verbs: %s\n'
+                     '  - apiGroups: ["", "events.k8s.io"]\n')
+
+
+def _operator_rbac_text(values_file, *sets):
+    """The rendered templates/operator-rbac.yaml, byte for byte (it holds no generated material)."""
+    cmd = ["helm", "template", "pa", str(CHART), "-n", NS, "--kube-version", "1.35.0", "-f", str(values_file),
+           "--show-only", "templates/operator-rbac.yaml"]
+    for s in sets:
+        cmd += ["--set-json", s]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except OSError as e:
+        if os.environ.get("CI"):
+            pytest.fail(f"helm is required in CI: {e}")
+        pytest.skip(f"helm not usable here: {e}")
+    assert p.returncode == 0, p.stderr
+    return p.stdout
+
+
+@pytest.mark.parametrize("values", [f for f in CI_VALUES if f.name != "scale-targets-values.yaml"], ids=lambda f: f.name)
+def test_without_scale_targets_the_rbac_renders_exactly_as_before(values):
+    # Every value set that existed before scaleTargets: the single /scale rule, its text unchanged, no resourceNames
+    # on it; and an explicit empty list is byte-identical to leaving the value out.
+    text = _operator_rbac_text(values)
+    write = (yaml.safe_load(values.read_text()).get("operator", {}).get("rbac", {}).get("scaleWrite", True))
+    assert text.count('resources: ["deployments/scale"]') == 1
+    assert LEGACY_SCALE_RULE % ('["get", "update"]' if write else '["get"]') in text
+    assert text.count("resourceNames:") == 2          # only the operator's own CRD and its Lease, as before
+    assert _operator_rbac_text(values, "operator.rbac.scaleTargets=[]") == text
+
+
+def test_scale_targets_limit_the_write_verb_to_the_named_deployments(render):
+    named = render({"operator": {"rbac": {"scaleWrite": True, "scaleTargets": ["web", "api"]}}})
+    # Exactly the write verb granted today (update; never patch) carries the names; get stays in its own rule,
+    # without names. For a subresource, resourceNames holds the parent object's name: the Deployment.
+    assert {r for r in rules_of(named, WRITE_ROLE) if r[:2] == SCALE_RULE[:2]} == {
+        (("apps",), ("deployments/scale",), (), ("get",)),
+        (("apps",), ("deployments/scale",), ("web", "api"), ("update",))}
+    role = next(d for d in named if d["kind"] == "ClusterRole" and d["metadata"]["name"] == WRITE_ROLE)
+    scale = [r for r in role["rules"] if r["resources"] == ["deployments/scale"]]
+    assert scale == [{"apiGroups": ["apps"], "resources": ["deployments/scale"], "verbs": ["get"]},
+                     {"apiGroups": ["apps"], "resources": ["deployments/scale"], "resourceNames": ["web", "api"],
+                      "verbs": ["update"]}]
+    # No rule of any role writes a /scale subresource without resourceNames, and none grants patch on it.
+    for (kind, _, name), (_, rules) in _rbac(named).items():
+        for _groups, resources, names, verbs in rules:
+            if any(res.endswith("/scale") for res in resources):
+                assert set(verbs) <= {"get"} or (names == ("web", "api") and set(verbs) == {"update"}), (kind, name)
+    # Nothing else changes: every other RBAC object and rule, every binding and every non-RBAC object.
+    default = render()
+    d, n = _rbac(default), _rbac(named)
+    assert d.keys() == n.keys()
+    for key in d:
+        assert d[key][0] == n[key][0], key
+        assert {r for r in d[key][1] if r[:2] != SCALE_RULE[:2]} == {r for r in n[key][1] if r[:2] != SCALE_RULE[:2]}, key
+    strip = lambda docs: [x for x in docs if x["kind"] not in RBAC_KINDS + ("Secret",)]
+    assert strip(default) == strip(named)
+
+
+def test_scale_targets_apply_in_each_watched_namespace_and_nowhere_else(render):
+    docs = render({"operator": {"watchNamespaces": ["shop", "payments"],
+                                "rbac": {"scaleTargets": ["web"]}}})          # scaleWrite defaults to true
+    assert (("apps",), ("deployments/scale",), ("web",), ("update",)) in rules_of(docs, WRITE_ROLE)
+    bound = [b for b in by_kind(docs, "RoleBinding") if b["roleRef"]["name"] == WRITE_ROLE]
+    assert sorted(b["metadata"]["namespace"] for b in bound) == ["payments", "shop"]
+    assert all(b["roleRef"]["kind"] == "ClusterRole" for b in bound)
+    # The named write role is never bound cluster-wide when namespaces are watched.
+    assert not [b for b in by_kind(docs, "ClusterRoleBinding") if b["roleRef"]["name"] == WRITE_ROLE]
+
+
+def test_scale_targets_need_scale_write_and_valid_distinct_names(render):
+    p = render({"operator": {"rbac": {"scaleWrite": False, "scaleTargets": ["web"]}}}, check=False)
+    assert p.returncode != 0 and "operator.rbac.scaleWrite is false" in p.stderr      # ambiguous intent: refused
+    for bad in (["Web"], ["web_1"], [""], ["-web"], ["web", "web"], "web", [7], ["x" * 254], [f"d{i}" for i in range(65)]):
+        p = render({"operator": {"rbac": {"scaleTargets": bad}}}, check=False)
+        assert p.returncode != 0 and "scaleTargets" in p.stderr, bad
+    assert render({"operator": {"rbac": {"scaleWrite": False, "scaleTargets": []}}}, check=False).returncode == 0
+
+
+# Kubernetes' DNS-1123 subdomain, label by label: each label [a-z0-9]([-a-z0-9]*[a-z0-9])?, single dots between them.
+MALFORMED_NAMES = ["web..api", "web.-api", "web-.api", ".web", "web.", "web.api.", "-web", "web-", "web.Api", "web_api",
+                   "web api", "web/api", "web\n", "web\r", "web\t", "\nweb", "web.\napi", "*", "", ".", "x" * 254,
+                   ".".join(["a" * 63] * 4) + "b"]
+WELL_FORMED_NAMES = ["web", "web-1", "web.api", "a.b.c", "0", "web-api.v2.shop-1", "x" * 253, ".".join(["a" * 63] * 3)]
+
+
+@pytest.mark.parametrize("skip_schema", [False, True], ids=["schema", "template"])
+def test_scale_target_names_are_dns_1123_subdomains_label_by_label(tmp_path, skip_schema):
+    # The schema refuses a malformed name, and so does the template when schema validation is skipped.
+    def run(names):
+        f = tmp_path / "values.yaml"
+        f.write_text(yaml.safe_dump(_merge(BASE, {"operator": {"rbac": {"scaleTargets": names}}})))
+        cmd = ["helm", "template", "pa", str(CHART), "-n", NS, "--kube-version", "1.35.0", "-f", str(f),
+               "--show-only", "templates/operator-rbac.yaml"] + (["--skip-schema-validation"] if skip_schema else [])
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        except OSError as e:
+            if os.environ.get("CI"):
+                pytest.fail(f"helm is required in CI: {e}")
+            pytest.skip(f"helm not usable here: {e}")
+    for name in MALFORMED_NAMES:
+        p = run([name])
+        assert p.returncode != 0 and "scaleTargets" in p.stderr, repr(name)
+        assert run(["web", name]).returncode != 0, repr(name)                 # wherever it stands in the list
+    ok = run(WELL_FORMED_NAMES)
+    assert ok.returncode == 0, ok.stderr
+    (rule,) = [r for d in yaml.safe_load_all(ok.stdout) if d and d["kind"] == "ClusterRole"
+               for r in d["rules"] if r.get("resourceNames") and r["resources"] == ["deployments/scale"]]
+    assert rule["resourceNames"] == WELL_FORMED_NAMES and rule["verbs"] == ["update"]
+    for bad in (["web", "web"], [f"d{i}" for i in range(65)], [7], ["web", None]):   # distinct, at most 64, strings
+        p = run(bad)
+        assert p.returncode != 0 and "scaleTargets" in p.stderr, bad
+    assert run([f"d{i}" for i in range(64)]).returncode == 0
+
+
+def test_the_scale_targets_ci_value_set_renders_the_named_write():
+    text = _operator_rbac_text(CHART / "ci" / "scale-targets-values.yaml")
+    assert ('  - apiGroups: ["apps"]\n    resources: ["deployments/scale"]\n    verbs: ["get"]\n'
+            '  - apiGroups: ["apps"]\n    resources: ["deployments/scale"]\n    resourceNames: ["web","api"]\n'
+            '    verbs: ["update"]\n') in text
+    assert "kind: RoleBinding" in text and "namespace: shop" in text
+
+
 def test_no_role_can_create_workloads_or_read_secrets(render):
     docs = render()
     for role in by_kind(docs, "ClusterRole") + by_kind(docs, "Role"):
