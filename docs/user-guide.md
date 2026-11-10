@@ -503,14 +503,15 @@ At the top choose the installation as on the Help & Overview dashboard, then the
 **targets** and the **capacity per replica**. A target is chosen by its PredictiveAutoscaler's name, and the dashboard
 uses the same name for the target Deployment, so the two must match. The capacity is the autoscalers'
 `capacityPerReplica` in requests per second as a plain number: no metric exports it, so it is a dashboard variable, and
-0 hides the capacity line. `dashboards.demonstration.namespace`, `forecastTarget`, `reactiveTarget` and
+0 hides the capacity line. It is a provisional, configured value, so the line drawn from it is labelled *nominal
+capacity*: a sizing reference, not a limit measured on the page. `dashboards.demonstration.namespace`, `forecastTarget`, `reactiveTarget` and
 `capacityPerReplica` pre-select these.
 
 | Row | Shows (A left, B right) | Reads |
 |---|---|---|
-| 1 Demand | Requests per minute: scheduled by the generator, received at the ingress, the rate the operator measured, failed responses. | k6 (remote write), the fixture's ingress, the operator |
+| 1 Demand | Requests per minute: scheduled, dispatched and dropped by the generator (scheduled is dispatched plus dropped), received at the ingress, the rate the operator measured, failed responses. | k6 (remote write), the fixture's ingress, the operator |
 | 2 Forecast and trust | The forecast upper bound against demand; the trust phase over time and each candidate family's gates; coverage, outcome availability and evidence counts. | the operator, the forecasting service |
-| 3 Scaling | Reactive need, forecast-side count, recommendation, applied scale (`spec.replicas`) and Ready replicas; Ready capacity against demand; the replicas the forecast added. Vertical markers are the operator's scale-up writes, one colour per target. | the operator, kube-state-metrics |
+| 3 Scaling | Reactive need, forecast-side count, recommendation, applied scale (`spec.replicas`) and Ready replicas; the nominal capacity of the Ready replicas against demand; the replicas the forecast added. Vertical markers are the operator's scale-up writes, one colour per target. | the operator, kube-state-metrics |
 | 4 Mode and safety | `ScalingActive`, `PredictionReady`, `ForecastAvailable`, `TelemetryAvailable`, `ConflictDetected` and `ScaleOutBlocked` over time, and whether a forecast took part in the decision or it was reactive only. | the operator |
 | 5 Service quality | p95 and p99 latency of successful requests with the 200 ms and 500 ms lines, the error fraction with the 0.1 % line, the fixture's queue and CPU throttling. | the fixture's ingress and pods, k6, cAdvisor |
 | 6 Health | Forecaster readiness and state volume (two proxies, see below), forecast issuances per minute, evidence age, the operator's reconciles and errors, the scrape targets. | kube-state-metrics, the kubelet, both components |

@@ -315,8 +315,38 @@ def test_a_stand_in_is_called_a_proxy(dashboard):
     assert sum("proxy" in p["title"].lower() for p in dashboard["panels"]) == 2
 
 
-def test_the_capacity_line_needs_the_variable(dashboard):
-    lines = [t["expr"] for p in data_panels(dashboard) for t in p["targets"] if "$capacity_per_replica" in t["expr"]]
+def test_the_demand_row_keeps_the_generators_counts_apart(dashboard):
+    """Scheduled, dispatched and dropped are the generator's own counts, received and failed are the ingress's, and
+    the operator's measured rate is its own series: none stands in for another."""
+    (demand,) = [a for name, a, _ in pairs(dashboard) if name.startswith("Demand: ")]
+    by_legend = {t["legendFormat"]: t["expr"] for t in demand["targets"] if not t["legendFormat"].startswith(AXIS)}
+    assert list(by_legend) == [
+        "generator: scheduled arrivals (dispatched + dropped)", "generator: dispatched",
+        "generator: dropped (scheduled, never sent)", "ingress: received", "operator: measured rate",
+        "ingress: failed responses", "ingress: no ready endpoint"]
+    rate = "sum(rate({}[$__rate_interval]))"
+    dispatched = rate.format('k6_http_reqs_total{c28_target="$target_a"}')
+    dropped = rate.format('k6_dropped_iterations_total{c28_target="$target_a"}')
+    assert by_legend["generator: dispatched"] == dispatched + " * 60"
+    assert by_legend["generator: dropped (scheduled, never sent)"] == dropped + " * 60"
+    # a generator that never dropped has no dropped series: the sum must not vanish with it
+    assert by_legend["generator: scheduled arrivals (dispatched + dropped)"] == f"({dispatched} + ({dropped} or vector(0))) * 60"
+    assert by_legend["ingress: received"] == rate.format('c28_ingress_requests_total{namespace="$namespace", target="$target_a"}') + " * 60"
+    assert demand["fieldConfig"]["defaults"]["unit"] == "reqpm"
+
+
+def test_the_capacity_line_is_nominal_and_needs_the_variable(dashboard):
+    """No metric exports the per-replica capacity: it is a dashboard variable holding a provisional value, so the line
+    is called nominal capacity, and it is not drawn while the variable is 0."""
+    labelled = [(t["legendFormat"], t["expr"]) for p in data_panels(dashboard) for t in p["targets"]
+                if "$capacity_per_replica" in t["expr"]]
+    assert {lg.removeprefix(AXIS) for lg, _ in labelled} == {"nominal capacity (provisional per-replica value)"}
+    variable = next(v for v in dashboard["templating"]["list"] if v["name"] == "capacity_per_replica")
+    assert "provisional" in variable["label"] and "provisional" in variable["description"].lower()
+    (panel,) = [a for name, a, _ in pairs(dashboard) if name.startswith("Nominal capacity")]
+    assert "provisional" in panel["description"] and "not a measured limit" in panel["description"]
+    assert "provisional" in dashboard["panels"][0]["options"]["content"]
+    lines = [e for _, e in labelled]
     assert len(lines) == 4                                                       # A and B, each also as the other's axis
     for e in lines:
         assert re.fullmatch(r'max\(kube_deployment_status_replicas_ready\{namespace="\$namespace", deployment="\$target_[ab]"\}\)'
