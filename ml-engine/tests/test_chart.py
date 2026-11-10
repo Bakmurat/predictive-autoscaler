@@ -113,6 +113,56 @@ def test_rbac_matches_the_documented_least_privilege_table(render):
     assert sorted(ev["verbs"]) == ["create", "patch"]
 
 
+SCALE_RULE = (("apps",), ("deployments/scale",), ())
+RBAC_KINDS = ("ClusterRole", "Role", "ClusterRoleBinding", "RoleBinding")
+
+
+def _rbac(docs):
+    """Every RBAC object by (kind, namespace, name), with its rules as a set of (groups, resources, names, verbs)."""
+    out = {}
+    for d in docs:
+        if d["kind"] not in RBAC_KINDS:
+            continue
+        key = (d["kind"], d["metadata"].get("namespace", ""), d["metadata"]["name"])
+        body = {k: v for k, v in d.items() if k not in ("metadata", "rules")}
+        rules = {(tuple(r.get("apiGroups", [])), tuple(r["resources"]), tuple(r.get("resourceNames", [])),
+                  tuple(sorted(r["verbs"]))) for r in d.get("rules", [])}
+        out[key] = (json.dumps(body, sort_keys=True), rules)
+    return out
+
+
+@pytest.mark.parametrize("extra", [{}, {"operator": {"watchNamespaces": ["shop", "payments"]}}])
+def test_a_shadow_install_cannot_write_replicas_and_changes_nothing_else(render, extra):
+    default = render(extra)
+    shadow = render(_merge(extra, {"operator": {"rbac": {"scaleWrite": False}}}))
+    explicit = render(_merge(extra, {"operator": {"rbac": {"scaleWrite": True}}}))
+    assert _rbac(explicit) == _rbac(default)                      # true is today's behaviour, exactly
+    write = "pa-predictive-autoscaler-operator-write"
+    assert {r for r in rules_of(default, write) if r[:3] == SCALE_RULE} == {SCALE_RULE + (("get", "update"),)}
+    assert {r for r in rules_of(shadow, write) if r[:3] == SCALE_RULE} == {SCALE_RULE + (("get",),)}
+    # No role of the shadow install may write any /scale subresource.
+    for (kind, _, name), (_, rules) in _rbac(shadow).items():
+        for groups, resources, _, verbs in rules:
+            if any(res.endswith("/scale") for res in resources):
+                assert set(verbs) <= {"get"}, (kind, name, resources, verbs)
+    # Every other object and rule is identical: status, events, the Lease, the reads and every binding.
+    d, s = _rbac(default), _rbac(shadow)
+    assert d.keys() == s.keys()
+    for key in d:
+        body_d, rules_d = d[key]
+        body_s, rules_s = s[key]
+        assert body_d == body_s, key
+        assert {r for r in rules_d if r[:3] != SCALE_RULE} == {r for r in rules_s if r[:3] != SCALE_RULE}, key
+    # And the non-RBAC objects render the same (the self-signed TLS Secret is generated anew on every render).
+    strip = lambda docs: [d for d in docs if d["kind"] not in RBAC_KINDS + ("Secret",)]
+    assert strip(default) == strip(shadow)
+
+
+def test_scale_write_must_be_a_boolean(render):
+    assert render({"operator": {"rbac": {"scaleWrite": "false"}}}, check=False).returncode != 0
+    assert render({"operator": {"rbac": {"scaleWrites": False}}}, check=False).returncode != 0
+
+
 def test_no_role_can_create_workloads_or_read_secrets(render):
     docs = render()
     for role in by_kind(docs, "ClusterRole") + by_kind(docs, "Role"):

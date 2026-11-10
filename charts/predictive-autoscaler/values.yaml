@@ -24,6 +24,11 @@ prometheus:
 operator:
   replicas: 1                # more replicas only add standby leaders (leader election is always on)
   watchNamespaces: []        # empty: every namespace
+  rbac:
+    # false: a shadow (Recommend-only) install. The operator may only read deployments/scale (no update), so it cannot
+    # change any replica count even if an autoscaler is set to Active (that write fails with Forbidden). Status,
+    # events and the leader-election Lease are unchanged.
+    scaleWrite: true
   # host:port the operator dials instead of the forecaster Service (empty: the Service). For an evaluation-owned route
   # in front of the forecaster (C2.8's scheduled forecast outages). With authentication on, the host must be listed in
   # forecaster.tls.extraDNSNames, so certificate verification stays on.

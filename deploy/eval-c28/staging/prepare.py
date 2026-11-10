@@ -11,8 +11,9 @@ Phases, in order (each a separate reviewed plan; nothing is applied as one unatt
               (its reclaimPolicy must be Retain); the chart then uses them as existingClaim
   values      the reviewed staging overlay for the evaluation release (a new local file, release-staging.yaml):
               digest-pinned images, statistical engine, no training, watched namespace only, one operator with the
-              ledger claim, retained state claim, S placement, auth and TLS on with the route's name in the certificate,
-              and NO lab qualification (labQualification.configMap "")
+              ledger claim and NO replica write (operator.rbac.scaleWrite false: deployments/scale get only),
+              retained state claim, S placement, auth and TLS on with the route's name in the certificate, and NO lab
+              qualification (labQualification.configMap "")
   common      the run-wide fixture objects (PriorityClass, scoped ResourceQuota, ingress, the two fault routes, their
               EMPTY fault schedules, route NetworkPolicies, the scrape object)
   targets     the ten target Deployments (fixed replicas), Services and EMPTY fault ConfigMaps; their UIDs are captured
@@ -30,8 +31,20 @@ The record's "prepare" section:
   {"storage": {"storage_class": "...", "access_mode": "ReadWriteOnce",
                "ledger_claim": {"name": "...", "size": "1Gi"}, "state_claim": {"name": "...", "size": "2Gi"}},
    "release": {"operator_image": "<repo>@sha256:...", "statistical_image": "<repo>@sha256:...",
-               "registry_pull_ref": "<name of the platform-managed pull Secret (referenced, never read)>",
+               "image_pull": {"mode": "secret", "pull_ref": "<the platform-managed pull Secret's name (referenced,
+                                                          never read)>"}
+                             | {"mode": "anonymous"},
                "network_policy": {chart networkPolicy values; enabled must stay true}}}
+
+image_pull is required and explicit: a record without it (or with the retired registry_pull_ref) is refused, never
+read as anonymous. Secret mode references the Secret by name in images.pullSecrets. Anonymous mode renders
+images.pullSecrets as [] and the values plan verifies every required image digest anonymously: a registry v2 manifest
+HEAD by digest (OCI and Docker manifest Accept headers, no credentials; a Bearer challenge is answered only with an
+anonymous token from the challenge's realm, which is never recorded). Each check (image, digest, URL, HTTP status,
+time; failures only as fixed categories, never exception text or header values) is recorded in the plan; anything but
+HTTP 200 with a Docker-Content-Digest equal to the expected digest (missing or different) is a plan problem, and apply
+checks again. A manifest HEAD from the checker proves that the registry serves the manifest anonymously to THIS host
+only: the nodes' pulls (their network path, mirrors, containerd configuration) remain an installation check.
 """
 
 from __future__ import annotations
@@ -42,7 +55,10 @@ import json
 import os
 import re
 import sys
-from typing import Dict, List, Optional, Tuple
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Callable, Dict, List, Optional, Tuple
 
 import yaml
 
@@ -52,6 +68,10 @@ HELPER = "prepare"
 PHASES = ("namespaces", "storage", "values", "common", "targets", "pas")
 _DIGEST_IMAGE = re.compile(r"^([a-z0-9][a-z0-9./:-]*)@(sha256:[0-9a-f]{64})$")
 _QUANTITY = re.compile(r"^[0-9]+(Mi|Gi|Ti)$")
+PULL_MODES = ("secret", "anonymous")
+MANIFEST_ACCEPT = ", ".join(("application/vnd.oci.image.index.v1+json", "application/vnd.oci.image.manifest.v1+json",
+                             "application/vnd.docker.distribution.manifest.list.v2+json",
+                             "application/vnd.docker.distribution.manifest.v2+json"))
 
 
 def _section(record: X.Record) -> Dict:
@@ -59,21 +79,169 @@ def _section(record: X.Record) -> Dict:
     st, rel = s.get("storage") or {}, s.get("release") or {}
     for c in ("ledger_claim", "state_claim"):
         claim = st.get(c) or {}
-        if not (X._DNS.match(str(claim.get("name", ""))) and _QUANTITY.match(str(claim.get("size", "")))):
+        if not (X._DNS.fullmatch(str(claim.get("name", ""))) and _QUANTITY.fullmatch(str(claim.get("size", "")))):
             raise X.StagingError(f"prepare.storage.{c} needs name and size")
     if st["ledger_claim"]["name"] == st["state_claim"]["name"]:
         raise X.StagingError("the ledger and state claims must differ")
-    if not X._DNS.match(str(st.get("storage_class", ""))) or st.get("access_mode") != "ReadWriteOnce":
+    if not X._DNS.fullmatch(str(st.get("storage_class", ""))) or st.get("access_mode") != "ReadWriteOnce":
         raise X.StagingError("prepare.storage needs storage_class and access_mode ReadWriteOnce (Recreate, one pod)")
     for k in ("operator_image", "statistical_image"):
-        if not _DIGEST_IMAGE.match(str(rel.get(k, ""))):
+        if not _DIGEST_IMAGE.fullmatch(str(rel.get(k, ""))):
             raise X.StagingError(f"prepare.release.{k} must be pinned by digest")
-    if not X._DNS.match(str(rel.get("registry_pull_ref", ""))):
-        raise X.StagingError("prepare.release.registry_pull_ref must name the platform-managed pull Secret")
+    _image_pull(rel)
     np_ = rel.get("network_policy") or {}
     if np_.get("enabled") is not True:
         raise X.StagingError("prepare.release.network_policy.enabled must be true (never disabled to pass staging)")
     return s
+
+
+def _image_pull(rel: Dict) -> Dict:
+    """The explicit pull mode: {"mode": "secret", "pull_ref": ...} or {"mode": "anonymous"}; nothing is defaulted."""
+    if "registry_pull_ref" in rel:
+        raise X.StagingError('prepare.release.registry_pull_ref is retired: set prepare.release.image_pull to '
+                             '{"mode": "secret", "pull_ref": ...} (or {"mode": "anonymous"})')
+    p = rel.get("image_pull")
+    if not isinstance(p, dict) or p.get("mode") not in PULL_MODES:
+        raise X.StagingError("prepare.release.image_pull.mode must be set explicitly to secret or anonymous (a missing "
+                             "setting is never read as anonymous)")
+    if p["mode"] == "secret" and (set(p) != {"mode", "pull_ref"} or not X._DNS.fullmatch(str(p["pull_ref"]))):
+        raise X.StagingError("prepare.release.image_pull secret mode needs exactly pull_ref, the platform-managed "
+                             "pull Secret")
+    if p["mode"] == "anonymous" and set(p) != {"mode"}:
+        raise X.StagingError("prepare.release.image_pull anonymous mode takes no other field")
+    return p
+
+
+# --- anonymous registry verification ----------------------------------------------------------------------------------
+
+# fetch(method, url, headers) -> (status, response headers with lower-case names, body bytes): the only network access,
+# injectable. It never receives credentials: the headers are Accept and, after a Bearer challenge, an anonymous token.
+Fetch = Callable[[str, str, Dict[str, str]], Tuple[int, Dict[str, str], bytes]]
+
+
+def _http_fetch(method: str, url: str, headers: Dict[str, str]) -> Tuple[int, Dict[str, str], bytes]:
+    req = urllib.request.Request(url, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:     # noqa: S310 - the record's digest-pinned registry
+            return r.status, {k.lower(): v for k, v in r.headers.items()}, r.read(1 << 16)
+    except urllib.error.HTTPError as e:
+        return e.code, {k.lower(): v for k, v in (e.headers or {}).items()}, b""
+
+
+def _image_parts(image: str) -> Tuple[str, str, str]:
+    """registry host, repository, digest of a digest-pinned reference (the host is the first path element)."""
+    repo, dig = _DIGEST_IMAGE.fullmatch(image).groups()
+    host, _, path = repo.partition("/")
+    if not path or not ("." in host or ":" in host or host == "localhost"):
+        raise X.StagingError(f"{image}: anonymous verification needs the registry host in the image reference")
+    return host, path, dig
+
+
+def _bearer_challenge(value: str) -> Dict[str, str]:
+    scheme, _, rest = value.partition(" ")
+    if scheme.lower() != "bearer":
+        return {}
+    return {k.lower(): v for k, v in re.findall(r'(\w+)="([^"]*)"', rest)}
+
+
+# The only error texts a check ever records: fixed categories, never exception text or header values (an exception
+# from the HTTP layer can quote the request's headers, the anonymous token included).
+PULL_ERRORS = ("network-error", "invalid-header", "token-handshake-failed", "digest-missing", "digest-mismatch")
+_B64TOKEN = re.compile(r"[A-Za-z0-9._~+/-]+=*")   # RFC 6750 b64token (fullmatch: no whitespace, no final newline)
+
+
+class _PullError(Exception):
+    def __init__(self, category: str):
+        super().__init__(category)
+        self.category = category
+
+
+def _call(fetch: Fetch, method: str, url: str, headers: Dict[str, str]) -> Tuple[int, Dict[str, str], bytes]:
+    """fetch, with every failure reduced to its category (the exception itself is dropped, never formatted)."""
+    try:
+        status, rh, body = fetch(method, url, headers)
+    except ValueError:
+        raise _PullError("invalid-header") from None
+    except Exception:                                          # noqa: BLE001 - URLError, timeouts, TLS, HTTP framing
+        raise _PullError("network-error") from None
+    return status, {str(k).lower(): v for k, v in (rh or {}).items()}, body or b""
+
+
+def _anonymous_token(fetch: Fetch, challenge: Dict[str, str]) -> str:
+    """An anonymous token from the challenge's https realm (no Authorization header). Anything else - no realm, a
+    refusal, a malformed answer, a token that is not a plain b64token - is token-handshake-failed."""
+    realm = challenge.get("realm", "")
+    if not realm.startswith("https://"):
+        raise _PullError("token-handshake-failed")
+    q = urllib.parse.urlencode({k: challenge[k] for k in ("service", "scope") if k in challenge})
+    try:
+        status, _, body = _call(fetch, "GET", realm + ("&" if "?" in realm else "?") + q if q else realm, {})
+        doc = json.loads(body.decode() or "{}") if status == 200 else {}
+    except (_PullError, ValueError):
+        raise _PullError("token-handshake-failed") from None
+    token = doc.get("token") or doc.get("access_token") if isinstance(doc, dict) else None
+    if not isinstance(token, str) or not _B64TOKEN.fullmatch(token):
+        raise _PullError("token-handshake-failed")
+    return token
+
+
+def verify_anonymous_pull(images: List[str], fetch: Fetch, now: Callable[[], str] = X.utcnow) -> List[Dict]:
+    """One manifest HEAD by digest per image, without credentials. A check passes only with HTTP 200 AND a
+    Docker-Content-Digest equal to the expected digest. Each check records image, digest, URL, status, whether a Bearer
+    challenge was answered anonymously, whether the digest was confirmed, a fixed error category (PULL_ERRORS or
+    http-<status>; "" when it passed) and the time - never the token, a header value or exception text. Proves anonymous
+    access from the checking host only (see the module docstring)."""
+    out = []
+    for image in images:
+        host, path, dig = _image_parts(image)
+        url = f"https://{host}/v2/{path}/manifests/{dig}"
+        headers = {"Accept": MANIFEST_ACCEPT}
+        status, answered, error = None, False, ""
+        try:
+            status, rh, _ = _call(fetch, "HEAD", url, headers)
+            if status == 401:
+                challenge = _bearer_challenge(str(rh.get("www-authenticate", "")))
+                if challenge:
+                    token = _anonymous_token(fetch, challenge)
+                    answered, status = True, None             # a failed retry has no status of its own
+                    status, rh, _ = _call(fetch, "HEAD", url, {**headers, "Authorization": f"Bearer {token}"})
+            if status != 200:
+                raise _PullError(f"http-{int(status)}" if isinstance(status, int) else "network-error")
+            got = rh.get("docker-content-digest")
+            if not got:
+                raise _PullError("digest-missing")
+            if got != dig:
+                raise _PullError("digest-mismatch")
+        except _PullError as e:
+            error = e.category
+        out.append({"image": image, "digest": dig, "url": url, "status": status if isinstance(status, int) else None,
+                    "anonymous_challenge": answered, "digest_confirmed": error == "", "error": error,
+                    "checked_at": now()})
+    return out
+
+
+def pull_problems(checks: List[Dict]) -> List[str]:
+    out = []
+    for c in checks:
+        if c["error"] or c["status"] != 200 or not c["digest_confirmed"]:
+            out.append(f"anonymous pull: {c['image']}: {c['error'] or 'unconfirmed'}"
+                       + (f" (HTTP {c['status']})" if c["status"] is not None else ""))
+    return out
+
+
+def _review_times(live: Dict, reviewed: Dict) -> Dict:
+    """The live plan with the reviewed check times when the checks otherwise match one to one (apply checks again; only
+    the time may differ). Anything else differing still differs."""
+    lv, rv = (live.get("image_pull") or {}).get("verification"), (reviewed.get("image_pull") or {}).get("verification")
+    if not lv or not rv or len(lv) != len(rv):
+        return live
+    strip = lambda cs: [{k: v for k, v in c.items() if k != "checked_at"} for c in cs]
+    if strip(lv) != strip(rv):
+        return live
+    out = copy.deepcopy(live)
+    for c, r in zip(out["image_pull"]["verification"], rv):
+        c["checked_at"] = r["checked_at"]
+    return out
 
 
 def split(params: Dict) -> Dict[str, List[Dict]]:
@@ -104,14 +272,17 @@ def staging_values(record: X.Record, params: Dict, s: Dict) -> Dict:
                    "matchExpressions": [{"key": r["role_label"], "operator": "In", "values": ["support"]},
                                         {"key": "kubernetes.io/hostname", "operator": "In",
                                          "values": [params["nodes"]["support"]]}]}]}}}}
-    op_repo, op_digest = _DIGEST_IMAGE.match(rel["operator_image"]).groups()
-    st_repo, st_digest = _DIGEST_IMAGE.match(rel["statistical_image"]).groups()
+    op_repo, op_digest = _DIGEST_IMAGE.fullmatch(rel["operator_image"]).groups()
+    st_repo, st_digest = _DIGEST_IMAGE.fullmatch(rel["statistical_image"]).groups()
+    pull = _image_pull(rel)
+    pull_secrets = [{"name": pull["pull_ref"]}] if pull["mode"] == "secret" else []
     return {
         "images": {"operator": {"repository": op_repo, "tag": "", "digest": op_digest},
                    "statisticalForecaster": {"repository": st_repo, "tag": "", "digest": st_digest},
-                   "pullPolicy": "IfNotPresent", "pullSecrets": [{"name": rel["registry_pull_ref"]}]},
+                   "pullPolicy": "IfNotPresent", "pullSecrets": pull_secrets},
         "prometheus": routes["prometheus"],
         "operator": {"replicas": 1, "watchNamespaces": [params["namespace"]],
+                     "rbac": {"scaleWrite": False},       # a shadow preparation: no replica write is authorized
                      "forecasterAddress": routes["operator"]["forecasterAddress"],
                      "forecastLedger": {"enabled": True, "persistence": {"existingClaim": st["ledger_claim"]["name"]}},
                      "podLabels": dict(routes["operator"]["podLabels"]),
@@ -140,6 +311,8 @@ def values_problems(v: Dict, params: Dict) -> List[str]:
         out.append("engine must be statistical with no training targets")
     if v["operator"]["watchNamespaces"] != [params["namespace"]] or v["operator"]["replicas"] != 1:
         out.append("one operator watching only the fixture namespace")
+    if (v["operator"].get("rbac") or {}).get("scaleWrite") is not False:
+        out.append("operator.rbac.scaleWrite must be false: a shadow preparation authorizes no replica write")
     if not v["operator"]["forecastLedger"]["enabled"] or not v["operator"]["forecastLedger"]["persistence"]["existingClaim"]:
         out.append("the forecast ledger must be on, on its existing claim")
     if not v["forecaster"]["statistical"]["persistence"]["existingClaim"]:
@@ -221,7 +394,7 @@ def _objects_for(phase: str, record: X.Record, params: Dict, s: Dict, parts: Dic
     return copy.deepcopy(parts[phase])
 
 
-def plan(record: X.Record, kube: X.Kube, phase: str) -> Dict:
+def plan(record: X.Record, kube: X.Kube, phase: str, fetch: Optional[Fetch] = None) -> Dict:
     if phase not in PHASES:
         raise X.StagingError(f"unknown phase {phase}")
     params = X.load_params(record)
@@ -234,6 +407,13 @@ def plan(record: X.Record, kube: X.Kube, phase: str) -> Dict:
     if phase == "values":
         v = staging_values(record, params, s)
         problems += values_problems(v, params)
+        pull = _image_pull(s["release"])
+        out["image_pull"] = {"mode": pull["mode"]}
+        if pull["mode"] == "anonymous":
+            checks = verify_anonymous_pull([s["release"][k] for k in ("operator_image", "statistical_image")],
+                                           fetch or _http_fetch)
+            out["image_pull"]["verification"] = checks
+            problems += pull_problems(checks)
         path = os.path.join(record.evidence_dir, "release-staging.yaml")
         if os.path.exists(path):
             problems.append(f"{path} exists (never overwritten)")
@@ -299,17 +479,19 @@ def plan(record: X.Record, kube: X.Kube, phase: str) -> Dict:
                       problems=problems, **out)
 
 
-def apply(record: X.Record, kube: X.Kube, phase: str, reviewed: Dict, reviewed_digest: str) -> Dict:
+def apply(record: X.Record, kube: X.Kube, phase: str, reviewed: Dict, reviewed_digest: str,
+          fetch: Optional[Fetch] = None) -> Dict:
     with X.mutating(record, kube, HELPER, {"phase": phase}):
-        p = plan(record, kube, phase)                   # validated under the shared lock
-        X.require_live(reviewed, reviewed_digest, HELPER, record, p)
+        p = plan(record, kube, phase, fetch)            # validated under the shared lock (anonymous pulls checked again)
+        X.require_live(reviewed, reviewed_digest, HELPER, record, _review_times(p, reviewed))
         if p["problems"]:
             raise X.StagingError("the plan has problems: " + "; ".join(p["problems"]))
         if phase == "values":
             text = yaml.safe_dump(p["values"], sort_keys=True)
             sha = X.write_new(p["file"], text)
             return X.receipt(record, HELPER, "values-written", {"phase": phase, "plan_sha256": reviewed_digest,
-                                                                "file": p["file"], "sha256": sha})
+                                                                "file": p["file"], "sha256": sha,
+                                                                "image_pull": p["image_pull"]})
         params = X.load_params(record)
         s = _section(record)
         objs = {(o["kind"], o["metadata"].get("namespace"), o["metadata"]["name"]): o
@@ -393,7 +575,7 @@ def injection_problems(kube: X.Kube, params: Dict) -> List[str]:
     return X.injection_problems(kube, params)
 
 
-def main(argv=None, api=None) -> int:
+def main(argv=None, api=None, fetch: Optional[Fetch] = None) -> int:
     ap = argparse.ArgumentParser(prog="prepare.py", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--record", required=True)
@@ -412,12 +594,12 @@ def main(argv=None, api=None) -> int:
                 raise X.StagingError("recover needs --plan <the reviewed recover plan> and --plan-digest")
             X.emit(X.recover(record, kube, X.load_plan(args.plan), args.plan_digest))
         elif args.command == "plan":
-            X.emit([X.cli_plan(record, HELPER, plan(record, kube, ph), f"plan-{ph}")
+            X.emit([X.cli_plan(record, HELPER, plan(record, kube, ph, fetch), f"plan-{ph}")
                     for ph in ([args.phase] if args.phase else PHASES)])
         elif args.command == "apply":
             if not args.phase or not args.plan:
                 raise X.StagingError("apply needs --phase and --plan: phases are applied one reviewed plan at a time")
-            X.emit(apply(record, kube, args.phase, X.load_plan(args.plan), args.plan_digest))
+            X.emit(apply(record, kube, args.phase, X.load_plan(args.plan), args.plan_digest, fetch))
         else:
             out = verify(record, kube)
             X.emit(out)

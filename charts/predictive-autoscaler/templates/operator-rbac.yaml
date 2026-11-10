@@ -52,7 +52,9 @@ subjects:
 ---
 # The operator, writes: replicas only through deployments/scale, its autoscalers' status, events. Bound cluster-wide
 # when every namespace is watched; otherwise only in the watched namespaces, so a narrowed install cannot scale anything
-# outside them. Leader-election events in the release namespace come from the Lease Role below.
+# outside them. Leader-election events in the release namespace come from the Lease Role below. With
+# operator.rbac.scaleWrite false (a shadow, Recommend-only install) the /scale rule keeps only get: no replica write is
+# authorized at all, and an autoscaler set to Active fails its write with Forbidden instead of scaling.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -64,7 +66,7 @@ rules:
     verbs: ["get", "update", "patch"]
   - apiGroups: ["apps"]
     resources: ["deployments/scale"]
-    verbs: ["get", "update"]
+    verbs: {{ if .Values.operator.rbac.scaleWrite }}["get", "update"]{{ else }}["get"]{{ end }}
   - apiGroups: ["", "events.k8s.io"]
     resources: ["events"]
     verbs: ["create", "patch"]
