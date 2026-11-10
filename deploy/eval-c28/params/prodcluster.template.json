@@ -39,11 +39,12 @@
  },
  "hpa_cpu_target_percent": "<selected on development traces, seeds 101-105>",
  "keda": {
-  "server_address": "http://c28-metrics-route.pa-eval-system.svc:8481/<query path of the observer>",
+  "server_address": "http://c28-metrics-route.pa-eval-system.svc:8481/select/0/prometheus",
   "polling_interval_seconds": 15
  },
  "routes": {
-  "metrics_upstream": "<host:port of the query API>",
+  "metrics_upstream": "<host:port of the cluster VictoriaMetrics query API (vmselect)>",
+  "metrics_query_path": "/select/0/prometheus",
   "forecast_upstream": "<host:port of the evaluation forecaster>"
  },
  "priority_class": "c28-fixture",

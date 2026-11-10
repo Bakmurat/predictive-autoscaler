@@ -44,6 +44,7 @@
  },
  "routes": {
   "metrics_upstream": "vm.monitoring.svc:8428",
+  "metrics_query_path": "/",
   "forecast_upstream": "pa-eval-predictive-autoscaler-forecaster.pa-eval-system.svc:8443"
  },
  "priority_class": "c28-fixture",

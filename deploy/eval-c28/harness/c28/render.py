@@ -96,7 +96,13 @@ class ParamsError(ValueError):
 
 
 def _placeholder(v) -> bool:
-    return isinstance(v, str) and v.strip().startswith("<")
+    """A template placeholder: a string starting with '<' ("<W node name>") or one wrapped in double underscores with a
+    non-empty body ("__METRICS_QUERY_PATH__"). An empty string or list is NOT a placeholder: a required field refuses
+    it in its own check, an optional one (residency.support_extra = []) may legitimately be empty."""
+    if not isinstance(v, str):
+        return False
+    s = v.strip()
+    return s.startswith("<") or (len(s) > 4 and s.startswith("__") and s.endswith("__"))
 
 
 def cpu_millicores(q) -> Decimal:
@@ -164,10 +170,17 @@ def validate(p: Dict) -> None:
         raise ParamsError("release must be the evaluation Helm release name")
     if not isinstance(p["release_network_policies"], bool):
         raise ParamsError("release_network_policies must say whether the evaluation release enforces NetworkPolicies")
-    route = f"http://{route_host(p, 'metrics')}:8481"
-    if not (str(p["keda"]["server_address"]) == route or str(p["keda"]["server_address"]).startswith(route + "/")):
-        raise ParamsError(f"keda.server_address must go through the evaluation metrics route ({route}), so the RPS "
-                          "outage reaches H-RPS")
+    routes = p["routes"]
+    if not isinstance(routes, dict):
+        raise ParamsError("routes must name metrics_upstream, metrics_query_path and forecast_upstream")
+    for k in ("metrics_upstream", "forecast_upstream"):
+        if not isinstance(routes.get(k), str) or not routes[k].strip():
+            raise ParamsError(f"routes.{k} is required (host:port)")
+    url = metrics_query_url(p)
+    if p["keda"]["server_address"] != url:
+        raise ParamsError(f"keda.server_address must be exactly the evaluation metrics route's query URL ({url}): "
+                          "the RPS outage reaches H-RPS, and KEDA queries the same API path as the operator and the "
+                          "forecaster")
     if "residency" in p:
         residency_params(p)
     left = placeholder_fields(p)
@@ -272,7 +285,7 @@ def validate_stage(p: Dict, stage: str) -> None:
 
 
 def placeholder_fields(p, prefix: str = "") -> List[str]:
-    """The dotted paths of every value that is still a template placeholder (a string starting with '<')."""
+    """The dotted paths of every value that is still a template placeholder ('<...>' or '__...__', _placeholder)."""
     if _placeholder(p):
         return [prefix or "(root)"]
     out: List[str] = []
@@ -410,12 +423,54 @@ def route_host(p: Dict, kind: str) -> str:
     return f"c28-{kind}-route.{p['control_namespace']}.svc"
 
 
+METRICS_ROUTE_PORT = 8481
+_PATH_SEGMENT = re.compile(r"[A-Za-z0-9._~-]+")      # fullmatch: "$" would admit a final newline
+
+
+def metrics_query_path(p: Dict) -> str:
+    """routes.metrics_query_path, validated: the Prometheus-API prefix of the upstream behind the metrics route (the
+    route is a plain TCP proxy, so the path travels in the URL). "/select/0/prometheus" for the cluster
+    VictoriaMetrics (vmselect, tenant 0), "/" for a non-tenant backend (single-node VictoriaMetrics, Prometheus).
+    Required; starts with "/", unreserved characters only, no query string, fragment, empty, "." or ".." segment, and
+    no trailing slash except the root itself."""
+    routes = p.get("routes") if isinstance(p, dict) else None
+    v = routes.get("metrics_query_path") if isinstance(routes, dict) else None
+    where = "routes.metrics_query_path"
+    if _placeholder(v):
+        raise ParamsError(f"{where} is still a placeholder")
+    if not isinstance(v, str) or not v:
+        raise ParamsError(f"{where} is required: the upstream's query API path, e.g. /select/0/prometheus, or / for "
+                          "a non-tenant backend")
+    if not v.startswith("/"):
+        raise ParamsError(f"{where} must start with '/'")
+    if "?" in v or "#" in v:
+        raise ParamsError(f"{where} must not carry a query string or fragment")
+    if ".." in v:
+        raise ParamsError(f"{where} must not contain '..'")
+    if v == "/":
+        return v
+    if v.endswith("/"):
+        raise ParamsError(f"{where} must not end with '/' (only the root path is '/')")
+    if not all(_PATH_SEGMENT.fullmatch(seg) and seg != "." for seg in v[1:].split("/")):
+        raise ParamsError(f"{where} must be '/'-separated non-empty segments of unreserved characters")
+    return v
+
+
+def metrics_query_url(p: Dict) -> str:
+    """The query API base URL through the evaluation metrics route, the ONE value for the operator's and forecaster's
+    prometheus.url and KEDA's serverAddress (validate() requires keda.server_address to equal it exactly). Clients
+    append /api/v1/query or /api/v1/query_range; for the root path the URL is the bare route, no trailing slash."""
+    path = metrics_query_path(p)
+    base = f"http://{route_host(p, 'metrics')}:{METRICS_ROUTE_PORT}"
+    return base if path == "/" else base + path
+
+
 def eval_release_values(p: Dict) -> Dict:
-    """The evaluation release's chart values that bind it to the routes: metrics through the metrics route, the
-    forecaster through the forecast route with the route's name in the certificate (verification stays on)."""
+    """The evaluation release's chart values that bind it to the routes: metrics through the metrics route at its
+    query path (metrics_query_url, the same URL KEDA uses), the forecaster through the forecast route with the route's name in the certificate (verification stays on)."""
     validate(p)
     fr = route_host(p, "forecast")
-    out = {"prometheus": {"url": f"http://{route_host(p, 'metrics')}:8481"},
+    out = {"prometheus": {"url": metrics_query_url(p)},
            "operator": {"watchNamespaces": [p["namespace"]], "forecasterAddress": f"{fr}:8443",
                         "podLabels": dict(SIDECAR_FREE), "podAnnotations": dict(SIDECAR_FREE)},
            "forecaster": {"engine": "statistical", "tls": {"extraDNSNames": [fr]},
@@ -595,7 +650,7 @@ def _writer(p: Dict, arm: str, profile: str, target: str) -> Dict:
                          "advanced": {"horizontalPodAutoscalerConfig": {"name": f"keda-hpa-{target}",
                                                                         "behavior": scale_down_behavior()}},
                          "triggers": [{"type": "prometheus", "metricType": "AverageValue", "metadata": {
-                             "serverAddress": k["server_address"], "query": rps_query(target), "threshold": c,
+                             "serverAddress": metrics_query_url(p), "query": rps_query(target), "threshold": c,
                              "ignoreNullValues": "false"}}]}}
     extra = (0, 0) if arm == "PA-R" else (F.EXTRA_MAX_REPLICAS, F.EXTRA_MAX_PERCENT)
     budget = F.PROFILE_STARTUP_BUDGET[profile]
@@ -728,7 +783,7 @@ def render_common(p: Dict) -> List[Dict]:
             "spec": {"selector": {"app.kubernetes.io/name": "c28-ingress", RUN_LABEL: p["run_id"]},
                      "ports": [{"name": "http", "port": 80, "targetPort": "http"}]}}
     out = [pc, quota, *ingress_rbac(ns, "c28-ingress", ilabels), ingress, isvc]
-    out += _proxy(p, "c28-metrics-route", p["routes"]["metrics_upstream"], 8481)
+    out += _proxy(p, "c28-metrics-route", p["routes"]["metrics_upstream"], METRICS_ROUTE_PORT)
     out += _proxy(p, "c28-forecast-route", p["routes"]["forecast_upstream"], 8443)
     if p["release_network_policies"]:
         out += _route_policies(p)

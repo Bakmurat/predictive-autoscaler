@@ -185,6 +185,107 @@ def test_h_rps_queries_through_the_evaluation_route(params):
         render.render_all(params)
 
 
+# --- the metrics route's query path: one URL for the operator, the forecaster and KEDA --------------------------------
+
+ROUTE = "http://c28-metrics-route.pa-eval-system.svc:8481"
+
+
+def _query_endpoints(url):
+    """What the clients request: the operator formats "%s/api/v1/query" (predictiveautoscaler_controller.go), the
+    forecaster url.rstrip("/") + "/api/v1/query_range" (forecasting/history.py)."""
+    return f"{url}/api/v1/query", f"{url.rstrip('/')}/api/v1/query_range"
+
+
+@pytest.mark.parametrize("path, url", [
+    ("/select/0/prometheus", ROUTE + "/select/0/prometheus"),       # cluster VictoriaMetrics (vmselect, tenant 0)
+    ("/", ROUTE),                                                    # non-tenant backend: the bare route, no slash
+])
+def test_operator_forecaster_and_keda_share_one_query_url(params, path, url):
+    params["routes"]["metrics_query_path"] = path
+    params["keda"]["server_address"] = url
+    assert render.metrics_query_url(params) == url
+    assert render.eval_release_values(params)["prometheus"]["url"] == url
+    query, query_range = _query_endpoints(url)
+    prefix = "" if path == "/" else path
+    assert query == f"{ROUTE}{prefix}/api/v1/query" and query_range == f"{ROUTE}{prefix}/api/v1/query_range"
+    sos = by(render.render_all(params), "ScaledObject")
+    assert sos and all(so["spec"]["triggers"][0]["metadata"]["serverAddress"] == url for so in sos)
+
+
+def test_the_prodcluster_template_queries_the_cluster_victoriametrics_path():
+    with open(os.path.join(os.path.dirname(PARAMS), "prodcluster.template.json")) as fh:
+        t = json.load(fh)
+    assert t["routes"]["metrics_query_path"] == "/select/0/prometheus"
+    assert render.metrics_query_url(t) == t["keda"]["server_address"] == ROUTE + "/select/0/prometheus"
+
+
+@pytest.mark.parametrize("path, message", [
+    ("select/0/prometheus", "start with '/'"),
+    ("/select/0/prometheus?x=1", "query string"),
+    ("/select/0/prometheus#f", "fragment"),
+    ("/select/../prometheus", r"'\.\.'"),
+    ("/select/0/prometheus/", "trailing|end with '/'"),
+    ("//", "end with '/'"),
+    ("/select//prometheus", "segments"),
+    ("/select/./prometheus", "segments"),
+    ("/select/0/prom etheus", "segments"),
+    ("/select/0/prometheus\n", "segments"),                       # "$" would have admitted the final newline
+    ("/\n", "segments"),
+    ("/select\n/0/prometheus", "segments"),
+    ("/select/0/\tprometheus", "segments"),
+    ("/select/0/prometheus\x00", "segments"),
+    ("/select/0/prom\x7fetheus", "segments"),
+    ("", "is required"),
+    (None, "is required"),
+    (5, "is required"),
+    ("<query path>", "still a placeholder"),
+    ("__METRICS_QUERY_PATH__", "still a placeholder"),
+])
+def test_bad_metrics_query_paths_are_refused(params, path, message):
+    params["routes"]["metrics_query_path"] = path
+    with pytest.raises(render.ParamsError, match=f"routes.metrics_query_path.*({message})"):
+        render.render_all(params)
+    with pytest.raises(render.ParamsError, match="routes.metrics_query_path"):
+        render.eval_release_values(params)
+
+
+@pytest.mark.parametrize("ctrl", ["\n", "\r", "\t", "\x00", "\x7f"])
+def test_a_control_character_with_the_matching_keda_url_is_still_refused(params, ctrl):
+    path = "/select/0/prometheus" + ctrl
+    params["routes"]["metrics_query_path"] = path
+    params["keda"]["server_address"] = ROUTE + path                  # the exact-equality check alone would pass
+    with pytest.raises(render.ParamsError, match="routes.metrics_query_path"):
+        render.validate(params)
+
+
+def test_a_missing_metrics_query_path_is_refused(params):
+    del params["routes"]["metrics_query_path"]
+    with pytest.raises(render.ParamsError, match="routes.metrics_query_path is required"):
+        render.validate(params)
+
+
+@pytest.mark.parametrize("path, keda", [
+    ("/", ROUTE + "/"),                                              # a trailing slash is not the same URL
+    ("/", ROUTE + "/select/0/prometheus"),                           # a path the operator would not use
+    ("/select/0/prometheus", ROUTE),                                 # the old prefix rule accepted these
+    ("/select/0/prometheus", ROUTE + "/select/0/prometheus/"),
+    ("/select/0/prometheus", ROUTE + "/select/1/prometheus"),
+    ("/select/0/prometheus", "http://vmselect.monitoring.svc:8481/select/0/prometheus"),
+])
+def test_keda_must_use_exactly_the_built_query_url(params, path, keda):
+    params["routes"]["metrics_query_path"] = path
+    params["keda"]["server_address"] = keda
+    with pytest.raises(render.ParamsError, match="keda.server_address must be exactly"):
+        render.render_all(params)
+
+
+@pytest.mark.parametrize("key", ["metrics_upstream", "forecast_upstream"])
+def test_empty_route_upstreams_are_refused(params, key):
+    params["routes"][key] = ""
+    with pytest.raises(render.ParamsError, match=f"routes.{key} is required"):
+        render.render_all(params)
+
+
 def test_route_policies_are_rendered_only_for_an_enforcing_release(params):
     assert not [o for o in render.render_all(params) if o["kind"] == "NetworkPolicy"]
     params["release_network_policies"] = True

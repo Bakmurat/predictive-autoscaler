@@ -125,11 +125,20 @@ the calibrated values themselves, which would recreate the c0/HPA-target cycle).
 separately validated calibration contract and admission checks. `residency` stays outside the reservation stage and
 mandatory for workload admission (`load_params`, prepare's residency audit).
 
+## The metrics route's query path
+
+The metrics route is a plain TCP proxy to `routes.metrics_upstream`, so the upstream's Prometheus-API prefix travels in
+the URL: `routes.metrics_query_path` is required, `/select/0/prometheus` for the cluster VictoriaMetrics (vmselect,
+tenant 0), `/` for a non-tenant backend (the kind smoke's single-node VictoriaMetrics). It must start with `/` and has
+no query string, fragment, `..`, empty segment or trailing slash (except the root). `render.metrics_query_url` builds
+the one URL the evaluation release's `prometheus.url` and KEDA's `serverAddress` use (the bare route for `/`); the
+operator appends `/api/v1/query`, the forecaster `/api/v1/query_range`. `keda.server_address` must equal it exactly.
+
 ## Fixture resources and the residency budget
 
 The fixture's CPU/memory requests and limits are a calibrated, reviewed parameter (manifest section 3), identical for
 every arm. They are never invented or lowered to make the budget fit. `validate` refuses a missing or placeholder value
-(`<...>`) and a request above its limit. The prodcluster template keeps them as placeholders; the kind smoke keeps its
+(`<...>` or `__...__`) and a request above its limit. The prodcluster template keeps them as placeholders; the kind smoke keeps its
 own values.
 
 When the params carry a `residency` section, `render` computes the evaluation's maximum resident requests on each
