@@ -38,11 +38,12 @@ has to be earned again from nothing.
 
 A DEMONSTRATION qualification (forecasting.demonstration) is the second, separate basis: it records no gate, is bound
 to a mounted and hash-verified demonstration contract, and stands in for the release gate only for its cluster, one
-namespace and at most two target UIDs, only while the live configuration is the contract's, and only for an answer
-whose SELECTED family it lists. That last rule is decided after selection (the gate is first evaluated without it) and
-re-checked on every answer, like the document's and the contract's digests. It is never combined with a lab
-qualification or with passed release gates: the service refuses to start. Eligibility is an answer, not an action:
-nothing here assumes a replica write follows.
+namespace and at most two target UIDs, only while both mounted files still hold the admitted bytes (read again at
+every answer; nothing new is loaded without a restart), only while the live configuration is the contract's (the
+resolved settings fingerprint included), and only for an answer whose SELECTED family it lists. That last rule is
+decided after selection (the gate is first evaluated without it) and re-checked on every answer, like the document's
+and the contract's digests. It is never combined with a lab qualification or with passed release gates: the service
+refuses to start. Eligibility is an answer, not an action: nothing here assumes a replica write follows.
 """
 
 from __future__ import annotations
@@ -120,6 +121,9 @@ class ForecastService:
         if d is not None and not (config.build.evaluation_build and d.source_tree == config.build.source_tree):
             raise Q.QualificationRefused("a demonstration qualification is honoured only by the evaluation build it "
                                          "names")
+        if d is not None and d.mounted is None:
+            raise Q.QualificationRefused("a demonstration qualification is honoured only from its two mounted files "
+                                         "(forecasting.demonstration.load): their bytes are checked at every answer")
         self.config, self.reader, self.fetch = config, reader, fetch
         self.clock = clock or ReceiptClock()
         os.makedirs(config.state_dir, exist_ok=True)
@@ -165,15 +169,17 @@ class ForecastService:
                 "build": {"source_tree": self.config.build.source_tree,
                           "evaluation_build": self.config.build.evaluation_build},
                 "lab_qualification": None if q is None else q.summary(),
-                "demonstration_qualification": None if d is None else d.summary(),
+                "demonstration_qualification": None if d is None else {**d.summary(), "withdrawn": d.mount_refusal()},
                 "qualification_basis": self.qualification_status()[0]}
 
     def qualification_status(self) -> Tuple[str, Dict[str, int]]:
         """(the release-gate basis in force for this process now: release, lab, demonstration or none; the mounted
-        documents' expiries). A document's scope is checked per request; this is what the metric and /health show."""
+        documents' expiries). A document's scope is checked per request; this is what the metric and /health show.
+        A demonstration qualification whose mounted files no longer hold the admitted bytes is withdrawn: none."""
         now_s = self.clock.now_ms() // 1000
         docs = {"lab": self.config.lab_qualification, "demonstration": self.config.demonstration_qualification}
-        valid = [k for k, doc in docs.items() if doc is not None and doc.not_before <= now_s < doc.expires]
+        valid = [k for k, doc in docs.items() if doc is not None and doc.not_before <= now_s < doc.expires
+                 and (k != "demonstration" or doc.mount_refusal() is None)]
         basis = "release" if RELEASE_GATES_PASSED else valid[0] if valid else "none"
         return basis, {k: doc.expires for k, doc in docs.items() if doc is not None}
 
@@ -516,18 +522,19 @@ class ForecastService:
 
     def _demonstration_gate(self, d: D.DemonstrationQualification, bound: BoundRequest, now_s: int, valid_until: int,
                             selected: Optional[str]) -> Dict:
-        """The gate under a demonstration qualification: passed only when the live cluster, namespace and target are
-        in its scope, it is valid now and at the answer's valid_until, the live autoscaler is configured as its
-        contract says (families, cadence, replica bounds, capacity) and, once a family is selected, that family is
-        listed. The record names the document and its contract and, when it did not pass, the first reason."""
+        """The gate under a demonstration qualification: passed only when both mounted files still hold the admitted
+        bytes (read and hashed now, at every call), the live cluster, namespace and target are in its scope, it is
+        valid now and at the answer's valid_until, the live autoscaler is configured as its contract says (families,
+        cadence, resolved settings fingerprint, replica bounds, capacity) and, once a family is selected, that family
+        is listed. The record names the document and its contract and, when it did not pass, the first reason."""
         if self._cluster_uid is None:
             self._cluster_uid = Q.cluster_uid(self.reader)
         sig = bound.signal
-        why = "release" if RELEASE_GATES_PASSED else d.refusal(
+        why = "release" if RELEASE_GATES_PASSED else d.mount_refusal() or d.refusal(
             cluster_uid=self._cluster_uid, autoscaler_namespace=bound.autoscaler_namespace, namespace=sig.namespace,
             name=sig.name, uid=sig.target_uid, now_s=now_s, valid_until=valid_until, spec=bound.spec,
             families=bound.settings.families, sample_interval_seconds=bound.settings.sample_interval_seconds,
-            selected=selected)
+            settings_sha256=bound.settings.fingerprint(), selected=selected)
         if why is not None:
             self.qualification_metrics.refused(why)
         return {"passed": why is None, "basis": "demonstration" if why is None else None,

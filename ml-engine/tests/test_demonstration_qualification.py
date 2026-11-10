@@ -14,8 +14,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from forecasting import contracts as c  # noqa: E402
 from forecasting import demonstration as D  # noqa: E402
 from forecasting import qualification as Q  # noqa: E402
-from tests.demonstration_helpers import DIGEST, EVAL, NOW, TREE, contract, contract_doc, pair, qualification, \
-    target  # noqa: E402
+from tests import demonstration_helpers as H  # noqa: E402
+from tests.demonstration_helpers import DIGEST, EVAL, NOW, SETTINGS, TREE, contract, contract_doc, pair, \
+    qualification, target  # noqa: E402
 
 SPEC = {"minReplicas": 1, "maxReplicas": 12, "metrics": {"requests": {"capacityPerReplica": "5.5"}},
         "prediction": {"updateIntervalSeconds": 60}}
@@ -29,7 +30,8 @@ def parse(q=None, cd=None, build=EVAL, now=NOW, digest=DIGEST):
 def live(d, **over):
     """refusal() for a request that is fully in scope unless `over` says otherwise."""
     kw = dict(cluster_uid="cluster-uid", autoscaler_namespace="demo", namespace="demo", name="web", uid="dep-uid",
-              now_s=NOW, valid_until=NOW + 600, spec=SPEC, families=("seasonalNaive",), sample_interval_seconds=60)
+              now_s=NOW, valid_until=NOW + 600, spec=SPEC, families=("seasonalNaive",), sample_interval_seconds=60,
+              settings_sha256=SETTINGS)
     kw.update(over)
     return d.refusal(**kw)
 
@@ -53,15 +55,19 @@ def test_a_complete_reviewed_pair_is_honoured_for_exactly_its_scope():
 
 
 def test_two_targets_in_one_namespace_are_the_widest_scope():
-    targets = [target(), target(name="api", uid="api-uid", max_replicas=6, capacity_per_replica="12")]
+    other = "0f" * 32                                                  # the second autoscaler's own reviewed settings
+    targets = [target(), target(name="api", uid="api-uid", max_replicas=6, capacity_per_replica="12",
+                                settings_sha256=other)]
     q, cd = pair(contract_kw={"targets": targets},
                  scope={"cluster_uid": "cluster-uid", "namespace": "demo",
                         "targets": [{k: t[k] for k in ("namespace", "name", "uid")} for t in targets]})
     d = D.parse(q, cd, EVAL, NOW, DIGEST)
-    assert live(d) is None and live(d, name="api", uid="api-uid") == "bounds"      # each target has its own contract
+    assert live(d) is None and live(d, name="api", uid="api-uid") == "settings"    # each target has its own contract
+    assert live(d, name="api", uid="api-uid", settings_sha256=other) == "bounds"
     api = {**SPEC, "maxReplicas": 6, "metrics": {"requests": {"capacityPerReplica": 12}}}
-    assert live(d, name="api", uid="api-uid", spec=api) is None
-    assert live(d, name="api", uid="dep-uid", spec=api) == "target"                # name and uid belong together
+    assert live(d, name="api", uid="api-uid", spec=api, settings_sha256=other) is None
+    assert live(d, name="api", uid="dep-uid", spec=api, settings_sha256=other) == "target"   # name and uid together
+    assert live(d, settings_sha256=other) == "settings"                            # never the other target's settings
 
 
 @pytest.mark.parametrize("build,why", [(Q.BuildInfo(TREE, False), "release build"),
@@ -99,6 +105,8 @@ def _scope(**over):
     ({"reviewers": ["executor"]}, "two distinct reviewers"),
     ({"reviewers": ["same", "same"]}, "two distinct reviewers"),
     ({"reviewers": ["same", " same "]}, "two distinct reviewers"),
+    ({"reviewers": ["Alice", "alice"]}, "two distinct reviewers"),                   # compared without regard to case
+    ({"reviewers": ["executor", "EXECUTOR\n"]}, "two distinct reviewers"),
     ({"reviewers": ["executor", "reviewer", ""]}, "two distinct reviewers"),
     ({"reviewers": ["executor", 7]}, "two distinct reviewers"),
     ({"reviewers": "executor,reviewer"}, "two distinct reviewers"),
@@ -117,6 +125,16 @@ def _scope(**over):
     (_scope(cluster_uid=""), "cluster_uid"),
     (_scope(namespace=""), "exactly one namespace"),
     (_scope(namespace=["demo"]), "exactly one namespace"),
+    (_scope(namespace="Demo"), "exactly one namespace"),                              # a DNS-1123 label
+    (_scope(namespace="demo.shop"), "exactly one namespace"),
+    (_scope(namespace="demo,shop"), "exactly one namespace"),
+    (_scope(namespace="*"), "exactly one namespace"),
+    (_scope(cluster_uid="cluster uid"), "cluster_uid"),
+    (_scope(targets=[{"namespace": "demo", "name": "web..api", "uid": "dep-uid"}]), "DNS-1123 subdomain"),
+    (_scope(targets=[{"namespace": "demo", "name": "Web", "uid": "dep-uid"}]), "DNS-1123 subdomain"),
+    (_scope(targets=[{"namespace": "demo", "name": "*", "uid": "dep-uid"}]), "DNS-1123 subdomain"),
+    (_scope(targets=[{"namespace": "demo", "name": "web", "uid": "dep uid"}]), "and a uid"),
+    (_scope(targets=[{"namespace": "demo", "name": "web", "uid": 7}]), "and a uid"),
     ({"scope": {"cluster_uid": "u", "namespaces": ["demo"],
                 "targets": [{"namespace": "demo", "name": "web", "uid": "dep-uid"}]}}, "exactly"),   # the lab shape
     (_scope(targets=[]), "targets"),
@@ -188,7 +206,20 @@ def _without(key):
     (_contract_with(targets=[target(name=n, uid=n) for n in ("a", "b", "c")]), "1..2 targets"),
     (_contract_with(targets=[{"namespace": "demo", "name": "web", "uid": "dep-uid"}]), "needs exactly"),
     (_contract_with(targets=[target(image="x")]), "needs exactly"),
-    (_contract_with(targets=[target(uid="")]), "needs exactly"),
+    (_contract_with(targets=[target(uid="")]), "and a uid"),
+    (_contract_with(targets=[target(name="web.-api")]), "DNS-1123 subdomain"),
+    (_contract_with(targets=[target(namespace="Demo")]), "DNS-1123 label"),
+    (_contract_with(targets=[{k: v for k, v in target().items() if k != "settings_sha256"}]), "needs exactly"),
+    (_contract_with(targets=[target(settings_sha256="nope")]), "settings_sha256"),
+    (_contract_with(targets=[target(settings_sha256="5E" * 32)]), "settings_sha256"),
+    (_contract_with(targets=[target(settings_sha256=None)]), "settings_sha256"),
+    (_contract_with(targets=[target(settings_sha256="sha256:" + "5e" * 32)]), "settings_sha256"),
+    # Reserved for the policy revisions of the bound identity: not compared by this build, so not accepted by it.
+    (_contract_with(calibration_policy_revision="calibration/v1"), "calibration_policy_revision is reserved"),
+    (_contract_with(trust_policy_revision="trust/v1"), "trust_policy_revision is reserved"),
+    (_contract_with(trust_policy_revision=None, calibration_policy_revision=None),
+     "calibration_policy_revision is reserved"),
+    (_contract_with(targets=[target(calibration_policy_revision="calibration/v1")]), "needs exactly"),
     (_contract_with(targets=[target(), target()]), "each target and each uid once"),
     (_contract_with(targets=[target(uid="other-uid")]), "targets differ from the contract"),
     (_contract_with(targets=[target(), target(name="api", uid="api-uid")]), "targets differ from the contract"),
@@ -234,6 +265,10 @@ def test_the_contract_is_bound_by_its_hash_and_never_names_the_qualification():
     ({"families": ()}, "families"),
     ({"families": None}, "families"),
     ({"sample_interval_seconds": 300}, "cadence"),
+    ({"settings_sha256": "0f" * 32}, "settings"),                          # a reviewed trust or calibration setting
+    ({"settings_sha256": None}, "settings"),
+    ({"settings_sha256": SETTINGS + "\n"}, "settings"),
+    ({"settings_sha256": SETTINGS.upper()}, "settings"),
     ({"spec": {**SPEC, "prediction": {"updateIntervalSeconds": 300}}}, "cadence"),
     ({"spec": {**SPEC, "prediction": {}}}, "cadence"),                     # never a default: it must be set
     ({"spec": {**SPEC, "prediction": {"updateIntervalSeconds": True}}}, "cadence"),
@@ -264,16 +299,19 @@ def test_a_request_whose_live_configuration_differs_from_the_contract_is_not_cov
 def test_the_first_failing_check_names_the_refusal():
     d = parse()
     everything_wrong = dict(cluster_uid="x", autoscaler_namespace="shop", namespace="shop", name="api", now_s=d.expires,
-                            families=("statistical",), sample_interval_seconds=300, spec={}, selected="statistical")
+                            families=("statistical",), sample_interval_seconds=300, settings_sha256="0f" * 32,
+                            spec={"prediction": {"updateIntervalSeconds": 60}}, selected="statistical")
     order = []
     for key, good in (("cluster_uid", "cluster-uid"), ("autoscaler_namespace", "demo"), ("namespace", "demo"),
                       ("name", "web"), ("now_s", NOW), ("families", ("seasonalNaive",)),
-                      ("sample_interval_seconds", 60), ("spec", SPEC), ("selected", "seasonal_naive")):
+                      ("sample_interval_seconds", 60), ("settings_sha256", SETTINGS),
+                      ("spec", {**SPEC, "metrics": {}}), ("spec", SPEC), ("selected", "seasonal_naive")):
         order.append(live(d, **everything_wrong))
         everything_wrong[key] = good
-    assert order == ["cluster", "namespace", "namespace", "target", "validity", "families", "cadence", "cadence",
-                     "family"] and live(d, **everything_wrong) is None
-    assert set(order) | {"release", "bounds", "capacity"} == set(D.REFUSALS)
+    assert order == ["cluster", "namespace", "namespace", "target", "validity", "families", "cadence", "settings",
+                     "bounds", "capacity", "family"] and live(d, **everything_wrong) is None
+    # With the three checks that come before any request is looked at, that is the whole fixed enum, in order.
+    assert D.REFUSALS == ("release", "qualification-file", "contract-file") + tuple(dict.fromkeys(order))
 
 
 def test_the_configuration_name_and_the_wire_name_of_a_family_agree():
@@ -293,6 +331,115 @@ def test_the_configuration_name_and_the_wire_name_of_a_family_agree():
     assert both.allows("seasonal_naive") and both.allows("statistical") and not both.allows("lstm")
 
 
+TAILS = ["\n", "\r", "\t", "\x00", " ", "\r\n", "\x0b", "\u2028"]
+
+
+@pytest.mark.parametrize("tail", TAILS)
+def test_no_trailing_control_character_passes_any_validation(tail):
+    """Every digest, tree, time, name and number of both files is matched whole (fullmatch): a value followed by a
+    newline, carriage return, tab, NUL or other whitespace is refused, as is one preceded by it."""
+    def refused(why, q=None, cd=None, build=EVAL, digest=DIGEST):
+        default_q, default_c = pair()
+        with pytest.raises(Q.QualificationRefused, match=why):
+            D.parse(default_q if q is None else q, default_c if cd is None else cd, build, NOW, digest)
+
+    def with_contract(why, **checked):
+        cd = _contract_with(**checked)
+        refused(why, qualification(cd), cd)
+    for bad in (lambda v: v + tail, lambda v: tail + v):
+        # The build's tree and the pod's digest, even when the document repeats the same bytes.
+        refused("no source tree", pair(source_tree=bad(TREE))[0], build=Q.BuildInfo(bad(TREE), True))
+        refused("digest is unknown", pair(image_digest=bad(DIGEST))[0], digest=bad(DIGEST))
+        refused("another source tree", pair(source_tree=bad(TREE))[0])
+        refused("another image digest", pair(image_digest=bad(DIGEST))[0])
+        refused("contract_sha256", pair(contract_sha256=bad(c.sha256_hex(contract())))[0])
+        refused("ending in Z", pair(not_before=bad("2026-11-08T00:00:00Z"))[0])
+        refused("ending in Z", pair(expires=bad("2026-11-28T00:00:00Z"))[0])
+        refused("cluster_uid", pair(**_scope(cluster_uid=bad("u")))[0])
+        refused("exactly one namespace", pair(**_scope(namespace=bad("demo")))[0])
+        for key, why in (("namespace", "DNS-1123 label"), ("name", "DNS-1123 subdomain"), ("uid", "and a uid")):
+            t = {"namespace": "demo", "name": "web", "uid": "dep-uid"}
+            refused(why, pair(**_scope(targets=[{**t, key: bad(t[key])}]))[0])
+            with_contract(why, targets=[target(**{key: bad(target()[key])})])
+        refused("families", pair(families=[bad("seasonalNaive")])[0])
+        with_contract("checked.families", families=[bad("seasonalNaive")])
+        with_contract("capacity_per_replica", targets=[target(capacity_per_replica=bad("5.5"))])
+        with_contract("capacity_per_replica", targets=[target(capacity_per_replica=bad("5"))])
+        with_contract("settings_sha256", targets=[target(settings_sha256=bad(SETTINGS))])
+        with_contract("expires_not_after", qualification={"expires_not_after": bad("2026-11-28T00:00:00Z")})
+    # Inside a value as well: a digest or a number broken by a control character.
+    with_contract("capacity_per_replica", targets=[target(capacity_per_replica="5" + tail + "5")])
+    with_contract("settings_sha256", targets=[target(settings_sha256=SETTINGS[:32] + tail + SETTINGS[33:])])
+    assert parse().contract.targets[0].capacity_per_replica == "5.5"          # and the clean document still parses
+
+
+def test_the_mounted_files_are_checked_again_on_every_call(tmp_path):
+    """mount_refusal() reads and hashes both files each time it is called: missing, unreadable, oversized or changed
+    bytes are refused; nothing read there is ever admitted; the admitted bytes, once back, are accepted again."""
+    q, cd = pair()
+    assert D.parse(q, cd, EVAL, NOW, DIGEST).mount_refusal() == "qualification-file"   # never loaded from a mount
+    d = H.load(tmp_path / "m", q, cd)
+    qf, cf = d.mounted
+    assert d.mount_refusal() is None and d.mounted == (qf, cf)
+    other_q = qualification(cd, reviewers=["executor", "another reviewer"])           # a valid document, not admitted
+    other_c = contract(unchecked={"revision": 2})
+    changes = {"qualification-file": [(qf, None), (qf, other_q), (qf, q[:-1]), (qf, q + b"\n"), (qf, b""),
+                                      (qf, q + b" " * D.MAX_BYTES), (qf, cd)],
+               "contract-file": [(cf, None), (cf, other_c), (cf, cd[:-1]), (cf, cd + b"\n"), (cf, b""),
+                                 (cf, cd + b" " * D.MAX_BYTES), (cf, q)]}
+    for why, cases in changes.items():
+        for path, data in cases:
+            os.remove(path)
+            if data is not None:
+                with open(path, "wb") as fh:
+                    fh.write(data)
+            assert d.mount_refusal() == why, (why, data and data[:20])
+            with open(path, "wb") as fh:                                              # the admitted bytes again
+                fh.write(q if path == qf else cd)
+            assert d.mount_refusal() is None
+    for path, why in ((qf, "qualification-file"), (cf, "contract-file")):             # unreadable: a directory there
+        good = open(path, "rb").read()
+        os.remove(path)
+        os.mkdir(path)
+        assert d.mount_refusal() == why
+        os.rmdir(path)
+        with open(path, "wb") as fh:
+            fh.write(good)
+        if os.geteuid() != 0:                                                         # and no permission to read it
+            os.chmod(path, 0)
+            assert d.mount_refusal() == why
+            os.chmod(path, 0o644)
+        assert d.mount_refusal() is None
+    os.remove(qf)
+    os.remove(cf)
+    assert d.mount_refusal() == "qualification-file"                                  # both gone: the first names it
+    assert d.sha256 == c.sha256_hex(q) and d.contract_sha256 == c.sha256_hex(cd)      # the object never changed
+
+
+def test_a_configmap_style_update_is_seen_without_a_modification_time(tmp_path):
+    # The kubelet updates a ConfigMap volume by swapping the ..data symlink; the new files may carry any timestamp.
+    q, cd = pair()
+    root = tmp_path / "volume"
+    first, second = root / "..2026_11_10_a", root / "..2026_11_10_b"
+    H.mount(first, q, cd)
+    H.mount(second, qualification(cd, reviewers=["executor", "another reviewer"]), cd)
+    for name in os.listdir(first):
+        st = os.stat(first / name)
+        os.utime(second / name, ns=(st.st_atime_ns, st.st_mtime_ns))                  # identical times, same sizes
+        os.symlink(os.path.join("..data", name), root / name)
+    os.symlink(first.name, root / "..data")
+    d = D.load(str(root / "demonstration-qualification.json"), str(root / "demonstration-contract.json"), EVAL, NOW,
+               DIGEST)
+    assert d.mount_refusal() is None
+    assert os.path.getsize(first / "demonstration-qualification.json") != 0
+    os.symlink(second.name, root / "..data.tmp")
+    os.replace(root / "..data.tmp", root / "..data")                                  # the atomic swap
+    assert d.mount_refusal() == "qualification-file"
+    os.symlink(first.name, root / "..data.tmp")
+    os.replace(root / "..data.tmp", root / "..data")
+    assert d.mount_refusal() is None
+
+
 def test_load_and_build_info(tmp_path):
     assert D.load(None, None, EVAL, NOW) is None and D.load("", "", EVAL, NOW) is None
     q, cd = pair()
@@ -306,7 +453,10 @@ def test_load_and_build_info(tmp_path):
         D.load(str(tmp_path / "missing.json"), str(cf), EVAL, NOW, DIGEST)
     with pytest.raises(Q.QualificationRefused, match="contract is unreadable"):
         D.load(str(qf), str(tmp_path / "missing.json"), EVAL, NOW, DIGEST)
-    assert D.load(str(qf), str(cf), EVAL, NOW, DIGEST).cluster_uid == "cluster-uid"
+    loaded = D.load(str(qf), str(cf), EVAL, NOW, DIGEST)
+    assert loaded.cluster_uid == "cluster-uid" and loaded.mounted == (str(qf), str(cf))
+    in_memory = D.parse(q, cd, EVAL, NOW, DIGEST)
+    assert in_memory.mounted is None and loaded.sha256 == in_memory.sha256
     with pytest.raises(Q.QualificationRefused, match="not the one the qualification names"):
         D.load(str(qf), str(qf), EVAL, NOW, DIGEST)                                    # the same file twice
     big = tmp_path / "big.json"
@@ -351,6 +501,14 @@ def test_the_app_refuses_to_start_with_a_qualification_it_cannot_honour(tmp_path
         assert h["demonstration_qualification"]["contract_sha256"] == c.sha256_hex(cd)
         assert h["build"]["evaluation_build"] is True and h["qualification_basis"] == "demonstration"
         assert h["release_gates_passed"] is False                        # the release gate itself never moves
+        assert h["demonstration_qualification"]["withdrawn"] is None
+        # The app's own service checks the mounted files again without a restart: here the contract is replaced.
+        cf.write_bytes(contract(targets=[target(max_replicas=24)]))
+        h = svc.health()
+        assert h["demonstration_qualification"]["withdrawn"] == "contract-file" and h["qualification_basis"] == "none"
+        assert h["demonstration_qualification"]["contract_sha256"] == c.sha256_hex(cd)      # nothing was hot-loaded
+        cf.write_bytes(cd)
+        assert svc.health()["qualification_basis"] == "demonstration"
     finally:
         svc.close()
     with pytest.raises(app.Refused, match="another image digest"):

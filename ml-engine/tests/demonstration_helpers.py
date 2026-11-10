@@ -1,6 +1,7 @@
 """Shared builders for the demonstration-qualification tests: a reviewed qualification and the contract it names."""
 
 import json
+import os
 from datetime import datetime, timezone
 
 from forecasting import demonstration as D
@@ -11,6 +12,7 @@ TREE = "a" * 40
 DIGEST = "sha256:" + "d" * 64
 EVAL = Q.BuildInfo(TREE, True)
 NOW = int(datetime(2026, 11, 10, tzinfo=timezone.utc).timestamp())
+SETTINGS = "5e" * 32                 # a resolved-settings fingerprint for tests without a live autoscaler
 
 
 def ts(seconds: int) -> str:
@@ -19,7 +21,7 @@ def ts(seconds: int) -> str:
 
 def target(namespace="demo", name="web", uid="dep-uid", **over):
     return {"namespace": namespace, "name": name, "uid": uid, "min_replicas": 1, "max_replicas": 12,
-            "capacity_per_replica": "5.5", **over}
+            "capacity_per_replica": "5.5", "settings_sha256": SETTINGS, **over}
 
 
 def contract_doc(*, targets=None, families=("seasonalNaive",), expires_not_after="2026-11-28T00:00:00Z",
@@ -51,3 +53,19 @@ def pair(*, contract_kw=None, **over):
     """(qualification bytes, contract bytes): consistent unless an override says otherwise."""
     cd = contract(**(contract_kw or {}))
     return qualification(cd, **over), cd
+
+
+def mount(directory, q: bytes, cd: bytes):
+    """The two files as the chart mounts them; returns (qualification path, contract path)."""
+    os.makedirs(directory, exist_ok=True)
+    paths = (os.path.join(str(directory), "demonstration-qualification.json"),
+             os.path.join(str(directory), "demonstration-contract.json"))
+    for path, data in zip(paths, (q, cd)):
+        with open(path, "wb") as fh:
+            fh.write(data)
+    return paths
+
+
+def load(directory, q: bytes, cd: bytes, now=NOW, build=EVAL, digest=DIGEST):
+    """The qualification as the service admits it: loaded from its two mounted files."""
+    return D.load(*mount(directory, q, cd), build, now, digest)

@@ -15,8 +15,18 @@ Two reviewed files, both mounted read-only:
     scope {cluster_uid, namespace, targets [{namespace, name, uid}]}
   demonstration-contract/v1        the running configuration it was reviewed for
     schema, checked {qualification {expires_not_after}, families, cadence {grid_seconds, update_interval_seconds},
-    targets [{namespace, name, uid, min_replicas, max_replicas, capacity_per_replica}]}, and optionally unchecked
-    (any JSON object: the rest of the reviewed contract, hashed with the file and never interpreted here)
+    targets [{namespace, name, uid, min_replicas, max_replicas, capacity_per_replica, settings_sha256}]}, and
+    optionally unchecked (any JSON object: the rest of the reviewed contract, hashed with the file and never
+    interpreted here)
+
+settings_sha256 is the target's autoscaler's resolved forecast settings fingerprint
+(forecasting.contracts.ForecastSettings.fingerprint: risk, calibration, trust, predictive extra, grid, history,
+horizon, families), so a reviewed trust or calibration setting cannot change under the same contract.
+capacity_per_replica is compared as EXACT TEXT with spec.metrics.requests.capacityPerReplica ("5.5" is not "5.50"):
+generate the contract from the admitted PredictiveAutoscaler object, never from a number.
+Two more checked keys are RESERVED and not enforced by this build: calibration_policy_revision and
+trust_policy_revision. A contract that carries either is refused, so nobody can believe they are compared before they
+are; a later build makes them required and compares them, under the same schema name.
 
 Neither file has a gates field: a demonstration qualification grants no G0-G5 pass and says nothing about them, and a
 document that carries one is refused. The hash dependency runs one way: the qualification names the contract's sha256;
@@ -31,25 +41,34 @@ It is honoured
   - only with at least two distinct reviewers and a validity window that is positive and at most 21 days;
   - only for one cluster UID (the kube-system namespace's UID, read live), ONE namespace and one or two targets, each
     by namespace, name AND UID;
+  - only while BOTH mounted files still hold exactly the bytes admitted at start-up: they are read and hashed again
+    at every authorization (no cache, so the bound is zero: the next authorization after a change sees it). A missing,
+    unreadable, oversized or changed file withdraws the basis; nothing new is ever loaded without a restart, and the
+    basis returns only if the mounted bytes are again exactly the admitted ones;
   - only for a request whose live configuration is the contract's: the autoscaler's families within the contract's,
-    the 60 s grid and the 60 s update interval, the target's replica bounds and its capacityPerReplica;
+    the 60 s grid and the 60 s update interval, the resolved forecast settings fingerprint, the target's replica
+    bounds and its capacityPerReplica;
   - only for an answer whose valid_until is not after the expiry, and whose SELECTED family is one it lists
     (configuration names: seasonalNaive, statistical; a family this build does not know is never allowed);
   - never beside a lab qualification, and never when the release gates have passed (no silent precedence).
 Anything malformed, out of scope or different from the contract fails closed: at start-up the service refuses to start;
-per request the answer is simply not eligible, and the journal records why (refusal(), REFUSALS).
+per request the answer is simply not eligible, and the journal records why (mount_refusal(), refusal(), REFUSALS).
+Withdrawing the qualification stops further authorization by the forecaster. It does not recall an answer the operator
+has already received and cached for its validity window: revoking the scale permission is the emergency stop.
+Every digest, tree, time, name and number is matched whole (fullmatch): no trailing newline or control character
+passes. Reviewers are compared stripped and without regard to case.
 """
 
 from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import FrozenSet, Mapping, Optional, Tuple
 
 from forecasting import policy_sim as P
 from forecasting.contracts import FAMILIES, FAMILY_MODELS, sha256_hex
-from forecasting.qualification import _DIGEST, _SHA256, _TREE, BuildInfo, QualificationRefused, _ts
+from forecasting.qualification import BuildInfo, QualificationRefused, _ts
 
 SCHEMA = "demonstration-qualification/v1"
 CONTRACT_SCHEMA = "demonstration-contract/v1"
@@ -59,15 +78,25 @@ MAX_BYTES = 1 << 16
 GRID_SECONDS = 60                    # the demonstration's cadence: one issuance per grid step, nothing else
 UPDATE_INTERVAL_SECONDS = 60
 # Why a request is not covered, in the order the checks run (the journal's release_gate.refused and the metric label).
-REFUSALS = ("release", "cluster", "namespace", "target", "validity", "families", "cadence", "bounds", "capacity",
-            "family")
+REFUSALS = ("release", "qualification-file", "contract-file", "cluster", "namespace", "target", "validity",
+            "families", "cadence", "settings", "bounds", "capacity", "family")
 _KEYS = {"schema", "source_tree", "image_digest", "contract_sha256", "reviewers", "not_before", "expires", "families",
          "scope"}
 _CONTRACT_KEYS = {"schema", "checked"}
 _CHECKED_KEYS = {"qualification", "families", "cadence", "targets"}
+# Reserved for the calibration and trust policy revisions of the bound identity: not enforced yet, so not accepted yet.
+RESERVED_CHECKED_KEYS = ("calibration_policy_revision", "trust_policy_revision")
 _TARGET_KEYS = {"namespace", "name", "uid"}
-_CONTRACT_TARGET_KEYS = _TARGET_KEYS | {"min_replicas", "max_replicas", "capacity_per_replica"}
-_CAPACITY = re.compile(r"^[0-9]+(\.[0-9]+)?$")
+_CONTRACT_TARGET_KEYS = _TARGET_KEYS | {"min_replicas", "max_replicas", "capacity_per_replica", "settings_sha256"}
+# Every pattern is used with fullmatch only: "$" would let a trailing newline through.
+_CAPACITY = re.compile(r"[0-9]+(\.[0-9]+)?")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+_TREE = re.compile(r"[0-9a-f]{40}")
+_TIME = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+_LABEL = re.compile(r"[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?")                               # a namespace
+_SUBDOMAIN = re.compile(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*")   # a Deployment name
+_UID = re.compile(r"[0-9A-Za-z]([-0-9A-Za-z._:]{0,126}[0-9A-Za-z])?")                      # an object UID
 
 
 def _json(data: bytes, what: str):
@@ -88,6 +117,16 @@ def _int(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def _whole(pattern, value, limit: Optional[int] = None) -> bool:
+    return isinstance(value, str) and (limit is None or len(value) <= limit) and pattern.fullmatch(value) is not None
+
+
+def _time(value, what: str) -> int:
+    if not _whole(_TIME, value):
+        raise QualificationRefused(f"{what} must be an RFC 3339 UTC time ending in Z (YYYY-MM-DDTHH:MM:SSZ)")
+    return _ts(value, what)
+
+
 def _families(value, where: str) -> FrozenSet[str]:
     if not isinstance(value, list) or not value or not all(isinstance(f, str) for f in value) or \
             len(set(value)) != len(value) or any(f not in FAMILIES for f in value):
@@ -99,9 +138,11 @@ def _targets(value, keys, where: str):
     if not isinstance(value, list) or not 1 <= len(value) <= MAX_TARGETS:
         raise QualificationRefused(f"{where} must list 1..{MAX_TARGETS} targets")
     for t in value:
-        if not isinstance(t, dict) or set(t) != keys or \
-                not all(isinstance(t[k], str) and t[k] for k in _TARGET_KEYS):
+        if not isinstance(t, dict) or set(t) != keys:
             raise QualificationRefused(f"a target of {where} needs exactly {sorted(keys)}: {t!r}")
+        if not (_whole(_LABEL, t["namespace"]) and _whole(_SUBDOMAIN, t["name"], 253) and _whole(_UID, t["uid"])):
+            raise QualificationRefused(f"a target of {where} needs a namespace (DNS-1123 label), a name (DNS-1123 "
+                                       f"subdomain) and a uid: {t!r}")
     if len({(t["namespace"], t["name"]) for t in value}) != len(value) or len({t["uid"] for t in value}) != len(value):
         raise QualificationRefused(f"{where} must name each target and each uid once")
     return value
@@ -115,6 +156,7 @@ class ContractTarget:
     min_replicas: int
     max_replicas: int
     capacity_per_replica: str            # the exact text of spec.metrics.requests.capacityPerReplica
+    settings_sha256: str                 # ForecastSettings.fingerprint() of the target's autoscaler, as reviewed
 
 
 @dataclass(frozen=True)
@@ -140,12 +182,16 @@ def parse_contract(data: bytes) -> DemonstrationContract:
     if "unchecked" in doc and not isinstance(doc["unchecked"], dict):
         raise QualificationRefused("the contract's unchecked part must be an object")
     checked = doc["checked"]
+    reserved = sorted(set(checked) & set(RESERVED_CHECKED_KEYS)) if isinstance(checked, dict) else []
+    if reserved:
+        raise QualificationRefused(f"checked.{reserved[0]} is reserved: this build does not compare the calibration "
+                                   f"or trust policy revision, so it does not accept a contract that states one")
     if not isinstance(checked, dict) or set(checked) != _CHECKED_KEYS:
         raise QualificationRefused(f"the contract's checked part needs exactly the keys {sorted(_CHECKED_KEYS)}")
     qual = checked["qualification"]
     if not isinstance(qual, dict) or set(qual) != {"expires_not_after"}:
         raise QualificationRefused("checked.qualification needs exactly expires_not_after")
-    not_after = _ts(qual["expires_not_after"], "checked.qualification.expires_not_after")
+    not_after = _time(qual["expires_not_after"], "checked.qualification.expires_not_after")
     families = _families(checked["families"], "checked.families")
     cadence = checked["cadence"]
     if not isinstance(cadence, dict) or set(cadence) != {"grid_seconds", "update_interval_seconds"} or \
@@ -160,11 +206,14 @@ def parse_contract(data: bytes) -> DemonstrationContract:
         lo, hi, cap = t["min_replicas"], t["max_replicas"], t["capacity_per_replica"]
         if not (_int(lo) and _int(hi) and 1 <= lo <= hi):
             raise QualificationRefused(f"a contract target needs integer replica bounds 1 <= min <= max: {t!r}")
-        if not (isinstance(cap, str) and _CAPACITY.match(cap)) or \
+        if not _whole(_CAPACITY, cap, 32) or \
                 P.capacity_rpm({"metrics": {"requests": {"capacityPerReplica": cap}}}) is None:
             raise QualificationRefused(f"capacity_per_replica must be a plain decimal string above 0 that the policy "
                                        f"admits (requests/second per replica): {t!r}")
-        out.append(ContractTarget(t["namespace"], t["name"], t["uid"], lo, hi, cap))
+        if not _whole(_SHA256, t["settings_sha256"]):
+            raise QualificationRefused(f"settings_sha256 must be the sha256 of the autoscaler's resolved forecast "
+                                       f"settings: {t!r}")
+        out.append(ContractTarget(t["namespace"], t["name"], t["uid"], lo, hi, cap, t["settings_sha256"]))
     return DemonstrationContract(sha256=sha256_hex(data), expires_not_after=not_after, families=families,
                                  grid_seconds=GRID_SECONDS, update_interval_seconds=UPDATE_INTERVAL_SECONDS,
                                  targets=tuple(out))
@@ -182,10 +231,26 @@ class DemonstrationQualification:
     families: FrozenSet[str]             # configuration names (spec.prediction.families)
     not_before: int
     expires: int
+    mounted: Optional[Tuple[str, str]] = None      # (qualification path, contract path) it was loaded from
 
     @property
     def contract_sha256(self) -> str:
         return self.contract.sha256
+
+    def mount_refusal(self) -> Optional[str]:
+        """None while both mounted files hold exactly the admitted bytes right now; otherwise which one does not
+        (missing, unreadable, oversized or changed). Read and hashed on every call, through the path (a ConfigMap
+        update swaps a symlink), never from a cache or a modification time. Nothing read here is ever admitted."""
+        if self.mounted is None:
+            return "qualification-file"
+        for path, admitted, reason in ((self.mounted[0], self.sha256, "qualification-file"),
+                                       (self.mounted[1], self.contract.sha256, "contract-file")):
+            try:
+                if sha256_hex(_read(path, reason)) != admitted:
+                    return reason
+            except QualificationRefused:
+                return reason
+        return None
 
     def allows(self, model: Optional[str]) -> bool:
         """The selected model family (wire name, e.g. seasonal_naive) is one of the listed families."""
@@ -193,11 +258,12 @@ class DemonstrationQualification:
 
     def refusal(self, *, cluster_uid: Optional[str], autoscaler_namespace: str, namespace: str, name: str, uid: str,
                 now_s: int, valid_until: int, spec: Mapping, families, sample_interval_seconds: int,
-                selected: Optional[str] = None) -> Optional[str]:
+                settings_sha256: Optional[str], selected: Optional[str] = None) -> Optional[str]:
         """None when the demonstration basis holds for this request right now, otherwise the first reason of REFUSALS
         it does not: the live cluster, the autoscaler's namespace and its live target are in scope; it is valid now
-        and at the answer's valid_until; the live configuration is the contract's; and, once a family is selected
-        (the model's wire name), that family is listed."""
+        and at the answer's valid_until; the live configuration is the contract's (settings_sha256 is the live
+        autoscaler's ForecastSettings.fingerprint()); and, once a family is selected (the model's wire name), that
+        family is listed."""
         if cluster_uid is None or cluster_uid != self.cluster_uid:
             return "cluster"
         if autoscaler_namespace != self.namespace or namespace != self.namespace:
@@ -219,6 +285,8 @@ class DemonstrationQualification:
         if sample_interval_seconds != self.contract.grid_seconds or not _int(update) or \
                 update != self.contract.update_interval_seconds:
             return "cadence"
+        if not isinstance(settings_sha256, str) or settings_sha256 != target.settings_sha256:
+            return "settings"
         lo, hi = spec.get("minReplicas"), spec.get("maxReplicas")
         if not (_int(lo) and _int(hi)) or (lo, hi) != (target.min_replicas, target.max_replicas):
             return "bounds"
@@ -242,9 +310,9 @@ def parse(data: bytes, contract_data: bytes, build: BuildInfo, now_s: int,
           image_digest: Optional[str]) -> DemonstrationQualification:
     if not build.evaluation_build:
         raise QualificationRefused("this is a release build: it never honours a demonstration qualification")
-    if not _TREE.match(build.source_tree):
+    if not _whole(_TREE, build.source_tree):
         raise QualificationRefused("the evaluation build records no source tree")
-    if not (isinstance(image_digest, str) and _DIGEST.match(image_digest)):
+    if not _whole(_DIGEST, image_digest):
         raise QualificationRefused("the pod's image digest is unknown (run the image pinned by digest)")
     doc = _json(data, "the demonstration qualification")
     if isinstance(doc, dict) and "gates" in doc:
@@ -255,13 +323,13 @@ def parse(data: bytes, contract_data: bytes, build: BuildInfo, now_s: int,
         raise QualificationRefused("the qualification names another source tree than this build")
     if doc["image_digest"] != image_digest:
         raise QualificationRefused("the qualification names another image digest than this pod runs")
-    if not (isinstance(doc["contract_sha256"], str) and _SHA256.match(doc["contract_sha256"])):
+    if not _whole(_SHA256, doc["contract_sha256"]):
         raise QualificationRefused("contract_sha256 must be a sha256")
     reviewers = doc["reviewers"]
     if not isinstance(reviewers, list) or not all(isinstance(r, str) and r.strip() for r in reviewers) or \
-            len({r.strip() for r in reviewers}) < 2:
+            len({r.strip().casefold() for r in reviewers}) < 2:
         raise QualificationRefused("at least two distinct reviewers (executor and reviewer) are required")
-    nb, exp = _ts(doc["not_before"], "not_before"), _ts(doc["expires"], "expires")
+    nb, exp = _time(doc["not_before"], "not_before"), _time(doc["expires"], "expires")
     if not nb < exp or exp - nb > MAX_VALIDITY_SECONDS:
         raise QualificationRefused("the validity window must be positive and at most 21 days")
     if now_s >= exp:
@@ -271,10 +339,10 @@ def parse(data: bytes, contract_data: bytes, build: BuildInfo, now_s: int,
     if not isinstance(scope, dict) or set(scope) != {"cluster_uid", "namespace", "targets"}:
         raise QualificationRefused("scope needs exactly cluster_uid, namespace and targets")
     cluster, namespace = scope["cluster_uid"], scope["namespace"]
-    if not isinstance(cluster, str) or not cluster:
-        raise QualificationRefused("scope.cluster_uid is required")
-    if not isinstance(namespace, str) or not namespace:
-        raise QualificationRefused("scope.namespace must name exactly one namespace")
+    if not _whole(_UID, cluster):
+        raise QualificationRefused("scope.cluster_uid is required (the kube-system namespace's UID)")
+    if not _whole(_LABEL, namespace):
+        raise QualificationRefused("scope.namespace must name exactly one namespace (a DNS-1123 label)")
     targets = _targets(scope["targets"], _TARGET_KEYS, "scope.targets")
     if any(t["namespace"] != namespace for t in targets):
         raise QualificationRefused("every target of scope.targets must be in scope.namespace")
@@ -308,16 +376,18 @@ def _read(path: str, what: str) -> bytes:
 
 def load(path: Optional[str], contract_path: Optional[str], build: BuildInfo, now_s: int,
          image_digest: Optional[str] = None) -> Optional[DemonstrationQualification]:
-    """None without either path; a verified qualification with its verified contract; or QualificationRefused (one
-    path without the other included)."""
+    """None without either path; a verified qualification with its verified contract, remembering the two paths so
+    the mounted bytes can be checked again at every authorization; or QualificationRefused (one path without the other
+    included)."""
     if not path and not contract_path:
         return None
     if not path or not contract_path:
         raise QualificationRefused("a demonstration qualification and its demonstration contract are mounted together "
                                    "or not at all")
-    return parse(_read(path, "the demonstration qualification"), _read(contract_path, "the demonstration contract"),
-                 build, now_s, image_digest)
+    q = parse(_read(path, "the demonstration qualification"), _read(contract_path, "the demonstration contract"),
+              build, now_s, image_digest)
+    return replace(q, mounted=(path, contract_path))
 
 
 __all__ = ["CONTRACT_SCHEMA", "ContractTarget", "DemonstrationContract", "DemonstrationQualification", "REFUSALS",
-           "SCHEMA", "load", "parse", "parse_contract"]
+           "RESERVED_CHECKED_KEYS", "SCHEMA", "load", "parse", "parse_contract"]

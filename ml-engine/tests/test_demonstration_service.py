@@ -3,10 +3,13 @@ in for the release gate and nothing else; only inside its scope, its validity an
 for a selected family it lists; an answer issued under it is re-checked on every reuse; and it is never combined with
 a lab qualification or with passed release gates."""
 
+import atexit
+import itertools
 import math
 import os
 import shutil
 import sys
+import tempfile
 
 import pytest
 
@@ -45,15 +48,22 @@ def demo_pa(prediction=None, **spec):
     return pa
 
 
+MOUNTS = tempfile.mkdtemp(prefix="demonstration-mounts-")        # one directory per mounted pair of documents
+atexit.register(shutil.rmtree, MOUNTS, ignore_errors=True)
+_mount = itertools.count()
+
+
 def documents(*, expires=T0 + 15 * DAY, not_before=T0 - DAY, name="web", uid="dep-uid", namespace="shop",
-              cluster="cluster-uid", contract_kw=None, **over):
-    """A verified demonstration qualification (with its contract) for the test autoscaler's target."""
-    kw = {"targets": [H.target(namespace=namespace, name=name, uid=uid)], "expires_not_after": H.ts(expires),
-          **(contract_kw or {})}
+              cluster="cluster-uid", settings=None, contract_kw=None, directory=None, **over):
+    """A demonstration qualification as the service admits it (loaded from its two mounted files, with its contract)
+    for the test autoscaler's target and that autoscaler's resolved settings."""
+    settings = settings or c.resolve_settings(demo_pa()).fingerprint()
+    kw = {"targets": [H.target(namespace=namespace, name=name, uid=uid, settings_sha256=settings)],
+          "expires_not_after": H.ts(expires), **(contract_kw or {})}
     q, cd = H.pair(contract_kw=kw, not_before=H.ts(not_before), expires=H.ts(expires),
                    scope={"cluster_uid": cluster, "namespace": namespace,
                           "targets": [{"namespace": namespace, "name": name, "uid": uid}]}, **over)
-    return D.parse(q, cd, BUILD, T0, H.DIGEST)
+    return H.load(directory or os.path.join(MOUNTS, str(next(_mount))), q, cd, now=T0, build=BUILD)
 
 
 def open_service(path, *, pa=None, cluster="cluster-uid", at=T0, backend=None, **cfg):
@@ -220,6 +230,12 @@ def test_a_stored_eligible_answer_is_not_reused_in_another_cluster(trusted, tmp_
     ({"prediction": {"updateIntervalSeconds": None}}, "cadence"),
     ({"prediction": {"sampleIntervalSeconds": 300}}, "cadence"),
     ({"prediction": {"families": ["seasonalNaive", "statistical"]}}, "families"),
+    # The reviewed trust and calibration settings are bound through the resolved settings fingerprint.
+    ({"prediction": {"trust": {**base.FAST_TRUST, "coverageToleranceBps": 2500}}}, "settings"),
+    ({"prediction": {"trust": {**base.FAST_TRUST, "minProspectiveWindows": 5}}}, "settings"),
+    ({"prediction": {"calibration": {"minWindows": 16, "maxScores": 65, "minMiscoverageBps": 600}}}, "settings"),
+    ({"prediction": {"risk": {"miscoverageBps": 700}}}, "settings"),
+    ({"prediction": {"historyDays": 3}}, "settings"),
 ])
 def test_a_live_configuration_that_differs_from_the_contract_is_not_eligible(trusted, tmp_path, change, why):
     # A first issuance under the changed configuration records why the gate did not pass.
@@ -242,6 +258,126 @@ def test_a_live_configuration_that_differs_from_the_contract_is_not_eligible(tru
         assert r.issuance_id == c.response_from_wire(trusted["wires"][-1]).issuance_id
         assert r.predictive_eligible is False and refusals(drifted) == {why: 1}
         assert drifted.store.issuances()[-1].payload()["release_gate"]["passed"] is True   # the record stays true
+
+
+def test_a_changed_trust_setting_is_refused_and_old_answers_are_not_served_again(trusted, tmp_path):
+    """The reviewer's case: coverageToleranceBps moved to 2500 after the review. The resolved settings fingerprint
+    changes, the contract names the reviewed one, so nothing is authorized under the new settings; and the answers
+    stored under the old fingerprint cannot be fetched or re-authorized for the changed autoscaler."""
+    doc, old = trusted["doc"], trusted["settings"]
+    loose = demo_pa(prediction={"trust": {**base.FAST_TRUST, "coverageToleranceBps": 2500}})
+    new = c.resolve_settings(loose).fingerprint()
+    assert new != old and doc.contract.targets[0].settings_sha256 == old == c.resolve_settings(demo_pa()).fingerprint()
+    svc, clock, _pa, settings = reopen(trusted, tmp_path, pa=loose, demonstration_qualification=doc)
+    assert settings == new
+    with pytest.raises(S.ServiceError) as e:                    # the stored answer is asked for with its own settings
+        svc.predict(base.body(LAST, old))
+    assert e.value.status == 422 and e.value.reason == "IdentityMismatch"
+    again = c.response_from_wire(svc.predict(base.body(LAST, new)))            # the same origin, the live settings
+    assert again.issuance_id != c.response_from_wire(trusted["wires"][-1]).issuance_id
+    assert again.predictive_eligible is False
+    g = gate(svc)
+    assert (g["passed"], g["basis"], g["refused"]) == (False, None, "settings")
+    assert g["demonstration_contract_sha256"] == doc.contract_sha256
+    # Even handed the old bundle directly, the answer path refuses it for the changed autoscaler.
+    bound = c.bind_request(base.body(LAST, new), svc.reader, now_ms=svc.clock.now_ms())
+    b = trusted["bundles"][-1]
+    assert b["release_gate"]["passed"] is True and b["settings_sha256"] == old
+    assert svc._authorized(bound, b) is False
+    assert refusals(svc) == {"settings": 2}
+    later = c.response_from_wire(ask(svc, clock, LAST + G, new))
+    assert later.predictive_eligible is False and gate(svc)["refused"] == "settings"
+
+
+# --- the mounted files: checked at every answer, without a restart ----------------------------------------------------
+
+def _replace(path, data):
+    os.remove(path)
+    with open(path, "wb") as fh:
+        fh.write(data)
+
+
+def _as_directory(path):
+    os.remove(path)
+    os.mkdir(path)
+
+
+CHANGES = {
+    # name: (what happens to the mounted files while the service runs, the recorded reason)
+    "both deleted": (lambda q, cf, other_q, other_c: (os.remove(q), os.remove(cf)), "qualification-file"),
+    "qualification replaced": (lambda q, cf, other_q, other_c: _replace(q, other_q), "qualification-file"),
+    "contract replaced": (lambda q, cf, other_q, other_c: _replace(cf, other_c), "contract-file"),
+    "qualification unreadable": (lambda q, cf, other_q, other_c: _as_directory(q), "qualification-file"),
+    "contract unreadable": (lambda q, cf, other_q, other_c: _as_directory(cf), "contract-file"),
+    "contract deleted": (lambda q, cf, other_q, other_c: os.remove(cf), "contract-file"),
+    "qualification malformed": (lambda q, cf, other_q, other_c: _replace(q, b'{"schema": '), "qualification-file"),
+    "both replaced by a valid pair": (lambda q, cf, other_q, other_c: (_replace(q, other_q), _replace(cf, other_c)),
+                                      "qualification-file"),
+}
+
+
+@pytest.mark.parametrize("change", sorted(CHANGES))
+def test_a_change_of_the_mounted_files_withdraws_the_basis_without_a_restart(trusted, tmp_path, change):
+    """default_service loads both files once; every authorization reads and hashes them again. After a change the
+    running service authorizes nothing more: not a stored eligible answer, not a new one. It never loads what it
+    finds (a replacement is admitted only by a restart), and the admitted bytes, once back, are honoured again."""
+    apply, why = CHANGES[change]
+    admitted = trusted["doc"]
+    q_bytes, c_bytes = (open(p, "rb").read() for p in admitted.mounted)
+    doc = H.load(tmp_path / "mount", q_bytes, c_bytes, now=T0, build=BUILD)     # this test's own mount, same bytes
+    assert (doc.sha256, doc.contract_sha256) == (admitted.sha256, admitted.contract_sha256)
+    qf, cf = doc.mounted
+    other_c = H.contract(targets=[H.target(namespace="shop", max_replicas=99, settings_sha256=trusted["settings"])],
+                         expires_not_after=H.ts(T0 + 15 * DAY))
+    other_q = H.qualification(other_c, not_before=H.ts(T0 - DAY), expires=H.ts(T0 + 15 * DAY), scope={
+        "cluster_uid": "cluster-uid", "namespace": "shop",
+        "targets": [{"namespace": "shop", "name": "web", "uid": "dep-uid"}]})
+    D.parse(other_q, other_c, BUILD, T0, H.DIGEST)                               # a complete, valid pair: never loaded
+    svc, clock, _pa, settings = reopen(trusted, tmp_path, demonstration_qualification=doc)
+    first = retry_last(svc, settings)
+    assert first.predictive_eligible is True and svc.health()["demonstration_qualification"]["withdrawn"] is None
+
+    apply(qf, cf, other_q if change != "qualification replaced" else H.qualification(
+        c_bytes, not_before=H.ts(T0 - DAY), expires=H.ts(T0 + 15 * DAY), reviewers=["executor", "someone else"],
+        scope={"cluster_uid": "cluster-uid", "namespace": "shop",
+               "targets": [{"namespace": "shop", "name": "web", "uid": "dep-uid"}]}), other_c)   # no restart
+
+    stored = retry_last(svc, settings)                           # the stored eligible answer is not served as eligible
+    assert stored.issuance_id == first.issuance_id and stored.predictive_eligible is False
+    assert refusals(svc) == {why: 1}
+    h = svc.health()
+    assert h["demonstration_qualification"]["withdrawn"] == why and h["qualification_basis"] == "none"
+    assert svc.qualification_status() == ("none", {"demonstration": doc.expires})
+    nxt = c.response_from_wire(ask(svc, clock, LAST + G, settings))               # and nothing new is authorized
+    g = gate(svc)
+    assert nxt.predictive_eligible is False and nxt.reason == "ReplayGateMissing"
+    assert (g["passed"], g["basis"], g["refused"]) == (False, None, why)
+    # No new authority was loaded: the service still holds, and records, only what it admitted at start-up.
+    held = svc.config.demonstration_qualification
+    assert held is doc and (g["demonstration_qualification_sha256"], g["demonstration_contract_sha256"]) == \
+        (admitted.sha256, admitted.contract_sha256)
+    assert held.contract.targets[0].max_replicas == 12
+    from prometheus_client import CollectorRegistry, generate_latest
+    reg = CollectorRegistry()
+    reg.register(svc.qualification_metrics)
+    text = generate_latest(reg).decode()
+    assert 'predictive_autoscaler_forecaster_qualification_basis{basis="none"} 1.0' in text
+    assert f'predictive_autoscaler_forecaster_demonstration_refusals_total{{reason="{why}"}} 2.0' in text
+    # The admitted bytes back in place: the same authority as before, for answers issued from now on.
+    for path in (qf, cf):
+        if os.path.isdir(path):
+            os.rmdir(path)
+    with open(qf, "wb") as fh:
+        fh.write(q_bytes)
+    with open(cf, "wb") as fh:
+        fh.write(c_bytes)
+    back = c.response_from_wire(ask(svc, clock, LAST + 2 * G, settings))
+    assert back.predictive_eligible is True and gate(svc)["basis"] == "demonstration"
+    assert svc.health()["demonstration_qualification"]["withdrawn"] is None
+    again = c.response_from_wire(svc.predict(base.body(LAST + 2 * G, settings)))
+    assert again.predictive_eligible is True
+    # The answer issued while the basis was withdrawn stays what it was issued as.
+    assert svc.store.issuances()[-2].payload()["release_gate"]["passed"] is False
 
 
 # --- families: only the selected family the document lists ------------------------------------------------------------
@@ -273,8 +409,9 @@ def test_a_family_outside_the_list_is_never_eligible(tmp_path, monkeypatch):
         return dict(r, shortage=[0.0, r["shortage"][1]], replica_time=[r["replica_time"][1]] * 2)
     monkeypatch.setattr(P, "paired_costs", passing)
     pa = base.policy_pa(updateIntervalSeconds=60)                   # both families (the default), bounds 1..12
-    doc = documents(expires=T0 + 20 * DAY, contract_kw={"targets": [H.target(namespace="shop",
-                                                                             capacity_per_replica="5")]})
+    reviewed = H.target(namespace="shop", capacity_per_replica="5",
+                        settings_sha256=c.resolve_settings(pa).fingerprint())
+    doc = documents(expires=T0 + 20 * DAY, contract_kw={"targets": [reviewed]})
     real_refusal = D.DemonstrationQualification.refusal
     monkeypatch.setattr(D.DemonstrationQualification, "refusal", lambda self, **kw: real_refusal(
         self, **{**kw, "families": tuple(self.families), "sample_interval_seconds": G}))
@@ -315,8 +452,7 @@ def test_a_family_outside_the_list_is_never_eligible(tmp_path, monkeypatch):
     # The control: the list is the only thing in the way. A document (and contract) that lists both families
     # authorizes the very same answer.
     both = documents(expires=T0 + 20 * DAY, families=["seasonalNaive", "statistical"], contract_kw={
-        "families": ("seasonalNaive", "statistical"),
-        "targets": [H.target(namespace="shop", capacity_per_replica="5")]})
+        "families": ("seasonalNaive", "statistical"), "targets": [reviewed]})
     wide, _ = base.make(tmp_path / "demo", reader=base.ClusterReader(pa), store_id="journal-1", build=BUILD,
                         clock=ManualClock(o * 1000 + 10_000), demonstration_qualification=both)
     assert wide._authorized(bound, forged(both)) is True and wide._authorized(bound, forged(doc)) is False
@@ -443,6 +579,11 @@ def test_a_demonstration_qualification_fails_closed_at_start(tmp_path, monkeypat
         base.make(tmp_path / "none", demonstration_qualification=doc)
     with pytest.raises(Q.QualificationRefused, match="at most one"):                 # mutually exclusive with a lab one
         base.make(tmp_path / "both", demonstration_qualification=doc, lab_qualification=base.lab(), build=BUILD)
+    # Only as loaded from its two mounted files: bytes handed over in memory could never be checked again.
+    in_memory = D.parse(*(open(p, "rb").read() for p in doc.mounted), BUILD, T0, H.DIGEST)
+    assert in_memory.sha256 == doc.sha256 and in_memory.mounted is None
+    with pytest.raises(Q.QualificationRefused, match="two mounted files"):
+        base.make(tmp_path / "unmounted", demonstration_qualification=in_memory, build=BUILD)
     # No silent precedence: with the release gates passed, the document is refused instead of ignored.
     monkeypatch.setattr(S, "RELEASE_GATES_PASSED", True)
     with pytest.raises(Q.QualificationRefused, match="release gates have passed"):
@@ -453,10 +594,6 @@ def test_a_demonstration_qualification_fails_closed_at_start(tmp_path, monkeypat
     assert gate(svc) == {"passed": True, "basis": "release", "lab_qualification_sha256": None}
     assert svc.qualification_status() == ("release", {})
     svc.close()
-    # A lab qualification keeps its existing precedence under passed release gates (unchanged by this document type).
-    lab_svc, clock, _pa, settings = open_service(tmp_path / "lab-release", lab_qualification=base.lab())
-    ask(lab_svc, clock, T0, settings)
-    assert gate(lab_svc)["basis"] == "release"
 
 
 def test_release_gates_passing_under_a_running_demonstration_fail_closed(tmp_path, monkeypatch):
