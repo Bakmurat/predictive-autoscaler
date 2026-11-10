@@ -229,6 +229,12 @@ def test_the_prodcluster_template_queries_the_cluster_victoriametrics_path():
     ("/select//prometheus", "segments"),
     ("/select/./prometheus", "segments"),
     ("/select/0/prom etheus", "segments"),
+    ("/select/0/prometheus\n", "segments"),                       # "$" would have admitted the final newline
+    ("/\n", "segments"),
+    ("/select\n/0/prometheus", "segments"),
+    ("/select/0/\tprometheus", "segments"),
+    ("/select/0/prometheus\x00", "segments"),
+    ("/select/0/prom\x7fetheus", "segments"),
     ("", "is required"),
     (None, "is required"),
     (5, "is required"),
@@ -241,6 +247,15 @@ def test_bad_metrics_query_paths_are_refused(params, path, message):
         render.render_all(params)
     with pytest.raises(render.ParamsError, match="routes.metrics_query_path"):
         render.eval_release_values(params)
+
+
+@pytest.mark.parametrize("ctrl", ["\n", "\r", "\t", "\x00", "\x7f"])
+def test_a_control_character_with_the_matching_keda_url_is_still_refused(params, ctrl):
+    path = "/select/0/prometheus" + ctrl
+    params["routes"]["metrics_query_path"] = path
+    params["keda"]["server_address"] = ROUTE + path                  # the exact-equality check alone would pass
+    with pytest.raises(render.ParamsError, match="routes.metrics_query_path"):
+        render.validate(params)
 
 
 def test_a_missing_metrics_query_path_is_refused(params):

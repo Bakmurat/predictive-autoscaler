@@ -424,7 +424,7 @@ def route_host(p: Dict, kind: str) -> str:
 
 
 METRICS_ROUTE_PORT = 8481
-_PATH_SEGMENT = re.compile(r"^[A-Za-z0-9._~-]+$")
+_PATH_SEGMENT = re.compile(r"[A-Za-z0-9._~-]+")      # fullmatch: "$" would admit a final newline
 
 
 def metrics_query_path(p: Dict) -> str:
@@ -451,7 +451,7 @@ def metrics_query_path(p: Dict) -> str:
         return v
     if v.endswith("/"):
         raise ParamsError(f"{where} must not end with '/' (only the root path is '/')")
-    if not all(_PATH_SEGMENT.match(seg) and seg != "." for seg in v[1:].split("/")):
+    if not all(_PATH_SEGMENT.fullmatch(seg) and seg != "." for seg in v[1:].split("/")):
         raise ParamsError(f"{where} must be '/'-separated non-empty segments of unreserved characters")
     return v
 
