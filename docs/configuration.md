@@ -50,7 +50,7 @@ brackets (20 and 60). The same applies to `metrics.requests`. Set these fields e
 | `targetUID` | UID of the target Deployment the status describes. |
 | `conflicts` | The other replica writers the last coexistence check found on the target, each as `{group, kind, namespace, name, reason}`. `reason` is set only where the kind alone does not explain it: `PausedReplicas` (a paused KEDA ScaledObject holding a fixed count) or `LegacyAPIGroup` (an autoscaler of the legacy group). Empty when there are none. After a failed check (`ConflictDetected=Unknown`) it lists those found before the failure. Conditions, events and the decision ledger show the same writers as text (`Kind/name`). |
 | `metricSource` | The compiled request-rate query: `query`, `sha256` (of the exact query text), `observedGeneration`, `targetUID`, `contract` (`requests-per-second/v1`). It is published before the forecasting service is asked. The service uses a forecast only when it was computed for this query, generation and target; any other forecast is refused, and the reactive rule applies. It is absent while the configuration is invalid. |
-| `prediction` | Engine `statistical` only: `engine`, `settingsSHA256`, the published `lead` (`seconds`, `startupDelaySeconds`, `actuationAllowanceSeconds`, `method` `configured`/`measured`, `sampleCount`, `observedGeneration`; the forecasting service reads it), `leadBasis` and `frozenLeadSeconds`, `startup` (`delaySeconds`, `method`, `sampleCount`, `measuredP90Seconds`, `pendingSeconds`, `observable`), and the last forecast: `phase`, `reason`, `model`, `issuanceID`, `decisionOrigin`, `validUntil`, `baseWindowMaxRPS`, `upperWindowMaxRPS`, `calibrationWindows`, `prospectiveWindows`, `gateCoverageBps`, the operator's `eligible` verdict, and `predictiveReplicas` / `cappedReplicas` / `capBinding`. |
+| `prediction` | Engine `statistical` only: `engine`, `settingsSHA256`, the published `lead` (`seconds`, `startupDelaySeconds`, `actuationAllowanceSeconds`, `method` `configured`/`measured`, `sampleCount`, `observedGeneration`; the forecasting service reads it), `leadBasis` and `frozenLeadSeconds`, `startup` (`delaySeconds`, `method`, `sampleCount`, `measuredP90Seconds`, `pendingSeconds` with `pendingEvidence` `neverReady`/`uncertain`, `observable`), and the last forecast: `phase`, `reason`, `model`, `issuanceID`, `decisionOrigin`, `validUntil`, `baseWindowMaxRPS`, `upperWindowMaxRPS`, `calibrationWindows`, `prospectiveWindows`, `gateCoverageBps`, the operator's `eligible` verdict, and `predictiveReplicas` / `cappedReplicas` / `capBinding`. |
 | `predictedReplicas` | Deprecated: the calculated count (historical meaning). Use `calculatedReplicas` and `forecastReplicas`. |
 | `lastPrediction` | Issue time of the last forecast used. |
 | `conditions` | `Ready` (the reconcile completed: `ReconcileCompleted`; when False the reason names the failure: `CrossNamespaceTarget`, `DeploymentNotFound`, `InvalidMetricQuery` or `ScalingError`, and `ScalingActive` gets the same reason), `CapacityConfigured` (`CapacityPerReplica`, or `DeprecatedTargetRPS` while the capacity comes from `targetRPS`; False with `CapacityMissing` when neither is set, or `CapacityInvalid` for a value the API server would reject; the message names the resolved requests per second), `TelemetryAvailable` (`Measured` / `MetricsUnavailable`), `ForecastAvailable` (`Used`, `Disabled`, `Unavailable`, `HorizonElapsed`, `SanityRejected`, `CapacityMissing` (no forecast is requested without a capacity), on the v2 path `NotTrusted`, `Rejected`, `LeadInsufficient` and `SettingsInvalid`, and for the operator-to-forecaster authentication `Unauthorized` (401), `Forbidden` (403), `AuthUnavailable` (TokenReview could not judge) and `AuthMisconfigured` (the operator's token or CA file is missing, empty or invalid, or a token is set with a non-https URL)); a cached forecast used during a forecaster outage counts as `Used`, `PredictionReady` (engine `statistical` only; True `Ready` when the operator verified a forecast as usable now, which is readiness to activate, not authorization: Recommend still writes nothing; False with the forecasting service's reason, `HistoryInsufficient`, `CalibrationInsufficient`, `ShadowInsufficient`, `CoverageLow`, `DataUnavailable`, `IdentityMismatch`, `StateUnavailable`, `LeadInsufficient` or `ReplayGateMissing`, or the operator's own: `SettingsInvalid`, `CapacityMissing`, `RequestRefused`, `ForecastRejected`, `NotEligible`, `EvidenceInsufficient`, `EvidenceStale`, `IssuedInFuture`, `DeadlinePassed`), `ScaleOutBlocked` (True `Unschedulable`, `QuotaExceeded` or `FailedCreate` while a scale-out cannot complete; False `None`; `Unknown`/`PodsUnreadable` when the target's ReplicaSets or pods could not be read, `Unknown`/`OwnershipUnresolved` when its current ReplicaSet could not be identified with certainty), `ScalingActive` (`Active`, `RecommendMode`, `CapacityMissing`, `TelemetryHold`, `Conflict`, `CheckFailed`, `GuardAborted`, or the failure reason), `ConflictDetected` (`NoConflict`; `ReplicaWriter` when an HPA, an unpaused KEDA ScaledObject or another Active PredictiveAutoscaler targets the Deployment; `Unknown`/`CheckFailed` when the check failed), `VPAInterference` (`None`; `VPAUpdatesPods` for a VPA in any mode except `Off`; `Unknown`/`CheckFailed` when the check did not complete), `ScaleDownHeadroom` (`Holding` while a scale-down is held for headroom; `NotHolding` when headroom is not currently blocking a scale-down, which says nothing about how much spare capacity exists; `RecommendMode`; informational: it never affects `Ready` or `ScalingActive`). See coexistence.md. |
@@ -163,11 +163,37 @@ has the evidence, a calibrated **upper bound** `U` of that peak, in requests per
    allowance `A` covers (`status.prediction.startup.measures: podCreationToReady`); the configured fallback should cover
    the whole scale request to Ready. When the current ReplicaSet cannot be identified with certainty, nothing is
    measured and the fallback applies. A new current ReplicaSet (a rollout) discards the samples.
+
+   **A pending start is a pod that has never been Ready** (`status.prediction.startup.pendingSeconds`, its age since
+   creation). A pod that was Ready and is not Ready now (a failed readiness probe, a restarted container) is a
+   readiness loss, not a start; a terminal pod (`Failed` or `Succeeded`, for example an evicted pod that stays listed
+   until pod garbage collection) and a terminating pod are not starts either. None of them changes the budget or the
+   lead. The operator decides this per pod from what it saw itself and from the pod's status, which also holds after
+   an operator restart: the kubelet stamps `status.startTime` and the first `Ready=False` at its first report and moves
+   the `Ready` condition's `lastTransitionTime` only when the status changes, so `Ready=False` since the first report
+   means never Ready, and a later transition means the pod was Ready before. A restart count proves neither. When the
+   status shows neither (no transition time, no start time, or conditions that contradict each other), the pod counts
+   as a pending start and `pendingEvidence` is `uncertain` instead of `neverReady`: that can lengthen the lead but
+   never shorten it.
+
    `L = ceil((D + C + A + Δ) / Δ) × Δ`, with `C` the decision interval: the reconcile interval rounded up to the grid,
-   plus 5 s for the start offset and queueing jitter. Within one configuration the
-   lead never shrinks automatically (`frozenLeadSeconds`); it grows at once when a slower start needs it, which starts a
-   new evidence epoch on the service. A lead longer than the horizon, or no budget at all, means no lead
-   (`LeadInsufficient`) and reactive decisions. The lead is published in `status.prediction.lead` before any request.
+   plus 5 s for the start offset and queueing jitter. A lead longer than the horizon, or no budget at all, means no
+   lead (`LeadInsufficient`) and reactive decisions. A pending start is never cut to fit the horizon: while a pod has
+   been starting for longer than the horizon allows, no forecast is requested and the reactive rule carries on
+   (`PredictionReady=False`, reason `LeadInsufficient`, with the pending time in the message). The lead is published in
+   `status.prediction.lead` before any request.
+
+   **The lead never shrinks automatically** (`frozenLeadSeconds`): not when the slow pod is gone, not after a rollout,
+   not after an operator restart, and not with time. It grows at once when a slower start needs it, and every new lead
+   starts a new evidence epoch on the service (calibration and the shadow period start again). A shorter lead needs a
+   new **lead basis** (`status.prediction.leadBasis`), which is a fingerprint of: the forecast settings
+   (`settingsSHA256`: `prediction.horizonMinutes`, `engine` and the statistical engine's settings after it),
+   `behavior.startup.fallbackDelaySeconds`, `minimumDelaySeconds` and `actuationAllowanceSeconds`, and the decision
+   interval (`prediction.updateIntervalSeconds` on the sample grid). Changing one of them starts a new basis, and the
+   lead is then chosen from the current budget;
+   so after a one-off slow start has raised the lead, a deliberate change of the startup configuration (for example
+   `minimumDelaySeconds`) brings it back. There is no other reset: other spec changes keep the frozen lead. Leaving
+   the statistical engine removes `status.prediction`, and the frozen lead with it.
 2. **Asks for the current origin** and checks the answer itself: every field present and nothing else, the identity
    echo (autoscaler and target UIDs, generation, query hash, settings fingerprint, origin, lead), the evidence epoch,
    the window and its targets, `valid_until`, finite non-negative rates in requests per second. A cached answer is reused

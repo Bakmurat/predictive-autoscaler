@@ -93,6 +93,9 @@ func (r *PredictiveAutoscalerReconciler) prepareV2(ctx context.Context, a *autos
 		}
 		want.LeadBasis = v2Hash(map[string]interface{}{"settings_sha256": want.SettingsSHA256, "fallback": fallback,
 			"minimum": cfg.Minimum, "allowance": cfg.Allowance, "decision_interval": c})
+		// The lead basis is the only reset of the frozen lead: a change of the settings fingerprint, of
+		// spec.behavior.startup or of the decision interval starts a new one, chosen from the current budget. Nothing
+		// else shortens the lead (no decay, no rollout, no operator restart: the value is kept in status).
 		frozen := int64(0)
 		if prev := a.Status.Prediction; prev != nil && prev.LeadBasis == want.LeadBasis {
 			frozen = int64(prev.FrozenLeadSeconds)
@@ -108,8 +111,16 @@ func (r *PredictiveAutoscalerReconciler) prepareV2(ctx context.Context, a *autos
 				lead = frozen // never shorten automatically within one basis
 			}
 			if lead > s.HorizonSeconds {
+				// Never shortened to fit, whatever raised it (a pending start included): a forecast for a window that
+				// ends before the scale-out is usable must not become eligible. The decision stays reactive.
 				out.leadProblem = fmt.Sprintf("the lead %d s (startup %d s + decision interval %d s + allowance %d s, on "+
 					"the %d s grid) exceeds the %d s horizon", lead, d, c, cfg.Allowance, s.SampleIntervalSeconds, s.HorizonSeconds)
+				if obs.Pending != nil && *obs.Pending >= d {
+					out.leadProblem += fmt.Sprintf(": a pod of the current ReplicaSet has not become Ready for %d s", *obs.Pending)
+					if obs.PendingEvidence == pendingUncertain {
+						out.leadProblem += " (its status does not show whether it was Ready before)"
+					}
+				}
 				break
 			}
 			sample := int64(0)

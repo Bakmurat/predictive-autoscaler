@@ -255,10 +255,19 @@ type StartupStatus struct {
 	// MeasuredP90Seconds is the 90th percentile of those starts (absent with fewer than 20).
 	// +optional
 	MeasuredP90Seconds *int32 `json:"measuredP90Seconds,omitempty"`
-	// PendingSeconds is the age of the oldest not-yet-Ready pod of the current template (absent when none); a pending
-	// start longer than the budget raises the budget.
+	// PendingSeconds is the age of the oldest pod of the current ReplicaSet that has never been Ready (absent when
+	// none); a pending start longer than the budget raises the budget, and it is never cut to fit the horizon. Pods
+	// that were Ready before (a failed readiness probe, a restarted container), terminal pods (Failed, Succeeded) and
+	// terminating pods are not pending starts.
 	// +optional
 	PendingSeconds *int32 `json:"pendingSeconds,omitempty"`
+	// PendingEvidence says how the pod behind PendingSeconds was classified: neverReady (its status shows that it has
+	// not been Ready since the kubelet first reported it, or no kubelet has reported it) or uncertain (its status does
+	// not show whether it was Ready before; it is then counted as a pending start, which can lengthen the lead but
+	// never shorten it).
+	// +kubebuilder:validation:Enum=neverReady;uncertain
+	// +optional
+	PendingEvidence string `json:"pendingEvidence,omitempty"`
 	// Observable is false when the operator could not read the target's ReplicaSets and pods, or could not identify the
 	// current ReplicaSet with certainty (the configured budget then applies).
 	Observable bool `json:"observable"`
@@ -275,12 +284,15 @@ type PredictionStatus struct {
 	// Lead is the selected lead (absent when no startup budget is available, or it does not fit the horizon).
 	// +optional
 	Lead *PredictionLead `json:"lead,omitempty"`
-	// LeadBasis fingerprints the settings and startup configuration the lead was frozen for: the lead never shrinks
-	// automatically while it is unchanged.
+	// LeadBasis fingerprints what the lead was frozen for: the forecast settings (SettingsSHA256),
+	// spec.behavior.startup (fallbackDelaySeconds, minimumDelaySeconds, actuationAllowanceSeconds) and the decision
+	// interval (spec.prediction.updateIntervalSeconds on the sample grid). The lead never shrinks automatically while
+	// it is unchanged.
 	// +optional
 	LeadBasis string `json:"leadBasis,omitempty"`
 	// FrozenLeadSeconds is the longest lead selected for LeadBasis. A later selection never goes below it, also after
-	// a period without a lead: a shorter lead needs a change of the settings or the startup configuration.
+	// a period without a lead, a rollout or an operator restart. A shorter lead needs a new LeadBasis, that is a
+	// change of one of the fields it fingerprints; there is no other reset.
 	// +optional
 	FrozenLeadSeconds int32 `json:"frozenLeadSeconds,omitempty"`
 	// Startup is the startup-delay measurement.

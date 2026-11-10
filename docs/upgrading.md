@@ -1,5 +1,12 @@
 # Upgrading
 
+## Pending starts (no new CRD revision)
+
+`status.prediction.startup.pendingEvidence` is new and only informative. The CRD revision stays 5: on a CRD without
+the field the API server drops it from the status and nothing else changes. Apply this release's CRD to see it.
+`pendingSeconds` now counts only pods that have never been Ready; see
+[configuration.md](configuration.md#forecast-contract-v2-engine-statistical-preview).
+
 ## Forecast families (CRD revision 5)
 
 Revision 5 adds `spec.prediction.families`: the forecast families the statistical forecaster issues and may select

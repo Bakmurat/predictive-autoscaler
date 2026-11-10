@@ -683,6 +683,13 @@ func TestV2LeadCoversTheScheduledDecisionInterval(t *testing.T) {
 // serveCurrentReplicaSet answers the target's ReplicaSet and pod lists: one current ReplicaSet, no pods.
 func serveCurrentReplicaSet(t *testing.T, f *v2Fixture) {
 	t.Helper()
+	serveReplicaSetPods(t, f)
+}
+
+// serveReplicaSetPods answers the target's ReplicaSet and pod lists: one current ReplicaSet and the pods given to the
+// returned function (startupPod fixtures, re-owned by that ReplicaSet; none until it is called).
+func serveReplicaSetPods(t *testing.T, f *v2Fixture) func(...podSpec) {
+	t.Helper()
 	var dep appsv1.Deployment
 	if err := f.r.Get(context.Background(), f.req.NamespacedName, &dep); err != nil {
 		t.Fatal(err)
@@ -696,15 +703,142 @@ func serveCurrentReplicaSet(t *testing.T, f *v2Fixture) {
 		OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "Deployment", Name: dep.Name, UID: dep.UID, Controller: &ctrlTrue}}},
 		Spec: appsv1.ReplicaSetSpec{Template: *dep.Spec.Template.DeepCopy()}}
 	rs.Spec.Template.Labels = map[string]string{podTemplateHashLabel: "h"}
+	var pods []corev1.Pod
 	wrapClient(f.r, interceptor.Funcs{List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
 		switch l := list.(type) {
 		case *appsv1.ReplicaSetList:
 			l.Items = []appsv1.ReplicaSet{rs}
 			return nil
 		case *corev1.PodList:
-			l.Items = nil
+			l.Items = pods
 			return nil
 		}
 		return c.List(ctx, list, opts...)
 	}})
+	return func(specs ...podSpec) {
+		pods = nil
+		for _, spec := range specs {
+			p := startupPod(spec) // created relative to startupNow, which is v2Origin
+			p.Namespace = dep.Namespace
+			p.OwnerReferences[0].Name, p.OwnerReferences[0].UID = rs.Name, rs.UID
+			pods = append(pods, *p)
+		}
+	}
+}
+
+// leadAndEpoch is the published lead, the frozen lead and the evidence key the forecasting service files evidence under.
+func (f *v2Fixture) leadAndEpoch(t *testing.T) (lead, frozen int32, epoch string) {
+	t.Helper()
+	a := f.pa(t)
+	p := a.Status.Prediction
+	if p == nil || p.Lead == nil {
+		return 0, p.FrozenLeadSeconds, ""
+	}
+	s, err := resolveV2Settings(a.Spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p.Lead.Seconds, p.FrozenLeadSeconds, v2EvidenceKey(string(a.UID), a.Status.MetricSource.TargetUID, a.Status.MetricSource.SHA256, s, int64(p.Lead.Seconds))
+}
+
+// R3-03 through Reconcile: pods of the current ReplicaSet that are not Ready but are no pending start (a readiness
+// loss, an evicted pod still listed, a terminating pod) leave the lead, the frozen lead and the evidence epoch alone,
+// also across an operator restart.
+func TestV2ReadinessLossAndDeadPodsKeepTheLeadAndTheEpoch(t *testing.T) {
+	f := v2Harness(t, autoscalerv1alpha1.ModeRecommend, "3000")
+	serve := serveReplicaSetPods(t, f)
+	served := podSpec{name: "web-a", hash: "h", createdAgo: 20 * time.Minute, startedAfter: 2 * time.Second, readyAfter: 20 * time.Second}
+	flap, evicted := served, podSpec{name: "web-e", hash: "h", createdAgo: 20 * time.Minute, readyAfter: 20 * time.Second,
+		lostReadyAgo: time.Minute, phase: corev1.PodFailed}
+	flap.lostReadyAgo = -5 * time.Minute // not Ready from origin + 300 s on (the clock is past it in the steps below)
+	terminating := podSpec{name: "web-t", hash: "h", createdAgo: 20 * time.Minute, terminating: true}
+	serve(served)
+	f.reconcile(t)
+	lead0, frozen0, epoch0 := f.leadAndEpoch(t)
+	if lead0 != 900 || frozen0 != 900 || epoch0 == "" {
+		t.Fatalf("precondition: lead %d frozen %d", lead0, frozen0)
+	}
+	serve(flap, evicted, terminating)
+	for i, at := range []int{301, 601, 901, 1201, 1501, 1801, 3301, 6901} {
+		if i == 3 {
+			f.r.startupTrackers = nil // an operator restart: only the pod objects say what the pods were
+		}
+		f.at(at)
+		before := f.stub.requests.Load()
+		d := f.reconcile(t)
+		lead, frozen, epoch := f.leadAndEpoch(t)
+		st := f.pa(t).Status.Prediction.Startup
+		if lead != lead0 || frozen != frozen0 || epoch != epoch0 || st.PendingSeconds != nil || st.PendingEvidence != "" ||
+			st.DelaySeconds == nil || *st.DelaySeconds != 120 {
+			t.Fatalf("t=+%d s: lead %d frozen %d startup %+v (same epoch: %v)", at, lead, frozen, st, epoch == epoch0)
+		}
+		if d.ForecastStatus == "lead_insufficient" || f.stub.requests.Load() != before+1 {
+			t.Fatalf("t=+%d s: the forecast must still be requested: %+v", at, d)
+		}
+	}
+}
+
+// A start that is really pending still raises the budget (R2-02 keeps this), and one longer than the horizon is never
+// cut to fit: there is no lead, no forecast is requested, and the reactive rule carries on. The lead does not come
+// back down by itself afterwards; a change of the startup configuration starts a new lead basis.
+func TestV2PendingStartBeyondTheHorizonDisablesPredictionNotTheReactiveRule(t *testing.T) {
+	f := v2Harness(t, autoscalerv1alpha1.ModeActive, "3000") // 3000 rpm at 600 per replica: 5
+	serve := serveReplicaSetPods(t, f)
+	serve(podSpec{name: "web-n", hash: "h", createdAgo: 400 * time.Second, startedAfter: 3 * time.Second})
+	if d := f.reconcile(t); d.Action != "scale_up" || d.AppliedReplicas != 5 {
+		t.Fatalf("reactive scale-up: %+v", d)
+	}
+	// Pending for 410 s: D = 410, L = ceil((410 + 305 + 15 + 300) / 300) x 300 = 1200.
+	lead, frozen, epoch1200 := f.leadAndEpoch(t)
+	if st := f.pa(t).Status.Prediction.Startup; lead != 1200 || frozen != 1200 || st.PendingSeconds == nil || *st.PendingSeconds != 410 ||
+		st.PendingEvidence != "neverReady" || *st.DelaySeconds != 410 {
+		t.Fatalf("a pending start raises the lead: lead %d frozen %d startup %+v", lead, frozen, st)
+	}
+	// Pending for 3701 s: no lead fits the 3600 s horizon.
+	f.at(3301)
+	before := f.stub.requests.Load()
+	d := f.reconcile(t)
+	if d.ForecastStatus != "lead_insufficient" || d.Action != "at_target" || d.DesiredReplicas != 5 || d.DesiredSource != "reactive" ||
+		d.TelemetryStatus != "measured" || f.stub.requests.Load() != before {
+		t.Fatalf("beyond the horizon the decision is reactive and no forecast is requested: %+v", d)
+	}
+	p := f.pa(t).Status.Prediction
+	if p.Lead != nil || p.FrozenLeadSeconds != 1200 || *p.Startup.PendingSeconds != 3701 || *p.Startup.DelaySeconds != 3701 {
+		t.Fatalf("no lead, and the pending start is reported uncut: %+v startup %+v", p, p.Startup)
+	}
+	if c := f.cond(t, "PredictionReady"); c.Status != "False" || c.Reason != "LeadInsufficient" ||
+		!strings.Contains(c.Message, "exceeds the 3600 s horizon") || !strings.Contains(c.Message, "has not become Ready for 3701 s") {
+		t.Fatalf("PredictionReady: %+v", c)
+	}
+	// The pod is gone: the lead is back, at the frozen value (no automatic shortening within the basis).
+	serve()
+	f.at(3601)
+	f.reconcile(t)
+	if lead, frozen, epoch := f.leadAndEpoch(t); lead != 1200 || frozen != 1200 || epoch != epoch1200 {
+		t.Fatalf("the lead must not shrink by itself: lead %d frozen %d", lead, frozen)
+	}
+	basis := f.pa(t).Status.Prediction.LeadBasis
+	// A spec change outside the lead basis keeps it.
+	a := f.pa(t)
+	a.Spec.MaxReplicas++
+	if err := f.r.Update(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	f.at(3901)
+	f.reconcile(t)
+	if lead, _, _ := f.leadAndEpoch(t); lead != 1200 || f.pa(t).Status.Prediction.LeadBasis != basis {
+		t.Fatalf("maxReplicas is not part of the lead basis: lead %d", lead)
+	}
+	// The reset route: a change of spec.behavior.startup is a new lead basis, chosen from the current budget.
+	a = f.pa(t)
+	one := int32(1)
+	a.Spec.Behavior.Startup.MinimumDelaySeconds = &one
+	if err := f.r.Update(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	f.at(4201)
+	f.reconcile(t)
+	if lead, frozen, _ := f.leadAndEpoch(t); lead != 900 || frozen != 900 || f.pa(t).Status.Prediction.LeadBasis == basis {
+		t.Fatalf("a new lead basis starts from the current budget: lead %d frozen %d", lead, frozen)
+	}
 }
