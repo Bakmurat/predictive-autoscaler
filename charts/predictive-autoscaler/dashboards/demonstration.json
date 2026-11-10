@@ -1,0 +1,5343 @@
+{
+  "uid": "pa-demonstration",
+  "title": "Predictive Autoscaler — Demonstration",
+  "description": "Live demonstration on synthetic diurnal traffic: demand, forecast and trust, scale decision, Ready capacity and service quality for two targets side by side (forecast path and reactive reference). A demonstration, not a comparison result.",
+  "tags": [
+    "predictive-autoscaler",
+    "demonstration"
+  ],
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "version": 1,
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "refresh": "1m",
+  "timezone": "utc",
+  "links": [
+    {
+      "title": "User Guide (docs/user-guide.md)",
+      "type": "link",
+      "url": "https://github.com/Bakmurat/predictive-autoscaler/blob/main/docs/user-guide.md",
+      "targetBlank": true,
+      "icon": "doc",
+      "tooltip": "The full Predictive Autoscaler user guide"
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Data source",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "refresh": 1,
+        "regex": ""
+      },
+      {
+        "name": "install_namespace",
+        "label": "Installed in",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(up{pa_install_namespace!=\"\", job=~\".+-operator-metrics\"}, pa_install_namespace)",
+          "refId": "install_namespace"
+        },
+        "definition": "label_values(up{pa_install_namespace!=\"\", job=~\".+-operator-metrics\"}, pa_install_namespace)",
+        "refresh": 2,
+        "regex": "",
+        "includeAll": false,
+        "multi": false,
+        "sort": 1,
+        "current": {}
+      },
+      {
+        "name": "installation",
+        "label": "Installation",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(up{pa_install_namespace=\"$install_namespace\", job=~\".+-operator-metrics\"}, job)",
+          "refId": "installation"
+        },
+        "definition": "label_values(up{pa_install_namespace=\"$install_namespace\", job=~\".+-operator-metrics\"}, job)",
+        "refresh": 2,
+        "regex": "/^(.+)-operator-metrics$/",
+        "includeAll": false,
+        "multi": false,
+        "sort": 1,
+        "current": {}
+      },
+      {
+        "name": "namespace",
+        "label": "Workload namespace",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(predictive_autoscaler_condition{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\"}, namespace)",
+          "refId": "namespace"
+        },
+        "definition": "label_values(predictive_autoscaler_condition{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\"}, namespace)",
+        "refresh": 2,
+        "regex": "",
+        "includeAll": false,
+        "multi": false,
+        "sort": 1,
+        "current": {}
+      },
+      {
+        "name": "target_a",
+        "label": "Target A (forecast path)",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(predictive_autoscaler_condition{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\"}, autoscaler)",
+          "refId": "target_a"
+        },
+        "definition": "label_values(predictive_autoscaler_condition{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\"}, autoscaler)",
+        "refresh": 2,
+        "regex": "",
+        "includeAll": false,
+        "multi": false,
+        "sort": 1,
+        "current": {}
+      },
+      {
+        "name": "target_b",
+        "label": "Target B (reactive reference)",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(predictive_autoscaler_condition{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\"}, autoscaler)",
+          "refId": "target_b"
+        },
+        "definition": "label_values(predictive_autoscaler_condition{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\"}, autoscaler)",
+        "refresh": 2,
+        "regex": "",
+        "includeAll": false,
+        "multi": false,
+        "sort": 1,
+        "current": {}
+      },
+      {
+        "name": "capacity_per_replica",
+        "label": "Capacity per replica (req/s)",
+        "type": "textbox",
+        "query": "0",
+        "current": {
+          "selected": true,
+          "text": "0",
+          "value": "0"
+        },
+        "hide": 0,
+        "description": "The autoscalers' spec.metrics.requests.capacityPerReplica as a plain number, in requests per second. 0 hides the Ready capacity line."
+      }
+    ]
+  },
+  "annotations": {
+    "list": [
+      {
+        "name": "A scaled up",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "enable": true,
+        "hide": false,
+        "iconColor": "#9085e9",
+        "expr": "(sum(predictive_autoscaler_scale_events_total{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_a\", direction=\"up\"}) - (sum(predictive_autoscaler_scale_events_total{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_a\", direction=\"up\"} offset 1m) or sum(predictive_autoscaler_scale_events_total{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_a\", direction=\"up\"}) * 0)) != 0",
+        "step": "60s",
+        "titleFormat": "A scaled up",
+        "textFormat": "replica write counted by the operator",
+        "tagKeys": ""
+      },
+      {
+        "name": "B scaled up",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "enable": true,
+        "hide": false,
+        "iconColor": "#008300",
+        "expr": "(sum(predictive_autoscaler_scale_events_total{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_b\", direction=\"up\"}) - (sum(predictive_autoscaler_scale_events_total{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_b\", direction=\"up\"} offset 1m) or sum(predictive_autoscaler_scale_events_total{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_b\", direction=\"up\"}) * 0)) != 0",
+        "step": "60s",
+        "titleFormat": "B scaled up",
+        "textFormat": "replica write counted by the operator",
+        "tagKeys": ""
+      },
+      {
+        "name": "A scaled down",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "enable": false,
+        "hide": false,
+        "iconColor": "#9085e9",
+        "expr": "(sum(predictive_autoscaler_scale_events_total{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_a\", direction=\"down\"}) - (sum(predictive_autoscaler_scale_events_total{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_a\", direction=\"down\"} offset 1m) or sum(predictive_autoscaler_scale_events_total{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_a\", direction=\"down\"}) * 0)) != 0",
+        "step": "60s",
+        "titleFormat": "A scaled down",
+        "textFormat": "replica write counted by the operator",
+        "tagKeys": ""
+      },
+      {
+        "name": "B scaled down",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "enable": false,
+        "hide": false,
+        "iconColor": "#008300",
+        "expr": "(sum(predictive_autoscaler_scale_events_total{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_b\", direction=\"down\"}) - (sum(predictive_autoscaler_scale_events_total{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_b\", direction=\"down\"} offset 1m) or sum(predictive_autoscaler_scale_events_total{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_b\", direction=\"down\"}) * 0)) != 0",
+        "step": "60s",
+        "titleFormat": "B scaled down",
+        "textFormat": "replica write counted by the operator",
+        "tagKeys": ""
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "About this dashboard",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 10
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "## Demonstration: predictive scaling on live synthetic diurnal traffic\n\n**What this shows.** Two workloads receive the same generated request program at the same time. **Target A** (left) is on the forecast path. **Target B** (right) is the reactive reference: the same operator and policy on identical traffic, without a predictive extra. Each row follows one step of the chain: demand, forecast and trust, scale decision, Ready capacity, service quality.\n\n**What it is not.** The traffic is **synthetic**: a generated daily program, not real business demand. This is a demonstration of a running system, **not a comparison result**. Nothing on this page is a scored or qualified outcome.\n\n**How to read the Scaling row.** The *recommendation* is what the operator calculated. *Applied scale* is the Deployment's `spec.replicas`. *Ready* is the pods that can serve. In Recommend mode the operator writes nothing, so applied scale does not follow the recommendation. *Ready capacity* is Ready replicas times the **Capacity per replica** variable at the top (set it to the autoscalers' `capacityPerReplica`, in requests per second; 0 hides the line). Around a rise in demand, compare when each target's Ready capacity rises, then check in the Forecast row whether the forecast was trusted at that time, and in the Mode and safety row whether a forecast took part in the decision. The vertical markers are the operator's scale-up writes, one colour per target.\n\n**Reading the panels.** Each pair (A left, B right) has the same time axis, and each panel also loads the other target's series, undrawn, so that both y-axes cover the same range. A panel titled *proxy* stands in for a quantity that no metric exports yet. Not shown, because no metric exists: the autoscaler's mode, the selected forecast family, the reason for a trust change, the forecast window and lead, the requested (as opposed to applied) scale, and the qualification basis with its expiry. `kubectl describe pa` and the forecasting service's `/health` show those. The Demand and Service quality rows read the evaluation fixture's ingress, the fixture pods and the k6 generator (`deploy/eval-c28`); they stay empty for other workloads.\n"
+      }
+    },
+    {
+      "id": 2,
+      "type": "row",
+      "title": "1 · Demand (requests per minute)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 10,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "A · $target_a · Demand: scheduled, received, failed",
+      "description": "Requests per minute for this target. Scheduled arrivals are the generator's own count: every scheduled arrival ends as a completed request or a dropped iteration, and a completed request is counted when it ends (up to the 2 s timeout after it was sent). Received is the arrival count at the ingress, the signal the autoscaler's query reads. The operator's measured rate is the value its last decision used. Failed is every ingress response outside 2xx/3xx; no ready endpoint is the part refused because no pod was Ready.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 11,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "(sum(rate(k6_http_reqs_total{c28_target=\"$target_a\"}[$__rate_interval])) + (sum(rate(k6_dropped_iterations_total{c28_target=\"$target_a\"}[$__rate_interval])) or vector(0))) * 60",
+          "refId": "A",
+          "legendFormat": "generator: scheduled arrivals (completed + dropped)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(k6_dropped_iterations_total{c28_target=\"$target_a\"}[$__rate_interval])) * 60",
+          "refId": "B",
+          "legendFormat": "generator: dropped (scheduled, never sent)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(c28_ingress_requests_total{namespace=\"$namespace\", target=\"$target_a\"}[$__rate_interval])) * 60",
+          "refId": "C",
+          "legendFormat": "ingress: received"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_current_rpm{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_a\"})",
+          "refId": "D",
+          "legendFormat": "operator: measured rate"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(c28_ingress_responses_total{namespace=\"$namespace\", target=\"$target_a\", code!~\"[23]..\"}[$__rate_interval])) * 60",
+          "refId": "E",
+          "legendFormat": "ingress: failed responses"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(c28_ingress_no_ready_endpoints_total{namespace=\"$namespace\", target=\"$target_a\"}[$__rate_interval])) * 60",
+          "refId": "F",
+          "legendFormat": "ingress: no ready endpoint"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "(sum(rate(k6_http_reqs_total{c28_target=\"$target_b\"}[$__rate_interval])) + (sum(rate(k6_dropped_iterations_total{c28_target=\"$target_b\"}[$__rate_interval])) or vector(0))) * 60",
+          "refId": "G",
+          "legendFormat": "(axis) generator: scheduled arrivals (completed + dropped)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(k6_dropped_iterations_total{c28_target=\"$target_b\"}[$__rate_interval])) * 60",
+          "refId": "H",
+          "legendFormat": "(axis) generator: dropped (scheduled, never sent)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(c28_ingress_requests_total{namespace=\"$namespace\", target=\"$target_b\"}[$__rate_interval])) * 60",
+          "refId": "I",
+          "legendFormat": "(axis) ingress: received"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_current_rpm{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_b\"})",
+          "refId": "J",
+          "legendFormat": "(axis) operator: measured rate"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(c28_ingress_responses_total{namespace=\"$namespace\", target=\"$target_b\", code!~\"[23]..\"}[$__rate_interval])) * 60",
+          "refId": "K",
+          "legendFormat": "(axis) ingress: failed responses"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(c28_ingress_no_ready_endpoints_total{namespace=\"$namespace\", target=\"$target_b\"}[$__rate_interval])) * 60",
+          "refId": "L",
+          "legendFormat": "(axis) ingress: no ready endpoint"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqpm",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "generator: scheduled arrivals (completed + dropped)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c3c2b7"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    8,
+                    6
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "generator: dropped (scheduled, never sent)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#8a8983"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dot",
+                  "dash": [
+                    2,
+                    6
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "ingress: received"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "operator: measured rate"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    8,
+                    6
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "ingress: failed responses"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d03b3b"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "ingress: no ready endpoint"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#fab219"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dot",
+                  "dash": [
+                    2,
+                    6
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^\\(axis\\) /"
+            },
+            "properties": [
+              {
+                "id": "custom.lineWidth",
+                "value": 0
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "never"
+              },
+              {
+                "id": "custom.hideFrom",
+                "value": {
+                  "legend": true,
+                  "tooltip": true,
+                  "viz": false
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "B · $target_b · Demand: scheduled, received, failed",
+      "description": "Requests per minute for this target. Scheduled arrivals are the generator's own count: every scheduled arrival ends as a completed request or a dropped iteration, and a completed request is counted when it ends (up to the 2 s timeout after it was sent). Received is the arrival count at the ingress, the signal the autoscaler's query reads. The operator's measured rate is the value its last decision used. Failed is every ingress response outside 2xx/3xx; no ready endpoint is the part refused because no pod was Ready.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 11,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "(sum(rate(k6_http_reqs_total{c28_target=\"$target_b\"}[$__rate_interval])) + (sum(rate(k6_dropped_iterations_total{c28_target=\"$target_b\"}[$__rate_interval])) or vector(0))) * 60",
+          "refId": "A",
+          "legendFormat": "generator: scheduled arrivals (completed + dropped)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(k6_dropped_iterations_total{c28_target=\"$target_b\"}[$__rate_interval])) * 60",
+          "refId": "B",
+          "legendFormat": "generator: dropped (scheduled, never sent)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(c28_ingress_requests_total{namespace=\"$namespace\", target=\"$target_b\"}[$__rate_interval])) * 60",
+          "refId": "C",
+          "legendFormat": "ingress: received"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_current_rpm{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_b\"})",
+          "refId": "D",
+          "legendFormat": "operator: measured rate"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(c28_ingress_responses_total{namespace=\"$namespace\", target=\"$target_b\", code!~\"[23]..\"}[$__rate_interval])) * 60",
+          "refId": "E",
+          "legendFormat": "ingress: failed responses"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(c28_ingress_no_ready_endpoints_total{namespace=\"$namespace\", target=\"$target_b\"}[$__rate_interval])) * 60",
+          "refId": "F",
+          "legendFormat": "ingress: no ready endpoint"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "(sum(rate(k6_http_reqs_total{c28_target=\"$target_a\"}[$__rate_interval])) + (sum(rate(k6_dropped_iterations_total{c28_target=\"$target_a\"}[$__rate_interval])) or vector(0))) * 60",
+          "refId": "G",
+          "legendFormat": "(axis) generator: scheduled arrivals (completed + dropped)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(k6_dropped_iterations_total{c28_target=\"$target_a\"}[$__rate_interval])) * 60",
+          "refId": "H",
+          "legendFormat": "(axis) generator: dropped (scheduled, never sent)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(c28_ingress_requests_total{namespace=\"$namespace\", target=\"$target_a\"}[$__rate_interval])) * 60",
+          "refId": "I",
+          "legendFormat": "(axis) ingress: received"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_current_rpm{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_a\"})",
+          "refId": "J",
+          "legendFormat": "(axis) operator: measured rate"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(c28_ingress_responses_total{namespace=\"$namespace\", target=\"$target_a\", code!~\"[23]..\"}[$__rate_interval])) * 60",
+          "refId": "K",
+          "legendFormat": "(axis) ingress: failed responses"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(c28_ingress_no_ready_endpoints_total{namespace=\"$namespace\", target=\"$target_a\"}[$__rate_interval])) * 60",
+          "refId": "L",
+          "legendFormat": "(axis) ingress: no ready endpoint"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqpm",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "generator: scheduled arrivals (completed + dropped)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c3c2b7"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    8,
+                    6
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "generator: dropped (scheduled, never sent)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#8a8983"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dot",
+                  "dash": [
+                    2,
+                    6
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "ingress: received"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "operator: measured rate"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    8,
+                    6
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "ingress: failed responses"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d03b3b"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "ingress: no ready endpoint"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#fab219"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dot",
+                  "dash": [
+                    2,
+                    6
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^\\(axis\\) /"
+            },
+            "properties": [
+              {
+                "id": "custom.lineWidth",
+                "value": 0
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "never"
+              },
+              {
+                "id": "custom.hideFrom",
+                "value": {
+                  "legend": true,
+                  "tooltip": true,
+                  "viz": false
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "row",
+      "title": "2 · Forecast and trust",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 20,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "A · $target_a · Forecast upper bound against demand",
+      "description": "The forecast upper bound of the request-rate peak in the lead window, against the measured demand (requests per minute). The operator's line is present only while a verified, eligible forecast is used in the decision. The forecaster's lines are its own latest committed bound and point maximum for every candidate family, trusted or not; the forecasting service declares these two series but does not publish values for them yet, so they stay empty until it does. The forecast window and lead are not exported as metrics.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 21,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(c28_ingress_requests_total{namespace=\"$namespace\", target=\"$target_a\"}[$__rate_interval])) * 60",
+          "refId": "A",
+          "legendFormat": "ingress: received"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_current_rpm{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_a\"})",
+          "refId": "B",
+          "legendFormat": "operator: measured rate"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_predicted_rpm{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_a\"})",
+          "refId": "C",
+          "legendFormat": "operator: forecast bound used in the decision"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (model) (predictive_autoscaler_forecast_upper_window_rps{job=\"${installation}-forecaster\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_a\"}) * 60",
+          "refId": "D",
+          "legendFormat": "forecaster: latest upper bound, {{model}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (model) (predictive_autoscaler_forecast_base_window_rps{job=\"${installation}-forecaster\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_a\"}) * 60",
+          "refId": "E",
+          "legendFormat": "forecaster: latest point maximum, {{model}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(c28_ingress_requests_total{namespace=\"$namespace\", target=\"$target_b\"}[$__rate_interval])) * 60",
+          "refId": "F",
+          "legendFormat": "(axis) ingress: received"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_current_rpm{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_b\"})",
+          "refId": "G",
+          "legendFormat": "(axis) operator: measured rate"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_predicted_rpm{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_b\"})",
+          "refId": "H",
+          "legendFormat": "(axis) operator: forecast bound used in the decision"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (model) (predictive_autoscaler_forecast_upper_window_rps{job=\"${installation}-forecaster\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_b\"}) * 60",
+          "refId": "I",
+          "legendFormat": "(axis) forecaster: latest upper bound, {{model}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (model) (predictive_autoscaler_forecast_base_window_rps{job=\"${installation}-forecaster\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_b\"}) * 60",
+          "refId": "J",
+          "legendFormat": "(axis) forecaster: latest point maximum, {{model}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqpm",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "ingress: received"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "operator: measured rate"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    8,
+                    6
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "operator: forecast bound used in the decision"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^forecaster:\\ latest\\ upper\\ bound,\\ .+$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    8,
+                    6
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^forecaster:\\ latest\\ point\\ maximum,\\ .+$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c98500"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dot",
+                  "dash": [
+                    2,
+                    6
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^\\(axis\\) /"
+            },
+            "properties": [
+              {
+                "id": "custom.lineWidth",
+                "value": 0
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "never"
+              },
+              {
+                "id": "custom.hideFrom",
+                "value": {
+                  "legend": true,
+                  "tooltip": true,
+                  "viz": false
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "B · $target_b · Forecast upper bound against demand",
+      "description": "The forecast upper bound of the request-rate peak in the lead window, against the measured demand (requests per minute). The operator's line is present only while a verified, eligible forecast is used in the decision. The forecaster's lines are its own latest committed bound and point maximum for every candidate family, trusted or not; the forecasting service declares these two series but does not publish values for them yet, so they stay empty until it does. The forecast window and lead are not exported as metrics.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 21,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(c28_ingress_requests_total{namespace=\"$namespace\", target=\"$target_b\"}[$__rate_interval])) * 60",
+          "refId": "A",
+          "legendFormat": "ingress: received"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_current_rpm{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_b\"})",
+          "refId": "B",
+          "legendFormat": "operator: measured rate"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_predicted_rpm{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_b\"})",
+          "refId": "C",
+          "legendFormat": "operator: forecast bound used in the decision"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (model) (predictive_autoscaler_forecast_upper_window_rps{job=\"${installation}-forecaster\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_b\"}) * 60",
+          "refId": "D",
+          "legendFormat": "forecaster: latest upper bound, {{model}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (model) (predictive_autoscaler_forecast_base_window_rps{job=\"${installation}-forecaster\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_b\"}) * 60",
+          "refId": "E",
+          "legendFormat": "forecaster: latest point maximum, {{model}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(c28_ingress_requests_total{namespace=\"$namespace\", target=\"$target_a\"}[$__rate_interval])) * 60",
+          "refId": "F",
+          "legendFormat": "(axis) ingress: received"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_current_rpm{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_a\"})",
+          "refId": "G",
+          "legendFormat": "(axis) operator: measured rate"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_predicted_rpm{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_a\"})",
+          "refId": "H",
+          "legendFormat": "(axis) operator: forecast bound used in the decision"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (model) (predictive_autoscaler_forecast_upper_window_rps{job=\"${installation}-forecaster\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_a\"}) * 60",
+          "refId": "I",
+          "legendFormat": "(axis) forecaster: latest upper bound, {{model}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (model) (predictive_autoscaler_forecast_base_window_rps{job=\"${installation}-forecaster\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_a\"}) * 60",
+          "refId": "J",
+          "legendFormat": "(axis) forecaster: latest point maximum, {{model}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqpm",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "ingress: received"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "operator: measured rate"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    8,
+                    6
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "operator: forecast bound used in the decision"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^forecaster:\\ latest\\ upper\\ bound,\\ .+$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    8,
+                    6
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^forecaster:\\ latest\\ point\\ maximum,\\ .+$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c98500"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dot",
+                  "dash": [
+                    2,
+                    6
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^\\(axis\\) /"
+            },
+            "properties": [
+              {
+                "id": "custom.lineWidth",
+                "value": 0
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "never"
+              },
+              {
+                "id": "custom.hideFrom",
+                "value": {
+                  "legend": true,
+                  "tooltip": true,
+                  "viz": false
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "type": "state-timeline",
+      "title": "A · $target_a · Trust state over time",
+      "description": "First row: the trust phase the forecasting service reported with the last forecast, as the operator received it (Collecting, Calibrating, Shadow, Trusted, Degraded); empty while there is no forecast. Other rows: whether each candidate family's evidence gates pass, from the forecasting service. Trusted means ready to activate: Recommend mode still makes no writes. The reason for a promotion or demotion and the selected family are not exported as metrics.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 30,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "1 * sum(predictive_autoscaler_prediction_gate{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_a\", phase=\"Collecting\"}) + 2 * sum(predictive_autoscaler_prediction_gate{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_a\", phase=\"Calibrating\"}) + 3 * sum(predictive_autoscaler_prediction_gate{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_a\", phase=\"Shadow\"}) + 4 * sum(predictive_autoscaler_prediction_gate{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_a\", phase=\"Trusted\"}) + 5 * sum(predictive_autoscaler_prediction_gate{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_a\", phase=\"Degraded\"})",
+          "refId": "A",
+          "legendFormat": "trust phase (operator)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (model) (predictive_autoscaler_forecast_trusted{job=\"${installation}-forecaster\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_a\"})",
+          "refId": "B",
+          "legendFormat": "{{model}} gates (forecaster)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 80,
+            "lineWidth": 0
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "Collecting",
+                  "color": "#8a8983",
+                  "index": 0
+                },
+                "2": {
+                  "text": "Calibrating",
+                  "color": "#86b6ef",
+                  "index": 1
+                },
+                "3": {
+                  "text": "Shadow",
+                  "color": "#3987e5",
+                  "index": 2
+                },
+                "4": {
+                  "text": "Trusted",
+                  "color": "#0ca30c",
+                  "index": 3
+                },
+                "5": {
+                  "text": "Degraded",
+                  "color": "#d03b3b",
+                  "index": 4
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#8a8983"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/ gates \\(forecaster\\)$/"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "text": "not trusted",
+                        "color": "#8a8983",
+                        "index": 0
+                      },
+                      "1": {
+                        "text": "trusted",
+                        "color": "#0ca30c",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "mergeValues": true,
+        "showValue": "auto",
+        "alignValue": "left",
+        "rowHeight": 0.85,
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "type": "state-timeline",
+      "title": "B · $target_b · Trust state over time",
+      "description": "First row: the trust phase the forecasting service reported with the last forecast, as the operator received it (Collecting, Calibrating, Shadow, Trusted, Degraded); empty while there is no forecast. Other rows: whether each candidate family's evidence gates pass, from the forecasting service. Trusted means ready to activate: Recommend mode still makes no writes. The reason for a promotion or demotion and the selected family are not exported as metrics.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 30,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "1 * sum(predictive_autoscaler_prediction_gate{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_b\", phase=\"Collecting\"}) + 2 * sum(predictive_autoscaler_prediction_gate{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_b\", phase=\"Calibrating\"}) + 3 * sum(predictive_autoscaler_prediction_gate{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_b\", phase=\"Shadow\"}) + 4 * sum(predictive_autoscaler_prediction_gate{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_b\", phase=\"Trusted\"}) + 5 * sum(predictive_autoscaler_prediction_gate{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_b\", phase=\"Degraded\"})",
+          "refId": "A",
+          "legendFormat": "trust phase (operator)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (model) (predictive_autoscaler_forecast_trusted{job=\"${installation}-forecaster\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_b\"})",
+          "refId": "B",
+          "legendFormat": "{{model}} gates (forecaster)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 80,
+            "lineWidth": 0
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "Collecting",
+                  "color": "#8a8983",
+                  "index": 0
+                },
+                "2": {
+                  "text": "Calibrating",
+                  "color": "#86b6ef",
+                  "index": 1
+                },
+                "3": {
+                  "text": "Shadow",
+                  "color": "#3987e5",
+                  "index": 2
+                },
+                "4": {
+                  "text": "Trusted",
+                  "color": "#0ca30c",
+                  "index": 3
+                },
+                "5": {
+                  "text": "Degraded",
+                  "color": "#d03b3b",
+                  "index": 4
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#8a8983"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/ gates \\(forecaster\\)$/"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "text": "not trusted",
+                        "color": "#8a8983",
+                        "index": 0
+                      },
+                      "1": {
+                        "text": "trusted",
+                        "color": "#0ca30c",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "mergeValues": true,
+        "showValue": "auto",
+        "alignValue": "left",
+        "rowHeight": 0.85,
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "A · $target_a · Forecast coverage and outcome availability",
+      "description": "From the forecasting service, per candidate family. Coverage: the share of matured windows whose realised peak stayed at or under the issued bound over 7 days, against the configured target. Outcome availability: the share of the last day's due windows that were scored. Both are absent, not 0 or 100 %, while nothing has matured.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 36,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (model) (predictive_autoscaler_forecast_window_coverage_ratio{job=\"${installation}-forecaster\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_a\", cohort=\"gate\"})",
+          "refId": "A",
+          "legendFormat": "{{model}}: coverage of matured bounds (7 d)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (model) (predictive_autoscaler_forecast_nominal_coverage_ratio{job=\"${installation}-forecaster\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_a\"})",
+          "refId": "B",
+          "legendFormat": "{{model}}: coverage target"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (model) (predictive_autoscaler_forecast_outcome_availability_ratio{job=\"${installation}-forecaster\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_a\"})",
+          "refId": "C",
+          "legendFormat": "{{model}}: outcome availability (1 d)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear"
+          },
+          "max": 1
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^.+:\\ coverage\\ of\\ matured\\ bounds\\ \\(7\\ d\\)$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^.+:\\ coverage\\ target$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c3c2b7"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    8,
+                    6
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^.+:\\ outcome\\ availability\\ \\(1\\ d\\)$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#199e70"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "B · $target_b · Forecast coverage and outcome availability",
+      "description": "From the forecasting service, per candidate family. Coverage: the share of matured windows whose realised peak stayed at or under the issued bound over 7 days, against the configured target. Outcome availability: the share of the last day's due windows that were scored. Both are absent, not 0 or 100 %, while nothing has matured.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 36,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (model) (predictive_autoscaler_forecast_window_coverage_ratio{job=\"${installation}-forecaster\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_b\", cohort=\"gate\"})",
+          "refId": "A",
+          "legendFormat": "{{model}}: coverage of matured bounds (7 d)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (model) (predictive_autoscaler_forecast_nominal_coverage_ratio{job=\"${installation}-forecaster\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_b\"})",
+          "refId": "B",
+          "legendFormat": "{{model}}: coverage target"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (model) (predictive_autoscaler_forecast_outcome_availability_ratio{job=\"${installation}-forecaster\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_b\"})",
+          "refId": "C",
+          "legendFormat": "{{model}}: outcome availability (1 d)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear"
+          },
+          "max": 1
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^.+:\\ coverage\\ of\\ matured\\ bounds\\ \\(7\\ d\\)$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^.+:\\ coverage\\ target$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c3c2b7"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    8,
+                    6
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^.+:\\ outcome\\ availability\\ \\(1\\ d\\)$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#199e70"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "A · $target_a · Forecast evidence (windows)",
+      "description": "From the forecasting service, per candidate family: scorable windows with an issued bound in the trailing 7 days, and scores in the calibration buffer.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 43,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (model) (predictive_autoscaler_forecast_scored_windows{job=\"${installation}-forecaster\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_a\", cohort=\"gate\"})",
+          "refId": "A",
+          "legendFormat": "{{model}}: scored windows with a bound (7 d)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (model) (predictive_autoscaler_forecast_calibration_windows{job=\"${installation}-forecaster\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_a\"})",
+          "refId": "B",
+          "legendFormat": "{{model}}: calibration scores"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (model) (predictive_autoscaler_forecast_scored_windows{job=\"${installation}-forecaster\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_b\", cohort=\"gate\"})",
+          "refId": "C",
+          "legendFormat": "(axis) {{model}}: scored windows with a bound (7 d)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (model) (predictive_autoscaler_forecast_calibration_windows{job=\"${installation}-forecaster\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_b\"})",
+          "refId": "D",
+          "legendFormat": "(axis) {{model}}: calibration scores"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^.+:\\ scored\\ windows\\ with\\ a\\ bound\\ \\(7\\ d\\)$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^.+:\\ calibration\\ scores$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c98500"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^\\(axis\\) /"
+            },
+            "properties": [
+              {
+                "id": "custom.lineWidth",
+                "value": 0
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "never"
+              },
+              {
+                "id": "custom.hideFrom",
+                "value": {
+                  "legend": true,
+                  "tooltip": true,
+                  "viz": false
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "B · $target_b · Forecast evidence (windows)",
+      "description": "From the forecasting service, per candidate family: scorable windows with an issued bound in the trailing 7 days, and scores in the calibration buffer.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 43,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (model) (predictive_autoscaler_forecast_scored_windows{job=\"${installation}-forecaster\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_b\", cohort=\"gate\"})",
+          "refId": "A",
+          "legendFormat": "{{model}}: scored windows with a bound (7 d)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (model) (predictive_autoscaler_forecast_calibration_windows{job=\"${installation}-forecaster\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_b\"})",
+          "refId": "B",
+          "legendFormat": "{{model}}: calibration scores"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (model) (predictive_autoscaler_forecast_scored_windows{job=\"${installation}-forecaster\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_a\", cohort=\"gate\"})",
+          "refId": "C",
+          "legendFormat": "(axis) {{model}}: scored windows with a bound (7 d)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (model) (predictive_autoscaler_forecast_calibration_windows{job=\"${installation}-forecaster\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_a\"})",
+          "refId": "D",
+          "legendFormat": "(axis) {{model}}: calibration scores"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^.+:\\ scored\\ windows\\ with\\ a\\ bound\\ \\(7\\ d\\)$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^.+:\\ calibration\\ scores$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c98500"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^\\(axis\\) /"
+            },
+            "properties": [
+              {
+                "id": "custom.lineWidth",
+                "value": 0
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "never"
+              },
+              {
+                "id": "custom.hideFrom",
+                "value": {
+                  "legend": true,
+                  "tooltip": true,
+                  "viz": false
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 14,
+      "type": "row",
+      "title": "3 · Scaling: recommendation, applied scale, Ready capacity",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 49,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "A · $target_a · Replicas: recommendation, applied, Ready",
+      "description": "Recommendation is the operator's calculated count (before scale-down stabilization); it is the larger of the reactive need and, when a forecast is used, the forecast-side count. Applied scale is the Deployment's spec.replicas, whoever wrote it. Ready is the pods that can serve. In Recommend mode nothing is written, so applied scale does not follow the recommendation. The scale the operator requested (as opposed to what was applied) is not exported as a metric.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 50,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_actual_needed_replicas{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_a\"})",
+          "refId": "A",
+          "legendFormat": "reactive need (measured rate only)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_predicted_replicas{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_a\"})",
+          "refId": "B",
+          "legendFormat": "forecast-side count (0 while no forecast is used)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_desired_replicas{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_a\"})",
+          "refId": "C",
+          "legendFormat": "recommendation (calculated)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(kube_deployment_spec_replicas{namespace=\"$namespace\", deployment=\"$target_a\"})",
+          "refId": "D",
+          "legendFormat": "applied scale (Deployment spec.replicas)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(kube_deployment_status_replicas_ready{namespace=\"$namespace\", deployment=\"$target_a\"})",
+          "refId": "E",
+          "legendFormat": "Ready replicas"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_actual_needed_replicas{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_b\"})",
+          "refId": "F",
+          "legendFormat": "(axis) reactive need (measured rate only)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_predicted_replicas{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_b\"})",
+          "refId": "G",
+          "legendFormat": "(axis) forecast-side count (0 while no forecast is used)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_desired_replicas{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_b\"})",
+          "refId": "H",
+          "legendFormat": "(axis) recommendation (calculated)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(kube_deployment_spec_replicas{namespace=\"$namespace\", deployment=\"$target_b\"})",
+          "refId": "I",
+          "legendFormat": "(axis) applied scale (Deployment spec.replicas)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(kube_deployment_status_replicas_ready{namespace=\"$namespace\", deployment=\"$target_b\"})",
+          "refId": "J",
+          "legendFormat": "(axis) Ready replicas"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "stepAfter"
+          },
+          "decimals": 0
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "reactive need (measured rate only)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    8,
+                    6
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "forecast-side count (0 while no forecast is used)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    8,
+                    6
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "recommendation (calculated)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c98500"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "applied scale (Deployment spec.replicas)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d55181"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Ready replicas"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#199e70"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^\\(axis\\) /"
+            },
+            "properties": [
+              {
+                "id": "custom.lineWidth",
+                "value": 0
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "never"
+              },
+              {
+                "id": "custom.hideFrom",
+                "value": {
+                  "legend": true,
+                  "tooltip": true,
+                  "viz": false
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "B · $target_b · Replicas: recommendation, applied, Ready",
+      "description": "Recommendation is the operator's calculated count (before scale-down stabilization); it is the larger of the reactive need and, when a forecast is used, the forecast-side count. Applied scale is the Deployment's spec.replicas, whoever wrote it. Ready is the pods that can serve. In Recommend mode nothing is written, so applied scale does not follow the recommendation. The scale the operator requested (as opposed to what was applied) is not exported as a metric.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 50,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_actual_needed_replicas{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_b\"})",
+          "refId": "A",
+          "legendFormat": "reactive need (measured rate only)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_predicted_replicas{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_b\"})",
+          "refId": "B",
+          "legendFormat": "forecast-side count (0 while no forecast is used)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_desired_replicas{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_b\"})",
+          "refId": "C",
+          "legendFormat": "recommendation (calculated)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(kube_deployment_spec_replicas{namespace=\"$namespace\", deployment=\"$target_b\"})",
+          "refId": "D",
+          "legendFormat": "applied scale (Deployment spec.replicas)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(kube_deployment_status_replicas_ready{namespace=\"$namespace\", deployment=\"$target_b\"})",
+          "refId": "E",
+          "legendFormat": "Ready replicas"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_actual_needed_replicas{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_a\"})",
+          "refId": "F",
+          "legendFormat": "(axis) reactive need (measured rate only)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_predicted_replicas{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_a\"})",
+          "refId": "G",
+          "legendFormat": "(axis) forecast-side count (0 while no forecast is used)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_desired_replicas{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_a\"})",
+          "refId": "H",
+          "legendFormat": "(axis) recommendation (calculated)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(kube_deployment_spec_replicas{namespace=\"$namespace\", deployment=\"$target_a\"})",
+          "refId": "I",
+          "legendFormat": "(axis) applied scale (Deployment spec.replicas)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(kube_deployment_status_replicas_ready{namespace=\"$namespace\", deployment=\"$target_a\"})",
+          "refId": "J",
+          "legendFormat": "(axis) Ready replicas"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "stepAfter"
+          },
+          "decimals": 0
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "reactive need (measured rate only)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    8,
+                    6
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "forecast-side count (0 while no forecast is used)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    8,
+                    6
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "recommendation (calculated)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c98500"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "applied scale (Deployment spec.replicas)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d55181"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Ready replicas"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#199e70"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^\\(axis\\) /"
+            },
+            "properties": [
+              {
+                "id": "custom.lineWidth",
+                "value": 0
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "never"
+              },
+              {
+                "id": "custom.hideFrom",
+                "value": {
+                  "legend": true,
+                  "tooltip": true,
+                  "viz": false
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "A · $target_a · Ready capacity against demand",
+      "description": "Ready capacity in requests per minute: Ready replicas x the Capacity per replica variable x 60. The variable is a dashboard constant (no metric exports the autoscaler's capacityPerReplica); set it to that value in requests per second, and the line is hidden while it is 0. Demand above the capacity line is demand the Ready pods are not sized for.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 59,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(c28_ingress_requests_total{namespace=\"$namespace\", target=\"$target_a\"}[$__rate_interval])) * 60",
+          "refId": "A",
+          "legendFormat": "ingress: received"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_predicted_rpm{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_a\"})",
+          "refId": "B",
+          "legendFormat": "operator: forecast bound used in the decision"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(kube_deployment_status_replicas_ready{namespace=\"$namespace\", deployment=\"$target_a\"}) * $capacity_per_replica * 60 and on() (vector($capacity_per_replica) > 0)",
+          "refId": "C",
+          "legendFormat": "Ready capacity (Ready replicas x capacity per replica)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(c28_ingress_requests_total{namespace=\"$namespace\", target=\"$target_b\"}[$__rate_interval])) * 60",
+          "refId": "D",
+          "legendFormat": "(axis) ingress: received"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_predicted_rpm{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_b\"})",
+          "refId": "E",
+          "legendFormat": "(axis) operator: forecast bound used in the decision"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(kube_deployment_status_replicas_ready{namespace=\"$namespace\", deployment=\"$target_b\"}) * $capacity_per_replica * 60 and on() (vector($capacity_per_replica) > 0)",
+          "refId": "F",
+          "legendFormat": "(axis) Ready capacity (Ready replicas x capacity per replica)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqpm",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "ingress: received"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "operator: forecast bound used in the decision"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Ready capacity (Ready replicas x capacity per replica)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#199e70"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^\\(axis\\) /"
+            },
+            "properties": [
+              {
+                "id": "custom.lineWidth",
+                "value": 0
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "never"
+              },
+              {
+                "id": "custom.hideFrom",
+                "value": {
+                  "legend": true,
+                  "tooltip": true,
+                  "viz": false
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "B · $target_b · Ready capacity against demand",
+      "description": "Ready capacity in requests per minute: Ready replicas x the Capacity per replica variable x 60. The variable is a dashboard constant (no metric exports the autoscaler's capacityPerReplica); set it to that value in requests per second, and the line is hidden while it is 0. Demand above the capacity line is demand the Ready pods are not sized for.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 59,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(c28_ingress_requests_total{namespace=\"$namespace\", target=\"$target_b\"}[$__rate_interval])) * 60",
+          "refId": "A",
+          "legendFormat": "ingress: received"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_predicted_rpm{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_b\"})",
+          "refId": "B",
+          "legendFormat": "operator: forecast bound used in the decision"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(kube_deployment_status_replicas_ready{namespace=\"$namespace\", deployment=\"$target_b\"}) * $capacity_per_replica * 60 and on() (vector($capacity_per_replica) > 0)",
+          "refId": "C",
+          "legendFormat": "Ready capacity (Ready replicas x capacity per replica)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(c28_ingress_requests_total{namespace=\"$namespace\", target=\"$target_a\"}[$__rate_interval])) * 60",
+          "refId": "D",
+          "legendFormat": "(axis) ingress: received"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_predicted_rpm{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", application=\"$target_a\"})",
+          "refId": "E",
+          "legendFormat": "(axis) operator: forecast bound used in the decision"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(kube_deployment_status_replicas_ready{namespace=\"$namespace\", deployment=\"$target_a\"}) * $capacity_per_replica * 60 and on() (vector($capacity_per_replica) > 0)",
+          "refId": "F",
+          "legendFormat": "(axis) Ready capacity (Ready replicas x capacity per replica)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqpm",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "ingress: received"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "operator: forecast bound used in the decision"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Ready capacity (Ready replicas x capacity per replica)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#199e70"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^\\(axis\\) /"
+            },
+            "properties": [
+              {
+                "id": "custom.lineWidth",
+                "value": 0
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "never"
+              },
+              {
+                "id": "custom.hideFrom",
+                "value": {
+                  "legend": true,
+                  "tooltip": true,
+                  "viz": false
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "A · $target_a · Forecast contribution to the decision",
+      "description": "Replicas a verified forecast added above the reactive need in the last decision, after the predictive-extra cap, and whether that cap bound. Both are absent when no forecast was used. A reactive reference configured with no predictive extra stays at 0.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 68,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_predictive_extra_replicas{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_a\"})",
+          "refId": "A",
+          "legendFormat": "replicas the forecast added above the reactive need"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_predictive_capped{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_a\"})",
+          "refId": "B",
+          "legendFormat": "predictive-extra cap bound (1 = yes)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_predictive_extra_replicas{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_b\"})",
+          "refId": "C",
+          "legendFormat": "(axis) replicas the forecast added above the reactive need"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_predictive_capped{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_b\"})",
+          "refId": "D",
+          "legendFormat": "(axis) predictive-extra cap bound (1 = yes)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "stepAfter"
+          },
+          "decimals": 0
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "replicas the forecast added above the reactive need"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "predictive-extra cap bound (1 = yes)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c3c2b7"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dot",
+                  "dash": [
+                    2,
+                    6
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^\\(axis\\) /"
+            },
+            "properties": [
+              {
+                "id": "custom.lineWidth",
+                "value": 0
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "never"
+              },
+              {
+                "id": "custom.hideFrom",
+                "value": {
+                  "legend": true,
+                  "tooltip": true,
+                  "viz": false
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "B · $target_b · Forecast contribution to the decision",
+      "description": "Replicas a verified forecast added above the reactive need in the last decision, after the predictive-extra cap, and whether that cap bound. Both are absent when no forecast was used. A reactive reference configured with no predictive extra stays at 0.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 68,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_predictive_extra_replicas{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_b\"})",
+          "refId": "A",
+          "legendFormat": "replicas the forecast added above the reactive need"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_predictive_capped{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_b\"})",
+          "refId": "B",
+          "legendFormat": "predictive-extra cap bound (1 = yes)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_predictive_extra_replicas{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_a\"})",
+          "refId": "C",
+          "legendFormat": "(axis) replicas the forecast added above the reactive need"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_predictive_capped{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_a\"})",
+          "refId": "D",
+          "legendFormat": "(axis) predictive-extra cap bound (1 = yes)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "stepAfter"
+          },
+          "decimals": 0
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "replicas the forecast added above the reactive need"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "predictive-extra cap bound (1 = yes)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c3c2b7"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dot",
+                  "dash": [
+                    2,
+                    6
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^\\(axis\\) /"
+            },
+            "properties": [
+              {
+                "id": "custom.lineWidth",
+                "value": 0
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "never"
+              },
+              {
+                "id": "custom.hideFrom",
+                "value": {
+                  "legend": true,
+                  "tooltip": true,
+                  "viz": false
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 21,
+      "type": "row",
+      "title": "4 · Mode and safety",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 74,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 22,
+      "type": "state-timeline",
+      "title": "A · $target_a · Conditions and decision basis",
+      "description": "The autoscaler's status conditions over time. ScalingActive=True means Active mode with writes permitted; False covers Recommend mode and every hold (the mode and the reason are not exported as metrics). PredictionReady=True means the operator verified a forecast as eligible now. Decision basis: 'forecast took part' while ForecastAvailable is True, otherwise 'reactive only', which is the fallback to the measured rate. TelemetryAvailable=False holds the replica count. ConflictDetected=True and ScaleOutBlocked=True are problems. The qualification basis and its expiry are not exported as metrics.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 75,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (type) (predictive_autoscaler_condition{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_a\", type=~\"ScalingActive|PredictionReady|ForecastAvailable|TelemetryAvailable|ConflictDetected|ScaleOutBlocked\", status=\"True\"}) + 2 * sum by (type) (predictive_autoscaler_condition{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_a\", type=~\"ScalingActive|PredictionReady|ForecastAvailable|TelemetryAvailable|ConflictDetected|ScaleOutBlocked\", status=\"Unknown\"})",
+          "refId": "A",
+          "legendFormat": "{{type}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_condition{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_a\", type=\"ForecastAvailable\", status=\"True\"})",
+          "refId": "B",
+          "legendFormat": "decision basis"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 80,
+            "lineWidth": 0
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "True",
+                  "color": "#0ca30c",
+                  "index": 0
+                },
+                "0": {
+                  "text": "False",
+                  "color": "#8a8983",
+                  "index": 1
+                },
+                "2": {
+                  "text": "Unknown",
+                  "color": "#fab219",
+                  "index": 2
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#8a8983"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "TelemetryAvailable"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "1": {
+                        "text": "True",
+                        "color": "#0ca30c",
+                        "index": 0
+                      },
+                      "0": {
+                        "text": "False",
+                        "color": "#d03b3b",
+                        "index": 1
+                      },
+                      "2": {
+                        "text": "Unknown",
+                        "color": "#fab219",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^(ConflictDetected|ScaleOutBlocked)$/"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "1": {
+                        "text": "True",
+                        "color": "#d03b3b",
+                        "index": 0
+                      },
+                      "0": {
+                        "text": "False",
+                        "color": "#0ca30c",
+                        "index": 1
+                      },
+                      "2": {
+                        "text": "Unknown",
+                        "color": "#fab219",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "decision basis"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "1": {
+                        "text": "forecast took part",
+                        "color": "#0ca30c",
+                        "index": 0
+                      },
+                      "0": {
+                        "text": "reactive only",
+                        "color": "#8a8983",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "mergeValues": true,
+        "showValue": "auto",
+        "alignValue": "left",
+        "rowHeight": 0.85,
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 23,
+      "type": "state-timeline",
+      "title": "B · $target_b · Conditions and decision basis",
+      "description": "The autoscaler's status conditions over time. ScalingActive=True means Active mode with writes permitted; False covers Recommend mode and every hold (the mode and the reason are not exported as metrics). PredictionReady=True means the operator verified a forecast as eligible now. Decision basis: 'forecast took part' while ForecastAvailable is True, otherwise 'reactive only', which is the fallback to the measured rate. TelemetryAvailable=False holds the replica count. ConflictDetected=True and ScaleOutBlocked=True are problems. The qualification basis and its expiry are not exported as metrics.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 75,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (type) (predictive_autoscaler_condition{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_b\", type=~\"ScalingActive|PredictionReady|ForecastAvailable|TelemetryAvailable|ConflictDetected|ScaleOutBlocked\", status=\"True\"}) + 2 * sum by (type) (predictive_autoscaler_condition{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_b\", type=~\"ScalingActive|PredictionReady|ForecastAvailable|TelemetryAvailable|ConflictDetected|ScaleOutBlocked\", status=\"Unknown\"})",
+          "refId": "A",
+          "legendFormat": "{{type}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(predictive_autoscaler_condition{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=\"$target_b\", type=\"ForecastAvailable\", status=\"True\"})",
+          "refId": "B",
+          "legendFormat": "decision basis"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 80,
+            "lineWidth": 0
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "True",
+                  "color": "#0ca30c",
+                  "index": 0
+                },
+                "0": {
+                  "text": "False",
+                  "color": "#8a8983",
+                  "index": 1
+                },
+                "2": {
+                  "text": "Unknown",
+                  "color": "#fab219",
+                  "index": 2
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#8a8983"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "TelemetryAvailable"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "1": {
+                        "text": "True",
+                        "color": "#0ca30c",
+                        "index": 0
+                      },
+                      "0": {
+                        "text": "False",
+                        "color": "#d03b3b",
+                        "index": 1
+                      },
+                      "2": {
+                        "text": "Unknown",
+                        "color": "#fab219",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^(ConflictDetected|ScaleOutBlocked)$/"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "1": {
+                        "text": "True",
+                        "color": "#d03b3b",
+                        "index": 0
+                      },
+                      "0": {
+                        "text": "False",
+                        "color": "#0ca30c",
+                        "index": 1
+                      },
+                      "2": {
+                        "text": "Unknown",
+                        "color": "#fab219",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "decision basis"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "1": {
+                        "text": "forecast took part",
+                        "color": "#0ca30c",
+                        "index": 0
+                      },
+                      "0": {
+                        "text": "reactive only",
+                        "color": "#8a8983",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "mergeValues": true,
+        "showValue": "auto",
+        "alignValue": "left",
+        "rowHeight": 0.85,
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 24,
+      "type": "row",
+      "title": "5 · Service quality",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 84,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "A · $target_a · Latency at the ingress: p95 and p99",
+      "description": "Latency of successful requests measured at the ingress. Dashed lines: the service objectives, p95 at most 200 ms and p99 at most 500 ms. The quantiles are estimated from histogram buckets (200 ms and 500 ms are bucket edges).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 85,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(c28_ingress_duration_seconds_bucket{namespace=\"$namespace\", target=\"$target_a\", outcome=\"success\"}[$__rate_interval])))",
+          "refId": "A",
+          "legendFormat": "p95 (successful requests)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(c28_ingress_duration_seconds_bucket{namespace=\"$namespace\", target=\"$target_a\", outcome=\"success\"}[$__rate_interval])))",
+          "refId": "B",
+          "legendFormat": "p99 (successful requests)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(c28_ingress_duration_seconds_bucket{namespace=\"$namespace\", target=\"$target_b\", outcome=\"success\"}[$__rate_interval])))",
+          "refId": "C",
+          "legendFormat": "(axis) p95 (successful requests)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(c28_ingress_duration_seconds_bucket{namespace=\"$namespace\", target=\"$target_b\", outcome=\"success\"}[$__rate_interval])))",
+          "refId": "D",
+          "legendFormat": "(axis) p99 (successful requests)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "transparent",
+                "value": null
+              },
+              {
+                "color": "#fab219",
+                "value": 0.2
+              },
+              {
+                "color": "#d03b3b",
+                "value": 0.5
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "p95 (successful requests)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "p99 (successful requests)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^\\(axis\\) /"
+            },
+            "properties": [
+              {
+                "id": "custom.lineWidth",
+                "value": 0
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "never"
+              },
+              {
+                "id": "custom.hideFrom",
+                "value": {
+                  "legend": true,
+                  "tooltip": true,
+                  "viz": false
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "B · $target_b · Latency at the ingress: p95 and p99",
+      "description": "Latency of successful requests measured at the ingress. Dashed lines: the service objectives, p95 at most 200 ms and p99 at most 500 ms. The quantiles are estimated from histogram buckets (200 ms and 500 ms are bucket edges).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 85,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(c28_ingress_duration_seconds_bucket{namespace=\"$namespace\", target=\"$target_b\", outcome=\"success\"}[$__rate_interval])))",
+          "refId": "A",
+          "legendFormat": "p95 (successful requests)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(c28_ingress_duration_seconds_bucket{namespace=\"$namespace\", target=\"$target_b\", outcome=\"success\"}[$__rate_interval])))",
+          "refId": "B",
+          "legendFormat": "p99 (successful requests)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(c28_ingress_duration_seconds_bucket{namespace=\"$namespace\", target=\"$target_a\", outcome=\"success\"}[$__rate_interval])))",
+          "refId": "C",
+          "legendFormat": "(axis) p95 (successful requests)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(c28_ingress_duration_seconds_bucket{namespace=\"$namespace\", target=\"$target_a\", outcome=\"success\"}[$__rate_interval])))",
+          "refId": "D",
+          "legendFormat": "(axis) p99 (successful requests)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "transparent",
+                "value": null
+              },
+              {
+                "color": "#fab219",
+                "value": 0.2
+              },
+              {
+                "color": "#d03b3b",
+                "value": 0.5
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "p95 (successful requests)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "p99 (successful requests)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^\\(axis\\) /"
+            },
+            "properties": [
+              {
+                "id": "custom.lineWidth",
+                "value": 0
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "never"
+              },
+              {
+                "id": "custom.hideFrom",
+                "value": {
+                  "legend": true,
+                  "tooltip": true,
+                  "viz": false
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 27,
+      "type": "timeseries",
+      "title": "A · $target_a · Error fraction",
+      "description": "Failed share of the ingress's responses (every code outside 2xx/3xx), and the failed share of the requests the generator completed (status 0 is no response within the 2 s timeout; dropped iterations are in the Demand row). Dashed line: the objective, at most 0.1 %.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 93,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "(sum(rate(c28_ingress_responses_total{namespace=\"$namespace\", target=\"$target_a\", code!~\"[23]..\"}[$__rate_interval])) or vector(0)) / sum(rate(c28_ingress_responses_total{namespace=\"$namespace\", target=\"$target_a\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "ingress: failed fraction of responses"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "(sum(rate(k6_http_reqs_total{c28_target=\"$target_a\", status!~\"[23]..\"}[$__rate_interval])) or vector(0)) / sum(rate(k6_http_reqs_total{c28_target=\"$target_a\"}[$__rate_interval]))",
+          "refId": "B",
+          "legendFormat": "generator: failed fraction of completed requests"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "(sum(rate(c28_ingress_responses_total{namespace=\"$namespace\", target=\"$target_b\", code!~\"[23]..\"}[$__rate_interval])) or vector(0)) / sum(rate(c28_ingress_responses_total{namespace=\"$namespace\", target=\"$target_b\"}[$__rate_interval]))",
+          "refId": "C",
+          "legendFormat": "(axis) ingress: failed fraction of responses"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "(sum(rate(k6_http_reqs_total{c28_target=\"$target_b\", status!~\"[23]..\"}[$__rate_interval])) or vector(0)) / sum(rate(k6_http_reqs_total{c28_target=\"$target_b\"}[$__rate_interval]))",
+          "refId": "D",
+          "legendFormat": "(axis) generator: failed fraction of completed requests"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "transparent",
+                "value": null
+              },
+              {
+                "color": "#d03b3b",
+                "value": 0.001
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "ingress: failed fraction of responses"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d03b3b"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "generator: failed fraction of completed requests"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d55181"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    8,
+                    6
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^\\(axis\\) /"
+            },
+            "properties": [
+              {
+                "id": "custom.lineWidth",
+                "value": 0
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "never"
+              },
+              {
+                "id": "custom.hideFrom",
+                "value": {
+                  "legend": true,
+                  "tooltip": true,
+                  "viz": false
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 28,
+      "type": "timeseries",
+      "title": "B · $target_b · Error fraction",
+      "description": "Failed share of the ingress's responses (every code outside 2xx/3xx), and the failed share of the requests the generator completed (status 0 is no response within the 2 s timeout; dropped iterations are in the Demand row). Dashed line: the objective, at most 0.1 %.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 93,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "(sum(rate(c28_ingress_responses_total{namespace=\"$namespace\", target=\"$target_b\", code!~\"[23]..\"}[$__rate_interval])) or vector(0)) / sum(rate(c28_ingress_responses_total{namespace=\"$namespace\", target=\"$target_b\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "ingress: failed fraction of responses"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "(sum(rate(k6_http_reqs_total{c28_target=\"$target_b\", status!~\"[23]..\"}[$__rate_interval])) or vector(0)) / sum(rate(k6_http_reqs_total{c28_target=\"$target_b\"}[$__rate_interval]))",
+          "refId": "B",
+          "legendFormat": "generator: failed fraction of completed requests"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "(sum(rate(c28_ingress_responses_total{namespace=\"$namespace\", target=\"$target_a\", code!~\"[23]..\"}[$__rate_interval])) or vector(0)) / sum(rate(c28_ingress_responses_total{namespace=\"$namespace\", target=\"$target_a\"}[$__rate_interval]))",
+          "refId": "C",
+          "legendFormat": "(axis) ingress: failed fraction of responses"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "(sum(rate(k6_http_reqs_total{c28_target=\"$target_a\", status!~\"[23]..\"}[$__rate_interval])) or vector(0)) / sum(rate(k6_http_reqs_total{c28_target=\"$target_a\"}[$__rate_interval]))",
+          "refId": "D",
+          "legendFormat": "(axis) generator: failed fraction of completed requests"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "transparent",
+                "value": null
+              },
+              {
+                "color": "#d03b3b",
+                "value": 0.001
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "ingress: failed fraction of responses"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d03b3b"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "generator: failed fraction of completed requests"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d55181"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    8,
+                    6
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^\\(axis\\) /"
+            },
+            "properties": [
+              {
+                "id": "custom.lineWidth",
+                "value": 0
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "never"
+              },
+              {
+                "id": "custom.hideFrom",
+                "value": {
+                  "legend": true,
+                  "tooltip": true,
+                  "viz": false
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 29,
+      "type": "timeseries",
+      "title": "A · $target_a · Fixture queue and requests in flight",
+      "description": "From the fixture pods of the target (their own /metrics; they must be scraped): requests waiting for a worker and requests being served, summed over the pods.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 101,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(c28_queue{namespace=\"$namespace\", target=\"$target_a\"})",
+          "refId": "A",
+          "legendFormat": "fixture: requests waiting (all pods)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(c28_inflight{namespace=\"$namespace\", target=\"$target_a\"})",
+          "refId": "B",
+          "legendFormat": "fixture: requests in flight (all pods)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(c28_queue{namespace=\"$namespace\", target=\"$target_b\"})",
+          "refId": "C",
+          "legendFormat": "(axis) fixture: requests waiting (all pods)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(c28_inflight{namespace=\"$namespace\", target=\"$target_b\"})",
+          "refId": "D",
+          "legendFormat": "(axis) fixture: requests in flight (all pods)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "fixture: requests waiting (all pods)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c98500"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "fixture: requests in flight (all pods)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^\\(axis\\) /"
+            },
+            "properties": [
+              {
+                "id": "custom.lineWidth",
+                "value": 0
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "never"
+              },
+              {
+                "id": "custom.hideFrom",
+                "value": {
+                  "legend": true,
+                  "tooltip": true,
+                  "viz": false
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "B · $target_b · Fixture queue and requests in flight",
+      "description": "From the fixture pods of the target (their own /metrics; they must be scraped): requests waiting for a worker and requests being served, summed over the pods.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 101,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(c28_queue{namespace=\"$namespace\", target=\"$target_b\"})",
+          "refId": "A",
+          "legendFormat": "fixture: requests waiting (all pods)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(c28_inflight{namespace=\"$namespace\", target=\"$target_b\"})",
+          "refId": "B",
+          "legendFormat": "fixture: requests in flight (all pods)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(c28_queue{namespace=\"$namespace\", target=\"$target_a\"})",
+          "refId": "C",
+          "legendFormat": "(axis) fixture: requests waiting (all pods)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(c28_inflight{namespace=\"$namespace\", target=\"$target_a\"})",
+          "refId": "D",
+          "legendFormat": "(axis) fixture: requests in flight (all pods)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "fixture: requests waiting (all pods)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c98500"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "fixture: requests in flight (all pods)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^\\(axis\\) /"
+            },
+            "properties": [
+              {
+                "id": "custom.lineWidth",
+                "value": 0
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "never"
+              },
+              {
+                "id": "custom.hideFrom",
+                "value": {
+                  "legend": true,
+                  "tooltip": true,
+                  "viz": false
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "A · $target_a · CPU throttling",
+      "description": "Share of CFS periods in which the target's containers were throttled (cAdvisor). Absent for containers without a CPU limit.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 108,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(container_cpu_cfs_throttled_periods_total{namespace=\"$namespace\", pod=~\"$target_a-[a-z0-9]+-[a-z0-9]+\", container!=\"\"}[$__rate_interval])) / sum(rate(container_cpu_cfs_periods_total{namespace=\"$namespace\", pod=~\"$target_a-[a-z0-9]+-[a-z0-9]+\", container!=\"\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "share of CFS periods throttled (all containers of the target)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(container_cpu_cfs_throttled_periods_total{namespace=\"$namespace\", pod=~\"$target_b-[a-z0-9]+-[a-z0-9]+\", container!=\"\"}[$__rate_interval])) / sum(rate(container_cpu_cfs_periods_total{namespace=\"$namespace\", pod=~\"$target_b-[a-z0-9]+-[a-z0-9]+\", container!=\"\"}[$__rate_interval]))",
+          "refId": "B",
+          "legendFormat": "(axis) share of CFS periods throttled (all containers of the target)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "share of CFS periods throttled (all containers of the target)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^\\(axis\\) /"
+            },
+            "properties": [
+              {
+                "id": "custom.lineWidth",
+                "value": 0
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "never"
+              },
+              {
+                "id": "custom.hideFrom",
+                "value": {
+                  "legend": true,
+                  "tooltip": true,
+                  "viz": false
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "B · $target_b · CPU throttling",
+      "description": "Share of CFS periods in which the target's containers were throttled (cAdvisor). Absent for containers without a CPU limit.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 108,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(container_cpu_cfs_throttled_periods_total{namespace=\"$namespace\", pod=~\"$target_b-[a-z0-9]+-[a-z0-9]+\", container!=\"\"}[$__rate_interval])) / sum(rate(container_cpu_cfs_periods_total{namespace=\"$namespace\", pod=~\"$target_b-[a-z0-9]+-[a-z0-9]+\", container!=\"\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "share of CFS periods throttled (all containers of the target)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(container_cpu_cfs_throttled_periods_total{namespace=\"$namespace\", pod=~\"$target_a-[a-z0-9]+-[a-z0-9]+\", container!=\"\"}[$__rate_interval])) / sum(rate(container_cpu_cfs_periods_total{namespace=\"$namespace\", pod=~\"$target_a-[a-z0-9]+-[a-z0-9]+\", container!=\"\"}[$__rate_interval]))",
+          "refId": "B",
+          "legendFormat": "(axis) share of CFS periods throttled (all containers of the target)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "share of CFS periods throttled (all containers of the target)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^\\(axis\\) /"
+            },
+            "properties": [
+              {
+                "id": "custom.lineWidth",
+                "value": 0
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "never"
+              },
+              {
+                "id": "custom.hideFrom",
+                "value": {
+                  "legend": true,
+                  "tooltip": true,
+                  "viz": false
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 33,
+      "type": "row",
+      "title": "6 · Health of the autoscaler",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 115,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 34,
+      "type": "timeseries",
+      "title": "Forecaster Ready (proxy for journal health)",
+      "description": "PROXY. No metric exports the forecast journal's health. The forecasting service's readiness probe fails while its journal cannot support issuance, so its Ready replica count (kube-state-metrics) stands in; a pod that is not Ready for another reason looks the same.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 116,
+        "w": 8,
+        "h": 7
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(kube_deployment_status_replicas_ready{namespace=\"$install_namespace\", deployment=\"${installation}-forecaster\"})",
+          "refId": "A",
+          "legendFormat": "forecaster Ready replicas"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "stepAfter"
+          },
+          "decimals": 0
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "forecaster Ready replicas"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#199e70"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 35,
+      "type": "timeseries",
+      "title": "Forecast state volume used (proxy for journal size)",
+      "description": "PROXY. No metric exports the journal's size. This is the kubelet's used and total bytes of the chart's forecast state volume (the claim <installation>-forecast-state), which holds the journal. Empty with another claim name or a volume type the kubelet does not report.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 116,
+        "w": 8,
+        "h": 7
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(kubelet_volume_stats_used_bytes{namespace=\"$install_namespace\", persistentvolumeclaim=\"${installation}-forecast-state\"})",
+          "refId": "A",
+          "legendFormat": "state volume used"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(kubelet_volume_stats_capacity_bytes{namespace=\"$install_namespace\", persistentvolumeclaim=\"${installation}-forecast-state\"})",
+          "refId": "B",
+          "legendFormat": "state volume size"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "state volume used"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "state volume size"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c3c2b7"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    8,
+                    6
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 36,
+      "type": "timeseries",
+      "title": "Forecast issuances per minute",
+      "description": "Unique committed forecast issuances per minute, per target and candidate family (retries excluded). One issuance is expected per decision interval; a lower rate is a missed forecast opportunity.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 116,
+        "w": 8,
+        "h": 7
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (autoscaler, model) (rate(predictive_autoscaler_forecast_issued_total{job=\"${installation}-forecaster\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=~\"$target_a|$target_b\"}[$__rate_interval])) * 60",
+          "refId": "A",
+          "legendFormat": "{{autoscaler}} {{model}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear"
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 37,
+      "type": "timeseries",
+      "title": "Forecast evidence age",
+      "description": "Seconds since the last prospective outcome that counts for the trust gates, per target and candidate family. Absent while there is none.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 123,
+        "w": 8,
+        "h": 7
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (autoscaler, model) (predictive_autoscaler_forecast_evidence_age_seconds{job=\"${installation}-forecaster\", pa_install_namespace=\"$install_namespace\", namespace=\"$namespace\", autoscaler=~\"$target_a|$target_b\"})",
+          "refId": "A",
+          "legendFormat": "{{autoscaler}} {{model}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear"
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 38,
+      "type": "timeseries",
+      "title": "Operator reconciles and errors per minute",
+      "description": "The operator's reconciles by result and its reconcile errors, per minute (controller-runtime's own metrics, all autoscalers of this installation).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 123,
+        "w": 8,
+        "h": 7
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (result) (rate(controller_runtime_reconcile_total{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\"}[$__rate_interval])) * 60",
+          "refId": "A",
+          "legendFormat": "reconciles: {{result}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(controller_runtime_reconcile_errors_total{job=\"${installation}-operator-metrics\", pa_install_namespace=\"$install_namespace\"}[$__rate_interval])) * 60",
+          "refId": "B",
+          "legendFormat": "reconcile errors"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear"
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "reconcile errors"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d03b3b"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 39,
+      "type": "timeseries",
+      "title": "Scrape targets",
+      "description": "Whether the metrics store reaches the operator and the forecasting service (1 = up).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 123,
+        "w": 8,
+        "h": 7
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "up{job=~\"${installation}-(operator-metrics|forecaster)\", pa_install_namespace=\"$install_namespace\"}",
+          "refId": "A",
+          "legendFormat": "{{pa_install_namespace}} {{job}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "stepAfter"
+          },
+          "decimals": 0,
+          "max": 1,
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    }
+  ]
+}

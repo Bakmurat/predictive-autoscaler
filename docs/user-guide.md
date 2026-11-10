@@ -125,7 +125,7 @@ cluster, or give several releases disjoint `operator.watchNamespaces`. Other opt
 | `networkPolicy.*` | The NetworkPolicies (on by default): DNS, Kubernetes API addresses and ports, Prometheus peers, who may scrape metrics. |
 | `metrics.serviceMonitor` / `metrics.vmServiceScrape` | Scrape objects for the Prometheus Operator or the VictoriaMetrics Operator. |
 | `metrics.alerts.*` | Alert rules as a `PrometheusRule` or `VMRule`, their thresholds and extra labels ([Monitoring](#11-monitoring-metrics-the-help-dashboard-and-alerts)). |
-| `dashboards.*` | The Grafana "Help & Overview" dashboard as a ConfigMap for the Grafana sidecar. |
+| `dashboards.*` | The Grafana "Help & Overview" dashboard as a ConfigMap for the Grafana sidecar, and under `dashboards.demonstration.*` the optional [demonstration dashboard](#the-demonstration-dashboard). |
 
 `values.yaml` documents every option and `values.schema.json` rejects unknown keys. After the install, `helm status`
 prints the chart's notes. Full reference: [helm.md](helm.md).
@@ -434,7 +434,9 @@ and at most one more fixed label:
   `predictive_autoscaler_forecast_calibration_windows`, `predictive_autoscaler_forecast_history_seconds`,
   `predictive_autoscaler_forecast_evidence_age_seconds` and `predictive_autoscaler_forecast_fit_failures_total`.
 - **Trust:** `predictive_autoscaler_forecast_trusted` (1 when that model's evidence gates pass) and the latest
-  `predictive_autoscaler_forecast_upper_window_rps` / `predictive_autoscaler_forecast_base_window_rps`.
+  `predictive_autoscaler_forecast_upper_window_rps` / `predictive_autoscaler_forecast_base_window_rps` (these two are
+  declared, but the service does not publish values for them yet; the bound a decision used is the operator's
+  `predictive_autoscaler_predicted_rpm`).
 
 A model is trusted only on **prospective** evidence (forecasts issued live before their outcome; offline replays warm up
 calibration but never count, not even in availability or error figures): at least 48 hours and 64 non-overlapping
@@ -487,6 +489,49 @@ autoscaler and application. Its first panel is a short version of this
 guide; the others show the conditions table, forecasting switch, measured vs forecast request rate, replicas, scale
 events, prediction error, model age and model in use, forecast freshness, guard rails and the scrape targets. The
 repository's `grafana/dashboards/` holds further, more detailed research dashboards.
+
+### The demonstration dashboard
+
+Set `dashboards.demonstration.enabled: true` (its own switch; it does not need `dashboards.enabled`) and the chart
+ships a second dashboard, **"Predictive Autoscaler — Demonstration (<namespace>/<release>)"**, in its own ConfigMap
+`<fullname>-demo-dashboard` with the same labels and annotations. It shows two autoscalers side by side on the same
+traffic: **target A** on the forecast path and **target B** as the reactive reference (the same operator and policy
+with `spec.prediction.predictiveExtra` at zero). It is made for a live demonstration on generated traffic. The traffic
+is synthetic, not real business demand, and the page is not a comparison result.
+
+At the top choose the installation as on the Help & Overview dashboard, then the **workload namespace**, the two
+**targets** and the **capacity per replica**. A target is chosen by its PredictiveAutoscaler's name, and the dashboard
+uses the same name for the target Deployment, so the two must match. The capacity is the autoscalers'
+`capacityPerReplica` in requests per second as a plain number: no metric exports it, so it is a dashboard variable, and
+0 hides the capacity line. `dashboards.demonstration.namespace`, `forecastTarget`, `reactiveTarget` and
+`capacityPerReplica` pre-select these.
+
+| Row | Shows (A left, B right) | Reads |
+|---|---|---|
+| 1 Demand | Requests per minute: scheduled by the generator, received at the ingress, the rate the operator measured, failed responses. | k6 (remote write), the fixture's ingress, the operator |
+| 2 Forecast and trust | The forecast upper bound against demand; the trust phase over time and each candidate family's gates; coverage, outcome availability and evidence counts. | the operator, the forecasting service |
+| 3 Scaling | Reactive need, forecast-side count, recommendation, applied scale (`spec.replicas`) and Ready replicas; Ready capacity against demand; the replicas the forecast added. Vertical markers are the operator's scale-up writes, one colour per target. | the operator, kube-state-metrics |
+| 4 Mode and safety | `ScalingActive`, `PredictionReady`, `ForecastAvailable`, `TelemetryAvailable`, `ConflictDetected` and `ScaleOutBlocked` over time, and whether a forecast took part in the decision or it was reactive only. | the operator |
+| 5 Service quality | p95 and p99 latency of successful requests with the 200 ms and 500 ms lines, the error fraction with the 0.1 % line, the fixture's queue and CPU throttling. | the fixture's ingress and pods, k6, cAdvisor |
+| 6 Health | Forecaster readiness and state volume (two proxies, see below), forecast issuances per minute, evidence age, the operator's reconciles and errors, the scrape targets. | kube-state-metrics, the kubelet, both components |
+
+Each pair of panels has the same time axis, and each panel also loads the other target's series without drawing them,
+so that both y-axes cover the same range. In Recommend mode the operator writes nothing, so the applied scale does not
+follow the recommendation.
+
+**What it needs.** This chart's scrape objects (`metrics.serviceMonitor` or `metrics.vmServiceScrape`),
+kube-state-metrics, cAdvisor and kubelet volume metrics in the same data source. The Demand and Service quality rows
+read the evaluation fixture of `deploy/eval-c28`: its ingress and fixture pods scraped with a `namespace` label, and
+the k6 generator's Prometheus remote-write output with its `c28_target` tag. They stay empty for other workloads.
+
+**What it does not show.** No metric exports these yet, so the dashboard leaves them out instead of approximating them:
+the autoscaler's mode (Recommend or Active), the selected forecast family, the reason for a trust change, the forecast
+window and lead, the scale the operator requested (as opposed to the applied `spec.replicas`), and the qualification
+basis with its expiry. `kubectl describe pa` and the forecasting service's `/health` show them. Two Health panels are
+stand-ins and are titled *proxy*: the forecasting service's Ready replicas for its journal's health (its readiness
+probe fails while the journal cannot support issuance), and the kubelet's used bytes of the forecast state volume for
+the journal's size. The forecaster's own upper-bound line stays empty until the service publishes that series (see
+Trust above); the operator's line shows the bound whenever a verified forecast is used.
 
 ### Alerts
 

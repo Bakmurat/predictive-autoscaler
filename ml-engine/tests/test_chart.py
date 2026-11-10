@@ -657,6 +657,114 @@ def test_notes_on_upgrade_explain_the_crd_and_install_notes_do_not(tmp_path):
     assert "Helm never upgrades the CRD" not in _render_notes(tmp_path, BASE)
 
 
+# --- the demonstration dashboard (two targets side by side; its content is pinned in test_demonstration_dashboard.py) ---
+
+DEMO_JSON = CHART / "dashboards" / "demonstration.json"
+DEMO = {"enabled": True, "namespace": "shop", "forecastTarget": "web-pa", "reactiveTarget": "web-reactive",
+        "capacityPerReplica": 18.5}
+
+
+def demo_dashboards(docs):
+    return [d for d in by_kind(docs, "ConfigMap")
+            if d["metadata"]["labels"].get("app.kubernetes.io/component") == "demo-dashboard"]
+
+
+def test_the_demonstration_dashboard_is_opt_in_with_its_own_switch(render):
+    assert not demo_dashboards(render())
+    assert not demo_dashboards(render({"dashboards": {"enabled": True}}))            # the overview alone
+    docs = render({"dashboards": {"demonstration": {"enabled": True}}})                # without the overview
+    (cm,) = demo_dashboards(docs)
+    assert cm["metadata"]["name"] == "pa-predictive-autoscaler-demo-dashboard"
+    assert [d["metadata"]["name"] for d in by_kind(docs, "ConfigMap") if "dashboard" in d["metadata"]["name"]] == [
+        "pa-predictive-autoscaler-demo-dashboard"]
+    both = render({"dashboards": {"enabled": True, "demonstration": {"enabled": True}}})
+    names = {d["metadata"]["name"] for d in by_kind(both, "ConfigMap") if "dashboard" in d["metadata"]["name"]}
+    assert names == {"pa-predictive-autoscaler-dashboards", "pa-predictive-autoscaler-demo-dashboard"}
+
+
+def test_the_demonstration_dashboard_configmap_carries_the_sidecar_label_and_the_shipped_json(render):
+    (cm,) = demo_dashboards(render({"dashboards": {"labels": {"team": "platform"},
+                                                   "annotations": {"grafana_folder": "Predictive Autoscaler"},
+                                                   "demonstration": DEMO}}))
+    meta = cm["metadata"]
+    assert meta["namespace"] == NS
+    assert meta["labels"]["grafana_dashboard"] == "1" and meta["labels"]["team"] == "platform"
+    assert meta["annotations"] == {"grafana_folder": "Predictive Autoscaler"}
+    (key,) = cm["data"]
+    got = json.loads(cm["data"][key])
+    assert key == f"{got['uid']}.json" and re.fullmatch(r"pa-demo-[0-9a-f]{12}", got["uid"])
+    assert got["title"] == "Predictive Autoscaler — Demonstration (pa-system/pa)"
+    variables = {v["name"]: v for v in got["templating"]["list"]}
+    assert {n: variables[n]["current"]["value"] for n in (
+        "install_namespace", "installation", "namespace", "target_a", "target_b", "capacity_per_replica")} == {
+        "install_namespace": NS, "installation": "pa-predictive-autoscaler", "namespace": "shop",
+        "target_a": "web-pa", "target_b": "web-reactive", "capacity_per_replica": "18.5"}
+    assert variables["capacity_per_replica"]["query"] == "18.5"                  # a text box starts from its query
+    # apart from the release-derived identity and the pre-selection, the shipped JSON is embedded unchanged
+    want = json.loads(DEMO_JSON.read_text())
+    for d in (got, want):
+        d.pop("uid"), d.pop("title")
+        for v in d["templating"]["list"]:
+            v.pop("current", None)
+            if v["type"] == "textbox":
+                v.pop("query")
+    assert got == want
+    # small enough for an apply tool that copies the object into its last-applied annotation (256 KiB)
+    assert len(yaml.safe_dump(cm)) < 200_000
+
+
+def test_the_demonstration_dashboard_preselects_only_what_is_set(render):
+    (cm,) = demo_dashboards(render({"dashboards": {"demonstration": {"enabled": True, "namespace": "shop"}}}))
+    (text,) = cm["data"].values()
+    variables = {v["name"]: v for v in json.loads(text)["templating"]["list"]}
+    assert variables["namespace"]["current"]["value"] == "shop"
+    assert variables["target_a"]["current"] == {} and variables["target_b"]["current"] == {}
+    shipped = {v["name"]: v for v in json.loads(DEMO_JSON.read_text())["templating"]["list"]}
+    assert variables["capacity_per_replica"] == shipped["capacity_per_replica"]   # 0: the capacity line stays hidden
+    assert shipped["capacity_per_replica"]["query"] == "0"
+
+
+def test_each_release_gets_its_own_demonstration_dashboard_identity(tmp_path):
+    values = _merge(BASE, {"dashboards": {"enabled": True, "demonstration": {"enabled": True}}})
+    ids = set()
+    for release in ("pa", "pb"):
+        docs = helm(values, tmp_path, release=release)
+        (cm,) = demo_dashboards(docs)
+        (key,) = cm["data"]
+        got = json.loads(cm["data"][key])
+        ids.add((key, got["uid"], got["title"]))
+        # never the overview's key, uid or title: one Grafana folder can hold both
+        (overview,) = [d for d in by_kind(docs, "ConfigMap")
+                       if d["metadata"]["labels"].get("app.kubernetes.io/component") == "dashboards"]
+        (okey,) = overview["data"]
+        other = json.loads(overview["data"][okey])
+        assert key != okey and got["uid"] != other["uid"] and got["title"] != other["title"]
+    assert len({k for k, _, _ in ids}) == len({u for _, u, _ in ids}) == len({t for _, _, t in ids}) == 2
+
+
+@pytest.mark.parametrize("bad", [{"enabled": "yes"}, {"namespace": "Shop"}, {"forecastTarget": "web_pa"},
+                                 {"reactiveTarget": "-web"}, {"capacityPerReplica": -1},
+                                 {"capacityPerReplica": "12.5k"}, {"capacityPerReplica": "1) or vector(1"},
+                                 {"folder": "x"}])
+def test_demonstration_dashboard_values_are_validated(render, bad):
+    p = render({"dashboards": {"demonstration": _merge({"enabled": True}, bad)}}, check=False)
+    assert p.returncode != 0, bad
+
+
+def test_the_longest_release_name_keeps_the_demonstration_dashboard_name_valid(tmp_path):
+    release = "a-very-long-release-name-for-predictive-autoscaling-x"     # Helm's maximum: 53 characters
+    docs = helm(_merge(BASE, {"dashboards": {"demonstration": {"enabled": True}}}), tmp_path, release=release)
+    (cm,) = demo_dashboards(docs)
+    assert len(cm["metadata"]["name"]) <= 63 and cm["metadata"]["name"].endswith("-demo-dashboard")
+
+
+def test_the_notes_name_the_demonstration_dashboard_only_when_enabled(tmp_path):
+    title = "Predictive Autoscaler — Demonstration (pa-system/pa)"
+    assert title not in _render_notes(tmp_path, BASE)
+    notes = _render_notes(tmp_path, _merge(BASE, {"dashboards": {"demonstration": {"enabled": True}}}))
+    assert title in notes and "pa-predictive-autoscaler-demo-dashboard" in notes
+
+
 # --- the statistical forecaster profile (C2.6) ---------------------------------------------------------------------
 
 STAT = {"forecaster": {"engine": "statistical"}, "training": {"targets": []}}

@@ -222,6 +222,17 @@ which needs RBAC to list and watch ConfigMaps there. Its first panel is a Help /
 alerts); the panels use only the operator's metrics and `up`, with a data source variable. The full guide is
 [user-guide.md](user-guide.md).
 
+`dashboards.demonstration.enabled` (its own switch; it does not need `dashboards.enabled`) installs a second dashboard,
+"Predictive Autoscaler — Demonstration (<namespace>/<release>)" (`dashboards/demonstration.json`), in its own ConfigMap
+`<fullname>-demo-dashboard` with the same labels and annotations and an identity derived from the release in the same
+way. It puts two autoscalers side by side on the same generated traffic, target A on the forecast path and target B as
+the reactive reference, from demand to service quality; it is a demonstration, not a comparison result.
+`dashboards.demonstration.namespace`, `forecastTarget`, `reactiveTarget` and `capacityPerReplica` (a plain number,
+requests per second) only pre-select its variables. Besides this chart's scrape objects it reads kube-state-metrics,
+cAdvisor and kubelet volume metrics, and its demand and service-quality rows read the evaluation fixture's ingress and
+k6 metrics (`deploy/eval-c28`). What each row shows, and which quantities it leaves out because no metric exports
+them: [user-guide.md](user-guide.md#the-demonstration-dashboard).
+
 ### Alerts
 
 `metrics.alerts.prometheusRule.enabled` (Prometheus Operator) or `metrics.alerts.vmRule.enabled` (VictoriaMetrics
