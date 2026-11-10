@@ -229,12 +229,12 @@ calibrate.py reduce --bundle evidence/calibrate/<id>      # offline: recompute c
 ```
 
 Manifest section 3's capacity calibration at fixed replicas with no autoscaler, never against a confirmation target.
-The record's `calibrate` section names a **calibration contract** (`c28-calibration-contract/v2`; v1 contracts, which predate the endpoints-rr ingress and its discovery gate, are refused, while recorded v1 bundles still reduce), frozen independently of
+The record's `calibrate` section names a **calibration contract** (`c28-calibration-contract/v3`; v1 contracts, which predate the endpoints-rr ingress and its discovery gate, are refused, while recorded v1 bundles still reduce; v2 contracts, whose dispatch identity omits the ingress's no-ready rejections, are read-only: status, verify, stop and recover of their own calibration and the reduction of their bundles are unchanged, while plan and apply refuse them), frozen independently of
 the unfinished params (only their reservation stage is read): cluster and node UIDs, namespace, source commit and the
 hash of `load/c28-calibrate.js`, the S1 `images.json` with its fixture and generator digests (taken from the record,
 never hardcoded), the candidate (CPU/memory requests and limits, max_inflight, max_queue, queue timeout, GOMAXPROCS,
 response size, startup delay), the work_iterations selection, ingress and generator resources, the observer (query API,
-the evaluation's 15 s scrape cadence, staleness, scrape kind, the exact queries, and `observer.discovery`: the ingress's synced and stale gauges, its scrape timestamp, its endpoint membership and per-endpoint dispatch), the criteria (the manifest's numbers,
+the evaluation's 15 s scrape cadence, staleness, scrape kind, the exact queries, and `observer.discovery`: the ingress's synced and stale gauges, its scrape timestamp, its endpoint membership, per-endpoint dispatch and (v3) `no_ready`, the `c28_ingress_no_ready_endpoints_total` of the target), the criteria (the manifest's numbers,
 which cannot be changed, the queue rule, the limit bounds, the 1.2 ceiling factor), the search bounds and limits
 (maximum trials, total deadline, seed, timeouts), the admission budget and the rollout guard. Placeholders, non-finite
 numbers and unknown fields are refused. The calibration ID is `c28cal-<10 hex of the contract digest>`: any change to
@@ -287,8 +287,13 @@ must report synced 1 and stale 0 from a fresh scrape and route to exactly the va
 measurement a stale flag, a missing or old discovery metric, or a membership mismatch stops the trial as incomplete
 evidence, and the result re-checks every evaluation of the measurement window from the recorded series (a blip between
 two live polls invalidates it too). Each trial records the per-endpoint dispatch (`c28_ingress_dispatched_total` by
-`endpoint_pod`): every arrival dispatched exactly once (sum = received) and only to the trial's fixture pods, with the
-round-robin's spread reported, never judged. Dispatched, received and answered arrivals reconcile
+`endpoint_pod`): every arrival dispatched exactly once or, with a v3 contract, answered 503 by the ingress because the
+target had no READY endpoint (sum + the `no_ready` delta = received, read with the same aligned before/after readings;
+v2: sum = received) and only to the trial's fixture pods, with the round-robin's spread reported, never judged. The
+no-ready 503s stay inside the failure fraction and latency that k6 measures and are reported in the dispatch detail,
+never judged again; an absent `no_ready` counter is 0 only from a successful query of the proven fresh, unchanged
+ingress, while a failed or stale reading, a series that disappears or a reset is incomplete evidence. No discovery,
+membership or stray-endpoint check is waived. Dispatched, received and answered arrivals reconcile
 with tolerance 0/0. The idle CPU baseline is averaged only after a washout of the 60 s rate window plus one CPU scrape
 interval.
 
