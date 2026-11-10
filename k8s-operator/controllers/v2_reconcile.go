@@ -208,6 +208,23 @@ func (out *v2Outcome) forecastStatus() string {
 	return "used"
 }
 
+// requestOutcome is the ledger's v2.request (v2DecisionDetail).
+func (out *v2Outcome) requestOutcome() string {
+	switch {
+	case out.Binding == nil:
+		return "none"
+	case out.Cached:
+		return "cached"
+	case out.Response != nil:
+		return "answered"
+	case stderrors.Is(out.Err, errNotAsked):
+		return "not_sent"
+	case timeoutError(out.Err):
+		return "timeout"
+	}
+	return "failed"
+}
+
 // readiness is the PredictionReady condition: True only when the operator verified a forecast as eligible now. It is
 // about evidence, not authorization: Recommend still writes nothing.
 func (out *v2Outcome) readiness(capacityOK bool, mode string) (bool, string, string) {
@@ -267,10 +284,16 @@ func int32Clamp(v int64) int32 {
 // v2DecisionDetail is the v2 part of the decision ledger line: the forecast it used or rejected, by issuance ID, and
 // how the predictive term was formed.
 type v2DecisionDetail struct {
-	IssuanceID          *string  `json:"issuance_id"`
-	DecisionOrigin      *string  `json:"decision_origin"`
-	ValidUntil          *string  `json:"valid_until"`
-	Cached              bool     `json:"cached"`
+	IssuanceID     *string `json:"issuance_id"`
+	DecisionOrigin *string `json:"decision_origin"`
+	ValidUntil     *string `json:"valid_until"`
+	Cached         bool    `json:"cached"`
+	// Request says what became of this decision's request to the service: answered (a complete, verified answer was
+	// received before the deadline), cached (no request: the verified answer of this origin was reused), timeout (no
+	// answer within the deadline; the request was cancelled, and the service may or may not have issued), not_sent (the
+	// wait allowance was used up), failed (any other error or a refused answer) or none (nothing to ask with). Only
+	// accepted says that a forecast was used.
+	Request             string   `json:"request"`
 	TrustState          *string  `json:"trust_state"`
 	ServiceReason       *string  `json:"service_reason"`
 	ServiceEligible     bool     `json:"service_eligible"`
@@ -291,7 +314,7 @@ type v2DecisionDetail struct {
 }
 
 func (out *v2Outcome) ledger(pol *v2Policy, capacityRPM float64, capacityOK bool, mode string) *v2DecisionDetail {
-	d := &v2DecisionDetail{Cached: out.Cached, SettingsSHA256: out.published.SettingsSHA256}
+	d := &v2DecisionDetail{Cached: out.Cached, Request: out.requestOutcome(), SettingsSHA256: out.published.SettingsSHA256}
 	_, d.Verdict, d.VerdictDetail = out.readiness(capacityOK, mode)
 	if out.startup != nil {
 		d.StartupMethod = out.startup.Method

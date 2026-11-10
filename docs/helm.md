@@ -98,10 +98,10 @@ has:
   may be ReadWriteOnce), so the old pod stops before the new one is ready. While the operator keeps running it uses a
   usable cached forecast, or else the reactive rule on live telemetry, subject to the usual scaling safeguards
   (headroom, stabilization, cooldown, conflict checks). Losing the forecaster adds no hold of its own, and only a
-  bounded wait: a refused connection costs nothing, and a forecaster that accepts requests without answering, or that
-  cannot be reached at all (dropped packets), is waited for at most 5 s once a minute and 0.25 s per decision otherwise,
-  so a round of 20 decisions is at most 10 s late
-  ([configuration.md](configuration.md#waiting-for-the-forecasting-service)). Missing telemetry triggers the existing
+  bounded wait: a refused connection costs nothing, and whatever else the forecaster does (accept requests without
+  answering, drop packets, answer slowly), all forecast requests of all autoscalers together wait at most 5 s plus
+  one sixth of the elapsed time, 10 s in a 30-second round
+  ([configuration.md](configuration.md#waiting-for-the-forecasting-service-and-the-metrics-backend)). Missing telemetry triggers the existing
   telemetry hold (user guide, [section 7](user-guide.md#7-get-forecasts)). Upgrade outside your peak if you rely on
   the forecast's lead time.
 

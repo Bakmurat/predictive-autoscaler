@@ -980,9 +980,10 @@ func mlAPIBaseURL() string {
 }
 
 // fetchV2 returns a verified answer for binding b: the cached one when it was made for exactly this request and its
-// window is still actionable, otherwise a fresh POST /v2/predict, bounded by the forecast wait budget
+// window is still actionable, otherwise a fresh POST /v2/predict, bounded by the forecast wait allowance
 // (forecast_wait.go). A refused, unauthorized or incoherent answer drops the cache. There is no stale reuse: an answer
-// past its deadline is never used, and a request that ran out of its budget is cancelled, so no late answer exists.
+// past its deadline is never used, and a request that ran out of its deadline is cancelled, so no late answer exists
+// here (the service may still have journalled an issuance for it: that is not delivery, and never use).
 func (r *PredictiveAutoscalerReconciler) fetchV2(ctx context.Context, key string, b v2Binding, now time.Time) (*v2Response, bool, error) {
 	if r.v2Cache == nil {
 		r.v2Cache = map[string]*v2CachedForecast{}
@@ -998,7 +999,10 @@ func (r *PredictiveAutoscalerReconciler) fetchV2(ctx context.Context, key string
 	if err != nil {
 		return nil, false, err
 	}
-	fctx, answered := r.forecastContext(ctx)
+	fctx, answered, err := r.forecastContext(ctx, key)
+	if err != nil {
+		return nil, false, err // not sent
+	}
 	out, err := r.requestV2(fctx, b, body)
 	if err = answered(err); err != nil {
 		return nil, false, err
