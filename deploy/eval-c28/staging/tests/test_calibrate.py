@@ -2,6 +2,7 @@ import copy
 import json
 import math
 import os
+import time
 import urllib.parse
 
 import pytest
@@ -473,8 +474,9 @@ def test_status_reports_a_trial_in_progress_as_running_not_interrupted(cal, api)
 
 
 def test_status_after_a_crash_reports_interrupted_and_stop_still_records_it(cal, api):
-    """The crashed executor's trial is interrupted (no lock; a stale lock of a dead executor; a lock taken after the
-    trial began; a lock of another helper); a lock on another host is unverified. stop-plan and stop are unchanged:
+    """The crashed executor's trial is interrupted (no lock; a stale lock of a dead or zombie executor; a lock of
+    another helper or boot); it is unverified when the outcome cannot be established (another host; a live lock whose
+    time is missing or after the begin, as a clock step would make it; an unreadable lock). stop-plan and stop are unchanged:
     the trial is recorded trial-interrupted and the bundle reproduces."""
     ctx = cal()
     real_sleep = ctx.clock.sleep
@@ -494,9 +496,16 @@ def test_status_after_a_crash_reports_interrupted_and_stop_still_records_it(cal,
     import subprocess
     dead = subprocess.Popen(["true"])
     dead.wait()
+    zombie = subprocess.Popen(["true"])                                   # exited, not yet reaped
+    deadline = time.time() + 10
+    while K._process_state(zombie.pid)["state"] != "Z":
+        assert time.time() < deadline
+        time.sleep(0.01)
     begin_at = [e for e in ctx.entries() if e["event"] == "trial-begin"][-1]["at"]
     cases = [({"pid": dead.pid}, "interrupted", False),                    # SIGKILLed executor: its lock stayed
-             ({"at": "2999-01-01T00:00:00Z"}, "interrupted", True),        # a live lock taken after the begin
+             ({"pid": zombie.pid, "pid_start": C.process_start(zombie.pid)}, "interrupted", False),
+             ({"at": "2999-01-01T00:00:00Z"}, "unverified", True),         # a live lock stamped after the begin
+             ({"at": None}, "unverified", True),
              ({"holder": "session"}, "interrupted", False),                # another helper holds the lock
              ({"boot_id": "another-boot"}, "interrupted", False),
              ({"host": "another-host"}, "unverified", None),
@@ -510,6 +519,16 @@ def test_status_after_a_crash_reports_interrupted_and_stop_still_records_it(cal,
         assert [t["id"] for t in st[where]] == ["t003"], (over, st)
         assert sum(len(st[k]) for k in ("running", "unverified", "interrupted")) == 1
         assert st["executor"]["alive"] is alive, (over, st["executor"])
+    zombie.wait()
+    path = PF.lock_file(ctx.record)
+    with open(path, "w") as fh:
+        fh.write("{not json")
+    try:
+        st = K.status(ctx)
+    finally:
+        os.unlink(path)
+    assert [t["id"] for t in st["unverified"]] == ["t003"] and st["interrupted"] == [] and st["running"] == []
+    assert st["executor"]["lock"] == "unreadable" and st["executor"]["alive"] is None
     sp = K.plan_stop(ctx)
     assert sp["interrupted"] == ["t003"]                                   # stop-plan: as before
     plan, digest = CW.reviewed(ctx, K.plan_stop, K.STOP, "stop-plan")
@@ -721,20 +740,23 @@ def test_plan_reports_the_uncapped_bound_the_enforced_budget_and_an_estimate_apa
             int(math.ceil(math.log2(max(2, rmax - rmin)))) + 1
     trials = plateaus * con["repetitions"] + 2 + 1
     assert se["uncapped_search_bound"] == {"plateaus": plateaus, "trials": trials, "trial_seconds": per_trial,
-                                           "duration_s": trials * per_trial + overhead}
+                                           "modelled_duration_s": trials * per_trial + overhead,
+                                           "duration_is_estimate": True, "excludes": K.DURATION_EXCLUDES}
     # the attempt budget apply enforces
     ab = se["attempt_budget"]
     assert ab["enforced"] is True and ab["max_trials"] == con["max_trials"] == se["max_trials"] == 80
     assert ab["deadline_utc"] == con["deadline_utc"] == se["deadline_utc"]
-    assert ab["max_trials_duration_s"] == 80 * per_trial + overhead
+    assert set(ab) == {"enforced", "max_trials", "deadline_utc", "trial_seconds", "uncapped_bound_exceeds_max_trials"}
     assert ab["uncapped_bound_exceeds_max_trials"] is (trials > 80)
     # the estimate: labelled, within the budget, below the uncapped bound
     est = se["estimated_duration"]
     assert est["is_estimate"] is True and "deadline is not modelled" in est["basis"]
+    assert est["excludes"] == K.DURATION_EXCLUDES and "cleanup" in est["excludes"]
+    assert est["at_max_trials_s"] == 80 * per_trial + overhead
     assert est["plateaus"] == 3 * (2 + 3)          # bracket_factor 1.25, resolution 0.05: ceil(log2(5)) = 3 bisections
     assert est["trials"] == 2 + est["plateaus"] * 3 + 1 <= con["max_trials"]
-    assert est["duration_s"] < se["uncapped_search_bound"]["duration_s"]
-    assert est["duration_s"] <= ab["max_trials_duration_s"]
+    assert est["duration_s"] < se["uncapped_search_bound"]["modelled_duration_s"]
+    assert est["duration_s"] <= est["at_max_trials_s"]
     assert X.digest(K.plan(ctx)) == X.digest(p)
 
 
@@ -2476,3 +2498,31 @@ def test_v3_an_error_envelope_is_never_an_absent_counter_at_runtime(cal):
     assert out["verdict"] == "NOT READY" and r["verdict"] == "INCOMPLETE"
     assert any(w.startswith("no-ready rejections before the trial: the query did not succeed") for w in r["incomplete"])
     assert K.reduce_bundle(ctx.dir)["reproduced"]
+
+
+def test_process_state_tells_a_missing_process_from_an_unreadable_one(monkeypatch):
+    """Status only: a process that does not exist is gone; one whose /proc entry cannot be read (permissions) is
+    unknown, and executor_liveness then reports alive None (unverified), never an ended executor."""
+    assert K._process_state(os.getpid())["state"] in ("R", "S")
+    assert K._process_state(-1)["state"] == "gone"
+    import builtins
+    real_open = builtins.open
+
+    def deny(path, *a, **k):
+        if str(path).startswith("/proc/") and str(path).endswith("/stat"):
+            raise PermissionError(13, "denied")
+        return real_open(path, *a, **k)
+    monkeypatch.setattr(builtins, "open", deny)
+    assert K._process_state(os.getpid()) == {"state": "unknown", "why": "PermissionError"}
+
+
+def test_executor_liveness_is_unknown_when_its_process_cannot_be_inspected(cal, monkeypatch):
+    ctx = cal()
+    path = _write_lock(ctx)
+    try:
+        assert K.executor_liveness(ctx.record)["alive"] is True
+        monkeypatch.setattr(K, "_process_state", lambda pid: {"state": "unknown", "why": "PermissionError"})
+        live = K.executor_liveness(ctx.record)
+    finally:
+        os.unlink(path)
+    assert live["alive"] is None and "cannot be inspected" in live["why"]

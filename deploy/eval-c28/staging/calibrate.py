@@ -197,8 +197,9 @@ generator Jobs first and proves their pods gone before touching the fixture; an 
 keeps the lock. An interrupted measurement stays recorded as interrupted and is never resumed: after a crash, recover
 and stop close the calibration as STOPPED; a new attempt is a new contract.attempt and a new ID. `status` (read-only)
 reports an unfinished trial as running only while the calibrate executor that took the lock before its trial-begin is
-still alive (executor_liveness: same host and boot, PID and process start time), as unverified when that executor is
-on another host, and as interrupted otherwise.
+still alive (executor_liveness: same host and boot, PID and process start time, not a zombie), as unverified when
+that cannot be established here (another host, an unreadable lock or process, an ambiguous lock/begin time order), and
+as interrupted otherwise.
 
 Evidence (evidence/calibrate/<id>/): contract.json, objects/, trials/<tNNN>/ (job, pods at begin and end, the generator
 pod with its termination message, the raw observer responses, the derived result), then at close manifest.json (every
@@ -1016,17 +1017,23 @@ def _fixed_overhead_s(con: Dict) -> int:
     return (len(se["replica_counts"]) + 4) * se["converge_timeout_s"] + len(ws["values"]) * ws["idle_s"]
 
 
+# What the plan's modelled durations leave out (Codex: label them modelled estimates with exclusions).
+DURATION_EXCLUDES = ["observer warm-up", "Kubernetes API and observer query time", "cleanup"]
+
+
 def uncapped_search_bound(con: Dict) -> Dict:
     """What the bracket + bisection search could need if NEITHER search.max_trials NOR search.deadline_utc stopped it
     (the numbers the plan used to call "worst_case"): every replica count at its _uncapped_plateaus, every plateau at
     its full repetitions, plus the work selection trials and the ceiling probe, each trial at the search's trial
-    length. A bound on the algorithm, not a forecast, and not what apply allows: see attempt_budget."""
+    length. A bound on the algorithm's trial count, not a forecast, and not what apply allows: see attempt_budget. Its
+    duration is modelled (DURATION_EXCLUDES are not in it), so it is labelled an estimate too."""
     se = con["search"]
     plateaus = sum(_uncapped_plateaus(con, n) for n in se["replica_counts"])
     trials = plateaus * se["repetitions"] + len(con["work_selection"]["values"]) + 1   # + selection + ceiling
     per_trial = trial_seconds(con)
     return {"plateaus": plateaus, "trials": trials, "trial_seconds": per_trial,
-            "duration_s": trials * per_trial + _fixed_overhead_s(con)}
+            "modelled_duration_s": trials * per_trial + _fixed_overhead_s(con), "duration_is_estimate": True,
+            "excludes": DURATION_EXCLUDES}
 
 
 def search_budget(con: Dict) -> Dict:
@@ -1034,13 +1041,14 @@ def search_budget(con: Dict) -> Dict:
     uncapped search bound"). Pure functions of the contract (never of the clock), so the plan and apply's re-plan
     under the lock produce the same figures:
       * uncapped_search_bound: the algorithm's bound with no budget (uncapped_search_bound);
-      * attempt_budget: what apply ENFORCES: search.max_trials (every trial counted; a plateau starts only when all
-        its repetitions fit) and search.deadline_utc (a plateau starts only when its repetitions fit before it), with
-        the longest the trial cap alone allows;
+      * attempt_budget: what apply ENFORCES, and only that: search.max_trials (every trial counted; a plateau starts
+        only when all its repetitions fit) and search.deadline_utc (a plateau starts only when its repetitions fit
+        before it);
       * estimated_duration: an ESTIMATE, not a bound: per replica count the initial plateau, one bracket move and a
         bisection of one bracket_factor-wide bracket down to the resolution (never more than the uncapped plateaus),
         every plateau at its full repetitions, selection trials at their own length, capped at max_trials, plus the
-        fixed overhead at its bound. A search that brackets late, or a deadline, makes the real duration differ."""
+        fixed overhead at its bound, and (at_max_trials_s) the same model with every allowed trial used. Both leave
+        out DURATION_EXCLUDES; a search that brackets late, or a deadline, makes the real duration differ."""
     se, ws = con["search"], con["work_selection"]
     bound = uncapped_search_bound(con)
     per_trial = trial_seconds(con)
@@ -1053,13 +1061,14 @@ def search_budget(con: Dict) -> Dict:
         "uncapped_search_bound": bound,
         "attempt_budget": {"enforced": True, "max_trials": se["max_trials"], "deadline_utc": se["deadline_utc"],
                            "trial_seconds": per_trial,
-                           "max_trials_duration_s": se["max_trials"] * per_trial + _fixed_overhead_s(con),
                            "uncapped_bound_exceeds_max_trials": bound["trials"] > se["max_trials"]},
         "estimated_duration": {"is_estimate": True, "plateaus": plateaus, "trials": selection + search_trials,
                                "duration_s": selection * sel_s + search_trials * per_trial + _fixed_overhead_s(con),
+                               "at_max_trials_s": se["max_trials"] * per_trial + _fixed_overhead_s(con),
                                "basis": "per replica count: the initial plateau, one bracket move, then bisection of "
                                         "one bracket_factor-wide bracket to the resolution; full repetitions; capped "
-                                        "at max_trials; the deadline is not modelled"},
+                                        "at max_trials; the deadline is not modelled",
+                               "excludes": DURATION_EXCLUDES},
     }
 
 
@@ -3654,12 +3663,37 @@ def executor_liveness(record: X.Record) -> Dict:
     if body.get("boot_id") != C._boot_id():                                  # noqa: SLF001 - same package
         return dict(out, alive=False, why="the lock was taken in another boot of this host: its executor ended")
     try:
-        start = C.process_start(int(body.get("pid", -1)))
+        pid = int(body.get("pid", -1))
     except (TypeError, ValueError):
         return dict(out, alive=None, why="the lock's pid is unreadable")
-    if start is not None and start == body.get("pid_start"):
-        return dict(out, alive=True, why=f"its executor (pid {body.get('pid')}) is running")
-    return dict(out, alive=False, why=f"its executor (pid {body.get('pid')}) has ended")
+    proc = _process_state(pid)
+    who = f"its executor (pid {body.get('pid')})"
+    if proc["state"] == "unknown":
+        return dict(out, alive=None, why=f"{who} cannot be inspected ({proc['why']})")
+    if proc["state"] == "gone" or proc["start"] != body.get("pid_start"):
+        return dict(out, alive=False, why=f"{who} has ended")
+    if proc["state"] in ("Z", "X"):
+        return dict(out, alive=False, why=f"{who} has exited (process state {proc['state']}, not yet reaped)")
+    return dict(out, alive=True, why=f"{who} is running")
+
+
+def _process_state(pid: int) -> Dict:
+    """Status only (recovery keeps C.owner_terminated): a process's state letter and start time from
+    /proc/<pid>/stat. gone when no such process exists; unknown when it cannot be read for another reason
+    (permissions, an unparseable stat), so a failed read never counts as an ended executor."""
+    if pid <= 0:
+        return {"state": "gone", "start": None}
+    try:
+        with open(f"/proc/{pid}/stat") as fh:
+            stat = fh.read()
+    except (FileNotFoundError, ProcessLookupError):
+        return {"state": "gone", "start": None}
+    except OSError as e:
+        return {"state": "unknown", "why": type(e).__name__}
+    fields = stat.rsplit(")", 1)[-1].split()
+    if len(fields) < 20:
+        return {"state": "unknown", "why": "unparseable /proc stat"}
+    return {"state": fields[0], "start": fields[19]}
 
 
 def unfinished_trials(entries: List[Dict], cal: str, base: str, liveness: Optional[Dict]) -> Dict[str, List[Dict]]:
@@ -3668,9 +3702,11 @@ def unfinished_trials(entries: List[Dict], cal: str, base: str, liveness: Option
     calibration is open; it is the calibration's latest trial-begin and the latest in the whole calibrate journal; no
     apply-error, stop-begin, cleanup-unresolved or calibration-closed of the calibration follows it; the calibrate
     lock of this record is held by a live executor (executor_liveness alive) that took it no later than the
-    trial-begin (the lock is exclusive and held from then to now, so its holder wrote the begin). With the executor's
-    liveness not checkable here (another host) such a trial is unverified; every other unfinished trial is
-    interrupted (recover and stop record it so; nothing here writes)."""
+    trial-begin (the lock is exclusive and held from then to now, so its holder wrote the begin). Such a trial is
+    unverified, not interrupted, when the outcome cannot be established here: the executor's liveness is unknown
+    (another host, an unreadable lock or process), or it is alive but the lock's time does not order before the
+    begin (missing, unparseable or later: a clock step alone must not establish interruption). Every other unfinished
+    trial is interrupted (recover and stop record it so; nothing here writes)."""
     out: Dict[str, List[Dict]] = {"running": [], "unverified": [], "interrupted": []}
     pending = _trial_records(entries, cal, base)[1]
     if not pending:
@@ -3685,12 +3721,10 @@ def unfinished_trials(entries: List[Dict], cal: str, base: str, liveness: Option
             not any(_mine(e, cal) and e["event"] in ("apply-error", "stop-begin", "cleanup-unresolved",
                                                      "calibration-closed") for e in entries[li + 1:]):
         live = liveness or {}
-        at = live.get("at")
-        if isinstance(at, str) and at <= le.get("at", ""):
-            if live.get("alive") is True:
-                candidate = "running"
-            elif live.get("alive") is None:
-                candidate = "unverified"
+        if live.get("alive") is True:
+            candidate = "running" if _orders_before(live.get("at"), le.get("at")) else "unverified"
+        elif live.get("alive") is None:
+            candidate = "unverified"
         if candidate:
             out[candidate].append(le["data"]["trial"])
     for t in pending:
@@ -3699,10 +3733,18 @@ def unfinished_trials(entries: List[Dict], cal: str, base: str, liveness: Option
     return out
 
 
+def _orders_before(lock_at, begin_at) -> bool:
+    """True only when both stamps parse and the lock's is no later than the trial-begin's."""
+    try:
+        return _utc(lock_at) <= _utc(begin_at)
+    except (TypeError, ValueError):
+        return False
+
+
 def status(ctx: Context) -> Dict:
     """Read-only. interrupted lists the unfinished trials whose executor has ended (or cannot have written them);
-    running the one trial a live executor is measuring now; unverified one whose executor is on another host
-    (unfinished_trials, executor_liveness)."""
+    running the one trial a live executor is measuring now; unverified one whose executor cannot be established here
+    as alive or ended (unfinished_trials, executor_liveness)."""
     entries = ctx.entries()
     trials, _ = _trial_records(entries, ctx.cal, ctx.dir) if os.path.isdir(ctx.dir) else ([], [])
     state = calibration_state(entries, ctx.cal)
