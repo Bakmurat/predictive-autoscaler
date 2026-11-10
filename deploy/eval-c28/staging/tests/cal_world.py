@@ -73,6 +73,7 @@ DISCOVERY_V2 = {
 NO_READY = 'sum(c28_ingress_no_ready_endpoints_total{namespace="__NAMESPACE__",target="__TARGET__"})'
 DISCOVERY = dict(DISCOVERY_V2, no_ready=NO_READY)
 V2 = "c28-calibration-contract/v2"
+V3 = "c28-calibration-contract/v3"          # v4 without observer.latency_offset_s (and its bounds)
 
 
 def contract(tmp, **over):
@@ -96,7 +97,7 @@ def contract(tmp, **over):
         "observer": {"query_api": "http://vmselect.monitoring.svc:8481/select/0/prometheus", "step_s": 15,
                      "max_staleness_s": 60, "scrape": "VMPodScrape", "queries": dict(QUERIES), "pods": [],
                      "pod_label": "pod", "freshness": dict(FRESHNESS), "cpu_scrape_interval_s": 30,
-                     "readiness_timeout_s": 300, "discovery": dict(DISCOVERY)},
+                     "readiness_timeout_s": 300, "discovery": dict(DISCOVERY), "latency_offset_s": 30},
         "stops": {"steal_query": STEAL, "node_label": "nodename", "steal_percent": 5, "steal_bins": 5},
         "criteria": {"p95_ms": 200, "p99_ms": 500, "max_failure_fraction": 0.001, "max_dropped_arrivals": 0,
                      "linearity_min": 0.90, "ceiling_factor": 1.2,
@@ -107,13 +108,15 @@ def contract(tmp, **over):
         "search": {"replica_counts": [1, 2, 4], "repetitions": 3, "settle_s": 300, "measure_s": 900,
                    "rate_min_rps_per_replica": 2, "rate_max_rps_per_replica": 30, "initial_rps_per_replica": 18,
                    "bracket_factor": 1.25, "resolution": 0.05, "max_trials": 80,
-                   "deadline_utc": "2027-01-01T00:00:00Z", "seed": 3101, "completion_grace_s": 45,
+                   "deadline_utc": "2027-01-01T00:00:00Z", "seed": 3101, "completion_grace_s": 62,
                    "job_slack_s": 120, "converge_timeout_s": 300, "poll_s": 300},
         "admission": {"limit_fraction": 0.75, "overlap_pods": 2},
         "rollout_guard": {"kinds": list(K.ROLLOUT_KINDS), "extra_owners": []},
     }
     if over.get("schema") == V2 and "observer.discovery" not in over:
         con["observer"]["discovery"] = dict(DISCOVERY_V2)     # the v2 reference contract
+    if over.get("schema") in (V2, V3):
+        del con["observer"]["latency_offset_s"]               # the v2 and v3 reference contracts
     for path, value in over.items():
         cur = con
         keys = path.split(".")
@@ -135,7 +138,10 @@ def _env(args):
 class World:
     """The simulated cluster state the observer reads; knobs: cap (rps per replica by work_iterations), lin4 (the
     4-replica efficiency), drops, extra_arrivals, stale_after, missing (query kinds answered with no series),
-    gen_throttle, hooks (callables run at each poll with (world, api))."""
+    gen_throttle, hooks (callables run at each poll with (world, api)), tail_copy_s (the query API substitutes the
+    newest points, as VictoriaMetrics does), drift (ingress counters that keep moving), prune_retired_s (the ingress
+    drops a retired endpoint's dispatch series that long after its pod left, as the real one does after 15
+    minutes)."""
 
     def __init__(self, api, clock, cal):
         self.api, self.clock, self.cal = api, clock, cal
@@ -170,6 +176,16 @@ class World:
         self.dispatched = {}
         self.rr_next = {}
         self.dispatch_short = 0
+        # the real ingress prunes a retired endpoint's dispatch series this long after the pod left the endpoint set
+        # (fixture/endpoints.go retiredSeriesKeep = 15 min); None: a retired series is exported for ever
+        self.prune_retired_s = None
+        self.retired_at = {}          # fixture pod name -> when it was first seen gone
+        # VictoriaMetrics' tail substitution (its -search.latencyOffset, 30 s by default): in a range query with a
+        # step under one minute every point newer than now - tail_copy_s is answered with the value of the last
+        # point at or before it, so at a 15 s step the last two points of a query that ends "now" repeat the
+        # third-last. None: every point is the true sample (the simulator's default)
+        self.tail_copy_s = None
+        self.drift = {}               # target -> (from, per second): its ingress counters keep rising from then on
         # arrivals the ingress answers 503 "no ready endpoint" (received, never dispatched; k6 sees failures), per
         # trial id in its measure scenario; the counter per target exists only from its first rejection on
         self.no_ready_trials = {}
@@ -189,6 +205,11 @@ class World:
                 h(self, api)
             self._deployments(api)
             self._jobs(api)
+            live = {n for (k, _, n) in api.objects if k == "pods"}
+            for d in self.dispatched.values():
+                for name in d:
+                    if name not in live:
+                        self.retired_at.setdefault(name, self.clock.now())
         finally:
             self._busy = False
 
@@ -341,6 +362,10 @@ class World:
         doc = self._answer(url)
         doc.setdefault("status", "success")
         doc.setdefault("data", {}).setdefault("resultType", "matrix")
+        step = int(urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["step"][0])
+        if self.tail_copy_s is not None and step < 60:
+            for r in doc["data"].get("result") or []:
+                r["values"] = tail_copied(r["values"], self.clock.now(), self.tail_copy_s)
         return doc
 
     def _answer(self, url):
@@ -401,7 +426,9 @@ class World:
             c = self.counters.get(target)
             if c is None:
                 return {"status": "success", "data": {"result": []}}
-            return self._series([t for t in grid if self._alive(lambda n: "-ing-" in n, t)], lambda t: c[kind])
+            since, rate = self.drift.get(target, (0, 0))
+            return self._series([t for t in grid if self._alive(lambda n: "-ing-" in n, t)],
+                                lambda t: c[kind] + rate * max(0, t - since))
         if kind == "up":
             live = sorted(o["metadata"]["name"] for (k, _, _), o in self.api.objects.items()
                           if k == "pods" and re.fullmatch(pods, o["metadata"]["name"]))
@@ -457,9 +484,9 @@ class World:
         if "c28_ingress_dispatched" in query:
             d = self.dispatched.get(target) or {}
             g = [t for t in grid if self._alive(lambda n: "-ing-" in n, t)]
-            return {"status": "success", "data": {"result": [
-                {"metric": {"endpoint_pod": n}, "values": [[t, str(v)] for t in g]} for n, v in sorted(d.items())
-                if g]}}
+            return {"status": "success", "data": {"result": [x for x in (
+                {"metric": {"endpoint_pod": n}, "values": [[t, str(v)] for t in g if not self._pruned(n, t)]}
+                for n, v in sorted(d.items())) if x["values"]]}}
         if "c28_ingress_endpoint{" in query:
             names = (set(self._variant_pods(target)) - self.disc_hidden) | self.disc_extra
             return {"status": "success", "data": {"result": [x for x in (
@@ -481,6 +508,10 @@ class World:
             {"metric": {"pod": n}, "values": [[t, str(value(t))] for t in grid if self._born_ok(n, t)]}
             for n in sorted(ing) if re.fullmatch(pods, n)) if x["values"]]}}
 
+    def _pruned(self, name, t):
+        return self.prune_retired_s is not None and name in self.retired_at and \
+            t >= self.retired_at[name] + self.prune_retired_s
+
     def _extra_at(self, name, t):
         w = self.disc_extra_window
         return w is None or w[0] <= t <= w[1]
@@ -500,6 +531,21 @@ class World:
         if not grid:
             return {"status": "success", "data": {"result": []}}
         return {"status": "success", "data": {"result": [{"metric": {}, "values": [[t, str(fn(t))] for t in grid]}]}}
+
+
+def tail_copied(values, now, latency_s):
+    """A series' [[t, value], ...] as VictoriaMetrics answers a range query at `now`: a point newer than now -
+    latency_s takes the value of the last point at or before it (and is dropped when there is none)."""
+    out, last = [], None
+    for t, v in values:
+        if t > now - latency_s:
+            if last is None:
+                continue
+            v = last
+        else:
+            last = v
+        out.append([t, v])
+    return out
 
 
 def setup(tmp_path, make_record, api, contract_over=None, images_over=None, nodes_alloc=("4", "8Gi")):
