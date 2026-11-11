@@ -32,7 +32,7 @@ production-ready. Known limits, most important first:
 9. **Heavy footprint:** the forecasting image includes TensorFlow (about 1 CPU / 1 GiB requested); the neural component
    has not shown a consistent advantage over the seasonal pattern in the evaluations so far.
 10. **Statistical forecasts are eligible in one validated configuration only** (engine `statistical`): a 60-second
-    grid, a 600-second lead, the default 90 % target and the seasonal-naive family alone, with default calibration and
+    grid, a 60-second update interval (`updateIntervalSeconds: 60`; the CRD's default is 300), a 600-second lead, the default 90 % target and the seasonal-naive family alone, with default calibration and
     trust settings. Any other grid, lead, target or family set is forecast and scored but stays reactive
     (`ConfigurationNotValidated`): at shorter leads the trust rules either demoted a correctly calibrated forecast too
     often on autocorrelated noise or detected a bad one too slowly, and nothing else has been validated. The rules'

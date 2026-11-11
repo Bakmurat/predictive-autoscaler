@@ -85,9 +85,17 @@ def test_every_setting_changes_the_fingerprint(change):
 
 def test_mode_and_legacy_lead_do_not_change_the_fingerprint():
     a = pa_object(prediction={"leadTimeMinutes": 15, "updateIntervalSeconds": 300})
-    b = pa_object(prediction={"leadTimeMinutes": 20, "updateIntervalSeconds": 60})
+    b = pa_object(prediction={"leadTimeMinutes": 20, "updateIntervalSeconds": 300})
     b["spec"]["mode"] = "Active"
     assert settings_sha(a) == settings_sha(b)
+
+
+def test_the_update_interval_is_in_the_fingerprint_as_the_operator_applies_it():
+    def sha(**pred):
+        return settings_sha(pa_object(prediction=pred))
+    assert sha(updateIntervalSeconds=300) != sha(updateIntervalSeconds=60)       # how often a bound is issued
+    assert sha() == sha(updateIntervalSeconds=60) == sha(updateIntervalSeconds=0)   # the operator's default
+    assert sha(updateIntervalSeconds=10) == sha(updateIntervalSeconds=30)        # ... and its floor
 
 
 @pytest.mark.parametrize("interval,horizon,steps", [

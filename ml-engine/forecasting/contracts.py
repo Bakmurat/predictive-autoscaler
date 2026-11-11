@@ -218,6 +218,21 @@ class PredictiveExtraSettings:
     max_percent: int = 50
 
 
+# spec.prediction.updateIntervalSeconds as the operator applies it (controllers: defaultReconcileSeconds,
+# minReconcileSeconds): absent or 0 is 60 s, anything shorter than 30 s is 30 s. It decides how often a decision is
+# made and a bound issued, so the sequence of outcomes the trust policy judges depends on it: it is part of the
+# settings fingerprint and of the evidence key, and a change of it starts a new evidence epoch.
+DEFAULT_UPDATE_INTERVAL_SECONDS, MIN_UPDATE_INTERVAL_SECONDS = 60, 30
+
+
+def effective_update_interval(value) -> int:
+    if value is None:
+        return DEFAULT_UPDATE_INTERVAL_SECONDS
+    if not _is_int(value):
+        raise ContractRefused(f"spec.prediction.updateIntervalSeconds must be an integer, got {value!r}")
+    return DEFAULT_UPDATE_INTERVAL_SECONDS if value == 0 else max(value, MIN_UPDATE_INTERVAL_SECONDS)
+
+
 @dataclass(frozen=True)
 class ForecastSettings:
     engine: str = "statistical"
@@ -226,6 +241,7 @@ class ForecastSettings:
     history_days: int = 14
     horizon_seconds: int = 3600
     min_lead_seconds: int = 0                # the lead is never shorter than this (rounded up to the grid)
+    update_interval_seconds: int = DEFAULT_UPDATE_INTERVAL_SECONDS   # the operator's reconcile period (see below)
     settlement_seconds: int = 120
     outcome_grace_seconds: int = 600
     risk: RiskSettings = field(default_factory=RiskSettings)
@@ -343,6 +359,7 @@ def resolve_settings(pa: Mapping) -> ForecastSettings:
     min_lead = pred.get("minLeadSeconds", d.min_lead_seconds)
     if not _is_int(min_lead) or not 0 <= min_lead <= MAX_HORIZON_SECONDS:
         raise ContractRefused(f"spec.prediction.minLeadSeconds must be in 0..{MAX_HORIZON_SECONDS}, got {min_lead!r}")
+    update = effective_update_interval(pred.get("updateIntervalSeconds"))
     settle = pred.get("settlementSeconds", d.settlement_seconds)
     if not _is_int(settle) or not 0 <= settle <= 900:
         raise ContractRefused(f"spec.prediction.settlementSeconds must be in 0..900, got {settle!r}")
@@ -366,7 +383,7 @@ def resolve_settings(pa: Mapping) -> ForecastSettings:
                               "only over a trusted seasonal-naive forecast)")
     s = ForecastSettings(engine=engine, sample_interval_seconds=interval, seasonality=seasonality,
                          history_days=history_days, horizon_seconds=horizon, min_lead_seconds=min_lead,
-                         settlement_seconds=settle,
+                         update_interval_seconds=update, settlement_seconds=settle,
                          outcome_grace_seconds=grace, risk=risk, calibration=cal, trust=trust, predictive_extra=extra,
                          families=tuple(sorted(families)))
     _check_feasible(s)
@@ -419,6 +436,7 @@ def minimum_lead_seconds(s: ForecastSettings) -> int:
 class ValidatedProfile:
     """A configuration the trust policy's operating characteristics were qualified for (module docstring)."""
     sample_interval_seconds: int
+    update_interval_seconds: int             # the operator's reconcile period: one decision and one bound per grid step
     lead_seconds: int
     miscoverage_bps: int
     families: Tuple[str, ...]                # sorted spec names
@@ -426,26 +444,30 @@ class ValidatedProfile:
 
 
 # Trust-repair protocol, amendment 2: one profile first. A second family, another lead, grid or risk needs its own
-# evidence; the seasonal-naive result is not doubled for the statistical family. The entry was committed together
+# evidence; the seasonal-naive result is not doubled for the statistical family. The profile is the grid AND the
+# operator's update interval (60 s each: one bound per grid step, as the qualification issued them). The entry was committed together
 # with the frozen thresholds, acceptance rules and validation seeds, BEFORE the validation ran (the protocol's
 # order): it stands only with a validation record whose verdict is "qualified", and is removed otherwise.
 VALIDATED_PROFILES = (
-    ValidatedProfile(60, 600, 1000, ("seasonalNaive",),
+    ValidatedProfile(60, 60, 600, 1000, ("seasonalNaive",),
                      "trust-repair protocol, amendment 2: evaluation/trust_qualification.py, validation record R9"),
 )
 
 
 def validated_profile(s: ForecastSettings, lead_seconds: int) -> Optional[ValidatedProfile]:
-    """The allowlist entry this configuration matches, or None. Besides grid, lead, risk and family set, the engine,
-    the seasonality, the outcome timing and every calibration and trust setting must be the defaults: those are
-    what was qualified, and a monitor with other thresholds is another monitor."""
+    """The allowlist entry this configuration matches, or None. Besides grid, update interval, lead, risk and family
+    set, the engine, the seasonality, the outcome timing and every calibration and trust setting must be the
+    defaults: those are what was qualified, and a monitor with other thresholds is another monitor. The update
+    interval is the live object's (resolve_settings): the qualification issued one bound per 60 s grid step, so an
+    object reconciled every 30 s, 300 s (the CRD's default) or anything else is not this profile."""
     d = ForecastSettings()
     if (s.engine, s.seasonality, s.settlement_seconds, s.outcome_grace_seconds, s.calibration, s.trust) != \
             (d.engine, d.seasonality, d.settlement_seconds, d.outcome_grace_seconds, d.calibration, d.trust):
         return None
     for p in VALIDATED_PROFILES:
-        if (p.sample_interval_seconds, p.lead_seconds, p.miscoverage_bps, p.families) == \
-                (s.sample_interval_seconds, lead_seconds, s.risk.miscoverage_bps, s.families):
+        if (p.sample_interval_seconds, p.update_interval_seconds, p.lead_seconds, p.miscoverage_bps, p.families) == \
+                (s.sample_interval_seconds, s.update_interval_seconds, lead_seconds, s.risk.miscoverage_bps,
+                 s.families):
             return p
     return None
 
@@ -545,7 +567,8 @@ def make_window(origin: int, settings: ForecastSettings, lead: LeadSelection) ->
 
 
 def evidence_key(signal: ResolvedSignal, settings: ForecastSettings, lead_seconds: int) -> str:
-    """The identity forecast evidence belongs to. A new PA or Deployment, query, cadence, lead, configured minimum
+    """The identity forecast evidence belongs to. A new PA or Deployment, query, cadence (the grid and the operator's
+    update interval), lead, configured minimum
     lead, seasonality, engine, risk, calibration policy (its method included), outcome timing or trust-policy REVISION
     starts a new key (a new epoch); a generation that changes only other fields (mode, caps, trust thresholds) keeps it, and callers check the
     generation separately.
@@ -555,7 +578,9 @@ def evidence_key(signal: ResolvedSignal, settings: ForecastSettings, lead_second
     body = {"schema": EVIDENCE_SCHEMA, "autoscaler_uid": signal.autoscaler_uid, "target_uid": signal.target_uid,
             "query_sha256": signal.sha256, "signal_contract": signal.contract, "forecast_contract": FORECAST_CONTRACT,
             "interval_seconds": settings.sample_interval_seconds, "lead_seconds": lead_seconds,
-            "min_lead_seconds": settings.min_lead_seconds, "engine": settings.engine, "seasonality": settings.seasonality, "history_days": settings.history_days,
+            "min_lead_seconds": settings.min_lead_seconds,
+            "update_interval_seconds": settings.update_interval_seconds, "engine": settings.engine,
+            "seasonality": settings.seasonality, "history_days": settings.history_days,
             "settlement_seconds": settings.settlement_seconds,
             "outcome_grace_seconds": settings.outcome_grace_seconds,
             "risk": asdict(settings.risk), "calibration": asdict(settings.calibration),

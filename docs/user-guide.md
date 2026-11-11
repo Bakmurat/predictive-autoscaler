@@ -496,6 +496,7 @@ workload: real misses can cluster differently, and nothing is claimed for them b
 demotions in 7 days, and a bound that misses 40 % of the time detected within 64 windows in at least 95 % of cases;
 on independent misses, on noise without serial dependence and on strongly autocorrelated noise (AR(1), coefficient
 0.7 per minute). The allowlist holds **one configuration**: a 60-second grid (`sampleIntervalSeconds: 60`), a
+60-second update interval (`updateIntervalSeconds: 60`; set it, the CRD's default is 300), a
 600-second lead (`minLeadSeconds: 600`), the default 90 % target and `families: [seasonalNaive]`, with the default
 calibration, trust and timing settings. Only a configuration on the allowlist can become `PredictionReady`. Every other configuration is forecast, calibrated,
 scored and reported in exactly the same way, and stays reactive with the reason `ConfigurationNotValidated`: at shorter

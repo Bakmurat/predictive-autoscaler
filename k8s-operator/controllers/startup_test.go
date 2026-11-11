@@ -226,7 +226,7 @@ func TestStartupPendingCountsOnlyPodsThatWereNeverReady(t *testing.T) {
 	cfg := startupConfig{Fallback: &fb, Allowance: 15}
 	lead := func(obs startupObservation) (int64, int64) {
 		d, _, _ := startupBudget(obs, cfg)
-		return d, v2AutomaticLead(d, v2LeadDecisionInterval(300*time.Second, 300), cfg.Allowance, 300)
+		return d, v2AutomaticLead(d, v2LeadDecisionInterval(300*time.Second, 300), cfg.Allowance, 300, 0)
 	}
 	served := podSpec{name: "web-a", hash: "h2", createdAgo: 25 * time.Minute, startedAfter: 2 * time.Second, readyAfter: 20 * time.Second}
 	with := func(base podSpec, change func(*podSpec)) podSpec { change(&base); return base }

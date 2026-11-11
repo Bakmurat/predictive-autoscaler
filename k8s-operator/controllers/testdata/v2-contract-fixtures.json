@@ -12,7 +12,7 @@
  "calibration_method": "normalized-window-score/two-part-scale/v1",
  "evidence": [
   {
-   "evidence_key": "db6885a55abf254b812aa81ddbefaccc4cd6d434fea1ebbb9b8a3d38487c1903",
+   "evidence_key": "2c2942256b4209e909a9d9f067541791314aafd7118be46ee2d3d081180e0850",
    "lead_seconds": 600,
    "settings_case": "absent",
    "signal": {
@@ -22,7 +22,7 @@
    }
   },
   {
-   "evidence_key": "a9cd47117b575cb0d311024cd41bdd5d4c2afefd5fcef5b531a8cc66ff63db7a",
+   "evidence_key": "b56d34e54d6ca5173f2a133e0e4be765ec3a4fe1d582a936291a1b60f1020e8a",
    "lead_seconds": 3600,
    "settings_case": "absent",
    "signal": {
@@ -32,7 +32,7 @@
    }
   },
   {
-   "evidence_key": "db6885a55abf254b812aa81ddbefaccc4cd6d434fea1ebbb9b8a3d38487c1903",
+   "evidence_key": "87074f7eb1ab5816a58a1ba30f80d199fdc4d0ed2527f0d3be941d9bc352d6aa",
    "lead_seconds": 600,
    "settings_case": "crd-defaults",
    "signal": {
@@ -42,7 +42,7 @@
    }
   },
   {
-   "evidence_key": "a9cd47117b575cb0d311024cd41bdd5d4c2afefd5fcef5b531a8cc66ff63db7a",
+   "evidence_key": "692162d6635647c0bc304fc9dba30585285ab481cde9b513ff65e8aaf8892b07",
    "lead_seconds": 3600,
    "settings_case": "crd-defaults",
    "signal": {
@@ -52,7 +52,7 @@
    }
   },
   {
-   "evidence_key": "db6885a55abf254b812aa81ddbefaccc4cd6d434fea1ebbb9b8a3d38487c1903",
+   "evidence_key": "87074f7eb1ab5816a58a1ba30f80d199fdc4d0ed2527f0d3be941d9bc352d6aa",
    "lead_seconds": 600,
    "settings_case": "statistical",
    "signal": {
@@ -62,7 +62,7 @@
    }
   },
   {
-   "evidence_key": "a9cd47117b575cb0d311024cd41bdd5d4c2afefd5fcef5b531a8cc66ff63db7a",
+   "evidence_key": "692162d6635647c0bc304fc9dba30585285ab481cde9b513ff65e8aaf8892b07",
    "lead_seconds": 3600,
    "settings_case": "statistical",
    "signal": {
@@ -72,7 +72,7 @@
    }
   },
   {
-   "evidence_key": "73229eab72c6dea0ecc8360d5749d4c06e3c955ac589d46f618c6234fc0d9aa0",
+   "evidence_key": "9d7119541f9e080eb492adf4b776001420b048e72a496966257f387de0ea1687",
    "lead_seconds": 120,
    "settings_case": "one-minute-grid",
    "signal": {
@@ -82,7 +82,7 @@
    }
   },
   {
-   "evidence_key": "6f9f6f74e926f847e954d7aa291e5a6f473aa1613fa706764f9b72b80495a73e",
+   "evidence_key": "35cbd73b44742842ab840605ff2de30a80ac4bbc2a379dcfbeec090b6fa10c9c",
    "lead_seconds": 3600,
    "settings_case": "one-minute-grid",
    "signal": {
@@ -92,7 +92,7 @@
    }
   },
   {
-   "evidence_key": "6cebfe9150cb180558d6aeddc17abb0c6e720a114bd6c80710b02a4b8dde39b6",
+   "evidence_key": "a2f90bc1c752ac8a78a6f9358d403e10af186d9653a8b0c9c30a2ed0ec155b1a",
    "lead_seconds": 1200,
    "settings_case": "ten-minute-grid-50min",
    "signal": {
@@ -102,7 +102,7 @@
    }
   },
   {
-   "evidence_key": "d8b45f0b652517baf3679069f4ccce0acf74429b5d9bd11784e1008cbf8be5c0",
+   "evidence_key": "a4d1bcf0fd22680ab1e6c787b90cf90ba85a7785ff81897860f351cdc0d98ae2",
    "lead_seconds": 3000,
    "settings_case": "ten-minute-grid-50min",
    "signal": {
@@ -112,7 +112,7 @@
    }
   },
   {
-   "evidence_key": "c68a2d34a73f35aca17bc3672a77ac44012af32e7aa78e94c117ca6646a1c5a9",
+   "evidence_key": "5c84b5e9da111da781076bdbeec0fc42d8c4e9d69ca6045fd8b35c27ae14b0d3",
    "lead_seconds": 960,
    "settings_case": "eight-minute-grid-56min",
    "signal": {
@@ -122,7 +122,7 @@
    }
   },
   {
-   "evidence_key": "0ee86ef6d9ff139048d9bbaec5182423df159b15b50324687c51e0265de5a64c",
+   "evidence_key": "2c7e3ee22fcb92ee0b271052224b435a39c5a9db756c18316578dc4d15ffa1af",
    "lead_seconds": 3360,
    "settings_case": "eight-minute-grid-56min",
    "signal": {
@@ -132,7 +132,7 @@
    }
   },
   {
-   "evidence_key": "99d7b83e95e2b7e760b8d33398b83fad7370020aa5d02a9909e004029715692f",
+   "evidence_key": "e2d098667ed5292cca1a164a94e9513eda796b8af890baea0b17241497176277",
    "lead_seconds": 1200,
    "settings_case": "legacy-lstm",
    "signal": {
@@ -142,7 +142,7 @@
    }
   },
   {
-   "evidence_key": "d165819c72d8ac0aad1e21a6c49c3f9531b960cf5c39de754f4ae50a8e1dc476",
+   "evidence_key": "660f79753623ee99f44ac9d0432fa7cd266164aef0bce994ecbdebb043f03a6c",
    "lead_seconds": 3600,
    "settings_case": "legacy-lstm",
    "signal": {
@@ -152,7 +152,7 @@
    }
   },
   {
-   "evidence_key": "c474a0cb884f5caa0a688748224f7d7127f0956b56818cff12242dbec695d808",
+   "evidence_key": "34df5dbc3b885a5bdc9c1cb6b60030e51ac6f1da234d00931edb2bcc9488b4e8",
    "lead_seconds": 1200,
    "settings_case": "legacy-lstm-history-one-day",
    "signal": {
@@ -162,9 +162,49 @@
    }
   },
   {
-   "evidence_key": "d88a6abec2059c19571e0c542e336a4e8f3dfef8ab148effbe8fd9cacfddb706",
+   "evidence_key": "141c3c4e1228c2c3852cfad67f4a28e0e1f265c32aed662365428592b5a33bc3",
    "lead_seconds": 3600,
    "settings_case": "legacy-lstm-history-one-day",
+   "signal": {
+    "autoscaler_uid": "pa-uid",
+    "query_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "target_uid": "dep-uid"
+   }
+  },
+  {
+   "evidence_key": "876e35286b452513afd89894f3bd9d82d533da8d8f2c5df57eabe251233bff2d",
+   "lead_seconds": 120,
+   "settings_case": "update-60",
+   "signal": {
+    "autoscaler_uid": "pa-uid",
+    "query_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "target_uid": "dep-uid"
+   }
+  },
+  {
+   "evidence_key": "8d30408a0408fa275fed3ff2f47c012b33f70ad86c9897300970681661160f05",
+   "lead_seconds": 3600,
+   "settings_case": "update-60",
+   "signal": {
+    "autoscaler_uid": "pa-uid",
+    "query_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "target_uid": "dep-uid"
+   }
+  },
+  {
+   "evidence_key": "f449184a48b2666b5bef2dd602f96937f6cef5af76335db8c318f9a463a621f9",
+   "lead_seconds": 600,
+   "settings_case": "update-120",
+   "signal": {
+    "autoscaler_uid": "pa-uid",
+    "query_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "target_uid": "dep-uid"
+   }
+  },
+  {
+   "evidence_key": "25aca5c763342400256fcaf8cc2042692681e8fea22977915f5a142e627e3128",
+   "lead_seconds": 3600,
+   "settings_case": "update-120",
    "signal": {
     "autoscaler_uid": "pa-uid",
     "query_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -2196,7 +2236,7 @@
    "autoscaler_namespace": "shop",
    "autoscaler_uid": "pa-uid",
    "decision_origin": 1793966400,
-   "evidence_key": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+   "evidence_key": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
    "lead": {
     "actuationAllowanceSeconds": 30,
     "method": "measured",
@@ -2208,7 +2248,7 @@
    "metric_query_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
    "nominal_miscoverage_bps": 1000,
    "sample_interval_seconds": 300,
-   "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+   "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
    "target_name": "web",
    "target_namespace": "shop",
    "target_uid": "dep-uid"
@@ -2226,7 +2266,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "confidence": 0.9,
@@ -2257,7 +2297,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -2289,7 +2329,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -2319,7 +2359,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -2350,7 +2390,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -2380,7 +2420,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -2412,7 +2452,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -2442,7 +2482,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -2474,7 +2514,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -2504,7 +2544,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -2536,7 +2576,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 11.0,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -2566,7 +2606,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -2598,7 +2638,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -2627,7 +2667,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -2658,7 +2698,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -2688,7 +2728,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -2720,7 +2760,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -2750,7 +2790,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -2782,7 +2822,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -2812,7 +2852,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -2844,7 +2884,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -2874,7 +2914,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -2906,7 +2946,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -2936,7 +2976,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -2968,7 +3008,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -2998,7 +3038,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -3030,7 +3070,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -3060,7 +3100,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -3092,7 +3132,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -3122,7 +3162,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -3154,7 +3194,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -3184,7 +3224,7 @@
      "reason": "CoverageLow",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -3216,7 +3256,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -3246,7 +3286,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -3278,7 +3318,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -3308,7 +3348,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -3340,7 +3380,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -3370,7 +3410,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -3402,7 +3442,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -3432,7 +3472,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -3464,7 +3504,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -3494,7 +3534,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -3526,7 +3566,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -3556,7 +3596,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -3588,7 +3628,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -3618,7 +3658,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "other",
@@ -3650,7 +3690,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -3680,7 +3720,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -3712,7 +3752,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -3774,7 +3814,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -3804,7 +3844,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -3836,7 +3876,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -3866,7 +3906,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -3898,7 +3938,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-other",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -3928,7 +3968,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -3960,7 +4000,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -3990,7 +4030,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -4022,7 +4062,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -4052,7 +4092,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -4084,7 +4124,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -4114,7 +4154,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -4146,7 +4186,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -4208,7 +4248,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -4238,7 +4278,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -4300,7 +4340,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -4332,7 +4372,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -4424,7 +4464,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -4456,7 +4496,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -4548,7 +4588,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -4580,7 +4620,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -4672,7 +4712,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -4704,7 +4744,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -4734,7 +4774,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -4766,7 +4806,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -4796,7 +4836,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 300,
      "target_name": "web",
      "target_namespace": "shop",
@@ -4829,7 +4869,7 @@
    "metric_query_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
    "metric_type": "requests",
    "namespace": "shop",
-   "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+   "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
    "target_uid": "dep-uid"
   },
   "valid": [
@@ -4843,7 +4883,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -4873,7 +4913,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -4903,7 +4943,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12.25,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -4933,7 +4973,7 @@
      "reason": "ShadowInsufficient",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -4963,7 +5003,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 0,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -4993,7 +5033,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -5023,7 +5063,7 @@
      "autoscaler_namespace": "shop",
      "autoscaler_uid": "pa-uid",
      "base_window_max_rps": 12,
-     "calibration_epoch": "c8db68770809349495228c526c803af55d1763bee8382707fc66aa7233393221",
+     "calibration_epoch": "d04776c651a20d352ec056f52acb314056286fba599838ebaca708cb91401a2a",
      "calibration_windows": 140,
      "checkpoint_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
      "contract": "requests-per-second/v1",
@@ -5053,7 +5093,7 @@
      "reason": "Ready",
      "sample_interval_seconds": 300,
      "selected_candidate": "seasonal_naive",
-     "settings_sha256": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+     "settings_sha256": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
      "startup_delay_seconds": 420,
      "target_name": "web",
      "target_namespace": "shop",
@@ -5077,15 +5117,15 @@
  },
  "settings": [
   {
-   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":14,\"horizon_seconds\":3600,\"min_lead_seconds\":0,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":300,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":64,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"consecutive_alarm_ppm\":7000,\"coverage_tolerance_bps\":500,\"day_alarm_ppm\":8000,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"miss_dependence_bps\":1750,\"policy\":\"budgeted-coverage-tests/v2\",\"repromotion_hours\":24,\"repromotion_windows\":32,\"rolling_alarm_ppm\":33000,\"seven_day_alarm_ppm\":2000,\"worst_day_min_outcomes\":24}}}",
-   "fingerprint": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":14,\"horizon_seconds\":3600,\"min_lead_seconds\":0,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":300,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":64,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"consecutive_alarm_ppm\":7000,\"coverage_tolerance_bps\":500,\"day_alarm_ppm\":8000,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"miss_dependence_bps\":1750,\"policy\":\"budgeted-coverage-tests/v2\",\"repromotion_hours\":24,\"repromotion_windows\":32,\"rolling_alarm_ppm\":33000,\"seven_day_alarm_ppm\":2000,\"worst_day_min_outcomes\":24},\"update_interval_seconds\":60}}",
+   "fingerprint": "4f19f7f9e0ef15e7cfe33b058051ec8e39706cfa89cdf3b110c8fc07b132aaec",
    "name": "absent",
    "prediction": null,
    "steps": 12
   },
   {
-   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":14,\"horizon_seconds\":3600,\"min_lead_seconds\":0,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":300,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":64,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"consecutive_alarm_ppm\":7000,\"coverage_tolerance_bps\":500,\"day_alarm_ppm\":8000,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"miss_dependence_bps\":1750,\"policy\":\"budgeted-coverage-tests/v2\",\"repromotion_hours\":24,\"repromotion_windows\":32,\"rolling_alarm_ppm\":33000,\"seven_day_alarm_ppm\":2000,\"worst_day_min_outcomes\":24}}}",
-   "fingerprint": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":14,\"horizon_seconds\":3600,\"min_lead_seconds\":0,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":300,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":64,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"consecutive_alarm_ppm\":7000,\"coverage_tolerance_bps\":500,\"day_alarm_ppm\":8000,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"miss_dependence_bps\":1750,\"policy\":\"budgeted-coverage-tests/v2\",\"repromotion_hours\":24,\"repromotion_windows\":32,\"rolling_alarm_ppm\":33000,\"seven_day_alarm_ppm\":2000,\"worst_day_min_outcomes\":24},\"update_interval_seconds\":300}}",
+   "fingerprint": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
    "name": "crd-defaults",
    "prediction": {
     "enabled": true,
@@ -5096,8 +5136,8 @@
    "steps": 12
   },
   {
-   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":14,\"horizon_seconds\":3600,\"min_lead_seconds\":0,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":300,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":64,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"consecutive_alarm_ppm\":7000,\"coverage_tolerance_bps\":500,\"day_alarm_ppm\":8000,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"miss_dependence_bps\":1750,\"policy\":\"budgeted-coverage-tests/v2\",\"repromotion_hours\":24,\"repromotion_windows\":32,\"rolling_alarm_ppm\":33000,\"seven_day_alarm_ppm\":2000,\"worst_day_min_outcomes\":24}}}",
-   "fingerprint": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":14,\"horizon_seconds\":3600,\"min_lead_seconds\":0,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":300,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":64,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"consecutive_alarm_ppm\":7000,\"coverage_tolerance_bps\":500,\"day_alarm_ppm\":8000,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"miss_dependence_bps\":1750,\"policy\":\"budgeted-coverage-tests/v2\",\"repromotion_hours\":24,\"repromotion_windows\":32,\"rolling_alarm_ppm\":33000,\"seven_day_alarm_ppm\":2000,\"worst_day_min_outcomes\":24},\"update_interval_seconds\":300}}",
+   "fingerprint": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
    "name": "statistical",
    "prediction": {
     "enabled": true,
@@ -5109,8 +5149,8 @@
    "steps": 12
   },
   {
-   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":14,\"horizon_seconds\":3600,\"min_lead_seconds\":0,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":60,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":64,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"consecutive_alarm_ppm\":7000,\"coverage_tolerance_bps\":500,\"day_alarm_ppm\":8000,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"miss_dependence_bps\":1750,\"policy\":\"budgeted-coverage-tests/v2\",\"repromotion_hours\":24,\"repromotion_windows\":32,\"rolling_alarm_ppm\":33000,\"seven_day_alarm_ppm\":2000,\"worst_day_min_outcomes\":24}}}",
-   "fingerprint": "d07d9f9c7d8bd71e0651f0829235f363db372131207b02328f1c79c09b3ef690",
+   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":14,\"horizon_seconds\":3600,\"min_lead_seconds\":0,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":60,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":64,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"consecutive_alarm_ppm\":7000,\"coverage_tolerance_bps\":500,\"day_alarm_ppm\":8000,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"miss_dependence_bps\":1750,\"policy\":\"budgeted-coverage-tests/v2\",\"repromotion_hours\":24,\"repromotion_windows\":32,\"rolling_alarm_ppm\":33000,\"seven_day_alarm_ppm\":2000,\"worst_day_min_outcomes\":24},\"update_interval_seconds\":300}}",
+   "fingerprint": "bfee7444df1527d8369d93d66fb9be0d89680a9fd233b2f0348b27aa747952c0",
    "name": "one-minute-grid",
    "prediction": {
     "enabled": true,
@@ -5123,8 +5163,8 @@
    "steps": 60
   },
   {
-   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":14,\"horizon_seconds\":3000,\"min_lead_seconds\":0,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":600,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":64,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"consecutive_alarm_ppm\":7000,\"coverage_tolerance_bps\":500,\"day_alarm_ppm\":8000,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"miss_dependence_bps\":1750,\"policy\":\"budgeted-coverage-tests/v2\",\"repromotion_hours\":24,\"repromotion_windows\":32,\"rolling_alarm_ppm\":33000,\"seven_day_alarm_ppm\":2000,\"worst_day_min_outcomes\":24}}}",
-   "fingerprint": "ab78831198564d90bb64a461f78b1ba53a4ddf1de3e43faaf1cc14c64afd0a1e",
+   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":14,\"horizon_seconds\":3000,\"min_lead_seconds\":0,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":600,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":64,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"consecutive_alarm_ppm\":7000,\"coverage_tolerance_bps\":500,\"day_alarm_ppm\":8000,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"miss_dependence_bps\":1750,\"policy\":\"budgeted-coverage-tests/v2\",\"repromotion_hours\":24,\"repromotion_windows\":32,\"rolling_alarm_ppm\":33000,\"seven_day_alarm_ppm\":2000,\"worst_day_min_outcomes\":24},\"update_interval_seconds\":300}}",
+   "fingerprint": "1c4633beef297dca5f9a979ecd9ef59f9bbae4e6db408110af9f6f9d32906068",
    "name": "ten-minute-grid-50min",
    "prediction": {
     "enabled": true,
@@ -5137,8 +5177,8 @@
    "steps": 5
   },
   {
-   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":14,\"horizon_seconds\":3360,\"min_lead_seconds\":0,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":480,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":64,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"consecutive_alarm_ppm\":7000,\"coverage_tolerance_bps\":500,\"day_alarm_ppm\":8000,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"miss_dependence_bps\":1750,\"policy\":\"budgeted-coverage-tests/v2\",\"repromotion_hours\":24,\"repromotion_windows\":32,\"rolling_alarm_ppm\":33000,\"seven_day_alarm_ppm\":2000,\"worst_day_min_outcomes\":24}}}",
-   "fingerprint": "b2c7f184dbe4a774f8a1fc031cf6ee9c5e3228a01c9d23a336fc0560ff68f2e6",
+   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":14,\"horizon_seconds\":3360,\"min_lead_seconds\":0,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":480,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":64,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"consecutive_alarm_ppm\":7000,\"coverage_tolerance_bps\":500,\"day_alarm_ppm\":8000,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"miss_dependence_bps\":1750,\"policy\":\"budgeted-coverage-tests/v2\",\"repromotion_hours\":24,\"repromotion_windows\":32,\"rolling_alarm_ppm\":33000,\"seven_day_alarm_ppm\":2000,\"worst_day_min_outcomes\":24},\"update_interval_seconds\":300}}",
+   "fingerprint": "6069c0962b85d297395ff35eacc205e121489ce18d2deea9ab5195cfead53154",
    "name": "eight-minute-grid-56min",
    "prediction": {
     "enabled": true,
@@ -5151,8 +5191,8 @@
    "steps": 7
   },
   {
-   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"legacyLstm\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":14,\"horizon_seconds\":3600,\"min_lead_seconds\":0,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":600,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":64,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"consecutive_alarm_ppm\":7000,\"coverage_tolerance_bps\":500,\"day_alarm_ppm\":8000,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"miss_dependence_bps\":1750,\"policy\":\"budgeted-coverage-tests/v2\",\"repromotion_hours\":24,\"repromotion_windows\":32,\"rolling_alarm_ppm\":33000,\"seven_day_alarm_ppm\":2000,\"worst_day_min_outcomes\":24}}}",
-   "fingerprint": "50b7b5f7a1c5a4d361a630b17c4d7d523b1635b13d67f15f5af0a850992d7181",
+   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"legacyLstm\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":14,\"horizon_seconds\":3600,\"min_lead_seconds\":0,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":600,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":64,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"consecutive_alarm_ppm\":7000,\"coverage_tolerance_bps\":500,\"day_alarm_ppm\":8000,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"miss_dependence_bps\":1750,\"policy\":\"budgeted-coverage-tests/v2\",\"repromotion_hours\":24,\"repromotion_windows\":32,\"rolling_alarm_ppm\":33000,\"seven_day_alarm_ppm\":2000,\"worst_day_min_outcomes\":24},\"update_interval_seconds\":300}}",
+   "fingerprint": "25eb6fde4fd67f5e491804831ad207854c0a614f347ecdfa9083b55f2e3ecfb0",
    "name": "legacy-lstm",
    "prediction": {
     "enabled": true,
@@ -5165,8 +5205,8 @@
    "steps": 6
   },
   {
-   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"legacyLstm\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":1,\"horizon_seconds\":3600,\"min_lead_seconds\":0,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":600,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":64,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"consecutive_alarm_ppm\":7000,\"coverage_tolerance_bps\":500,\"day_alarm_ppm\":8000,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"miss_dependence_bps\":1750,\"policy\":\"budgeted-coverage-tests/v2\",\"repromotion_hours\":24,\"repromotion_windows\":32,\"rolling_alarm_ppm\":33000,\"seven_day_alarm_ppm\":2000,\"worst_day_min_outcomes\":24}}}",
-   "fingerprint": "64c55cbeffa093bfed168568a3fa8e04ad6a97a93d11ba68d562b060aa5d3a44",
+   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"legacyLstm\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":1,\"horizon_seconds\":3600,\"min_lead_seconds\":0,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":600,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":64,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"consecutive_alarm_ppm\":7000,\"coverage_tolerance_bps\":500,\"day_alarm_ppm\":8000,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"miss_dependence_bps\":1750,\"policy\":\"budgeted-coverage-tests/v2\",\"repromotion_hours\":24,\"repromotion_windows\":32,\"rolling_alarm_ppm\":33000,\"seven_day_alarm_ppm\":2000,\"worst_day_min_outcomes\":24},\"update_interval_seconds\":300}}",
+   "fingerprint": "c26bf8eb43a94a65d4f45c8c5aee3413104aa1368516c9265092a4deb3394c91",
    "name": "legacy-lstm-history-one-day",
    "prediction": {
     "enabled": true,
@@ -5180,8 +5220,8 @@
    "steps": 6
   },
   {
-   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":25,\"max_miscoverage_bps\":2000,\"max_scores\":600,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":50,\"min_windows\":200,\"retention_days\":10,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":21,\"horizon_seconds\":2400,\"min_lead_seconds\":0,\"outcome_grace_seconds\":900,\"predictive_extra\":{\"max_percent\":25,\"max_replicas\":0},\"risk\":{\"miscoverage_bps\":500},\"sample_interval_seconds\":120,\"seasonality\":\"daily\",\"settlement_seconds\":90,\"trust\":{\"acute_consecutive_misses\":4,\"acute_recent_windows\":40,\"challenger_cost_ratio_bps\":10100,\"challenger_exit_loss_ratio_bps\":10500,\"challenger_loss_ratio_bps\":9000,\"challenger_min_hours\":60,\"challenger_min_pairs\":70,\"consecutive_alarm_ppm\":7000,\"coverage_tolerance_bps\":300,\"day_alarm_ppm\":8000,\"max_fit_age_hours\":6,\"min_availability_bps\":9000,\"min_prospective_windows\":80,\"min_shadow_hours\":72,\"miss_dependence_bps\":1750,\"policy\":\"budgeted-coverage-tests/v2\",\"repromotion_hours\":12,\"repromotion_windows\":20,\"rolling_alarm_ppm\":33000,\"seven_day_alarm_ppm\":2000,\"worst_day_min_outcomes\":30}}}",
-   "fingerprint": "e38d3b99af203fcf4a71f9cf28b0e889eb9e063e2bc2cb939c1a4554377521a6",
+   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":25,\"max_miscoverage_bps\":2000,\"max_scores\":600,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":50,\"min_windows\":200,\"retention_days\":10,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":21,\"horizon_seconds\":2400,\"min_lead_seconds\":0,\"outcome_grace_seconds\":900,\"predictive_extra\":{\"max_percent\":25,\"max_replicas\":0},\"risk\":{\"miscoverage_bps\":500},\"sample_interval_seconds\":120,\"seasonality\":\"daily\",\"settlement_seconds\":90,\"trust\":{\"acute_consecutive_misses\":4,\"acute_recent_windows\":40,\"challenger_cost_ratio_bps\":10100,\"challenger_exit_loss_ratio_bps\":10500,\"challenger_loss_ratio_bps\":9000,\"challenger_min_hours\":60,\"challenger_min_pairs\":70,\"consecutive_alarm_ppm\":7000,\"coverage_tolerance_bps\":300,\"day_alarm_ppm\":8000,\"max_fit_age_hours\":6,\"min_availability_bps\":9000,\"min_prospective_windows\":80,\"min_shadow_hours\":72,\"miss_dependence_bps\":1750,\"policy\":\"budgeted-coverage-tests/v2\",\"repromotion_hours\":12,\"repromotion_windows\":20,\"rolling_alarm_ppm\":33000,\"seven_day_alarm_ppm\":2000,\"worst_day_min_outcomes\":30},\"update_interval_seconds\":300}}",
+   "fingerprint": "d6e78a7f44bbd0b73b275477d3a92257fd70d47b38202b1e9b850b0cfff8d3a8",
    "name": "everything",
    "prediction": {
     "calibration": {
@@ -5230,8 +5270,8 @@
    "steps": 20
   },
   {
-   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\"],\"history_days\":14,\"horizon_seconds\":3600,\"min_lead_seconds\":0,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":300,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":64,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"consecutive_alarm_ppm\":7000,\"coverage_tolerance_bps\":500,\"day_alarm_ppm\":8000,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"miss_dependence_bps\":1750,\"policy\":\"budgeted-coverage-tests/v2\",\"repromotion_hours\":24,\"repromotion_windows\":32,\"rolling_alarm_ppm\":33000,\"seven_day_alarm_ppm\":2000,\"worst_day_min_outcomes\":24}}}",
-   "fingerprint": "ff040746cc196686f3fcfc0957fa4d76281490b85086918825ef26a975b7026d",
+   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\"],\"history_days\":14,\"horizon_seconds\":3600,\"min_lead_seconds\":0,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":300,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":64,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"consecutive_alarm_ppm\":7000,\"coverage_tolerance_bps\":500,\"day_alarm_ppm\":8000,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"miss_dependence_bps\":1750,\"policy\":\"budgeted-coverage-tests/v2\",\"repromotion_hours\":24,\"repromotion_windows\":32,\"rolling_alarm_ppm\":33000,\"seven_day_alarm_ppm\":2000,\"worst_day_min_outcomes\":24},\"update_interval_seconds\":300}}",
+   "fingerprint": "7244717520909c9be332d5468bd21e0f6be3c30b24f7fa0cd16350a1dae9687e",
    "name": "naive-only",
    "prediction": {
     "enabled": true,
@@ -5246,8 +5286,8 @@
    "steps": 12
   },
   {
-   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\"],\"history_days\":14,\"horizon_seconds\":3600,\"min_lead_seconds\":600,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":60,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":64,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"consecutive_alarm_ppm\":7000,\"coverage_tolerance_bps\":500,\"day_alarm_ppm\":8000,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"miss_dependence_bps\":1750,\"policy\":\"budgeted-coverage-tests/v2\",\"repromotion_hours\":24,\"repromotion_windows\":32,\"rolling_alarm_ppm\":33000,\"seven_day_alarm_ppm\":2000,\"worst_day_min_outcomes\":24}}}",
-   "fingerprint": "a9323d7df6b5c7f0b716e6fd1eaaabf8b5b19dfeb08b82aa1468129471833f5d",
+   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\"],\"history_days\":14,\"horizon_seconds\":3600,\"min_lead_seconds\":600,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":60,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":64,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"consecutive_alarm_ppm\":7000,\"coverage_tolerance_bps\":500,\"day_alarm_ppm\":8000,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"miss_dependence_bps\":1750,\"policy\":\"budgeted-coverage-tests/v2\",\"repromotion_hours\":24,\"repromotion_windows\":32,\"rolling_alarm_ppm\":33000,\"seven_day_alarm_ppm\":2000,\"worst_day_min_outcomes\":24},\"update_interval_seconds\":300}}",
+   "fingerprint": "46f3ced7b2b792b660b354307f71cd050a399b463b435d91bd471209a36ae71b",
    "name": "min-lead-600",
    "prediction": {
     "enabled": true,
@@ -5264,8 +5304,8 @@
    "steps": 60
   },
   {
-   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":14,\"horizon_seconds\":3600,\"min_lead_seconds\":541,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":300,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":64,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"consecutive_alarm_ppm\":7000,\"coverage_tolerance_bps\":500,\"day_alarm_ppm\":8000,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"miss_dependence_bps\":1750,\"policy\":\"budgeted-coverage-tests/v2\",\"repromotion_hours\":24,\"repromotion_windows\":32,\"rolling_alarm_ppm\":33000,\"seven_day_alarm_ppm\":2000,\"worst_day_min_outcomes\":24}}}",
-   "fingerprint": "52228021f9ac695ccbb31de87d34980763ae7ec0aec82c53dd09d152136f5168",
+   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":14,\"horizon_seconds\":3600,\"min_lead_seconds\":541,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":300,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":64,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"consecutive_alarm_ppm\":7000,\"coverage_tolerance_bps\":500,\"day_alarm_ppm\":8000,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"miss_dependence_bps\":1750,\"policy\":\"budgeted-coverage-tests/v2\",\"repromotion_hours\":24,\"repromotion_windows\":32,\"rolling_alarm_ppm\":33000,\"seven_day_alarm_ppm\":2000,\"worst_day_min_outcomes\":24},\"update_interval_seconds\":300}}",
+   "fingerprint": "7f30b18c18e7eaf20e67d25707edbd7f9d3cdaa8c499e2592424b4c5ea0ba5bd",
    "name": "min-lead-rounded",
    "prediction": {
     "enabled": true,
@@ -5278,8 +5318,8 @@
    "steps": 12
   },
   {
-   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":14,\"horizon_seconds\":600,\"min_lead_seconds\":600,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":60,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":64,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"consecutive_alarm_ppm\":7000,\"coverage_tolerance_bps\":500,\"day_alarm_ppm\":8000,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"miss_dependence_bps\":1750,\"policy\":\"budgeted-coverage-tests/v2\",\"repromotion_hours\":24,\"repromotion_windows\":32,\"rolling_alarm_ppm\":33000,\"seven_day_alarm_ppm\":2000,\"worst_day_min_outcomes\":24}}}",
-   "fingerprint": "4f783ce62349700a96ec3f0bd9a86b81b5247202b5a42d59926b7a6ac89b9f3f",
+   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":14,\"horizon_seconds\":600,\"min_lead_seconds\":600,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":60,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":64,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"consecutive_alarm_ppm\":7000,\"coverage_tolerance_bps\":500,\"day_alarm_ppm\":8000,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"miss_dependence_bps\":1750,\"policy\":\"budgeted-coverage-tests/v2\",\"repromotion_hours\":24,\"repromotion_windows\":32,\"rolling_alarm_ppm\":33000,\"seven_day_alarm_ppm\":2000,\"worst_day_min_outcomes\":24},\"update_interval_seconds\":300}}",
+   "fingerprint": "ad5fcee0adb314ca6e6bc0e9d05a23d0a469d43b2d9d73a049a344c91dc703c4",
    "name": "min-lead-equals-horizon",
    "prediction": {
     "enabled": true,
@@ -5293,8 +5333,8 @@
    "steps": 10
   },
   {
-   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":14,\"horizon_seconds\":3600,\"min_lead_seconds\":0,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":300,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":64,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"consecutive_alarm_ppm\":7000,\"coverage_tolerance_bps\":500,\"day_alarm_ppm\":8000,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"miss_dependence_bps\":1750,\"policy\":\"budgeted-coverage-tests/v2\",\"repromotion_hours\":24,\"repromotion_windows\":32,\"rolling_alarm_ppm\":33000,\"seven_day_alarm_ppm\":2000,\"worst_day_min_outcomes\":24}}}",
-   "fingerprint": "e59c45ff1167b83e118041d034e4732c3079d564a3dc2c5aa84cada2b27c0e0a",
+   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":14,\"horizon_seconds\":3600,\"min_lead_seconds\":0,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":300,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":64,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"consecutive_alarm_ppm\":7000,\"coverage_tolerance_bps\":500,\"day_alarm_ppm\":8000,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"miss_dependence_bps\":1750,\"policy\":\"budgeted-coverage-tests/v2\",\"repromotion_hours\":24,\"repromotion_windows\":32,\"rolling_alarm_ppm\":33000,\"seven_day_alarm_ppm\":2000,\"worst_day_min_outcomes\":24},\"update_interval_seconds\":300}}",
+   "fingerprint": "473d4574818138dd53c0ead04300426aea96e60f591c8c6f2fadbd50abf1d4f6",
    "name": "families-reordered",
    "prediction": {
     "enabled": true,
@@ -5306,6 +5346,63 @@
     "horizonMinutes": 60,
     "leadTimeMinutes": 15,
     "updateIntervalSeconds": 300
+   },
+   "steps": 12
+  },
+  {
+   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\"],\"history_days\":14,\"horizon_seconds\":3600,\"min_lead_seconds\":600,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":60,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":64,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"consecutive_alarm_ppm\":7000,\"coverage_tolerance_bps\":500,\"day_alarm_ppm\":8000,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"miss_dependence_bps\":1750,\"policy\":\"budgeted-coverage-tests/v2\",\"repromotion_hours\":24,\"repromotion_windows\":32,\"rolling_alarm_ppm\":33000,\"seven_day_alarm_ppm\":2000,\"worst_day_min_outcomes\":24},\"update_interval_seconds\":60}}",
+   "fingerprint": "974a8b35611cf1c6b2f341d0b86f2d93ed935999eb93090e194cc34ffb8f6840",
+   "name": "update-60",
+   "prediction": {
+    "enabled": true,
+    "engine": "statistical",
+    "families": [
+     "seasonalNaive"
+    ],
+    "horizonMinutes": 60,
+    "leadTimeMinutes": 15,
+    "minLeadSeconds": 600,
+    "sampleIntervalSeconds": 60,
+    "updateIntervalSeconds": 60
+   },
+   "steps": 60
+  },
+  {
+   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":14,\"horizon_seconds\":3600,\"min_lead_seconds\":0,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":300,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":64,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"consecutive_alarm_ppm\":7000,\"coverage_tolerance_bps\":500,\"day_alarm_ppm\":8000,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"miss_dependence_bps\":1750,\"policy\":\"budgeted-coverage-tests/v2\",\"repromotion_hours\":24,\"repromotion_windows\":32,\"rolling_alarm_ppm\":33000,\"seven_day_alarm_ppm\":2000,\"worst_day_min_outcomes\":24},\"update_interval_seconds\":60}}",
+   "fingerprint": "4f19f7f9e0ef15e7cfe33b058051ec8e39706cfa89cdf3b110c8fc07b132aaec",
+   "name": "update-zero-is-default",
+   "prediction": {
+    "enabled": true,
+    "engine": "statistical",
+    "horizonMinutes": 60,
+    "leadTimeMinutes": 15,
+    "updateIntervalSeconds": 0
+   },
+   "steps": 12
+  },
+  {
+   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":14,\"horizon_seconds\":3600,\"min_lead_seconds\":0,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":300,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":64,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"consecutive_alarm_ppm\":7000,\"coverage_tolerance_bps\":500,\"day_alarm_ppm\":8000,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"miss_dependence_bps\":1750,\"policy\":\"budgeted-coverage-tests/v2\",\"repromotion_hours\":24,\"repromotion_windows\":32,\"rolling_alarm_ppm\":33000,\"seven_day_alarm_ppm\":2000,\"worst_day_min_outcomes\":24},\"update_interval_seconds\":30}}",
+   "fingerprint": "96edebae31a5ea2b403df4d68a91736a2c01be3b4a28e58d8f2506d47aad4bec",
+   "name": "update-below-floor",
+   "prediction": {
+    "enabled": true,
+    "engine": "statistical",
+    "horizonMinutes": 60,
+    "leadTimeMinutes": 15,
+    "updateIntervalSeconds": 10
+   },
+   "steps": 12
+  },
+  {
+   "canonical": "{\"schema\":\"forecast-settings/v1\",\"settings\":{\"calibration\":{\"eta_bps\":50,\"max_miscoverage_bps\":2500,\"max_scores\":512,\"method\":\"normalized-window-score/two-part-scale/v1\",\"min_miscoverage_bps\":100,\"min_windows\":128,\"retention_days\":7,\"scale_bins\":8,\"scale_floor_bps\":500,\"scale_min_season_bps\":8000},\"engine\":\"statistical\",\"families\":[\"seasonalNaive\",\"statistical\"],\"history_days\":14,\"horizon_seconds\":3600,\"min_lead_seconds\":0,\"outcome_grace_seconds\":600,\"predictive_extra\":{\"max_percent\":50,\"max_replicas\":2},\"risk\":{\"miscoverage_bps\":1000},\"sample_interval_seconds\":300,\"seasonality\":\"daily\",\"settlement_seconds\":120,\"trust\":{\"acute_consecutive_misses\":5,\"acute_recent_windows\":64,\"challenger_cost_ratio_bps\":10200,\"challenger_exit_loss_ratio_bps\":10000,\"challenger_loss_ratio_bps\":9500,\"challenger_min_hours\":48,\"challenger_min_pairs\":64,\"consecutive_alarm_ppm\":7000,\"coverage_tolerance_bps\":500,\"day_alarm_ppm\":8000,\"max_fit_age_hours\":12,\"min_availability_bps\":9500,\"min_prospective_windows\":64,\"min_shadow_hours\":48,\"miss_dependence_bps\":1750,\"policy\":\"budgeted-coverage-tests/v2\",\"repromotion_hours\":24,\"repromotion_windows\":32,\"rolling_alarm_ppm\":33000,\"seven_day_alarm_ppm\":2000,\"worst_day_min_outcomes\":24},\"update_interval_seconds\":120}}",
+   "fingerprint": "ad7bc2d8b465f6be960fd52934092d586b4a7d26dbdc2c97c0e8565154d90184",
+   "name": "update-120",
+   "prediction": {
+    "enabled": true,
+    "engine": "statistical",
+    "horizonMinutes": 60,
+    "leadTimeMinutes": 15,
+    "updateIntervalSeconds": 120
    },
    "steps": 12
   },

@@ -41,6 +41,7 @@ def strip_to_additive(canon):
         canon["settings"]["trust"].pop(k)
     canon["settings"]["trust"]["acute_recent_windows"] = 32
     canon["settings"].pop("min_lead_seconds", None)      # the minimum lead came with trust policy v2
+    canon["settings"].pop("update_interval_seconds", None)   # ... and so did the update interval
     return canon
 # The default statistical settings and the fixture binding's evidence key under the additive method, frozen from
 # k8s-operator/controllers/testdata/v2-contract-fixtures.json at commit 44f65cf (the Go tests use the same constants).

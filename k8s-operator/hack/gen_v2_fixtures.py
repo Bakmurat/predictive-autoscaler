@@ -61,6 +61,13 @@ SETTINGS_CASES = [
     ("min-lead-equals-horizon", {"engine": "statistical", "sampleIntervalSeconds": 60, "horizonMinutes": 10,
                                  "minLeadSeconds": 600}),
     ("families-reordered", {"engine": "statistical", "families": ["statistical", "seasonalNaive"]}),
+    # the operator's update interval is part of the identity: the validated profile's 60 s, the operator's default
+    # for 0 (60 s) and its floor (30 s); every other case carries the CRD's default, 300 s
+    ("update-60", {"engine": "statistical", "sampleIntervalSeconds": 60, "families": ["seasonalNaive"],
+                   "minLeadSeconds": 600, "updateIntervalSeconds": 60}),
+    ("update-zero-is-default", {"engine": "statistical", "updateIntervalSeconds": 0}),
+    ("update-below-floor", {"engine": "statistical", "updateIntervalSeconds": 10}),
+    ("update-120", {"engine": "statistical", "updateIntervalSeconds": 120}),
     # refused
     ("disabled", {"engine": "statistical", "enabled": False}),
     ("families-without-naive", {"engine": "statistical", "families": ["statistical"]}),
@@ -145,7 +152,8 @@ def settings_cases():
 
 def evidence_cases():
     out = []
-    for name, pred in SETTINGS_CASES[:8]:
+    cadence = [case for case in SETTINGS_CASES if case[0] in ("update-60", "update-120")]
+    for name, pred in SETTINGS_CASES[:8] + cadence:
         s = c.resolve_settings(pa_with(pred))
         for lead in sorted({s.sample_interval_seconds * 2, s.horizon_seconds}):
             out.append({"settings_case": name, "lead_seconds": lead,
@@ -166,7 +174,9 @@ def legacy_identity():
         canon["settings"]["trust"].pop(k)
     canon["settings"]["trust"].update(_V1_TRUST)
     canon["settings"].pop("min_lead_seconds")
-    v1_body = {k: v for k, v in _evidence_body(s).items() if k != "min_lead_seconds"}
+    canon["settings"].pop("update_interval_seconds")
+    v1_body = {k: v for k, v in _evidence_body(s).items()
+               if k not in ("min_lead_seconds", "update_interval_seconds")}
     v1_body["trust_policy"] = _V1_TRUST["policy"]
     v1 = {"settings_sha256": c.sha256_hex(c.canonical_json(canon)),
           "evidence_key": c.sha256_hex(c.canonical_json(v1_body))}
@@ -179,9 +189,11 @@ def legacy_identity():
         canon["settings"]["trust"].pop(k)
     canon["settings"]["trust"].update(_EARLIER_TRUST_DEFAULTS)
     canon["settings"].pop("min_lead_seconds")
+    canon["settings"].pop("update_interval_seconds")
     pre = {"settings_sha256": c.sha256_hex(c.canonical_json(canon)),
            "evidence_key": c.sha256_hex(c.canonical_json({k: v for k, v in _evidence_body(s).items()
-                                                          if k not in ("trust_policy", "min_lead_seconds")}))}
+                                                          if k not in ("trust_policy", "min_lead_seconds",
+                                                                       "update_interval_seconds")}))}
     if pre != PRE_TRUST_POLICY:
         raise SystemExit(f"the pre-trust-policy identity no longer re-derives: {pre}")
     for k in _ADDED_CALIBRATION_KEYS:
@@ -207,7 +219,8 @@ def _evidence_body(s):
     return {"schema": c.EVIDENCE_SCHEMA, "autoscaler_uid": SIGNAL.autoscaler_uid, "target_uid": SIGNAL.target_uid,
             "query_sha256": SIGNAL.sha256, "signal_contract": SIGNAL.contract,
             "forecast_contract": c.FORECAST_CONTRACT, "interval_seconds": s.sample_interval_seconds,
-            "lead_seconds": 1200, "min_lead_seconds": s.min_lead_seconds, "engine": s.engine,
+            "lead_seconds": 1200, "min_lead_seconds": s.min_lead_seconds,
+            "update_interval_seconds": s.update_interval_seconds, "engine": s.engine,
             "seasonality": s.seasonality, "history_days": s.history_days,
             "settlement_seconds": s.settlement_seconds, "outcome_grace_seconds": s.outcome_grace_seconds,
             "risk": dataclasses.asdict(s.risk), "calibration": dataclasses.asdict(s.calibration),

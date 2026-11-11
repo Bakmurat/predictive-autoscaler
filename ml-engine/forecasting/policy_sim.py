@@ -221,7 +221,7 @@ def decision_interval(spec: Mapping, interval: int) -> int:
     """Go v2DecisionInterval of the reconcile interval (spec.prediction.updateIntervalSeconds, default 60, at least 30)
     rounded up to the grid."""
     rec = (spec.get("prediction") or {}).get("updateIntervalSeconds") or DEFAULT_RECONCILE_S
-    rec = max(int(rec), MIN_RECONCILE_S)
+    rec = max(int(rec), MIN_RECONCILE_S)             # = contracts.effective_update_interval (the bound settings' value)
     return max(-(-rec // interval) * interval, interval)
 
 

@@ -95,6 +95,7 @@ type v2Settings struct {
 	HistoryDays           int64
 	HorizonSeconds        int64
 	MinLeadSeconds        int64 // the lead is never shorter than this, rounded up to the grid (0: no minimum)
+	UpdateIntervalSeconds int64 // the reconcile period as applied (v2EffectiveUpdateInterval): part of the identity
 	SettlementSeconds     int64
 	OutcomeGraceSeconds   int64
 	MiscoverageBps        int64
@@ -146,7 +147,8 @@ const (
 
 func v2Default() v2Settings {
 	return v2Settings{Engine: autoscalerv1alpha1.EngineStatistical, SampleIntervalSeconds: 300, Seasonality: "daily",
-		HistoryDays: 14, HorizonSeconds: 3600, SettlementSeconds: 120, OutcomeGraceSeconds: 600, MiscoverageBps: 1000,
+		HistoryDays: 14, HorizonSeconds: 3600, UpdateIntervalSeconds: defaultReconcileSeconds,
+		SettlementSeconds: 120, OutcomeGraceSeconds: 600, MiscoverageBps: 1000,
 		Calibration: [9]int64{128, 512, 7, 50, 100, 2500, 8, 500, 8000},
 		Trust: [20]int64{48, 64, 500, 24, 9500, 5, 64, 24, 32, 64, 48, 9500, 10000, 10200, 12, 33000, 7000, 8000, 2000,
 			1750},
@@ -157,6 +159,19 @@ type v2Bound struct {
 	key    string
 	value  *int32
 	lo, hi int64
+}
+
+// v2EffectiveUpdateInterval is contracts.effective_update_interval: spec.prediction.updateIntervalSeconds as the
+// reconciler applies it (absent or 0: defaultReconcileSeconds; never below minReconcileSeconds). It decides how often
+// a bound is issued, so it is part of the settings fingerprint and of the evidence key.
+func v2EffectiveUpdateInterval(configured int32) int64 {
+	switch {
+	case configured == 0:
+		return defaultReconcileSeconds
+	case configured < minReconcileSeconds:
+		return minReconcileSeconds
+	}
+	return int64(configured)
 }
 
 func v2Set(dst *int64, b v2Bound) error {
@@ -176,6 +191,7 @@ func v2Set(dst *int64, b v2Bound) error {
 func resolveV2Settings(spec autoscalerv1alpha1.PredictiveAutoscalerSpec) (v2Settings, error) {
 	p := spec.Prediction
 	s := v2Default()
+	s.UpdateIntervalSeconds = v2EffectiveUpdateInterval(p.UpdateIntervalSeconds)
 	if p.Enabled != nil && !*p.Enabled {
 		return s, fmt.Errorf("forecasting is disabled for this autoscaler (spec.prediction.enabled)")
 	}
@@ -364,7 +380,8 @@ func (s v2Settings) canonical() map[string]interface{} {
 	return map[string]interface{}{"schema": v2SettingsSchema, "settings": map[string]interface{}{
 		"engine": s.Engine, "sample_interval_seconds": s.SampleIntervalSeconds, "seasonality": s.Seasonality,
 		"history_days": s.HistoryDays, "horizon_seconds": s.HorizonSeconds, "min_lead_seconds": s.MinLeadSeconds,
-		"settlement_seconds":    s.SettlementSeconds,
+		"update_interval_seconds": s.UpdateIntervalSeconds,
+		"settlement_seconds":      s.SettlementSeconds,
 		"outcome_grace_seconds": s.OutcomeGraceSeconds, "risk": s.riskMap(), "calibration": s.calibrationMap(),
 		"trust":            s.trustMap(),
 		"predictive_extra": map[string]interface{}{"max_replicas": s.ExtraMaxReplicas, "max_percent": s.ExtraMaxPercent},
@@ -405,7 +422,7 @@ func v2EvidenceKey(paUID, targetUID, querySHA string, s v2Settings, leadSeconds 
 	return v2Hash(map[string]interface{}{"schema": v2EvidenceSchema, "autoscaler_uid": paUID, "target_uid": targetUID,
 		"query_sha256": querySHA, "signal_contract": metricContract, "forecast_contract": forecastContractV2,
 		"interval_seconds": s.SampleIntervalSeconds, "lead_seconds": leadSeconds,
-		"min_lead_seconds": s.MinLeadSeconds, "engine": s.Engine,
+		"min_lead_seconds": s.MinLeadSeconds, "update_interval_seconds": s.UpdateIntervalSeconds, "engine": s.Engine,
 		"seasonality": s.Seasonality, "history_days": s.HistoryDays, "settlement_seconds": s.SettlementSeconds,
 		"outcome_grace_seconds": s.OutcomeGraceSeconds, "risk": s.riskMap(), "calibration": s.calibrationMap(),
 		"trust_policy": v2TrustPolicyRevision})

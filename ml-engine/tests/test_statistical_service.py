@@ -627,6 +627,28 @@ def test_a_lab_qualification_stands_in_for_the_release_gate_and_nothing_else(tmp
                for a, b in zip(got["lab"][1][:first_ready], got["plain"][1][:first_ready]))
 
 
+def test_a_change_of_the_update_interval_starts_a_new_epoch_and_reuses_no_stored_answer(tmp_path):
+    """The operator's update interval is bound into the settings fingerprint and the evidence key: after the live
+    object changes it, the answer stored for the same decision origin is not reused, the old fingerprint is refused,
+    and the evidence starts again in a new epoch (so trust earned at one cadence never serves another)."""
+    reader = Reader(pa_object(prediction=dict(PREDICTION, updateIntervalSeconds=300)))
+    svc, clock = make(tmp_path, reader=reader)
+    old = c.resolve_settings(reader.pa).fingerprint()
+    clock.set(T0 * 1000 + 10_000)
+    first = c.response_from_wire(svc.predict(body(T0, old)))
+    assert c.response_from_wire(svc.predict(body(T0, old))).issuance_id == first.issuance_id     # the stored answer
+    reader.pa = pa_object(prediction=dict(PREDICTION, updateIntervalSeconds=600))
+    new = c.resolve_settings(reader.pa).fingerprint()
+    assert new != old
+    with pytest.raises(ServiceError) as e:
+        svc.predict(body(T0, old))                               # the object no longer has these settings
+    assert e.value.status == 422
+    second = c.response_from_wire(svc.predict(body(T0, new)))
+    assert second.issuance_id != first.issuance_id and second.calibration_epoch != first.calibration_epoch
+    assert second.prospective_windows == 0                       # nothing earned before counts in the new epoch
+    svc.close()
+
+
 def test_an_unvalidated_configuration_is_never_eligible(tmp_path):
     """The same lab-qualified run without the allowlist override: the naive is trusted and selected, the release
     gate's stand-in holds, every bound is issued, and the answer is not eligible: ConfigurationNotValidated."""

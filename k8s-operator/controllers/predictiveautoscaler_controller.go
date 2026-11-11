@@ -282,13 +282,8 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 
 	// Throttle reconciliation to prevent tight loops from status updates
 	key := req.NamespacedName.String()
-	reconcileInterval := time.Duration(autoscaler.Spec.Prediction.UpdateIntervalSeconds) * time.Second
-	if reconcileInterval == 0 {
-		reconcileInterval = time.Duration(defaultReconcileSeconds) * time.Second
-	}
-	if reconcileInterval < time.Duration(minReconcileSeconds)*time.Second {
-		reconcileInterval = time.Duration(minReconcileSeconds) * time.Second
-	}
+	// The same value the forecast settings bind (v2Settings.UpdateIntervalSeconds): one definition of the cadence.
+	reconcileInterval := time.Duration(v2EffectiveUpdateInterval(autoscaler.Spec.Prediction.UpdateIntervalSeconds)) * time.Second
 	// Forecast v2 decisions are anchored to grid origins: at most one decision per decision interval C (the reconcile
 	// interval rounded up to the grid), started one second after its origin, whatever triggers the reconcile (a status
 	// update, a watch event) and however long the previous one took. Deleting the throttle entry (a fast retry) releases it.

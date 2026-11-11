@@ -265,7 +265,7 @@ def profile_settings(**pred):
 def test_only_the_validated_profile_is_on_the_allowlist():
     """Amendment 2: grid 60 s, lead 600 s, risk 10 %, seasonal-naive only, with the default calibration, trust and
     timing settings. Anything else is not validated, whatever its evidence."""
-    assert c.VALIDATED_PROFILES == (c.ValidatedProfile(60, 600, 1000, ("seasonalNaive",),
+    assert c.VALIDATED_PROFILES == (c.ValidatedProfile(60, 60, 600, 1000, ("seasonalNaive",),
                                                        c.VALIDATED_PROFILES[0].evidence),)
     assert c.validated_profile(profile_settings(), 600) is c.VALIDATED_PROFILES[0]
     assert c.validated_profile(profile_settings(minLeadSeconds=0), 600) is c.VALIDATED_PROFILES[0]   # the lead decides
@@ -281,6 +281,29 @@ def test_only_the_validated_profile_is_on_the_allowlist():
     default = c.resolve_settings({"spec": {"prediction": {}}})               # 300 s grid, both families
     assert all(c.validated_profile(default, lead) is None for lead in (600, 1200))
     assert (Q.GRID, Q.LEAD, Q.NOMINAL_BPS, Q.FAMILIES) == (60, 600, 1000, 1)  # what the qualification job measures
+
+
+def test_the_update_interval_is_part_of_the_validated_profile_and_of_the_identity():
+    """The qualification issued one bound per 60 s grid step. The operator's update interval decides how often a
+    bound is issued, so the profile names it (60 s), the live object's value is what is compared, and a change of it
+    is a new settings fingerprint and a new evidence epoch: a stored answer or earned trust never carries over."""
+    base = profile_settings()                                   # absent: the operator's own default, 60 s
+    assert base.update_interval_seconds == 60 and c.validated_profile(base, 600) is c.VALIDATED_PROFILES[0]
+    assert profile_settings(updateIntervalSeconds=60) == base and profile_settings(updateIntervalSeconds=0) == base
+    assert base.canonical()["settings"]["update_interval_seconds"] == 60
+    sig = c.bind_request(svc_helpers.body(svc_helpers.T0), svc_helpers.Reader(),
+                         now_ms=svc_helpers.T0 * 1000 + 10_000).signal
+    # 300 is what the CRD writes into every object that does not set it; 10 is raised to the operator's floor.
+    for configured, effective in ((30, 30), (10, 30), (61, 61), (120, 120), (300, 300), (3600, 3600)):
+        s = profile_settings(updateIntervalSeconds=configured)
+        assert s.update_interval_seconds == effective, configured
+        assert c.validated_profile(s, 600) is None, configured
+        assert s.fingerprint() != base.fingerprint(), configured
+        assert c.evidence_key(sig, s, 600) != c.evidence_key(sig, base, 600), configured
+    assert c.validated_profile(dataclasses.replace(base, update_interval_seconds=300), 600) is None
+    for bad in ("60", 60.0, True, [60]):
+        with pytest.raises(c.ContractRefused, match="updateIntervalSeconds"):
+            profile_settings(updateIntervalSeconds=bad)
 
 
 def test_an_unvalidated_configuration_is_trusted_and_reported_but_never_ready():
@@ -796,6 +819,7 @@ def policy_v1_identity(pa, lead_seconds):
         canon["settings"]["trust"].pop(k)
     canon["settings"]["trust"].update(policy="budgeted-coverage-tests/v1", rolling_alarm_ppm=35_000)
     canon["settings"].pop("min_lead_seconds")
+    canon["settings"].pop("update_interval_seconds")
     body = {"schema": c.EVIDENCE_SCHEMA, "autoscaler_uid": pa["metadata"]["uid"],
             "target_uid": pa["status"]["metricSource"]["targetUID"],
             "query_sha256": pa["status"]["metricSource"]["sha256"], "signal_contract": svc_helpers.CONTRACT,
@@ -808,7 +832,8 @@ def policy_v1_identity(pa, lead_seconds):
 
 
 def test_the_identity_of_policy_v1_is_what_its_code_computed():
-    """Nothing but the policy revision, its budgets and the minimum lead moved the identity since v1."""
+    """Nothing but the policy revision, its budgets, the minimum lead and the update interval moved the identity
+    since v1."""
     assert policy_v1_identity(svc_helpers.pa_object(), svc_helpers.LEAD) == POLICY_V1_IDENTITY
 
 
