@@ -5,6 +5,7 @@ production-ready. Known limits, most important first:
 
 1. **Holds during metrics outages.** Without a measured request rate the operator holds the current replica count (see
    configuration.md, Decision rule), so a real load change during a monitoring outage is not followed until metrics return.
+   Only the bounds are still enforced. There is no scale-to-zero: a target at 0 replicas is paused, not managed.
 2. **Only known scalers are detected.** In `Active` mode the operator refuses to scale while one of these targets the
    Deployment: an HPA, an unpaused KEDA ScaledObject, or another Active PredictiveAutoscaler. It does not detect other
    writers (CI jobs, `kubectl scale`, GitOps applying `replicas`), and the check is not atomic. A write is refused if

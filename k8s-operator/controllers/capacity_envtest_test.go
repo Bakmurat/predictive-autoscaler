@@ -125,3 +125,51 @@ func TestEnvtestNoCapacityHoldsWithoutWriting(t *testing.T) {
 		t.Fatalf("status: %+v / %+v / calculated %d", c, sa, pa.Status.CalculatedReplicas)
 	}
 }
+
+// A Deployment at 0 replicas through the real API server (R3-02): Active mode writes nothing (the Deployment's
+// generation does not move), the persisted status says TargetPaused, and scaling resumes when its owner restores a
+// positive count.
+func TestEnvtestATargetAtZeroReplicasIsPausedAndResumes(t *testing.T) {
+	f := envHarness(t, autoscalerv1alpha1.ModeActive) // 3000 rpm at 600 per replica: 5
+	ctx := context.Background()
+	setReplicas := func(n int32) {
+		d := f.deployment(t)
+		d.Spec.Replicas = &n
+		if err := f.c.Update(ctx, d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setReplicas(0)
+	before := f.deployment(t)
+	for i := 0; i < 2; i++ {
+		reconcileOnce(t, f.r, f.req)
+		if d := lastDecision(t, f.path); d.Action != "paused" || d.AppliedReplicas != 0 || d.DesiredSource != "paused" {
+			t.Fatalf("decision %+v", d)
+		}
+	}
+	if after := f.deployment(t); *after.Spec.Replicas != 0 || after.Generation != before.Generation {
+		t.Fatalf("a paused target was written: replicas %d, generation %d → %d", *after.Spec.Replicas, before.Generation, after.Generation)
+	}
+	var pa autoscalerv1alpha1.PredictiveAutoscaler
+	if err := f.c.Get(ctx, f.req.NamespacedName, &pa); err != nil {
+		t.Fatal(err)
+	}
+	// The serialized API response carries the known zero (it used to drop out of the JSON at 0).
+	raw := &unstructured.Unstructured{}
+	raw.SetGroupVersionKind(autoscalerv1alpha1.GroupVersion.WithKind("PredictiveAutoscaler"))
+	if err := f.c.Get(ctx, f.req.NamespacedName, raw); err != nil {
+		t.Fatal(err)
+	}
+	if v, found, err := unstructured.NestedInt64(raw.Object, "status", "currentReplicas"); err != nil || !found || v != 0 {
+		t.Fatalf("status.currentReplicas in the API response: %v found=%v err=%v", v, found, err)
+	}
+	if sa := meta.FindStatusCondition(pa.Status.Conditions, "ScalingActive"); sa == nil || sa.Status != "False" || sa.Reason != "TargetPaused" ||
+		pa.Status.AppliedReplicas != 0 || pa.Status.CalculatedReplicas != 0 {
+		t.Fatalf("status: %+v / applied %d calculated %d", sa, pa.Status.AppliedReplicas, pa.Status.CalculatedReplicas)
+	}
+	setReplicas(2)
+	reconcileOnce(t, f.r, f.req)
+	if d := lastDecision(t, f.path); d.Action != "scale_up" || *f.deployment(t).Spec.Replicas != 5 {
+		t.Fatalf("after the resume: decision %+v, replicas %d", d, *f.deployment(t).Spec.Replicas)
+	}
+}

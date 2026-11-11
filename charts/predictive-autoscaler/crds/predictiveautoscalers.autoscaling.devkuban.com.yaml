@@ -542,12 +542,22 @@ spec:
               calculatedReplicas:
                 description: |-
                   CalculatedReplicas is the decision rule's result: clamp(max(forecast, reactive), min, max), or the held count
-                  when the current request rate is unavailable. Absent while no per-replica capacity is configured: the
-                  recommendation is then incomplete (CapacityConfigured=False) and the decision holds the current count.
+                  when the current request rate is unavailable (the nearest bound when that count is outside minReplicas and
+                  maxReplicas). Absent while no per-replica capacity is configured: the recommendation is then incomplete
+                  (CapacityConfigured=False) and the decision holds the current count. Absent too while the target is paused
+                  (0 desired replicas): nothing is wanted of it.
                 format: int32
                 type: integer
               conditions:
-                description: Conditions represent the latest available observations
+                description: |-
+                  Conditions represent the latest available observations: Ready, CapacityConfigured, TelemetryAvailable,
+                  ForecastAvailable, ScalingActive, ConflictDetected, VPAInterference, ScaleOutBlocked, ScaleDownHeadroom and,
+                  with engine statistical, PredictionReady. ScalingActive is True with reason Active; when False its reason
+                  names why scaling on demand is off: RecommendMode, TargetPaused (the target Deployment has 0 desired
+                  replicas: nothing is written in any mode until its count is positive again; the operator never writes 0),
+                  Conflict, CheckFailed, GuardAborted, CapacityMissing or TelemetryHold (the current count is held),
+                  BoundsEnforced (no need could be computed and the count was outside minReplicas and maxReplicas: it is brought
+                  inside them, and the message says whether that was written), or the failure reason of Ready.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -636,7 +646,9 @@ spec:
                 type: array
                 x-kubernetes-list-type: atomic
               currentReplicas:
-                description: CurrentReplicas is the current number of replicas
+                description: |-
+                  CurrentReplicas is the target's desired replica count observed in the last reconcile. A zero is reported, not
+                  left out: it is what a paused target shows.
                 format: int32
                 type: integer
               forecastReplicas:

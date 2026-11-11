@@ -196,7 +196,7 @@ current generation, and a calculated replica count. The Deployment does not chan
 | Min, Max | `spec.minReplicas` and `spec.maxReplicas`. |
 | Mode | The mode applied in the last reconcile (`status.mode`). |
 | Current | The Deployment's replica count (`status.currentReplicas`). |
-| Calculated | The decision: what the operator would set now (`status.calculatedReplicas`), or the held count while the request rate cannot be measured. Empty while no per-replica capacity is configured: the recommendation is incomplete. |
+| Calculated | The decision: what the operator would set now (`status.calculatedReplicas`), or the held count while the request rate cannot be measured. Empty while no per-replica capacity is configured (the recommendation is incomplete) and while the target is paused at 0 replicas. |
 | Applied | The last count the operator successfully wrote. Empty until the first write; it keeps showing that last write after a switch back to Recommend, and is cleared only when the target Deployment is replaced. |
 | Ready | The Deployment's **ready replicas** (`status.readyReplicas`), not the `Ready` condition. |
 | Age | Since the autoscaler was created. |
@@ -222,7 +222,7 @@ current generation, and a calculated replica count. The Deployment does not chan
 | `CapacityConfigured` | A per-replica capacity is configured; the message names it in requests per second. | `CapacityPerReplica` (True); `DeprecatedTargetRPS` (True, from the deprecated `targetRPS`: move to `capacityPerReplica`); `CapacityMissing` (False: neither field is set, so nothing is calculated and the count is held); `CapacityInvalid` (False: a value the API server would reject, such as both fields at once). |
 | `TelemetryAvailable` | The request rate was measured. | `Measured`; `MetricsUnavailable` when the query failed, returned no series, several series, a partial answer or a non-finite value. The replica count is then held. |
 | `ForecastAvailable` | A forecast took part in the decision. | `Used`; `Disabled` (`spec.prediction.enabled: false`); `Unavailable` (no model yet, a refusal or an outage: see [section 7](#7-get-forecasts)); `HorizonElapsed` (every step of the cached forecast has passed); `SanityRejected` (its first step exceeded ten times the measured rate, so it was discarded); `CapacityMissing` (no forecast is requested without a per-replica capacity); with engine `statistical`, `NotTrusted` (not yet eligible: see `PredictionReady`), `Rejected` (the answer failed the operator's checks), `LeadInsufficient` and `SettingsInvalid`; and the authentication failures `Unauthorized`, `Forbidden`, `AuthUnavailable`, `AuthMisconfigured` ([section 12](#12-security)). |
-| `ScalingActive` | Scaling is permitted: Active mode, no conflict, the check succeeded, no guard abort, a capacity configured, telemetry measured. It does not mean a write happened; `Applied`, `lastScaleTime` and the `ScaledUp`/`ScaledDown` events show writes. | `Active`; `RecommendMode`; `CapacityMissing` (holding because no per-replica capacity is configured); `TelemetryHold` (holding because the rate is unavailable); `Conflict` (another writer); `CheckFailed` (the coexistence check failed); `GuardAborted` (a last-moment check stopped a write; it retries within seconds); or the failure reason from `Ready`. |
+| `ScalingActive` | Scaling is permitted: Active mode, a target above 0 replicas, no conflict, the check succeeded, no guard abort, a capacity configured, telemetry measured. It does not mean a write happened; `Applied`, `lastScaleTime` and the `ScaledUp`/`ScaledDown` events show writes. | `Active`; `RecommendMode`; `TargetPaused` (the Deployment has 0 desired replicas: nothing is written in any mode, see [Pausing a target](#pausing-a-target)); `CapacityMissing` (holding because no per-replica capacity is configured); `TelemetryHold` (holding because the rate is unavailable); `BoundsEnforced` (nothing could be measured or calculated, and the count was outside `[minReplicas, maxReplicas]`: it is brought inside them, and the message says whether that was written); `Conflict` (another writer); `CheckFailed` (the coexistence check failed); `GuardAborted` (a last-moment check stopped a write; it retries within seconds); or the failure reason from `Ready`. |
 | `ConflictDetected` | Another replica writer targets the Deployment. | `NoConflict` (False); `ReplicaWriter` (True: an HPA, an unpaused KEDA ScaledObject, another Active PredictiveAutoscaler or a legacy-group autoscaler); `CheckFailed` (status `Unknown`: the check could not finish, which blocks writes like a conflict). |
 | `VPAInterference` | A VerticalPodAutoscaler changes the pods' requests. | `None` (False); `VPAUpdatesPods` (True: a VPA in any mode except `Off`; scaling continues, but per-pod capacity may drift); `CheckFailed` (status `Unknown`). |
 | `PredictionReady` | Engine `statistical` only: the operator verified the last forecast as usable now (ready to activate; Recommend still makes no writes). | `Ready` (True). False with the forecasting service's reason (`HistoryInsufficient`, `CalibrationInsufficient`, `ShadowInsufficient`, `CoverageLow`, `DataUnavailable`, `IdentityMismatch`, `StateUnavailable`, `LeadInsufficient`, `ReplayGateMissing`) or the operator's own: `SettingsInvalid`, `CapacityMissing`, `RequestRefused` (the service refused the request), `ForecastRejected` (the answer failed the operator's checks), `NotEligible`, `EvidenceInsufficient`, `EvidenceStale`, `IssuedInFuture`, `DeadlinePassed`. Collecting evidence is normal: decisions are reactive meanwhile. |
@@ -236,7 +236,7 @@ current generation, and a calculated replica count. The Deployment does not chan
 `ForecastUnavailable` / `ForecastRestored`; `ScalingInactive` / `ScalingActive`; `CapacityNotConfigured` (Warning) /
 `CapacityConfigured`; `ScaleOutBlocked` (Warning) / `ScaleOutUnblocked`; `PredictionReady` / `PredictionNotReady`
 (engine `statistical`; a warning only for `ForecastRejected`, `RequestRefused` and `SettingsInvalid`); `ReconcileFailed` /
-`ReconcileRecovered`; `RecommendMode` and `Disabled` (configured states, type Normal); and for coexistence
+`ReconcileRecovered`; `RecommendMode`, `Disabled` and `TargetPaused` (configured states, type Normal); and for coexistence
 `ConflictDetected`, `ConflictResolved`, `ConflictCheckFailed`, `VPAInterference` and `VPAInterferenceCleared`.
 
 ## 7. Get forecasts
@@ -302,7 +302,9 @@ to two minutes ([configuration.md](configuration.md#waiting-for-the-forecasting-
 
 Losing the forecast leaves you with reactive scaling. Losing the **request rate** is more serious: the operator then
 holds the current replica count and does not follow demand in either direction until telemetry returns
-(`TelemetryAvailable=False`, `ScalingActive=False` with `TelemetryHold`).
+(`TelemetryAvailable=False`, `ScalingActive=False` with `TelemetryHold`). Only the bounds still apply: a count below
+`minReplicas` is raised to it at once and a count above `maxReplicas` is lowered to it through the scale-down holds,
+shown as `BoundsEnforced` instead of `TelemetryHold`.
 
 ## 8. Switch to Active, and how to stop
 
@@ -332,6 +334,21 @@ kubectl --kubeconfig <file> --context <context> -n shop patch pa web-pa --type m
 Writes stop at the next reconcile and the Deployment keeps its current replica count. `ScalingActive` shows
 `RecommendMode`. `Applied` keeps showing the last write made while Active. Deleting the autoscaler also stops scaling and leaves the replica count as it is (the operator uses no
 finalizer). To hand over to KEDA, follow the [paused-KEDA fallback pattern](coexistence.md#the-paused-keda-fallback-pattern).
+
+### Pausing a target
+
+To take a workload down for maintenance without touching the autoscaler, scale the Deployment to 0:
+
+```sh
+kubectl --kubeconfig <file> --context <context> -n shop scale deployment web --replicas=0
+```
+
+A Deployment with 0 desired replicas is **paused**: the operator writes nothing to it in any mode and does not bring it
+back to `minReplicas`. `ScalingActive` shows `TargetPaused`, the Calculated column is empty, and the ledger records
+`action: paused`. Set a positive replica count to resume; the next reconcile then decides normally (a scale-up at once,
+a scale-down after the usual ten minutes of a fresh start). This is not scale-to-zero: the operator never sets 0 itself
+and does not wake a paused workload when traffic returns
+([configuration.md](configuration.md#pausing-a-target)).
 
 ## 9. Scale-down behaviour and headroom
 
@@ -618,6 +635,8 @@ With Argo CD the CRD (and, with `retain: true`, the model claim) are also protec
 | `ScalingActive=False`, `GuardAborted` now and then | The autoscaler or the Deployment changed between the decision and the write. | Normal; a fresh reconcile follows within seconds. Frequent aborts mean another writer is changing the replica count. |
 | `ScalingActive=False`, `CapacityMissing` | No per-replica capacity is configured, so the count is held. | Set `capacityPerReplica` (see above). |
 | `ScalingActive=False`, `TelemetryHold` | The request rate cannot be measured, so the count is held. | Fix the telemetry (see above). |
+| `ScalingActive=False`, `BoundsEnforced` | Nothing could be measured or calculated, and the replica count was outside `[minReplicas, maxReplicas]`: it was raised to `minReplicas`, or is being lowered to `maxReplicas` through the scale-down holds. | Fix the telemetry or the capacity; the message says whether a write happened. |
+| `ScalingActive=False`, `TargetPaused`; the Deployment stays at 0 | The Deployment has 0 desired replicas, so the operator leaves it alone. | Set a positive replica count to resume ([Pausing a target](#pausing-a-target)). |
 | Replicas flip back and forth | Another writer (GitOps `replicas`, a CI job, `kubectl scale`) that the operator cannot detect. | Remove `replicas` from the managed manifest or ignore the field in GitOps. |
 | No scale-down although traffic dropped | Stabilization, cooldown, the headroom floor (`ScaleDownHeadroom=True`), or a forecast that still asks for more pods. | Wait for the windows; compare `forecastReplicas`; see [section 9](#9-scale-down-behaviour-and-headroom). |
 | Operator pod unready after an upgrade | The CRD is older than the operator needs (revision gate). | Apply the new CRD ([section 13](#13-upgrading-and-the-api-group-migration)). |

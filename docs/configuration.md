@@ -44,7 +44,7 @@ brackets (20 and 60). The same applies to `metrics.requests`. Set these fields e
 | `observedGeneration` | The spec generation the status describes. |
 | `currentReplicas` / `readyReplicas` | The Deployment's replicas and ready replicas (a zero is reported). |
 | `forecastReplicas` | Replicas from the forecast alone; absent when no forecast was used. |
-| `calculatedReplicas` | The decision rule's result, or the held count when the request rate is unavailable. **Absent while no per-replica capacity is configured** (`CapacityConfigured=False`): the recommendation is incomplete, and no number stands in for it. |
+| `calculatedReplicas` | The decision rule's result, or the held count when the request rate is unavailable (the nearest bound when that count is outside `[minReplicas, maxReplicas]`). **Absent while no per-replica capacity is configured** (`CapacityConfigured=False`): the recommendation is incomplete, and no number stands in for it. Absent too while the target is [paused](#pausing-a-target). |
 | `stabilizedReplicas` | Active only: what is applied after scale-down stabilization and cooldown. Absent in Recommend mode, which keeps no hypothetical scale history. |
 | `appliedReplicas`, `lastScaleTime` | Active only: the last successful write. Cleared when the target Deployment is replaced (`targetUID` changes). |
 | `targetUID` | UID of the target Deployment the status describes. |
@@ -53,7 +53,7 @@ brackets (20 and 60). The same applies to `metrics.requests`. Set these fields e
 | `prediction` | Engine `statistical` only: `engine`, `settingsSHA256`, the published `lead` (`seconds`, `startupDelaySeconds`, `actuationAllowanceSeconds`, `method` `configured`/`measured`, `sampleCount`, `observedGeneration`; the forecasting service reads it), `leadBasis` and `frozenLeadSeconds`, `startup` (`delaySeconds`, `method`, `sampleCount`, `measuredP90Seconds`, `pendingSeconds` with `pendingEvidence` `neverReady`/`uncertain`, `observable`), and the last forecast: `phase`, `reason`, `model`, `issuanceID`, `decisionOrigin`, `validUntil`, `baseWindowMaxRPS`, `upperWindowMaxRPS`, `calibrationWindows`, `prospectiveWindows`, `gateCoverageBps`, the operator's `eligible` verdict, and `predictiveReplicas` / `cappedReplicas` / `capBinding`. |
 | `predictedReplicas` | Deprecated: the calculated count (historical meaning). Use `calculatedReplicas` and `forecastReplicas`. |
 | `lastPrediction` | Issue time of the last forecast used. |
-| `conditions` | `Ready` (the reconcile completed: `ReconcileCompleted`; when False the reason names the failure: `CrossNamespaceTarget`, `DeploymentNotFound`, `InvalidMetricQuery` or `ScalingError`, and `ScalingActive` gets the same reason), `CapacityConfigured` (`CapacityPerReplica`, or `DeprecatedTargetRPS` while the capacity comes from `targetRPS`; False with `CapacityMissing` when neither is set, or `CapacityInvalid` for a value the API server would reject; the message names the resolved requests per second), `TelemetryAvailable` (`Measured` / `MetricsUnavailable`), `ForecastAvailable` (`Used`, `Disabled`, `Unavailable`, `HorizonElapsed`, `SanityRejected`, `CapacityMissing` (no forecast is requested without a capacity), on the v2 path `NotTrusted`, `Rejected`, `LeadInsufficient` and `SettingsInvalid`, and for the operator-to-forecaster authentication `Unauthorized` (401), `Forbidden` (403), `AuthUnavailable` (TokenReview could not judge) and `AuthMisconfigured` (the operator's token or CA file is missing, empty or invalid, or a token is set with a non-https URL)); a cached forecast used during a forecaster outage counts as `Used`, `PredictionReady` (engine `statistical` only; True `Ready` when the operator verified a forecast as usable now, which is readiness to activate, not authorization: Recommend still writes nothing; False with the forecasting service's reason, `HistoryInsufficient`, `CalibrationInsufficient`, `ShadowInsufficient`, `CoverageLow`, `DataUnavailable`, `IdentityMismatch`, `StateUnavailable`, `LeadInsufficient` or `ReplayGateMissing`, or the operator's own: `SettingsInvalid`, `CapacityMissing`, `RequestRefused`, `ForecastRejected`, `NotEligible`, `EvidenceInsufficient`, `EvidenceStale`, `IssuedInFuture`, `DeadlinePassed`), `ScaleOutBlocked` (True `Unschedulable`, `QuotaExceeded` or `FailedCreate` while a scale-out cannot complete; False `None`; `Unknown`/`PodsUnreadable` when the target's ReplicaSets or pods could not be read, `Unknown`/`OwnershipUnresolved` when its current ReplicaSet could not be identified with certainty), `ScalingActive` (`Active`, `RecommendMode`, `CapacityMissing`, `TelemetryHold`, `Conflict`, `CheckFailed`, `GuardAborted`, or the failure reason), `ConflictDetected` (`NoConflict`; `ReplicaWriter` when an HPA, an unpaused KEDA ScaledObject or another Active PredictiveAutoscaler targets the Deployment; `Unknown`/`CheckFailed` when the check failed), `VPAInterference` (`None`; `VPAUpdatesPods` for a VPA in any mode except `Off`; `Unknown`/`CheckFailed` when the check did not complete), `ScaleDownHeadroom` (`Holding` while a scale-down is held for headroom; `NotHolding` when headroom is not currently blocking a scale-down, which says nothing about how much spare capacity exists; `RecommendMode`; informational: it never affects `Ready` or `ScalingActive`). See coexistence.md. |
+| `conditions` | `Ready` (the reconcile completed: `ReconcileCompleted`; when False the reason names the failure: `CrossNamespaceTarget`, `DeploymentNotFound`, `InvalidMetricQuery` or `ScalingError`, and `ScalingActive` gets the same reason), `CapacityConfigured` (`CapacityPerReplica`, or `DeprecatedTargetRPS` while the capacity comes from `targetRPS`; False with `CapacityMissing` when neither is set, or `CapacityInvalid` for a value the API server would reject; the message names the resolved requests per second), `TelemetryAvailable` (`Measured` / `MetricsUnavailable`), `ForecastAvailable` (`Used`, `Disabled`, `Unavailable`, `HorizonElapsed`, `SanityRejected`, `CapacityMissing` (no forecast is requested without a capacity), on the v2 path `NotTrusted`, `Rejected`, `LeadInsufficient` and `SettingsInvalid`, and for the operator-to-forecaster authentication `Unauthorized` (401), `Forbidden` (403), `AuthUnavailable` (TokenReview could not judge) and `AuthMisconfigured` (the operator's token or CA file is missing, empty or invalid, or a token is set with a non-https URL)); a cached forecast used during a forecaster outage counts as `Used`, `PredictionReady` (engine `statistical` only; True `Ready` when the operator verified a forecast as usable now, which is readiness to activate, not authorization: Recommend still writes nothing; False with the forecasting service's reason, `HistoryInsufficient`, `CalibrationInsufficient`, `ShadowInsufficient`, `CoverageLow`, `DataUnavailable`, `IdentityMismatch`, `StateUnavailable`, `LeadInsufficient` or `ReplayGateMissing`, or the operator's own: `SettingsInvalid`, `CapacityMissing`, `RequestRefused`, `ForecastRejected`, `NotEligible`, `EvidenceInsufficient`, `EvidenceStale`, `IssuedInFuture`, `DeadlinePassed`), `ScaleOutBlocked` (True `Unschedulable`, `QuotaExceeded` or `FailedCreate` while a scale-out cannot complete; False `None`; `Unknown`/`PodsUnreadable` when the target's ReplicaSets or pods could not be read, `Unknown`/`OwnershipUnresolved` when its current ReplicaSet could not be identified with certainty), `ScalingActive` (`Active`, `RecommendMode`, `TargetPaused` (the target has 0 desired replicas: nothing is written in any mode), `CapacityMissing`, `TelemetryHold`, `BoundsEnforced` (no need could be computed and the count was outside `[minReplicas, maxReplicas]`; the message says whether it was written), `Conflict`, `CheckFailed`, `GuardAborted`, or the failure reason), `ConflictDetected` (`NoConflict`; `ReplicaWriter` when an HPA, an unpaused KEDA ScaledObject or another Active PredictiveAutoscaler targets the Deployment; `Unknown`/`CheckFailed` when the check failed), `VPAInterference` (`None`; `VPAUpdatesPods` for a VPA in any mode except `Off`; `Unknown`/`CheckFailed` when the check did not complete), `ScaleDownHeadroom` (`Holding` while a scale-down is held for headroom; `NotHolding` when headroom is not currently blocking a scale-down, which says nothing about how much spare capacity exists; `RecommendMode`; informational: it never affects `Ready` or `ScalingActive`). See coexistence.md. |
 
 Events are emitted when a condition changes (and on `ScaledUp` / `ScaledDown`), never on every reconcile. The
 transition events are `TelemetryUnavailable` / `TelemetryRestored`, `ForecastUnavailable` / `ForecastRestored`,
@@ -62,7 +62,7 @@ transition events are `TelemetryUnavailable` / `TelemetryRestored`, `ForecastUna
 `RequestRefused` and `SettingsInvalid`) and `ReconcileFailed` /
 `ReconcileRecovered` (Warning when the condition turns
 False, Normal when it turns True; a first healthy observation emits nothing); a change to the configured states
-`RecommendMode` or `Disabled` is a Normal event of that name. The
+`RecommendMode`, `Disabled` or `TargetPaused` is a Normal event of that name. The
 coexistence events are `ConflictDetected`, `ConflictResolved`, `ConflictCheckFailed`, `VPAInterference` and
 `VPAInterferenceCleared`; `kubectl
 describe pa <name>` shows them. `kubectl get pa` shows Target, Min, Max, Mode, Current, Calculated, Applied, Ready, Age; Mode is `status.mode`, Applied
@@ -101,15 +101,28 @@ therefore differ after a restart.
 **When the current request rate cannot be measured, the replica count is held.** Only a complete, successful answer with
 exactly one finite, non-negative sample counts as a measurement; a failed or partial query, an empty result (no series),
 several series or a non-finite value is "unavailable" — never zero traffic. Without a measurement the operator holds the
-current replica count (within `[minReplicas, maxReplicas]`), whether or not a forecast exists: it neither scales down on
+current replica count, whether or not a forecast exists: it neither scales down on
 missing data nor scales on a forecast alone. The decision ledger records `telemetry_status: unavailable` with the reason and
 the safeguard `telemetry_unavailable_hold`, and the measurement gauges (current RPM, actual need, prediction error) are
 removed instead of showing stale or invented values.
 
+**The bounds are enforced also when nothing can be measured.** A hold keeps a count that lies inside
+`[minReplicas, maxReplicas]`. A positive count outside them is not held: below `minReplicas` it is raised to `minReplicas`
+at once, above `maxReplicas` it is lowered to `maxReplicas` through the usual scale-down holds (stabilization, cooldown,
+at most `max(ceil(10 %), 2)` pods per step), without any measurement. This applies to both holds (no measured rate, no
+capacity) and is recorded as what it is, never as a hold: the ledger shows `desired_source: min_replicas` or
+`max_replicas` with the safeguard `bounds_enforced` (not `keep_current` and not a `*_hold` safeguard), and its `action`
+says what became of the write: `scale_up` or `scale_down` (written), `hold_stabilizing` or `hold_cooldown` (a scale-down
+that is not due yet), `scale_error` (the write failed), `guard_abort` or `conflict_hold` (refused), `recommend`
+(Recommend mode: nothing is written). In Active mode `ScalingActive` is False with reason `BoundsEnforced` (unless a
+conflict, a guard abort or a failed write is the reason), and its message names the cause and says "was set from N to M"
+or "nothing was written this time". A count of 0 is different: see [Pausing a target](#pausing-a-target).
+
 **Without a per-replica capacity, the replica count is held too.** The capacity is `capacityPerReplica`, or the
 deprecated `targetRPS`; one value serves the reactive rule, the forecast rule and the headroom floor. When neither is set
 the operator does not guess one (earlier versions silently assumed 20,000 requests per minute per pod for the reactive
-part and 30,000 for the forecast part). It holds the current count (within `[minReplicas, maxReplicas]`, as above),
+part and 30,000 for the forecast part). It holds the current count (a count outside `[minReplicas, maxReplicas]` is
+brought inside them, as above),
 requests no forecast, leaves `calculatedReplicas` absent, sets `CapacityConfigured=False` (reason `CapacityMissing`) with
 a Warning event `CapacityNotConfigured`, and in Active mode `ScalingActive=False` (reason `CapacityMissing`). The measured
 rate is still published (`predictive_autoscaler_current_rpm`); the replica gauges (desired, predicted, actual need,
@@ -117,6 +130,25 @@ prediction error) are removed. The ledger records `capacity_source: missing` and
 with a capacity it records `capacity_source` (`capacityPerReplica` or `targetRPS`) and `capacity_rpm_per_replica`.
 Recommend mode still writes nothing. Creating or updating an object without a capacity is still accepted, so existing
 objects keep working while they are migrated; a later release will require a capacity for Active mode.
+
+### Pausing a target
+A target Deployment whose desired replica count (`spec.replicas`) is **0 is paused**: the operator writes nothing to it,
+in Active and in Recommend mode, with or without telemetry, a capacity or a forecast, and it does not raise it to
+`minReplicas`. Scale a Deployment to 0 for maintenance (`kubectl scale --replicas=0`, a GitOps change, a job) and it
+stays at 0 until you set a positive count again; the HorizontalPodAutoscaler treats a target at 0 the same way. While
+paused:
+
+- `ScalingActive` is False with reason `TargetPaused` (a Normal event `TargetPaused`, not a warning), `Ready` stays True
+  with `calculated=paused`, `calculatedReplicas` is absent, and `currentReplicas: 0` is published (a known zero is
+  written out, not left out of the status);
+- the ledger records `action: paused`, `desired_source: paused`, `desired_replicas: 0`, `applied_replicas: 0` and the
+  safeguard `target_paused`; the measured rate, the reactive need and the forecast are still recorded as they were;
+- the metric source, the conflict checks and the forecast requests continue, so nothing has to be rebuilt afterwards.
+
+**To resume**, set a positive replica count. The next reconcile decides normally from that count: a scale-up is applied
+at once, and a scale-down waits as after any fresh start (a resume is treated like a switch to Active: at least 10
+minutes before the first scale-down). This is not scale-to-zero: the operator itself never writes 0 (`minReplicas` is at
+least 1), and it does not start a paused target when traffic returns.
 
 ### Waiting for the forecasting service and the metrics backend
 The forecast and the current request rate are requested inside the reconcile, before the decision, and one worker

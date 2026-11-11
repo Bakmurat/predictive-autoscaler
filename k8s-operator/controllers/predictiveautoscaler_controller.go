@@ -83,6 +83,9 @@ type scaleState struct {
 	mode      string
 	signal    string
 	targetUID types.UID
+	// paused: the target had 0 desired replicas at the last reconcile. A resume (back to a positive count) resets the
+	// state like a mode change.
+	paused bool
 	// Replay-only (Codex C-52): the differential harness rebases wall-clock timestamps so a
 	// recorded sequence can be replayed at its own cadence through the real decision
 	// functions. Unused in production -- nothing outside replay_harness_test.go sets these.
@@ -326,17 +329,23 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		return r.updateStatusWithError(ctx, &autoscaler, "DeploymentNotFound", err.Error())
 	}
 	currentReplicas := *deployment.Spec.Replicas
+	// A target with 0 desired replicas is paused by whoever set it (kubectl scale --replicas=0, a maintenance job):
+	// the decision is still computed and recorded, but nothing is written in any mode until the count is positive
+	// again (the HorizontalPodAutoscaler treats a target at 0 the same way). The operator never writes 0 itself:
+	// minReplicas is at least 1. This is not scale-to-zero support.
+	paused := currentReplicas == 0
 	mode := autoscaler.Spec.EffectiveMode()
-	if st := r.getOrCreateScaleState(key); st.mode != mode || st.targetUID != deployment.UID {
-		*st = scaleState{mode: mode, targetUID: deployment.UID}
-		// A fresh Active state (operator restart, leader change, switch to Active, re-created target) has no write
-		// history, and the persisted status can lag the last write (a failed status update after a successful scale).
+	if st := r.getOrCreateScaleState(key); st.mode != mode || st.targetUID != deployment.UID || st.paused != paused {
+		*st = scaleState{mode: mode, targetUID: deployment.UID, paused: paused}
+		// A fresh Active state (operator restart, leader change, switch to Active, re-created target, a target resumed
+		// from 0 replicas) has no write history, and the persisted status can lag the last write (a failed status
+		// update after a successful scale).
 		// It is treated as if a write had just happened (hold bookkeeping only: nothing is written and
 		// status.lastScaleTime is unchanged): the scale-up hold, then the below-current timer, block
 		// scale-down for both windows, and the cooldown (which also applies under the overestimate override) starts
 		// now, independent of the persisted status. Scale-up is not affected. Forecast-dependent state (cache,
 		// overestimate tracking, ramp reference) also starts again, so forecast decisions may still differ.
-		if mode == autoscalerv1alpha1.ModeActive {
+		if mode == autoscalerv1alpha1.ModeActive && !paused {
 			now := r.now()
 			st.lastScaleUp, st.lastScaleDown = now, now
 		}
@@ -534,18 +543,36 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	desiredReplicas, keepCurrent := unifiedDesired(predictedReplicas, reactiveReplicas,
 		autoscaler.Spec.MinReplicas, autoscaler.Spec.MaxReplicas, currentReplicas,
 		dec.ForecastStatus == "used", needMeasured)
-	if keepCurrent && !capacityOK {
-		log.Info("No per-replica capacity configured: holding the current replica count",
-			"current", currentReplicas, "desired", desiredReplicas)
-		dec.Safeguards = append(dec.Safeguards, "capacity_missing_hold")
-	}
-	if keepCurrent && vmErr != nil {
-		log.Info("Current request rate unavailable: holding the current replica count",
-			"current", currentReplicas, "desired", desiredReplicas, "error", vmErr.Error())
-		// A forecast may be available but does not take part in a hold.
-		dec.Safeguards = append(dec.Safeguards, "telemetry_unavailable_hold")
+	// boundsEnforced: no need could be computed (keepCurrent), and the count that would be held lies outside
+	// [minReplicas, maxReplicas]. The clamp then moves it (up at once, down through the scale-down holds): that is the
+	// documented enforcement of the bounds, and it is recorded as that, never as a hold.
+	boundsEnforced := keepCurrent && desiredReplicas != currentReplicas && !paused
+	switch {
+	case paused:
+		// Nothing is wanted of a paused target: the rule's result (at least minReplicas) is not acted on or published.
+		desiredReplicas, keepCurrent = 0, false
+		dec.Safeguards = append(dec.Safeguards, "target_paused")
+	case boundsEnforced:
+		log.Info("No measured need: only the replica bounds are enforced", "current", currentReplicas, "desired", desiredReplicas,
+			"minReplicas", autoscaler.Spec.MinReplicas, "maxReplicas", autoscaler.Spec.MaxReplicas)
+		dec.Safeguards = append(dec.Safeguards, "bounds_enforced")
+	default:
+		if keepCurrent && !capacityOK {
+			log.Info("No per-replica capacity configured: holding the current replica count",
+				"current", currentReplicas, "desired", desiredReplicas)
+			dec.Safeguards = append(dec.Safeguards, "capacity_missing_hold")
+		}
+		if keepCurrent && vmErr != nil {
+			log.Info("Current request rate unavailable: holding the current replica count",
+				"current", currentReplicas, "desired", desiredReplicas, "error", vmErr.Error())
+			// A forecast may be available but does not take part in a hold.
+			dec.Safeguards = append(dec.Safeguards, "telemetry_unavailable_hold")
+		}
 	}
 	dec.setDecision(predictedReplicas, desiredReplicas, keepCurrent)
+	if paused {
+		dec.DesiredSource = "paused"
+	}
 	if useV2 {
 		dec.ForecastContract = forecastContractV2
 		dec.V2 = v2out.ledger(v2pol, capacityRPM, capacityOK, mode)
@@ -672,7 +699,11 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	// Recommend mode: the decision is complete and recorded, nothing is written and no scale history is advanced.
 	stabilized, applied := int32(0), int32(0)
 	headroomHold, headroomPct := false, autoscaler.Spec.ScaleDownHeadroomPercent()
-	if mode != autoscalerv1alpha1.ModeActive {
+	if paused {
+		// Before the mode: a paused target is not written in Active mode and gets no recommendation in Recommend mode.
+		log.Info("Target paused (0 desired replicas): not scaling", "mode", mode)
+		r.recordDecision(dec, "paused", currentReplicas)
+	} else if mode != autoscalerv1alpha1.ModeActive {
 		log.Info("Recommend mode: not scaling", "calculated", desiredReplicas, "current", currentReplicas)
 		r.recordDecision(dec, "recommend", currentReplicas)
 	} else if blocked {
@@ -779,6 +810,7 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		telemetry: dec.TelemetryStatus, telemetryError: dec.TelemetryError, forecastStatus: dec.ForecastStatus,
 		forecastIssuedAt: dec.ForecastIssuedAt, targetUID: string(deployment.UID),
 		headroomHold: headroomHold, headroomPercent: headroomPct, capacityOK: capacityOK, startup: startup,
+		paused: paused, boundsEnforced: boundsEnforced, telemetryOK: vmErr == nil,
 		v2: v2out, v2Policy: v2pol,
 		conflicts: check.Conflicts, writers: check.Writers, warnings: check.Warnings, vpaChecked: check.VPAChecked, checkError: checkMsg, guard: guard,
 	}); err != nil {
@@ -1053,6 +1085,10 @@ var errMetricsUnavailable = stderrors.New("current request rate unavailable")
 //	telemetry measured: desired = clamp(max(forecast replicas if a forecast is used, reactive replicas), min, max)
 //	telemetry missing:  hold the current count (clamped to the bounds) — never scale on a forecast alone, never
 //	                    read "no data" as zero traffic (user decision 2026-10-09: missing metrics → HOLD).
+//
+// The clamp also applies to a hold: a held count outside [min, max] comes back as the nearest bound, and Reconcile
+// records that as bounds enforcement (boundsEnforced), not as a hold. A target at 0 replicas is paused and never
+// reaches a write (Reconcile), whatever this returns.
 func unifiedDesired(predicted, reactive, minReplicas, maxReplicas, current int32, forecastUsed, telemetryOK bool) (int32, bool) {
 	clamp := func(v int32) int32 {
 		if v < minReplicas {
@@ -1561,6 +1597,9 @@ type statusInputs struct {
 	headroomHold                                              bool
 	headroomPercent                                           int32
 	capacityOK                                                bool // a per-replica capacity resolved (capacity.go)
+	paused                                                    bool // the target has 0 desired replicas: nothing is written
+	boundsEnforced                                            bool // a hold whose count was outside [minReplicas, maxReplicas]
+	telemetryOK                                               bool // the current request rate was measured
 	startup                                                   startupObservation
 	v2                                                        *v2Outcome // nil unless engine statistical
 	v2Policy                                                  *v2Policy
@@ -1620,6 +1659,9 @@ func (r *PredictiveAutoscalerReconciler) updateStatus(ctx context.Context, autos
 	if !in.capacityOK {
 		calculated = "incomplete"
 	}
+	if in.paused {
+		calculated = "paused"
+	}
 	set("Ready", true, "ReconcileCompleted", fmt.Sprintf("calculated=%s current=%d mode=%s", calculated, in.current, in.mode))
 	capOK, capReason, capMsg := capacityCondition(autoscaler.Spec)
 	set("CapacityConfigured", capOK, capReason, capMsg)
@@ -1658,6 +1700,9 @@ func (r *PredictiveAutoscalerReconciler) updateStatus(ctx context.Context, autos
 		setStatus("VPAInterference", metav1.ConditionFalse, "None", "no VerticalPodAutoscaler (other than Off) targets the Deployment")
 	}
 	switch {
+	case in.paused:
+		set("ScalingActive", false, "TargetPaused", "the target Deployment has 0 desired replicas: scaling is paused and "+
+			"nothing is written in any mode until its replica count is set above 0")
 	case in.mode != autoscalerv1alpha1.ModeActive:
 		set("ScalingActive", false, "RecommendMode", "Recommend mode: the operator computes and publishes decisions and writes nothing")
 	case in.checkError != "":
@@ -1666,6 +1711,20 @@ func (r *PredictiveAutoscalerReconciler) updateStatus(ctx context.Context, autos
 		set("ScalingActive", false, "Conflict", "another replica writer targets the Deployment: "+strings.Join(in.conflicts, ", "))
 	case in.guard != "":
 		set("ScalingActive", false, "GuardAborted", in.guard)
+	case in.boundsEnforced:
+		// Not a hold: the count was outside the bounds and is moved (or about to be). Demand is still not followed.
+		why := "no per-replica capacity is configured"
+		if in.capacityOK && !in.telemetryOK {
+			why = "the current request rate is unavailable"
+		}
+		spec := autoscaler.Spec
+		did := fmt.Sprintf("the replica count was set from %d to %d", in.current, in.applied)
+		if in.applied == 0 {
+			did = fmt.Sprintf("the replica count %d is above maxReplicas %d and is lowered after the scale-down holds; "+
+				"nothing was written this time", in.current, spec.MaxReplicas)
+		}
+		set("ScalingActive", false, "BoundsEnforced", fmt.Sprintf("%s, so demand is not followed and only the bounds [%d, %d] "+
+			"are enforced: %s", why, spec.MinReplicas, spec.MaxReplicas, did))
 	case !in.capacityOK:
 		set("ScalingActive", false, "CapacityMissing", "holding the current replica count: no per-replica capacity is configured")
 	case in.keepCurrent:
@@ -1780,7 +1839,7 @@ func (r *PredictiveAutoscalerReconciler) transitionEvents(a *autoscalerv1alpha1.
 		switch {
 		case c.Status == metav1.ConditionTrue:
 			r.event(a, "Normal", n[1], c.Message)
-		case c.Reason == "RecommendMode" || c.Reason == "Disabled": // configured states, not faults
+		case c.Reason == "RecommendMode" || c.Reason == "Disabled" || c.Reason == "TargetPaused": // configured states, not faults
 			r.event(a, "Normal", c.Reason, c.Message)
 		default:
 			r.event(a, "Warning", n[0], c.Reason+": "+c.Message)
