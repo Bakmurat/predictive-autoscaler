@@ -102,6 +102,13 @@ ASSUMED_INFLIGHT_BYTES = 128 * 2**10     # one request in flight (goroutine, con
 ASSUMED_TABLE_ENTRY_BYTES = 64           # one per-minute count of the schedule table, parsed, in one VU's runtime
 CONFIGMAP_LIMIT_BYTES = 1_048_576        # the API server's limit on a ConfigMap's data (1 MiB)
 SETUP_VUS = 1                            # k6 runs setup() in its own VU
+# The least memory limit the stage accepts for the fixture's ingress. Both targets' traffic passes through this one
+# container: if it is killed, both lose requests. On kind (2026-11-11) an ingress with bounded dials peaked at
+# 41.3 MiB with ONE target unreachable at the schedule's peak rate; two unreachable targets and longer faults were
+# not measured. 64 MiB would leave about a third of that single measurement as margin, so the reviewed floor is
+# 128 MiB. It is a floor for admission, not evidence that 128 MiB is enough: that is the fault test on the final
+# images. The residency count uses the params' request, as for every other pod.
+INGRESS_MEMORY_LIMIT_MIN_BYTES = 128 * 2**20
 
 _DNS = re.compile(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?")
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -294,11 +301,33 @@ def problems(p: Dict) -> List[str]:
     if "residency" not in p:
         out.append("residency is required: the stage's admission counts W and S (allocatable and system requests)")
     out += block_problems(p)
+    out += [x for x in ingress_problems(p) if x not in out]
     if not out:
         try:
             out += sizing_problems(p)
         except (R.ParamsError, ValueError) as e:
             out.append(str(e))
+    return out
+
+
+def ingress_problems(p: Dict) -> List[str]:
+    """The ingress's memory limit is at least the reviewed floor, and its request is its limit, so that the node
+    really holds what the limit allows (the residency count reads requests). A value that cannot be read is reported
+    by the common validation; here it is simply not accepted."""
+    ing = p.get("ingress") if isinstance(p, dict) else None
+    try:
+        limit, request = R.memory_bytes(ing["memory_limit"]), R.memory_bytes(ing["memory_request"])
+    except (R.ParamsError, KeyError, TypeError, ValueError, ArithmeticError):
+        return [f"ingress.memory_limit and ingress.memory_request must be memory quantities of at least "
+                f"{INGRESS_MEMORY_LIMIT_MIN_BYTES // 2**20}Mi"]
+    out = []
+    if limit < INGRESS_MEMORY_LIMIT_MIN_BYTES:
+        out.append(f"ingress.memory_limit {ing['memory_limit']} is below the stage's floor of "
+                   f"{INGRESS_MEMORY_LIMIT_MIN_BYTES // 2**20}Mi: both targets' traffic passes through this one "
+                   "container, and it must survive an unreachable target")
+    if request != limit:
+        out.append(f"ingress.memory_request {ing['memory_request']} must equal ingress.memory_limit "
+                   f"{ing['memory_limit']}: the residency count reads requests, and the node must hold what the limit allows")
     return out
 
 

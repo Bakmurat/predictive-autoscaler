@@ -909,3 +909,36 @@ def test_cli_smoke_origin_puts_the_smoke_at_a_chosen_time_of_the_schedules_day(t
                          "--smoke-origin-utc", "2026-11-10T13:20:00Z"], "smoke-only option")):
         with pytest.raises(render.ParamsError, match=text):
             main(argv)
+
+
+# --- the ingress's memory: one container carries both targets' traffic ------------------------------------------------
+
+def _ingress(p, request, limit):
+    return changed(p, "ingress", {**p["ingress"], "memory_request": request, "memory_limit": limit})
+
+
+@pytest.mark.parametrize("value", ["64Mi", "127Mi", "100M", "1Mi"])
+def test_an_ingress_memory_limit_below_the_floor_is_refused(value):
+    for p in (params(), prod_like()):
+        refused(_ingress(p, value, value), "below the stage's floor of 128Mi")
+
+
+@pytest.mark.parametrize("value", ["", "lots", None, "128"])
+def test_an_ingress_memory_that_cannot_be_read_or_is_tiny_is_refused(value):
+    found = problems(_ingress(params(), value, value))
+    assert any("memory quantit" in x or "below the stage's floor" in x for x in found), found
+
+
+def test_the_ingress_request_must_equal_its_limit():
+    refused(_ingress(params(), "64Mi", "128Mi"), "must equal ingress.memory_limit")
+    refused(_ingress(params(), "256Mi", "128Mi"), "must equal ingress.memory_limit")
+
+
+def test_the_floor_and_more_pass_and_the_residency_counts_the_ingress_memory():
+    assert demo.INGRESS_MEMORY_LIMIT_MIN_BYTES == 128 * 2**20
+    assert params()["ingress"]["memory_limit"] == params()["ingress"]["memory_request"] == "128Mi"
+    for value in ("128Mi", "256Mi", "1Gi"):
+        assert problems(_ingress(prod_like(), value, value)) == []
+    used = {v: demo.residency_report(_ingress(prod_like(), v, v))["nodes"]["workload"]["total"]["memory_bytes"]
+            for v in ("128Mi", "256Mi")}
+    assert used["256Mi"] - used["128Mi"] == 128 * 2**20            # the node must hold what the limit allows

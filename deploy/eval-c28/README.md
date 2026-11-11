@@ -221,6 +221,15 @@ experiment (`full_validation_problems`).
 
 Unknown fields are refused; so is any `<...>` or `__...__` placeholder in a consumed field.
 
+The stage also sets a floor for the ingress (`demo.ingress_problems`): `ingress.memory_limit` at least 128Mi, and
+`ingress.memory_request` equal to it, so that the residency count (which reads requests) holds what the limit allows.
+Both targets' traffic passes through that one container, so if it is killed both lose requests. On kind
+(2026-11-11) an ingress with bounded dials peaked at 41.3 MiB with one target unreachable at the schedule's peak
+rate; two unreachable targets and longer faults were not measured. The floor is a rule for admission, not evidence
+that 128Mi is enough: that is the fault test on the final images. `params/kind-demo.json` uses the floor, and the
+replacement smoke no longer raises the ingress limit on its own (`DEMO_INGRESS_MEMORY` overrides it for a
+comparison run).
+
 `demo.active_values_problems(values, params)` validates the scale-write part of the release's chart values for both
 configurations and produces neither: shadow (`scaleWrite: false`) may name no `scaleTargets`; Active
 (`scaleWrite: true`) must name exactly the two targets, and an empty or missing list (the chart's namespace-wide

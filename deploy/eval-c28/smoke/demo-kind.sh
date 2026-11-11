@@ -426,6 +426,7 @@ DEMO_TIMEOUT_SECONDS="${DEMO_TIMEOUT_SECONDS:-110}"
 #   requests             the packets TO its pods' port 8080 are dropped: not even the SYN arrives (a network
 #                        blackhole), so every connection attempt of the ingress hangs.
 DEMO_BLACKHOLE="${DEMO_BLACKHOLE:-responses}"
+DEMO_INGRESS_MEMORY="${DEMO_INGRESS_MEMORY:-}"     # empty: the params' ingress memory (the stage's floor)
 case "$DEMO_BLACKHOLE" in responses|requests) ;; *) echo "demo smoke: DEMO_BLACKHOLE must be responses or requests" >&2; exit 2 ;; esac
 # drop_rule <pod IP>: the iptables match of the chosen direction.
 drop_rule() {
@@ -619,10 +620,13 @@ ref['nodes'] = {'workload': {'name': '$W', 'uid': '$W_UID'}, 'support': {'name':
 p['demonstration']['schedule_origin_utc'] = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT00:00:00Z')
 if '$GENERATOR_REF':
     p['demonstration']['generator']['image'] = '$GENERATOR_REF'
-if '$REPLACEMENT' == '1':        # the replacement smoke: a higher rate on a light fixture, room for hanging requests
+if '$REPLACEMENT' == '1':        # the replacement smoke: a higher rate on a light fixture
     p['demonstration']['capacity_per_replica_rps'] = float('$DEMO_CAPACITY_RPS')
     p['fixture']['work_iterations'] = int('$DEMO_WORK_ITERATIONS')
-    p['ingress']['memory_limit'] = '256Mi'
+    # The ingress keeps the params' memory limit (the stage's floor, 128Mi): the smoke exercises the limit the
+    # stage admits, not a larger one. DEMO_INGRESS_MEMORY overrides it for a comparison run.
+    if '$DEMO_INGRESS_MEMORY':
+        p['ingress']['memory_limit'] = p['ingress']['memory_request'] = '$DEMO_INGRESS_MEMORY'
 "
 c28 validate --params "$PRM" --stage demonstration >/dev/null || die "the smoke params do not validate"
 RUN="$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["run_id"])' "$PRM")"
