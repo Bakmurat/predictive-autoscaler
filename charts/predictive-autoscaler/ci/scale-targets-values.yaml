@@ -1,5 +1,6 @@
 # Replica writes limited to named Deployments in named namespaces: update on deployments/scale carries resourceNames
-# (operator.rbac.scaleTargets), bound only in operator.watchNamespaces; reading /scale stays unrestricted.
+# (operator.rbac.scaleTargets), bound only in operator.watchNamespaces; reading /scale stays unrestricted. The
+# operator also refuses every write to a Deployment whose UID is not the reviewed one (operator.writeAllowlist).
 prometheus:
   url: http://prometheus-server.monitoring.svc.cluster.local:80
 networkPolicy:
@@ -12,3 +13,6 @@ operator:
   rbac:
     scaleWrite: true
     scaleTargets: [web, api]
+  writeAllowlist:
+    - {namespace: shop, name: web, uid: 6f1d2c3a-8b7e-4f5a-9c0d-1e2f3a4b5c6d}
+    - {namespace: shop, name: api, uid: 0a9b8c7d-6e5f-4a3b-8c2d-1f0e9d8c7b6a}

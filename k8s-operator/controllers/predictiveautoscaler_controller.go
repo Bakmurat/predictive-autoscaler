@@ -125,6 +125,9 @@ type PredictiveAutoscalerReconciler struct {
 	// forecastWait and metricsWait account what reconciles wait for the forecasting service and the metrics backend,
 	// cumulatively across autoscalers (forecast_wait.go).
 	forecastWait, metricsWait waitAllowance
+	// WriteAllowlist, when set, limits every replica write to the listed Deployments at their reviewed UIDs
+	// (write_allowlist.go); nil restricts nothing.
+	WriteAllowlist *WriteAllowlist
 }
 
 func (r *PredictiveAutoscalerReconciler) mlAPI() *mlAPIClient {
@@ -641,6 +644,11 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		dec.ConflictCheckError = &checkMsg
 	}
 	blocked := mode == autoscalerv1alpha1.ModeActive && (checkErr != nil || len(check.Conflicts) > 0)
+	// The write allowlist is decided on the object this reconcile read; the write itself checks the fresh Scale again.
+	notAllowed := ""
+	if mode == autoscalerv1alpha1.ModeActive {
+		notAllowed = r.WriteAllowlist.refusal(deployment.Namespace, deployment.Name, deployment.UID)
+	}
 	// write re-reads the autoscaler and the target immediately before the write; guard holds the reason when it
 	// aborted the write (the object changed during the reconcile).
 	// The write itself goes through /scale and applies only if the replica count is still the one decided from; a
@@ -701,6 +709,12 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	} else if mode != autoscalerv1alpha1.ModeActive {
 		log.Info("Recommend mode: not scaling", "calculated", desiredReplicas, "current", currentReplicas)
 		r.recordDecision(dec, "recommend", currentReplicas)
+	} else if notAllowed != "" {
+		// Not a reviewed target (or a replacement of one): no write of any kind, reactive ones included, and no
+		// scale-down timer keeps running.
+		log.Info("Not scaling: the target is not in the write allowlist", "reason", notAllowed)
+		r.recordDecision(dec, "target_not_allowed", currentReplicas)
+		state.belowCurrentSince = time.Time{}
 	} else if blocked {
 		// Another writer owns the count (or ownership is unknown): no write, and no scale-down timer keeps running.
 		log.Info("Not scaling: another replica writer or a failed coexistence check",
@@ -808,6 +822,7 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		paused: paused, boundsEnforced: boundsEnforced, telemetryOK: vmErr == nil,
 		v2: v2out, v2Policy: v2pol,
 		conflicts: check.Conflicts, writers: check.Writers, warnings: check.Warnings, vpaChecked: check.VPAChecked, checkError: checkMsg, guard: guard,
+		notAllowed: notAllowed,
 	}); err != nil {
 		log.Error(err, "Failed to update status")
 	}
@@ -1535,6 +1550,9 @@ var errStaleDecision = stderrors.New("stale decision")
 // staleDecisionRetry is how soon a reconcile follows a write aborted by a stale decision.
 const staleDecisionRetry = 5 * time.Second
 
+// errWriteNotAllowed marks a write refused by the write allowlist at the write itself.
+var errWriteNotAllowed = stderrors.New("write not allowed")
+
 // scaleWriteTimeout bounds the fresh Scale read, the final authorization and the /scale update together.
 var scaleWriteTimeout = 10 * time.Second
 
@@ -1559,11 +1577,15 @@ func (r *PredictiveAutoscalerReconciler) freshScale(ctx context.Context, deploym
 
 // writeScale writes the replica count through /scale (never a full-object update, so no other field is touched). The
 // body keeps the Scale's UID and resourceVersion: the API server rejects it (Conflict) if the Deployment was replaced
-// or changed after the read. It is not retried here.
+// or changed after the read. It is not retried here. With a write allowlist, the UID in that body must be the reviewed
+// one: this is the only place a replica count is written, so no path reaches the API server around the check.
 func (r *PredictiveAutoscalerReconciler) writeScale(ctx context.Context, deployment *appsv1.Deployment, scale *autoscalingv1.Scale, replicas int32) error {
 	from := scale.Spec.Replicas
 	if replicas == from {
 		return nil // already at target
+	}
+	if why := r.WriteAllowlist.refusal(deployment.Namespace, deployment.Name, scale.UID); why != "" {
+		return fmt.Errorf("%w: %s", errWriteNotAllowed, why)
 	}
 	direction := "up"
 	if replicas < from {
@@ -1598,6 +1620,7 @@ type statusInputs struct {
 	startup                                                   startupObservation
 	v2                                                        *v2Outcome // nil unless engine statistical
 	v2Policy                                                  *v2Policy
+	notAllowed                                                string // why the write allowlist refuses the target ("": it does not)
 }
 
 var forecastReasons = map[string]string{"disabled": "Disabled", "unavailable": "Unavailable",
@@ -1700,6 +1723,8 @@ func (r *PredictiveAutoscalerReconciler) updateStatus(ctx context.Context, autos
 			"nothing is written in any mode until its replica count is set above 0")
 	case in.mode != autoscalerv1alpha1.ModeActive:
 		set("ScalingActive", false, "RecommendMode", "Recommend mode: the operator computes and publishes decisions and writes nothing")
+	case in.notAllowed != "":
+		set("ScalingActive", false, "TargetNotAllowed", "nothing is written: "+in.notAllowed)
 	case in.checkError != "":
 		set("ScalingActive", false, "CheckFailed", "the coexistence check failed, so nothing is written: "+in.checkError)
 	case len(in.conflicts) > 0:

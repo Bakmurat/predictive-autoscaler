@@ -72,14 +72,44 @@ has:
 - RBAC binds the **name**, not the object. A Deployment deleted and recreated under an allowed name is still
   authorized by RBAC. The operator refuses a replaced target only within the reconcile that read the old object (its
   fresh Scale read and identity guard compare UIDs); on its next reconcile it reads the replacement, starts its state
-  again for the new UID, and can then scale it reactively. Restricting writes to reviewed UIDs needs an operator-side
-  check, which this chart value does not provide.
+  again for the new UID, and can then scale it reactively. `operator.writeAllowlist` (below) closes this.
 - An autoscaler whose target is not listed keeps working in Recommend mode; in Active mode its write fails with
   Forbidden, as in a shadow install.
 - After changing the list, check the effective permissions as the operator's ServiceAccount, for example
   `kubectl auth can-i update deployments/web --subresource=scale -n shop --as system:serviceaccount:<release namespace>:<operator ServiceAccount>`
   (expect `yes` for a listed name and `no` for any other name or namespace). Bindings made outside the chart can
   grant more than the chart renders, so check the answer, not only the rendered role.
+
+### Limiting the replica write to reviewed Deployments, by UID
+
+`operator.writeAllowlist` (empty by default) lists the Deployments the operator may scale, each with the UID it had
+when it was reviewed:
+
+```yaml
+operator:
+  watchNamespaces: [shop]
+  rbac:
+    scaleTargets: [web]
+  writeAllowlist:
+    - {namespace: shop, name: web, uid: 6f1d2c3a-8b7e-4f5a-9c0d-1e2f3a4b5c6d}   # kubectl -n shop get deployment web -o jsonpath='{.metadata.uid}'
+```
+
+- With entries, the operator checks every replica write, reactive ones included, before it is sent: the target must
+  be listed and its UID must be the listed one. The check runs when the decision is made and again on the `/scale`
+  object that carries the write, whose UID the API server enforces.
+- A Deployment that is not listed, or that was deleted and created again under a listed name, is never written. Its
+  autoscaler keeps computing and publishing decisions and reports `ScalingActive=False` with reason
+  `TargetNotAllowed`; the decision record has `action: target_not_allowed`. Recommend mode is unchanged.
+- After a replacement has been reviewed, set its new UID and upgrade the release. The operator reads the list only
+  at start, so the change takes effect with the restart the upgrade causes.
+- An empty list means no restriction by UID (unchanged for existing installs). The list is passed as
+  `SCALE_WRITE_ALLOWLIST` (`namespace/name=uid`, comma-separated); an operator that cannot read it exactly does not
+  start.
+- Refused at render time: an entry outside `operator.watchNamespaces` or, when names are set, outside
+  `operator.rbac.scaleTargets` (it could never be written); a Deployment listed twice; more than 64 entries; any
+  entry with `scaleWrite: false`.
+- This is an operator-side check, not a permission. Keep `scaleTargets` and `watchNamespaces` as the RBAC bound: the
+  allowlist narrows what the operator does within it.
 
 ## The CRD
 

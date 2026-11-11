@@ -347,7 +347,8 @@ type PredictiveAutoscalerStatus struct {
 	// with engine statistical, PredictionReady. ScalingActive is True with reason Active; when False its reason
 	// names why scaling on demand is off: RecommendMode, TargetPaused (the target Deployment has 0 desired
 	// replicas: nothing is written in any mode until its count is positive again; the operator never writes 0),
-	// Conflict, CheckFailed, GuardAborted, CapacityMissing or TelemetryHold (the current count is held),
+	// TargetNotAllowed (the operator's write allowlist does not name the target at its current UID), Conflict,
+	// CheckFailed, GuardAborted, CapacityMissing or TelemetryHold (the current count is held),
 	// BoundsEnforced (no need could be computed and the count was outside minReplicas and maxReplicas: it is brought
 	// inside them, and the message says whether that was written), or the failure reason of Ready.
 	Conditions []metav1.Condition `json:"conditions,omitempty"`

@@ -89,6 +89,15 @@ func main() {
 		mgrOpts.Cache = cache.Options{DefaultNamespaces: watched}
 		setupLog.Info("Restricting watches to namespaces", "namespaces", namespaces)
 	}
+	// A write allowlist that cannot be read exactly stops the operator here, before anything can be scaled.
+	writeAllowlist, err := controllers.WriteAllowlistFromEnv()
+	if err != nil {
+		setupLog.Error(err, "unable to read the write allowlist")
+		os.Exit(1)
+	}
+	if writeAllowlist != nil {
+		setupLog.Info("Replica writes are limited to the write allowlist", "deployments", writeAllowlist.Len())
+	}
 	restConfig := ctrl.GetConfigOrDie()
 
 	// The CRD revision gate runs BEFORE the manager exists: ctrl.NewManager already binds the probe and metrics ports
@@ -123,12 +132,13 @@ func main() {
 	}
 
 	if err = (&controllers.PredictiveAutoscalerReconciler{
-		Client:    mgr.GetClient(),
-		Scheme:    mgr.GetScheme(),
-		Log:       ctrl.Log.WithName("controllers").WithName("PredictiveAutoscaler"),
-		Recorder:  mgr.GetEventRecorder("predictive-autoscaler"),
-		APIReader: mgr.GetAPIReader(),
-		Discovery: controllers.RESTDiscovery{Client: discoveryClient.RESTClient()},
+		Client:         mgr.GetClient(),
+		Scheme:         mgr.GetScheme(),
+		Log:            ctrl.Log.WithName("controllers").WithName("PredictiveAutoscaler"),
+		Recorder:       mgr.GetEventRecorder("predictive-autoscaler"),
+		APIReader:      mgr.GetAPIReader(),
+		Discovery:      controllers.RESTDiscovery{Client: discoveryClient.RESTClient()},
+		WriteAllowlist: writeAllowlist,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "PredictiveAutoscaler")
 		os.Exit(1)
