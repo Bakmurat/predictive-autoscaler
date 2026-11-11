@@ -380,7 +380,7 @@ func parseUpstreams(spec string) (map[string]string, error) {
 }
 
 func newIngress(upstreams map[string]string, timeout time.Duration, now func() time.Time) *ingress {
-	tr := &http.Transport{MaxIdleConnsPerHost: 1024, IdleConnTimeout: 90 * time.Second}
+	tr := upstreamTransport(timeout)
 	return &ingress{upstreams: upstreams, now: now, latency: map[string]*histogram{}, timeout: timeout,
 		routing: routingService, client: &http.Client{Timeout: timeout, Transport: tr, CheckRedirect: noRedirect}}
 }
@@ -650,7 +650,11 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		g := newIngress(ups, envSeconds("TIMEOUT_SECONDS", 2), time.Now)
+		timeout := envSeconds("TIMEOUT_SECONDS", 2)
+		if timeout <= 0 {
+			log.Fatal("TIMEOUT_SECONDS must be positive") // 0 would mean no request timeout and no dial bound
+		}
+		g := newIngress(ups, timeout, time.Now)
 		switch routing := envString("ROUTING", routingService); routing {
 		case routingService:
 		case routingEndpointsRR:
@@ -662,7 +666,7 @@ func main() {
 			if resync < time.Second || stale <= resync {
 				log.Fatal("DISCOVERY_RESYNC_SECONDS must be at least 1 and DISCOVERY_STALE_SECONDS larger than it")
 			}
-			r, err := newRRRouter(ups, ns, stale, time.Now)
+			r, err := newRRRouter(ups, ns, stale, timeout, time.Now)
 			if err != nil {
 				log.Fatal(err)
 			}

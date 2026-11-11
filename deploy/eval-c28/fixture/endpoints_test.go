@@ -68,7 +68,7 @@ func testRouter(t *testing.T, now func() time.Time, targets ...string) *rrRouter
 	for _, n := range targets {
 		ups[n] = "http://" + n + ".demo.svc"
 	}
-	r, err := newRRRouter(ups, "demo", 90*time.Second, now)
+	r, err := newRRRouter(ups, "demo", 90*time.Second, 2*time.Second, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,8 +252,11 @@ func TestUpstreamsForEndpointsModeAreServicesInTheOwnNamespace(t *testing.T) {
 		}
 	}
 	if _, err := newRRRouter(map[string]string{"a": "http://s.demo.svc", "b": "http://s.demo.svc"}, "demo",
-		time.Minute, time.Now); err == nil {
+		time.Minute, time.Second, time.Now); err == nil {
 		t.Error("two targets on one Service must be refused")
+	}
+	if _, err := newRRRouter(map[string]string{"a": "http://s.demo.svc"}, "demo", time.Minute, 0, time.Now); err == nil {
+		t.Error("a router without a dial timeout must be refused: its dials would be unbounded")
 	}
 }
 
