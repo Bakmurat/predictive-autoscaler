@@ -173,12 +173,15 @@ def test_reservation_is_atomic_and_counts_against_the_limit():
 
 def test_a_registration_names_its_uid_and_a_new_uid_starts_empty():
     m = M.ForecastMetrics(max_autoscalers=1)
-    assert m.reserve("shop", "web", "uid-1", 1000) is None
+    first = m.reserve("shop", "web", "uid-1", 1000)
+    assert first.replaced is None
     m.update("shop", "web", snapshot(uid="uid-1"))
     assert samples(registry(m), "web")
-    assert m.reserve("shop", "web", "uid-1", 2000) is None             # the same object: its series stay
+    assert m.reserve("shop", "web", "uid-1", 2000) == first            # the same object: its series and token stay
     assert samples(registry(m), "web") and m.slots() == [("shop", "web", "uid-1", 2000)]
-    assert m.reserve("shop", "web", "uid-2", 3000) == "uid-1"          # replaced: the slot is the new object's ...
+    second = m.reserve("shop", "web", "uid-2", 3000)                   # replaced: the slot is the new object's ...
+    assert second.replaced == "uid-1" and second.token != first.token
+    assert m.update("shop", "web", snapshot(uid="uid-1"), first.token) is False     # old work is shut out
     assert samples(registry(m), "web") == [] and m.slots() == [("shop", "web", "uid-2", 3000)]   # ... and empty
     assert m.released == {"not_found": 0, "replaced": 1, "idle": 0}
 

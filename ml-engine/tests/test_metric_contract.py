@@ -282,8 +282,14 @@ def test_kube_reader_rereads_the_token_and_maps_statuses(tmp_path):
     (tmp_path / "token").write_text("t2")  # rotation
     kr.get("/x")
     assert [s[0] for s in seen] == ["Bearer t1", "Bearer t2"] and seen[0][1:] == (8.0, 1 << 20)
-    answer["status"] = 404
-    assert kr.get("/x") is None
+    dep = "/apis/apps/v1/namespaces/shop/deployments/web"
+    answer["status"], answer["body"] = 404, (b'{"kind":"Status","status":"Failure","reason":"NotFound","code":404,'
+                                             b'"details":{"name":"web","group":"apps","kind":"deployments"}}')
+    assert kr.get(dep) is None                         # the API server's NotFound for exactly that object
+    for path in ("/x", dep.replace("/web", "/api")):   # a 404 that does not name the requested object proves nothing
+        with pytest.raises(LookupFailed):
+            kr.get(path)
+    answer["body"] = b'{"ok": true}'
     for status in (401, 403, 500, TransportFailure("down"), DeadlineExceeded("slow"), BodyTooLarge("big")):
         answer["status"] = status
         with pytest.raises(LookupFailed):

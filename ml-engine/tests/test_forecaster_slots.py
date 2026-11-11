@@ -6,18 +6,19 @@ and frees nothing; a release frees the registration and the metric series, never
 import json
 import os
 import sys
+import threading
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from api.identity import KubeReader, LookupFailed  # noqa: E402
+from api.identity import API_GROUP, KubeReader, LookupFailed, definite_not_found  # noqa: E402
 from data.bounded_http import TransportFailure  # noqa: E402
 from forecasting import contracts as c  # noqa: E402
 from forecasting import service as service_module  # noqa: E402
 from forecasting.artifacts import Binding  # noqa: E402
 from forecasting.service import ServiceConfig, ServiceError  # noqa: E402
-from tests.test_statistical_service import DT, T0, body, make, pa_object  # noqa: E402
+from tests.test_statistical_service import DT, T0, Backend, body, make, pa_object  # noqa: E402
 
 SWEEP_MS = service_module.SLOT_SWEEP_SECONDS * 1000
 
@@ -37,6 +38,31 @@ class Cluster:
         if name in self.fail:
             raise self.fail[name]
         return pa_object(uid=self.live[name]) if name in self.live else None
+
+
+def not_found(path, **details):
+    """The API server's own 404 for the object `path` names (apierrors.NewNotFound), as bytes; `details` overrides."""
+    parts = path.split("/")
+    named = {"name": parts[-1], "group": parts[2], "kind": parts[-2]}
+    return json.dumps({"kind": "Status", "apiVersion": "v1", "metadata": {}, "status": "Failure",
+                       "message": f"{parts[-2]}.{parts[2]} \"{parts[-1]}\" not found", "reason": "NotFound",
+                       "details": {**named, **details}, "code": 404}).encode()
+
+
+# 404 answers that say nothing about the object: the path is not served (e.g. the CRD is not installed), a proxy's
+# page, a cut-off body, and a NotFound about another object, resource or group.
+INDEFINITE_404 = {
+    "path_not_served_404": lambda path: json.dumps({
+        "kind": "Status", "apiVersion": "v1", "metadata": {}, "status": "Failure", "reason": "NotFound",
+        "message": "the server could not find the requested resource", "details": {}, "code": 404}).encode(),
+    "proxy_page_404": lambda path: b"<html><body><h1>404 Not Found</h1></body></html>",
+    "plain_text_404": lambda path: b"404 page not found\n",
+    "cut_off_404": lambda path: not_found(path)[:-9],
+    "no_details_404": lambda path: b'{"kind":"Status","status":"Failure","reason":"NotFound","code":404}',
+    "other_name_404": lambda path: not_found(path, name="another"),
+    "other_resource_404": lambda path: not_found(path, kind="deployments"),
+    "other_group_404": lambda path: not_found(path, group="apps"),
+}
 
 
 def names(n):
@@ -103,10 +129,10 @@ def test_a_definite_not_found_releases_the_slot_and_a_new_name_is_admitted(tmp_p
     assert svc.metrics.released == {"not_found": 1, "replaced": 0, "idle": 0} and svc.metrics.refused == 0
 
 
-@pytest.mark.parametrize("failure", ["timeout", "http_500", "http_403", "http_401"])
+@pytest.mark.parametrize("failure", ["timeout", "http_500", "http_403", "http_401", *INDEFINITE_404])
 def test_an_api_failure_never_releases_a_slot(tmp_path, failure):
-    # The real reader over a fake transport: only its definite 404 is "gone"; a timeout, a 5xx and a refused read are
-    # LookupFailed, which proves nothing about the autoscaler.
+    # The real reader over a fake transport: only the API server's NotFound naming the object is "gone"; a timeout, a
+    # 5xx, a refused read and any other 404 are LookupFailed, which proves nothing about the autoscaler.
     (tmp_path / "sa").mkdir()
     (tmp_path / "sa" / "token").write_text("t")
     cluster, broken = Cluster(names(2)), set()
@@ -117,10 +143,12 @@ def test_an_api_failure_never_releases_a_slot(tmp_path, failure):
         if name in broken:
             if failure == "timeout":
                 raise TransportFailure("deadline exceeded")
+            if failure in INDEFINITE_404:
+                return 404, INDEFINITE_404[failure](path)
             return int(failure[-3:]), b'{"kind":"Status","status":"Failure"}'
         obj = cluster.get(path)
         if obj is None:
-            return 404, b'{"kind":"Status","status":"Failure","reason":"NotFound","code":404}'
+            return 404, not_found(path)
         return 200, json.dumps(obj).encode()
 
     svc, clock = make(tmp_path / "state", reader=KubeReader("https://kube", str(tmp_path / "sa"), fetch),
@@ -130,8 +158,11 @@ def test_an_api_failure_never_releases_a_slot(tmp_path, failure):
     cluster.live["pa-new"] = "uid-new"
     del cluster.live["pa-0"]                                    # really gone, but the API cannot say so
     broken.update({"pa-0", "pa-1"})
-    e = refused(svc, clock, T0, "pa-new", "uid-new")
+    e = refused(svc, clock, T0, "pa-new", "uid-new")            # the check of the full registry releases nothing
     assert (e.status, e.reason) == (503, "AutoscalerLimitReached")
+    assert registered(svc) == {"pa-0", "pa-1"} and sum(svc.metrics.released.values()) == 0
+    e = refused(svc, clock, T0, "pa-0", "uid-0")                # nor does the request for the autoscaler itself
+    assert (e.status, e.reason) == (503, "IdentityMismatch")
     assert registered(svc) == {"pa-0", "pa-1"} and sum(svc.metrics.released.values()) == 0
     broken.clear()                                              # the API answers again: now the 404 is authoritative
     clock.advance(SWEEP_MS)
@@ -279,3 +310,149 @@ def test_a_request_keeps_its_own_slot_fresh(tmp_path):
     for i in range(1, 14):                                      # pa-0 keeps asking; pa-1 stops
         ask(svc, clock, T0 + i * DT, "pa-0", "uid-0")
     assert registered(svc) == {"pa-0"} and svc.metrics.released["idle"] == 1
+
+
+# --- what counts as "not found" ------------------------------------------------------------------------------------
+
+PA_PATH = f"/apis/{API_GROUP}/v1alpha1/namespaces/shop/predictiveautoscalers/web-pa"
+
+
+def test_only_the_api_servers_not_found_for_that_object_is_definite():
+    assert definite_not_found(PA_PATH, not_found(PA_PATH))
+    dep = "/apis/apps/v1/namespaces/shop/deployments/web"
+    assert definite_not_found(dep, not_found(dep))
+    core = b'{"kind":"Status","status":"Failure","reason":"NotFound","details":{"name":"kube-system",' \
+           b'"kind":"namespaces"},"code":404}'
+    assert definite_not_found("/api/v1/namespaces/kube-system", core)        # the core group has no group detail
+    assert not definite_not_found("/api/v1/namespaces/other", core)
+    for make_body in INDEFINITE_404.values():
+        assert not definite_not_found(PA_PATH, make_body(PA_PATH))
+    for body_ in (b"", b"[]", b"null", not_found(PA_PATH).replace(b'"code": 404', b'"code": 410'),
+                  not_found(PA_PATH).replace(b"NotFound", b"Gone"), not_found(PA_PATH).replace(b"Failure", b"Success")):
+        assert not definite_not_found(PA_PATH, body_)
+    # A path this module cannot name an object for (a list, a subresource) is never proven absent.
+    assert not definite_not_found(PA_PATH + "/status", not_found(PA_PATH))
+    assert not definite_not_found(PA_PATH.rsplit("/", 1)[0], not_found(PA_PATH))
+
+
+@pytest.mark.parametrize("ca", ["not_a_certificate", "unreadable"])
+def test_an_unusable_ca_file_is_a_failed_lookup_not_an_error(tmp_path, ca):
+    (tmp_path / "token").write_text("t")
+    if ca == "unreadable":
+        (tmp_path / "ca.crt").mkdir()                           # open() fails whoever runs the test
+    else:
+        (tmp_path / "ca.crt").write_text("-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----\n")
+    calls = []
+    reader = KubeReader("https://kube", str(tmp_path), lambda *a, **k: calls.append(a) or (200, b"{}"))
+    with pytest.raises(LookupFailed, match="CA unusable"):
+        reader.get(PA_PATH)
+    assert calls == []                                          # nothing was sent
+
+
+# --- requests still in flight when their registration changes -----------------------------------------------------
+
+def in_flight(tmp_path, cluster, name, uid):
+    """A service with one registration and a request for (name, uid) held while it reads its history: (service, clock,
+    resume, join) where resume() lets it finish and join() returns its answer or its ServiceError."""
+    entered, go, result, backend = threading.Event(), threading.Event(), {}, Backend()
+
+    def fetch(*a, **kw):
+        if threading.current_thread().name == "held-request":
+            entered.set()
+            assert go.wait(10)
+        return backend(*a, **kw)
+
+    svc, clock = make(tmp_path, reader=cluster, backend=fetch, max_autoscalers=1)
+
+    def held():
+        try:
+            result["answer"] = ask(svc, clock, T0, name, uid)
+        except ServiceError as e:
+            result["error"] = e
+
+    thread = threading.Thread(target=held, name="held-request")
+    thread.start()
+    assert entered.wait(10)
+
+    def join():
+        go.set()
+        thread.join(10)
+        assert not thread.is_alive()
+        return result
+
+    return svc, clock, join
+
+
+def test_an_old_request_never_overwrites_the_registration_that_replaced_it(tmp_path):
+    cluster = Cluster({"web-pa": "old-uid"})
+    svc, clock, join = in_flight(tmp_path, cluster, "web-pa", "old-uid")
+    cluster.live["web-pa"] = "new-uid"                          # deleted and created again while the request waits
+    ask(svc, clock, T0, "web-pa", "new-uid")
+    before = svc.metrics.slots()
+    assert [s[2] for s in before] == ["new-uid"] and svc.metrics.released["replaced"] == 1
+    new_epoch = svc._uppers.get(("shop", "web-pa"), {}).get("epoch")
+    result = join()                                             # the old request finishes last
+    assert (result["error"].status, result["error"].reason) == (503, "IdentityMismatch")
+    assert "in flight" in result["error"].message
+    assert svc.metrics.slots() == before                        # still the new object's registration and series
+    assert svc._uppers.get(("shop", "web-pa"), {}).get("epoch") == new_epoch
+    ask(svc, clock, T0 + DT, "web-pa", "new-uid")               # and the new object simply carries on
+    assert [s[2] for s in svc.metrics.slots()] == ["new-uid"]
+    svc.close()
+
+
+def test_an_old_request_never_brings_a_released_registration_back(tmp_path):
+    cluster = Cluster({"pa-0": "uid-0"})
+    svc, clock, join = in_flight(tmp_path, cluster, "pa-0", "uid-0")
+    del cluster.live["pa-0"]                                    # deleted while its request waits ...
+    cluster.live["pa-new"] = "uid-new"
+    ask(svc, clock, T0, "pa-new", "uid-new")                    # ... and the full registry's check frees its slot
+    assert registered(svc) == {"pa-new"} and svc.metrics.released["not_found"] == 1
+    result = join()
+    assert (result["error"].status, result["error"].reason) == (503, "IdentityMismatch")
+    assert registered(svc) == {"pa-new"} and ("shop", "pa-0") not in svc._uppers and ("shop", "pa-0") not in svc._costs
+    assert svc.metrics.counts()[0] == 1
+    svc.close()
+
+
+def test_a_publication_under_a_stale_token_is_dropped(tmp_path):
+    svc, clock = make(tmp_path, reader=Cluster({"web-pa": "uid-1", "other": "uid-2"}), max_autoscalers=1)
+    ask(svc, clock, T0, "web-pa", "uid-1")
+    held = svc.metrics.reserve("shop", "web-pa", "uid-1", clock.now_ms())
+    snap = svc.metrics._snaps[("shop", "web-pa")]
+    assert svc.metrics.holds("shop", "web-pa", held.token) and svc.metrics.update("shop", "web-pa", snap, held.token)
+    assert svc.metrics.release("shop", "web-pa", "not_found")
+    assert not svc.metrics.holds("shop", "web-pa", held.token)
+    assert svc.metrics.update("shop", "web-pa", snap, held.token) is False and svc.metrics.registered() == []
+    again = svc.metrics.reserve("shop", "web-pa", "uid-1", clock.now_ms())     # the same object registers anew:
+    assert again.token != held.token                                            # the old work stays shut out
+    assert svc.metrics.update("shop", "web-pa", snap, held.token) is False
+    svc.close()
+
+
+# --- slow lookups and the check of a full registry ----------------------------------------------------------------
+
+def test_slow_lookups_cannot_keep_the_check_from_a_later_registration(tmp_path, monkeypatch):
+    svc, clock, cluster = fill(tmp_path, n=3)
+    del cluster.live["pa-2"]                                    # gone; pa-0 and pa-1 answer only after 8 s, with nothing
+    elapsed, real = [0.0], cluster.get
+
+    def get(path):
+        name = path.rsplit("/", 1)[1]
+        if name in ("pa-0", "pa-1"):
+            cluster.lookups.append(name)
+            elapsed[0] += 8.0
+            raise LookupFailed("deadline exceeded")
+        return real(path)
+
+    cluster.get = get
+    cluster.lookups.clear()
+    monkeypatch.setattr(service_module.time, "monotonic", lambda: elapsed[0])
+    now = clock.now_ms()
+    assert svc._sweep_slots(now + SWEEP_MS) is False
+    assert cluster.lookups == ["pa-0", "pa-1"] and registered(svc) == {"pa-0", "pa-1", "pa-2"}   # out of time
+    assert svc._sweep_slots(now + 2 * SWEEP_MS) is True         # continues after pa-1 instead of starting over
+    assert cluster.lookups[2:] == ["pa-2", "pa-0", "pa-1"] and registered(svc) == {"pa-0", "pa-1"}   # then wraps
+    assert svc.metrics.released["not_found"] == 1
+    monkeypatch.undo()
+    svc.close()

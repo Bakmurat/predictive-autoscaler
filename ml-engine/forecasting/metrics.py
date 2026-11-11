@@ -15,6 +15,11 @@ beyond that update() and reserve() refuse (RegistryFull / CardinalityExceeded) r
 caller (forecasting.service) decides what may be released, and only on evidence. A missing value (no denominator, no
 bound) removes that series instead of exporting 0 or 1.
 
+Every registration carries a token, new whenever the name is registered or its UID is replaced. Work admitted under one
+registration publishes with that token (update(token=...)): once the registration was replaced or released the token no
+longer matches and the publication is dropped, so a slow old request can neither overwrite its replacement nor bring a
+released registration back.
+
 ServiceMetrics is the service's own handful of series (predictive_autoscaler_forecaster_*, no autoscaler or model
 label): the registrations in use, their limit, the refusals at the limit and the releases by reason.
 """
@@ -24,7 +29,7 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Dict, Iterator, List, Mapping, Optional, Tuple
+from typing import Dict, Iterator, List, Mapping, NamedTuple, Optional, Tuple
 
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 from prometheus_client.registry import Collector
@@ -140,17 +145,27 @@ class Snapshot:
         return sum(len(v) for v in self.models.values())
 
 
+class Reservation(NamedTuple):
+    token: int                    # the registration this request was admitted under
+    replaced: Optional[str]       # the UID whose registration this request's UID replaced, if any
+
+
 class ForecastMetrics(Collector):
     def __init__(self, max_autoscalers: int = MAX_AUTOSCALERS,
                  max_series_per_autoscaler: int = MAX_SERIES_PER_AUTOSCALER):
         self.max_autoscalers, self.max_series = max_autoscalers, max_series_per_autoscaler
         self._snaps: Dict[Tuple[str, str], Snapshot] = {}
         self._seen: Dict[Tuple[str, str], int] = {}               # the registration's last request (clock ms)
+        self._tokens: Dict[Tuple[str, str], int] = {}             # the registration's token (see the module text)
+        self._issued_tokens = 0
         self.refused = 0                                          # requests refused at the limit
         self.released = {r: 0 for r in RELEASE_REASONS}
         self._lock = threading.Lock()
 
-    def update(self, namespace: str, autoscaler: str, snapshot: Snapshot) -> None:
+    def update(self, namespace: str, autoscaler: str, snapshot: Snapshot, token: Optional[int] = None) -> bool:
+        """Replace the autoscaler's snapshot. With `token` (a Reservation's), only while that registration still
+        stands: False, and nothing changes, once it was replaced or released. Without one the name is registered if
+        it is not yet (direct use; the service always publishes with its token)."""
         snapshot = Snapshot(snapshot.uid, snapshot.models)        # validate and keep our own frozen copy
         for model, samples in snapshot.models.items():
             if model not in MODEL_FAMILIES:
@@ -164,16 +179,26 @@ class ForecastMetrics(Collector):
                                       f"(at most {self.max_series})")
         key = (namespace, autoscaler)
         with self._lock:
-            if key not in self._snaps and len(self._snaps) >= self.max_autoscalers:
-                raise RegistryFull(f"{self.max_autoscalers} autoscalers are already registered")
+            if token is not None:
+                if self._tokens.get(key) != token:
+                    return False
+            elif key not in self._snaps:
+                if len(self._snaps) >= self.max_autoscalers:
+                    raise RegistryFull(f"{self.max_autoscalers} autoscalers are already registered")
+                self._tokens[key] = self._new_token()
             self._snaps[key] = snapshot
             self._seen.setdefault(key, 0)
+            return True
 
-    def reserve(self, namespace: str, autoscaler: str, uid: str = "", now_ms: int = 0) -> Optional[str]:
+    def _new_token(self) -> int:
+        self._issued_tokens += 1
+        return self._issued_tokens
+
+    def reserve(self, namespace: str, autoscaler: str, uid: str = "", now_ms: int = 0) -> Reservation:
         """Admit an autoscaler before any work is done for it (atomic; an empty snapshot until its first update) and
         note the request's time. A registration held by another UID is replaced by an empty one for `uid` (the same
-        slot, a new identity: none of the old object's series survive) and that old UID is returned; otherwise None.
-        Raises RegistryFull when the limit is reached and it is not registered yet."""
+        slot, a new identity with a new token: none of the old object's series survive) and that old UID is returned
+        with the token. Raises RegistryFull when the limit is reached and it is not registered yet."""
         key = (namespace, autoscaler)
         with self._lock:
             have = self._snaps.get(key)
@@ -181,15 +206,22 @@ class ForecastMetrics(Collector):
                 if len(self._snaps) >= self.max_autoscalers:
                     raise RegistryFull(f"{self.max_autoscalers} autoscalers are already registered")
                 self._snaps[key] = Snapshot(uid, {})
+                self._tokens[key] = self._new_token()
             self._seen[key] = max(now_ms, self._seen.get(key, 0))
             if have is None or not uid or have.uid == uid:
-                return None
+                return Reservation(self._tokens[key], None)
             if not have.uid:                                      # registered without a UID so far: it is this one's
                 self._snaps[key] = Snapshot(uid, have.models)
-                return None
+                return Reservation(self._tokens[key], None)
             self._snaps[key] = Snapshot(uid, {})
+            self._tokens[key] = self._new_token()
             self.released["replaced"] += 1
-            return have.uid
+            return Reservation(self._tokens[key], have.uid)
+
+    def holds(self, namespace: str, autoscaler: str, token: int) -> bool:
+        """Whether the registration a Reservation was admitted under still stands (not replaced, not released)."""
+        with self._lock:
+            return self._tokens.get((namespace, autoscaler)) == token
 
     def release(self, namespace: str, autoscaler: str, reason: str, *, uid: Optional[str] = None,
                 seen_ms: Optional[int] = None) -> bool:
@@ -205,6 +237,7 @@ class ForecastMetrics(Collector):
                 return False
             del self._snaps[key]
             self._seen.pop(key, None)
+            self._tokens.pop(key, None)
             self.released[reason] += 1
             return True
 
@@ -216,6 +249,7 @@ class ForecastMetrics(Collector):
         with self._lock:
             self._snaps.pop((namespace, autoscaler), None)
             self._seen.pop((namespace, autoscaler), None)
+            self._tokens.pop((namespace, autoscaler), None)
 
     def registered(self) -> List[Tuple[str, str]]:
         with self._lock:

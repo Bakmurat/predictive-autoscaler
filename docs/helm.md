@@ -204,14 +204,19 @@ The forecasting service and the trainer share the model volume.
   reactive (`PredictionReady=False`, reason `DataUnavailable`, with the error in the condition's message), and the
   others are served as before. A registration is released, and its metric series removed, only when
   - the Kubernetes API answers a definite 404 for the autoscaler (it was deleted): on a request for it, or when the
-    registry is full and the service looks up every registered autoscaler (at most once a minute);
+    registry is full and the service looks up the registered autoscalers (at most once a minute, for about ten
+    seconds, continuing in name order where the last check stopped). Definite means the API server's `NotFound`
+    status naming that object; a 404 from a path that is not served (the CRD is missing) or from a proxy is a failed
+    lookup;
   - the live object has another UID (deleted and created again under the same name): the new object starts as a new
     identity with no evidence, calibration or trust of the old one;
   - no request arrived for it for `forecaster.statistical.autoscalerIdleReleaseHours` (24; 0 turns this off), for
     example after its namespace left `operator.watchNamespaces` or its engine changed.
 
-  A failed lookup (timeout, 5xx, 401/403) releases nothing. A release never deletes journal evidence: the same object
-  registering again continues where it was. `predictive_autoscaler_forecaster_autoscaler_slots`,
+  A failed lookup (timeout, 5xx, 401/403, an unusable CA file) releases nothing. A release never deletes journal
+  evidence: the same object registering again continues where it was. A request still in flight when its
+  registration is replaced or released is answered 503 and publishes nothing; the operator's next request starts
+  from the current registration. `predictive_autoscaler_forecaster_autoscaler_slots`,
   `..._autoscaler_slot_limit`, `..._autoscaler_slot_refusals_total` and `..._autoscaler_slot_releases_total{reason}`
   (`not_found`, `replaced`, `idle`) on the forecaster's `/metrics` show the registry.
 - **Families and the challenger:** `spec.prediction.families` (`[seasonalNaive, statistical]` by default) lists what

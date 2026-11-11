@@ -67,9 +67,17 @@ def test_the_registration_limit_and_idle_period_come_from_the_environment(tmp_pa
     assert svc.metrics.max_autoscalers == 20
     svc.close()
     for bad in ({"FORECAST_MAX_AUTOSCALERS": "0"}, {"FORECAST_MAX_AUTOSCALERS": "eight"},
-                {"FORECAST_AUTOSCALER_IDLE_SECONDS": "-1"}, {"FORECAST_AUTOSCALER_IDLE_SECONDS": "1d"}):
+                {"FORECAST_AUTOSCALER_IDLE_SECONDS": "-1"}, {"FORECAST_AUTOSCALER_IDLE_SECONDS": "1d"},
+                {"FORECAST_STATE_QUOTA_BYTES": "1536Mi"}, {"FORECAST_STATE_QUOTA_BYTES": "0"},
+                {"FORECAST_STATE_QUOTA_BYTES": str((1 << 40) + 1)}):
         with pytest.raises(statistical.Refused):
             statistical.default_service({**env, **bad})
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "four", "65", ""])
+def test_the_admission_limit_is_bounded_and_a_bad_value_is_a_configuration_error(value):
+    with pytest.raises(statistical.Refused, match="FORECAST_ADMISSION"):
+        statistical.create_app({"FORECAST_ADMISSION": value}, service_factory=FakeService)
 
 
 def test_predict_health_ready_and_metrics(tmp_path):

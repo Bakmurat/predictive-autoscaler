@@ -53,9 +53,16 @@ released only on evidence, never because a lookup failed:
   - the live object has another UID: the old identity's registration ends and the new UID starts as a new, isolated
     identity (the evidence key, the journal epoch and the fit artifacts are all bound to the UID);
   - no request for it for ServiceConfig.slot_idle_seconds (a day by default; 0: never).
-A timeout, a 5xx or a refused read (401/403) proves nothing and releases nothing. A release frees the registration, the
-metric series and the in-memory caches; the journal keeps the autoscaler's evidence under its retention rules, so the
-same object (the same UID) registering again continues exactly where it was.
+A timeout, a 5xx, a refused read (401/403) or a 404 that does not name the object (a missing API path, a proxy's page)
+proves nothing and releases nothing. A release frees the registration, the metric series and the in-memory caches; the
+journal keeps the autoscaler's evidence under its retention rules, so the same object (the same UID) registering again
+continues exactly where it was.
+
+A request works under the registration it was admitted to (forecasting.metrics.Reservation). If that registration is
+replaced or released while the request is still reading history, the request is refused (503, retryable) before it
+issues, and whatever it would publish is dropped: old work never overwrites a replacement, never brings a released
+registration back and never refills its caches. A full registry is checked in name order from where the last check
+stopped, so slow lookups cannot keep the check from ever reaching a later registration.
 """
 
 from __future__ import annotations
@@ -172,6 +179,7 @@ class ForecastService:
         self._costs: Dict = {}                          # (namespace, autoscaler) -> (cache key, costs)
         self._sweep_lock = threading.Lock()             # one check of a full registry at a time
         self._swept_ms: Optional[int] = None            # when the last one started
+        self._sweep_after: Optional[Tuple[str, str]] = None   # the last (namespace, autoscaler) a check looked up
         self.cost_replays = 0                           # cost simulations run (each one replays both families)
 
     # --- status -------------------------------------------------------------------------------------------------
@@ -229,7 +237,7 @@ class ForecastService:
         except LookupFailed as e:
             raise ServiceError(503, "IdentityMismatch", f"the autoscaler could not be read: {e}") from e
         sig = bound.signal
-        self._admit(bound, now_ms)                             # atomic, before any expensive work
+        token = self._admit(bound, now_ms)                     # atomic, before any expensive work
         if not self.store_healthy:
             raise ServiceError(503, "StateUnavailable", "the forecast journal is unavailable; no issuance")
         if bound.lead is None:
@@ -247,8 +255,13 @@ class ForecastService:
         if not grid.is_fresh(self.clock.now_ms() / 1000, s.settlement_seconds):
             raise ServiceError(503, "DataUnavailable", "the newest finalized observation is too old")
         with self._lock:
+            # _forget (a replacement's or a release's cache cleanup) takes this lock too: a request that passes this
+            # check finishes before the cleanup, and one that comes after it issues and caches nothing.
+            if not self.metrics.holds(sig.namespace, bound.autoscaler_name, token):
+                raise ServiceError(503, "IdentityMismatch", "the autoscaler's registration was replaced or released "
+                                   "while this request was in flight; nothing is issued")
             try:
-                return self._issue(bound, grid, self.clock.now_ms())    # the time after the history and the lock
+                return self._issue(bound, grid, self.clock.now_ms(), token)   # the time after the history and the lock
             except StoreUnavailable as e:
                 raise ServiceError(503, "StateUnavailable", f"the forecast journal failed: {e}") from e
             except StoreError as e:
@@ -256,7 +269,7 @@ class ForecastService:
                 # unavailable with that reason, nothing is issued, and the error never escapes as a 500.
                 raise ServiceError(503, "StateUnavailable", f"the forecast state cannot be journaled: {e}") from e
 
-    def _issue(self, bound: BoundRequest, grid, now_ms: int) -> Dict:
+    def _issue(self, bound: BoundRequest, grid, now_ms: int, token: Optional[int] = None) -> Dict:
         store, s, sig, lead = self.store, bound.settings, bound.signal, bound.lead
         ek, t, dt = bound.evidence_key, bound.decision_origin, s.sample_interval_seconds
         window = bound.window
@@ -291,7 +304,7 @@ class ForecastService:
         if self._compacted_s is None or now_s - self._compacted_s >= self.config.compact_every_seconds:
             store.compact(now_s)          # only checkpoint-covered, fully matured windows leave the journal
             self._compacted_s = now_s
-        self._export(bound, state, grid, now_s)
+        self._export(bound, state, grid, now_s, token)
         return self._response(bound, iss.payload())
 
     @staticmethod
@@ -524,7 +537,7 @@ class ForecastService:
         check_response(r, bound)
         return r.to_wire()
 
-    def _export(self, bound: BoundRequest, state: Dict, grid, now_s: int) -> None:
+    def _export(self, bound: BoundRequest, state: Dict, grid, now_s: int, token: Optional[int] = None) -> None:
         trusted = {m: h.get("trusted", False) for m, h in state["trust"].items() if m in RECIPES}
         failures = dict(self.worker.failures) if self.worker is not None else {}
         models = {}
@@ -535,14 +548,15 @@ class ForecastService:
                                           trusted=trusted.get(model, False), history_seconds=max(0, now_s - first),
                                           now_s=now_s, fit_failures=failures if model == "statistical" else None)
         self.metrics.update(bound.signal.namespace, bound.autoscaler_name,
-                            Snapshot(bound.signal.autoscaler_uid, models))
+                            Snapshot(bound.signal.autoscaler_uid, models), token)
 
     # --- registrations ----------------------------------------------------------------------------------------------
 
-    def _admit(self, bound: BoundRequest, now_ms: int) -> None:
-        """Register the request's autoscaler, or refuse it at the limit (503 AutoscalerLimitReached). Registrations
-        idle for slot_idle_seconds are released first; a full registry is then checked against the API once
-        (_sweep_slots). A registration held by another UID becomes the new object's, with nothing carried over."""
+    def _admit(self, bound: BoundRequest, now_ms: int) -> int:
+        """Register the request's autoscaler and return its registration token, or refuse it at the limit (503
+        AutoscalerLimitReached). Registrations idle for slot_idle_seconds are released first; a full registry is then
+        checked against the API once (_sweep_slots). A registration held by another UID becomes the new object's, with
+        nothing carried over."""
         ns, name, uid = bound.signal.namespace, bound.autoscaler_name, bound.signal.autoscaler_uid
         idle_ms = self.config.slot_idle_seconds * 1000
         if idle_ms:
@@ -550,26 +564,29 @@ class ForecastService:
                 if (s_ns, s_name) != (ns, name) and now_ms - seen >= idle_ms:
                     self._release(s_ns, s_name, "idle", uid=s_uid, seen_ms=seen)
         try:
-            replaced = self.metrics.reserve(ns, name, uid, now_ms)
+            held = self.metrics.reserve(ns, name, uid, now_ms)
         except RegistryFull:
             try:
                 if not self._sweep_slots(now_ms):
                     raise
-                replaced = self.metrics.reserve(ns, name, uid, now_ms)
+                held = self.metrics.reserve(ns, name, uid, now_ms)
             except RegistryFull as e:
                 self.metrics.count_refusal()
                 raise ServiceError(503, "AutoscalerLimitReached", f"the service's registration limit is reached: {e}; "
                                    "a registration is released when its autoscaler is deleted, replaced or idle") from e
-        if replaced is not None:
+        if held.replaced is not None:
             self._forget(ns, name)
             logger.info("autoscaler %s/%s was replaced (UID %s, now %s): registered as a new identity", ns, name,
-                        replaced, uid)
+                        held.replaced, uid)
+        return held.token
 
     def _sweep_slots(self, now_ms: int) -> bool:
-        """The registry is full: look up every registered autoscaler, the longest without a request first, and release
-        those the API says are gone (a definite 404) or replaced (another UID). A lookup that could not be completed
-        (timeout, 5xx, 401/403) or an unreadable object proves nothing and keeps its registration. One check at a
-        time, at most one per SLOT_SWEEP_SECONDS; True when a registration was released."""
+        """The registry is full: look up the registered autoscalers and release those the API says are gone (a
+        definite 404) or replaced (another UID). A lookup that could not be completed (timeout, 5xx, 401/403) or an
+        unreadable object proves nothing and keeps its registration. One check at a time, at most one per
+        SLOT_SWEEP_SECONDS, and none starts a lookup after SLOT_SWEEP_BUDGET_SECONDS: it goes in name order and the
+        next check continues after the last name this one looked up, so every registration is reached within a
+        bounded number of checks however slow the lookups are. True when a registration was released."""
         if not self._sweep_lock.acquire(blocking=False):
             return False
         try:
@@ -577,9 +594,14 @@ class ForecastService:
                 return False
             self._swept_ms = now_ms
             started, freed = time.monotonic(), False
-            for ns, name, uid, seen in self.metrics.slots():
+            slots = sorted(self.metrics.slots(), key=lambda slot: slot[:2])
+            if self._sweep_after is not None:                   # continue after the last name looked up, then wrap
+                slots = [x for x in slots if x[:2] > self._sweep_after] + \
+                        [x for x in slots if x[:2] <= self._sweep_after]
+            for ns, name, uid, seen in slots:
                 if time.monotonic() - started > SLOT_SWEEP_BUDGET_SECONDS:
                     break
+                self._sweep_after = (ns, name)
                 try:
                     pa = self.reader.get(f"/apis/{API_GROUP}/{API_VERSION}/namespaces/{ns}/predictiveautoscalers/"
                                          f"{name}")

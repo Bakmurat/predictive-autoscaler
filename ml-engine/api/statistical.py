@@ -48,6 +48,10 @@ BENCHMARK_SWITCHES = ("ALLOW_BENCHMARK_EXPERIMENTS", "SEASONAL_EXPERIMENT", "ENS
 MAX_BODY = 64 << 10
 
 
+MIN_STATE_QUOTA_BYTES, MAX_STATE_QUOTA_BYTES = 1 << 20, 1 << 40    # FORECAST_STATE_QUOTA_BYTES: 1 MiB to 1 TiB
+MAX_ADMISSION = 64                                                 # FORECAST_ADMISSION: 1 to 64 requests at once
+
+
 class Refused(Exception):
     """The configuration asks for something this service never does: it does not start."""
 
@@ -59,13 +63,14 @@ def refuse_benchmark_switches(env: Mapping[str, str]) -> None:
                       f"{', '.join(present)}")
 
 
-def _int_env(env: Mapping[str, str], name: str, default: int, minimum: int) -> int:
+def _int_env(env: Mapping[str, str], name: str, default: int, minimum: int, maximum: Optional[int] = None) -> int:
     try:
         value = int(env.get(name, str(default)))
     except ValueError:
         value = None
-    if value is None or value < minimum:
-        raise Refused(f"{name} must be an integer of at least {minimum}, got {env.get(name)!r}")
+    if value is None or value < minimum or (maximum is not None and value > maximum):
+        bounds = f"at least {minimum}" if maximum is None else f"{minimum} to {maximum}"
+        raise Refused(f"{name} must be an integer of {bounds}, got {env.get(name)!r}")
     return value
 
 
@@ -95,7 +100,8 @@ def default_service(env: Mapping[str, str]):
     except Q.QualificationRefused as e:
         raise Refused(f"the demonstration qualification is refused: {e}") from e
     cfg = ServiceConfig(prometheus_url=url, state_dir=env.get("FORECAST_STATE_DIR", "/state"),
-                        quota_bytes=int(env.get("FORECAST_STATE_QUOTA_BYTES", str(1536 << 20))),
+                        quota_bytes=_int_env(env, "FORECAST_STATE_QUOTA_BYTES", 1536 << 20, MIN_STATE_QUOTA_BYTES,
+                                             MAX_STATE_QUOTA_BYTES),
                         fit_mode=env.get("FORECAST_FIT_MODE", "worker"),
                         max_autoscalers=_int_env(env, "FORECAST_MAX_AUTOSCALERS", 8, 1),
                         slot_idle_seconds=_int_env(env, "FORECAST_AUTOSCALER_IDLE_SECONDS", 86400, 0),
@@ -133,7 +139,7 @@ def create_app(env: Mapping[str, str] = os.environ, service_factory: Optional[Ca
                   docs_url=None, redoc_url=None, openapi_url=None)
     if auth_config.enabled:
         app.add_middleware(AuthMiddleware, config=auth_config, reviewer=TokenReviewer(auth_config))
-    admission = Admission(int(env.get("FORECAST_ADMISSION", "4")))
+    admission = Admission(_int_env(env, "FORECAST_ADMISSION", 4, 1, MAX_ADMISSION))
     registry = CollectorRegistry()
     ProcessCollector(registry=registry)
 
