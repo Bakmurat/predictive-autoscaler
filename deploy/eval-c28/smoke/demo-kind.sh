@@ -20,6 +20,33 @@
 #                                                      and check placement, the single generator pod, a planned
 #                                                      restart with exit 0, the records in the pod log, and the
 #                                                      reduction against the ingress's raw samples
+#   deploy/eval-c28/smoke/demo-kind.sh --images images.json
+#                                                      FULL mode with the reviewed images of a c28-images/v1 file
+#                                                      (fixture and generator): pulled BY DIGEST on the nodes from
+#                                                      their registries, no build, no local registry
+#   deploy/eval-c28/smoke/demo-kind.sh --replacement [--images images.json]
+#                                                      FULL mode as the generator's RESTART AND REPLACEMENT smoke, at
+#                                                      the schedule's daily peak (a smoke-only origin) and a higher
+#                                                      rate (DEMO_CAPACITY_RPS per replica, default 17.5), with the
+#                                                      generator's remote write into the cluster's VictoriaMetrics:
+#                                                        1. three consecutive planned restarts (the k6 container
+#                                                           exits 0 at its segment end, the kubelet restarts it in
+#                                                           the same pod): the gap of each, back-off included, and
+#                                                           resume without replay;
+#                                                        2. `kubectl delete pod` with the default grace period
+#                                                           (never forced): the replacement pod exists only after the
+#                                                           old pod object is gone, never two pod objects at once;
+#                                                        3. one target stops answering (its pods' responses are
+#                                                           dropped on the workload node, so every request to it
+#                                                           runs into the timeout) and the generator container's
+#                                                           memory is read from its cgroup on the node against its
+#                                                           limit;
+#                                                        4. the reducer over the log of the WHOLE smoke (collected
+#                                                           continuously: the API keeps only the current and the
+#                                                           previous container's log), with its verdicts per phase.
+#                                                      Its analysis (smoke/demo_kind.py) is self-tested offline by
+#                                                      --render-only. The work directory keeps the evidence when
+#                                                      WORK is given.
 #   KEEP=1 deploy/eval-c28/smoke/demo-kind.sh          keep the cluster for inspection
 #
 # The full mode only ever talks to its own cluster: the kubeconfig in its work directory, checked (context, local
@@ -37,15 +64,54 @@ SIM="$HARNESS/tests/demo_sim.js"
 PY="${PYTHON:-python3}"
 case "$PY" in */*) PY="$(cd "$(dirname "$PY")" && pwd)/$(basename "$PY")" ;; esac
 c28() { (cd "$HARNESS" && KUBECONFIG=/dev/null "$PY" -m c28 "$@"); }
-MODE=full
+SMOKE_DIR="$ROOT/deploy/eval-c28/smoke"
+MODE=full IMAGES_FILE="" REPLACEMENT=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --render-only) MODE=render ;;
     --k6-local) MODE=k6 ;;
+    --images) [ $# -ge 2 ] || { echo "demo smoke: --images needs a file" >&2; exit 2; }; IMAGES_FILE="$2"; shift ;;
+    --images=*) IMAGES_FILE="${1#--images=}" ;;
+    --replacement) REPLACEMENT=1 ;;
     *) echo "demo smoke: unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
 done
+if [ -n "$IMAGES_FILE" ]; then
+  [ -f "$IMAGES_FILE" ] || { echo "demo smoke: --images $IMAGES_FILE is not a file" >&2; exit 2; }
+  IMAGES_FILE="$(cd "$(dirname "$IMAGES_FILE")" && pwd)/$(basename "$IMAGES_FILE")"
+fi
+
+# images_read <images.json>: print "<fixture ref> <generator ref>" of a c28-images/v1 record of a reviewed, verified
+# build, or refuse (exit 1). Every ref must be <repo>@sha256:<64 hex> (no tag), and the generator must be the k6 image
+# the stage admits (demo.GENERATOR_DIGEST).
+images_read() {
+  "$PY" - "$1" "$HARNESS" <<'PY'
+import json, re, sys
+sys.path.insert(0, sys.argv[2])
+from c28 import demo
+def refuse(why):
+    sys.exit(f"images: {sys.argv[1]}: {why}; refusing")
+try:
+    doc = json.load(open(sys.argv[1]))
+except (OSError, ValueError) as e:
+    refuse(f"not a readable JSON file ({e.__class__.__name__})")
+if not isinstance(doc, dict) or doc.get("schema") != "c28-images/v1":
+    refuse("schema is not c28-images/v1")
+if doc.get("verified") is not True:
+    refuse("verified is not true (an unverified build record)")
+refs = []
+for role in ("fixture", "generator"):
+    ref = ((doc.get("images") or {}).get(role) or {}).get("ref")
+    if not isinstance(ref, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/:-]*@sha256:[0-9a-f]{64}", ref) \
+            or ":" in ref.split("@")[0].split("/")[-1]:
+        refuse(f"images.{role}.ref must be <repository>@sha256:<64 hex> without a tag")
+    refs.append(ref)
+if not refs[1].endswith("@" + demo.GENERATOR_DIGEST):
+    refuse(f"images.generator.ref is not the reviewed k6 image ({demo.GENERATOR_DIGEST})")
+print(*refs)
+PY
+}
 
 # edit_params <in> <out> <python statements over p>: a scratch copy of a params file (never the tracked one).
 edit_params() {
@@ -108,6 +174,20 @@ EOF
   edit_params "$PARAMS" "$out/extra.json" 'p.update(c0_rps="<measured c0>", hpa_cpu_target_percent="__HPA__", keda="<unused>")'
   c28 validate --params "$out/extra.json" --stage demonstration >/dev/null
   echo "render-only: experiment-only fields are not consumed (placeholders there do not block the stage)"
+  "$PY" "$SMOKE_DIR/demo_kind.py" selftest | sed 's/^/render-only: /'
+  # --images: a reviewed record is read, anything else is refused (offline; no image is pulled here).
+  h="$(printf 'a%.0s' $(seq 64))"
+  printf '{"schema":"c28-images/v1","verified":true,"images":{"fixture":{"ref":"harbor.example/x/c28-fixture@sha256:%s"},"generator":{"ref":"grafana/k6@sha256:70af91f86cd8e142e0544a4edaf79835a80033f71974b92edd5ac36fd4442a7b"}}}' "$h" > "$out/images.json"
+  [ "$(images_read "$out/images.json")" = "harbor.example/x/c28-fixture@sha256:$h grafana/k6@sha256:70af91f86cd8e142e0544a4edaf79835a80033f71974b92edd5ac36fd4442a7b" ] \
+    || { echo "demo smoke: a valid images file was not read" >&2; exit 1; }
+  n=0
+  for bad in 's/"verified":true/"verified":false/' 's/c28-images\/v1/c28-images\/v0/' 's/c28-fixture@sha256/c28-fixture:r2@sha256/' \
+             's/70af91f8/80af91f8/' 's/@sha256:aaaa/@sha256:aaa/'; do
+    sed "$bad" "$out/images.json" > "$out/images-bad.json"
+    if images_read "$out/images-bad.json" >/dev/null 2>&1; then echo "demo smoke: images file accepted after $bad" >&2; exit 1; fi
+    n=$((n + 1))
+  done
+  echo "render-only: --images reads a verified c28-images/v1 record (fixture and generator by digest) and refuses $n altered ones"
 
   # --- rendering and its audits ---------------------------------------------------------------------------------------
   c28 render --params "$PARAMS" --stage demonstration --out "$out/all.yaml"
@@ -328,8 +408,18 @@ REG_NAME=pa-c28-demo-registry
 REG_PORT="${REG_PORT:-5002}"
 NODE_IMAGE="${NODE_IMAGE:-kindest/node:v1.35.8@sha256:07b2536e30b803ed61d1677a79df6115f798ce64c80f9e22f6ed45afd09323c0}"
 REGISTRY_IMAGE=registry:2.8.3
-VM_IMAGE=victoriametrics/victoria-metrics:v1.153.0
-SEGMENT_MINUTES=3
+VM_IMAGE=victoriametrics/victoria-metrics@sha256:5eff7af5341e401471002f58d106d399e614a62f3d240f2dbc21901e49eed5dd   # v1.153.0
+SEGMENT_MINUTES="${SEGMENT_MINUTES:-3}"
+# --replacement: the per-replica rate and the fixture's work per request for the smoke's own params (a light fixture,
+# so the healthy target carries the rate on a small bed), where in the schedule's day the generator starts (the daily
+# peak is at 18:00), how many consecutive planned restarts are required and how long one target does not answer.
+DEMO_CAPACITY_RPS="${DEMO_CAPACITY_RPS:-17.5}"
+DEMO_WORK_ITERATIONS="${DEMO_WORK_ITERATIONS:-100}"
+DEMO_START_AT="${DEMO_START_AT:-17:40}"
+DEMO_MIN_RESTARTS="${DEMO_MIN_RESTARTS:-3}"
+DEMO_TIMEOUT_SECONDS="${DEMO_TIMEOUT_SECONDS:-110}"
+UNANSWERED=c28-demo-pa-r
+FOLLOW_PID="" UNANSWERED_IPS=""
 export KUBECONFIG="$KCFG"
 unset KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT
 log() { printf '%s  %s\n' "$(date -u +%H:%M:%SZ)" "$*"; }
@@ -358,6 +448,10 @@ wait_for() {
   done
 }
 cleanup() {
+  if [ -n "$FOLLOW_PID" ]; then kill "$FOLLOW_PID" 2>/dev/null || true; fi      # only the follower this run started
+  for ip in $UNANSWERED_IPS; do                                                # only rules this run added, in its node
+    docker exec "$W" iptables -D FORWARD -s "$ip" -p tcp --sport 8080 --tcp-flags PSH PSH -j DROP >/dev/null 2>&1 || true
+  done
   if [ "${KEEP:-0}" = 1 ]; then
     log "kept: KUBECONFIG=$KCFG kubectl get pods -A ; delete with: $KIND delete cluster --name $CLUSTER"
     return
@@ -370,6 +464,14 @@ cleanup() {
 trap cleanup EXIT
 for tool in docker "$KIND" kubectl "$PY"; do command -v "$tool" >/dev/null || die "missing tool: $tool"; done
 if "$KIND" get clusters 2>/dev/null | grep -qx "$CLUSTER"; then die "a kind cluster named $CLUSTER already exists; refusing"; fi
+GENERATOR_REF=""
+if [ -n "$IMAGES_FILE" ]; then
+  render_only                                       # the offline checks first: nothing is created on a refusal
+  # --- the reviewed images, by digest: no build, no local registry (they are pulled on the nodes below) -------------
+  reviewed="$(images_read "$IMAGES_FILE")" || die "the images file was refused"
+  read -r FIXTURE_IMAGE GENERATOR_REF <<<"$reviewed"
+  pass "reviewed images from $IMAGES_FILE (no build): fixture $FIXTURE_IMAGE, generator $GENERATOR_REF"
+else
 if docker container inspect "$REG_NAME" >/dev/null 2>&1; then die "a container named $REG_NAME already exists; refusing"; fi
 FIXTURE_TAG="localhost:$REG_PORT/c28-fixture:demo-smoke"
 if docker image inspect "$FIXTURE_TAG" >/dev/null 2>&1; then die "an image tagged $FIXTURE_TAG already exists; refusing"; fi
@@ -387,6 +489,7 @@ FIXTURE_DIGEST="${FIXTURE_DIGEST#*@}"
 [[ "$FIXTURE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || die "no registry digest for the fixture image"
 FIXTURE_IMAGE="localhost:$REG_PORT/c28-fixture@$FIXTURE_DIGEST"
 pass "fixture image built and pinned at $FIXTURE_DIGEST"
+fi
 
 # --- the cluster: one control plane, a workload node and a support node ---------------------------------------------
 cat > "$WORK/kind.yaml" <<EOF
@@ -396,6 +499,8 @@ nodes:
   - role: control-plane
   - role: worker
   - role: worker
+EOF
+[ -n "$IMAGES_FILE" ] || cat >> "$WORK/kind.yaml" <<EOF
 containerdConfigPatches:
   - |-
     [plugins."io.containerd.grpc.v1.cri".registry.mirrors."localhost:$REG_PORT"]
@@ -403,10 +508,30 @@ containerdConfigPatches:
 EOF
 OWN_CLUSTER=1
 "$KIND" create cluster --name "$CLUSTER" --image "$NODE_IMAGE" --config "$WORK/kind.yaml" --kubeconfig "$KCFG" --wait 120s >/dev/null
-docker network connect kind "$REG_NAME" 2>/dev/null || true
+[ -n "$IMAGES_FILE" ] || docker network connect kind "$REG_NAME" 2>/dev/null || true
 guard
 CLUSTER_UID="$(k get namespace kube-system -o jsonpath='{.metadata.uid}')"
 W="$CLUSTER-worker"; S="$CLUSTER-worker2"
+if [ -n "$IMAGES_FILE" ]; then
+  # The reviewed images reach the nodes BY DIGEST from their registries (crictl pull inside each node that runs
+  # them), as smoke/kind.sh does: containerd verifies the manifest digest, and every manifest names the
+  # <repository>@sha256 reference itself. The metrics backend is pulled by its digest too.
+  while read -r node ref; do
+    docker exec "$node" crictl pull "$ref" >/dev/null || die "node $node: pull $ref"
+    docker exec "$node" crictl inspecti -o json "$ref" | "$PY" -c '
+import json, sys
+st = json.load(sys.stdin)["status"]
+want = sys.argv[1].split("@")[1]
+assert any(d.endswith("@" + want) for d in st.get("repoDigests") or []), (sys.argv[1], st.get("repoDigests"))
+' "$ref" || die "node $node: $ref is not present under its digest"
+  done <<EOF
+$W $FIXTURE_IMAGE
+$S $FIXTURE_IMAGE
+$S $GENERATOR_REF
+$CLUSTER-control-plane $VM_IMAGE
+EOF
+  pass "fixture on W and S, k6 on S and the metrics backend on the control plane pulled by digest inside the nodes"
+fi
 # The reservation belongs to the OWNER run (its id is the taint value); the demonstration never retags the nodes.
 k taint node "$CLUSTER-control-plane" node-role.kubernetes.io/control-plane:NoSchedule- >/dev/null
 k label node "$W" c28.devkuban.com/role=workload --overwrite >/dev/null
@@ -467,6 +592,12 @@ p['nodes'] = {'workload': '$W', 'support': '$S'}
 ref = p['demonstration']['reservation_ref']
 ref['nodes'] = {'workload': {'name': '$W', 'uid': '$W_UID'}, 'support': {'name': '$S', 'uid': '$S_UID'}}
 p['demonstration']['schedule_origin_utc'] = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT00:00:00Z')
+if '$GENERATOR_REF':
+    p['demonstration']['generator']['image'] = '$GENERATOR_REF'
+if '$REPLACEMENT' == '1':        # the replacement smoke: a higher rate on a light fixture, room for hanging requests
+    p['demonstration']['capacity_per_replica_rps'] = float('$DEMO_CAPACITY_RPS')
+    p['fixture']['work_iterations'] = int('$DEMO_WORK_ITERATIONS')
+    p['ingress']['memory_limit'] = '256Mi'
 "
 c28 validate --params "$PRM" --stage demonstration >/dev/null || die "the smoke params do not validate"
 RUN="$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["run_id"])' "$PRM")"
@@ -486,7 +617,16 @@ pass "common objects, two targets and two Recommend PredictiveAutoscalers applie
 
 # --- the generator: one pod, the reviewed k6 image by digest, a ${SEGMENT_MINUTES}-minute smoke segment ---------------
 guard
-c28 render --params "$PRM" --stage demonstration --part generator --smoke-segment-minutes "$SEGMENT_MINUTES" --out "$WORK/generator.yaml"
+SMOKE_ORIGIN=()
+if [ "$REPLACEMENT" = 1 ]; then
+  # A smoke-only origin: the generator starts at $DEMO_START_AT of the schedule's day 0, so the smoke runs across the
+  # daily peak (18:00) whatever the wall clock says. Never a demonstration's origin.
+  ORIGIN_S=$(( ($(date +%s) / 60) * 60 - 10#${DEMO_START_AT%%:*} * 3600 - 10#${DEMO_START_AT##*:} * 60 ))
+  SMOKE_ORIGIN=(--smoke-origin-utc "$(date -u -d "@$ORIGIN_S" +%Y-%m-%dT%H:%M:%SZ)")
+  log "replacement smoke: origin ${SMOKE_ORIGIN[1]} (the generator starts at $DEMO_START_AT of day 0), $DEMO_CAPACITY_RPS rps per replica, ${SEGMENT_MINUTES}-minute segments"
+fi
+c28 render --params "$PRM" --stage demonstration --part generator --smoke-segment-minutes "$SEGMENT_MINUTES" \
+  ${SMOKE_ORIGIN[@]+"${SMOKE_ORIGIN[@]}"} --out "$WORK/generator.yaml"
 # Server-side: the ConfigMap carries the whole 28-day table (about 0.2 MiB); a client-side apply would copy it into
 # the last-applied annotation, which is limited to 256 KiB.
 k apply --server-side -f "$WORK/generator.yaml" >/dev/null || die "apply generator"
@@ -510,6 +650,130 @@ for p in json.load(sys.stdin)["items"]:
 ' "$W" "$S")"
 [ -z "$bad" ] || die "placement: $bad"
 pass "every demonstration pod is on its role's node (targets and ingress on W; routes and generator on S)"
+
+if [ "$REPLACEMENT" = 1 ]; then
+  # ===================================================================================================================
+  # The generator's restart and replacement smoke. Everything it collects is in $WORK/replacement.
+  # ===================================================================================================================
+  EV="$WORK/replacement"; mkdir "$EV"
+  GEN=c28-demo-generator; POD="$GEN-0"; SEG_S=$(( SEGMENT_MINUTES * 60 ))
+  ms() { date +%s%3N; }
+  pod_uid() { k -n "$NS" get pod "$POD" -o jsonpath='{.metadata.uid}' 2>/dev/null; }
+  "$PY" "$SMOKE_DIR/demo_kind.py" follow --kubeconfig "$KCFG" --context "kind-$CLUSTER" --namespace "$NS" \
+    --name "$GEN" --node "$S" --out "$EV" --interval 3 > "$EV/follow.log" 2>&1 &
+  FOLLOW_PID=$!
+  T0=$(( GEN_STARTED * 1000 ))
+  FIRST_UID="$(pod_uid)"
+
+  # --- 1. planned restarts: the segment ends, k6 exits 0, the kubelet restarts the container in the same pod -------
+  restarts_done() {
+    local st
+    st="$(k -n "$NS" get pod "$POD" -o jsonpath='{.metadata.uid} {.status.containerStatuses[0].restartCount} {.status.containerStatuses[0].state.running.startedAt}')"
+    set -- $st
+    [ "${1:-}" = "$FIRST_UID" ] && [ "${2:-0}" -ge "$DEMO_MIN_RESTARTS" ] && [ -n "${3:-}" ]
+  }
+  log "1. waiting for $DEMO_MIN_RESTARTS consecutive planned restarts of the k6 container in pod $POD ($FIRST_UID)"
+  wait_for $(( (SEGMENT_MINUTES * (DEMO_MIN_RESTARTS + 1) + 15) * 60 )) "$DEMO_MIN_RESTARTS planned restarts in the same pod" restarts_done
+  sleep 75                                           # at least one whole minute of the incarnation after the last one
+  [ "$(gen_pods)" = 1 ] && [ "$(pod_uid)" = "$FIRST_UID" ] || die "1. the planned restarts did not keep the one pod"
+  pass "1. $DEMO_MIN_RESTARTS planned restarts in the same pod ($(k -n "$NS" get pod "$POD" -o jsonpath='{.status.containerStatuses[0].restartCount}') so far)"
+  T1="$(ms)"
+
+  # --- 2. ordinary pod deletion with its termination grace period: NEVER forced -------------------------------------
+  guard
+  log "2. kubectl delete pod $POD (the default grace period; no --force, no --grace-period)"
+  k -n "$NS" delete pod "$POD" --wait=false >/dev/null || die "2. delete pod"
+  replaced() {
+    local st
+    st="$(k -n "$NS" get pod "$POD" -o jsonpath='{.metadata.uid} {.status.phase} {.status.containerStatuses[0].state.running.startedAt}' 2>/dev/null)"
+    set -- $st
+    [ -n "${1:-}" ] && [ "$1" != "$FIRST_UID" ] && [ "${2:-}" = Running ] && [ -n "${3:-}" ]
+  }
+  wait_for 300 "a replacement generator pod is running" replaced
+  [ "$(gen_pods)" = 1 ] || die "2. $(gen_pods) generator pods after the replacement"
+  pass "2. the deleted pod was replaced by $(pod_uid) (the order of the objects is judged from the watch events)"
+  sleep 150
+  T2="$(ms)"
+
+  # --- 3. timeout load: one target stops answering while the other keeps being served ------------------------------
+  # Begin 25 s after the next segment boundary, so the unanswered stretch lies inside ONE incarnation (one container,
+  # one cgroup) and ends before that segment does.
+  into=$(( ($(date +%s) - ORIGIN_S) % SEG_S ))
+  sleep $(( SEG_S - into + 25 ))
+  guard
+  IPS="$(k -n "$NS" get pods -l "c28.devkuban.com/target=$UNANSWERED" -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}')"
+  [ -n "$IPS" ] || die "3. no pod IP of $UNANSWERED"
+  T3="$(ms)"
+  # The target's pods keep accepting connections and requests, but their RESPONSES never arrive: the data segments
+  # they send from port 8080 are dropped in the workload node's FORWARD chain (the node is this run's own kind
+  # container). The kubelet's probes are local to the node and keep passing, so the endpoints stay ready and the
+  # ingress keeps routing to them: every request to this target hangs until a timeout. (Dropping the packets TO the
+  # pods instead leaves the ingress with dials that never finish; its container was restarted after a minute of
+  # that in the first run of this smoke.)
+  UNANSWERED_IPS="$IPS"
+  for ip in $IPS; do
+    docker exec "$W" iptables -I FORWARD 1 -s "$ip" -p tcp --sport 8080 --tcp-flags PSH PSH -j DROP || die "3. iptables on $W"
+  done
+  log "3. the responses of $UNANSWERED are dropped on $W for ${DEMO_TIMEOUT_SECONDS}s ($(echo $IPS | wc -w) pods)"
+  sleep "$DEMO_TIMEOUT_SECONDS"
+  for ip in $IPS; do
+    docker exec "$W" iptables -D FORWARD -s "$ip" -p tcp --sport 8080 --tcp-flags PSH PSH -j DROP || die "3. iptables -D on $W"
+  done
+  UNANSWERED_IPS=""
+  T4="$(ms)"
+  pass "3. the drop rules were removed after ${DEMO_TIMEOUT_SECONDS}s"
+  # The ingress as the timeout load left it (its restarts would show as a counter reset in the reduction).
+  k -n "$NS" get pods -l app.kubernetes.io/name=c28-ingress -o json > "$EV/ingress-pods.json"
+  k -n "$NS" logs -l app.kubernetes.io/name=c28-ingress --previous --tail=50 > "$EV/ingress-previous.log" 2>/dev/null || true
+  log "collecting five more minutes (recovery, and the last lines)"
+  sleep 300
+  T5=$(( $(ms) - 120000 ))
+  touch "$EV/stop"; wait "$FOLLOW_PID" || true; FOLLOW_PID=""
+
+  # --- 4. the records of the whole smoke, the ingress's raw samples, remote write, the analysis ---------------------
+  guard
+  k -n "$NS" get configmap "$GEN" -o jsonpath='{.data.config\.json}' > "$EV/config.json"
+  k -n "$NS" get statefulset "$GEN" -o json > "$EV/statefulset.json"
+  k -n "$NS" get pods -o wide > "$EV/pods-final.txt"
+  for t in c28-demo-pa-n c28-demo-pa-r; do
+    k get --raw "/api/v1/namespaces/monitoring/services/vm:8428/proxy/api/v1/query?query=c28_ingress_requests_total%7Btarget%3D%22$t%22%7D%5B90m%5D" \
+      > "$EV/ingress-$t.json" || die "the ingress samples of $t could not be read"
+  done
+  # Remote write: what the generator's k6 output delivered to the cluster's VictoriaMetrics.
+  k get --raw "/api/v1/namespaces/monitoring/services/vm:8428/proxy/api/v1/query?query=sum%20by%20(__name__)%20(%7B__name__%3D~%22k6_c28d_.%2B%22%7D)" \
+    > "$EV/remote-write.json" || die "the remote-write series could not be read"
+  "$PY" - "$EV" "$T0" "$T1" "$T2" "$T3" "$T4" "$T5" "$UNANSWERED" "$DEMO_MIN_RESTARTS" <<'PY'
+import json, sys
+d, t0, t1, t2, t3, t4, t5 = sys.argv[1], *map(int, sys.argv[2:8])
+out = {}
+for t in ("c28-demo-pa-n", "c28-demo-pa-r"):
+    res = json.load(open(f"{d}/ingress-{t}.json"))["data"]["result"]
+    assert len(res) == 1, f"{t}: expected one raw series, got {len(res)}"
+    out[t] = [[float(ts), float(v)] for ts, v in res[0]["values"]]
+json.dump(out, open(d + "/ingress.json", "w"))
+sts = json.load(open(d + "/statefulset.json"))
+limit = sts["spec"]["template"]["spec"]["containers"][0]["resources"]["limits"]["memory"]
+units = {"Ki": 2**10, "Mi": 2**20, "Gi": 2**30}
+limit_bytes = int(limit[:-2]) * units[limit[-2:]] if limit[-2:] in units else int(limit)
+rw = {r["metric"]["__name__"]: float(r["value"][1]) for r in json.load(open(d + "/remote-write.json"))["data"]["result"]}
+ing = [{"pod": p["metadata"]["name"], "restarts": cs.get("restartCount"),
+        "last_terminated": (cs.get("lastState") or {}).get("terminated")}
+       for p in json.load(open(d + "/ingress-pods.json"))["items"] for cs in p["status"].get("containerStatuses", [])]
+assert sts["spec"]["replicas"] == 1 and sts["kind"] == "StatefulSet"
+json.dump({"phases": {"restarts": [t0, t1], "replacement": [t1, t2], "steady": [t2, t3], "timeout": [t3, t4],
+                      "recovery": [t4, t5]},
+           "unanswered_target": sys.argv[8], "min_restarts": int(sys.argv[9]), "memory_limit_bytes": limit_bytes,
+           "remote_write_series": rw, "ingress": ing}, open(d + "/phases.json", "w"), indent=1)
+print("remote write:", json.dumps(rw))
+assert any(v > 0 for v in rw.values()), "no k6_c28d_* series reached the metrics backend: remote write did not work"
+PY
+  rc=0
+  "$PY" "$SMOKE_DIR/demo_kind.py" analyse --dir "$EV" --harness "$HARNESS" --config "$EV/config.json" \
+    --ingress "$EV/ingress.json" --phases "$EV/phases.json" --out "$EV/summary.json" || rc=$?
+  [ "$rc" = 0 ] || die "the replacement smoke's analysis found problems (see $EV/summary.json)"
+  pass "restart and replacement smoke complete: $EV/summary.json (functionality only; no evidence, no operator, no forecaster, no Active)"
+  exit 0
+fi
 
 # --- a planned restart: the segment ends, k6 exits 0, the kubelet starts the next incarnation -------------------------
 restarted() {

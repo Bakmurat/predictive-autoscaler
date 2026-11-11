@@ -545,7 +545,8 @@ def _generator_labels(p: Dict) -> Dict[str, str]:
     return {**R._labels(p), "app.kubernetes.io/name": GENERATOR_NAME, COMPONENT_LABEL: "generator"}
 
 
-def generator_objects(p: Dict, smoke_segment_minutes: Optional[int] = None) -> List[Dict]:
+def generator_objects(p: Dict, smoke_segment_minutes: Optional[int] = None,
+                      smoke_origin_ms: Optional[int] = None) -> List[Dict]:
     """The generator: a ConfigMap (the script and its configuration), a headless Service and ONE StatefulSet with one
     replica on the support node.
 
@@ -560,7 +561,7 @@ def generator_objects(p: Dict, smoke_segment_minutes: Optional[int] = None) -> L
     The container runs `k6 run` once per SEGMENT: the script resumes the program at the wall-clock position, ends at
     the next segment boundary and k6 exits 0, so the kubelet restarts the container in the same pod (restartPolicy
     Always): the next incarnation."""
-    cfg = generator_config(p, smoke_segment_minutes)
+    cfg = generator_config(p, smoke_segment_minutes, smoke_origin_ms)
     g = p["demonstration"]["generator"]
     ns, labels = p["namespace"], _generator_labels(p)
     selector = {"app.kubernetes.io/name": GENERATOR_NAME, R.RUN_LABEL: p["run_id"]}
@@ -611,7 +612,8 @@ def generator_pod_name() -> str:
 
 # --- rendering ------------------------------------------------------------------------------------------------------
 
-def render(p: Dict, smoke_segment_minutes: Optional[int] = None) -> Dict[str, List[Dict]]:
+def render(p: Dict, smoke_segment_minutes: Optional[int] = None,
+           smoke_origin_ms: Optional[int] = None) -> Dict[str, List[Dict]]:
     """The stage's objects by preparation phase: common, targets (Deployment, Service, EMPTY faults ConfigMap), pas
     (both in Recommend), writers (always empty: the stage has no HPA or KEDA writer) and generator. Audited: every
     target has exactly its PredictiveAutoscaler, every pod template is sidecar-free and least-privilege, every object
@@ -620,7 +622,8 @@ def render(p: Dict, smoke_segment_minutes: Optional[int] = None) -> Dict[str, Li
     d = p["demonstration"]
     ts = targets(p)
     out: Dict[str, List[Dict]] = {"common": R.common_objects(p, [t["name"] for t in ts]), "targets": [], "pas": [],
-                                  "writers": [], "generator": generator_objects(p, smoke_segment_minutes)}
+                                  "writers": [],
+                                  "generator": generator_objects(p, smoke_segment_minutes, smoke_origin_ms)}
     for t in ts:
         labels = {**R._labels(p, t["arm"], d["profile"], t["name"]), DEMO_ROLE_LABEL: t["role"]}
         out["targets"] += R.target_objects(p, t["name"], labels, d["profile"], d["shadow_replicas"])

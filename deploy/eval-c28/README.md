@@ -14,7 +14,7 @@ evidence by itself. The executor uses it under a locked run-lock and the change 
 | `trace/` | PROPOSAL (draft contract v2, pending Codex review): the pre-declared selection and transformation of the Azure Functions 2019 trace (CC BY 4.0) for a separate public-trace demonstration. Not part of C2.8 scoring and no replacement for the manifest's ordinary warm-up. `azure_functions_2019.py select|prepare|plan|rules` (standard library, one file, run with `python -I`): each stage checks the reviewed sha256 of its input and records the hashes it was built from (source, selection, prepared, plan), validates schema, membership, length and transformation consistency, and never overwrites an output. `plan` emits exactly the `c28-k6-plan/v1` that `load/c28.js` accepts (kind `trace-demo`), one constant rate per trace minute, so each minute's scheduled count equals its intended count; `tests/c28js_loader.js` runs the real `c28.js` validator on it under node. Generated requests are "derived from per-minute invocation counts", never real arrival timestamps or real traffic. `k6_points.py` sums k6 counter samples into per-minute "metric-point buckets" anchored to a declared scenario start (emission/completion time, so not dispatch or ingress receipt times). It never runs a forecaster. |
 | `params/` | `kind-demo.json` and `demonstration.template.json` for the demonstration stage (no `c0_rps`, HPA target or KEDA setting). `kind-smoke.json` for the kind smoke. `prodcluster.template.json` lists what the run-lock must resolve; it cannot be rendered until every placeholder is replaced (the calibrated fixture resources and the W/S residency inputs included). |
 | `smoke/kind.sh` | The aspire kind-bed smoke, on its own cluster and kubeconfig only. `--render-only` renders and audits offline; `scripts/verify.sh` runs that mode. `--images images.json` runs the exact reviewed digests of a `c28-images/v1` file (pulled by digest, no build) and fails on any other running image. `--shadow` (with or without `--images`) installs the release as the S3 shadow install runs it (`operator.rbac.scaleWrite: false`, the forecast ledger on) and adds checks S1–S5: the live scale rule is `get` only; the API server's authorizer answers no to `update` and `patch` (yes to `get`) on `deployments/scale` for the operator's ServiceAccount, asked without a name and for the Deployment name of every PredictiveAutoscaler target (a grant restricted by `resourceNames` answers only the named question), an error counting as unproven, never as no; and no RoleBinding or ClusterRoleBinding of the cluster that names that ServiceAccount, its username or one of its groups, whatever its labels, resolves to a rule that may write a scale subresource. S1 then tests itself: a Role without the release's labels granting `update` on `deployments/scale` for one named target, bound to the operator's ServiceAccount, must make it refuse, and after the Role and RoleBinding are deleted it must pass again, all before any load. Under a second accelerated load a Recommend arm recommends at least 4 replicas while its Deployment keeps 2 replicas and its generation, with `ScalingActive=False/RecommendMode` (an unavailable forecast is expected and only reported); the operator log has no `deployments/scale` line at any time and no `forbidden` line up to the point before the quota check (check 6), after which the only `forbidden` lines allowed are the smoke's own quota denial as the operator's ScaleOutBlocked event quotes it (`pods … is forbidden: exceeded quota: c28-fixture-quota`), counted separately and reported, any other failing; the ledger advances and holds only `recommend` decisions; and at the end no autoscaler left Recommend or records a write. `--render-only --shadow` renders the chart with and without the shadow values (`helm template`, no cluster) and self-tests those checks' classifiers, the name-restricted outside grant included; `scripts/verify.sh` runs it where helm is installed (always in CI). |
-| `smoke/demo-kind.sh` | The demonstration-stage smoke. `--render-only` (offline; `scripts/verify.sh` runs it): the params stage and its refusals, the rendering audits, and the real generator script under node through `demo-reduce`. `--k6-local`: the real k6 binary against a dummy server on 127.0.0.1. Without a flag: a throwaway kind cluster with its own kubeconfig. |
+| `smoke/demo-kind.sh` | The demonstration-stage smoke. `--render-only` (offline; `scripts/verify.sh` runs it): the params stage and its refusals, the rendering audits, and the real generator script under node through `demo-reduce`. `--k6-local`: the real k6 binary against a dummy server on 127.0.0.1. Without a flag: a throwaway kind cluster with its own kubeconfig. `--images images.json`: the full mode with the reviewed fixture and k6 images of a `c28-images/v1` record, pulled by digest on the nodes (no build, no local registry). `--replacement`: the generator's restart and replacement smoke (three consecutive planned restarts with their gaps, `kubectl delete pod` with its grace period, one target that stops answering with the generator's memory read from its cgroup, and the reducer over the continuously collected log of the whole smoke, with verdicts per phase); `smoke/demo_kind.py` holds its log follower and its analysis, self-tested offline by `--render-only`. |
 | `smoke/calibrate-kind.sh` | The kind smoke of the calibration path (`--images images.json --out report.json`, own cluster and kubeconfig only, reviewed digests pulled on the nodes): non-root summary delivery through the termination message, the actual scenario timing, zero drops reconciled against the ingress's own counters, reported drops with starved VUs, refusal of truncated or malformed summaries, UID-bound stop, `activeDeadlineSeconds` expiry, cleanup and image identity (`calibrate_kind.py`). Required before any prod calibration; not C2.8 evidence. |
 
 ```sh
@@ -295,8 +295,9 @@ non-empty fault schedule, the residency audit and the reservation gate in every 
   (`phase: "schedule-exhausted"`) and that record, sends nothing, idles to its segment end and exits 0 (no hot loop).
   There is no per-minute line before the origin or after the end: intended is undefined there, not zero.
 - **Smoke-only origin.** A configuration labelled `smoke` (`generator_config(..., smoke_segment_minutes=N,
-  smoke_origin_ms=T)`) may start on any whole minute, so a smoke can put a day boundary of the table a few minutes
-  ahead of its start. A configuration labelled `demonstration` always has a UTC-midnight origin and exactly 28 days;
+  smoke_origin_ms=T)`, on the command line `--smoke-segment-minutes N --smoke-origin-utc YYYY-MM-DDTHH:MM:00Z`) may
+  start on any whole minute, so a smoke can put a day boundary of the table a few minutes ahead of its start, or
+  sit at the daily peak whatever the wall clock says. A configuration labelled `demonstration` always has a UTC-midnight origin and exactly 28 days;
   Python and the script both refuse anything else.
 - **Open loop, independent targets.** One k6 scenario per target with ONE virtual user, whose single iteration runs
   an event loop: arrivals are timed by `setTimeout` against wall-clock time and sent with `http.asyncRequest`, so no
@@ -340,6 +341,11 @@ non-empty fault schedule, the residency audit and the reservation gate in every 
   `memory.current`. The ConfigMap carries the script and the whole table (about 0.2 MiB for
   28 days); rendering refuses more than three quarters of the 1 MiB limit, and the kind smoke applies it server-side
   (a client-side apply would copy it into an annotation limited to 256 KiB).
+- **A failed request is a record, not a log line.** The script sets k6's `throw` option: a request without an HTTP
+  response (a timeout, a refused or cut connection) rejects its promise and is recorded as status 0, exactly as
+  before, but k6 no longer writes a "Request Failed" warning for each. On the kind bed one target that did not answer
+  produced 16,683 such lines in two minutes; at the peak rate that is about 9 kB of log per second, enough to
+  rotate the container's log within minutes and take the minute lines with it.
 - **The configuration that runs is the one reviewed.** At start the script recomputes the configuration's digest
   from what it parsed, exactly as `schedule.digest` does (SHA-256 over the JSON with sorted keys, separators `,` and
   `:`, non-ASCII escaped, the `digest` key left out; `k6/crypto`), and refuses to start on a mismatch: a table edited
@@ -442,8 +448,44 @@ the peak rate with the memory sampled, plus an altered table under its old diges
 exercises k6's event loop, `http.asyncRequest`, `k6/timers`, `k6/crypto`, the stderr record stream and the exit
 status at a segment end; it is functionality, not evidence. **Not run for the 28-day schedule:**
 `demo-kind.sh --k6-local` (needs k6 on PATH) and the full mode on a throwaway kind cluster. Nothing on a cluster has
-therefore exercised the StatefulSet and its headless Service, the kubelet's restart of the container at a segment
-end, the ingress, remote write, or the server-side apply of the ConfigMap.
+therefore exercised the default full mode's own checks. The generator's restart and replacement were run on kind
+(next paragraph).
+
+**On a kind cluster (2026-11-11, `demo-kind.sh --replacement --images`, the laptop bed; functionality, not
+evidence).** The reviewed fixture and k6 images by digest, no operator and no forecaster, the schedule placed at its
+daily peak with 17.5 rps per replica (about 157 arrivals a second per target), 3-minute smoke segments, remote write
+into an in-cluster VictoriaMetrics.
+- *Apply.* The stage's 24 objects applied; the generator's ConfigMap (234 kB as JSON) through server-side apply; the
+  StatefulSet with one replica and its headless Service (no port) were accepted and the pod `c28-demo-generator-0`
+  ran on S.
+- *Planned restarts.* Seven in the run, every one exit 0 (`Completed`) in the same pod, each next incarnation
+  resuming exactly at its start with nothing replayed. The gap from the segment end to the first scheduled arrival
+  of the next incarnation was 4.0 s, 15.3 s and 26.5 s in the first pod and 4.6 s, 15.4 s, 33.4 s and 51.5 s in
+  the second: the old incarnation waits 2.5 s for its last outcomes before it exits; the first restart of a pod
+  then takes 1.5 to 2.1 s (the kubelet restarting the container, k6 starting); every further one also waits for the
+  kubelet's restart back-off (10 s, 20 s, 40 s, ... up to 5 minutes),
+  which is only reset after a container has run for 10 minutes. With the smoke's 3-minute segments it never is;
+  with the demonstration's 24-hour segments every restart should be a first one, which this smoke does not show.
+- *Pod deletion with its grace period (never forced).* The old pod object was gone 1.1 s after the delete (k6 stops
+  at once on SIGTERM, so the 15 s grace period was not used up), the replacement was created 24 ms after that and
+  ran 2.1 s after the delete; never two pod objects at once (watch events and polls). The reducer shows no
+  `duplicate_generators`; the minute of the deletion is `unknown` (`unrecorded_tail`: the killed incarnation wrote
+  no line for it), the next ones `partial` (`incarnation_boundary`) and `observed`.
+- *One target not answering, remote write on.* Its pods' responses were dropped for 110 s. In the whole minute inside
+  that span all 9,429 requests to it failed (9,133 at the generator's own 2 s timeout, 296 as the ingress's 504),
+  314 requests in flight on average against `max_inflight` 505, none dropped; the other target was served
+  completely (9,429 of 9,429, dispatch lateness under 10 ms). The generator container's memory (cgroup `memory.current` and
+  `memory.peak` on the node) reached 50.2 MB (47.9 MiB), 9.4 % of its 512 MiB limit; about 26 MB otherwise.
+- *Reducer over the whole smoke* (19 minutes per target, the log collected continuously): 11 `observed`, 7
+  `partial` (`incarnation_boundary` at each restart, `ingress_gap` in the first minute of the series), 1 `unknown`
+  (the deletion); no forbidden reason, every incarnation with a valid start record, no lost line.
+- *Seen in the first run and changed.* k6's per-request warnings (above). And the fixture's INGRESS container was
+  restarted about a minute after the packets TO a target's pods were dropped (a network blackhole); its exit reason
+  was not captured. The smoke now drops the target's responses instead (the ingress stayed up). A blackholed target
+  as a risk for the ingress is open.
+- *Not shown.* A pod that needs its whole grace period to stop, a node failure, the `--k6-local` mode and the
+  default full mode of this script, 24-hour segments, the operator and the forecaster (not installed), and any rate
+  above the one used.
 
 ## Restore to the common starting count
 

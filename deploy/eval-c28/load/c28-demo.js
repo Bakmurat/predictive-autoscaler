@@ -472,6 +472,12 @@ cfg.targets.forEach((_, i) => {
 
 export const options = {
   discardResponseBodies: true,
+  // A request that fails without an HTTP response (a timeout, a refused or cut connection) REJECTS its promise
+  // instead of resolving with status 0 and a "Request Failed" warning in the log: the rejection handler below
+  // records it exactly the same way (status 0), and the log stays the records. Without this k6 writes one warning
+  // line per failed request (seen on the kind bed: 16,683 such lines in two minutes with one target not answering),
+  // which at the peak rate rotates the container's log within minutes and takes the minute lines with it.
+  throw: true,
   // One VU keeps up to max_inflight requests in flight: keep that many idle connections instead of k6's 20/6.
   batch: cfg.max_inflight,
   batchPerHost: cfg.max_inflight,

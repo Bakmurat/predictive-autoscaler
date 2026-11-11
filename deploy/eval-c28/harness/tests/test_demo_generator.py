@@ -47,6 +47,7 @@ def test_the_script_loads_and_declares_one_single_vu_scenario_per_target(tmp_pat
         assert (s["executor"], s["vus"], s["iterations"], s["exec"]) == ("per-vu-iterations", 1, 1, "run")
         assert s["maxDuration"] == f"{cfg['segment_minutes'] * 60 + 900}s"     # the segment, and room to finish
     assert out["options"]["discardResponseBodies"] is True
+    assert out["options"]["throw"] is True        # a failed request rejects (recorded as status 0): no k6 warning line each
     assert out["options"]["batch"] == out["options"]["batchPerHost"] == cfg["max_inflight"]
 
 

@@ -579,8 +579,8 @@ def test_the_render_never_allows_two_generator_pods(monkeypatch, edit, text):
     """The rendering audit: one StatefulSet with one replica and nothing else that carries a pod template."""
     real = demo.generator_objects
 
-    def altered(params, smoke=None):
-        objs = real(params, smoke)
+    def altered(params, *smoke):
+        objs = real(params, *smoke)
         edit(objs)
         return objs
     monkeypatch.setattr(demo, "generator_objects", altered)
@@ -875,6 +875,37 @@ def test_cli_smoke_segment_is_labelled_and_only_for_the_generator(tmp_path, caps
                   "--smoke-segment-minutes", "3")
     cm = list(yaml.safe_load_all(out))[0]
     assert json.loads(cm["data"]["config.json"])["label"] == "smoke"
-    with pytest.raises(render.ParamsError, match="renders only --part generator"):
+    with pytest.raises(render.ParamsError, match="render only --part generator"):
         main(["render", "--params", str(tmp_path / "params.json"), "--stage", "demonstration",
               "--smoke-segment-minutes", "3"])
+
+
+def test_cli_smoke_origin_puts_the_smoke_at_a_chosen_time_of_the_schedules_day(tmp_path, capsys):
+    """--smoke-origin-utc (only with a smoke segment): the origin on any whole minute, so a kind smoke can sit at the
+    daily peak whatever the wall clock says. A demonstration can never use it."""
+    import yaml
+    from c28.__main__ import main
+    p = prod_like()
+    rc, out = cli(tmp_path, capsys, p, "demo-plan", "--smoke-segment-minutes", "3", "--smoke-origin-utc",
+                  "2026-11-10T13:20:00Z")
+    cfg = json.loads(out)
+    assert rc == 0 and cfg == demo.generator_config(p, 3, 1794316800000)
+    assert (cfg["label"], cfg["origin_utc"], cfg["origin_ms"]) == ("smoke", "2026-11-10T13:20:00Z", 1794316800000)
+    assert cfg["origin_ms"] % 86_400_000 != 0 and demo.config_problems(cfg) == []
+    rc, out = cli(tmp_path, capsys, p, "render", "--stage", "demonstration", "--part", "generator",
+                  "--smoke-segment-minutes", "3", "--smoke-origin-utc", "2026-11-10T13:20:00Z")
+    cm = list(yaml.safe_load_all(out))[0]
+    assert json.loads(cm["data"]["config.json"]) == cfg
+    params_file = str(tmp_path / "params.json")
+    for argv, text in ((["demo-plan", "--params", params_file, "--smoke-origin-utc", "2026-11-10T13:20:00Z"],
+                        "smoke-only option"),
+                       (["demo-plan", "--params", params_file, "--smoke-segment-minutes", "3", "--smoke-origin-utc",
+                         "2026-11-10T13:20:30Z"], "whole minute"),
+                       (["demo-plan", "--params", params_file, "--smoke-segment-minutes", "3", "--smoke-origin-utc",
+                         "yesterday"], "must be YYYY-MM-DDTHH:MM:SSZ"),
+                       (["render", "--params", params_file, "--stage", "demonstration", "--smoke-origin-utc",
+                         "2026-11-10T13:20:00Z"], "render only --part generator"),
+                       (["render", "--params", params_file, "--stage", "demonstration", "--part", "generator",
+                         "--smoke-origin-utc", "2026-11-10T13:20:00Z"], "smoke-only option")):
+        with pytest.raises(render.ParamsError, match=text):
+            main(argv)
