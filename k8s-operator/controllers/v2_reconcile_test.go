@@ -38,7 +38,7 @@ var v2Origin = time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
 
 // v2Mode is what the stub service answers.
 type v2Mode struct {
-	Kind  string  // eligible, shadow, collecting, status:<code>, malformed, wrong-epoch
+	Kind  string  // eligible, shadow, collecting, status:<code>, limit, malformed, wrong-epoch
 	Upper float64 // upper window max RPS
 }
 
@@ -131,6 +131,10 @@ func startV2Stub(t *testing.T, reader client.Reader, clock func() time.Time) *v2
 			}
 			w.WriteHeader(code)
 			_, _ = w.Write([]byte(`{"detail":"stub"}`))
+			return
+		case mode.Kind == "limit": // the service's own refusal at its registration limit
+			w.WriteHeader(503)
+			_, _ = w.Write([]byte(`{"detail":{"error":"AutoscalerLimitReached","message":"the service's registration limit is reached"}}`))
 			return
 		case mode.Kind == "malformed":
 			_, _ = w.Write([]byte(`{"predictions":[1,2,3]}`))

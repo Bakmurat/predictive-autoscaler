@@ -256,8 +256,8 @@ The forecasting service and the trainer share the model volume.
 - **Autoscaler limit:** the service registers at most `forecaster.statistical.maxAutoscalers` autoscalers
   (namespace/name) at once, 8 by default (1 to 64); its resources and `stateQuota` are sized for 8, so raise them
   together. A request for one more is refused with HTTP 503, error `AutoscalerLimitReached`: that autoscaler stays
-  reactive (`PredictionReady=False`, reason `DataUnavailable`, with the error in the condition's message), and the
-  others are served as before. A registration is released, and its metric series removed, only when
+  reactive (`PredictionReady=False`, reason `AutoscalerLimitReached`, with the error in the condition's message),
+  and the others are served as before. It lasts while every registration is in use: raise the limit or free a registration (see below for when one is released). A registration is released, and its metric series removed, only when
   - the Kubernetes API answers a definite 404 for the autoscaler (it was deleted): on a request for it, or when the
     registry is full and the service looks up the registered autoscalers (at most once a minute, for about ten
     seconds, continuing in name order where the last check stopped). Definite means the API server's `NotFound`

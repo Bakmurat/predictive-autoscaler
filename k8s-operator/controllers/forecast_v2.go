@@ -1111,16 +1111,39 @@ func (r *PredictiveAutoscalerReconciler) requestV2(ctx context.Context, b v2Bind
 	return out, nil
 }
 
-// v2FailureReason is the PredictionReady reason for a failed request.
+// v2FailureReason is the PredictionReady reason for a failed request. The service's registration limit gets its own
+// reason: it is not a data problem and lasts while every registration is in use (until the limit is raised or a
+// registration is freed), so it must not hide among the transient DataUnavailable causes.
 func v2FailureReason(err error) string {
 	var refused *forecastRefusedError
+	var unavailable *forecastServerError
 	switch {
 	case stderrors.Is(err, errV2Refused):
 		return "ForecastRejected"
 	case stderrors.As(err, &refused) && refused.status == http.StatusUnprocessableEntity:
 		return "RequestRefused"
+	case stderrors.As(err, &unavailable) && unavailable.status == http.StatusServiceUnavailable &&
+		v2RefusalCode(unavailable.body) == v2AutoscalerLimitReached:
+		return v2AutoscalerLimitReached
 	}
 	return "DataUnavailable"
+}
+
+// v2AutoscalerLimitReached is the service's error code for a request refused at its registration limit (503).
+const v2AutoscalerLimitReached = "AutoscalerLimitReached"
+
+// v2RefusalCode reads the error code of the service's refusal body, {"detail": {"error": "<code>", ...}}; "" for any
+// other body. The code is only ever compared with known constants, never shown as it is.
+func v2RefusalCode(body string) string {
+	var b struct {
+		Detail struct {
+			Error string `json:"error"`
+		} `json:"detail"`
+	}
+	if json.Unmarshal([]byte(body), &b) != nil {
+		return ""
+	}
+	return b.Detail.Error
 }
 
 func v2FormatRPS(v float64) string { return strconv.FormatFloat(v, 'f', -1, 64) }

@@ -2074,7 +2074,8 @@ func (r *PredictiveAutoscalerReconciler) clearForecastOverride(log logr.Logger, 
 }
 
 // predictionReadyEvent reports PredictionReady transitions. Collecting evidence is normal operation, not a fault: only
-// a forecast the operator rejected, a refused request or invalid settings are warnings.
+// a forecast the operator rejected, a refused request, invalid settings or the service's registration limit (which
+// lasts while every registration is in use) are warnings.
 func (r *PredictiveAutoscalerReconciler) predictionReadyEvent(a *autoscalerv1alpha1.PredictiveAutoscaler, prev *metav1.Condition, c metav1.Condition) {
 	if prev != nil && prev.Status == c.Status && prev.Reason == c.Reason {
 		return
@@ -2082,7 +2083,8 @@ func (r *PredictiveAutoscalerReconciler) predictionReadyEvent(a *autoscalerv1alp
 	switch {
 	case c.Status == metav1.ConditionTrue:
 		r.event(a, "Normal", "PredictionReady", c.Message)
-	case c.Reason == "ForecastRejected" || c.Reason == "RequestRefused" || c.Reason == "SettingsInvalid":
+	case c.Reason == "ForecastRejected" || c.Reason == "RequestRefused" || c.Reason == "SettingsInvalid" ||
+		c.Reason == v2AutoscalerLimitReached:
 		r.event(a, "Warning", "PredictionNotReady", c.Reason+": "+c.Message)
 	default:
 		r.event(a, "Normal", "PredictionNotReady", c.Reason+": "+c.Message)
