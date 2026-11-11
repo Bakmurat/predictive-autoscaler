@@ -186,12 +186,18 @@ var conditionMetricTypes = []string{
 	"ScaleDownHeadroom", "CapacityConfigured", "PredictionReady", "ScaleOutBlocked",
 }
 
-// recordConditionMetrics publishes an autoscaler's persisted conditions (a type it does not carry has no series) and
-// whether its forecasting is enabled.
-func recordConditionMetrics(ns, name string, forecasting bool, conds []metav1.Condition) {
+// recordConditionMetrics publishes an autoscaler's persisted conditions (a type it does not carry has no series), each
+// with its reason, its mode, and whether its forecasting is enabled.
+func recordConditionMetrics(ns, name, mode string, forecasting bool, conds []metav1.Condition) {
 	forecastingEnabledGauge.WithLabelValues(ns, name).Set(map[bool]float64{true: 1, false: 0}[forecasting])
+	recordMode(ns, name, mode)
 	for _, t := range conditionMetricTypes {
 		c := meta.FindStatusCondition(conds, t)
+		if c == nil {
+			recordConditionReason(ns, name, t, nil)
+		} else {
+			recordConditionReason(ns, name, t, &c.Reason)
+		}
 		for _, s := range []metav1.ConditionStatus{metav1.ConditionTrue, metav1.ConditionFalse, metav1.ConditionUnknown} {
 			if c == nil {
 				conditionGauge.DeleteLabelValues(ns, name, t, string(s))
@@ -206,11 +212,13 @@ func recordConditionMetrics(ns, name string, forecasting bool, conds []metav1.Co
 	}
 }
 
-// forgetConditionMetrics removes a deleted autoscaler's condition and forecasting-enabled series.
+// forgetConditionMetrics removes every per-autoscaler series of a deleted autoscaler that carries its namespace and
+// name: conditions, forecasting-enabled, the forecast v2 series and the stage series.
 func forgetConditionMetrics(ns, name string) {
 	conditionGauge.DeletePartialMatch(prometheus.Labels{"namespace": ns, "autoscaler": name})
 	forecastingEnabledGauge.DeleteLabelValues(ns, name)
 	forgetV2Metrics(ns, name)
+	forgetStageMetrics(ns, name)
 }
 
 func init() {

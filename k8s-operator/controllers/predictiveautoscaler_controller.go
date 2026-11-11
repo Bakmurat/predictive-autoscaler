@@ -380,6 +380,7 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	// One resolved capacity for the reactive rule, the forecast rule and the headroom floor (capacity.go). Without one
 	// no replica count is computed: the decision holds the current count and no forecast is requested.
 	capacityRPM, capacitySource, capacityOK := perReplicaCapacityRPM(autoscaler.Spec)
+	recordCapacity(autoscaler.Namespace, autoscaler.Name, capacityRPM, capacitySource, capacityOK)
 
 	// --- STARTUP DELAY AND BLOCKED SCALE-OUTS (startup.go; every engine) ---
 	now := r.now()
@@ -576,6 +577,11 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		dec.V2 = v2out.ledger(v2pol, capacityRPM, capacityOK, mode)
 	}
 	recordV2Metrics(autoscaler.Namespace, autoscaler.Name, v2out, v2pol, reactiveReplicas)
+	if v2out != nil {
+		recordPredictionWindow(autoscaler.Namespace, autoscaler.Name, v2out.Response, v2pol != nil)
+	} else {
+		forgetPredictionWindow(autoscaler.Namespace, autoscaler.Name)
+	}
 
 	// --- ACCURACY METRICS ---
 	// The actual need and the prediction error come from a measured rate and a configured capacity only: without both
@@ -655,12 +661,19 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	// change or a write conflict aborts it (never retried with the old decision) and the next reconcile, with fresh
 	// checks, follows soon.
 	guard, retrySoon := "", false
+	// requested is the count a write was attempted for, whatever became of it; every attempt's outcome is counted.
+	var requested *int32
+	attempt := func(result string, to int32) {
+		recordWrite(autoscaler.Namespace, autoscaler.Name, result, to, float64(r.now().UnixMilli())/1000)
+	}
 	// Order (Codex r07): read the fresh Scale first, then the final authorization (identity guard), then the update, all
 	// within scaleWriteTimeout, so a slow read cannot leave the authorization old when the write begins.
 	write := func(to int32) (bool, error) {
 		wctx, cancel := context.WithTimeout(ctx, scaleWriteTimeout)
 		defer cancel()
+		requested = &to
 		stale := func(err error) (bool, error) {
+			attempt(writeStale, to)
 			guard, retrySoon = "the target changed since the decision: "+err.Error(), true
 			log.Info("Not scaling: the decision is stale", "guard", guard)
 			r.recordDecision(dec, "guard_abort", currentReplicas)
@@ -671,9 +684,11 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 			return stale(err)
 		}
 		if err != nil {
+			attempt(writeReadFailed, to)
 			return true, err
 		}
 		if guard = r.identityGuard(wctx, &autoscaler, deployment); guard != "" {
+			attempt(writeGuardAbort, to)
 			log.Info("Not scaling: the autoscaler or its target changed during the reconcile", "guard", guard)
 			r.recordDecision(dec, "guard_abort", currentReplicas)
 			return false, nil
@@ -685,6 +700,7 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 			guard, retrySoon = "the forecast expired before the write (valid until "+v2FormatTS(v2out.Response.ValidUntil)+")", true
 			v2out.Verdict = v2Verdict{Reason: "DeadlinePassed", Detail: guard}
 			dec.V2.Accepted, dec.V2.Verdict, dec.V2.VerdictDetail = false, "DeadlinePassed", guard
+			attempt(writeGuardAbort, to)
 			log.Info("Not scaling: the forecast expired before the write", "guard", guard)
 			r.recordDecision(dec, "guard_abort", currentReplicas)
 			return false, nil
@@ -693,9 +709,17 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 			if errors.IsConflict(err) {
 				return stale(err)
 			}
+			attempt(writeFailure(err), to)
 			return true, err
 		}
+		attempt(writeApplied, to)
 		return true, nil
+	}
+
+	// The replica count at each stage, published once per reconcile, also when a failed write ends it early.
+	publishStages := func() {
+		recordStages(autoscaler.Namespace, autoscaler.Name, stageReplicas{calculated: desiredReplicas, target: currentReplicas,
+			ready: deployment.Status.ReadyReplicas, requested: requested})
 	}
 
 	// --- APPLY SCALING ---
@@ -730,6 +754,7 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		wrote, err := write(desiredReplicas)
 		if err != nil {
 			log.Error(err, "Failed to scale up")
+			publishStages()
 			r.recordDecision(dec, "scale_error", currentReplicas)
 			return r.updateStatusWithError(ctx, &autoscaler, "ScalingError", err.Error())
 		}
@@ -770,6 +795,7 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 			wrote, err := write(target)
 			if err != nil {
 				log.Error(err, "Failed to scale down")
+				publishStages()
 				r.recordDecision(dec, "scale_error", currentReplicas)
 				return r.updateStatusWithError(ctx, &autoscaler, "ScalingError", err.Error())
 			}
@@ -813,6 +839,11 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	if dec.ForecastStatus == "used" {
 		forecastReplicas = predictedReplicas
 	}
+	// A hold in Active mode asks for the current count; a write attempt asked for its target, whatever became of it.
+	if requested == nil && stabilized > 0 {
+		requested = &stabilized
+	}
+	publishStages()
 	if err := r.updateStatus(ctx, &autoscaler, statusInputs{
 		mode: mode, calculated: desiredReplicas, forecast: forecastReplicas, stabilized: stabilized, applied: applied,
 		current: currentReplicas, ready: deployment.Status.ReadyReplicas, keepCurrent: keepCurrent,
@@ -1782,14 +1813,14 @@ func (r *PredictiveAutoscalerReconciler) updateStatus(ctx context.Context, autos
 			"headroom %d%% is not blocking a scale-down", in.headroomPercent))
 	}
 	if statusEqual(before, st) {
-		recordConditionMetrics(autoscaler.Namespace, autoscaler.Name, predictionEnabled(autoscaler), st.Conditions)
+		recordConditionMetrics(autoscaler.Namespace, autoscaler.Name, autoscaler.Spec.EffectiveMode(), predictionEnabled(autoscaler), st.Conditions)
 		return nil
 	}
 	if err := r.Status().Update(ctx, autoscaler); err != nil {
 		return err
 	}
-	recordConditionMetrics(autoscaler.Namespace, autoscaler.Name, predictionEnabled(autoscaler), st.Conditions) // the persisted conditions only
-	r.transitionEvents(autoscaler, before.Conditions, st.Conditions)                                            // only after the status is persisted
+	recordConditionMetrics(autoscaler.Namespace, autoscaler.Name, autoscaler.Spec.EffectiveMode(), predictionEnabled(autoscaler), st.Conditions) // the persisted conditions only
+	r.transitionEvents(autoscaler, before.Conditions, st.Conditions)                                                                             // only after the status is persisted
 	return nil
 }
 
@@ -1914,7 +1945,7 @@ func (r *PredictiveAutoscalerReconciler) updateStatusWithError(
 		}
 		r.transitionEvents(autoscaler, before.Conditions, autoscaler.Status.Conditions)
 	}
-	recordConditionMetrics(autoscaler.Namespace, autoscaler.Name, predictionEnabled(autoscaler), autoscaler.Status.Conditions)
+	recordConditionMetrics(autoscaler.Namespace, autoscaler.Name, autoscaler.Spec.EffectiveMode(), predictionEnabled(autoscaler), autoscaler.Status.Conditions)
 	return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
 }
 

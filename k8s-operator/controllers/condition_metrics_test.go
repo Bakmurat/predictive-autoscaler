@@ -111,9 +111,9 @@ func TestConditionMetricsTelemetryLoss(t *testing.T) {
 
 func TestConditionMetricsTypeAbsentHasNoSeries(t *testing.T) {
 	t.Cleanup(func() { forgetConditionMetrics("ns-a", "pa-a") })
-	recordConditionMetrics("ns-a", "pa-a", true, []metav1.Condition{{Type: "Ready", Status: metav1.ConditionUnknown}})
+	recordConditionMetrics("ns-a", "pa-a", "Active", true, []metav1.Condition{{Type: "Ready", Status: metav1.ConditionUnknown}})
 	wantSeries(t, conditionSeries(t, "ns-a", "pa-a", "Ready"), "Unknown")
-	recordConditionMetrics("ns-a", "pa-a", true, nil)
+	recordConditionMetrics("ns-a", "pa-a", "Active", true, nil)
 	if got := conditionSeries(t, "ns-a", "pa-a", "Ready"); len(got) != 0 {
 		t.Fatalf("a condition the status no longer carries keeps its series: %v", got)
 	}

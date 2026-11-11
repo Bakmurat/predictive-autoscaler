@@ -44,8 +44,15 @@ def help_text(dashboard):
     return dashboard["panels"][0]["options"]["content"]
 
 
+STAGE_METRICS_GO = METRICS_GO.with_name("stage_metrics.go")
+
+
+def _metric_names(path):
+    return set(re.findall(r'Name:\s*"(predictive_autoscaler_[a-z0-9_]+)"', path.read_text()))
+
+
 def operator_metric_names():
-    return set(re.findall(r'Name:\s*"(predictive_autoscaler_[a-z0-9_]+)"', METRICS_GO.read_text()))
+    return _metric_names(METRICS_GO) | _metric_names(STAGE_METRICS_GO)
 
 
 def forecaster_metric_names():
@@ -210,6 +217,14 @@ def test_every_metric_the_guide_names_is_exported_by_the_operator():
     named = set(re.findall(r"predictive_autoscaler_[a-z0-9_]*[a-z0-9]", GUIDE.read_text()))
     exported = operator_metric_names() | forecaster_metric_names()
     assert named and named <= exported, named - exported
+
+
+def test_the_guide_names_every_stage_metric():
+    # The series a dashboard follows one autoscaler with (stage_metrics.go): each is explained in the guide.
+    stage, guide = _metric_names(STAGE_METRICS_GO), GUIDE.read_text()
+    assert len(stage) >= 18 and not stage & _metric_names(METRICS_GO)
+    assert all(re.search(rf"`{name}[`{{]", guide) for name in stage), sorted(
+        name for name in stage if not re.search(rf"`{name}[`{{]", guide))
 
 
 def test_the_guide_and_the_dashboard_cover_every_forecast_quality_metric(dashboard):

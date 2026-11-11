@@ -13,21 +13,23 @@ import (
 // It is observation only: nothing here feeds back into the decision. Lines carry "event":"decision",
 // so readers that treat event lines as non-issuance records keep working.
 type decisionRecord struct {
-	ForecastLookup   *forecastLookup `json:"forecast_lookup,omitempty"`
-	Event            string          `json:"event"`
-	At               string          `json:"at"`
-	Application      string          `json:"application"`
-	Namespace        string          `json:"namespace"`
-	Forecasting      bool            `json:"forecasting"`
-	ForecastStatus   string          `json:"forecast_status"` // used|unavailable|horizon_elapsed|sanity_rejected|disabled|unauthorized|forbidden|auth_unavailable|auth_misconfigured|capacity_missing; v2 also not_eligible|rejected|lead_insufficient|settings_invalid
-	ForecastIssuedAt *string         `json:"forecast_issued_at"`
-	ArtifactSHA256   *string         `json:"artifact_sha256"`
-	ModelVersion     *string         `json:"model_version"`
-	LeadWindowPeak   *float64        `json:"lead_window_peak_rpm"`
-	Confidence       *float64        `json:"confidence"`
-	RawPredicted     *int32          `json:"raw_predicted_replicas"`
-	ConfidenceAdj    *int32          `json:"confidence_adjusted_replicas"`
-	PredictedClamped *int32          `json:"predicted_after_clamp"`
+	ForecastLookup *forecastLookup `json:"forecast_lookup,omitempty"`
+	// The autoscaler the decision belongs to (for its metrics; the record itself names the target).
+	autoscalerNamespace, autoscalerName string
+	Event                               string   `json:"event"`
+	At                                  string   `json:"at"`
+	Application                         string   `json:"application"`
+	Namespace                           string   `json:"namespace"`
+	Forecasting                         bool     `json:"forecasting"`
+	ForecastStatus                      string   `json:"forecast_status"` // used|unavailable|horizon_elapsed|sanity_rejected|disabled|unauthorized|forbidden|auth_unavailable|auth_misconfigured|capacity_missing; v2 also not_eligible|rejected|lead_insufficient|settings_invalid
+	ForecastIssuedAt                    *string  `json:"forecast_issued_at"`
+	ArtifactSHA256                      *string  `json:"artifact_sha256"`
+	ModelVersion                        *string  `json:"model_version"`
+	LeadWindowPeak                      *float64 `json:"lead_window_peak_rpm"`
+	Confidence                          *float64 `json:"confidence"`
+	RawPredicted                        *int32   `json:"raw_predicted_replicas"`
+	ConfidenceAdj                       *int32   `json:"confidence_adjusted_replicas"`
+	PredictedClamped                    *int32   `json:"predicted_after_clamp"`
 	// PredictedReplicas is the value that entered max(predicted, reactive, min): after the sanity
 	// and overestimate safeguards; 0 when no usable forecast participated.
 	PredictedReplicas int32    `json:"predicted_replicas"`
@@ -71,6 +73,7 @@ func newDecisionRecord(a *autoscalerv1alpha1.PredictiveAutoscaler, forecasting b
 	if d.Namespace == "" {
 		d.Namespace = a.Namespace
 	}
+	d.autoscalerNamespace, d.autoscalerName = a.Namespace, a.Name
 	if !forecasting {
 		d.ForecastStatus = "disabled"
 	}
@@ -171,5 +174,8 @@ func (r *PredictiveAutoscalerReconciler) recordDecision(d *decisionRecord, actio
 	}
 	d.At = time.Now().UTC().Format(time.RFC3339)
 	d.Action, d.AppliedReplicas = action, applied
+	if d.autoscalerName != "" {
+		recordDecisionAction(d.autoscalerNamespace, d.autoscalerName, action)
+	}
 	r.appendForecastLog(d)
 }
