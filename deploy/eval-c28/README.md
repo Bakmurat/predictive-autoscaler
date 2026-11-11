@@ -487,8 +487,22 @@ into an in-cluster VictoriaMetrics.
   evidence replaced by `{}`, the analysis now fails (both passed before).
 - *Seen in the first run and changed.* k6's per-request warnings (above). And the fixture's INGRESS container was
   restarted about a minute after the packets TO a target's pods were dropped (a network blackhole); its exit reason
-  was not captured. The smoke now drops the target's responses instead (the ingress stayed up). A blackholed target
-  as a risk for the ingress is open.
+  was not captured. The smoke's default drops the target's responses instead (the ingress stayed up).
+- *Blackhole direction and the ingress's own verdict.* `DEMO_BLACKHOLE=requests` makes the timeout phase drop the
+  packets TO the target's pods again (the SYN never arrives; `responses`, the default, is the direction above). The
+  follower samples the ingress container's cgroup on the workload node once a second (`memory.current`,
+  `memory.peak`, `memory.max`, the `oom_kill` counter of `memory.events`, and the pod cgroup's, which outlives a
+  restarted container), and the smoke keeps the ingress pod's statuses (before the fault, right after it and after
+  the recovery), previous log, events and description. A pass now also needs, as positive evidence: the ingress
+  status AFTER THE RECOVERY with a restart count of 0; the same pod UID and container ID as before the fault, and
+  exactly that container in the samples from the fault to the end of the recovery; real samples of its memory in the
+  timeout phase below its limit; and both OOM counters read at 0 from the start of the fault to the end of the
+  recovery (within 5 s of each end, no gap over 15 s). A counter that was read once, or a status taken before the
+  recovery, proves nothing about what came after and fails. The two archived comparison runs predate the captures
+  before the fault and after the recovery, so this verifier reports them as not captured; their samples show one
+  container and counters at 0 throughout for the new build. The fixture's ingress bounds its upstream dials by the request
+  timeout since PR #76; the two runs that compare the reviewed image with a build of that source under
+  `DEMO_BLACKHOLE=requests` are recorded with the evidence, not here.
 - *Not shown.* A pod that needs its whole grace period to stop, a node failure, the `--k6-local` mode and the
   default full mode of this script, 24-hour segments, the operator and the forecaster (not installed), and any rate
   above the one used.

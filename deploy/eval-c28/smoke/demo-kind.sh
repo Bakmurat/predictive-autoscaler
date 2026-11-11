@@ -37,10 +37,12 @@
 #                                                           (never forced): the replacement pod exists only after the
 #                                                           old pod object is gone, never two pod objects at once;
 #                                                        3. one target stops answering (its pods' responses are
-#                                                           dropped on the workload node, so every request to it
-#                                                           runs into the timeout) and the generator container's
-#                                                           memory is read from its cgroup on the node against its
-#                                                           limit;
+#                                                           dropped on the workload node, or with
+#                                                           DEMO_BLACKHOLE=requests the packets to them, so every
+#                                                           request to it runs into the timeout); the generator
+#                                                           container's memory is read from its cgroup on the node
+#                                                           against its limit, and the ingress container's too, with
+#                                                           its restart count and OOM kills;
 #                                                        4. the reducer over the log of the WHOLE smoke (collected
 #                                                           continuously: the API keeps only the current and the
 #                                                           previous container's log), with its verdicts per phase.
@@ -418,6 +420,18 @@ DEMO_WORK_ITERATIONS="${DEMO_WORK_ITERATIONS:-100}"
 DEMO_START_AT="${DEMO_START_AT:-17:40}"
 DEMO_MIN_RESTARTS="${DEMO_MIN_RESTARTS:-3}"
 DEMO_TIMEOUT_SECONDS="${DEMO_TIMEOUT_SECONDS:-110}"
+# How the target is made to stop answering in the timeout phase, on the workload node:
+#   responses (default)  the data segments its pods SEND from port 8080 are dropped: connections are made, requests
+#                        arrive, answers never do;
+#   requests             the packets TO its pods' port 8080 are dropped: not even the SYN arrives (a network
+#                        blackhole), so every connection attempt of the ingress hangs.
+DEMO_BLACKHOLE="${DEMO_BLACKHOLE:-responses}"
+case "$DEMO_BLACKHOLE" in responses|requests) ;; *) echo "demo smoke: DEMO_BLACKHOLE must be responses or requests" >&2; exit 2 ;; esac
+# drop_rule <pod IP>: the iptables match of the chosen direction.
+drop_rule() {
+  if [ "$DEMO_BLACKHOLE" = requests ]; then echo "-d $1 -p tcp --dport 8080 -j DROP"
+  else echo "-s $1 -p tcp --sport 8080 --tcp-flags PSH PSH -j DROP"; fi
+}
 UNANSWERED=c28-demo-pa-r
 FOLLOW_PID="" UNANSWERED_IPS=""
 export KUBECONFIG="$KCFG"
@@ -450,7 +464,7 @@ wait_for() {
 cleanup() {
   if [ -n "$FOLLOW_PID" ]; then kill "$FOLLOW_PID" 2>/dev/null || true; fi      # only the follower this run started
   for ip in $UNANSWERED_IPS; do                                                # only rules this run added, in its node
-    docker exec "$W" iptables -D FORWARD -s "$ip" -p tcp --sport 8080 --tcp-flags PSH PSH -j DROP >/dev/null 2>&1 || true
+    docker exec "$W" iptables -D FORWARD $(drop_rule "$ip") >/dev/null 2>&1 || true
   done
   if [ "${KEEP:-0}" = 1 ]; then
     log "kept: KUBECONFIG=$KCFG kubectl get pods -A ; delete with: $KIND delete cluster --name $CLUSTER"
@@ -488,6 +502,9 @@ FIXTURE_DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "$FIXTURE_T
 FIXTURE_DIGEST="${FIXTURE_DIGEST#*@}"
 [[ "$FIXTURE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || die "no registry digest for the fixture image"
 FIXTURE_IMAGE="localhost:$REG_PORT/c28-fixture@$FIXTURE_DIGEST"
+# What was built, for the record: the image's ID (its config digest) and the registry digest the manifests pin.
+printf '{"tag": "%s", "image_id": "%s", "digest": "%s", "ref": "%s"}\n' "$FIXTURE_TAG" \
+  "$(docker inspect --format '{{.Id}}' "$FIXTURE_TAG")" "$FIXTURE_DIGEST" "$FIXTURE_IMAGE" > "$WORK/fixture-image.json"
 pass "fixture image built and pinned at $FIXTURE_DIGEST"
 fi
 
@@ -503,12 +520,20 @@ EOF
 [ -n "$IMAGES_FILE" ] || cat >> "$WORK/kind.yaml" <<EOF
 containerdConfigPatches:
   - |-
-    [plugins."io.containerd.grpc.v1.cri".registry.mirrors."localhost:$REG_PORT"]
-      endpoint = ["http://$REG_NAME:5000"]
+    [plugins."io.containerd.grpc.v1.cri".registry]
+      config_path = "/etc/containerd/certs.d"
 EOF
 OWN_CLUSTER=1
 "$KIND" create cluster --name "$CLUSTER" --image "$NODE_IMAGE" --config "$WORK/kind.yaml" --kubeconfig "$KCFG" --wait 120s >/dev/null
-[ -n "$IMAGES_FILE" ] || docker network connect kind "$REG_NAME" 2>/dev/null || true
+if [ -z "$IMAGES_FILE" ]; then
+  # The local registry, by its container name on the kind network, as the nodes' mirror of localhost:$REG_PORT
+  # (containerd's hosts.toml; the older registry.mirrors table is gone from containerd 2.x).
+  docker network connect kind "$REG_NAME" 2>/dev/null || true
+  for node in $("$KIND" get nodes --name "$CLUSTER"); do
+    docker exec "$node" mkdir -p "/etc/containerd/certs.d/localhost:$REG_PORT"
+    printf '[host."http://%s:5000"]\n' "$REG_NAME" | docker exec -i "$node" cp /dev/stdin "/etc/containerd/certs.d/localhost:$REG_PORT/hosts.toml"
+  done
+fi
 guard
 CLUSTER_UID="$(k get namespace kube-system -o jsonpath='{.metadata.uid}')"
 W="$CLUSTER-worker"; S="$CLUSTER-worker2"
@@ -660,7 +685,7 @@ if [ "$REPLACEMENT" = 1 ]; then
   ms() { date +%s%3N; }
   pod_uid() { k -n "$NS" get pod "$POD" -o jsonpath='{.metadata.uid}' 2>/dev/null; }
   "$PY" "$SMOKE_DIR/demo_kind.py" follow --kubeconfig "$KCFG" --context "kind-$CLUSTER" --namespace "$NS" \
-    --name "$GEN" --node "$S" --out "$EV" --interval 3 > "$EV/follow.log" 2>&1 &
+    --name "$GEN" --node "$S" --ingress-node "$W" --out "$EV" --interval 3 > "$EV/follow.log" 2>&1 &
   FOLLOW_PID=$!
   T0=$(( GEN_STARTED * 1000 ))
   FIRST_UID="$(pod_uid)"
@@ -703,30 +728,39 @@ if [ "$REPLACEMENT" = 1 ]; then
   guard
   IPS="$(k -n "$NS" get pods -l "c28.devkuban.com/target=$UNANSWERED" -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}')"
   [ -n "$IPS" ] || die "3. no pod IP of $UNANSWERED"
+  # The ingress before the fault: the pod and container the verdict expects to find again after the recovery.
+  k -n "$NS" get pods -l app.kubernetes.io/name=c28-ingress -o json > "$EV/ingress-pods-before.json"
   T3="$(ms)"
-  # The target's pods keep accepting connections and requests, but their RESPONSES never arrive: the data segments
-  # they send from port 8080 are dropped in the workload node's FORWARD chain (the node is this run's own kind
-  # container). The kubelet's probes are local to the node and keep passing, so the endpoints stay ready and the
-  # ingress keeps routing to them: every request to this target hangs until a timeout. (Dropping the packets TO the
-  # pods instead leaves the ingress with dials that never finish; its container was restarted after a minute of
-  # that in the first run of this smoke.)
+  # The drop rules go into the workload node's FORWARD chain (the node is this run's own kind container). The
+  # kubelet's probes are local to the node and keep passing, so the endpoints stay ready and the ingress keeps
+  # routing to the target: every request to it hangs until a timeout. Direction "responses": the pods accept
+  # connections and requests, but the data segments they send never arrive. Direction "requests": nothing reaches
+  # the pods, so every connection attempt of the ingress hangs (an ingress that does not bound its dials piles them
+  # up: the first run of this smoke lost its ingress container that way).
   UNANSWERED_IPS="$IPS"
   for ip in $IPS; do
-    docker exec "$W" iptables -I FORWARD 1 -s "$ip" -p tcp --sport 8080 --tcp-flags PSH PSH -j DROP || die "3. iptables on $W"
+    docker exec "$W" iptables -I FORWARD 1 $(drop_rule "$ip") || die "3. iptables on $W"
   done
-  log "3. the responses of $UNANSWERED are dropped on $W for ${DEMO_TIMEOUT_SECONDS}s ($(echo $IPS | wc -w) pods)"
+  log "3. $UNANSWERED blackholed (direction $DEMO_BLACKHOLE) on $W for ${DEMO_TIMEOUT_SECONDS}s ($(echo $IPS | wc -w) pods)"
   sleep "$DEMO_TIMEOUT_SECONDS"
   for ip in $IPS; do
-    docker exec "$W" iptables -D FORWARD -s "$ip" -p tcp --sport 8080 --tcp-flags PSH PSH -j DROP || die "3. iptables -D on $W"
+    docker exec "$W" iptables -D FORWARD $(drop_rule "$ip") || die "3. iptables -D on $W"
   done
   UNANSWERED_IPS=""
   T4="$(ms)"
   pass "3. the drop rules were removed after ${DEMO_TIMEOUT_SECONDS}s"
-  # The ingress as the timeout load left it (its restarts would show as a counter reset in the reduction).
+  # The ingress as the timeout load left it: container statuses (restart count, last termination), the previous
+  # container's log, the pod's events and its description.
   k -n "$NS" get pods -l app.kubernetes.io/name=c28-ingress -o json > "$EV/ingress-pods.json"
-  k -n "$NS" logs -l app.kubernetes.io/name=c28-ingress --previous --tail=50 > "$EV/ingress-previous.log" 2>/dev/null || true
+  IPOD="$(k -n "$NS" get pods -l app.kubernetes.io/name=c28-ingress -o jsonpath='{.items[0].metadata.name}')"
+  k -n "$NS" logs "$IPOD" --previous > "$EV/ingress-previous.log" 2> "$EV/ingress-previous.err" || true
+  k -n "$NS" logs "$IPOD" --tail=200 > "$EV/ingress-current.log" 2>/dev/null || true
+  k -n "$NS" get events --field-selector "involvedObject.name=$IPOD" -o json > "$EV/ingress-events.json" || true
+  k -n "$NS" describe pod "$IPOD" > "$EV/ingress-describe.txt" || true
   log "collecting five more minutes (recovery, and the last lines)"
   sleep 300
+  # The ingress after the recovery: the status the verdict is decided on (a restart during the recovery counts too).
+  k -n "$NS" get pods -l app.kubernetes.io/name=c28-ingress -o json > "$EV/ingress-pods-final.json"
   T5=$(( $(ms) - 120000 ))
   touch "$EV/stop"; wait "$FOLLOW_PID" || true; FOLLOW_PID=""
 
@@ -742,7 +776,7 @@ if [ "$REPLACEMENT" = 1 ]; then
   # Remote write: what the generator's k6 output delivered to the cluster's VictoriaMetrics.
   k get --raw "/api/v1/namespaces/monitoring/services/vm:8428/proxy/api/v1/query?query=sum%20by%20(__name__)%20(%7B__name__%3D~%22k6_c28d_.%2B%22%7D)" \
     > "$EV/remote-write.json" || die "the remote-write series could not be read"
-  "$PY" - "$EV" "$T0" "$T1" "$T2" "$T3" "$T4" "$T5" "$UNANSWERED" "$DEMO_MIN_RESTARTS" <<'PY'
+  "$PY" - "$EV" "$T0" "$T1" "$T2" "$T3" "$T4" "$T5" "$UNANSWERED" "$DEMO_MIN_RESTARTS" "$DEMO_BLACKHOLE" <<'PY'
 import json, sys
 d, t0, t1, t2, t3, t4, t5 = sys.argv[1], *map(int, sys.argv[2:8])
 out = {}
@@ -756,14 +790,19 @@ limit = sts["spec"]["template"]["spec"]["containers"][0]["resources"]["limits"][
 units = {"Ki": 2**10, "Mi": 2**20, "Gi": 2**30}
 limit_bytes = int(limit[:-2]) * units[limit[-2:]] if limit[-2:] in units else int(limit)
 rw = {r["metric"]["__name__"]: float(r["value"][1]) for r in json.load(open(d + "/remote-write.json"))["data"]["result"]}
-ing = [{"pod": p["metadata"]["name"], "restarts": cs.get("restartCount"),
-        "last_terminated": (cs.get("lastState") or {}).get("terminated")}
-       for p in json.load(open(d + "/ingress-pods.json"))["items"] for cs in p["status"].get("containerStatuses", [])]
+def ingress_statuses(name):
+    return [{"pod": p["metadata"]["name"], "uid": p["metadata"].get("uid"), "container_id": cs.get("containerID"),
+             "restarts": cs.get("restartCount"), "last_terminated": (cs.get("lastState") or {}).get("terminated")}
+            for p in json.load(open(d + "/" + name))["items"] for cs in p["status"].get("containerStatuses", [])]
+ing = ingress_statuses("ingress-pods.json")                      # right after the fault (with the logs and events)
 assert sts["spec"]["replicas"] == 1 and sts["kind"] == "StatefulSet"
 json.dump({"phases": {"restarts": [t0, t1], "replacement": [t1, t2], "steady": [t2, t3], "timeout": [t3, t4],
                       "recovery": [t4, t5]},
            "unanswered_target": sys.argv[8], "min_restarts": int(sys.argv[9]), "memory_limit_bytes": limit_bytes,
-           "remote_write_series": rw, "ingress": ing}, open(d + "/phases.json", "w"), indent=1)
+           "remote_write_series": rw, "ingress": ing, "ingress_before": ingress_statuses("ingress-pods-before.json"),
+           "ingress_final": ingress_statuses("ingress-pods-final.json"),
+           "blackhole": {"direction": sys.argv[10], "from_ms": t3, "to_ms": t4}},
+          open(d + "/phases.json", "w"), indent=1)
 print("remote write:", json.dumps(rw))
 assert any(v > 0 for v in rw.values()), "no k6_c28d_* series reached the metrics backend: remote write did not work"
 PY
