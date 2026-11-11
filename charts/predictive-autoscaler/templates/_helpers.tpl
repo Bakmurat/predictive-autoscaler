@@ -104,14 +104,22 @@ true
 {{- end -}}
 {{- end -}}
 
-{{/* The statistical journal's byte budget from forecaster.statistical.stateQuota (Mi or Gi). */}}
+{{/* A binary quantity (Ki, Mi, Gi or Ti; decimals allowed) in bytes. */}}
+{{- define "pa.quantityBytes" -}}
+{{- $unit := substr (sub (len .) 2 | int) (len .) . -}}
+{{- mulf (trimSuffix $unit . | float64) (get (dict "Ki" 1024 "Mi" 1048576 "Gi" 1073741824 "Ti" 1099511627776) $unit) | floor | int64 -}}
+{{- end -}}
+
+{{/* The statistical journal's byte budget from forecaster.statistical.stateQuota (Mi or Gi). It must leave a fifth of
+     the chart's own volume for the fit artifacts and the filesystem; an existingClaim's capacity is not known here. */}}
 {{- define "pa.stateQuotaBytes" -}}
 {{- $q := .Values.forecaster.statistical.stateQuota -}}
-{{- if hasSuffix "Gi" $q -}}
-{{- mul (trimSuffix "Gi" $q | atoi) 1073741824 -}}
-{{- else -}}
-{{- mul (trimSuffix "Mi" $q | atoi) 1048576 -}}
+{{- $bytes := include "pa.quantityBytes" $q | int64 -}}
+{{- $p := .Values.forecaster.statistical.persistence -}}
+{{- if and (not $p.existingClaim) (gt (mul $bytes 5) (mul (include "pa.quantityBytes" $p.size | int64) 4)) -}}
+{{- fail (printf "forecaster.statistical.stateQuota (%s) must be at most 80%% of forecaster.statistical.persistence.size (%s): the volume also holds the fit artifacts, and a journal that fills it stops the forecaster" $q $p.size) -}}
 {{- end -}}
+{{- $bytes -}}
 {{- end -}}
 
 {{- define "pa.modelsClaim" -}}
@@ -206,6 +214,7 @@ carries the release and its namespace. */}}
 {{- $ns := .Release.Namespace -}}
 {{- $op := printf "job=%q, pa_install_namespace=%q" (printf "%s-operator-metrics" (include "pa.fullname" .)) $ns -}}
 {{- $fc := printf "job=%q, pa_install_namespace=%q" (printf "%s-forecaster" (include "pa.fullname" .)) $ns -}}
+{{- $journal := printf "max(predictive_autoscaler_forecaster_journal_unhealthy_since_seconds{%s})" $fc -}}
 {{- $cond := printf "max by (namespace, autoscaler) (predictive_autoscaler_condition{%s, type=%%q, status=%%q})" $op -}}
 {{- $cutoff := printf "predictive_autoscaler_model_training_cutoff_timestamp_seconds{%s}" $op -}}
 {{- $issued := printf "predictive_autoscaler_forecast_issued_timestamp_seconds{%s}" $op -}}
@@ -242,6 +251,10 @@ carries the release and its namespace. */}}
         "expr" (printf "absent(up{%s} == 1)" $fc)
         "summary" "predictive-autoscaler forecaster not scraped"
         "description" "No forecaster scrape target is up; the operator falls back to the measured rate.")
+  (dict "alert" "PredictiveAutoscalerForecastJournalUnhealthy" "for" $a.journalFor "severity" "warning"
+        "expr" (printf "%s > 0" $journal)
+        "summary" "predictive-autoscaler statistical forecaster: journal unhealthy"
+        "description" "The statistical forecaster's journal cannot be written or trusted, so it answers 503 and is not ready: autoscalers with engine statistical are reactive only. It retries by itself: 5 s after the failure, then 15 s, 1 min, 5 min and 15 min after each failed attempt (about 5 s, 20 s, 80 s, 6 min and 21 min after the failure), then every 30 min. Still firing: its /ready names the reason; a full state volume or a corrupt journal needs an operator (docs/helm.md).")
 -}}
 - name: predictive-autoscaler
   rules:

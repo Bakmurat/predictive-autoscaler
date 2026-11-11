@@ -577,6 +577,7 @@ Each rule watches only its own installation, and every alert carries `pa_release
 | `PredictiveAutoscalerModelStale` | warning | Forecasts in the last hour came from a model whose training data ends more than 26 hours ago. | Check the training CronJob (schedule, failed jobs, logs, `activeDeadlineSeconds`); train by hand ([section 7](#7-get-forecasts)). |
 | `PredictiveAutoscalerOperatorDown` | critical | No operator scrape target has been up for 10 minutes. | Check the operator pod, its events and log. An unready operator after an upgrade usually means an old CRD ([section 13](#13-upgrading-and-the-api-group-migration)). Also check the scrape object and NetworkPolicy `metricsFrom`. |
 | `PredictiveAutoscalerForecasterDown` | warning | No forecasting-service scrape target has been up for 10 minutes. | Check the forecasting service pod, its log and the model volume. Decisions are reactive meanwhile. |
+| `PredictiveAutoscalerForecastJournalUnhealthy` | warning | Engine `statistical` only: the forecasting service's journal has been unwritable or untrustworthy for 15 minutes, although the service retries by itself. It answers 503 and is not ready. | Read the reason on the forecasting service's `/ready` (or its log). A full quota or state volume: enlarge it, or wait for retention to free expired windows; a corrupt journal: move the file away and the service starts an empty one ([helm.md](helm.md#statistical-forecaster-profile-preview)). Decisions are reactive meanwhile. |
 
 Reference: [helm.md, Monitoring](helm.md#monitoring).
 

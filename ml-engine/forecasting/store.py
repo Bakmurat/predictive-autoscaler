@@ -16,10 +16,25 @@ What it guarantees (design C2, section 6):
   - checkpoints are derived state (counters, levels, last processed outcome) with a checksum. recover() replays the
     outcomes after the checkpoint's last sequence number, so each outcome is folded in exactly once after a restart;
   - a full disk, the quota, an I/O error or corruption raises StoreUnavailable/StoreCorrupt and marks the store
-    unhealthy for good (until it is reopened): predictive eligibility needs a healthy store, reactive scaling does not.
-    A fresh or lost store starts a new epoch; it never presents itself as evidence it does not hold.
-The quota is enforced twice: SQLite's max_page_count (a hard SQLITE_FULL) and a check of database + WAL size before
-each write. Retention removes an issuance whose window ended more than `retention_seconds` ago only together with its
+    unhealthy until reopen() has proven it again: predictive eligibility needs a healthy store, reactive scaling does
+    not. reopen() is a restart of the store inside the process: a new connection, the same start-up checks, every
+    record read against its checksum, room for the write the quota refused, and one durable commit. A journal that
+    is still full or corrupt stays failed with the new reason; the caller spaces the attempts (forecasting.service).
+    A fresh or lost store starts a new epoch; it never presents itself as evidence it does not hold. Recovery
+    accepts only the journal this process opened: the identity is remembered from the first successful open, also
+    when none was configured, and a journal with another identity is refused. reopen() never CREATES a journal
+    either: a file that is gone or empty keeps the store failed until the service is restarted, which is the one
+    place where a new journal (a new identity, evidence from nothing) begins. (A service whose journal could not be
+    opened at all at start has no store yet; its retries are first opens, which may initialize an empty file: that
+    is the start-up path repeated, not a recovery. See ForecastService._reopen_store.) A recovery that ends in any error,
+    expected or not, leaves the store failed.
+The quota is enforced twice: SQLite's max_page_count (a hard SQLITE_FULL) and a check of database + WAL size plus
+the write's own size (its payload and an allowance for rows, indexes and page rounding: conservative accounting
+from measurements, not an exact guarantee of the physical size of a write) before each write, so
+the check refuses first and knows how much room the refused write needs. A write that does not fit is refused only
+after retention has freed what it may (compaction up to now, the freed pages and the WAL given back); nothing still in
+retention is ever removed to make room. Retention removes an issuance whose window ended more than `retention_seconds`
+ago only together with its
 outcomes, and only when EVERY expected model has a terminal outcome covered by the epoch's latest verified checkpoint, so recover()
 gives the same state before and after compaction; per-epoch aggregate counts and a digest chain over what was removed
 are kept. Uncovered or still-open old issuances stay. Keys below the retention horizon are retired: committing one is
@@ -50,6 +65,8 @@ MAX_CHECKPOINT_BYTES = 1 << 20            # calibration buffers and 7-day trust 
 RETENTION_SECONDS = 7 * 86400
 OBSERVATION_RETENTION_SECONDS = 28 * 86400
 WAL_LIMIT_BYTES = 64 << 20
+OBSERVATION_ROW_BYTES = 128               # the quota check's size of a stored sample besides its series name
+RECORD_SLACK_BYTES = 8 << 10              # ... and of any write besides its payload: columns, indexes, page rounding
 CHECKPOINTS_KEPT = 3
 OUTCOME_STATUSES = ("scored", "unscorable")
 MAX_MODELS = 3                            # naive, statistical, optional LSTM: one chosen variant per family
@@ -259,23 +276,33 @@ class ForecastStore:
             raise StoreError("observations must be kept at least as long as issuances")
         self._lock = threading.RLock()
         self._problem: Optional[str] = None
+        self._recovering = False                                    # inside reopen(): not healthy until it has passed
+        self._shortfall = 0                                         # bytes of the write the quota last refused
+        self._requested_id = store_id                               # then: the identity the first open found
         self._fault_hook: Optional[Callable[[str], None]] = None    # tests: simulate a crash at a named point
-        try:
-            self._db = sqlite3.connect(path, isolation_level=None, check_same_thread=False, timeout=5.0)
-        except sqlite3.Error as e:
-            raise StoreUnavailable(f"cannot open the journal: {e}") from e
+        self._connect()
         try:
             self._open(store_id)
         except StoreError:
             self._db.close()
             raise
+        self._requested_id = self.store_id      # recovery must find THIS journal, whether an identity was configured
 
     # --- lifecycle --------------------------------------------------------------------------------------------------
 
-    def _open(self, store_id: Optional[str]) -> None:
+    def _connect(self) -> None:
+        try:
+            self._db = sqlite3.connect(self.path, isolation_level=None, check_same_thread=False, timeout=5.0)
+        except sqlite3.Error as e:
+            raise StoreUnavailable(f"cannot open the journal: {e}") from e
+
+    def _open(self, store_id: Optional[str], create: bool = True) -> None:
         with self._guard("open"):
             db = self._db
             fresh = db.execute("SELECT count(*) FROM sqlite_master").fetchone()[0] == 0
+            if fresh and not create:
+                raise StoreCorrupt("the journal file is gone or empty; recovery never starts a new journal (restart "
+                                   "the service to begin one: its evidence starts from nothing)")
             if fresh:
                 db.execute("PRAGMA auto_vacuum = INCREMENTAL")      # only effective before the first table
             if db.execute("PRAGMA journal_mode = WAL").fetchone()[0].lower() != "wal":
@@ -301,11 +328,25 @@ class ForecastStore:
             meta = dict(db.execute("SELECT key, value FROM meta").fetchall())
             if meta.get("schema_version") != str(SCHEMA_VERSION):
                 raise StoreCorrupt(f"unsupported journal schema {meta.get('schema_version')!r}")
-            if store_id is not None and meta.get("store_id") != store_id:
+            sid = meta.get("store_id")
+            if not isinstance(sid, str) or not sid:
+                raise StoreCorrupt("the journal has no store identity")
+            if store_id is not None and sid != store_id:
                 raise StoreCorrupt("the journal belongs to another store identity")
-            self.store_id = meta["store_id"]
-            self._obs_extra = int(meta["observation_extra_seconds"])     # the file's own, fixed at creation
-            self.created_at_ms = int(meta["created_at_ms"])
+            # Every number the journal's retention is computed from must be what this code writes: a plain
+            # non-negative decimal integer. A negative observation retention would make compaction delete
+            # observations still inside their retention; a horizon that is not a number disables the triggers.
+            numbers = {}
+            for name in ("observation_extra_seconds", "created_at_ms", "retention_horizon"):
+                v = meta.get(name)
+                if not isinstance(v, str) or not v.isascii() or not v.isdigit():
+                    raise StoreCorrupt(f"the journal's metadata is malformed: {name} is {v!r}, not a non-negative "
+                                       "integer")
+                numbers[name] = int(v)
+            obs_extra, created = numbers["observation_extra_seconds"], numbers["created_at_ms"]
+            self.store_id = sid
+            self._obs_extra = obs_extra                                  # the file's own, fixed at creation
+            self.created_at_ms = created
 
     def close(self) -> None:
         with self._lock:
@@ -314,9 +355,49 @@ class ForecastStore:
             except sqlite3.Error:
                 pass
 
+    def reopen(self) -> None:
+        """Recover in place after a failure, as a restart would, and prove more than a restart does. A new connection
+        passes the start-up checks (WAL mode, quick_check, schema, identity); every record is read against its checksum
+        (verify); the write the quota refused must fit now, after retention has freed what it may; and one commit must
+        be durable (the retention horizon rewritten with its own value: a WAL append and an fsync, no logical change).
+        Only then is the store healthy again. Otherwise it stays failed with the new reason and the error is raised:
+        a StoreError, also for an error nothing here expected (never healthy by omission). The journal must be the
+        one this process opened (its identity), and it must exist: recovery creates nothing."""
+        with self._lock:
+            self._recovering = True
+            try:
+                try:
+                    self._db.close()
+                except sqlite3.Error:
+                    pass
+                self._problem = None
+                try:
+                    with self._guard("reopen"):
+                        self._connect()
+                        self._open(self._requested_id, create=False)
+                        self.verify()
+                        if self._shortfall and self.usage_bytes() + self._shortfall > self.quota_bytes:
+                            self._reclaim()
+                            if self.usage_bytes() + self._shortfall > self.quota_bytes:
+                                raise StoreFull(f"the journal is still at its {self.quota_bytes} byte quota (a "
+                                                f"{self._shortfall} byte write does not fit)")
+                        with self._tx():
+                            self._db.execute("UPDATE meta SET value = value WHERE key = 'retention_horizon'")
+                except StoreError as e:
+                    if self._problem is None:
+                        self._problem = f"reopen: {e}"
+                    raise
+                except Exception as e:                  # not foreseen: still a failed recovery, with a StoreError
+                    if self._problem is None:
+                        self._problem = f"reopen: unexpected {type(e).__name__}: {e}"
+                    raise StoreUnavailable(self._problem) from e
+                self._shortfall = 0
+            finally:
+                self._recovering = False
+
     @property
     def healthy(self) -> bool:
-        return self._problem is None
+        return self._problem is None and not self._recovering
 
     @property
     def problem(self) -> Optional[str]:
@@ -386,8 +467,21 @@ class ForecastStore:
         return pages * size + wal
 
     def _check_quota(self, incoming: int) -> None:
+        if self.usage_bytes() + incoming <= self.quota_bytes:
+            return
+        self._reclaim()                       # before refusing: retention may free the room
         if self.usage_bytes() + incoming > self.quota_bytes:
+            self._shortfall = incoming
             raise StoreFull(f"the journal would exceed its {self.quota_bytes} byte quota")
+
+    def _reclaim(self) -> None:
+        """Give back what the retention rules allow: compaction up to now (expired, checkpoint-covered windows and
+        expired observations; never a row still in retention, which the triggers refuse anyway), then the freed pages
+        and the WAL."""
+        self.compact(self.clock.now_ms() // 1000)
+        with self._guard("reclaim"):
+            self._db.execute("PRAGMA incremental_vacuum").fetchall()
+            self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
 
     # --- issuances --------------------------------------------------------------------------------------------------
 
@@ -446,7 +540,7 @@ class ForecastStore:
             if existing is not None:
                 return self._same(existing, bundle, expected), False
             self._refuse_retired(key)
-            self._check_quota(len(bundle))
+            self._check_quota(len(bundle) + RECORD_SLACK_BYTES)
             now = self.clock.now_ms()
             with self._tx():
                 self._db.execute(
@@ -562,7 +656,7 @@ class ForecastStore:
                 raise StoreError(f"no issuance {issuance_id}")
             if model not in iss.models:
                 raise StoreError(f"issuance {issuance_id} expects outcomes for {iss.models}, not {model!r}")
-            self._check_quota(len(data))
+            self._check_quota(len(data) + RECORD_SLACK_BYTES)
             now = self.clock.now_ms()
             if now < (iss.key.window_end) * 1000:
                 raise StoreError("an outcome cannot be committed before its window has ended")
@@ -600,7 +694,7 @@ class ForecastStore:
         new = dup = corrected = 0
         with self._lock, self._guard("record observations"):
             self._require_healthy()
-            self._check_quota(64 * len(rows))
+            self._check_quota((len(series.encode()) + OBSERVATION_ROW_BYTES) * len(rows) + RECORD_SLACK_BYTES)
             with self._tx():
                 for ts, v, received_ms in rows:
                     have = self._db.execute("SELECT value FROM observations WHERE series = ? AND event_time = ?",
@@ -645,7 +739,7 @@ class ForecastStore:
                     raise StoreError("a checkpoint cannot go back before the latest one")
                 if (latest.last_outcome_seq, latest.payload_sha256) == (last_outcome_seq, sha256_hex(data)):
                     return latest
-            self._check_quota(len(data))
+            self._check_quota(len(data) + len(data) // 512 + RECORD_SLACK_BYTES)   # and overflow chains
             now = self.clock.now_ms()
             with self._tx():
                 self._db.execute("INSERT INTO checkpoints (evidence_key, last_outcome_seq, schema_version, payload, "
@@ -755,9 +849,10 @@ class ForecastStore:
             check = self._db.execute("PRAGMA integrity_check").fetchall()
             if check != [("ok",)]:
                 raise StoreCorrupt(f"integrity_check: {check[:3]}")
-            self.issuances()
-            for (ek,) in self._db.execute("SELECT DISTINCT evidence_key FROM outcomes").fetchall():
-                self.outcomes_after(ek, 0)
+            for row in self._db.execute(f"SELECT {self._ISSUANCE_COLS} FROM issuances ORDER BY seq"):
+                self._row_to_issuance(row)             # row by row: a recovery must not load the journal at once
+            for row in self._db.execute(f"SELECT {self._OUTCOME_COLS} FROM outcomes ORDER BY seq"):
+                self._row_to_outcome(row)
             for (ek,) in self._db.execute("SELECT DISTINCT evidence_key FROM checkpoints").fetchall():
                 self.latest_checkpoint(ek)
 

@@ -176,3 +176,26 @@ tests:
               summary: "predictive-autoscaler forecaster not scraped"
               description: "No forecaster scrape target is up; the operator falls back to the measured rate."
       - {eval_time: 17m, alertname: PredictiveAutoscalerForecasterDown, exp_alerts: []}
+
+
+  - name: the statistical forecaster's journal unhealthy for 15 minutes, then recovered; a short failure and another installation never fire
+    # The gauge exists only while the journal is unhealthy (its value: since when). Minutes 5-6: a failure the service
+    # recovers from by itself. Minutes 10-34: one it does not.
+    interval: 1m
+    input_series:
+      - series: 'predictive_autoscaler_forecaster_journal_unhealthy_since_seconds{job="pa-predictive-autoscaler-forecaster", pa_install_namespace="pa-system", instance="10.0.0.12:8443", pod="pa-fc-1", namespace="pa-system", service="pa-predictive-autoscaler-forecaster"}'
+        values: '_x5 300x1 stale _x2 600x24 stale _x9'
+      - series: 'predictive_autoscaler_forecaster_journal_unhealthy_since_seconds{job="pa-predictive-autoscaler-forecaster", pa_install_namespace="other", instance="10.0.1.12:8443", pod="pa-fc-9", namespace="other", service="pa-predictive-autoscaler-forecaster"}'
+        values: '60x45'
+    alert_rule_test:
+      - {eval_time: 7m, alertname: PredictiveAutoscalerForecastJournalUnhealthy, exp_alerts: []}
+      - {eval_time: 24m, alertname: PredictiveAutoscalerForecastJournalUnhealthy, exp_alerts: []}
+      - eval_time: 26m
+        alertname: PredictiveAutoscalerForecastJournalUnhealthy
+        exp_alerts:
+          - exp_labels: {severity: warning, pa_release: pa, pa_release_namespace: pa-system}
+            exp_annotations:
+              summary: "predictive-autoscaler statistical forecaster: journal unhealthy"
+              description: "The statistical forecaster's journal cannot be written or trusted, so it answers 503 and is not ready: autoscalers with engine statistical are reactive only. It retries by itself: 5 s after the failure, then 15 s, 1 min, 5 min and 15 min after each failed attempt (about 5 s, 20 s, 80 s, 6 min and 21 min after the failure), then every 30 min. Still firing: its /ready names the reason; a full state volume or a corrupt journal needs an operator (docs/helm.md)."
+      - {eval_time: 36m, alertname: PredictiveAutoscalerForecastJournalUnhealthy, exp_alerts: []}
+      - {eval_time: 44m, alertname: PredictiveAutoscalerForecastJournalUnhealthy, exp_alerts: []}

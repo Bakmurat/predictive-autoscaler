@@ -50,6 +50,17 @@ decided after selection (the gate is first evaluated without it) and re-checked 
 and the contract's digests. It is never combined with a lab qualification or with passed release gates: the service
 refuses to start. Eligibility is an answer, not an action: nothing here assumes a replica write follows.
 
+A failed journal is recovered inside the process (maintain(), called every few seconds by the app): it is reopened
+(ForecastStore.reopen: the start-up checks, every record against its checksum, room for the refused write, one durable
+commit) 5 s after the failure, then 15 s, 1 min, 5 min and 15 min after each failed attempt (RECOVERY_BACKOFF_SECONDS:
+the waits add up, so the attempts fall about 5 s, 20 s, 80 s, 6 min and 21 min after the failure).
+When those are used up the failure is permanent (an operator must act: the volume is full or the journal corrupt), still
+retried every RECOVERY_SLOW_SECONDS. A recovery that lasts less than RECOVERY_STABLE_SECONDS does not start the schedule
+again, so a journal that fails right after every reopen is never retried in a hot loop. While unhealthy the service is
+not ready and says why (health(), the forecaster_journal_* series); it stays alive, because a restart repairs neither a
+full nor a corrupt volume. A recovery is a restart of the journal: the in-memory caches are dropped and every epoch's
+state is read again from its checkpoint, exactly as after a new process.
+
 The service registers at most ServiceConfig.max_autoscalers (namespace, autoscaler) names at once (its metric series
 and working memory are sized for them); one more is refused with 503 AutoscalerLimitReached. A registration is
 released only on evidence, never because a lookup failed:
@@ -91,7 +102,7 @@ from forecasting import trust as T
 from forecasting.artifacts import ArtifactRefused, ArtifactStore, Binding, encode_e1, fit_payload
 from forecasting.clock import ReceiptClock
 from forecasting.contracts import FAMILY_MODELS, FORECAST_CONTRACT, UNIT, BoundRequest, ContractRefused, V2Response, \
-    bind_request, canonical_json, check_response, sha256_hex, validated_profile
+    bind_request, canonical_json, check_response, format_ms, sha256_hex, validated_profile
 from forecasting.history import HistoryRefused, HistoryUnavailable, read_rps_history
 from forecasting.maturation import candidate, issued_outcome
 from forecasting.metrics import ForecastMetrics, RegistryFull, ServiceMetrics, Snapshot, UidConflict, model_samples
@@ -111,6 +122,10 @@ _GATE_IDENTITY = ("basis", "lab_qualification_sha256", "demonstration_qualificat
                   "demonstration_contract_sha256")
 SLOT_SWEEP_SECONDS = 60             # a full registry is checked against the Kubernetes API at most this often
 SLOT_SWEEP_BUDGET_SECONDS = 10      # ... and one check starts no further lookup after this long
+RECOVERY_BACKOFF_SECONDS = (5, 15, 60, 300, 900)   # a failed journal: the wait before each reopen attempt
+RECOVERY_SLOW_SECONDS = 1800        # ... and between the attempts after those (a permanent failure, still retried)
+RECOVERY_STABLE_SECONDS = 3600      # healthy this long after a recovery: the next failure starts the schedule again
+CLOSE_WAIT_SECONDS = 30             # close() waits this long for a maintenance pass in flight before it closes anyway
 
 logger = logging.getLogger("forecasting.service")
 
@@ -164,13 +179,19 @@ class ForecastService:
         os.makedirs(config.state_dir, exist_ok=True)
         self.store: Optional[ForecastStore] = None
         self.store_problem: Optional[str] = None
+        self._health_lock = threading.Lock()            # the recovery schedule's state below
+        self._recovery_lock = threading.Lock()          # one recovery attempt at a time
+        self._closing = threading.Event()               # close() was called: no pass starts, nothing is reopened
+        self._failed_ms: Optional[int] = None           # since when the journal is unhealthy (None: healthy)
+        self._attempts = 0                              # reopen attempts since the journal was last healthy for long
+        self._next_attempt_ms = 0
+        self._recovered_ms: Optional[int] = None
+        self.journal_failures = self.journal_recoveries = self.journal_recovery_attempts = 0
         try:
-            self.store = ForecastStore(os.path.join(config.state_dir, "journal.sqlite"), clock=self.clock,
-                                       quota_bytes=config.quota_bytes, store_id=config.store_id,
-                                       retention_seconds=config.retention_seconds,
-                                       observation_retention_seconds=max(config.retention_seconds, 28 * DAY))
+            self.store = self._open_store()
         except StoreError as e:
             self.store_problem = str(e)
+            self._note_failure(self.clock.now_ms())
         self.artifacts = ArtifactStore(os.path.join(config.state_dir, "artifacts"))
         self.worker = worker
         if self.worker is None and config.fit_mode == "worker":
@@ -178,7 +199,7 @@ class ForecastService:
             self.worker = FitWorker(self.artifacts)
         self.metrics = ForecastMetrics(max_autoscalers=config.max_autoscalers)
         self.qualification_metrics = QualificationMetrics(self.qualification_status, D.REFUSALS)
-        self.service_metrics = ServiceMetrics(self.metrics)
+        self.service_metrics = ServiceMetrics(self.metrics, self.journal_status)
         self._lock = threading.Lock()                   # one writer of the journal and the epoch states
         self._compacted_s: Optional[int] = None
         self._cluster_uid: Optional[str] = None         # read once it succeeds (a pod never changes cluster)
@@ -199,11 +220,29 @@ class ForecastService:
         """Readiness: the journal can support issuance. Young history or untrusted models do not make it unready."""
         return self.store_healthy
 
+    def journal_status(self) -> Dict:
+        """The journal's recovery state: since when it is unhealthy (ms; None: healthy), the attempts of the current
+        schedule, when the next one is due, whether the bounded attempts are used up, and the lifetime counters."""
+        with self._health_lock:
+            down = self._failed_ms is not None
+            return {"unhealthy_since_ms": self._failed_ms, "recovery_attempts": self._attempts,
+                    "next_attempt_ms": self._next_attempt_ms if down else None,
+                    "permanent_failure": down and self._attempts >= len(RECOVERY_BACKOFF_SECONDS),
+                    "failures": self.journal_failures, "recoveries": self.journal_recoveries,
+                    "attempts": self.journal_recovery_attempts}
+
     def health(self) -> Dict:
-        problem = self.store_problem or (self.store.problem if self.store is not None else None)
+        problem = self.store.problem if self.store is not None else self.store_problem
         q, d = self.config.lab_qualification, self.config.demonstration_qualification
+        j = self.journal_status()
+        since, due = j["unhealthy_since_ms"], j["next_attempt_ms"]
         return {"status": "healthy", "state": "healthy" if self.store_healthy else "unavailable",
-                "state_problem": problem, "forecast_contract": FORECAST_CONTRACT,
+                "state_problem": problem,
+                "journal": {"unhealthy_since": None if since is None else format_ms(since),
+                            "recovery_attempts": j["recovery_attempts"],
+                            "next_attempt": None if due is None else format_ms(due),
+                            "permanent_failure": j["permanent_failure"]},
+                "forecast_contract": FORECAST_CONTRACT,
                 "release_gates_passed": RELEASE_GATES_PASSED,
                 "build": {"source_tree": self.config.build.source_tree,
                           "evaluation_build": self.config.build.evaluation_build},
@@ -223,10 +262,119 @@ class ForecastService:
         return basis, {k: doc.expires for k, doc in docs.items() if doc is not None}
 
     def close(self) -> None:
-        if self.worker is not None:
-            self.worker.close()
-        if self.store is not None:
-            self.store.close()
+        """Stop for good: no maintenance pass starts any more, the one in flight (it may be reopening the journal in
+        a worker thread that cancelling its caller does not stop) is waited for, and only then are the fit worker and
+        the journal closed. A closed service never opens its journal again."""
+        self._closing.set()
+        waited = self._recovery_lock.acquire(timeout=CLOSE_WAIT_SECONDS)
+        try:
+            if not waited:
+                logger.error("a maintenance pass did not finish within %d s of shutdown; closing anyway (the pass "
+                             "closes the journal again when it returns)", CLOSE_WAIT_SECONDS)
+            if self.worker is not None:
+                self.worker.close()
+            if self.store is not None:
+                self.store.close()
+        finally:
+            if waited:
+                self._recovery_lock.release()
+
+    # --- the journal's recovery -----------------------------------------------------------------------------------
+
+    def _open_store(self) -> ForecastStore:
+        c = self.config
+        return ForecastStore(os.path.join(c.state_dir, "journal.sqlite"), clock=self.clock, quota_bytes=c.quota_bytes,
+                             store_id=c.store_id, retention_seconds=c.retention_seconds,
+                             observation_retention_seconds=max(c.retention_seconds, 28 * DAY))
+
+    def _delay_ms(self) -> int:
+        """The wait before the next attempt: the schedule's step for the attempts made so far, then the slow one."""
+        n = self._attempts
+        return (RECOVERY_BACKOFF_SECONDS[n] if n < len(RECOVERY_BACKOFF_SECONDS) else RECOVERY_SLOW_SECONDS) * 1000
+
+    def _note_failure(self, now_ms: int) -> None:
+        """The journal turned unhealthy (noted once): count it and schedule the first attempt."""
+        with self._health_lock:
+            if self._failed_ms is not None:
+                return
+            self._failed_ms, self._next_attempt_ms = now_ms, now_ms + self._delay_ms()
+            self.journal_failures += 1
+        logger.error("the forecast journal is unhealthy (%s): no issuance; first recovery attempt in %d s",
+                     self.store.problem if self.store is not None else self.store_problem,
+                     (self._next_attempt_ms - now_ms) // 1000)
+
+    def maintain(self) -> None:
+        """One housekeeping pass (the app runs it every few seconds, off the request path): the journal's recovery,
+        when an attempt is due (the schedule is in the module docstring). Never raises for a journal problem."""
+        if not self._recovery_lock.acquire(blocking=False):
+            return
+        try:
+            if self._closing.is_set():
+                return
+            now = self.clock.now_ms()
+            if self.store_healthy:
+                with self._health_lock:
+                    if self._attempts and self._recovered_ms is not None and \
+                            now - self._recovered_ms >= RECOVERY_STABLE_SECONDS * 1000:
+                        self._attempts = 0                  # it lasted: a later failure starts the schedule again
+                return
+            self._note_failure(now)
+            if now < self._next_attempt_ms:
+                return
+            with self._health_lock:
+                self._attempts += 1
+                self.journal_recovery_attempts += 1
+                attempt = self._attempts
+            try:
+                with self._lock:                            # no request is inside the journal meanwhile
+                    self._reopen_store()
+            except StoreError as e:
+                with self._health_lock:
+                    self._next_attempt_ms = self.clock.now_ms() + self._delay_ms()
+                    wait = self._delay_ms() // 1000
+                if attempt >= len(RECOVERY_BACKOFF_SECONDS):
+                    logger.error("the forecast journal is still unhealthy after %d recovery attempts (%s): PERMANENT "
+                                 "FAILURE, operator action required; next attempt in %d s", attempt, e, wait)
+                else:
+                    logger.warning("forecast journal recovery attempt %d failed (%s); next attempt in %d s", attempt,
+                                   e, wait)
+                return
+            with self._health_lock:
+                down_s = (self.clock.now_ms() - self._failed_ms) // 1000
+                self._failed_ms, self._recovered_ms = None, self.clock.now_ms()
+                self.journal_recoveries += 1
+            logger.warning("the forecast journal recovered on attempt %d after %d s; issuance resumes", attempt, down_s)
+        finally:
+            self._recovery_lock.release()
+            if self._closing.is_set() and self.store is not None:
+                self.store.close()                          # close() gave up waiting for this pass: finish its work
+
+    def _reopen_store(self) -> None:
+        """Reopen the journal (or open it at last, when it never opened) and forget what was derived from the old
+        connection: every epoch's state is read again from its checkpoint, as after a restart.
+
+        Two different cases. A journal this process HAD opened is only ever recovered: the same identity, never a
+        new file (ForecastStore.reopen). A journal that never opened since the process started (self.store is None)
+        is opened as at start-up, and that first open may initialize an empty or missing file: nothing was held
+        before, so nothing is replaced."""
+        if self.store is None:
+            try:
+                store = self._open_store()                  # the start-up checks ...
+            except StoreError as e:
+                self.store_problem = str(e)
+                raise
+            try:
+                store.reopen()                              # ... and what a recovery has to prove on top
+            except StoreError as e:
+                self.store_problem = str(e)
+                store.close()
+                raise
+            self.store, self.store_problem = store, None
+        else:
+            self.store.reopen()
+        self._uppers.clear()
+        self._costs.clear()
+        self._compacted_s = None
 
     # --- the request --------------------------------------------------------------------------------------------
 
@@ -246,6 +394,7 @@ class ForecastService:
         sig = bound.signal
         token = self._admit(bound, now_ms)                     # atomic, before any expensive work
         if not self.store_healthy:
+            self._note_failure(now_ms)
             raise ServiceError(503, "StateUnavailable", "the forecast journal is unavailable; no issuance")
         if bound.lead is None:
             raise ServiceError(503, "LeadInsufficient", bound.lead_problem)
@@ -268,13 +417,22 @@ class ForecastService:
                 raise ServiceError(503, "IdentityMismatch", "the autoscaler's registration was replaced or released "
                                    "while this request was in flight; nothing is issued")
             try:
+                if not self.store_healthy:                              # it failed, or is not recovered, meanwhile
+                    raise StoreUnavailable("the journal is unavailable")
                 return self._issue(bound, grid, self.clock.now_ms(), token)   # the time after the history and the lock
             except StoreUnavailable as e:
+                self._note_failure(self.clock.now_ms())
                 raise ServiceError(503, "StateUnavailable", f"the forecast journal failed: {e}") from e
             except StoreError as e:
                 # A record the journal refuses (e.g. a state or bundle above its size cap): this autoscaler is
                 # unavailable with that reason, nothing is issued, and the error never escapes as a 500.
                 raise ServiceError(503, "StateUnavailable", f"the forecast state cannot be journaled: {e}") from e
+            except ContractRefused as e:
+                # The issuance committed for this origin no longer answers this request (a same-origin retry after
+                # the autoscaler's published lead changed): a refusal like any other mismatch, never a 500. The next
+                # origin is issued for the new lead.
+                raise ServiceError(422, "IdentityMismatch", f"the issuance committed for this decision origin does "
+                                                            f"not fit the request: {e}") from e
 
     def _issue(self, bound: BoundRequest, grid, now_ms: int, token: Optional[int] = None) -> Dict:
         store, s, sig, lead = self.store, bound.settings, bound.signal, bound.lead

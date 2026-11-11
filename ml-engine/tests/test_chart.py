@@ -706,7 +706,12 @@ def test_alert_rules_are_opt_in_and_identical_for_both_rule_engines(render):
     assert {r["alert"] for r in rules} == {
         "PredictiveAutoscalerNotReady", "PredictiveAutoscalerTelemetryUnavailable",
         "PredictiveAutoscalerForecastUnavailable", "PredictiveAutoscalerConflict", "PredictiveAutoscalerModelStale",
-        "PredictiveAutoscalerOperatorDown", "PredictiveAutoscalerForecasterDown"}
+        "PredictiveAutoscalerOperatorDown", "PredictiveAutoscalerForecasterDown",
+        "PredictiveAutoscalerForecastJournalUnhealthy"}
+    journal = next(r for r in rules if r["alert"] == "PredictiveAutoscalerForecastJournalUnhealthy")
+    assert journal["for"] == "15m" and journal["expr"] == (
+        'max(predictive_autoscaler_forecaster_journal_unhealthy_since_seconds{job="pa-predictive-autoscaler-forecaster", '
+        f'pa_install_namespace="{NS}"}}) > 0')
     assert all(r["labels"]["team"] == "platform" and r["labels"]["severity"] and r["labels"]["pa_release"] == "pa"
                and r["labels"]["pa_release_namespace"] == NS for r in rules)
     # every selector is scoped to this installation
@@ -734,7 +739,7 @@ def test_both_scrapes_keep_the_workload_namespace_label(render):
 
 
 @pytest.mark.parametrize("bad", [{"notReadyFor": "15 minutes"}, {"modelStaleHours": 0}, {"modelStaleHours": 1.5},
-                                 {"unknown": 1}])
+                                 {"journalFor": "soon"}, {"unknown": 1}])
 def test_alert_values_are_validated(render, bad):
     p = render({"metrics": {"alerts": bad}}, check=False)
     assert p.returncode != 0
@@ -877,6 +882,29 @@ def test_switching_profiles_keeps_the_service_and_both_volumes(render):
                                  {"forecaster": {"statistical": {"autoscalerIdleReleaseHours": "24h"}}}])
 def test_the_statistical_values_are_validated(render, bad):
     assert render(_merge(STAT, bad), check=False).returncode != 0
+
+
+@pytest.mark.parametrize("quota,size,ok", [("1536Mi", "2Gi", True), ("1638Mi", "2Gi", True), ("1639Mi", "2Gi", False),
+                                           ("2Gi", "2Gi", False), ("3Gi", "2Gi", False), ("8Gi", "10Gi", True),
+                                           ("1228Mi", "1.5Gi", True), ("1229Mi", "1.5Gi", False),
+                                           ("800Mi", "1024000Ki", True), ("801Mi", "1024000Ki", False)])
+def test_the_state_quota_must_leave_a_fifth_of_the_charts_volume(render, quota, size, ok):
+    # R3-10 f: a quota at or above the volume's size never takes effect; the volume fills first and the journal fails.
+    p = render(_merge(STAT, {"forecaster": {"statistical": {"stateQuota": quota, "persistence": {"size": size}}}}),
+               check=False)
+    assert (p.returncode == 0) is ok, p.stderr
+    if not ok:
+        assert f"stateQuota ({quota}) must be at most 80% of forecaster.statistical.persistence.size ({size})" in p.stderr
+
+
+def test_the_state_quota_is_not_checked_against_a_brought_claim_or_the_other_engine(render):
+    big = {"stateQuota": "50Gi"}                                   # the chart cannot see an existing claim's capacity
+    docs = render(_merge(STAT, {"forecaster": {"statistical": {**big, "persistence": {"existingClaim": "state-v1"}}}}))
+    env = {e["name"]: e.get("value") for e in forecaster_of(docs)["spec"]["template"]["spec"]["containers"][0]["env"]}
+    assert env["FORECAST_STATE_QUOTA_BYTES"] == str(50 << 30)
+    render({"forecaster": {"statistical": big}})                   # legacyLstm: the statistical values are unused
+    helm_doc = (ROOT / "docs" / "helm.md").read_text()
+    assert "at most 80 % of" in helm_doc and "existingClaim" in helm_doc
 
 
 def test_the_autoscaler_limit_and_idle_release_are_values(render):

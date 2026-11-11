@@ -67,7 +67,8 @@ forecaster:
       storageClass: ""
       size: 2Gi
       retain: true
-    stateQuota: 1536Mi       # the journal's own budget inside the volume (database + WAL)
+    stateQuota: 1536Mi       # the journal's own budget inside the volume (database + WAL): at most 80 % of
+                             # persistence.size (checked); with an existingClaim, of that claim's capacity (not checked)
     # The autoscalers (namespace/name) the service registers at once; one more is refused with 503
     # AutoscalerLimitReached and that autoscaler stays reactive. The resources and stateQuota above are sized for 8
     # (hack/statistical-envelope.py): raise them with it. A registration is released when the Kubernetes API says its
@@ -175,6 +176,7 @@ metrics:
     conflictFor: 5m                    # ConflictDetected=True (another replica writer; the operator writes nothing)
     modelStaleHours: 26                # served model's training cutoff older than this
     absentFor: 10m                     # a scrape target down or missing
+    journalFor: 15m                    # the statistical forecaster's journal unhealthy (it retries by itself first)
 
 # The optional Grafana "Help & Overview" dashboard (dashboards/overview.json): a walkthrough, what every panel and
 # alert means, and panels on the operator's metrics. Rendered as a ConfigMap for the Grafana dashboard sidecar.

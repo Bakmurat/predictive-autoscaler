@@ -37,6 +37,9 @@ class FakeService:
     def close(self):
         self.closed = True
 
+    def maintain(self):
+        pass
+
 
 def client(env=None, svc=None):
     svc = svc or FakeService()

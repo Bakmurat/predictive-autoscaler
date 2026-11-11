@@ -21,7 +21,9 @@ longer matches and the publication is dropped, so a slow old request can neither
 released registration back.
 
 ServiceMetrics is the service's own handful of series (predictive_autoscaler_forecaster_*, no autoscaler or model
-label): the registrations in use, their limit, the refusals at the limit and the releases by reason.
+label): the registrations in use, their limit, the refusals at the limit and the releases by reason; and the journal's
+health: since when it is unhealthy (absent while healthy), whether its bounded recovery attempts are used up, and the
+failures, recovery attempts and recoveries so far.
 """
 
 from __future__ import annotations
@@ -29,7 +31,7 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Dict, Iterator, List, Mapping, NamedTuple, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Mapping, NamedTuple, Optional, Tuple
 
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 from prometheus_client.registry import Collector
@@ -298,10 +300,24 @@ class ForecastMetrics(Collector):
 class ServiceMetrics(Collector):
     """The service's own series over a ForecastMetrics registry: bounded (one label at most, from a fixed enum)."""
 
-    def __init__(self, registry: ForecastMetrics):
-        self.registry = registry
+    def __init__(self, registry: ForecastMetrics, journal: Optional[Callable[[], Mapping]] = None):
+        self.registry, self.journal = registry, journal       # journal: ForecastService.journal_status
 
     def collect(self) -> Iterator:
+        if self.journal is not None:
+            j = self.journal()
+            since = GaugeMetricFamily(SERVICE_PREFIX + "journal_unhealthy_since_seconds", "Unix time since which the "
+                                      "forecast journal cannot support issuance; absent while it is healthy.")
+            if j["unhealthy_since_ms"] is not None:
+                since.add_metric([], j["unhealthy_since_ms"] / 1000)
+            yield since
+            yield GaugeMetricFamily(SERVICE_PREFIX + "journal_permanent_failure", "1 while the journal is unhealthy "
+                                    "and its bounded recovery attempts are used up (operator action required; still "
+                                    "retried slowly); otherwise 0.", value=1.0 if j["permanent_failure"] else 0.0)
+            for name, key, text in (("journal_failures", "failures", "Times the journal turned unhealthy."),
+                                    ("journal_recovery_attempts", "attempts", "Journal reopen attempts."),
+                                    ("journal_recoveries", "recoveries", "Journal reopen attempts that succeeded.")):
+                yield CounterMetricFamily(SERVICE_PREFIX + name, text, value=float(j[key]))
         used, refused, released = self.registry.counts()
         yield GaugeMetricFamily(SERVICE_PREFIX + "autoscaler_slots", "Autoscalers registered with the service now.",
                                 value=float(used))
