@@ -97,8 +97,11 @@ p["demonstration"]["reservation_ref"]["nodes"]["support"]["uid"] = "not-a-uid"|m
 p["demonstration"]["generator"]["image"] = "grafana/k6:0.57.0"|must be pinned by digest
 p["demonstration"]["targets"][0]["name"] = "demo-pa-n"|must be a c28-* DNS label
 p.pop("residency")|residency is required
+p["demonstration"]["program"]["days"] = 29|demonstration.program.days must be an integer in 1..28
+p["demonstration"]["program"].pop("days")|demonstration.program is missing days
+p["demonstration"]["program"]["seed"] = 180|must not be a tuning or confirmation seed of the comparison
 EOF
-  echo "render-only: $n refusals of the params stage (cadence, placeholders, targets, profile, bounds, reservation reference, image, names, residency)"
+  echo "render-only: $n refusals of the params stage (cadence, placeholders, targets, profile, bounds, reservation reference, image, names, residency, the schedule's days and seeds)"
   edit_params "$PARAMS" "$out/extra.json" 'p.update(c0_rps="<measured c0>", hpa_cpu_target_percent="__HPA__", keda="<unused>")'
   c28 validate --params "$out/extra.json" --stage demonstration >/dev/null
   echo "render-only: experiment-only fields are not consumed (placeholders there do not block the stage)"
@@ -134,6 +137,14 @@ assert extras[names[1]] == {"maxReplicas": 0, "maxPercent": 0} and extras[names[
 gens = [o for o in objs if o["kind"] == "Deployment" and o["metadata"]["name"] == demo.GENERATOR_NAME]
 assert len(gens) == 1 and gens[0]["spec"]["replicas"] == 1 and gens[0]["spec"]["strategy"] == {"type": "Recreate"}
 assert gens[0]["spec"]["template"]["spec"]["containers"][0]["image"].endswith("@" + demo.GENERATOR_DIGEST)
+# The generator's configuration carries the WHOLE finite schedule: 28 days, one row and one predeclared seed per day.
+cms = [o for o in objs if o["kind"] == "ConfigMap" and o["metadata"]["name"] == demo.GENERATOR_NAME]
+cfg = json.loads(cms[0]["data"][demo.GENERATOR_CONFIG])
+assert len(cms) == 1 and demo.config_problems(cfg) == [] and cfg["label"] == "demonstration"
+assert cfg["days"] == 28 == len(cfg["per_minute_days"]) and all(len(r) == 1440 for r in cfg["per_minute_days"])
+assert cfg["seeds"] == list(range(cfg["program"]["seed"], cfg["program"]["seed"] + 28))
+assert all(a != b for a, b in zip(cfg["per_minute_days"], cfg["per_minute_days"][1:]))      # no day repeats its neighbour
+assert cfg["schedule_end_ms"] == cfg["origin_ms"] + 28 * 86_400_000
 rep = json.load(open(sys.argv[4]))
 assert rep["problems"] == [], rep["problems"]
 w = {c["name"]: c["pods"] for c in rep["nodes"]["workload"]["contributions"]}
@@ -145,7 +156,8 @@ for values, want in (({"operator": {"rbac": {"scaleWrite": True, "scaleTargets":
     assert (got == []) if want is None else any(want in x for x in got), got
 frac = {r: rep["nodes"][r]["fraction"] for r in ("workload", "support")}
 print(f"render-only: {len(objs)} objects, all c28-* under run label {run}, sidecar-free, least-privilege, one "
-      f"Recommend PA per target, one Recreate generator; residency {frac} within 75 %; the Active configuration "
+      f"Recommend PA per target, one Recreate generator with a finite schedule of {cfg['days']} days (seeds "
+      f"{cfg['seeds'][0]}..{cfg['seeds'][-1]}); residency {frac} within 75 %; the Active configuration "
       "refuses an empty or partial scaleTargets list")
 PY
 
@@ -463,7 +475,9 @@ pass "common objects, two targets and two Recommend PredictiveAutoscalers applie
 # --- the generator: one pod, the reviewed k6 image by digest, a ${SEGMENT_MINUTES}-minute smoke segment ---------------
 guard
 c28 render --params "$PRM" --stage demonstration --part generator --smoke-segment-minutes "$SEGMENT_MINUTES" --out "$WORK/generator.yaml"
-k apply -f "$WORK/generator.yaml" >/dev/null || die "apply generator"
+# Server-side: the ConfigMap carries the whole 28-day table (about 0.2 MiB); a client-side apply would copy it into
+# the last-applied annotation, which is limited to 256 KiB.
+k apply --server-side -f "$WORK/generator.yaml" >/dev/null || die "apply generator"
 wait_for 300 "the generator is running" k -n "$NS" rollout status deploy/c28-demo-generator --timeout=5s
 GEN_STARTED="$(date +%s)"
 gen_pods() { k -n "$NS" get pods -l app.kubernetes.io/name=c28-demo-generator --no-headers 2>/dev/null | wc -l; }

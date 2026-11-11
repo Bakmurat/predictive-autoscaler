@@ -127,7 +127,8 @@
   "peak_multiple": 9,
   "program": {
    "kind": "ordinary",
-   "seed": 301
+   "seed": 301,
+   "days": 28
   },
   "generator": {
    "image": "grafana/k6@sha256:70af91f86cd8e142e0544a4edaf79835a80033f71974b92edd5ac36fd4442a7b",

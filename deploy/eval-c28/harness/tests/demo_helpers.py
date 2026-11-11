@@ -9,7 +9,7 @@ import subprocess
 
 import pytest
 
-from c28 import demo
+from c28 import demo, schedule
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PARAMS_DIR = os.path.join(HERE, "..", "..", "params")
@@ -46,6 +46,27 @@ def prod_like():
 
 def config(p=None, **kw):
     return demo.generator_config(p or params(), **kw)
+
+
+def intended(cfg, m):
+    """The table's count of ABSOLUTE minute m from the origin (its day's row); None outside the finite schedule."""
+    if not 0 <= m < cfg["schedule_minutes"]:
+        return None
+    return cfg["per_minute_days"][m // 1440][m % 1440]
+
+
+def edited(cfg, **fields):
+    """A copy of a generator configuration with fields replaced and its digest recomputed (a test-only table)."""
+    out = dict(cfg, **fields)
+    out["digest"] = schedule.digest(out)
+    return out
+
+
+def scaled_day(cfg, day, factor):
+    """The configuration with ONE day's row scaled: adjacent days that nobody can mistake for each other."""
+    table = [list(row) for row in cfg["per_minute_days"]]
+    table[day] = [round(n * factor) for n in table[day]]
+    return edited(cfg, per_minute_days=table)
 
 
 def node():

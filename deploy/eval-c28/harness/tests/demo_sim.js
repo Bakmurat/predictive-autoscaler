@@ -7,7 +7,8 @@
 //
 // scenario.json:
 //   {"incarnations": [{"pod_uid": "...", "start_ms": T, "kill_ms": T | null, "skew_ms": 0,
-//                      "stalls": [{"at_ms": T, "for_ms": D}]}],          start/kill/stalls in TRUE time
+//                      "stalls": [{"at_ms": T, "for_ms": D}],            start/kill/stalls in TRUE time
+//                      "clock_steps": [{"at_ms": T, "by_ms": D}]}],      its clock steps by D (+ forward, - back) at T
 //    "latency_ms": 20,                              response time of a healthy request
 //    "faults": [{"target": "...", "from_ms": T, "to_ms": T, "mode": "timeout" | "status", "status": 503}],
 //    "network_ms": 1,                               dispatch -> ingress receipt
@@ -15,12 +16,14 @@
 //               "gaps": [{"from_ms": T, "to_ms": T}]},          ingress counter samples (raw, with their timestamps)
 //    "ingress_restarts": [T, ...],                  the ingress's counters restart (no series until the next request)
 //    "ingress_initial": 100}                        the counters' value at the beginning (absent: no series yet)
-// An incarnation's own clock reads true time + skew_ms (it schedules by its own clock); the ingress's Date header and
-// the scrape timestamps are true time. kill_ms ends an incarnation abruptly: nothing more is written (SIGKILL).
+// An incarnation's own clock reads true time + skew_ms + every clock step so far (it schedules by its own clock; its
+// timers are delays and do not move with a step, like k6's); the ingress's Date header and the scrape timestamps are
+// true time. kill_ms ends an incarnation abruptly: nothing more is written (SIGKILL).
 //
 // Output (stdout, JSON): {"lines": [every record the script wrote, in order], "truth": {"<target>": {"<minute>":
-//   {"dispatched": n, "received": n}}} (by TRUE dispatch / receipt time, minute index from the origin), "ingress":
-//   {"<target>": [[t_seconds, counter], ...]}, "functions": {...results of the pure functions for "probes"...}}
+//   {"dispatched": n, "received": n}}} (by TRUE dispatch / receipt time, minute index from the origin), "sends":
+//   {"<target>": total requests sent}, "ingress": {"<target>": [[t_seconds, counter], ...]}, "functions": {...results
+//   of the pure functions for "probes"...}}
 'use strict';
 const fs = require('fs');
 
@@ -47,8 +50,9 @@ function loadScript(scriptPath, configPath) {
     setTimeout: () => { throw new Error('timers are not available at init'); },
   };
   const open = (p) => fs.readFileSync(p, 'utf8');
-  const body = `${src}\nreturn { checkConfig, minuteIndex, minuteStart, dayMinute, intended, targetPhase, arrivalTime,
-    firstIndexAtOrAfter, segmentEnd, incarnationId, okStatus, httpDateSeconds, createGenerator, cfg, options, setup, run };`;
+  const body = `${src}\nreturn { checkConfig, minuteIndex, minuteStart, scheduled, dayIndex, dayMinute, intended,
+    targetPhase, arrivalTime, firstIndexAtOrAfter, segmentEnd, incarnationId, okStatus, httpDateSeconds,
+    createGenerator, cfg, options, setup, run };`;
   // eslint-disable-next-line no-new-func
   return new Function('open', '__ENV', '__stubs', body)(open, { C28D_CONFIG: configPath, POD_UID: 'init-pod' }, stubs);
 }
@@ -90,11 +94,12 @@ function simulate(mod, sc) {
   let T = 0;                                       // TRUE time, ms
   const lines = [];
   const truth = {};
+  const sends = {};
   const counters = {};                             // the ingress's counters (reset by a restart)
   const samples = {};
   // ingress_initial: the counters' value when the simulation begins (earlier traffic); absent = no series yet.
   const initial = sc.ingress_initial === undefined ? null : sc.ingress_initial;
-  for (const t of cfg.targets) { truth[t] = {}; counters[t] = initial; samples[t] = []; }
+  for (const t of cfg.targets) { truth[t] = {}; sends[t] = 0; counters[t] = initial; samples[t] = []; }
   const bump = (target, tMs, key) => {
     const m = String(mod.minuteIndex(cfg, tMs));
     const row = truth[target][m] || (truth[target][m] = { dispatched: 0, received: 0 });
@@ -117,7 +122,9 @@ function simulate(mod, sc) {
   }
 
   (sc.incarnations || []).forEach((inc, n) => {
-    const skew = inc.skew_ms || 0;
+    // The incarnation's clock offset at true time t: its skew and every clock step that has happened by then.
+    const skewAt = (t) => (inc.skew_ms || 0) +
+      (inc.clock_steps || []).reduce((sum, c) => sum + (t >= c.at_ms ? c.by_ms : 0), 0);
     const owner = { alive: true, n };
     const stalled = (t) => {                       // the end of the stall covering true time t, else t
       const s = (inc.stalls || []).find((x) => t >= x.at_ms && t < x.at_ms + x.for_ms);
@@ -125,14 +132,14 @@ function simulate(mod, sc) {
     };
     const at = (t, fn) => q.push(stalled(t), fn, owner);
     const deps = {
-      now: () => T + skew,
+      now: () => T + skewAt(T),
       setTimeout: (fn, ms) => at(T + Math.max(0, ms), fn),
       emit: (o) => lines.push(o),
       count: () => null,
       send: null,
     };
     q.push(inc.start_ms, () => {
-      const started = T + skew;
+      const started = T + skewAt(T);
       const shared = { started_ms: started, segment_end_ms: mod.segmentEnd(cfg, started), pod_uid: inc.pod_uid, pod: `gen-${n}` };
       cfg.targets.forEach((target, i) => {
         const d = Object.assign({}, deps, {
@@ -140,6 +147,7 @@ function simulate(mod, sc) {
             const sent = T;
             if (url !== `${cfg.base_url}/t/${target}/work`) throw new Error(`unexpected URL ${url}`);
             bump(target, sent, 'dispatched');
+            sends[target] += 1;
             const f = fault(target, sent);
             if (f && f.mode === 'unreachable') {            // never reaches the ingress: no HTTP response at all
               at(sent + timeoutMs, () => done(0, timeoutMs, undefined));
@@ -169,7 +177,7 @@ function simulate(mod, sc) {
     if (e.owner === null || e.owner.alive) e.fn();
     if ((guard += 1) > 50_000_000) throw new Error('the simulation does not terminate');
   }
-  return { lines, truth, ingress: samples };
+  return { lines, truth, sends, ingress: samples };
 }
 
 function probes(mod, list) {
@@ -178,8 +186,10 @@ function probes(mod, list) {
     const phase = mod.targetPhase(cfg, p.target_index || 0);
     if (p.fn === 'position') {
       const m = mod.minuteIndex(cfg, p.t_ms);
-      return { minute: m, day_minute: mod.dayMinute(cfg, m), intended: mod.intended(cfg, m),
-        first_index: mod.firstIndexAtOrAfter(cfg, m, p.t_ms, phase), segment_end_ms: mod.segmentEnd(cfg, p.t_ms) };
+      const inside = mod.scheduled(cfg, m);
+      return { minute: m, scheduled: inside, day: mod.dayIndex(cfg, m), day_minute: mod.dayMinute(cfg, m),
+        intended: mod.intended(cfg, m), first_index: inside ? mod.firstIndexAtOrAfter(cfg, m, p.t_ms, phase) : null,
+        segment_end_ms: mod.segmentEnd(cfg, p.t_ms) };
     }
     if (p.fn === 'arrivals') {
       const n = mod.intended(cfg, p.minute);
@@ -189,7 +199,16 @@ function probes(mod, list) {
     }
     if (p.fn === 'httpdate') return { seconds: mod.httpDateSeconds(p.text) };
     if (p.fn === 'check') {
-      try { mod.checkConfig(Object.assign({}, cfg, p.override)); return { ok: true }; } catch (e) { return { ok: false, error: String(e.message) }; }
+      // override: fields to replace; day_rows: {"<day>": row} replaces single rows of the table (the config is large).
+      try {
+        const c = Object.assign({}, cfg, p.override);
+        if (p.day_rows) {
+          c.per_minute_days = c.per_minute_days.slice();
+          for (const [d, row] of Object.entries(p.day_rows)) c.per_minute_days[Number(d)] = row;
+        }
+        mod.checkConfig(c);
+        return { ok: true };
+      } catch (e) { return { ok: false, error: String(e.message) }; }
     }
     return { error: `unknown probe ${p.fn}` };
   });

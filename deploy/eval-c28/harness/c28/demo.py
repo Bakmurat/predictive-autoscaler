@@ -11,7 +11,9 @@ A real stage of the tools with no experiment-only field and no dummy value. It r
     explicit zero, exactly as the PA-R arm is rendered;
   * ONE continuous generator (a Deployment with one replica and strategy Recreate, the reviewed k6 image by digest, the
     script load/c28-demo.js and its configuration from a ConfigMap) on the support node, feeding both targets the same
-    ordinary diurnal program from ONE immutable schedule origin.
+    FINITE schedule from ONE immutable schedule origin: program.days whole UTC days (28 for a demonstration), day d
+    being the ordinary diurnal program of the predeclared seed program.seed + d. The schedule never repeats and never
+    wraps: after its last day the generator sends nothing.
 
 What the stage consumes is render.STAGE_FIELDS["demonstration"]; it never reads c0_rps, hpa_cpu_target_percent or
 keda.* (render.EXPERIMENT_ONLY): its per-replica capacity is its own reviewed field, labelled provisional and naming
@@ -30,6 +32,7 @@ chart values when another tool presents them.
 from __future__ import annotations
 
 import copy
+import functools
 import hashlib
 import json
 import math
@@ -64,7 +67,9 @@ GENERATOR_K6_VERSION = "0.57.0"
 GENERATOR_NAME = "c28-demo-generator"
 GENERATOR_SCRIPT = "c28-demo.js"
 GENERATOR_CONFIG = "config.json"
-GENERATOR_CONFIG_SCHEMA = "c28-demo-generator/v1"
+GENERATOR_CONFIG_SCHEMA = "c28-demo-generator/v2"
+DEMONSTRATION_DAYS = 28                           # the finite schedule of a demonstration: 28 predeclared days
+MAX_DAYS = 28                                     # program.days is 1..28 (fewer than 28 only renders as a smoke)
 GENERATOR_USER = 12345                            # the k6 image's user
 K6_OUTPUT = "experimental-prometheus-rw"          # as staging/session.py's generator Job
 SCRIPT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "load", GENERATOR_SCRIPT)
@@ -73,6 +78,8 @@ SCRIPT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..
 MAX_LATE_MS = 1_000          # an arrival more than this late is DROPPED (reason "late"), never replayed in a burst
 FLUSH_GRACE_MS = 500         # a minute's line is written this long after its last request can have timed out
 MIN_SEGMENT_MS = 300_000     # an incarnation starting closer than this to its segment boundary runs to the next one
+PRE_ORIGIN_MAX_MS = 600_000  # an incarnation starting at most this long BEFORE the origin waits for it and runs the first
+#                              segment; an earlier one only idles (it sends nothing) and exits 0 before the origin
 LATENCY_BOUNDS_MS = (5, 10, 25, 50, 100, 200, 300, 500, 750, 1000, 1500, 2000)
 SEGMENT_HOURS = tuple(24 * n for n in range(1, 29))      # whole days, so every planned restart falls on a UTC
 #                                                          midnight of the origin: the ordinary cycle's lowest demand
@@ -81,6 +88,8 @@ SEGMENT_HOURS = tuple(24 * n for n in range(1, 29))      # whole days, so every 
 ASSUMED_BASE_BYTES = 128 * 2**20         # the k6 process with its outputs, before any VU
 ASSUMED_VU_BYTES = 16 * 2**20            # one JavaScript VU (the script, its parsed configuration, its runtime)
 ASSUMED_INFLIGHT_BYTES = 128 * 2**10     # one request in flight (goroutine, connection buffers, promise)
+ASSUMED_TABLE_ENTRY_BYTES = 64           # one per-minute count of the schedule table, parsed, in one VU's runtime
+CONFIGMAP_LIMIT_BYTES = 1_048_576        # the API server's limit on a ConfigMap's data (1 MiB)
 SETUP_VUS = 1                            # k6 runs setup() in its own VU
 
 _DNS = re.compile(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?")
@@ -208,13 +217,21 @@ def block_problems(p: Dict) -> List[str]:
     if not _int(d["peak_multiple"], PEAK_MULTIPLE, PEAK_MULTIPLE):
         out.append(f"demonstration.peak_multiple must be {PEAK_MULTIPLE}, the ordinary program's peak in units of c")
     prog = d["program"]
-    if _keys(prog, ("kind", "seed"), "demonstration.program", out):
+    if _keys(prog, ("kind", "seed", "days"), "demonstration.program", out):
         if prog["kind"] != "ordinary":
             out.append("demonstration.program.kind must be ordinary")
-        if not _int(prog["seed"], 1, 2**31 - 1):
-            out.append("demonstration.program.seed must be a positive integer")
-        elif prog["seed"] in F.TUNING_SEEDS + F.CONFIRMATION_SEEDS:
-            out.append("demonstration.program.seed must not be a tuning or confirmation seed of the comparison")
+        days_ok = _int(prog["days"], 1, MAX_DAYS)
+        if not days_ok:
+            out.append(f"demonstration.program.days must be an integer in 1..{MAX_DAYS}: the schedule's whole UTC days "
+                       f"({DEMONSTRATION_DAYS} for a demonstration; fewer only for a smoke)")
+        if not _int(prog["seed"], 1, 2**31 - 1 - MAX_DAYS):
+            out.append("demonstration.program.seed must be a positive integer (the base seed: day d uses seed + d)")
+        elif days_ok:
+            taken = [s for s in range(prog["seed"], prog["seed"] + prog["days"])
+                     if s in F.TUNING_SEEDS + F.CONFIRMATION_SEEDS]
+            if taken:
+                out.append(f"demonstration.program.seed must not be a tuning or confirmation seed of the comparison: "
+                           f"the schedule's seeds {prog['seed']}..{prog['seed'] + prog['days'] - 1} include {taken}")
     out += _generator_problems(d["generator"])
     return out
 
@@ -310,35 +327,68 @@ def capacity(p: Dict) -> str:
 
 # --- the generator's program and configuration --------------------------------------------------------------------
 
-def day_plan(p: Dict) -> List[int]:
-    """Intended arrivals of each of the 1,440 minutes of the day, for EACH target (identical demand): the ordinary
-    program of the declared seed in units of c, times the per-replica capacity, per minute. The same conversion as
-    schedule.k6_plan (max(0, round(u * c * 60)))."""
-    c = float(capacity(p))
+def schedule_seeds(p: Dict) -> List[int]:
+    """The predeclared seed of every day of the finite schedule: day d (0-based, whole UTC days from the origin) uses
+    program.seed + d. Consecutive, so the whole list follows from the two reviewed numbers (base seed, day count)."""
     prog = p["demonstration"]["program"]
-    return [max(0, round(u * c * 60)) for u in schedule.program(prog["kind"], prog["seed"])]
+    return [prog["seed"] + d for d in range(prog["days"])]
+
+
+@functools.lru_cache(maxsize=8)
+def _table(kind: str, base_seed: int, days: int, c: float) -> Tuple[Tuple[int, ...], ...]:
+    return tuple(tuple(max(0, round(u * c * 60)) for u in schedule.program(kind, base_seed + d)) for d in range(days))
+
+
+def day_table(p: Dict) -> List[List[int]]:
+    """The whole schedule: for every day, the intended arrivals of each of its 1,440 minutes, for EACH target
+    (identical demand). Day d is the ordinary program of seed program.seed + d in units of c, times the per-replica
+    capacity, per minute: the same conversion as schedule.k6_plan (max(0, round(u * c * 60))). Python is the only
+    source of these numbers: the generator script reads the table and never draws a random number."""
+    prog = p["demonstration"]["program"]
+    return [list(day) for day in _table(prog["kind"], prog["seed"], prog["days"], float(capacity(p)))]
+
+
+def day_plan(p: Dict, day: int = 0) -> List[int]:
+    """One day's row of day_table (day 0 by default)."""
+    return day_table(p)[day]
+
+
+def schedule_end_ms(p: Dict) -> int:
+    """The first millisecond after the schedule's last day: from then on nothing is intended and nothing is sent."""
+    d = p["demonstration"]
+    return origin_ms(d["schedule_origin_utc"]) + d["program"]["days"] * schedule.MINUTES * 60_000
 
 
 def generator_sizing(p: Dict) -> Dict:
     """The generator's limits against the peak rate and the response timeout (R2-18), with the arithmetic.
 
-    The script runs ONE virtual user per target (an event loop that dispatches asynchronous requests), so the number
-    of VUs does not grow with the rate; what grows is the number of requests in flight, bounded per target by
-    max_inflight = ceil(peak arrivals per second x timeout x 1.5) + 10 (schedule.k6_plan's rule for its VUs). Memory
-    is ESTIMATED from the ASSUMED_* constants, not measured."""
-    plan = day_plan(p)
-    peak = max(plan)
+    The peak is the MAXIMUM minute of the WHOLE schedule table (every day, its perturbation included), never one
+    day's: a later day may hold the highest minute. The script runs ONE virtual user per target (an event loop that
+    dispatches asynchronous requests), so the number of VUs does not grow with the rate; what grows is the number of
+    requests in flight, bounded per target by max_inflight = ceil(peak arrivals per second x timeout x 1.5) + 10
+    (schedule.k6_plan's rule for its VUs). Memory is ESTIMATED from the ASSUMED_* constants, not measured; it counts
+    the parsed table once per VU."""
+    table = day_table(p)
+    seeds = schedule_seeds(p)
+    peaks = [max(day) for day in table]
+    peak = max(peaks)
+    peak_day = peaks.index(peak)
     peak_rps = peak / 60.0
     inflight = int(math.ceil(peak_rps * F.REQUEST_TIMEOUT_S * 1.5)) + 10
     n = len(target_names(p))
     vus = n + SETUP_VUS
-    estimate = ASSUMED_BASE_BYTES + vus * ASSUMED_VU_BYTES + n * inflight * ASSUMED_INFLIGHT_BYTES
-    return {"targets": n, "peak_per_minute_per_target": peak, "peak_rps_per_target": round(peak_rps, 3),
+    entries = len(table) * schedule.MINUTES
+    estimate = ASSUMED_BASE_BYTES + vus * ASSUMED_VU_BYTES + n * inflight * ASSUMED_INFLIGHT_BYTES + \
+        vus * entries * ASSUMED_TABLE_ENTRY_BYTES
+    return {"targets": n, "days": len(table), "seeds": [seeds[0], seeds[-1]],
+            "peak_per_minute_per_target": peak, "peak_day": peak_day, "peak_seed": seeds[peak_day],
+            "peak_rps_per_target": round(peak_rps, 3),
             "peak_rps_total": round(peak_rps * n, 3), "timeout_s": F.REQUEST_TIMEOUT_S,
-            "max_inflight_per_target": inflight, "vus": vus,
+            "max_inflight_per_target": inflight, "vus": vus, "table_entries": entries,
             "memory_estimate_bytes": estimate,
             "memory_estimate": f"{ASSUMED_BASE_BYTES} + {vus} x {ASSUMED_VU_BYTES} + {n} x {inflight} x "
-                               f"{ASSUMED_INFLIGHT_BYTES} = {estimate} bytes (assumed constants, not measured)",
+                               f"{ASSUMED_INFLIGHT_BYTES} + {vus} x {entries} x {ASSUMED_TABLE_ENTRY_BYTES} = {estimate} "
+                               "bytes (assumed constants, not measured)",
             "memory_limit_bytes": int(R.memory_bytes(p["demonstration"]["generator"]["resources"]["memory_limit"]))}
 
 
@@ -350,34 +400,95 @@ def sizing_problems(p: Dict) -> List[str]:
     return []
 
 
-def generator_config(p: Dict, smoke_segment_minutes: Optional[int] = None) -> Dict:
-    """The configuration load/c28-demo.js reads (schema c28-demo-generator/v1), with its digest.
+def generator_config(p: Dict, smoke_segment_minutes: Optional[int] = None,
+                     smoke_origin_ms: Optional[int] = None) -> Dict:
+    """The configuration load/c28-demo.js reads (schema c28-demo-generator/v2), with its digest.
 
-    smoke_segment_minutes (the kind smoke only): a short segment so a planned restart happens within minutes; the
-    configuration is then labelled "smoke" and is never a demonstration."""
+    It carries the WHOLE finite schedule: per_minute_days (one row of 1,440 intended arrivals per day), the seed of
+    every day, the origin and the schedule's end. The digest covers all of it (and the schema): changing one count of
+    one day, one seed or the origin changes the digest.
+
+    A configuration labelled "demonstration" has exactly DEMONSTRATION_DAYS days and a UTC-midnight origin. The two
+    smoke-only options below label the configuration "smoke"; it is then never a demonstration:
+      smoke_segment_minutes  a short segment so a planned restart happens within minutes (and fewer days are allowed);
+      smoke_origin_ms        (only together with smoke_segment_minutes) an origin on any whole minute instead of the
+                             params' UTC midnight, so a smoke can put a day boundary of the table a few minutes ahead
+                             of its start. The script accepts such an origin only under the label "smoke"."""
     validate(p)
     d = p["demonstration"]
-    plan = day_plan(p)
+    table = day_table(p)
+    days = len(table)
     seg = d["generator"]["segment_hours"] * 60
     label = "demonstration"
+    origin, origin_utc = origin_ms(d["schedule_origin_utc"]), d["schedule_origin_utc"]
     if smoke_segment_minutes is not None:
         if not _int(smoke_segment_minutes, 2, 1_440):
             raise R.ParamsError("smoke_segment_minutes must be an integer in 2..1440")
         seg, label = smoke_segment_minutes, "smoke"
+    if smoke_origin_ms is not None:
+        if label != "smoke":
+            raise R.ParamsError("smoke_origin_ms is a smoke-only option: it needs smoke_segment_minutes, and a "
+                                "configuration labelled demonstration always starts at the params' UTC midnight")
+        if not _int(smoke_origin_ms, 0, 4_102_444_800_000) or smoke_origin_ms % 60_000:
+            raise R.ParamsError("smoke_origin_ms must be a whole minute in epoch milliseconds")
+        origin = smoke_origin_ms
+        origin_utc = datetime.fromtimestamp(origin // 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if label == "demonstration" and days != DEMONSTRATION_DAYS:
+        raise R.ParamsError(f"a demonstration's schedule has exactly {DEMONSTRATION_DAYS} days; demonstration.program."
+                            f"days {days} renders only as a smoke (smoke_segment_minutes)")
+    minutes = days * schedule.MINUTES
     cfg = {"schema": GENERATOR_CONFIG_SCHEMA, "label": label, "run_id": p["run_id"],
-           "origin_utc": d["schedule_origin_utc"], "origin_ms": origin_ms(d["schedule_origin_utc"]),
-           "minute_ms": 60_000, "day_minutes": schedule.MINUTES, "segment_minutes": seg,
+           "origin_utc": origin_utc, "origin_ms": origin,
+           "minute_ms": 60_000, "day_minutes": schedule.MINUTES, "days": days, "schedule_minutes": minutes,
+           "schedule_end_ms": origin + minutes * 60_000, "segment_minutes": seg,
            "min_segment_ms": MIN_SEGMENT_MS if label == "demonstration" else 30_000,
+           "pre_origin_max_ms": PRE_ORIGIN_MAX_MS,
            "base_url": f"http://c28-ingress.{p['namespace']}.svc", "targets": target_names(p),
            "timeout_ms": F.REQUEST_TIMEOUT_S * 1000, "max_late_ms": MAX_LATE_MS, "flush_grace_ms": FLUSH_GRACE_MS,
            "max_inflight": generator_sizing(p)["max_inflight_per_target"],
            "latency_bounds_ms": list(LATENCY_BOUNDS_MS),
-           "program": {"kind": d["program"]["kind"], "seed": d["program"]["seed"],
+           "program": {"kind": d["program"]["kind"], "seed": d["program"]["seed"], "days": days,
                        "capacity_per_replica_rps": float(capacity(p)), "capacity_label": d["capacity_label"],
                        "capacity_source_calibration": d["capacity_source_calibration"]},
-           "per_minute": plan}
+           "seeds": schedule_seeds(p), "per_minute_days": table}
     cfg["digest"] = schedule.digest(cfg)
     return cfg
+
+
+def config_problems(cfg) -> List[str]:
+    """Why a generator configuration's schedule cannot be used by a reader (the reducer): the same structural checks
+    as the script's checkConfig on the table, the seed list, the origin and the schedule length, plus the digest.
+    Never raises."""
+    if not isinstance(cfg, dict) or cfg.get("schema") != GENERATOR_CONFIG_SCHEMA:
+        return [f"not a {GENERATOR_CONFIG_SCHEMA} configuration"]
+    out = []
+    days, table, seeds = cfg.get("days"), cfg.get("per_minute_days"), cfg.get("seeds")
+    if cfg.get("minute_ms") != 60_000 or cfg.get("day_minutes") != schedule.MINUTES:
+        out.append("minute_ms must be 60000 and day_minutes 1440")
+    if not _int(days, 1, MAX_DAYS):
+        return out + [f"days must be an integer in 1..{MAX_DAYS}"]
+    if not (isinstance(table, list) and len(table) == days and all(
+            isinstance(row, list) and len(row) == schedule.MINUTES and all(_int(n, 0, 600_000) for n in row)
+            for row in table)):
+        out.append("per_minute_days must be one row of 1440 arrival counts per day")
+    if not (isinstance(seeds, list) and len(seeds) == days and _int(seeds[0], 1, 2**31 - 1)
+            and all(s == seeds[0] + i for i, s in enumerate(seeds))):
+        out.append("seeds must be one seed per day, consecutive")
+    elif (cfg.get("program") or {}).get("seed") != seeds[0] or (cfg.get("program") or {}).get("days") != days:
+        out.append("program.seed and program.days must be the base seed and the day count")
+    if cfg.get("label") not in ("demonstration", "smoke"):
+        out.append("label must be demonstration or smoke")
+    o = cfg.get("origin_ms")
+    if not _int(o, 0, 4_102_444_800_000) or o % 60_000 or (o % 86_400_000 and cfg.get("label") != "smoke"):
+        out.append("origin_ms must be a UTC midnight (a whole minute only under the label smoke)")
+    elif cfg.get("schedule_minutes") != days * schedule.MINUTES or \
+            cfg.get("schedule_end_ms") != o + days * schedule.MINUTES * 60_000:
+        out.append("schedule_minutes and schedule_end_ms must be days x 1440 minutes from the origin")
+    if cfg.get("label") == "demonstration" and days != DEMONSTRATION_DAYS:
+        out.append(f"a demonstration's schedule has exactly {DEMONSTRATION_DAYS} days")
+    if schedule.digest(cfg) != cfg.get("digest"):
+        out.append("the digest differs")
+    return out
 
 
 def script_text() -> str:
@@ -401,6 +512,10 @@ def generator_objects(p: Dict, smoke_segment_minutes: Optional[int] = None) -> L
     script = script_text()
     cm = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": GENERATOR_NAME, "namespace": ns, "labels": labels},
           "data": {GENERATOR_SCRIPT: script, GENERATOR_CONFIG: json.dumps(cfg, sort_keys=True, separators=(",", ":"))}}
+    size = sum(len(k.encode()) + len(v.encode()) for k, v in cm["data"].items())
+    if size > CONFIGMAP_LIMIT_BYTES * 3 // 4:
+        raise R.ParamsError(f"the generator's ConfigMap would hold {size} bytes (script and the whole schedule table): "
+                            f"more than three quarters of the {CONFIGMAP_LIMIT_BYTES}-byte limit")
     args = ["run", "--quiet", "--no-color", "--no-usage-report", "--no-summary", "--no-thresholds",
             "--log-format", "raw", "--out", K6_OUTPUT, "--tag", f"c28_run={p['run_id']}",
             "-e", f"C28D_CONFIG=/plan/{GENERATOR_CONFIG}", f"/plan/{GENERATOR_SCRIPT}"]

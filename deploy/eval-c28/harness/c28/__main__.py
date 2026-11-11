@@ -27,7 +27,8 @@ The demonstration stage (LIVE-DEMO-PLAN sections 5-6; its own params stage, neve
   python -m c28 residency --params P --stage demonstration [--out FILE]  both targets at max + overlap, the release,
                                                                the generator and system requests vs 75 %
   python -m c28 demo-plan --params P [--out FILE]              the continuous generator's configuration: ONE schedule
-                                                               origin and the day's per-minute arrivals (JSON)
+                                                               origin and the FINITE schedule's table, one row of
+                                                               per-minute arrivals and one seed per day (JSON)
                          (--smoke-segment-minutes N, here and with render --part generator: the kind smoke's short
                          segment; the configuration is then labelled smoke, never a demonstration)
   python -m c28 demo-sizing --params P                         the generator's limits against the peak rate and the
@@ -255,8 +256,10 @@ def main(argv=None) -> int:
         print(_json(demo.generator_sizing(params)), end="")
     elif args.cmd == "demo-reduce":
         cfg = _load(args.config)
-        if cfg.get("schema") != demo.GENERATOR_CONFIG_SCHEMA or schedule.digest(cfg) != cfg.get("digest"):
-            raise render.ParamsError("--config is not an intact c28-demo-generator/v1 configuration (its digest differs)")
+        why = demo.config_problems(cfg)
+        if why:
+            raise render.ParamsError(f"--config is not an intact {demo.GENERATOR_CONFIG_SCHEMA} configuration: "
+                                     + "; ".join(why))
         lines = []
         for path in args.log:
             with open(path, errors="replace") as fh:

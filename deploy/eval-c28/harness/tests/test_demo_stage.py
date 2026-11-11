@@ -171,6 +171,15 @@ def test_shadow_replicas_within_the_bounds_are_rendered(n):
     ("demonstration.program.kind", "scored", "program.kind must be ordinary"),
     ("demonstration.program.seed", 201, "must not be a tuning or confirmation seed"),
     ("demonstration.program.seed", 103, "must not be a tuning or confirmation seed"),
+    ("demonstration.program.seed", 180, "the schedule's seeds 180..207 include [201, 202, 203, 204, 205]"),   # a LATER day
+    ("demonstration.program.seed", 74, "the schedule's seeds 74..101 include [101]"),                # the last day only
+    ("demonstration.program.seed", 0, "program.seed must be a positive integer"),
+    ("demonstration.program.seed", 2**31 - 1, "program.seed must be a positive integer"),
+    ("demonstration.program.days", 0, "program.days must be an integer in 1..28"),
+    ("demonstration.program.days", 29, "program.days must be an integer in 1..28"),
+    ("demonstration.program.days", "28", "program.days must be an integer in 1..28"),
+    ("demonstration.program.days", True, "program.days must be an integer in 1..28"),
+    ("demonstration.program.days", KeyError, "demonstration.program is missing days"),
     ("demonstration.run_id", "c28-prod-1", "demonstration.run_id must be the params' run_id"),
     ("demonstration.extra_field", 1, "unknown fields extra_field"),
 ])
@@ -393,42 +402,153 @@ def test_the_generator_is_one_recreate_deployment_on_the_support_node():
     assert ann["c28.devkuban.com/generator-script"] == hashlib.sha256(cm["data"]["c28-demo.js"].encode()).hexdigest()
 
 
-def test_the_generator_config_is_the_ordinary_program_from_one_origin():
+def test_the_generator_config_is_the_finite_schedule_of_28_days_from_one_origin():
     from c28 import schedule
     p = prod_like()
     cfg = demo.generator_config(p)
+    assert cfg["schema"] == "c28-demo-generator/v2" == demo.GENERATOR_CONFIG_SCHEMA
     assert cfg["origin_utc"] == "2026-11-01T00:00:00Z" and cfg["origin_ms"] == 1793491200000
     assert cfg["origin_ms"] % 86_400_000 == 0
     assert cfg["targets"] == ["c28-demo-pa-n", "c28-demo-pa-r"] and cfg["base_url"] == "http://c28-ingress.demo.svc"
-    us = schedule.program("ordinary", 301)
-    assert cfg["per_minute"] == [round(u * 17.5 * 60) for u in us] and len(cfg["per_minute"]) == 1440
-    # The same conversion as the comparison's k6 plan: iterations per minute for the same capacity and seed.
-    plan = schedule.k6_plan("ordinary", 301, 17.5, "x")
-    assert cfg["per_minute"] == [s["target"] for s in plan["stages"][0::2]]
+    # 28 predeclared, consecutive seeds from the base seed; one row of 1,440 counts per day; a finite length.
+    assert cfg["days"] == 28 == demo.DEMONSTRATION_DAYS and cfg["seeds"] == list(range(301, 329)) == demo.schedule_seeds(p)
+    assert not set(cfg["seeds"]) & set(F.TUNING_SEEDS + F.CONFIRMATION_SEEDS)
+    assert cfg["schedule_minutes"] == 28 * 1440 and cfg["schedule_end_ms"] == cfg["origin_ms"] + 28 * 86_400_000
+    assert cfg["schedule_end_ms"] == demo.schedule_end_ms(p)
+    table = cfg["per_minute_days"]
+    assert len(table) == 28 and all(len(row) == 1440 for row in table) and table == demo.day_table(p)
+    for d in (0, 1, 13, 27):
+        us = schedule.program("ordinary", 301 + d)
+        assert table[d] == [round(u * 17.5 * 60) for u in us] == demo.day_plan(p, d)
+        # The same conversion as the comparison's k6 plan: iterations per minute for the same capacity and seed.
+        plan = schedule.k6_plan("ordinary", 301 + d, 17.5, "x")
+        assert table[d] == [s["target"] for s in plan["stages"][0::2]]
+    assert all(a != b for a, b in zip(table, table[1:]))                   # unequal adjacent days
     assert cfg["timeout_ms"] == 2000 and cfg["segment_minutes"] == 1440 and cfg["label"] == "demonstration"
-    assert cfg["digest"] == schedule.digest(cfg)
-    assert cfg["program"]["capacity_label"] == "provisional"
-    assert max(cfg["per_minute"]) <= 9 * 1.05 * 17.5 * 60 + 1 and max(cfg["per_minute"]) > 9 * 17.5 * 60 * 0.95
-    assert demo.generator_config(changed(p, "demonstration.schedule_origin_utc", "2026-11-02T00:00:00Z"))["digest"] \
-        != cfg["digest"]
+    assert cfg["digest"] == schedule.digest(cfg) and demo.config_problems(cfg) == []
+    assert cfg["program"] == {"kind": "ordinary", "seed": 301, "days": 28, "capacity_per_replica_rps": 17.5,
+                              "capacity_label": "provisional", "capacity_source_calibration": "c28cal-0000000000"}
+    peak = max(map(max, table))
+    assert peak <= 9 * 1.05 * 17.5 * 60 + 1 and peak > 9 * 17.5 * 60 * 0.95
     smoke = demo.generator_config(p, smoke_segment_minutes=3)
-    assert smoke["label"] == "smoke" and smoke["segment_minutes"] == 3 and smoke["per_minute"] == cfg["per_minute"]
+    assert smoke["label"] == "smoke" and smoke["segment_minutes"] == 3 and smoke["per_minute_days"] == table
+    assert smoke["digest"] != cfg["digest"]
+
+
+def test_the_digest_binds_every_day_every_seed_the_origin_and_the_schema():
+    """Whatever is changed in the schedule, the digest changes: through the params (another base seed, day count or
+    origin) and in the configuration itself (one count of one day, one seed, the origin, the schema)."""
+    from c28 import schedule
+    p = prod_like()
+    cfg = demo.generator_config(p)
+    seen = {cfg["digest"]}
+    for path, value in (("demonstration.program.seed", 302), ("demonstration.program.seed", 300),
+                        ("demonstration.schedule_origin_utc", "2026-11-02T00:00:00Z"),
+                        ("demonstration.capacity_per_replica_rps", 17.6)):
+        other = demo.generator_config(changed(p, path, value))
+        assert other["digest"] not in seen, path
+        seen.add(other["digest"])
+    assert demo.generator_config(changed(p, "demonstration.program.seed", 302))["per_minute_days"][0] == \
+        cfg["per_minute_days"][1]                                           # the table really moved by one day
+    fewer = demo.generator_config(changed(p, "demonstration.program.days", 27), smoke_segment_minutes=3)
+    assert fewer["digest"] not in seen and fewer["days"] == 27 and len(fewer["per_minute_days"]) == 27
+    for day in (0, 1, 14, 27):                                              # ANY day, not only the first
+        for minute in (0, 719, 1439):
+            edit = copy.deepcopy(cfg)
+            edit["per_minute_days"][day][minute] += 1
+            d = schedule.digest(edit)
+            assert d not in seen, (day, minute)
+            seen.add(d)
+            assert demo.config_problems(edit) == ["the digest differs"]
+    for i in (0, 9, 27):
+        edit = copy.deepcopy(cfg)
+        edit["seeds"][i] += 1000
+        assert schedule.digest(edit) not in seen and "the digest differs" in demo.config_problems(edit)
+        seen.add(schedule.digest(edit))
+    swapped = copy.deepcopy(cfg)
+    swapped["per_minute_days"][3], swapped["per_minute_days"][4] = cfg["per_minute_days"][4], cfg["per_minute_days"][3]
+    assert schedule.digest(swapped) not in seen                             # the ORDER of the days is bound too
+    for field, value in (("origin_ms", cfg["origin_ms"] + 86_400_000), ("origin_utc", "2026-11-02T00:00:00Z"),
+                         ("schema", "c28-demo-generator/v1"), ("schedule_end_ms", cfg["schedule_end_ms"] + 60_000),
+                         ("days", 27), ("label", "smoke")):
+        assert schedule.digest(dict(cfg, **{field: value})) not in seen, field
+        assert demo.config_problems(dict(cfg, **{field: value})), field
+
+
+def test_a_demonstration_has_exactly_28_days_and_fewer_render_only_as_a_smoke():
+    p = changed(prod_like(), "demonstration.program.days", 7)
+    assert problems(p) == []                                                # the params stage allows 1..28
+    with pytest.raises(render.ParamsError, match="exactly 28 days"):
+        demo.generator_config(p)
+    with pytest.raises(render.ParamsError, match="exactly 28 days"):
+        demo.render(p)
+    smoke = demo.generator_config(p, smoke_segment_minutes=3)
+    assert (smoke["label"], smoke["days"], smoke["seeds"]) == ("smoke", 7, list(range(301, 308)))
+    assert smoke["schedule_end_ms"] == smoke["origin_ms"] + 7 * 86_400_000 and demo.config_problems(smoke) == []
+    relabelled = dict(smoke, label="demonstration")
+    assert "a demonstration's schedule has exactly 28 days" in demo.config_problems(relabelled)
+    one = demo.generator_config(changed(prod_like(), "demonstration.program.days", 1), smoke_segment_minutes=3)
+    assert one["seeds"] == [301] and len(one["per_minute_days"]) == 1
 
 
 def test_generator_sizing_states_the_arithmetic_against_the_peak_and_the_timeout():
     p = prod_like()
     s = demo.generator_sizing(p)
-    peak = max(demo.day_plan(p))
+    table = demo.day_table(p)
+    peak = max(max(day) for day in table)                                   # the WHOLE table, not one day
     assert s["peak_per_minute_per_target"] == peak and s["vus"] == 3 and s["timeout_s"] == 2
+    assert s["days"] == 28 and s["seeds"] == [301, 328] and s["table_entries"] == 28 * 1440
+    assert max(table[s["peak_day"]]) == peak and s["peak_seed"] == 301 + s["peak_day"]
     import math
     assert s["max_inflight_per_target"] == math.ceil(peak / 60 * 2 * 1.5) + 10
     assert s["memory_estimate_bytes"] == demo.ASSUMED_BASE_BYTES + 3 * demo.ASSUMED_VU_BYTES + \
-        2 * s["max_inflight_per_target"] * demo.ASSUMED_INFLIGHT_BYTES
+        2 * s["max_inflight_per_target"] * demo.ASSUMED_INFLIGHT_BYTES + 3 * 28 * 1440 * demo.ASSUMED_TABLE_ENTRY_BYTES
     assert "not measured" in s["memory_estimate"]
     assert s["memory_estimate_bytes"] <= s["memory_limit_bytes"]
     refused(changed(p, "demonstration.generator.resources",
                     {"cpu_request": "250m", "cpu_limit": "1", "memory_request": "64Mi", "memory_limit": "128Mi"}),
             "below the estimated need at the peak rate")
+
+
+def test_sizing_uses_the_maximum_across_all_days_not_the_first_day(monkeypatch):
+    """A table whose highest minute is on a LATER day: admission (peak, max_inflight, the memory estimate and the
+    configuration's max_inflight) follows that day, perturbation included."""
+    p = prod_like()
+    real = demo.day_table(p)
+    first_day_peak = max(real[0])
+    natural = demo.generator_sizing(p)
+    assert natural["peak_per_minute_per_target"] == max(map(max, real)) >= first_day_peak
+
+    def later_peak(params):
+        table = [list(day) for day in real]
+        table[19][1083] = 3 * first_day_peak                                # day 19 holds the highest minute by far
+        return table
+    monkeypatch.setattr(demo, "day_table", later_peak)
+    s = demo.generator_sizing(p)
+    assert (s["peak_per_minute_per_target"], s["peak_day"], s["peak_seed"]) == (3 * first_day_peak, 19, 320)
+    import math
+    assert s["max_inflight_per_target"] == math.ceil(3 * first_day_peak / 60 * 2 * 1.5) + 10
+    assert s["max_inflight_per_target"] > 2.5 * natural["max_inflight_per_target"]
+    assert s["memory_estimate_bytes"] > natural["memory_estimate_bytes"]
+    # The admission follows it: the 512Mi limit that covers the first day's peak no longer covers the table's.
+    need = s["memory_estimate_bytes"]
+    assert natural["memory_estimate_bytes"] <= natural["memory_limit_bytes"] < need
+    assert any("below the estimated need at the peak rate" in x for x in problems(p))
+    with pytest.raises(render.ParamsError, match="below the estimated need at the peak rate"):
+        demo.generator_config(p)
+    ok = changed(p, "demonstration.generator.resources",
+                 {"cpu_request": "250m", "cpu_limit": "1", "memory_request": "256Mi", "memory_limit": str(need)})
+    assert problems(ok) == []
+    assert demo.generator_config(ok)["max_inflight"] == s["max_inflight_per_target"]   # the script's bound too
+
+
+def test_the_generators_configmap_holds_the_whole_table_within_the_api_limit():
+    p = prod_like()
+    cm = [o for o in demo.render(p)["generator"] if o["kind"] == "ConfigMap"][0]
+    size = sum(len(k) + len(v.encode()) for k, v in cm["data"].items())
+    assert 150_000 < size < demo.CONFIGMAP_LIMIT_BYTES * 3 // 4            # 28 x 1,440 counts and the script
+    cfg = json.loads(cm["data"]["config.json"])
+    assert len(cfg["per_minute_days"]) == 28 and cfg == demo.generator_config(p)
 
 
 # --- admission: the residency audit -----------------------------------------------------------------------------------
