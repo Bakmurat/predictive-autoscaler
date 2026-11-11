@@ -89,6 +89,21 @@
             }
           }
         },
+        "writeAllowlist": {
+          "type": "array",
+          "description": "Reviewed Deployments the operator may scale, each at one UID (needs rbac.scaleWrite true); empty: no restriction by UID.",
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["namespace", "name", "uid"],
+            "properties": {
+              "namespace": {"type": "string", "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"},
+              "name": {"type": "string", "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$", "minLength": 1, "maxLength": 253},
+              "uid": {"type": "string", "pattern": "^[0-9A-Za-z-]{1,64}$"}
+            }
+          }
+        },
         "forecasterAddress": {"type": "string", "pattern": "^$|^[a-z0-9]([-a-z0-9.]*[a-z0-9])?:[0-9]{1,5}$"},
         "forecastLedger": {
           "type": "object",

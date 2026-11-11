@@ -280,7 +280,83 @@ def test_scale_target_names_are_dns_1123_subdomains_label_by_label(tmp_path, ski
     for bad in (["web", "web"], [f"d{i}" for i in range(65)], [7], ["web", None]):   # distinct, at most 64, strings
         p = run(bad)
         assert p.returncode != 0 and "scaleTargets" in p.stderr, bad
+    for not_a_list in (None, {}, {"web": True}, "", "web", 0, False):                # null would drop the names silently
+        p = run(not_a_list)
+        assert p.returncode != 0 and "scaleTargets" in p.stderr, repr(not_a_list)
     assert run([f"d{i}" for i in range(64)]).returncode == 0
+
+
+# --- operator.writeAllowlist: every replica write limited to reviewed Deployments, by UID -----------------------------
+
+UID_WEB, UID_API = "6f1d2c3a-8b7e-4f5a-9c0d-1e2f3a4b5c6d", "0a9b8c7d-6e5f-4a3b-8c2d-1f0e9d8c7b6a"
+
+
+def _operator_env(docs):
+    (dep,) = [d for d in by_kind(docs, "Deployment") if d["metadata"]["name"].endswith("-operator")]
+    (container,) = dep["spec"]["template"]["spec"]["containers"]
+    return {e["name"]: e.get("value") for e in container["env"]}
+
+
+def test_no_write_allowlist_by_default_and_the_listed_uids_reach_the_operator(render):
+    assert "SCALE_WRITE_ALLOWLIST" not in _operator_env(render())          # unset: the operator restricts nothing by UID
+    docs = render({"operator": {"watchNamespaces": ["shop"], "rbac": {"scaleTargets": ["web", "api"]},
+                                "writeAllowlist": [{"namespace": "shop", "name": "web", "uid": UID_WEB},
+                                                   {"namespace": "shop", "name": "api", "uid": UID_API}]}})
+    assert _operator_env(docs)["SCALE_WRITE_ALLOWLIST"] == f"shop/web={UID_WEB},shop/api={UID_API}"
+    # Without names or namespaces in RBAC the list still applies on its own.
+    docs = render({"operator": {"writeAllowlist": [{"namespace": "shop", "name": "web", "uid": UID_WEB}]}})
+    assert _operator_env(docs)["SCALE_WRITE_ALLOWLIST"] == f"shop/web={UID_WEB}"
+
+
+@pytest.mark.parametrize("skip_schema", [False, True], ids=["schema", "template"])
+def test_a_write_allowlist_that_cannot_be_applied_exactly_is_refused(tmp_path, skip_schema):
+    def run(operator):
+        f = tmp_path / "values.yaml"
+        f.write_text(yaml.safe_dump(_merge(BASE, {"operator": operator})))
+        cmd = ["helm", "template", "pa", str(CHART), "-n", NS, "--kube-version", "1.35.0", "-f", str(f),
+               "--show-only", "templates/operator.yaml"] + (["--skip-schema-validation"] if skip_schema else [])
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        except OSError as e:
+            if os.environ.get("CI"):
+                pytest.fail(f"helm is required in CI: {e}")
+            pytest.skip(f"helm not usable here: {e}")
+    web = {"namespace": "shop", "name": "web", "uid": UID_WEB}
+    assert run({"writeAllowlist": [web]}).returncode == 0
+    malformed = [dict(web, uid=""), dict(web, uid="a b"), dict(web, uid="a,b"), dict(web, uid="a=b"), dict(web, uid="a/b"),
+                 dict(web, uid="x" * 65), dict(web, uid=UID_WEB + "\n"), dict(web, uid=7), dict(web, namespace="Shop"),
+                 dict(web, namespace="shop/x"), dict(web, namespace=""), dict(web, namespace="x" * 64),
+                 dict(web, name="Web"), dict(web, name="web..api"), dict(web, name=""), dict(web, name="x" * 254),
+                 dict(web, extra="x"), {"namespace": "shop", "name": "web"}, {"name": "web", "uid": UID_WEB},
+                 f"shop/web={UID_WEB}", None]
+    for bad in malformed:
+        p = run({"writeAllowlist": [bad]})
+        assert p.returncode != 0 and "writeAllowlist" in p.stderr, repr(bad)
+        assert run({"writeAllowlist": [web, bad]}).returncode != 0, repr(bad)     # wherever it stands in the list
+    for operator, want in (
+            ({"writeAllowlist": [web, dict(web, uid=UID_API)]}, "writeAllowlist"),            # one UID per Deployment
+            ({"writeAllowlist": [web, dict(web)]}, "writeAllowlist"),
+            ({"writeAllowlist": [dict(web, name=f"d{i}") for i in range(65)]}, "writeAllowlist"),
+            ({"writeAllowlist": [web], "rbac": {"scaleWrite": False}}, "operator.rbac.scaleWrite is false"),
+            ({"writeAllowlist": [web], "watchNamespaces": ["payments"]}, "outside operator.watchNamespaces"),
+            ({"writeAllowlist": [web], "rbac": {"scaleTargets": ["api"]}}, "not in operator.rbac.scaleTargets")):
+        p = run(operator)
+        assert p.returncode != 0 and want in p.stderr, (operator, p.stderr[-300:])
+    assert run({"writeAllowlist": [dict(web, name=f"d{i}") for i in range(64)]}).returncode == 0
+    assert run({"writeAllowlist": [], "rbac": {"scaleWrite": False}}).returncode == 0
+    # The value itself must be a list. null removes the chart's default before the schema sees it, and a map or a
+    # scalar has nothing to iterate: each would render an operator with no restriction at all.
+    for not_a_list in (None, {}, {"shop/web": UID_WEB}, "", f"shop/web={UID_WEB}", 0, False):
+        p = run({"writeAllowlist": not_a_list})
+        assert p.returncode != 0 and "writeAllowlist" in p.stderr, repr(not_a_list)
+        assert "SCALE_WRITE_ALLOWLIST" not in p.stdout
+    p = run({})                                                                      # omitted: the default, no restriction
+    assert p.returncode == 0 and "SCALE_WRITE_ALLOWLIST" not in p.stdout
+
+
+def test_the_scale_targets_ci_value_set_lists_the_reviewed_uids(tmp_path):
+    docs = helm(yaml.safe_load((CHART / "ci" / "scale-targets-values.yaml").read_text()), tmp_path)
+    assert _operator_env(docs)["SCALE_WRITE_ALLOWLIST"] == f"shop/web={UID_WEB},shop/api={UID_API}"
 
 
 def test_the_scale_targets_ci_value_set_renders_the_named_write():

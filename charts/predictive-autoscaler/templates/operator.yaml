@@ -1,4 +1,34 @@
 {{- $ledger := .Values.operator.forecastLedger }}
+{{- /*
+operator.writeAllowlist: the reviewed Deployments, by UID, the operator may scale (SCALE_WRITE_ALLOWLIST, entries
+namespace/name=uid). The schema checks the same; the template repeats it for --skip-schema-validation and checks what
+a schema cannot: one entry per Deployment, and every entry inside the namespaces and names the write role covers (an
+entry outside them could never be written, so it is a mistake, not a narrower grant). The value itself must be a
+list: null (which removes the default before the schema sees it) or a map would otherwise render no restriction.
+*/}}
+{{- if not (kindIs "slice" .Values.operator.writeAllowlist) }}
+{{- fail "operator.writeAllowlist must be a list (use [] for no restriction by UID): null or any other value would silently remove the restriction" }}
+{{- end }}
+{{- $allowlist := list }}
+{{- $allowSeen := dict }}
+{{- range $i, $e := .Values.operator.writeAllowlist }}
+{{- if not (kindIs "map" $e) }}{{ fail "operator.writeAllowlist entries must be maps of namespace, name and uid" }}{{ end }}
+{{- range $k, $_ := $e }}{{ if not (has $k (list "namespace" "name" "uid")) }}{{ fail (printf "operator.writeAllowlist[%d]: unknown key %q (namespace, name and uid only)" $i $k) }}{{ end }}{{ end }}
+{{- range $k := list "namespace" "name" "uid" }}{{ if or (not (hasKey $e $k)) (not (kindIs "string" (get $e $k))) }}{{ fail (printf "operator.writeAllowlist[%d]: %s must be a string" $i $k) }}{{ end }}{{ end }}
+{{- if not (regexMatch "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\\z" $e.namespace) }}{{ fail (printf "operator.writeAllowlist[%d]: %q is not a namespace name" $i $e.namespace) }}{{ end }}
+{{- if or (gt (len $e.name) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*\\z" $e.name)) }}{{ fail (printf "operator.writeAllowlist[%d]: %q is not a Deployment name" $i $e.name) }}{{ end }}
+{{- if not (regexMatch "^[0-9A-Za-z-]{1,64}\\z" $e.uid) }}{{ fail (printf "operator.writeAllowlist[%d]: %q is not a UID" $i $e.uid) }}{{ end }}
+{{- $key := printf "%s/%s" $e.namespace $e.name }}
+{{- if hasKey $allowSeen $key }}{{ fail (printf "operator.writeAllowlist lists %s more than once" $key) }}{{ end }}
+{{- $_ := set $allowSeen $key true }}
+{{- if and $.Values.operator.watchNamespaces (not (has $e.namespace $.Values.operator.watchNamespaces)) }}{{ fail (printf "operator.writeAllowlist: %s is outside operator.watchNamespaces, so the operator never reconciles it" $key) }}{{ end }}
+{{- if and $.Values.operator.rbac.scaleTargets (not (has $e.name $.Values.operator.rbac.scaleTargets)) }}{{ fail (printf "operator.writeAllowlist: %s is not in operator.rbac.scaleTargets, so the write role does not cover it" $key) }}{{ end }}
+{{- $allowlist = append $allowlist (printf "%s=%s" $key $e.uid) }}
+{{- end }}
+{{- if gt (len $allowlist) 64 }}{{ fail "operator.writeAllowlist lists more than 64 Deployments" }}{{ end }}
+{{- if and $allowlist (not .Values.operator.rbac.scaleWrite) }}
+{{- fail "operator.writeAllowlist names Deployments the operator may scale, but operator.rbac.scaleWrite is false (no replica write at all): set scaleWrite true or empty writeAllowlist" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -49,6 +79,10 @@ spec:
             {{- with .Values.operator.watchNamespaces }}
             - name: WATCH_NAMESPACES
               value: {{ join "," . | quote }}
+            {{- end }}
+            {{- if $allowlist }}
+            - name: SCALE_WRITE_ALLOWLIST
+              value: {{ join "," $allowlist | quote }}
             {{- end }}
             {{- if $ledger.enabled }}
             - name: FORECAST_LOG

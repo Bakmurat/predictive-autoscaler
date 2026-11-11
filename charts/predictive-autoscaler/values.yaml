@@ -35,6 +35,14 @@ operator:
     # namespaces. Reading /scale stays unrestricted. Not allowed with scaleWrite false. RBAC binds the name, not
     # the object: a Deployment recreated under a listed name can be scaled after the operator's next reconcile.
     scaleTargets: []
+  # The reviewed Deployments the operator may scale, each with the UID it has now (kubectl get deployment <name>
+  # -o jsonpath='{.metadata.uid}'): entries of namespace, name and uid. Empty: no such restriction. With entries,
+  # every replica write, reactive ones included, is refused for a Deployment that is not listed or whose UID differs
+  # (it was deleted and created again): its autoscaler reports ScalingActive=False, reason TargetNotAllowed, and
+  # keeps publishing its decisions. This closes what scaleTargets cannot (RBAC binds names); use both. Needs
+  # scaleWrite true; each entry must be within watchNamespaces and scaleTargets when those are set. After a reviewed
+  # replacement, update the uid here: the operator restarts with the new list.
+  writeAllowlist: []
   # host:port the operator dials instead of the forecaster Service (empty: the Service). For an evaluation-owned route
   # in front of the forecaster (C2.8's scheduled forecast outages). With authentication on, the host must be listed in
   # forecaster.tls.extraDNSNames, so certificate verification stays on.

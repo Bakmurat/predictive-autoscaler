@@ -67,6 +67,9 @@ the single rule below. The names are validated here as well as in values.schema.
 skipped): Kubernetes' DNS-1123 subdomain, label by label, at most 253 characters, distinct, at most 64.
 */}}
 {{- $scaleTargets := .Values.operator.rbac.scaleTargets }}
+{{- if not (kindIs "slice" $scaleTargets) }}
+{{- fail "operator.rbac.scaleTargets must be a list (use [] for every Deployment where the write role is bound): null or any other value would silently remove the names" }}
+{{- end }}
 {{- range $scaleTargets }}
 {{- if not (kindIs "string" .) }}{{ fail "operator.rbac.scaleTargets must list Deployment names (strings)" }}{{ end }}
 {{- if or (gt (len .) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*\\z" .)) }}
