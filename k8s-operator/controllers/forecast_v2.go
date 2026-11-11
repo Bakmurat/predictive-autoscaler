@@ -1112,8 +1112,8 @@ func (r *PredictiveAutoscalerReconciler) requestV2(ctx context.Context, b v2Bind
 }
 
 // v2FailureReason is the PredictionReady reason for a failed request. The service's registration limit gets its own
-// reason: it is not a data problem and does not pass by itself (an operator has to raise the limit or remove an
-// autoscaler), so it must not hide among the transient DataUnavailable causes.
+// reason: it is not a data problem and lasts while every registration is in use (until the limit is raised or a
+// registration is freed), so it must not hide among the transient DataUnavailable causes.
 func v2FailureReason(err error) string {
 	var refused *forecastRefusedError
 	var unavailable *forecastServerError
