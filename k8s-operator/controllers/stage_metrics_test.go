@@ -337,6 +337,9 @@ func TestEveryReasonTheOperatorSetsIsExportedByName(t *testing.T) {
 		regexp.MustCompile(`return (?:true|false), "([A-Za-z0-9]+)"`),                     // readiness, capacityCondition
 		regexp.MustCompile(`\bBlocked(?:, obs\.BlockedMsg)? = "([A-Za-z0-9]+)"`),          // ScaleOutBlocked
 		regexp.MustCompile(`"[a-z_]+":\s+"([A-Z][A-Za-z0-9]+)"`),                          // forecastReasons
+		regexp.MustCompile(`\breason = "([A-Z][A-Za-z0-9]+)"`),                            // a reason set in a variable
+		regexp.MustCompile(`(?m)^\s+return "([A-Z][A-Za-z0-9]+)"$`),                       // v2FailureReason
+		regexp.MustCompile(`const v2[A-Za-z]+ = "([A-Z][A-Za-z0-9]+)"`),                   // a reason held in a constant
 	}
 	files, err := filepath.Glob("*.go")
 	if err != nil {
@@ -360,8 +363,38 @@ func TestEveryReasonTheOperatorSetsIsExportedByName(t *testing.T) {
 	if len(found) < 40 {
 		t.Fatalf("the scan found only %d reasons: its patterns no longer match the sources", len(found))
 	}
-	for _, r := range append(append([]string{}, v2Reasons...), "Unavailable", "DataUnavailable", "ForecastRejected", "RequestRefused") {
+	for _, r := range []string{"NotEligible", "ForecastRejected", "RequestRefused", "DataUnavailable", v2AutoscalerLimitReached} {
+		if found[r] == "" {
+			t.Errorf("the scan no longer finds %s: a reason set this way would be missed", r)
+		}
+	}
+	for _, r := range append(append([]string{}, v2Reasons...), "Unavailable") {
 		found[r] = "the forecast contract"
+	}
+	// The documentation is the second witness: every reason the configuration reference names for a condition is
+	// exported by name. (Its row also names the condition types and the statuses, which are not reasons.)
+	doc, err := os.ReadFile(filepath.Join("..", "..", "docs", "configuration.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var row string
+	for _, line := range strings.Split(string(doc), "\n") {
+		if strings.HasPrefix(line, "| `conditions` |") {
+			row = line
+		}
+	}
+	notReasons := map[string]bool{"Unknown": true, "Off": true, "True": true, "False": true}
+	for _, typ := range conditionMetricTypes {
+		notReasons[typ] = true
+	}
+	documented := regexp.MustCompile("`([A-Z][A-Za-z0-9]+)`").FindAllStringSubmatch(row, -1)
+	if len(documented) < 40 {
+		t.Fatalf("the conditions row of docs/configuration.md names only %d terms: the row was not found", len(documented))
+	}
+	for _, m := range documented {
+		if !notReasons[m[1]] {
+			found[m[1]] = "docs/configuration.md"
+		}
 	}
 	for reason, where := range found {
 		if oneOf(reason, conditionReasons) != reason {
@@ -473,4 +506,61 @@ func TestAReconcileThatEndsEarlyRemovesTheStagesOfThePreviousOne(t *testing.T) {
 		t.Fatalf("the failure reason must be exported: %v", got)
 	}
 	wantWrites(t, seriesOf(t, scaleWritesTotal, ns, name), map[string]float64{writeApplied: 1})
+}
+
+// The registration limit is told apart from the transient causes, and only by the service's exact code on a 503.
+func TestTheRegistrationLimitHasItsOwnReason(t *testing.T) {
+	limit := `{"detail": {"error": "AutoscalerLimitReached", "message": "the service's registration limit is reached: 8 autoscalers are already registered"}}`
+	for _, c := range []struct {
+		err  error
+		want string
+	}{
+		{&forecastServerError{status: 503, body: limit}, "AutoscalerLimitReached"},
+		{fmt.Errorf("forecast: %w", &forecastServerError{status: 503, body: limit}), "AutoscalerLimitReached"},
+		{&forecastServerError{status: 503, body: `{"detail": {"error": "StateUnavailable", "message": "x"}}`}, "DataUnavailable"},
+		{&forecastServerError{status: 503, body: `AutoscalerLimitReached`}, "DataUnavailable"}, // not the service's body
+		{&forecastServerError{status: 503, body: `{"detail": "AutoscalerLimitReached"}`}, "DataUnavailable"},
+		{&forecastServerError{status: 503, body: ``}, "DataUnavailable"},
+		{&forecastServerError{status: 500, body: limit}, "DataUnavailable"}, // only on a 503
+		{&forecastRefusedError{status: 422, body: limit}, "RequestRefused"},
+		{fmt.Errorf("%w: bad window", errV2Refused), "ForecastRejected"},
+		{context.DeadlineExceeded, "DataUnavailable"},
+	} {
+		got := v2FailureReason(c.err)
+		if got != c.want {
+			t.Errorf("%v: got %s, want %s", c.err, got, c.want)
+		}
+		if oneOf(got, conditionReasons) != got {
+			t.Errorf("%s would be exported as Other", got)
+		}
+	}
+}
+
+// End to end: the service refuses the autoscaler at its limit. The autoscaler stays reactive, says why in a reason of
+// its own (also as a metric label), warns once, and recovers when the service answers again.
+func TestAnAutoscalerRefusedAtTheServiceLimitSaysSoAndStaysReactive(t *testing.T) {
+	f := v2Harness(t, autoscalerv1alpha1.ModeActive, "3000")
+	t.Cleanup(func() { forgetConditionMetrics(f.req.Namespace, f.req.Name) })
+	f.stub.set("limit", 0)
+	d := f.reconcile(t)
+	if d.AppliedReplicas != 5 || d.Action != "scale_up" {
+		t.Fatalf("the reactive need is still served: %+v", d)
+	}
+	c := f.cond(t, "PredictionReady")
+	if c.Status != "False" || c.Reason != "AutoscalerLimitReached" || !strings.Contains(c.Message, "registration limit") {
+		t.Fatalf("PredictionReady: %+v", c)
+	}
+	if ev := strings.Join(f.events(), "\n"); !strings.Contains(ev, "Warning PredictionNotReady AutoscalerLimitReached") {
+		t.Fatalf("the limit must warn: %s", ev)
+	}
+	reasons := seriesOf(t, conditionReasonGauge, f.req.Namespace, f.req.Name)
+	if reasons["reason=AutoscalerLimitReached,type=PredictionReady"] != 1 {
+		t.Fatalf("the reason must be a metric label of its own: %v", reasons)
+	}
+	f.stub.set("status:503", 0) // another 503 is the transient kind
+	f.at(310)
+	f.reconcile(t)
+	if c := f.cond(t, "PredictionReady"); c.Reason != "DataUnavailable" {
+		t.Fatalf("an ordinary 503 stays DataUnavailable: %+v", c)
+	}
 }

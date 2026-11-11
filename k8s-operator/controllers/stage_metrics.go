@@ -137,7 +137,8 @@ var (
 		// PredictionReady: the service's reasons, the operator's own verdicts and request failures
 		"HistoryInsufficient", "CalibrationInsufficient", "ShadowInsufficient", "CoverageLow", "DataUnavailable",
 		"IdentityMismatch", "StateUnavailable", "ConfigurationNotValidated", "ReplayGateMissing", "Ready",
-		"EvidenceInsufficient", "EvidenceStale", "IssuedInFuture", "DeadlinePassed", "ForecastRejected", "RequestRefused",
+		"NotEligible", "EvidenceInsufficient", "EvidenceStale", "IssuedInFuture", "DeadlinePassed", "ForecastRejected",
+		"RequestRefused", "AutoscalerLimitReached",
 	}
 	// appliedOwner remembers, per autoscaler, the autoscaler and target objects (UIDs) its applied stage belongs to.
 	appliedOwner sync.Map
