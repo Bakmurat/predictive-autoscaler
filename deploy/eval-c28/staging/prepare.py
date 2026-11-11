@@ -36,6 +36,30 @@ The record's "prepare" section:
                              | {"mode": "anonymous"},
                "network_policy": {chart networkPolicy values; enabled must stay true}}}
 
+Stage "demonstration" (prepare.stage; LIVE-DEMO-PLAN section 5; default "experiment", everything above):
+  {"stage": "demonstration", "storage": {...}, "release": {...},
+   "reservation": {"record": "<the reservation OWNER's preparation record>", "sha256": "<that file's sha256>"}}
+The record's run_id is the demonstration's own (its objects, receipts and journals use it), and its params validate
+for the demonstration stage only (render.validate_stage: no c0_rps, HPA target or KEDA setting is read). The phases
+are the same six, rendered by the harness's demo module (two targets at the fixed shadow replica count, two
+PredictiveAutoscalers in Recommend, the common objects with the ingress routing to those two targets), plus
+  generator   the ONE continuous generator (ConfigMap, headless Service and a StatefulSet with one replica: at most one
+              generator pod can exist), created only after targets and pas, with its schedule origin in the past and
+              its finite schedule not yet over, and only when no other generator exists
+Every refusal above stays. What differs:
+  * The reservation is ANOTHER run's. Nodes are never retagged and reserve.py's ownership checks are not relaxed:
+    the gate loads the owner's record (bound by sha256), checks the params' reference against it (owner run id, taint
+    key and value, role label, both node names and UIDs, the same cluster and lock directory, the same release and
+    control namespace), then requires the owner's LIVE reservation verdict with the demonstration as an authorized
+    occupant (reserve.verify(owner, occupant=...): its pods by run label and namespace; any other pod is still an
+    unplanned occupant) and the rendered placement of the demonstration's own pods.
+  * Admission counts BOTH targets at maxReplicas plus rollout overlap, the ingress, the routes, the rendered
+    generator, the release as the final chart values request it, and system requests (demo.residency_report).
+  * The values phase also enables the release's own scrape object from params.scrape (VMPodScrape ->
+    metrics.vmServiceScrape, PodMonitor -> metrics.serviceMonitor; "annotations" is refused for the release) and
+    values_problems requires exactly one. The scale write stays withheld (scaleWrite false, no scaleTargets): the
+    Active transition, the qualification mount and scaleTargets belong to other tools.
+
 image_pull is required and explicit: a record without it (or with the retired registry_pull_ref) is refused, never
 read as anonymous. Secret mode references the Secret by name in images.pullSecrets. Anonymous mode renders
 images.pullSecrets as [] and the values plan verifies every required image digest anonymously: a registry v2 manifest
@@ -58,6 +82,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional, Tuple
 
 import yaml
@@ -66,6 +91,8 @@ import execlib as X
 
 HELPER = "prepare"
 PHASES = ("namespaces", "storage", "values", "common", "targets", "pas")
+STAGES = ("experiment", "demonstration")
+DEMO_PHASES = PHASES + ("generator",)          # the demonstration's phases: the same six, then its generator
 _DIGEST_IMAGE = re.compile(r"^([a-z0-9][a-z0-9./:-]*)@(sha256:[0-9a-f]{64})$")
 _QUANTITY = re.compile(r"^[0-9]+(Mi|Gi|Ti)$")
 PULL_MODES = ("secret", "anonymous")
@@ -92,7 +119,33 @@ def _section(record: X.Record) -> Dict:
     np_ = rel.get("network_policy") or {}
     if np_.get("enabled") is not True:
         raise X.StagingError("prepare.release.network_policy.enabled must be true (never disabled to pass staging)")
+    stage = s.get("stage", "experiment")
+    if stage not in STAGES:
+        raise X.StagingError(f"prepare.stage must be one of {', '.join(STAGES)}")
+    ref = s.get("reservation")
+    if stage == "demonstration":
+        if not isinstance(ref, dict) or set(ref) != {"record", "sha256"} or not isinstance(ref["record"], str) \
+                or not ref["record"] or not X._SHA.fullmatch(str(ref["sha256"])):
+            raise X.StagingError("prepare.reservation must be exactly {record, sha256}: the reservation owner's "
+                                 "preparation record and its sha256 (the demonstration occupies another run's "
+                                 "reservation by explicit reference)")
+    elif ref is not None:
+        raise X.StagingError("prepare.reservation belongs to stage demonstration (the experiment owns its reservation)")
     return s
+
+
+def stage_of(s: Dict) -> str:
+    return s.get("stage", "experiment")
+
+
+def phases_of(stage: str) -> Tuple[str, ...]:
+    return DEMO_PHASES if stage == "demonstration" else PHASES
+
+
+def load_params(record: X.Record, stage: str) -> Dict:
+    """The record's params: the full validation for the experiment, the demonstration stage's own validation (which
+    requires the residency section itself) for the demonstration."""
+    return X.load_params(record) if stage == "experiment" else X.load_params_stage(record, stage)
 
 
 def _image_pull(rel: Dict) -> Dict:
@@ -244,9 +297,15 @@ def _review_times(live: Dict, reviewed: Dict) -> Dict:
     return out
 
 
-def split(params: Dict) -> Dict[str, List[Dict]]:
-    """The rendered objects by phase: common, targets (Deployment, Service, faults ConfigMap), pas, writers."""
+def split(params: Dict, stage: str = "experiment") -> Dict[str, List[Dict]]:
+    """The rendered objects by phase: common, targets (Deployment, Service, faults ConfigMap), pas, writers, and the
+    demonstration's generator (empty for the experiment)."""
     c28 = X.import_harness()
+    if stage == "demonstration":
+        try:
+            return c28.demo.render(params)            # audited: one writer per target, sidecar-free, RBAC, names, labels
+        except c28.render.ParamsError as e:
+            raise X.StagingError(f"params: {e}") from e
     common = c28.render.render_common(params)
     targets, pas, writers = [], [], []
     for profile in c28.frozen.PROFILES:
@@ -259,12 +318,23 @@ def split(params: Dict) -> Dict[str, List[Dict]]:
                 else:
                     targets.append(o)
     c28.render.audit_rendered(common + targets + pas + writers)
-    return {"common": common, "targets": targets, "pas": pas, "writers": writers}
+    return {"common": common, "targets": targets, "pas": pas, "writers": writers, "generator": []}
+
+
+def target_names(params: Dict, stage: str) -> List[str]:
+    c28 = X.import_harness()
+    if stage == "demonstration":
+        return c28.demo.target_names(params)
+    return [c28.render.target_name(a, pr) for pr in c28.frozen.PROFILES for a in c28.frozen.ARMS]
+
+
+SCRAPE_VALUES = {"VMPodScrape": "vmServiceScrape", "PodMonitor": "serviceMonitor"}     # params.scrape -> chart metrics.*
 
 
 def staging_values(record: X.Record, params: Dict, s: Dict) -> Dict:
     c28 = X.import_harness()
-    routes = c28.render.eval_release_values(params)
+    stage = stage_of(s)
+    routes = c28.render.eval_release_values(params, stage)
     rel, st, r = s["release"], s["storage"], params["reservation"]
     support = {"tolerations": [{"key": r["taint_key"], "operator": "Equal", "value": r["taint_value"],
                                 "effect": "NoSchedule"}],
@@ -276,7 +346,7 @@ def staging_values(record: X.Record, params: Dict, s: Dict) -> Dict:
     st_repo, st_digest = _DIGEST_IMAGE.fullmatch(rel["statistical_image"]).groups()
     pull = _image_pull(rel)
     pull_secrets = [{"name": pull["pull_ref"]}] if pull["mode"] == "secret" else []
-    return {
+    out = {
         "images": {"operator": {"repository": op_repo, "tag": "", "digest": op_digest},
                    "statisticalForecaster": {"repository": st_repo, "tag": "", "digest": st_digest},
                    "pullPolicy": "IfNotPresent", "pullSecrets": pull_secrets},
@@ -301,10 +371,18 @@ def staging_values(record: X.Record, params: Dict, s: Dict) -> Dict:
         "training": {"targets": []},
         "networkPolicy": copy.deepcopy(rel["network_policy"]),
     }
+    if stage == "demonstration":
+        # The release's OWN metrics (operator and forecaster) through the observer's scrape object, at the evaluation's
+        # scrape interval. "annotations" enables neither: values_problems then refuses the overlay.
+        on = SCRAPE_VALUES.get(params["scrape"])
+        out["metrics"] = {v: {"enabled": v == on, "interval": f"{c28.frozen.SCRAPE_INTERVAL_S}s"}
+                          for v in sorted(SCRAPE_VALUES.values())}
+    return out
 
 
-def values_problems(v: Dict, params: Dict) -> List[str]:
-    """The overlay's must-haves (STAGING S3), checked on the final document."""
+def values_problems(v: Dict, params: Dict, stage: str = "experiment") -> List[str]:
+    """The overlay's must-haves (STAGING S3), checked on the final document. Stage demonstration adds: exactly one
+    scrape object for the release's own metrics, and no scaleTargets while the scale write is withheld."""
     out = []
     route = f"c28-forecast-route.{params['control_namespace']}.svc"
     if v["forecaster"]["engine"] != "statistical" or v["training"]["targets"] != []:
@@ -333,6 +411,14 @@ def values_problems(v: Dict, params: Dict) -> List[str]:
     for k in ("operator", "statisticalForecaster"):
         if not str(v["images"][k]["digest"]).startswith("sha256:"):
             out.append(f"images.{k} must be digest-pinned")
+    if stage == "demonstration":
+        m = v.get("metrics") or {}
+        flags = [(m.get(k) or {}).get("enabled") for k in sorted(SCRAPE_VALUES.values())]
+        if not all(isinstance(f, bool) for f in flags) or sum(flags) != 1:
+            out.append("the release's own metrics need exactly one scrape object: metrics.vmServiceScrape (params.scrape "
+                       "VMPodScrape) or metrics.serviceMonitor (PodMonitor); scrape \"annotations\" is refused for the "
+                       "release")
+        out += c28.demo.active_values_problems(v, params)
     return out
 
 
@@ -341,11 +427,15 @@ def admission_problems(record: X.Record, params: Dict, s: Dict, parts: Dict) -> 
     overlay), run before every preparation plan and so again at apply time: a phase is never prepared on its own
     while the evaluation as a whole would not be admitted."""
     c28 = X.import_harness()
-    objs = parts["common"] + parts["targets"] + parts["pas"] + parts["writers"]
+    objs = parts["common"] + parts["targets"] + parts["pas"] + parts["writers"] + parts.get("generator", [])
     try:
         c28.render.audit_sidecar_free(objs)
         values = staging_values(record, params, s)
-        rep = c28.render.residency_report(params, objs, chart=c28.render.chart_values(values))
+        chart = c28.render.chart_values(values)
+        if stage_of(s) == "demonstration":      # both targets at max + overlap, the rendered generator, the release
+            rep = c28.demo.residency_report(params, objs, chart=chart)
+        else:
+            rep = c28.render.residency_report(params, objs, chart=chart)
     except c28.render.ParamsError as e:
         return [str(e)]
     return [f"residency: {p}" for p in rep["problems"]]
@@ -366,6 +456,148 @@ def reservation_gate(record: X.Record, kube: X.Kube) -> Tuple[Dict, List[str]]:
     except X.StagingError as e:
         return gate, [f"reservation gate: {p}" for p in out["problems"]] or [f"reservation gate: {e}"]
     return gate, []
+
+
+def demonstration_placement_problems(params: Dict, parts: Dict) -> List[str]:
+    """The RENDERED demonstration pods: every one tolerates exactly the reservation owner's taint and requires its
+    role's label and hostname (targets and ingress on W; routes and generator on S)."""
+    c28 = X.import_harness()
+    r = params["reservation"]
+    want_tol = [{"key": r["taint_key"], "operator": "Equal", "value": r["taint_value"], "effect": "NoSchedule"}]
+    on_w = set(c28.demo.target_names(params)) | {"c28-ingress"}
+    out = []
+    for o in c28.demo.flat(parts):
+        for t in c28.render.pod_templates(o):
+            name, spec = o["metadata"]["name"], t.get("spec") or {}
+            role = "workload" if name in on_w else "support"
+            if spec.get("tolerations") != want_tol:
+                out.append(f"{name}: tolerations {spec.get('tolerations')} are not exactly the reservation's taint")
+            terms = ((spec.get("affinity") or {}).get("nodeAffinity") or {}).get(
+                "requiredDuringSchedulingIgnoredDuringExecution", {}).get("nodeSelectorTerms", [])
+            want = [{"matchExpressions": [{"key": r["role_label"], "operator": "In", "values": [role]},
+                                          {"key": "kubernetes.io/hostname", "operator": "In",
+                                           "values": [params["nodes"][role]]}]}]
+            if terms != want:
+                out.append(f"{name}: required node affinity is not the {role} role and hostname")
+    return out
+
+
+def reservation_owner(record: X.Record, params: Dict, s: Dict) -> Tuple[Optional[X.Record], Dict, List[str]]:
+    """The reservation owner's record as the demonstration references it, and every way the reference does not hold.
+    The demonstration's params name the owner's run id, taint value and both nodes by name and UID; the record names
+    the owner's preparation record by path and sha256. All of it must be what the owner's record says."""
+    import reserve
+    ref, d = s["reservation"], params["demonstration"]["reservation_ref"]
+    path = record.resolve(ref["record"])
+    gate = {"owner_run_id": d["run_id"], "owner_record_sha256": ref["sha256"]}
+    if not os.path.isfile(path):
+        return None, gate, [f"the reservation owner's record {path} does not exist"]
+    if X.sha256_file(path) != ref["sha256"]:
+        return None, gate, ["the reservation owner's record differs from prepare.reservation.sha256 (review the "
+                            "reference again)"]
+    try:
+        owner = X.load_record(path, ("reserve",))
+        owner_params = X.load_params_stage(owner, reserve.STAGE)
+        rs = reserve._section(owner, owner_params)
+    except X.StagingError as e:
+        return None, gate, [f"the reservation owner's record cannot be used: {e}"]
+    problems = []
+    if owner.run_id != d["run_id"]:
+        problems.append(f"the referenced record is run {owner.run_id}'s, not the reservation owner "
+                        f"{d['run_id']} the params name")
+    if owner.cluster_uid != record.cluster_uid:
+        problems.append("the reservation owner's record is for another cluster")
+    if owner.doc.get("lock_dir") != record.doc.get("lock_dir"):
+        problems.append("the reservation owner's record uses another lock_dir: both runs must share the one "
+                        "mutation lock")
+    r = params["reservation"]
+    if (rs["taint_key"], rs["role_label"], owner.run_id) != (r["taint_key"], r["role_label"], r["taint_value"]):
+        problems.append(f"the owner's reservation (taint {rs['taint_key']}={owner.run_id}, role label "
+                        f"{rs['role_label']}) is not the params' ({r['taint_key']}={r['taint_value']}, "
+                        f"{r['role_label']})")
+    for role in reserve.ROLES:
+        want, got = rs["nodes"][role], d["nodes"][role]
+        if (want["name"], want["uid"]) != (got["name"], got["uid"]):
+            problems.append(f"reservation_ref.nodes.{role} ({got['name']}, {got['uid']}) is not the owner's reserved "
+                            f"node ({want['name']}, {want['uid']})")
+    if (owner_params["control_namespace"], owner_params["release"]) != (params["control_namespace"], params["release"]):
+        problems.append("the owner's params name another control namespace or release: the release's pods on S "
+                        "would not classify as evaluation pods")
+    return owner, gate, problems
+
+
+def demonstration_gate(record: X.Record, kube: X.Kube, params: Dict, s: Dict, parts: Dict) -> Tuple[Dict, List[str]]:
+    """The demonstration's reservation gate, required in every plan and again under the lock at apply: the explicit
+    reference holds (reservation_owner), the OWNER's live reservation passes with the demonstration as its authorized
+    occupant (reserve.verify(owner, occupant=...); reserve.require_reservation_pass), and the demonstration's rendered
+    pods are placed on the reserved nodes. The nodes are never retagged; without this reference the demonstration's
+    pods are unplanned occupants of the owner's reservation."""
+    import reserve
+    owner, gate, problems = reservation_owner(record, params, s)
+    if problems:
+        return dict(gate, reservation="UNVERIFIED", placement="UNVERIFIED", ready_for_demonstration=False,
+                    result="FAIL"), [f"reservation gate: {p}" for p in problems]
+    occupant = {"run_id": record.run_id, "namespaces": sorted({params["namespace"], params["control_namespace"]})}
+    out = reserve.verify(owner, kube, occupant=occupant)
+    problems = [f"reservation gate: {p}" for p in out["reservation_problems"]]
+    try:
+        reserve.require_reservation_pass(out)
+    except X.StagingError as e:
+        problems = problems or [f"reservation gate: {e}"]
+    placement = demonstration_placement_problems(params, parts)
+    problems += [f"reservation gate: {p}" for p in placement]
+    ready = out["reservation"] == "PASS" and not problems
+    gate.update(reservation=out["reservation"], placement="PASS" if not placement else "FAIL",
+                ready_for_demonstration=ready, result="PASS" if ready else "FAIL")
+    return gate, problems
+
+
+def generator_problems(record: X.Record, kube: X.Kube, params: Dict, parts: Dict, ours: List[Dict],
+                       now: Callable[[], str] = X.utcnow) -> List[str]:
+    """What the generator phase needs beyond the common refusals: the recorded schedule origin already passed (the
+    program resumes at the wall-clock position; an origin in the future is not a record of anything) and the finite
+    schedule not yet over (after its last day the generator would send nothing: an expired schedule is refused, never
+    wrapped), the targets and their PredictiveAutoscalers created by THIS run and still the same objects, both PAs in
+    Recommend, the ingress present, and no other generator: single ownership is one StatefulSet with one replica, and
+    any other Deployment, StatefulSet or Pod that carries the generator's name label in the namespace is refused
+    (a terminating pod included: it may still be sending). Listings are strict: a failed list is never "no
+    generator". `now` is the caller's clock (tests pass a fixed time)."""
+    c28 = X.import_harness()
+    out: List[str] = []
+    d, ns = params["demonstration"], params["namespace"]
+    origin = c28.demo.origin_ms(d["schedule_origin_utc"])
+    now_ms = datetime.strptime(now(), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp() * 1000
+    if origin is None or origin > now_ms:
+        out.append(f"demonstration.schedule_origin_utc {d['schedule_origin_utc']} is in the future: the origin is "
+                   "recorded once, at or before the start")
+    else:
+        end_ms = c28.demo.schedule_end_ms(params)
+        if now_ms >= end_ms:
+            end = datetime.fromtimestamp(end_ms / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            out.append(f"the schedule has expired: its {d['program']['days']} days from {d['schedule_origin_utc']} "
+                       f"ended at {end}; a generator created now would send nothing (the schedule is finite and is "
+                       "never wrapped or restarted under the same origin)")
+    created = created_objects(record)
+    for name in c28.demo.target_names(params):
+        for kind in ("Deployment", "PredictiveAutoscaler"):
+            ref = created.get((kind, ns, name))
+            live = kube.get(kind, name, ns)
+            if ref is None or live is None or live["metadata"]["uid"] != ref["uid"]:
+                out.append(f"{kind} {ns}/{name} was not created by this run or was replaced (phases targets and pas "
+                           "first)")
+            elif kind == "PredictiveAutoscaler" and live["spec"].get("mode") != "Recommend":
+                out.append(f"PredictiveAutoscaler/{name} is {live['spec'].get('mode')}, not Recommend")
+    ing = created.get(("Deployment", ns, "c28-ingress"))
+    live = kube.get("Deployment", "c28-ingress", ns)
+    if ing is None or live is None or live["metadata"]["uid"] != ing["uid"]:
+        out.append(f"Deployment {ns}/c28-ingress was not created by this run or was replaced (phase common first)")
+    mine = {(r["kind"], r["name"]) for r in ours}
+    label = {"app.kubernetes.io/name": c28.demo.GENERATOR_NAME}
+    for kind in ("Deployment", "StatefulSet", "Pod"):
+        for o in kube.list(kind, ns, labels=label, strict=True):
+            if (kind, o["metadata"]["name"]) not in mine:
+                out.append(f"another generator exists: {kind} {ns}/{o['metadata']['name']} (one generator only)")
+    return out
 
 
 def _exists(kube: X.Kube, obj: Dict) -> Optional[Dict]:
@@ -394,19 +626,28 @@ def _objects_for(phase: str, record: X.Record, params: Dict, s: Dict, parts: Dic
     return copy.deepcopy(parts[phase])
 
 
-def plan(record: X.Record, kube: X.Kube, phase: str, fetch: Optional[Fetch] = None) -> Dict:
-    if phase not in PHASES:
-        raise X.StagingError(f"unknown phase {phase}")
-    params = X.load_params(record)
+def plan(record: X.Record, kube: X.Kube, phase: str, fetch: Optional[Fetch] = None,
+         now: Callable[[], str] = X.utcnow) -> Dict:
+    """`now` is the clock the generator phase judges the schedule's origin and end by (tests pass a fixed time)."""
     s = _section(record)
-    parts = split(params)
+    stage = stage_of(s)
+    if phase not in phases_of(stage):
+        raise X.StagingError(f"unknown phase {phase}" + (" (the generator phase belongs to stage demonstration)"
+                                                         if phase in DEMO_PHASES else ""))
+    params = load_params(record, stage)
+    parts = split(params) if stage == "experiment" else split(params, stage)
     problems: List[str] = admission_problems(record, params, s, parts)
-    gate, gate_problems = reservation_gate(record, kube)
+    if stage == "demonstration":
+        gate, gate_problems = demonstration_gate(record, kube, params, s, parts)
+    else:
+        gate, gate_problems = reservation_gate(record, kube)
     problems += gate_problems
     out = {"phase": phase, "reservation_gate": gate}
+    if stage != "experiment":
+        out["stage"] = stage
     if phase == "values":
         v = staging_values(record, params, s)
-        problems += values_problems(v, params)
+        problems += values_problems(v, params, stage)
         pull = _image_pull(s["release"])
         out["image_pull"] = {"mode": pull["mode"]}
         if pull["mode"] == "anonymous":
@@ -443,7 +684,7 @@ def plan(record: X.Record, kube: X.Kube, phase: str, fetch: Optional[Fetch] = No
                 continue
         elif live is not None:
             problems.append(f"{o['kind']} {m.get('namespace') or ''}/{m['name']} already exists (never adopted)")
-        if phase in ("common", "targets", "pas") and not m["name"].startswith("c28-"):
+        if phase in ("common", "targets", "pas", "generator") and not m["name"].startswith("c28-"):
             problems.append(f"{o['kind']}/{m['name']} is not a c28-* name")
         if o["kind"] == "ConfigMap" and m["name"].endswith("-faults") and o["data"].get("faults.json") != "{}":
             problems.append(f"{m['name']}: a prepared fault schedule must be empty")
@@ -459,7 +700,7 @@ def plan(record: X.Record, kube: X.Kube, phase: str, fetch: Optional[Fetch] = No
         elif sc.get("reclaimPolicy") != "Retain":
             problems.append(f"StorageClass {s['storage']['storage_class']} reclaims with "
                             f"{sc.get('reclaimPolicy', 'Delete')}: the claims need the storage owner's Retain class")
-    if phase in ("namespaces", "storage", "common", "targets", "pas"):
+    if phase in ("namespaces", "storage", "common", "targets", "pas", "generator"):
         for ns in sorted({params["namespace"], params["control_namespace"]}):
             if phase != "namespaces" and kube.get("Namespace", ns) is None:
                 problems.append(f"namespace {ns} does not exist (phase namespaces first)")
@@ -469,6 +710,8 @@ def plan(record: X.Record, kube: X.Kube, phase: str, fetch: Optional[Fetch] = No
         problems += _writer_refs(kube, params["namespace"], names)
         if os.path.exists(os.path.join(record.evidence_dir, "targets.json")):
             problems.append("targets.json exists: targets are created once per run")
+    if phase == "generator":
+        problems += generator_problems(record, kube, params, parts, ours, now)
     if phase == "common":
         rq = [o for o in create if o["kind"] == "ResourceQuota"]
         if len(rq) != 1 or rq[0]["spec"]["hard"]["pods"] != str(params["quota"]["pods_normal"]):
@@ -480,9 +723,9 @@ def plan(record: X.Record, kube: X.Kube, phase: str, fetch: Optional[Fetch] = No
 
 
 def apply(record: X.Record, kube: X.Kube, phase: str, reviewed: Dict, reviewed_digest: str,
-          fetch: Optional[Fetch] = None) -> Dict:
+          fetch: Optional[Fetch] = None, now: Callable[[], str] = X.utcnow) -> Dict:
     with X.mutating(record, kube, HELPER, {"phase": phase}):
-        p = plan(record, kube, phase, fetch)            # validated under the shared lock (anonymous pulls checked again)
+        p = plan(record, kube, phase, fetch, now)       # validated under the shared lock (anonymous pulls checked again)
         X.require_live(reviewed, reviewed_digest, HELPER, record, _review_times(p, reviewed))
         if p["problems"]:
             raise X.StagingError("the plan has problems: " + "; ".join(p["problems"]))
@@ -492,10 +735,12 @@ def apply(record: X.Record, kube: X.Kube, phase: str, reviewed: Dict, reviewed_d
             return X.receipt(record, HELPER, "values-written", {"phase": phase, "plan_sha256": reviewed_digest,
                                                                 "file": p["file"], "sha256": sha,
                                                                 "image_pull": p["image_pull"]})
-        params = X.load_params(record)
         s = _section(record)
+        stage = stage_of(s)
+        params = load_params(record, stage)
         objs = {(o["kind"], o["metadata"].get("namespace"), o["metadata"]["name"]): o
-                for o in _objects_for(phase, record, params, s, split(params))}
+                for o in _objects_for(phase, record, params, s,
+                                      split(params) if stage == "experiment" else split(params, stage))}
         created = []
         for c in p["actions"]:
             o = objs[(c["create"], c["namespace"], c["name"])]
@@ -504,8 +749,9 @@ def apply(record: X.Record, kube: X.Kube, phase: str, reviewed: Dict, reviewed_d
                                      "refusing")
             created.append(X.object_ref(kube.create(o)))
         if phase == "targets":
+            names = set(target_names(params, stage))
             uids = {r["name"]: r["uid"] for (k, ns, n), r in created_objects(record).items()
-                    if k == "Deployment" and ns == params["namespace"] and n.startswith("c28-") and n != "c28-ingress"}
+                    if k == "Deployment" and ns == params["namespace"] and n in names}
             X.write_new(os.path.join(record.evidence_dir, "targets.json"),
                         json.dumps({"schema": "c28-targets/v1", "run_id": record.run_id,
                                     "cluster_uid": record.cluster_uid, "namespace": params["namespace"],
@@ -527,8 +773,10 @@ def created_objects(record: X.Record) -> Dict[tuple, Dict]:
 
 
 def verify(record: X.Record, kube: X.Kube) -> Dict:
-    params = X.load_params(record)
     s = _section(record)
+    stage = stage_of(s)
+    params = load_params(record, stage)
+    fixed = params["demonstration"]["shadow_replicas"] if stage == "demonstration" else 2
     problems, seen = [], []
     for (kind, ns, name), ref in sorted(created_objects(record).items(), key=lambda kv: tuple(str(x) for x in kv[0])):
         live = kube.get(kind, name, ns)
@@ -551,8 +799,9 @@ def verify(record: X.Record, kube: X.Kube) -> Dict:
                 pv = kube.get("PersistentVolume", pv_name)
                 if not pv or pv.get("spec", {}).get("persistentVolumeReclaimPolicy") != "Retain":
                     problems.append(f"claim {name}: its volume {pv_name} does not reclaim with Retain")
+    names = set(target_names(params, stage))
     targets = sorted(r["name"] for r in seen if r["kind"] == "Deployment" and r["namespace"] == params["namespace"]
-                     and r["name"] != "c28-ingress")
+                     and r["name"] in names)
     pas = {r["name"]: r for r in seen if r["kind"] == "PredictiveAutoscaler"}
     for name, writers in sorted(X.writer_inventory(kube, params["namespace"], targets).items()):
         want = [{"kind": "PredictiveAutoscaler", "namespace": params["namespace"], "name": name,
@@ -562,11 +811,52 @@ def verify(record: X.Record, kube: X.Kube) -> Dict:
             problems.append(f"{name}: writers {got}, expected {[X.ident_str(w) for w in want] or 'none'} "
                             "outside a session")
         live = kube.get("Deployment", name, params["namespace"])
-        if live and live["spec"].get("replicas") != 2:
-            problems.append(f"{name} has {live['spec'].get('replicas')} replicas, not the fixed 2, outside a session")
+        if live and live["spec"].get("replicas") != fixed:
+            problems.append(f"{name} has {live['spec'].get('replicas')} replicas, not the fixed {fixed}, outside a "
+                            "session")
+    if stage == "demonstration":
+        problems += generator_verify_problems(kube, params, seen)
     problems += injection_problems(kube, params)
     return {"helper": HELPER, "action": "verify", "run_id": record.run_id, "objects": seen, "problems": problems,
             "result": "PASS" if not problems else "FAIL", "storage_class": s["storage"]["storage_class"]}
+
+
+def generator_verify_problems(kube: X.Kube, params: Dict, seen: List[Dict]) -> List[str]:
+    """Single-generator ownership, checked live (strict listings): the generator this run created is still a
+    StatefulSet with one replica, at most ONE generator pod may be running, that pod is the StatefulSet's own
+    (<name>-0, controlled by it), and no other workload carries the generator's name label.
+
+    A TERMINATING pod counts: a deletion timestamp only says the pod was asked to stop, its containers may run until
+    the end of the grace period (or indefinitely on an unreachable node). Only a pod whose phase says its containers
+    have stopped (Succeeded, Failed) is not a possible sender."""
+    c28 = X.import_harness()
+    ns, name = params["namespace"], c28.demo.GENERATOR_NAME
+    if not any(r["kind"] == "StatefulSet" and r["namespace"] == ns and r["name"] == name for r in seen):
+        return []
+    out = []
+    live = kube.get("StatefulSet", name, ns)
+    spec = (live or {}).get("spec") or {}
+    if spec.get("replicas") != 1 or isinstance(spec.get("replicas"), bool):
+        out.append(f"{name} must be a StatefulSet with exactly one replica (at most one generator pod)")
+    label = {"app.kubernetes.io/name": name}
+    pods = [p for p in kube.list("Pod", ns, labels=label, strict=True)
+            if (p.get("status") or {}).get("phase") not in ("Succeeded", "Failed")]
+    if len(pods) > 1:
+        shown = sorted(p["metadata"]["name"] + (" (terminating)" if p["metadata"].get("deletionTimestamp") else "")
+                       for p in pods)
+        out.append(f"{len(pods)} generator pods may be running ({shown}): two generators would send at once")
+    own, uid = c28.demo.generator_pod_name(), ((live or {}).get("metadata") or {}).get("uid")
+    for p in pods:
+        owners = [o for o in p["metadata"].get("ownerReferences") or [] if o.get("controller")]
+        if p["metadata"]["name"] != own or [(o.get("kind"), o.get("uid")) for o in owners] != [("StatefulSet", uid)]:
+            out.append(f"generator pod {p['metadata']['name']} is not the StatefulSet's own pod {own}: another "
+                       "generator is running")
+    for kind in ("Deployment", "StatefulSet"):
+        others = [d["metadata"]["name"] for d in kube.list(kind, ns, labels=label, strict=True)
+                  if (kind, d["metadata"]["name"]) != ("StatefulSet", name)]
+        if others:
+            out.append(f"other generator {kind}s exist: {sorted(others)}")
+    return out
 
 
 def injection_problems(kube: X.Kube, params: Dict) -> List[str]:
@@ -575,12 +865,12 @@ def injection_problems(kube: X.Kube, params: Dict) -> List[str]:
     return X.injection_problems(kube, params)
 
 
-def main(argv=None, api=None, fetch: Optional[Fetch] = None) -> int:
+def main(argv=None, api=None, fetch: Optional[Fetch] = None, now: Callable[[], str] = X.utcnow) -> int:
     ap = argparse.ArgumentParser(prog="prepare.py", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--record", required=True)
     ap.add_argument("command", nargs="?", default="plan", choices=["plan", "apply", "verify", "recover-plan", "recover"])
-    ap.add_argument("--phase", default="", choices=("",) + PHASES)
+    ap.add_argument("--phase", default="", choices=("",) + DEMO_PHASES)
     ap.add_argument("--plan", default="")
     ap.add_argument("--plan-digest", default="")
     args = ap.parse_args(argv)
@@ -594,12 +884,12 @@ def main(argv=None, api=None, fetch: Optional[Fetch] = None) -> int:
                 raise X.StagingError("recover needs --plan <the reviewed recover plan> and --plan-digest")
             X.emit(X.recover(record, kube, X.load_plan(args.plan), args.plan_digest))
         elif args.command == "plan":
-            X.emit([X.cli_plan(record, HELPER, plan(record, kube, ph, fetch), f"plan-{ph}")
-                    for ph in ([args.phase] if args.phase else PHASES)])
+            X.emit([X.cli_plan(record, HELPER, plan(record, kube, ph, fetch, now), f"plan-{ph}")
+                    for ph in ([args.phase] if args.phase else phases_of(stage_of(_section(record))))])
         elif args.command == "apply":
             if not args.phase or not args.plan:
                 raise X.StagingError("apply needs --phase and --plan: phases are applied one reviewed plan at a time")
-            X.emit(apply(record, kube, args.phase, X.load_plan(args.plan), args.plan_digest, fetch))
+            X.emit(apply(record, kube, args.phase, X.load_plan(args.plan), args.plan_digest, fetch, now))
         else:
             out = verify(record, kube)
             X.emit(out)

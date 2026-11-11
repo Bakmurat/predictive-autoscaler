@@ -1,0 +1,138 @@
+{
+ "schema": "c28-params/v1",
+ "run_id": "c28-demo-smoke",
+ "namespace": "demo",
+ "control_namespace": "pa-eval-system",
+ "image": "localhost/c28-fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+ "nodes": {
+  "workload": "pa-c28-demo-worker",
+  "support": "pa-c28-demo-worker2"
+ },
+ "reservation": {
+  "taint_key": "c28.devkuban.com/reserved",
+  "taint_value": "c28-smoke-owner",
+  "role_label": "c28.devkuban.com/role"
+ },
+ "fixture": {
+  "work_iterations": 2000,
+  "response_bytes": 512,
+  "max_inflight": 2,
+  "max_queue": 32,
+  "queue_timeout_seconds": 1.5,
+  "cpu_request": "50m",
+  "cpu_limit": "100m",
+  "memory_request": "32Mi",
+  "memory_limit": "32Mi"
+ },
+ "ingress": {
+  "cpu_request": "100m",
+  "cpu_limit": "500m",
+  "memory_request": "64Mi",
+  "memory_limit": "64Mi"
+ },
+ "proxy": {
+  "cpu_request": "20m",
+  "cpu_limit": "100m",
+  "memory_request": "16Mi",
+  "memory_limit": "32Mi"
+ },
+ "routes": {
+  "metrics_upstream": "vm.monitoring.svc:8428",
+  "metrics_query_path": "/",
+  "forecast_upstream": "pa-eval-predictive-autoscaler-forecaster.pa-eval-system.svc:8443"
+ },
+ "priority_class": "c28-demo-fixture",
+ "quota": {
+  "name": "c28-demo-fixture-quota",
+  "pods_normal": 64
+ },
+ "scrape": "annotations",
+ "release": "pa-eval",
+ "release_network_policies": false,
+ "residency": {
+  "workload": {
+   "allocatable": {
+    "cpu": "4",
+    "memory": "8Gi"
+   },
+   "system_requests": {
+    "cpu": "300m",
+    "memory": "512Mi"
+   }
+  },
+  "support": {
+   "allocatable": {
+    "cpu": "4",
+    "memory": "8Gi"
+   },
+   "system_requests": {
+    "cpu": "300m",
+    "memory": "512Mi"
+   }
+  },
+  "support_extra": []
+ },
+ "demonstration": {
+  "run_id": "c28-demo-smoke",
+  "reservation_ref": {
+   "run_id": "c28-smoke-owner",
+   "taint_value": "c28-smoke-owner",
+   "nodes": {
+    "workload": {
+     "name": "pa-c28-demo-worker",
+     "uid": "00000000-0000-4000-8000-000000000001"
+    },
+    "support": {
+     "name": "pa-c28-demo-worker2",
+     "uid": "00000000-0000-4000-8000-000000000002"
+    }
+   }
+  },
+  "targets": [
+   {
+    "name": "c28-demo-pa-n",
+    "role": "forecast",
+    "families": [
+     "seasonalNaive"
+    ]
+   },
+   {
+    "name": "c28-demo-pa-r",
+    "role": "reactive"
+   }
+  ],
+  "profile": "s20",
+  "shadow_replicas": 3,
+  "bounds": {
+   "min": 1,
+   "max": 12
+  },
+  "capacity_per_replica_rps": 2,
+  "capacity_label": "provisional",
+  "capacity_source_calibration": "c28cal-0000000000",
+  "cadence": {
+   "grid_seconds": 60,
+   "update_interval_seconds": 60
+  },
+  "min_lead_seconds": 600,
+  "schedule_origin_utc": "2026-11-01T00:00:00Z",
+  "peak_multiple": 9,
+  "program": {
+   "kind": "ordinary",
+   "seed": 301,
+   "days": 28
+  },
+  "generator": {
+   "image": "grafana/k6@sha256:70af91f86cd8e142e0544a4edaf79835a80033f71974b92edd5ac36fd4442a7b",
+   "k6_version": "0.57.0",
+   "resources": {
+    "cpu_request": "250m",
+    "cpu_limit": "1",
+    "memory_request": "256Mi",
+    "memory_limit": "512Mi"
+   },
+   "segment_hours": 24,
+   "remote_write_url": "http://vm.monitoring.svc:8428/api/v1/write"
+  }
+ }
+}

@@ -132,18 +132,33 @@ def capacity_rps(c0: float) -> str:
 def validate(p: Dict) -> None:
     """The FULL c28-params/v1 validation: every field the experiment consumes is complete and well-formed, and no
     value anywhere is still a template placeholder. It includes every stage validation (validate_stage)."""
-    missing = [k for k in REQUIRED if k not in p]
+    _validate(p, experiment=True)
+
+
+# The experiment-only quantities: the uncapped calibrated capacity c0, the CPU HPA's tuned target and the KEDA settings.
+# A stage that runs no H-CPU or H-RPS arm and takes its capacity from its own reviewed field (the demonstration) never
+# consumes them: they may be absent or still placeholders there, and no dummy value is ever filled in for them.
+EXPERIMENT_ONLY = ("c0_rps", "hpa_cpu_target_percent", "keda")
+
+
+def _validate(p: Dict, experiment: bool) -> None:
+    """validate()'s checks, in its order. experiment=False (the demonstration stage, demo.validate) leaves out exactly
+    the EXPERIMENT_ONLY fields and the reservation stage's "taint_value is the run_id" rule (the demonstration occupies
+    another run's reservation by explicit reference, which demo.problems checks instead)."""
+    required = REQUIRED if experiment else tuple(k for k in REQUIRED if k not in EXPERIMENT_ONLY)
+    missing = [k for k in required if k not in p]
     if missing:
         raise ParamsError(f"missing parameters: {', '.join(missing)}")
     if p["schema"] != "c28-params/v1":
         raise ParamsError("schema must be c28-params/v1")
-    validate_stage(p, "reservation")
+    if experiment:
+        validate_stage(p, "reservation")
     for key in ("run_id", "namespace", "control_namespace", "priority_class"):
         if not _DNS.match(str(p[key])) or len(str(p[key])) > 40:
             raise ParamsError(f"{key} must be a short DNS label")
     if not _DIGEST_IMAGE.match(p["image"]):
         raise ParamsError("image must be pinned by digest (no tags, never latest)")
-    if not (isinstance(p["c0_rps"], (int, float)) and p["c0_rps"] > 0):
+    if experiment and not (isinstance(p["c0_rps"], (int, float)) and p["c0_rps"] > 0):
         raise ParamsError("c0_rps must be a positive number (the calibrated per-replica capacity)")
     for role in ("workload", "support"):
         if not _DNS.match(str(p["nodes"].get(role, ""))):
@@ -162,7 +177,7 @@ def validate(p: Dict) -> None:
         for req, lim, fn in parse:
             if fn(p[res][req]) <= 0 or fn(p[res][req]) > fn(p[res][lim]):
                 raise ParamsError(f"{res}.{req} must be positive and at most {res}.{lim}")
-    if p["hpa_cpu_target_percent"] not in F.HPA_CPU_CANDIDATES:
+    if experiment and p["hpa_cpu_target_percent"] not in F.HPA_CPU_CANDIDATES:
         raise ParamsError(f"hpa_cpu_target_percent must be one of the tuning candidates {F.HPA_CPU_CANDIDATES}")
     if p["scrape"] not in ("PodMonitor", "VMPodScrape", "annotations"):
         raise ParamsError("scrape must be PodMonitor, VMPodScrape or annotations")
@@ -177,13 +192,13 @@ def validate(p: Dict) -> None:
         if not isinstance(routes.get(k), str) or not routes[k].strip():
             raise ParamsError(f"routes.{k} is required (host:port)")
     url = metrics_query_url(p)
-    if p["keda"]["server_address"] != url:
+    if experiment and p["keda"]["server_address"] != url:
         raise ParamsError(f"keda.server_address must be exactly the evaluation metrics route's query URL ({url}): "
                           "the RPS outage reaches H-RPS, and KEDA queries the same API path as the operator and the "
                           "forecaster")
     if "residency" in p:
         residency_params(p)
-    left = placeholder_fields(p)
+    left = placeholder_fields(p if experiment else {k: v for k, v in p.items() if k not in EXPERIMENT_ONLY})
     if left:
         raise ParamsError(f"still placeholders: {', '.join(left)}")
 
@@ -196,9 +211,16 @@ def validate(p: Dict) -> None:
 # run_id (the taint value and the run label of evaluation pods), nodes.workload/support (bound to the record's
 # name+UID), reservation.taint_key/taint_value/role_label, and control_namespace + release (occupant classification:
 # the evaluation release's pods on S count as evaluation pods). Capacity calibration on the reserved W comes after it.
+# The demonstration stage (c28/demo.py; LIVE-DEMO-PLAN section 5) consumes every field its own objects are rendered
+# from and nothing of the comparison experiment: no c0_rps, no hpa_cpu_target_percent, no keda.* (EXPERIMENT_ONLY).
 STAGE_FIELDS = {
     "reservation": ("schema", "run_id", "nodes.workload", "nodes.support", "reservation.taint_key",
                     "reservation.taint_value", "reservation.role_label", "control_namespace", "release"),
+    "demonstration": ("schema", "run_id", "namespace", "control_namespace", "release", "image", "nodes.workload",
+                      "nodes.support", "reservation.taint_key", "reservation.taint_value", "reservation.role_label",
+                      "fixture", "ingress", "proxy", "routes.metrics_upstream", "routes.metrics_query_path",
+                      "routes.forecast_upstream", "priority_class", "quota", "scrape", "release_network_policies",
+                      "residency", "demonstration"),
 }
 _LABEL_NAME = re.compile(r"^[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$")
 _DNS_SUBDOMAIN = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$")
@@ -231,6 +253,16 @@ def stage_problems(p: Dict, stage: str) -> List[str]:
         raise ValueError(f"unknown params stage {stage!r} (known: {', '.join(sorted(STAGE_FIELDS))})")
     if not isinstance(p, dict):
         return ["the params must be a JSON object"]
+    if stage == "demonstration":
+        from . import demo                     # demo imports this module: resolved at call time
+        return demo.problems(p)
+    return _reservation_problems(p, run_owned=True)
+
+
+def _reservation_problems(p: Dict, run_owned: bool) -> List[str]:
+    """The reservation stage's checks. run_owned=False (the demonstration, which occupies ANOTHER run's reservation by
+    explicit reference) leaves out only "reservation.taint_value must be the run_id"; demo.problems binds the taint
+    value to the referenced reservation instead."""
     out: List[str] = []
     if p.get("schema") != "c28-params/v1":
         out.append("schema must be c28-params/v1")
@@ -272,7 +304,7 @@ def stage_problems(p: Dict, stage: str) -> List[str]:
         out.append("reservation.taint_value is still a placeholder")
     elif not (isinstance(tv, str) and _LABEL_NAME.match(tv)):
         out.append("reservation.taint_value must be a label value")
-    elif isinstance(p.get("run_id"), str) and tv != p["run_id"]:
+    elif run_owned and isinstance(p.get("run_id"), str) and tv != p["run_id"]:
         out.append("reservation.taint_value must be the run_id")
     return out
 
@@ -465,10 +497,12 @@ def metrics_query_url(p: Dict) -> str:
     return base if path == "/" else base + path
 
 
-def eval_release_values(p: Dict) -> Dict:
+def eval_release_values(p: Dict, stage: str = "experiment") -> Dict:
     """The evaluation release's chart values that bind it to the routes: metrics through the metrics route at its
-    query path (metrics_query_url, the same URL KEDA uses), the forecaster through the forecast route with the route's name in the certificate (verification stays on)."""
-    validate(p)
+    query path (metrics_query_url, the same URL KEDA uses), the forecaster through the forecast route with the route's name in the certificate (verification stays on).
+    `stage`: "experiment" (the full validation, the default) or a STAGE_FIELDS stage that renders the release
+    ("demonstration"): the values are the same function of the same fields."""
+    validate(p) if stage == "experiment" else validate_stage(p, stage)
     fr = route_host(p, "forecast")
     out = {"prometheus": {"url": metrics_query_url(p)},
            "operator": {"watchNamespaces": [p["namespace"]], "forecasterAddress": f"{fr}:8443",
@@ -652,8 +686,18 @@ def _writer(p: Dict, arm: str, profile: str, target: str) -> Dict:
                          "triggers": [{"type": "prometheus", "metricType": "AverageValue", "metadata": {
                              "serverAddress": metrics_query_url(p), "query": rps_query(target), "threshold": c,
                              "ignoreNullValues": "false"}}]}}
-    extra = (0, 0) if arm == "PA-R" else (F.EXTRA_MAX_REPLICAS, F.EXTRA_MAX_PERCENT)
+    return pa_object(p, target, labels, profile, c, reactive_only=arm == "PA-R", families=F.PA_FAMILIES[arm])
+
+
+def pa_object(p: Dict, target: str, labels: Dict[str, str], profile: str, capacity: str, reactive_only: bool,
+              families: Iterable[str]) -> Dict:
+    """One PredictiveAutoscaler in Recommend, as every PA arm is rendered (and the demonstration's two targets, which
+    reuse it): reactive_only writes the predictive extra as an explicit zero (PA-R: forecasts never add replicas),
+    otherwise the frozen extra; `families` is spec.prediction.families; `capacity` the capacityPerReplica string."""
+    ns = p["namespace"]
+    extra = (0, 0) if reactive_only else (F.EXTRA_MAX_REPLICAS, F.EXTRA_MAX_PERCENT)
     budget = F.PROFILE_STARTUP_BUDGET[profile]
+    c = capacity
     pa = {"apiVersion": "autoscaling.devkuban.com/v1alpha1", "kind": "PredictiveAutoscaler",
           "metadata": {"name": target, "namespace": ns, "labels": labels},
           "spec": {"mode": "Recommend", "targetDeployment": {"name": target, "namespace": ns},
@@ -669,7 +713,7 @@ def _writer(p: Dict, arm: str, profile: str, target: str) -> Dict:
                                   "calibration": {"minWindows": F.CALIBRATION_MIN, "maxScores": F.CALIBRATION_MAX,
                                                   "retentionDays": F.RETENTION_DAYS},
                                   "predictiveExtra": {"maxReplicas": extra[0], "maxPercent": extra[1]},
-                                  "families": list(F.PA_FAMILIES[arm])},
+                                  "families": list(families)},
                    "behavior": {"scaleDown": {"headroomPercent": F.PA_HEADROOM_PERCENT},
                                 "startup": {"fallbackDelaySeconds": budget, "minimumDelaySeconds": budget,
                                             "actuationAllowanceSeconds": F.ACTUATION_ALLOWANCE_S}}}}
@@ -679,7 +723,15 @@ def _writer(p: Dict, arm: str, profile: str, target: str) -> Dict:
 def render_arm(p: Dict, arm: str, profile: str) -> List[Dict]:
     validate(p)
     target = target_name(arm, profile)
-    ns, labels = p["namespace"], _labels(p, arm, profile, target)
+    labels = _labels(p, arm, profile, target)
+    return [*target_objects(p, target, labels, profile, FIXED_REPLICAS), _writer(p, arm, profile, target)]
+
+
+def target_objects(p: Dict, target: str, labels: Dict[str, str], profile: str, replicas: int) -> List[Dict]:
+    """One fixture target without its writer: the EMPTY fault ConfigMap, the Deployment (the calibrated fixture
+    resources, probes and placement, identical for every arm and for the demonstration's targets) and the Service.
+    The caller has validated the params (validate, or its stage)."""
+    ns = p["namespace"]
     fx = p["fixture"]
     faults_cm = {"apiVersion": "v1", "kind": "ConfigMap",
                  "metadata": {"name": f"{target}-faults", "namespace": ns, "labels": labels},
@@ -709,13 +761,13 @@ def render_arm(p: Dict, arm: str, profile: str) -> List[Dict]:
                     "volumes": [{"name": "faults", "configMap": {"name": f"{target}-faults", "optional": True}}]}}
     deployment = {"apiVersion": "apps/v1", "kind": "Deployment",
                   "metadata": {"name": target, "namespace": ns, "labels": labels},
-                  "spec": {"replicas": FIXED_REPLICAS, "revisionHistoryLimit": 2,
+                  "spec": {"replicas": replicas, "revisionHistoryLimit": 2,
                            "selector": {"matchLabels": {TARGET_LABEL: target}},
                            "strategy": {"type": "RollingUpdate", "rollingUpdate": {"maxSurge": 0, "maxUnavailable": 1}},
                            "template": pod}}
     service = {"apiVersion": "v1", "kind": "Service", "metadata": {"name": target, "namespace": ns, "labels": labels},
                "spec": {"selector": {TARGET_LABEL: target}, "ports": [{"name": "http", "port": 80, "targetPort": "http"}]}}
-    return [faults_cm, deployment, service, _writer(p, arm, profile, target)]
+    return [faults_cm, deployment, service]
 
 
 def _proxy(p: Dict, name: str, upstream: str, port: int) -> List[Dict]:
@@ -747,8 +799,13 @@ def render_common(p: Dict) -> List[Dict]:
     """Run-wide objects: the PriorityClass and its scoped ResourceQuota (the quota fault), the ingress (on the workload
     node, routing /t/<target>/ to every target of the run) and the two evaluation-owned fault routes."""
     validate(p)
+    return common_objects(p, [target_name(a, pr) for pr in F.PROFILES for a in F.ARMS])
+
+
+def common_objects(p: Dict, targets: List[str]) -> List[Dict]:
+    """render_common's objects for an explicit target list (the ingress routes /t/<target>/ to exactly these). The
+    caller has validated the params (validate, or its stage)."""
     ns, labels = p["namespace"], _labels(p)
-    targets = [target_name(a, pr) for pr in F.PROFILES for a in F.ARMS]
     ups = ",".join(f"{t}=http://{t}.{ns}.svc" for t in targets)
     pc = {"apiVersion": "scheduling.k8s.io/v1", "kind": "PriorityClass", "metadata": {"name": p["priority_class"],
           "labels": labels}, "value": 0, "globalDefault": False, "preemptionPolicy": "Never",
@@ -942,8 +999,15 @@ def _m(cpu: Decimal) -> str:
     return f"{format(Decimal(cpu).normalize(), 'f')}m"
 
 
-def residency_report(p: Dict, objs: List[Dict] = None, chart: Optional[Dict] = None) -> Dict:
+def residency_report(p: Dict, objs: List[Dict] = None, chart: Optional[Dict] = None, *, all_loaded: bool = False,
+                     max_replicas: Optional[int] = None, generator_jobs: bool = True) -> Dict:
     """The evaluation's maximum resident requests on W and S against 75 % of each node's allocatable.
+
+    The keyword options serve a stage whose targets are all loaded at once and whose generator is a rendered workload
+    (the demonstration, demo.residency_report); the defaults are the comparison experiment's accounting, unchanged:
+    all_loaded counts EVERY fixture target at max_replicas (default the frozen maximum) plus overlap_pods, instead of
+    one loaded arm and the others idle; generator_jobs=False leaves out the budgeted generator Jobs (the rendered
+    generator is counted from its own pod template, like every other rendered pod on S).
 
     W: the ten fixture arms, all but one at idle_arm_replicas, the loaded arm (the largest per-pod request, so the worst
        case) at maxReplicas plus overlap_pods, plus every other rendered pod pinned to W (the ingress) at its replicas.
@@ -976,7 +1040,12 @@ def residency_report(p: Dict, objs: List[Dict] = None, chart: Optional[Dict] = N
             else:
                 replicas = 1 if o["kind"] in ("Pod", "Job", "CronJob") else int(o["spec"].get("replicas", 1))
                 add(role, name, replicas, cpu, mem)
-    if arms:
+    top = F.MAX_REPLICAS if max_replicas is None else _count(max_replicas, "max_replicas", 1, F.MAX_REPLICAS)
+    if arms and all_loaded:
+        for name, cpu, mem in arms:
+            add("workload", name, top, cpu, mem, "loaded target at maxReplicas (every target is loaded at once)")
+            add("workload", f"{name} overlap", r["overlap_pods"], cpu, mem, "rollout/termination overlap")
+    elif arms:
         idle, overlap = r["idle_arm_replicas"], r["overlap_pods"]
         loaded = max(arms, key=lambda a: (a[1], a[2]))
         for name, cpu, mem in arms:
@@ -993,7 +1062,8 @@ def residency_report(p: Dict, objs: List[Dict] = None, chart: Optional[Dict] = N
         if cpu < want[0] or mem < want[1]:
             under.append(f"the evaluation release's {name} requests {_m(cpu)}/{_mi(mem)}, below its declared budget "
                          f"{_m(want[0])}/{_mi(want[1])} (residency.{name}): the chart values must request it")
-    add("support", "generator Jobs", r["generator_concurrent"], *r["generator"], "concurrent generators")
+    if generator_jobs:
+        add("support", "generator Jobs", r["generator_concurrent"], *r["generator"], "concurrent generators")
     for name, replicas, cpu, mem in r["support_extra"]:
         add("support", name, replicas, cpu, mem)
     out = {"limit_fraction": F.RESIDENCY_LIMIT_FRACTION, "idle_arm_replicas": r["idle_arm_replicas"],
