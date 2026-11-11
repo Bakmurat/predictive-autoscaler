@@ -433,6 +433,26 @@ Two series carry `namespace` and `autoscaler` (the PredictiveAutoscaler's name) 
 `predictive_autoscaler_forecasting_enabled` (1 unless `spec.prediction.enabled` is false). They disappear with the
 autoscaler. The forecasting service exports its own metrics as well.
 
+The same two labels carry what a dashboard needs to follow one autoscaler through a reconcile. A value that does not
+exist has no series (nothing is shown as 0 that was not measured, decided or confirmed), and no label holds free
+text: reasons and outcomes are fixed names, anything else is `Other`. The stage, decision, capacity and forecast series
+describe the last reconcile that reached a decision: a reconcile that ends before that (no target, an invalid query)
+removes them, so an old value is never shown as current.
+
+| Series | Meaning |
+|---|---|
+| `predictive_autoscaler_mode{mode}` | 1 for the current mode (`Recommend` or `Active`), 0 for the other. |
+| `predictive_autoscaler_condition_reason{type, reason}` | One series with value 1 per condition, labelled with its current reason (for example `type="ScalingActive", reason="TargetNotAllowed"`). |
+| `predictive_autoscaler_decision_action{action}` | One series with value 1: what the last decision did (`scale_up`, `hold_stabilizing`, `recommend`, `conflict_hold`, ...), the `action` of the decision record. |
+| `predictive_autoscaler_calculated_replicas` | Stage 1: the calculated count, in any mode. |
+| `predictive_autoscaler_requested_replicas` | Stage 2: the count the write path intended: the target of a write attempt, or the held count. A final guard may still have prevented the write (see `scale_writes_total`). Active mode only; absent when nothing was intended (Recommend, a paused target, a conflict, a target that is not allowed). |
+| `predictive_autoscaler_applied_replicas`, `predictive_autoscaler_applied_timestamp_seconds` | Stage 3: the last write the API server confirmed, and when. Absent until this operator process has written once, and removed when the Deployment or the autoscaler is replaced by another object; a switch to Recommend keeps it. |
+| `predictive_autoscaler_target_replicas`, `predictive_autoscaler_target_ready_replicas` | Stages 4 and 5: the Deployment's desired and Ready replicas as the last reconcile read them. |
+| `predictive_autoscaler_scale_writes_total{result}` | Write attempts by outcome: `applied`; `stale` (the target changed since the decision); `guard_abort`; `not_allowed`; `read_failed` (nothing was sent); `rejected` (the API server refused it); `unknown` (no answer: the write may or may not have been applied). Every outcome starts at 0. |
+| `predictive_autoscaler_capacity_per_replica_rps{source}` | The configured capacity of one replica in requests per second and the field it comes from (`capacityPerReplica` or `targetRPS`). |
+| `predictive_autoscaler_prediction_selected_family{family}`, `predictive_autoscaler_prediction_used_family{family}` | Forecast contract v2: the family the service selected in the last verified forecast, trusted or not, and the family of the forecast the operator accepted into its calculation and still accepted at the final check (absent when it accepted none; accepted does not mean it added replicas or that a write happened). |
+| `predictive_autoscaler_prediction_lead_seconds`, `predictive_autoscaler_prediction_issued_timestamp_seconds`, `predictive_autoscaler_prediction_window_start_timestamp_seconds`, `predictive_autoscaler_prediction_window_end_timestamp_seconds`, `predictive_autoscaler_prediction_valid_until_timestamp_seconds` | Forecast contract v2: the last verified forecast's lead, when it was issued, the future window it covers and until when it may authorize a write. A forecast's values are about its window, not about the time it was issued: plot them against the window. |
+
 ### Forecast quality (forecast contract v2, preview)
 
 The statistical forecasting service (forecast contract v2, `window-max-rps/v1`; in development, not in the current
