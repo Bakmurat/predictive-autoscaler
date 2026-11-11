@@ -469,8 +469,9 @@ class ForecastService:
         if self._compacted_s is None or now_s - self._compacted_s >= self.config.compact_every_seconds:
             store.compact(now_s)          # only checkpoint-covered, fully matured windows leave the journal
             self._compacted_s = now_s
-        self._export(bound, state, grid, now_s, token)
-        return self._response(bound, iss.payload())
+        payload = iss.payload()
+        self._export(bound, state, grid, now_s, token, payload)
+        return self._response(bound, payload)
 
     @staticmethod
     def _refuse_late(bound: BoundRequest, now_ms: int) -> None:
@@ -706,8 +707,19 @@ class ForecastService:
         check_response(r, bound)
         return r.to_wire()
 
-    def _export(self, bound: BoundRequest, state: Dict, grid, now_s: int, token: Optional[int] = None) -> None:
+    def _export(self, bound: BoundRequest, state: Dict, grid, now_s: int, token: Optional[int] = None,
+                issued: Optional[Dict] = None) -> None:
+        """Publish the autoscaler's samples. `issued` is the committed forecast this request answers with: each of
+        its candidates is shown as issued, trusted or not (a shadow candidate is visible before it may act), with the
+        window it is about and the trust gate's reason for it. A candidate without an upper bound has none here."""
         trusted = {m: h.get("trusted", False) for m, h in state["trust"].items() if m in RECIPES}
+        latest, reasons = {}, {}
+        for model, c in ((issued or {}).get("candidates") or {}).items():
+            latest[model] = {"upper_window_rps": c["upper_window_max_rps"], "base_window_rps": c["base_window_max_rps"],
+                             "latest_issued_timestamp_seconds": issued["issued_at_ms"] / 1000,
+                             "latest_window_start_timestamp_seconds": issued["window_start"],
+                             "latest_window_end_timestamp_seconds": issued["window_end"]}
+            reasons[model] = issued["verdict"]["candidates"][model]["reason"]
         failures = dict(self.worker.failures) if self.worker is not None else {}
         models = {}
         first = next((ts for ts, v in zip(grid.timestamps, grid.values) if v is not None), now_s)
@@ -715,7 +727,8 @@ class ForecastService:
             models[model] = model_samples(ledger=m["ledger"], calibration=m["calibration"],
                                           nominal_miscoverage=bound.settings.risk.miscoverage_bps / 10_000,
                                           trusted=trusted.get(model, False), history_seconds=max(0, now_s - first),
-                                          now_s=now_s, fit_failures=failures if model == "statistical" else None)
+                                          now_s=now_s, fit_failures=failures if model == "statistical" else None,
+                                          latest=latest.get(model), trust_reason=reasons.get(model))
         self.metrics.update(bound.signal.namespace, bound.autoscaler_name,
                             Snapshot(bound.signal.autoscaler_uid, models), token)
 

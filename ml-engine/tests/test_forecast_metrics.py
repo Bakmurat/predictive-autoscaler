@@ -66,8 +66,13 @@ def test_missing_denominators_remove_series_instead_of_exporting_zero():
     names = {s.name for s in samples(registry(m))}
     for absent in ("window_coverage_ratio", "outcome_availability_ratio", "window_mae_rps", "window_bias_rps",
                    "window_pinball_loss_rps", "step_mae_rps", "evidence_age_seconds", "upper_window_rps",
-                   "base_window_rps"):
+                   "base_window_rps", "prediction_availability_ratio", "trust_reason",
+                   "latest_issued_timestamp_seconds", "latest_window_start_timestamp_seconds",
+                   "latest_window_end_timestamp_seconds"):
         assert M.PREFIX + absent not in names, absent
+    # The denominator itself is exported: 0 expected origins says the ratio is unknown, not that it is 0.
+    expected = [s.value for s in samples(registry(m)) if s.name == M.PREFIX + "prediction_expected_windows"]
+    assert expected == [0.0, 0.0, 0.0]
     scored = [s for s in samples(registry(m)) if s.name == M.PREFIX + "scored_windows"]
     assert scored and all(s.value == 0 for s in scored)                 # a count of zero is a real zero
     trusted = [s.value for s in samples(registry(m)) if s.name == M.PREFIX + "trusted"]
@@ -221,3 +226,45 @@ def test_the_services_own_series_are_bounded_and_label_free():
                    **{(p + "autoscaler_slot_releases_total", (("reason", r),)): float(r == "not_found")
                       for r in M.RELEASE_REASONS}}
     assert not p.startswith(M.PREFIX) and not any(n.startswith(M.PREFIX) for n, _ in got)
+
+
+def test_the_prediction_availability_is_the_trust_gates_own_figure():
+    f = good()
+    s = dict(((n, e), v) for n, e, v in M.model_samples(ledger=f.ledger, calibration=None, nominal_miscoverage=0.1,
+                                                       trusted=True, history_seconds=1, now_s=NOW))
+    gate = T.availability(f.ledger, NOW)["predictions"]
+    assert gate is not None and s[("prediction_availability_ratio", ())] == gate
+    issued, expected = s[("prediction_issued_windows", ())], s[("prediction_expected_windows", ())]
+    assert expected == T.expected_opportunities(f.ledger, NOW, 86400) > 0 and issued / expected == gate
+    assert issued <= expected                                            # never above 1: retries do not count twice
+
+
+def test_the_latest_forecast_is_published_as_issued_and_never_made_up():
+    kw = dict(ledger=good().ledger, calibration=None, nominal_miscoverage=0.1, trusted=False, history_seconds=1, now_s=NOW)
+    shown = {"upper_window_rps": None, "base_window_rps": 4.0, "latest_issued_timestamp_seconds": NOW + 0.25,
+             "latest_window_start_timestamp_seconds": NOW + 600, "latest_window_end_timestamp_seconds": NOW + 660}
+    s = dict(((n, e), v) for n, e, v in M.model_samples(**kw, latest=shown, trust_reason="CalibrationInsufficient"))
+    assert ("upper_window_rps", ()) not in s                             # no bound was issued: none is shown
+    assert s[("base_window_rps", ())] == 4.0 and s[("trusted", ())] == 0.0   # an untrusted candidate is still shown
+    assert s[("latest_issued_timestamp_seconds", ())] == NOW + 0.25
+    assert (s[("latest_window_start_timestamp_seconds", ())], s[("latest_window_end_timestamp_seconds", ())]) == \
+        (NOW + 600, NOW + 660)
+    assert [(n, e) for n, e in s if n == "trust_reason"] == [("trust_reason", ("CalibrationInsufficient",))]
+    bare = dict(((n, e), v) for n, e, v in M.model_samples(**kw))        # the candidate was not in the forecast
+    assert not any(n in M.LATEST_KEYS or n == "trust_reason" for n, _ in bare)
+
+
+def test_a_trust_reason_outside_the_contract_is_refused():
+    m = M.ForecastMetrics()
+    kw = dict(ledger=good().ledger, calibration=None, nominal_miscoverage=0.1, trusted=False, history_seconds=1, now_s=NOW)
+    for bad in ("timeout", "made up: Get https://10.0.0.1", ""):         # a fit-failure reason is another enum
+        with pytest.raises(ValueError):
+            m.update("shop", "web", M.Snapshot("uid-1", {"seasonal_naive": M.model_samples(**kw, trust_reason=bad)}))
+    assert m.update("shop", "web", M.Snapshot("uid-1", {"seasonal_naive": M.model_samples(**kw, trust_reason="Ready")}))
+    assert M.label_values("trust_reason") == c_reasons() and M.label_values("fit_failures_total") == M.FIT_FAILURE_REASONS
+    assert M.label_values("trusted") == ()
+
+
+def c_reasons():
+    from forecasting.contracts import REASONS
+    return REASONS

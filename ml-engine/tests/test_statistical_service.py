@@ -189,6 +189,40 @@ def test_matured_windows_calibrate_the_bound_and_feed_the_metrics(tmp_path):
     assert 'predictive_autoscaler_forecast_calibration_windows{autoscaler="web-pa",model="seasonal_naive"' in text
 
 
+def exported(svc, model="seasonal_naive"):
+    """{(metric suffix, extra label value or None): value} of one model's series."""
+    from forecasting.metrics import PREFIX
+    out = {}
+    for family in svc.metrics.collect():
+        for s in family.samples:
+            if s.labels.get("model") == model:
+                extra = [v for k, v in s.labels.items() if k not in ("namespace", "autoscaler", "model")]
+                out[(s.name[len(PREFIX):], extra[0] if extra else None)] = s.value
+    return out
+
+
+def test_the_committed_forecast_is_exported_while_untrusted(tmp_path):
+    svc, clock = make(tmp_path)
+    first = c.response_from_wire(ask(svc, clock, T0))                  # cold start: a point forecast, no bound yet
+    e = exported(svc)
+    assert first.upper_window_max_rps is None and ("upper_window_rps", None) not in e    # never a made-up bound
+    assert e[("base_window_rps", None)] == first.base_window_max_rps and e[("trusted", None)] == 0.0
+    assert e[("latest_issued_timestamp_seconds", None)] == first.issued_at_ms / 1000
+    assert (e[("latest_window_start_timestamp_seconds", None)], e[("latest_window_end_timestamp_seconds", None)]) == \
+        (first.window_start, first.window_end)
+    assert [k for k in e if k[0] == "trust_reason"] == [("trust_reason", first.reason)] and first.reason != "Ready"
+    assert e[("prediction_expected_windows", None)] == e[("prediction_issued_windows", None)] == 1.0
+    assert e[("prediction_availability_ratio", None)] == 1.0
+    out = [c.response_from_wire(w) for w in run(svc, clock, 96, start=T0 + DT)]    # 8 hours: calibrated, not trusted
+    last, e = out[-1], exported(svc)
+    assert last.upper_window_max_rps is not None and last.predictive_eligible is False
+    assert e[("upper_window_rps", None)] == last.upper_window_max_rps      # the shadow bound, shown as issued
+    assert e[("base_window_rps", None)] == last.base_window_max_rps and e[("trusted", None)] == 0.0
+    assert e[("latest_window_start_timestamp_seconds", None)] == last.window_start > first.window_start
+    assert [k for k in e if k[0] == "trust_reason"] == [("trust_reason", last.reason)]      # one reason, the current one
+    assert not exported(svc, "statistical").keys() & {("base_window_rps", None), ("trust_reason", last.reason)}
+
+
 # --- restarts: keep verified state, or start over -----------------------------------------------------------------
 
 def test_a_restart_continues_exactly_where_it_stopped(tmp_path):
