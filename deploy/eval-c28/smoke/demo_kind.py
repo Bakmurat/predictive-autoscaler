@@ -317,8 +317,62 @@ def phase_verdicts(reduction, phases):
                 "no_response": sum(x["no_response"] for x in g),
                 "dropped": {k: sum(x["dropped"][k] for x in g) for k in ("late", "inflight", "segment_end")},
                 "late_max_ms": max([x.get("late_max_ms", 0) for x in g] or [0]),
+                # Minutes the reducer could confirm against the ingress AND in which requests were served: the
+                # positive evidence evidence_problems() asks for.
+                "observed_served": sum(1 for r in rows if r["state"] == "observed" and r["generator"]["ok"] > 0),
                 "forbidden": sorted(x for x in reasons if x in FORBIDDEN)}
     return out
+
+
+# The phases demo-kind.sh --replacement runs, the ones in which every target must be seen served, and the fewest
+# memory samples that count as a measurement of the timeout phase (one sample every 3 s: 30 s of it).
+PHASES = ("restarts", "replacement", "steady", "timeout", "recovery")
+SERVED_PHASES = ("steady", "recovery")
+MIN_MEMORY_SAMPLES = 10
+
+
+def evidence_problems(verdicts, memory, timeout, phases, targets, unanswered):
+    """What the verdict needs to have SEEN, so that evidence that is missing never reads as a pass: the absence of a
+    forbidden reason proves nothing when no minute was observed, and a memory maximum of 0 is no measurement.
+
+    - every phase ran;
+    - in the steady and recovery phases each target has an observed minute with served requests (the restart and
+      replacement phases keep their declared gaps: nothing is asked of them here);
+    - in the timeout phase the unanswered target has failed requests and every other target an observed, served minute;
+    - the generator's memory limit is known and the timeout phase holds real samples below it."""
+    problems = [f"phase {name} is missing from the phases file" for name in PHASES if name not in phases]
+
+    def served(name, target):
+        return ((verdicts.get(name) or {}).get(target) or {}).get("observed_served", 0)
+    if not targets:
+        problems.append("the configuration names no target")
+    for name in SERVED_PHASES:
+        for target in targets if name in phases else ():
+            if served(name, target) < 1:
+                problems.append(f"phase {name}, target {target}: no minute was observed with served requests "
+                                "(no positive evidence from the generator and the ingress together)")
+    if "timeout" in phases:
+        if unanswered not in targets:
+            problems.append(f"the unanswered target {unanswered!r} is not one of the targets {sorted(targets)}")
+        if timeout is None or not timeout["minutes"]:
+            problems.append("the timeout phase holds no minute line of the unanswered target")
+        elif timeout["failed_total"] == 0:
+            problems.append("the timeout phase produced no failed request: the target kept answering")
+        for target in targets:
+            if target != unanswered and served("timeout", target) < 1:
+                problems.append(f"phase timeout, target {target}: no minute was observed with served requests "
+                                "(the other target must stay served while one does not answer)")
+        limit = memory.get("limit_bytes")
+        window = (memory.get("windows") or {}).get("timeout") or {}
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+            problems.append(f"the generator's memory limit is unknown ({limit!r}): nothing to compare the memory with")
+        if window.get("samples", 0) < MIN_MEMORY_SAMPLES or window.get("max_current_bytes", 0) <= 0:
+            problems.append(f"the timeout phase holds {window.get('samples', 0)} memory samples with a largest value of "
+                            f"{window.get('max_current_bytes', 0)} bytes (at least {MIN_MEMORY_SAMPLES} samples above "
+                            "0 needed): the generator's memory was not measured")
+        elif isinstance(limit, int) and limit > 0 and memory["max_bytes"] >= limit:
+            problems.append("the generator's memory reached its limit")
+    return problems
 
 
 def timeout_load(lines, cfg, target, window):
@@ -400,11 +454,8 @@ def analyse(a):
         if i["start_record"] != "valid" or i["flags"]:
             problems.append(f"incarnation {i['incarnation']} ({i['target']}): start record {i['start_record']}, "
                             f"flags {i['flags']}")
-    if tl is not None:
-        if tl["failed_total"] == 0:
-            problems.append("the timeout phase produced no failed request: the target kept answering")
-        if memory["limit_bytes"] and memory["max_bytes"] >= memory["limit_bytes"]:
-            problems.append("the generator's memory reached its limit")
+    problems += evidence_problems(verdicts, memory, tl, phases, list(cfg["targets"]),
+                                  ph.get("unanswered_target"))
     out = {"schema": "c28-demo-kind-smoke/v1", "config_digest": cfg["digest"], "label": cfg["label"],
            "origin_utc": cfg["origin_utc"], "segment_minutes": cfg["segment_minutes"],
            "max_inflight": cfg["max_inflight"], "log": log_stats, "records": red["records"],
@@ -504,6 +555,56 @@ def selftest():
     assert v["one"][t]["states"] == {"observed": 1, "unknown": 1} and v["one"][t]["forbidden"] == []
     assert v["two"][t]["forbidden"] == ["duplicate_generators"]
     assert v["three"][t]["minutes"] == 2                                 # a minute counts in every phase it overlaps
+    assert v["one"][t]["observed_served"] == 1 and v["two"][t]["observed_served"] == 0
+    # The verdict asks for what was SEEN. A complete run passes; each missing piece of evidence fails, in particular
+    # no memory sample at all (a maximum of 0 is below any limit) and no ingress evidence (no minute is observed, so
+    # no minute carries a forbidden reason either).
+    o = "c28-y"
+    names = {"restarts": [0, 60_000], "replacement": [60_000, 120_000], "steady": [120_000, 180_000],
+             "timeout": [180_000, 240_000], "recovery": [240_000, 300_000]}
+    served = {"start_ms": 0, "state": "observed", "reasons": [], "intended": 5, "generator": g}
+    failing = {"start_ms": 0, "state": "partial", "reasons": [], "intended": 5, "generator": dict(g, ok=0, failed=5)}
+
+    def reduction(rows_of):
+        return {"targets": {x: {"rows": [dict(r, start_ms=m * 60_000) for m, r in enumerate(rows_of(x))]}
+                            for x in (t, o)}}
+    full = phase_verdicts(reduction(lambda x: [served, served, served, failing if x == t else served, served]), names)
+    mem_ok = memory_summary([{"t_ms": 180_000 + 3_000 * i, "container": "c1", "current": 400 + i, "peak": 500}
+                             for i in range(MIN_MEMORY_SAMPLES)], 1000, names)
+    load_ok = {"minutes": [{}], "failed_total": 5}
+    assert evidence_problems(full, mem_ok, load_ok, names, [t, o], t) == []
+
+    def flagged(needle, verdicts=full, mem=mem_ok, load=load_ok, phases=names, targets=(t, o), unanswered=t):
+        found = evidence_problems(verdicts, mem, load, phases, list(targets), unanswered)
+        assert any(needle in p for p in found), (needle, found)
+        return found
+    flagged("memory was not measured", mem=memory_summary([], 1000, names))               # every sample deleted
+    flagged("memory was not measured", mem=memory_summary(
+        [{"t_ms": 10 + i, "container": "c1", "current": 400, "peak": 500} for i in range(50)], 1000, names))  # none in the phase
+    flagged("memory was not measured", mem=memory_summary(
+        [{"t_ms": 180_000 + i, "container": "c1", "current": None, "peak": None} for i in range(50)], 1000, names))
+    flagged("memory was not measured", mem=memory_summary(
+        [{"t_ms": 180_000 + i, "container": "c1", "current": 400, "peak": 500} for i in range(MIN_MEMORY_SAMPLES - 1)],
+        1000, names))
+    for limit in (None, 0, True):
+        flagged("memory limit is unknown", mem=dict(mem_ok, limit_bytes=limit))
+    flagged("reached its limit", mem=dict(mem_ok, limit_bytes=500))
+    # No ingress evidence: the reducer observes no minute (here every row unknown), and nothing is forbidden.
+    blind = phase_verdicts(reduction(lambda x: [dict(served, state="unknown", reasons=["ingress_gap"])] * 5), names)
+    assert all(v2[x]["forbidden"] == [] for v2 in blind.values() for x in v2)
+    found = flagged("phase steady, target c28-x: no minute was observed", verdicts=blind)
+    assert sum("no minute was observed" in p for p in found) == 5, found   # steady and recovery x 2, timeout x the other
+    flagged("phase recovery, target c28-y", verdicts=phase_verdicts(
+        reduction(lambda x: [served, served, served, failing if x == t else served,
+                             dict(served, generator=dict(g, ok=0)) if x == o else served]), names))  # observed, nothing served
+    flagged("phase timeout, target c28-y", verdicts=phase_verdicts(
+        reduction(lambda x: [served, served, served, failing, served]), names))            # both targets failed
+    flagged("kept answering", load={"minutes": [{}], "failed_total": 0})
+    flagged("holds no minute line", load={"minutes": [], "failed_total": 0})
+    flagged("holds no minute line", load=None)
+    flagged("phase steady is missing", phases={k: v2 for k, v2 in names.items() if k != "steady"})
+    flagged("is not one of the targets", unanswered="c28-z")
+    flagged("names no target", targets=())
     cfg2 = {"origin_ms": 0, "minute_ms": 60_000, "timeout_ms": 2_000, "max_inflight": 505}
     ls = [{"target": t, "minute": 5, "intended": 9000, "dispatched": 9000, "ok": 0, "failed": 9000,
            "failed_by": {"0": 9000}, "dropped": {"inflight": 0}, "lat": {"max_ms": 0}},
@@ -512,7 +613,7 @@ def selftest():
     load = timeout_load(ls, cfg2, t, [310_000, 350_000])
     assert load["inflight_reached"] == 300.0 and load["failed_total"] == 9000 and len(load["minutes"]) == 1
     print("demo_kind selftest: restarts and their gaps, replay detection, the pod timeline (never two objects), "
-          "container exits, memory, phase verdicts and the in-flight arithmetic: OK")
+          "container exits, memory, phase verdicts, the in-flight arithmetic and the evidence a pass needs: OK")
     return 0
 
 

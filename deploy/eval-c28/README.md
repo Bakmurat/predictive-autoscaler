@@ -479,6 +479,12 @@ into an in-cluster VictoriaMetrics.
 - *Reducer over the whole smoke* (19 minutes per target, the log collected continuously): 11 `observed`, 7
   `partial` (`incarnation_boundary` at each restart, `ingress_gap` in the first minute of the series), 1 `unknown`
   (the deletion); no forbidden reason, every incarnation with a valid start record, no lost line.
+- *What a pass needs to have seen* (`demo_kind.py`, `evidence_problems`; added after review, the run above passes
+  it unchanged). Missing evidence fails instead of reading as "nothing wrong": every phase ran; in the steady and
+  recovery phases each target has an `observed` minute with served requests; in the timeout phase the unanswered
+  target has failed requests and the other target an `observed`, served minute; the memory limit is known and the
+  timeout phase holds at least 10 memory samples above 0. With the run's memory samples removed, or its ingress
+  evidence replaced by `{}`, the analysis now fails (both passed before).
 - *Seen in the first run and changed.* k6's per-request warnings (above). And the fixture's INGRESS container was
   restarted about a minute after the packets TO a target's pods were dropped (a network blackhole); its exit reason
   was not captured. The smoke now drops the target's responses instead (the ingress stayed up). A blackholed target
