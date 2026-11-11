@@ -351,7 +351,12 @@ class ForecastService:
 
     def _reopen_store(self) -> None:
         """Reopen the journal (or open it at last, when it never opened) and forget what was derived from the old
-        connection: every epoch's state is read again from its checkpoint, as after a restart."""
+        connection: every epoch's state is read again from its checkpoint, as after a restart.
+
+        Two different cases. A journal this process HAD opened is only ever recovered: the same identity, never a
+        new file (ForecastStore.reopen). A journal that never opened since the process started (self.store is None)
+        is opened as at start-up, and that first open may initialize an empty or missing file: nothing was held
+        before, so nothing is replaced."""
         if self.store is None:
             try:
                 store = self._open_store()                  # the start-up checks ...

@@ -265,7 +265,10 @@ def test_recovery_never_creates_a_journal(tmp_path, configured):
 
 
 @pytest.mark.parametrize("key_,value", [("observation_extra_seconds", "not-an-int"), ("created_at_ms", ""),
-                                         ("observation_extra_seconds", None), ("store_id", "")])
+                                         ("observation_extra_seconds", None), ("store_id", ""),
+                                         ("observation_extra_seconds", "-172800"), ("created_at_ms", "-1"),
+                                         ("observation_extra_seconds", " 86400"), ("observation_extra_seconds", "1e5"),
+                                         ("retention_horizon", "soon")])
 def test_malformed_metadata_is_a_corrupt_journal_and_a_failed_reopen_is_never_healthy(tmp_path, key_, value):
     path = tmp_path / "j.sqlite"
     s = ForecastStore(str(path), clock=ManualClock(T0 * 1000))
@@ -282,6 +285,26 @@ def test_malformed_metadata_is_a_corrupt_journal_and_a_failed_reopen_is_never_he
             s.reopen()
         assert not s.healthy and s.problem                         # the service issues nothing while this holds
     s.close()
+
+
+def test_a_negative_observation_retention_never_deletes_observations_inside_their_retention(tmp_path):
+    # Review of PR #66: with observation_extra_seconds = -172800 a reopen reported healthy and the next compaction
+    # deleted an observation 60 seconds old despite the one-day retention. The journal is refused instead, at reopen
+    # and at a fresh start alike, and the observation is still there.
+    path = tmp_path / "j.sqlite"
+    clock = ManualClock(T0 * 1000)
+    s = ForecastStore(str(path), clock=clock, retention_seconds=DAY, observation_retention_seconds=DAY)
+    s.record_observations("signal:" + "0" * 64, [(T0 - 60, 1.0, T0 * 1000)], SRC)
+    s._db.execute("DROP TRIGGER meta_fixed")
+    s._db.execute("UPDATE meta SET value = '-172800' WHERE key = 'observation_extra_seconds'")
+    s._fail("simulated I/O failure")
+    with pytest.raises(StoreCorrupt, match="observation_extra_seconds"):
+        s.reopen()
+    assert not s.healthy
+    s.close()
+    with pytest.raises(StoreCorrupt, match="observation_extra_seconds"):
+        ForecastStore(str(path), clock=clock, retention_seconds=DAY, observation_retention_seconds=DAY)
+    assert raw(path).execute("SELECT count(*) FROM observations").fetchone()[0] == 1
 
 
 def test_an_unforeseen_error_in_reopen_leaves_the_store_failed_with_a_store_error(tmp_path):

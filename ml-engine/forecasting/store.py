@@ -22,9 +22,11 @@ What it guarantees (design C2, section 6):
     is still full or corrupt stays failed with the new reason; the caller spaces the attempts (forecasting.service).
     A fresh or lost store starts a new epoch; it never presents itself as evidence it does not hold. Recovery
     accepts only the journal this process opened: the identity is remembered from the first successful open, also
-    when none was configured, and a journal with another identity is refused. Recovery never CREATES a journal
+    when none was configured, and a journal with another identity is refused. reopen() never CREATES a journal
     either: a file that is gone or empty keeps the store failed until the service is restarted, which is the one
-    place where a new journal (a new identity, evidence from nothing) begins. A recovery that ends in any error,
+    place where a new journal (a new identity, evidence from nothing) begins. (A service whose journal could not be
+    opened at all at start has no store yet; its retries are first opens, which may initialize an empty file: that
+    is the start-up path repeated, not a recovery. See ForecastService._reopen_store.) A recovery that ends in any error,
     expected or not, leaves the store failed.
 The quota is enforced twice: SQLite's max_page_count (a hard SQLITE_FULL) and a check of database + WAL size plus
 the write's own size (its payload and an allowance for rows, indexes and page rounding: conservative accounting
@@ -331,10 +333,17 @@ class ForecastStore:
                 raise StoreCorrupt("the journal has no store identity")
             if store_id is not None and sid != store_id:
                 raise StoreCorrupt("the journal belongs to another store identity")
-            try:
-                obs_extra, created = int(meta["observation_extra_seconds"]), int(meta["created_at_ms"])
-            except (KeyError, TypeError, ValueError) as e:
-                raise StoreCorrupt(f"the journal's metadata is malformed ({type(e).__name__}: {e})") from e
+            # Every number the journal's retention is computed from must be what this code writes: a plain
+            # non-negative decimal integer. A negative observation retention would make compaction delete
+            # observations still inside their retention; a horizon that is not a number disables the triggers.
+            numbers = {}
+            for name in ("observation_extra_seconds", "created_at_ms", "retention_horizon"):
+                v = meta.get(name)
+                if not isinstance(v, str) or not v.isascii() or not v.isdigit():
+                    raise StoreCorrupt(f"the journal's metadata is malformed: {name} is {v!r}, not a non-negative "
+                                       "integer")
+                numbers[name] = int(v)
+            obs_extra, created = numbers["observation_extra_seconds"], numbers["created_at_ms"]
             self.store_id = sid
             self._obs_extra = obs_extra                                  # the file's own, fixed at creation
             self.created_at_ms = created
