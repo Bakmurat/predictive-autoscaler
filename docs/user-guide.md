@@ -225,7 +225,7 @@ current generation, and a calculated replica count. The Deployment does not chan
 | `ScalingActive` | Scaling is permitted: Active mode, a target above 0 replicas, no conflict, the check succeeded, no guard abort, a capacity configured, telemetry measured. It does not mean a write happened; `Applied`, `lastScaleTime` and the `ScaledUp`/`ScaledDown` events show writes. | `Active`; `RecommendMode`; `TargetPaused` (the Deployment has 0 desired replicas: nothing is written in any mode, see [Pausing a target](#pausing-a-target)); `CapacityMissing` (holding because no per-replica capacity is configured); `TelemetryHold` (holding because the rate is unavailable); `BoundsEnforced` (nothing could be measured or calculated, and the count was outside `[minReplicas, maxReplicas]`: it is brought inside them, and the message says whether that was written); `Conflict` (another writer); `CheckFailed` (the coexistence check failed); `GuardAborted` (a last-moment check stopped a write; it retries within seconds); or the failure reason from `Ready`. |
 | `ConflictDetected` | Another replica writer targets the Deployment. | `NoConflict` (False); `ReplicaWriter` (True: an HPA, an unpaused KEDA ScaledObject, another Active PredictiveAutoscaler or a legacy-group autoscaler); `CheckFailed` (status `Unknown`: the check could not finish, which blocks writes like a conflict). |
 | `VPAInterference` | A VerticalPodAutoscaler changes the pods' requests. | `None` (False); `VPAUpdatesPods` (True: a VPA in any mode except `Off`; scaling continues, but per-pod capacity may drift); `CheckFailed` (status `Unknown`). |
-| `PredictionReady` | Engine `statistical` only: the operator verified the last forecast as usable now (ready to activate; Recommend still makes no writes). | `Ready` (True). False with the forecasting service's reason (`HistoryInsufficient`, `CalibrationInsufficient`, `ShadowInsufficient`, `CoverageLow`, `DataUnavailable`, `IdentityMismatch`, `StateUnavailable`, `LeadInsufficient`, `ReplayGateMissing`) or the operator's own: `SettingsInvalid`, `CapacityMissing`, `RequestRefused` (the service refused the request), `ForecastRejected` (the answer failed the operator's checks), `NotEligible`, `EvidenceInsufficient`, `EvidenceStale`, `IssuedInFuture`, `DeadlinePassed`. Collecting evidence is normal: decisions are reactive meanwhile. |
+| `PredictionReady` | Engine `statistical` only: the operator verified the last forecast as usable now (ready to activate; Recommend still makes no writes). | `Ready` (True). False with the forecasting service's reason (`HistoryInsufficient`, `CalibrationInsufficient`, `ShadowInsufficient`, `CoverageLow`, `DataUnavailable`, `IdentityMismatch`, `StateUnavailable`, `ConfigurationNotValidated` (the grid, lead, target and family set are not a configuration the trust rules were validated for: see "Validated configurations" in section 11), `LeadInsufficient`, `ReplayGateMissing`) or the operator's own: `SettingsInvalid`, `CapacityMissing`, `RequestRefused` (the service refused the request), `ForecastRejected` (the answer failed the operator's checks), `NotEligible`, `EvidenceInsufficient`, `EvidenceStale`, `IssuedInFuture`, `DeadlinePassed`. Collecting evidence is normal: decisions are reactive meanwhile. |
 | `ScaleOutBlocked` | A scale-out cannot complete. | `Unschedulable` (a pod the scheduler cannot place), `QuotaExceeded` or `FailedCreate` (the ReplicaSet cannot create pods) (True); `None` (False); `PodsUnreadable` (status `Unknown`: the operator may not read the target's ReplicaSets or pods); `OwnershipUnresolved` (status `Unknown`: the Deployment's current ReplicaSet could not be identified with certainty). Only the current ReplicaSet's pods count. |
 | `ScaleDownHeadroom` | A scale-down is held to keep headroom. | `Holding` (True); `NotHolding` (headroom is not blocking a scale-down; it says nothing about how much spare capacity exists); `RecommendMode`. Informational: never affects `Ready` or `ScalingActive`. |
 
@@ -446,7 +446,11 @@ The upper bound is the point peak plus a calibrated multiple of a **scale** that
 differed from the same time one day earlier at each load level, so the margin is wider at high load when the noise is.
 The fit needs samples one day apart for at least 80 % of a day, so about 1.8 days of history
 (with engine `statistical`, `prediction.historyDays` below 2 is refused, at admission and by the forecaster): a younger signal gets point forecasts without a bound. Each forecast
-records the scale it was issued with.
+records the scale it was issued with. A limit to know: in the acceptance simulations the bound kept its coverage
+across load levels for continuous noise, but not for very low or discrete load. With request counts around 0.5 per
+second or less (zero at night) the middle load range was covered about 80 % of the time instead of 90 %, while
+windows with a zero forecast were covered almost always. For a workload that idles at or near zero the bound is not
+validated.
 
 Its series (all listed here) carry `namespace`, `autoscaler` and `model` (`seasonal_naive`, `statistical` or `lstm`),
 and at most one more fixed label:
@@ -477,12 +481,35 @@ model), and over the last day at least 95 % of the due windows scored and 95 % o
 window whose outcome is overdue (its data deadline passed without one) counts as not scored, and an origin without a
 forecast counts as a missed opportunity. Evidence belongs to one model version (recipe): a new recipe starts again. A
 trusted model that fails a gate is demoted at once; it is trusted again only after its gates have held for 24 hours and
-32 new windows. The three miss limits are not fixed percentages: each is the smallest count that a correctly calibrated
-forecast reaches by chance with at most a budgeted probability, so that all of them together demote such a forecast
-in at most 5 % of weeks (shared by the enabled model families). They depend on the lead: at a 180-second lead with
-the default 90 % target and both families enabled, 19 misses among the last 64 windows or 6 in a row; a day of 480
-windows fails at 72 misses.
-A new window result is one look of these tests; asking again without a new result changes nothing. The statistical model is used only when it is trusted **and** has beaten a trusted seasonal-naive
+32 new windows. A new window result is one look of these tests; asking again without a new result changes nothing.
+
+*How the miss limits are set, and what that does and does not show.* The four coverage rules (misses among the last 64
+windows, misses in a row, a completed day, the last 7 days) are not fixed percentages. Each threshold is computed
+under one stated model of the misses: they occur at the target rate, and a miss follows a miss with probability 0.175
+(a two-state Markov chain, started in its steady state; with the default 90 % target an independent sequence would
+have 0.10). Under that model the four rules together demote a correctly calibrated forecast with probability at most
+5 % in 7 days, shared by the enabled families. This is a computed property of the model, not a promise for every
+workload: real misses can cluster differently, and nothing is claimed for them beyond what was measured.
+
+*Validated configurations.* The rules are qualified by a simulation job that runs the complete monitor
+(`ml-engine/evaluation/trust_qualification.py`), with acceptance rules frozen beforehand: at most 5 % false coverage
+demotions in 7 days, and a bound that misses 40 % of the time detected within 64 windows in at least 95 % of cases;
+on independent misses, on noise without serial dependence and on strongly autocorrelated noise (AR(1), coefficient
+0.7 per minute). The allowlist holds **one configuration**: a 60-second grid (`sampleIntervalSeconds: 60`), a
+600-second lead (`minLeadSeconds: 600`), the default 90 % target and `families: [seasonalNaive]`, with the default
+calibration, trust and timing settings. Only a configuration on the allowlist can become `PredictionReady`. Every other configuration is forecast, calibrated,
+scored and reported in exactly the same way, and stays reactive with the reason `ConfigurationNotValidated`: at shorter
+leads the same rules false-alarmed too often on autocorrelated noise or detected too slowly, and no other lead, grid,
+target or family set has been validated. A second model family needs its own evidence. At the validated
+configuration the limits are 18 misses among the last 64 windows, 7 in a row, 29 in a completed day of 144 windows,
+and for the last 7 days a coverage below 85 % together with a miss count a correctly calibrated forecast would
+almost never reach (153 of 1,008 windows in a full week; 59 of 288 after two days).
+
+*What it costs.* The limits react to clear miscalibration, not to a mild one. At a 600-second lead 64 windows are
+about 10 hours 40 minutes, so even a bound that misses 40 % of the time can stay trusted for hours; a bound that
+misses every time is demoted after at most 7 windows (about 70 minutes). A moderate sustained undercoverage (for
+example 15 to 20 % misses instead of 10 %) is caught slowly or not at all, because a week of windows at a long lead
+cannot tell it from noise at this false-alarm budget. The statistical model is used only when it is trusted **and** has beaten a trusted seasonal-naive
 forecast on the same windows (spanning at least 48 hours) for 24 hours in a row; it is then kept until it does worse
 than the seasonal-naive forecast, so small differences do not make the choice flip back and forth, but any safety
 failure falls back at once. Otherwise the seasonal-naive forecast is used when trusted, and otherwise scaling stays
@@ -493,11 +520,14 @@ forecast windows is not a latency or error-rate guarantee.
 **What the operator does with it** (`spec.prediction.engine: statistical`). It never takes the service's word for a
 write. It publishes the lead it needs: a startup budget (pod creation to Ready of the current ReplicaSet's pods once 20
 starts are measured, otherwise `spec.behavior.startup.fallbackDelaySeconds`), plus a decision interval and an allowance
-that also covers the time from the scale request to the pod's creation. A pod that has never been Ready and is already
+that also covers the time from the scale request to the pod's creation; and never less than
+`spec.prediction.minLeadSeconds` when that is set (rounded up to the grid; the measured startup delay is not changed by
+it). A pod that has never been Ready and is already
 older than the budget raises it; a pod that was Ready and failed a readiness probe, an evicted pod and a terminating pod
 do not. The lead never gets shorter by itself, and a start too slow for the forecast horizon switches the forecast off
 (`LeadInsufficient`) while reactive scaling continues; changing `spec.behavior.startup` starts again from the current
-budget. It asks for the window starting at the current
+budget. The forecast covers the window from the next grid step to the lead: a longer lead widens that window, it
+does not mean scaling exactly that long before a rise. It asks for the window starting at the current
 grid time and checks the answer itself: identity, settings, window, an upper bound backed by enough evidence, and enough
 time left in the window, checked again right before the write. Only then does the bound count:
 `ceil(bound / capacityPerReplica)` replicas, but never more than `spec.prediction.predictiveExtra` above the reactive need

@@ -1,48 +1,61 @@
-"""Acceptance protocol B of the trust repair: the operating characteristics of the coverage rules
-(forecasting.trust, policy budgeted-coverage-tests/v1), measured. This is the reproducible QUALIFICATION JOB of the
-protocol (T5): it is expensive and is not part of the unit-test run; tests/test_trust_monitor.py guards the same
-characteristics cheaply (exact arithmetic and a small fixed-seed simulation).
+"""Acceptance protocol B of the trust repair, amendment 2: the operating characteristics of the coverage rules
+(forecasting.trust, policy budgeted-coverage-tests/v2) at ONE profile, measured through the complete monitor. This is
+the reproducible QUALIFICATION JOB (protocol T5): it is expensive and is not part of the unit-test run;
+tests/test_trust_monitor.py guards the same characteristics cheaply.
 
-Declared before any validation result exists:
+Everything below was frozen, with the implementation and the thresholds, in the commit that introduced it, BEFORE any
+validation seed was read. The validation is run once.
 
-  - Targets. False alarms: P(any false coverage demotion of a target within 7 days) <= 5 %, all coverage rules and
-    all enabled families together, under the nominal model. Detection: >= 95 % probability that a sustained 40 %
-    miscoverage is detected within 64 newly matured gate outcomes.
-  - Nominal model. (N0) independent gate misses at the nominal rate: exact arithmetic (the union bound the
-    thresholds are derived from, trust.rolling_limit / day_limit / consecutive_bound_ppm). (N1) the repaired
-    calibration running on the declared independent noise models of evaluation.calibration_acceptance (additive,
-    proportional, mixed): the bound's real miss sequence, with the adaptive level, the scale refits and the service's
-    timing. The AR(1) variants of those models are the declared serially dependent models: reported, not part of the
-    nominal model, and a missed target there is reported as missed.
-  - What one path is. One signal path per seed; the product's seasonal-naive forecast and calibration issue a bound
-    for every cohort window (calibration_acceptance.simulate); the candidate becomes Trusted at the first evaluation
-    where every gate holds (48 h after its first bound, 64 bounds); a FALSE ALARM is a demotion by the coverage gate
-    within the 7 days after that. The estimate for a target with F enabled families is F times the per-candidate
-    probability (Bonferroni: valid under any dependence between the families).
-  - The monitor. fast_monitor evaluates the rules at every evaluation where their state can change (a folded gate
-    outcome, an hour boundary of the 7-day window, a completed day, the end of the shadow period), with the limits
-    of trust.coverage_limits. real_monitor drives the product's own functions (trust.note_issuance, note_outcome,
-    evaluate with its hysteresis) at EVERY request of the grid, overlapping windows included, with a restart
-    (the state through JSON, as a checkpoint) at chosen requests; `equivalence` checks that both give the same
-    first trust, the same demotions with the same rules and the same re-promotions on the same paths.
-  - Detection. Gate misses that are independent at the nominal rate up to a change point and at 40 % (also 50 %,
-    and 100 %: an abrupt all-miss step) after it; detection = a coverage rule failing at one of the first 64
-    outcomes after the change, CONDITIONAL ON AN ELIGIBLE STATE AT THE CHANGE (protocol amendment 1): a path on which
-    a rule failed at any outcome of the pre-change stretch is not eligible there (it is alarmed, or demoted with its
-    re-promotion dwell possibly still running); it is excluded from the denominator and reported separately, never
-    counted as a detection. The serially dependent variant thresholds a latent Gaussian AR(1) series whose
-    coefficient is AR_RHO ** (lead / 60 s), the dependence the declared AR(1) noise leaves between consecutive cohort
-    windows. Wall time from the change to the demotion being visible: outcomes x lead + settlement + one request
-    interval.
-  - Seeds. DEVELOPMENT_SEEDS chose the thresholds (procedure in `select`). VALIDATION_SEEDS are frozen: run once
-    after the thresholds are frozen, and nothing is tuned afterwards.
-  - Uncertainty. Probabilities over independent paths with 95 % Wilson intervals. A target is MET when the whole
+  - Profile. Grid 60 s, lead 600 s, seasonal-naive only (one family), nominal miscoverage 10 %, default calibration,
+    trust and outcome-timing settings: contracts.VALIDATED_PROFILES[0]. Nothing here says anything about another
+    lead, grid, risk or family set.
+  - Targets (unchanged). False alarms: P(any false coverage demotion of a target within 7 days) <= 5 %, the four
+    coverage rules together (rolling, consecutive, completed day, seven-day). Detection: >= 95 % probability that a
+    sustained 40 % miscoverage is detected within 64 newly matured gate outcomes.
+  - Named models (the qualification is EMPIRICAL under these; it is not a guarantee for a class of miss processes).
+      bernoulli           independent gate misses at 10 %, one outcome per lead;
+      additive, proportional, mixed
+                          the product's calibration (calibration_acceptance.simulate: seasonal-naive forecast, scale
+                          refits, adaptive level, the service's timing) on the declared independent noise models;
+      additive_ar1, proportional_ar1, mixed_ar1
+                          the same on the declared AR(1) noise, rho = 0.7 per 60 s sample: the stress model.
+  - One path. One seed gives one signal path (or one Bernoulli sequence). The candidate becomes Trusted at the first
+    evaluation where every gate holds (48 h after its first bound, 64 bounds). fast_monitor evaluates the four rules,
+    the shadow gate and the hysteresis at every evaluation where their state can change, with the limits of
+    trust.coverage_limits; real_monitor drives the product's own functions at every request, with restarts, and
+    `equivalence` (and the unit tests) check that both give the same promotions, demotions, rules and re-promotions.
+  - False alarm of a path: a demotion by the coverage gate within the 7 days after the first promotion.
+  - Detection on a path. The change falls at the first gate window that ends a day plus a seeded uniform part of a
+    day after the first promotion (so anywhere in the diurnal cycle). A path is ELIGIBLE when the candidate has been
+    Trusted without interruption since before the change is first folded (so no rule is failing then); the others
+    are excluded from the denominator and counted. From the change on the misses are replaced by:
+      independent   independent misses at 40 % (also 50 %, and 100 %: an abrupt all-miss step);
+      clustered     (calibrated paths only) the path's own normalized scores (y - base) / sigma above a fixed
+                    threshold: the miss sequence a too-low bound would give, WITH the model's own serial dependence.
+                    The thresholds (CLUSTERED_SCORE) are the pooled 60th and 50th percentiles of the post-shadow
+                    scores of the development paths, frozen here; the miss rate they realize on the validation paths
+                    is reported. The adaptive calibration's reaction after the change is left out by the definition
+                    of "sustained".
+    Detected: a coverage demotion at or before the request that folds the 64th changed outcome. Delay: changed
+    outcomes folded at the demotion, and wall time from the start of the first changed window to the demoting
+    request (the lead, the settlement and the request grid included); 64 outcomes are 64 x 600 s + 120 s + 60 s.
+  - Acceptance rules. Probabilities over independent paths with 95 % Wilson intervals. A cell is MET when the whole
     interval is on the right side, NOT MET when the estimate is on the wrong side, INCONCLUSIVE otherwise.
+      criterion cells, false alarms: each of the seven sources;
+      criterion cells, detection:    independent 40 % on each of the seven sources, clustered 40 % on each of the six
+                                     calibrated sources.
+    The profile is qualified only if every criterion cell is MET. Reported beside them, not criteria: the 50 % and
+    all-miss cases, the delays, the rules behind each alarm, re-promotion within 48 h, the excluded paths.
+  - Seeds. DEVELOPMENT_SEEDS were used by the feasibility work (R8) and to freeze CLUSTERED_SCORE. VALIDATION_SEEDS
+    were never read before the freeze. Per path: the signal from calibration_acceptance.signal(model, seed); Bernoulli
+    misses from default_rng([seed, 1001]); the change point and the post-change draws from default_rng([seed, 1002]).
+  - `latent_detection` (below) is a SEPARATE model: exceedances of a latent Gaussian AR(1) series. It is not the miss
+    process of the calibrated bound and is not claimed equivalent to it; it is a cheap guard for the unit tests.
 
-  python -m evaluation.trust_qualification select --out select.json                 # development seeds only
-  python -m evaluation.trust_qualification false-alarms --seeds validation --out false-alarms.json
-  python -m evaluation.trust_qualification detection --seeds validation --out detection.json
-  python -m evaluation.trust_qualification equivalence --seeds validation --paths 12 --out equivalence.json
+  python -m evaluation.trust_qualification validate --seeds validation --sources bernoulli,additive,... --out a.json
+  python -m evaluation.trust_qualification report a.json b.json --out validation.json     # readings and tables
+  python -m evaluation.trust_qualification equivalence --seeds development --paths 12 --out equivalence.json
+  python -m evaluation.trust_qualification clustered-thresholds --out thresholds.json    # development seeds only
 """
 
 from __future__ import annotations
@@ -61,37 +74,36 @@ import numpy as np
 from evaluation import calibration_acceptance as acceptance
 from forecasting import calibration as cal
 from forecasting import trust as T
-from forecasting.contracts import TrustSettings
+from forecasting.contracts import VALIDATED_PROFILES, TrustSettings
 
 DAY, HOUR = 86400, 3600
 SETTLEMENT, GRACE = 120, 600
 NOMINAL_BPS = 1000
 FALSE_ALARM_TARGET, DETECTION_TARGET, DETECTION_OUTCOMES = 0.05, 0.95, 64
-PATH_DAYS = {180: 12, 300: 12, 1200: 14}                 # first bound + 48 h shadow + 7 days, with margin
-# (grid seconds, lead seconds, declared): the two evaluation profiles carry the criteria; the default 300 s grid with
-# a 1200 s lead is reported beside them.
-CONFIGS = ((60, 180, True), (60, 300, True), (300, 1200, False))
+GRID, LEAD = 60, 600                                     # the profile (contracts.VALIDATED_PROFILES[0])
+FAMILIES = 1                                             # seasonal-naive only
+PATH_DAYS = 12                                           # first bound + 48 h shadow + 7 days + a change + 64 outcomes
 NOMINAL_MODELS = ("additive", "proportional", "mixed")
 DEPENDENT_MODELS = ("additive_ar1", "proportional_ar1", "mixed_ar1")
-FAMILIES = (1, 2)
+BERNOULLI = "bernoulli"
+SOURCES = (BERNOULLI,) + NOMINAL_MODELS + DEPENDENT_MODELS
+INDEPENDENT_CASES = (("independent 40 %", 0.4), ("independent 50 %", 0.5), ("all-miss step", 1.0))
+CLUSTERED_CASES = (("clustered 40 %", 0), ("clustered 50 %", 1))
+CRITERION_CASES = ("independent 40 %", "clustered 40 %")
 
-DEVELOPMENT_SEEDS = tuple(range(200_000, 201_000))
-VALIDATION_SEEDS = tuple(range(950_000, 951_000))        # frozen; run once after the thresholds are frozen
-# Paths per cell of the false-alarm run (the first so many seeds of the set): the nominal models on the declared
-# configurations get every seed; the dependent models and the reported configuration fewer (they are reported, and the
-# reported configuration needs the slower exact kernel).
-PATHS_DEPENDENT, PATHS_REPORTED = 500, 300
-DETECTION_DEVELOPMENT_SEED, DETECTION_VALIDATION_SEED = 20_261_110, 95_000_001
-DETECTION_TRIALS = 400_000
-
-# The threshold sets `select` compares (development seeds): n of the rolling window and the three budgets, in ppm per
-# target and 7 days. Only triples whose sum is within the 5 % target are compared, so the exact bound under
-# independent nominal misses holds by construction for every lead, nominal rate and family count.
-GRID_N = (32, 48, 64)
-GRID_ROLLING_PPM = (20_000, 25_000, 30_000, 33_000, 35_000, 40_000)
-GRID_CONSECUTIVE_PPM = (5_000, 7_000, 10_000)
-GRID_DAY_PPM = (5_000, 8_000, 10_000)
-BUDGET_PPM = 50_000
+DEVELOPMENT_SEEDS = tuple(range(310_000, 311_000))
+VALIDATION_SEEDS = tuple(range(1_260_000, 1_264_000))    # frozen; never read before the freeze; run once
+BERNOULLI_STREAM, CHANGE_STREAM = 1001, 1002
+# The clustered alternative's score thresholds per calibrated source: (60th, 50th) pooled percentile of the normalized
+# scores of the DEVELOPMENT paths after the shadow period (`clustered-thresholds`). Frozen before validation.
+CLUSTERED_SCORE: Dict[str, Tuple[float, float]] = {
+    "additive": (0.1464, 0.0),
+    "proportional": (0.1401, 0.0003),
+    "mixed": (0.1427, -0.0003),
+    "additive_ar1": (0.1931, 0.0008),
+    "proportional_ar1": (0.1868, 0.0005),
+    "mixed_ar1": (0.1905, 0.0006),
+}
 
 
 # --- gate outcomes of one path ----------------------------------------------------------------------------------------
@@ -106,6 +118,7 @@ class GateOutcomes:
     miss: np.ndarray
     first_bound_origin: int
     last_origin: int
+    score: Optional[np.ndarray] = None            # normalized score (y - base) / sigma of each outcome (calibrated paths)
 
 
 def request_origin(t: int, grid: int, offset: int = acceptance.REQUEST_OFFSET) -> int:
@@ -113,9 +126,8 @@ def request_origin(t: int, grid: int, offset: int = acceptance.REQUEST_OFFSET) -
     return -(-(t - offset) // grid) * grid
 
 
-def gate_outcomes(model: str, seed: int, grid: int, lead: int, days: Optional[int] = None) -> GateOutcomes:
+def gate_outcomes(model: str, seed: int, grid: int = GRID, lead: int = LEAD, days: int = PATH_DAYS) -> GateOutcomes:
     """One path of the declared model through the repaired calibration (calibration_acceptance.simulate)."""
-    days = days or PATH_DAYS[lead]
     x = acceptance.signal(acceptance.MODEL[model], seed, days, grid)
     p = acceptance.policy(lead)
     kernel = "fast" if p.max_scores * lead < p.retention_seconds - DAY else "exact"
@@ -128,7 +140,20 @@ def gate_outcomes(model: str, seed: int, grid: int, lead: int, days: Optional[in
     # not only a cohort origin).
     first = request_origin(int(path.origin[scaled[p.min_windows - 1]]) + lead + SETTLEMENT, grid)
     return GateOutcomes(grid, lead, (path.origin[bounded] + lead).astype(np.int64),
-                        (path.y[bounded] > path.upper[bounded]).astype(np.int64), first, int(path.origin[-1]))
+                        (path.y[bounded] > path.upper[bounded]).astype(np.int64), first, int(path.origin[-1]),
+                        (path.y[bounded] - path.base[bounded]) / path.sigma[bounded])
+
+
+def bernoulli_outcomes(seed: int, grid: int = GRID, lead: int = LEAD, days: int = PATH_DAYS,
+                       rate: float = NOMINAL_BPS / T.BPS) -> GateOutcomes:
+    """Independent gate misses at `rate`: one outcome per lead from the first window, bounded from the start."""
+    ends = np.arange(lead, days * DAY + 1, lead, dtype=np.int64)
+    miss = (np.random.default_rng([seed, BERNOULLI_STREAM]).random(len(ends)) < rate).astype(np.int64)
+    return GateOutcomes(grid, lead, ends, miss, 0, int(ends[-1]) - lead)
+
+
+def source_outcomes(source: str, seed: int) -> GateOutcomes:
+    return bernoulli_outcomes(seed) if source == BERNOULLI else gate_outcomes(source, seed)
 
 
 # --- the rules at every evaluation where their state can change ---------------------------------------------------------
@@ -178,8 +203,11 @@ def fast_monitor(out: GateOutcomes, t: TrustSettings, families: int, *, offset: 
     bounded7 = seen - idx_lo
     covered7 = bounded7 - (cs[seen] - cs[idx_lo])
     threshold = (1.0 - NOMINAL_BPS / T.BPS) - t.coverage_tolerance_bps / 10_000
+    k7 = np.array([lim.seven_day_misses(int(b)) for b in np.unique(bounded7)])
+    need = k7[np.searchsorted(np.unique(bounded7), bounded7)]
     with np.errstate(divide="ignore", invalid="ignore"):
-        fail["seven_day"] = (bounded7 == 0) | (covered7 / np.maximum(bounded7, 1) < threshold)
+        fail["seven_day"] = (bounded7 == 0) | ((covered7 / np.maximum(bounded7, 1) < threshold) &
+                                               (bounded7 - covered7 >= need))
     # Completed UTC days inside the window (trust.completed_days), each tested once it is final.
     day_of = w // DAY
     fail["day"] = np.zeros(len(events), dtype=bool)
@@ -206,7 +234,8 @@ def fast_monitor(out: GateOutcomes, t: TrustSettings, families: int, *, offset: 
         if bad.size == 0:
             return res
         j = i + 1 + int(bad[0])                               # demoted at this evaluation
-        d = {"at": int(events[j]), "rules": [r for r in T.COVERAGE_RULES if fail[r][j]], "repromoted_at": None}
+        d = {"at": int(events[j]), "rules": [r for r in T.COVERAGE_RULES if fail[r][j]], "repromoted_at": None,
+             "seen": int(seen[j])}
         res.demotions.append(d)
         # Re-promotion: the gates hold at every evaluation for hold_s, and hold_n new gate outcomes since the demotion.
         k, since = j + 1, None
@@ -244,7 +273,8 @@ def real_monitor(out: GateOutcomes, t: TrustSettings, families: int, *, offset: 
     start = first_gate - 2 * DAY                              # two days of unbounded issuances first (availability)
     end = (int(out.window_end[-1]) + SETTLEMENT) if until is None else until
     g_kw = dict(lead_seconds=lead, nominal_miscoverage=NOMINAL_BPS / T.BPS, replay_suite_passed=True,
-                startup_budget_valid=True, outcome_deadline_seconds=SETTLEMENT + GRACE, families=families)
+                startup_budget_valid=True, outcome_deadline_seconds=SETTLEMENT + GRACE, families=families,
+                configuration_validated=True)
     res = MonitorResult(None, [], len(out.window_end))
     seq, pending, trusted, requests = 0, [], False, 0
     for o in range(-(-start // grid) * grid, end + 1, grid):
@@ -286,7 +316,7 @@ def real_monitor(out: GateOutcomes, t: TrustSettings, families: int, *, offset: 
     return res
 
 
-# --- detection ------------------------------------------------------------------------------------------------------------
+# --- a separate latent model (unit-test guard only) ---------------------------------------------------------------------
 
 def _normal_quantile(p: float) -> float:
     """The standard normal quantile (Acklam's rational approximation, relative error below 1.2e-9)."""
@@ -309,9 +339,10 @@ def _normal_quantile(p: float) -> float:
         (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1)
 
 
-def detection(lim: T.CoverageLimits, miss_rate: float, *, trials: int, seed: int, phi: float = 0.0,
+def latent_detection(lim: T.CoverageLimits, miss_rate: float, *, trials: int, seed: int, phi: float = 0.0,
               outcomes: int = DETECTION_OUTCOMES) -> Dict[str, object]:
-    """P(a rolling or consecutive alarm state at one of the first `outcomes` gate outcomes after the miss rate
+    """A SEPARATE MODEL, for the unit tests' cheap guard only (module docstring): not the calibrated bound's misses.
+    P(a rolling or consecutive alarm state at one of the first `outcomes` gate outcomes after the miss rate
     changes from nominal to miss_rate | the path is ELIGIBLE at the change), and the distribution of the first such
     outcome. Eligible: no rule failed at any outcome of the pre-change stretch (4 n outcomes), so the candidate is
     trusted and not alarmed at the change. The other paths are excluded from the denominator and reported
@@ -397,63 +428,261 @@ def reading_at_least(lo: float, est: float, hi: float, target: float) -> str:
     return "MET" if lo >= target else "INCONCLUSIVE"
 
 
-def union_bound_ppm(t: TrustSettings, lead: int, families: int) -> Dict[str, float]:
-    """The exact false-alarm budget of a TARGET per 7 days under independent nominal misses (N0), by rule, in ppm.
-    The 7-day gate is not in it (it is measured)."""
+
+# --- the frozen thresholds of the profile -----------------------------------------------------------------------------------
+
+def limits_report(t: TrustSettings = TrustSettings(), lead: int = LEAD, families: int = FAMILIES) -> Dict[str, object]:
+    """The thresholds the profile's monitor uses and the budgets they were computed for (forecasting.trust)."""
     lim = T.coverage_limits(t, lead, NOMINAL_BPS, families)
-    a, n, k = NOMINAL_BPS, lim.recent_n, lim.rolling_misses
-    rolling = 0.0 if k > n else \
-        lim.looks * (a / T.BPS) * T.binomial_tail(n - 1, a, k - 1) / T.BPS ** (n - 1) * T.PPM * families
-    cons = T.consecutive_bound_ppm(lim.consecutive, a, lim.looks) * families
-    per_day = lim.looks // 7
-    day = 7 * T.binomial_tail(per_day, a, lim.day_misses(per_day)) / T.BPS ** per_day * T.PPM * families
-    return {"rolling": rolling, "consecutive": cons, "day": day, "total": rolling + cons + day,
-            "rolling_misses": k, "recent_n": n, "consecutive_misses": lim.consecutive, "looks": lim.looks,
-            "day_outcomes": per_day, "day_misses": lim.day_misses(per_day)}
+    per_day = DAY // lead
+    ratio = lambda m: (NOMINAL_BPS + t.coverage_tolerance_bps) * m // T.BPS + 1      # noqa: E731  misses that fail the ratio
+    return {"policy": lim.policy, "families": families, "lead": lead, "looks": lim.looks, "miss_bps": lim.miss_bps,
+            "dependence_bps": lim.dependence_bps, "recent_n": lim.recent_n, "rolling_misses": lim.rolling_misses,
+            "consecutive": lim.consecutive, "day_outcomes": per_day, "day_misses": lim.day_misses(per_day),
+            "seven_day": [{"outcomes": m, "count_condition": lim.seven_day_misses(m), "coverage_condition": ratio(m),
+                           "misses_to_fail": max(lim.seven_day_misses(m), ratio(m))}
+                          for m in (64, 144, 288, 432, 576, 720, 864, lim.looks)],
+            "budgets_ppm": {"rolling": t.rolling_alarm_ppm, "consecutive": t.consecutive_alarm_ppm,
+                            "day": t.day_alarm_ppm, "seven_day": t.seven_day_alarm_ppm}}
 
 
-def false_alarms(model: str, grid: int, lead: int, seeds: Sequence[int], settings: Sequence[TrustSettings],
-                 families: Sequence[int] = FAMILIES, progress=None) -> List[dict]:
-    """For every trust setting and family count: the per-candidate false-alarm count over the seeds' paths."""
-    rows = [{"model": model, "grid": grid, "lead": lead, "families": f, "settings": dataclasses.asdict(t),
-             "paths": 0, "trusted": 0, "alarms": 0, "by_rule": {r: 0 for r in T.COVERAGE_RULES},
-             "repromoted_48h": 0, "miss_rate_sum": 0.0, "hours_to_alarm": []}
-            for t in settings for f in families]
-    for n, seed in enumerate(seeds):
-        out = gate_outcomes(model, seed, grid, lead)
-        i = 0
-        for t in settings:
-            for f in families:
-                r = fast_monitor(out, t, f)
-                row = rows[i]
-                i += 1
-                row["paths"] += 1
-                row["miss_rate_sum"] += float(out.miss.mean())
-                if r.trusted_at is None:
+# --- validation: the complete monitor, path by path -------------------------------------------------------------------------
+
+def fold_origin(window_end: int, grid: int, offset: int = acceptance.REQUEST_OFFSET) -> int:
+    """The request origin that folds an outcome (fast_monitor's rule)."""
+    return -(-(window_end + SETTLEMENT - offset) // grid) * grid
+
+
+def trusted_throughout(res: MonitorResult, before: int) -> bool:
+    """Promoted before `before` and Trusted at every request from the last (re-)promotion up to it."""
+    if res.trusted_at is None or res.trusted_at >= before:
+        return False
+    return all(d["repromoted_at"] is not None and d["repromoted_at"] < before
+               for d in res.demotions if d["at"] < before)
+
+
+def change_point(out: GateOutcomes, res: MonitorResult, seed: int):
+    """(index of the first changed outcome or None when 64 outcomes do not follow, the path's change generator)."""
+    rng = np.random.default_rng([seed, CHANGE_STREAM])
+    at = res.trusted_at + DAY + int(rng.integers(0, DAY))
+    tau = int(np.searchsorted(out.window_end, at, side="left"))
+    return (tau if tau + DETECTION_OUTCOMES <= len(out.window_end) else None), rng
+
+
+def path_result(source: str, seed: int, t: TrustSettings = TrustSettings()) -> Dict[str, object]:
+    """One path through the complete monitor: its false alarm (if any) and every detection case (module docstring)."""
+    out = source_outcomes(source, seed)
+    res = fast_monitor(out, t, FAMILIES)
+    got: Dict[str, object] = {"trusted": res.trusted_at is not None, "miss_rate": float(out.miss.mean()),
+                              "false_alarm": None, "detection": {}}
+    cases = [c for c, _ in INDEPENDENT_CASES] + ([c for c, _ in CLUSTERED_CASES] if source != BERNOULLI else [])
+    if res.trusted_at is None:
+        got["detection"] = {c: {"state": "excluded"} for c in cases}
+        return got
+    fa = res.false_alarm
+    if fa is not None:
+        got["false_alarm"] = {"rules": fa["rules"], "hours": (fa["at"] - res.trusted_at) / HOUR,
+                              "repromoted_48h": fa["repromoted_at"] is not None and
+                              fa["repromoted_at"] - fa["at"] <= 48 * HOUR}
+    tau, rng = change_point(out, res, seed)
+    if tau is None:
+        got["detection"] = {c: {"state": "short"} for c in cases}
+        return got
+    at_change = fold_origin(int(out.window_end[tau]), out.grid)
+    if not trusted_throughout(res, at_change):
+        got["detection"] = {c: {"state": "excluded"} for c in cases}
+        return got
+    n_post = len(out.miss) - tau
+    draws = {rate: rng.random(n_post) for _, rate in INDEPENDENT_CASES[:2]}
+    post = {c: (np.ones(n_post, dtype=bool) if rate >= 1.0 else draws[rate] < rate) for c, rate in INDEPENDENT_CASES}
+    if source != BERNOULLI:
+        for c, i in CLUSTERED_CASES:
+            post[c] = out.score[tau:] > CLUSTERED_SCORE[source][i]
+    stop = tau + DETECTION_OUTCOMES
+    for c in cases:
+        miss = out.miss.copy()
+        miss[tau:] = post[c]
+        changed = GateOutcomes(out.grid, out.lead, out.window_end[:stop], miss[:stop], out.first_bound_origin,
+                               out.last_origin)
+        hit = next((d for d in fast_monitor(changed, t, FAMILIES).demotions if d["at"] >= at_change), None)
+        cell = {"state": "eligible", "detected": hit is not None, "post_miss_rate": float(post[c][:DETECTION_OUTCOMES].mean())}
+        if hit is not None:
+            cell.update(outcomes=hit["seen"] - tau, rules=hit["rules"],
+                        wall_seconds=hit["at"] + acceptance.REQUEST_OFFSET - (int(out.window_end[tau]) - out.lead))
+        got["detection"][c] = cell
+    return got
+
+
+def validate(sources: Sequence[str], seeds: Sequence[int], progress=None) -> dict:
+    """Every source over the seeds: the raw counts of each cell (no reading here: `report` reads them)."""
+    cells = []
+    for source in sources:
+        if source not in SOURCES:
+            raise ValueError(f"unknown source {source!r}")
+        cell = {"source": source, "paths": 0, "trusted": 0, "alarms": 0, "by_rule": {r: 0 for r in T.COVERAGE_RULES},
+                "repromoted_48h": 0, "hours_to_alarm": [], "miss_rate_sum": 0.0, "detection": {}}
+        for n, seed in enumerate(seeds):
+            r = path_result(source, seed)
+            cell["paths"] += 1
+            cell["trusted"] += r["trusted"]
+            cell["miss_rate_sum"] += r["miss_rate"]
+            fa = r["false_alarm"]
+            if fa is not None:
+                cell["alarms"] += 1
+                cell["repromoted_48h"] += fa["repromoted_48h"]
+                cell["hours_to_alarm"].append(round(fa["hours"], 2))
+                for rule in fa["rules"]:
+                    cell["by_rule"][rule] += 1
+            for case, d in r["detection"].items():
+                c = cell["detection"].setdefault(case, {"eligible": 0, "excluded": 0, "short": 0, "detected": 0,
+                                                        "outcomes": [0] * (DETECTION_OUTCOMES + 1), "wall_seconds": [],
+                                                        "by_rule": {x: 0 for x in T.COVERAGE_RULES},
+                                                        "post_miss_rate_sum": 0.0})
+                if d["state"] != "eligible":
+                    c[d["state"]] += 1
                     continue
-                row["trusted"] += 1
-                fa = r.false_alarm
-                if fa is not None:
-                    row["alarms"] += 1
-                    for rule in fa["rules"]:
-                        row["by_rule"][rule] += 1
-                    row["hours_to_alarm"].append(round((fa["at"] - r.trusted_at) / HOUR, 2))
-                    if fa["repromoted_at"] is not None and fa["repromoted_at"] - fa["at"] <= 48 * HOUR:
-                        row["repromoted_48h"] += 1
-        if progress and (n + 1) % 100 == 0:
-            progress(model, grid, lead, n + 1)
-    for row in rows:
-        lo, hi = wilson(row["alarms"], row["trusted"])
-        p = row["alarms"] / row["trusted"] if row["trusted"] else None
-        f = row["families"]
-        row.update(candidate={"probability": p, "lo": lo, "hi": hi},
-                   target={"probability": None if p is None else min(1.0, f * p), "lo": min(1.0, f * lo),
-                           "hi": min(1.0, f * hi)},
-                   mean_miss_rate=row.pop("miss_rate_sum") / max(1, row["paths"]))
-        row["reading"] = "NOT MEASURED" if p is None else reading_at_most(row["target"]["lo"],
-                                                                         row["target"]["probability"],
-                                                                         row["target"]["hi"], FALSE_ALARM_TARGET)
-    return rows
+                c["eligible"] += 1
+                c["post_miss_rate_sum"] += d["post_miss_rate"]
+                if d["detected"]:
+                    c["detected"] += 1
+                    c["outcomes"][d["outcomes"]] += 1
+                    c["wall_seconds"].append(int(d["wall_seconds"]))
+                    for rule in d["rules"]:
+                        c["by_rule"][rule] += 1
+            if progress and (n + 1) % 200 == 0:
+                progress(source, n + 1)
+        cells.append(cell)
+    return _digest({"schema": "trust-validation-cells/v1", "trust_policy": TrustSettings().policy,
+                    "profile": dataclasses.asdict(VALIDATED_PROFILES[0]), "seeds": [seeds[0], seeds[-1], len(seeds)],
+                    "settings": dataclasses.asdict(TrustSettings()), "limits": limits_report(), "cells": cells})
+
+
+def _quantile(hist: Sequence[int], q: float) -> Optional[int]:
+    total, run = sum(hist), 0
+    if not total:
+        return None
+    for value, count in enumerate(hist):
+        run += count
+        if run > q * total or run == total:
+            return value
+    return None
+
+
+def wall_deadline_seconds() -> int:
+    """From the start of the first changed window to the request that folds the 64th changed outcome, at worst."""
+    return DETECTION_OUTCOMES * LEAD + SETTLEMENT + GRID
+
+
+def report(docs: Sequence[dict]) -> dict:
+    """The readings of a complete validation: every source exactly once, the same seeds, policy and limits."""
+    cells = [c for d in docs for c in d["cells"]]
+    names = [c["source"] for c in cells]
+    if sorted(names) != sorted(SOURCES):
+        raise ValueError(f"the validation needs every source exactly once, got {names}")
+    for key in ("trust_policy", "profile", "seeds", "settings", "limits"):
+        if any(d[key] != docs[0][key] for d in docs):
+            raise ValueError(f"the parts disagree on {key}")
+    rows, verdict = [], True
+    for source in SOURCES:
+        c = next(x for x in cells if x["source"] == source)
+        lo, hi = wilson(c["alarms"], c["trusted"])
+        p = c["alarms"] / c["trusted"] if c["trusted"] else None
+        fa = {"probability": None if p is None else FAMILIES * p, "lo": FAMILIES * lo, "hi": min(1.0, FAMILIES * hi),
+              "alarms": c["alarms"], "trusted": c["trusted"], "paths": c["paths"], "by_rule": c["by_rule"],
+              "repromoted_48h": c["repromoted_48h"], "mean_miss_rate": c["miss_rate_sum"] / max(1, c["paths"])}
+        fa["reading"] = "NOT MEASURED" if p is None else reading_at_most(fa["lo"], fa["probability"], fa["hi"],
+                                                                         FALSE_ALARM_TARGET)
+        verdict &= fa["reading"] == "MET"
+        det = {}
+        for case, d in c["detection"].items():
+            dlo, dhi = wilson(d["detected"], d["eligible"])
+            dp = d["detected"] / d["eligible"] if d["eligible"] else None
+            wall = sorted(d["wall_seconds"])
+            det[case] = {"probability": dp, "lo": dlo, "hi": dhi, "detected": d["detected"], "eligible": d["eligible"],
+                         "excluded": d["excluded"], "short": d["short"], "criterion": case in CRITERION_CASES,
+                         "post_change_miss_rate": d["post_miss_rate_sum"] / max(1, d["eligible"]),
+                         "median_outcomes": _quantile(d["outcomes"], 0.5), "p95_outcomes": _quantile(d["outcomes"], 0.95),
+                         "median_wall_seconds": wall[len(wall) // 2] if wall else None,
+                         "p95_wall_seconds": wall[min(len(wall) - 1, int(0.95 * len(wall)))] if wall else None,
+                         "by_rule": d["by_rule"],
+                         "reading": "NOT MEASURED" if dp is None else reading_at_least(dlo, dp, dhi, DETECTION_TARGET)}
+            if case in CRITERION_CASES:
+                verdict &= det[case]["reading"] == "MET"
+        rows.append({"source": source, "false_alarms": fa, "detection": det})
+    d0 = docs[0]
+    return _digest({"schema": "trust-validation/v1", "trust_policy": d0["trust_policy"], "profile": d0["profile"],
+                    "seeds": d0["seeds"], "settings": d0["settings"], "limits": d0["limits"],
+                    "targets": {"false_alarms": FALSE_ALARM_TARGET, "detection": DETECTION_TARGET,
+                                "outcomes": DETECTION_OUTCOMES, "wall_deadline_seconds": wall_deadline_seconds()},
+                    "parts": [d["sha256"] for d in docs], "rows": rows,
+                    "qualified": bool(verdict)})
+
+
+def _pct(p: Optional[float], lo: float, hi: float) -> str:
+    return "n/a" if p is None else f"{100 * p:.2f} % [{100 * lo:.2f}, {100 * hi:.2f}]"
+
+
+def _dur(seconds: Optional[int]) -> str:
+    if seconds is None:
+        return "n/a"
+    return f"{seconds // 3600} h {seconds % 3600 // 60:02d} min"
+
+
+def tables(doc: dict) -> str:
+    """The validation as Markdown: false alarms per source, then every detection case."""
+    out = ["| Source | Paths (trusted) | False coverage demotions in 7 days | P [95 %] | By rule | Re-promoted in 48 h | "
+           "Reading (<= 5 %) |", "|" + "---|" * 7]
+    for r in doc["rows"]:
+        f = r["false_alarms"]
+        rules = ", ".join(f"{k} {v}" for k, v in f["by_rule"].items() if v) or "none"
+        out.append(f"| {r['source']} | {f['paths']} ({f['trusted']}) | {f['alarms']} | "
+                   f"{_pct(f['probability'], f['lo'], f['hi'])} | {rules} | {f['repromoted_48h']} | **{f['reading']}** |")
+    out += ["", "| Source | Post-change misses | Eligible (excluded) | Miss rate realized | Detected within 64 [95 %] | "
+            "Median / p95 outcomes | Median / p95 wall time | Criterion | Reading (>= 95 %) |", "|" + "---|" * 9]
+    for r in doc["rows"]:
+        for case, d in r["detection"].items():
+            out.append(f"| {r['source']} | {case} | {d['eligible']} ({d['excluded'] + d['short']}) | "
+                       f"{100 * d['post_change_miss_rate']:.1f} % | {_pct(d['probability'], d['lo'], d['hi'])} | "
+                       f"{d['median_outcomes']} / {d['p95_outcomes']} | {_dur(d['median_wall_seconds'])} / "
+                       f"{_dur(d['p95_wall_seconds'])} | {'yes' if d['criterion'] else 'reported'} | "
+                       f"{('**' + d['reading'] + '**') if d['criterion'] else d['reading']} |")
+    return "\n".join(out)
+
+
+def clustered_thresholds(seeds: Sequence[int] = DEVELOPMENT_SEEDS) -> Dict[str, List[float]]:
+    """The pooled 60th and 50th percentiles of the post-shadow normalized scores, per calibrated source."""
+    out = {}
+    for source in NOMINAL_MODELS + DEPENDENT_MODELS:
+        pooled = []
+        for seed in seeds:
+            o = gate_outcomes(source, seed)
+            pooled.append(o.score[o.window_end >= o.first_bound_origin + 48 * HOUR])
+        s = np.concatenate(pooled)
+        out[source] = [round(float(np.quantile(s, 0.6)), 4), round(float(np.quantile(s, 0.5)), 4)]
+    return out
+
+
+def run_equivalence(seeds: Sequence[int], paths: int = 12, restart_every: int = 997) -> dict:
+    """The product's functions at every request (with restarts) against fast_monitor on the same paths of the
+    profile, half of them with injected misses so that demotions and re-promotions are exercised."""
+    t = TrustSettings()
+    cells, same = [], True
+    for k, seed in enumerate(seeds[:paths]):
+        source = SOURCES[k % len(SOURCES)]
+        out = source_outcomes(source, seed)
+        if k % 2:                                             # a burst of misses a day after first trust
+            at = np.searchsorted(out.window_end, out.first_bound_origin + 72 * HOUR)
+            burst = np.random.default_rng(seed).random(40 + 40 * (k % 3)) < 0.45
+            out.miss[at:at + len(burst)] |= burst[:len(out.miss[at:at + len(burst)])].astype(np.int64)
+        fast, real = fast_monitor(out, t, FAMILIES), real_monitor(out, t, FAMILIES, restart_every=restart_every)
+        a = (fast.trusted_at, [(d["at"], d["rules"], d["repromoted_at"]) for d in fast.demotions])
+        b = (real.trusted_at, [(d["at"], d["rules"], d["repromoted_at"]) for d in real.demotions])
+        cells.append({"source": source, "seed": seed, "equal": a == b, "trusted_at": fast.trusted_at,
+                      "demotions": fast.demotions, "real": real.demotions})
+        same &= a == b
+        _log("equivalence", seed, source, "equal" if a == b else "DIFFERENT", len(fast.demotions))
+    return _digest({"schema": "trust-monitor-equivalence/v2", "paths": len(cells), "restart_every": restart_every,
+                    "all_equal": bool(same), "cells": cells})
 
 
 def _digest(doc: dict) -> dict:
@@ -469,181 +698,29 @@ def _log(*a) -> None:
     print(*a, file=sys.stderr, flush=True)
 
 
-# --- commands -------------------------------------------------------------------------------------------------------------
-
-def select(paths: int = len(DEVELOPMENT_SEEDS), trials: int = 100_000) -> dict:
-    """Feasibility first, on DEVELOPMENT seeds only. For every threshold set of the grid:
-      (1) the exact union bound of the target's 7-day false-alarm probability under independent nominal misses, at
-          each declared lead with two families;
-      (2) the detection probability of a sustained 40 % miscoverage within 64 outcomes (independent misses), at each
-          declared lead, with one and with two families;
-      (3) the simulated false-alarm probability through the real calibration on the independent noise models.
-    A set is FEASIBLE when (1) is at most 5 % at every declared lead, the lower end of (2) is at least 95 % everywhere
-    and the upper end of (3), for a target with two families, is at most 5 % on every nominal model and declared
-    lead. The frozen set is the feasible one with the largest worst-case detection probability (the minimum of (2)
-    over the declared leads and family counts: the target with the least margin), then the largest rolling budget
-    (the same limit then holds at shorter leads), then the largest day budget, the rest going to the consecutive
-    rule. If none is feasible the result says so and lists the trade-off: nothing is chosen."""
-    base = TrustSettings()
-    declared = [(g, lead) for g, lead, d in CONFIGS if d]
-    grid_sets = [dataclasses.replace(base, acute_recent_windows=n, rolling_alarm_ppm=r, consecutive_alarm_ppm=c,
-                                     day_alarm_ppm=d)
-                 for n in GRID_N for r in GRID_ROLLING_PPM for c in GRID_CONSECUTIVE_PPM for d in GRID_DAY_PPM
-                 if r + c + d <= BUDGET_PPM]
-    rows = []
-    for t in grid_sets:
-        row = {"n": t.acute_recent_windows, "rolling_ppm": t.rolling_alarm_ppm,
-               "consecutive_ppm": t.consecutive_alarm_ppm, "day_ppm": t.day_alarm_ppm, "union": {}, "detection": {}}
-        ok = True
-        for _, lead in declared:
-            ub = union_bound_ppm(t, lead, 2)
-            row["union"][str(lead)] = ub
-            ok &= ub["total"] <= FALSE_ALARM_TARGET * T.PPM
-            for f in FAMILIES:
-                lim = T.coverage_limits(t, lead, NOMINAL_BPS, f)
-                key = (lim.recent_n, lim.rolling_misses, lim.consecutive)
-                d = _DETECTION_CACHE.get(key)
-                if d is None:
-                    d = _DETECTION_CACHE[key] = detection(lim, 0.4, trials=trials, seed=DETECTION_DEVELOPMENT_SEED)
-                row["detection"][f"{lead}/{f}"] = {k: d[k] for k in ("probability", "lo", "hi")}
-                ok &= d["lo"] >= DETECTION_TARGET
-        row["arithmetic_feasible"] = bool(ok)
-        row["worst_detection"] = min(d["probability"] for d in row["detection"].values())
-        rows.append((t, row))
-    candidates = [t for t, row in rows if row["arithmetic_feasible"]]
-    _log(f"select: {len(candidates)} of {len(rows)} threshold sets pass the exact budget and the detection target")
-    sims: Dict[int, List[dict]] = {i: [] for i in range(len(candidates))}
-    for grid, lead in declared:
-        # Sets with the same limits at this lead are the same monitor: simulate each distinct one once.
-        lims = [T.coverage_limits(t, lead, NOMINAL_BPS, 2) for t in candidates]
-        distinct: Dict[T.CoverageLimits, int] = {}
-        for i, lim in enumerate(lims):
-            distinct.setdefault(lim, i)
-        reps = sorted(distinct.values())
-        _log(f"select: lead {lead}: {len(reps)} distinct monitors among {len(candidates)} sets")
-        for model in NOMINAL_MODELS:
-            got = false_alarms(model, grid, lead, DEVELOPMENT_SEEDS[:paths], [candidates[i] for i in reps],
-                               families=(2,), progress=lambda *a: _log("select", *a))
-            by_rep = dict(zip(reps, got))
-            for i, lim in enumerate(lims):
-                r = by_rep[distinct[lim]]
-                sims[i].append({k: r[k] for k in ("model", "lead", "trusted", "alarms", "by_rule", "target",
-                                                   "reading", "mean_miss_rate")})
-    feasible = []
-    for i, t in enumerate(candidates):
-        row = next(r for tt, r in rows if tt is t)
-        row["simulated"] = sims[i]
-        row["feasible"] = all(s["target"]["hi"] <= FALSE_ALARM_TARGET for s in sims[i])
-        if row["feasible"]:
-            feasible.append(t)
-    chosen = None
-    if feasible:
-        worst = {id(t): row["worst_detection"] for t, row in rows}
-        best = min(feasible, key=lambda t: (-worst[id(t)], -t.rolling_alarm_ppm, -t.day_alarm_ppm,
-                                            -t.consecutive_alarm_ppm, t.acute_recent_windows))
-        chosen = {"acute_recent_windows": best.acute_recent_windows, "rolling_alarm_ppm": best.rolling_alarm_ppm,
-                  "consecutive_alarm_ppm": best.consecutive_alarm_ppm, "day_alarm_ppm": best.day_alarm_ppm}
-    return _digest({"schema": "trust-threshold-selection/v1", "seed_set": "development", "paths": paths,
-                    "detection_trials": trials, "declared_configs": declared, "nominal_models": list(NOMINAL_MODELS),
-                    "feasible": bool(feasible), "feasible_sets": len(feasible), "chosen": chosen,
-                    "grid": [row for _, row in rows]})
-
-
-_DETECTION_CACHE: Dict[tuple, dict] = {}
-
-
-def run_false_alarms(seed_set: str, paths: Optional[int] = None, models: Optional[Sequence[str]] = None) -> dict:
-    seeds = _seeds(seed_set)[:paths]
-    t = TrustSettings()
-    cells = []
-    for grid, lead, declared in CONFIGS:
-        for model in models or NOMINAL_MODELS + DEPENDENT_MODELS:
-            use = seeds[:PATHS_REPORTED] if not declared else seeds if model in NOMINAL_MODELS else \
-                seeds[:PATHS_DEPENDENT]
-            for row in false_alarms(model, grid, lead, use, [t], progress=lambda *a: _log("false-alarms", *a)):
-                row.update(declared=declared, nominal=model in NOMINAL_MODELS)
-                cells.append(row)
-    return _digest({"schema": "trust-false-alarms/v1", "seed_set": seed_set, "seeds": [seeds[0], seeds[-1]],
-                    "paths_dependent": PATHS_DEPENDENT, "paths_reported": PATHS_REPORTED,
-                    "trust_policy": t.policy, "settings": dataclasses.asdict(t), "target": FALSE_ALARM_TARGET,
-                    "union_bound_ppm": {f"{lead}/{f}": union_bound_ppm(t, lead, f) for _, lead, _ in CONFIGS
-                                        for f in FAMILIES}, "cells": cells})
-
-
-def run_detection(seed_set: str, trials: int = DETECTION_TRIALS) -> dict:
-    seed = DETECTION_DEVELOPMENT_SEED if seed_set == "development" else DETECTION_VALIDATION_SEED
-    t = TrustSettings()
-    cells = []
-    for grid, lead, declared in CONFIGS:
-        phi_dep = acceptance.AR_RHO ** (lead / 60.0)
-        for f in FAMILIES:
-            lim = T.coverage_limits(t, lead, NOMINAL_BPS, f)
-            for label, rate, phi in (("40 %", 0.4, 0.0), ("50 %", 0.5, 0.0), ("all-miss step", 1.0, 0.0),
-                                     ("40 % dependent", 0.4, phi_dep), ("50 % dependent", 0.5, phi_dep)):
-                d = detection(lim, rate, trials=trials, seed=seed, phi=phi)
-                d.update(case=label, grid=grid, lead=lead, families=f, declared=declared,
-                         rolling_misses=lim.rolling_misses, recent_n=lim.recent_n, consecutive=lim.consecutive,
-                         wall_seconds_median=None if d["median_outcomes"] is None else
-                         wall_seconds(d["median_outcomes"], lead, grid),
-                         wall_seconds_p95=None if d["p95_outcomes"] is None else
-                         wall_seconds(d["p95_outcomes"], lead, grid),
-                         wall_seconds_64=wall_seconds(DETECTION_OUTCOMES, lead, grid),
-                         reading=reading_at_least(d["lo"], d["probability"], d["hi"], DETECTION_TARGET))
-                cells.append(d)
-                _log("detection", lead, f, label, round(d["probability"], 4))
-    return _digest({"schema": "trust-detection/v1", "seed_set": seed_set, "seed": seed, "trials": trials,
-                    "target": DETECTION_TARGET, "outcomes": DETECTION_OUTCOMES, "trust_policy": t.policy,
-                    "settings": dataclasses.asdict(t), "cells": cells})
-
-
-def run_equivalence(seed_set: str, paths: int = 12, restart_every: int = 997) -> dict:
-    """The product's functions at every request (with restarts) against fast_monitor on the same paths, plus paths
-    with injected misses so that demotions and re-promotions are exercised."""
-    seeds = _seeds(seed_set)[:paths]
-    t = TrustSettings()
-    cells, same = [], True
-    for grid, lead, _ in CONFIGS[:2]:
-        for k, seed in enumerate(seeds):
-            model = (NOMINAL_MODELS + DEPENDENT_MODELS)[k % 6]
-            out = gate_outcomes(model, seed, grid, lead)
-            if k % 2:                                         # inject a burst of misses a day after first trust
-                at = np.searchsorted(out.window_end, out.first_bound_origin + 72 * HOUR)
-                burst = np.random.default_rng(seed).random(40 + 40 * (k % 3)) < 0.45
-                out.miss[at:at + len(burst)] |= burst.astype(np.int64)
-            f = 1 + k % 2
-            fast, real = fast_monitor(out, t, f), real_monitor(out, t, f, restart_every=restart_every)
-            a = (fast.trusted_at, [(d["at"], d["rules"], d["repromoted_at"]) for d in fast.demotions])
-            b = (real.trusted_at, [(d["at"], d["rules"], d["repromoted_at"]) for d in real.demotions])
-            cells.append({"model": model, "seed": seed, "lead": lead, "families": f, "equal": a == b,
-                          "trusted_at": fast.trusted_at, "demotions": fast.demotions, "real": real.demotions})
-            same &= a == b
-            _log("equivalence", lead, seed, model, "equal" if a == b else "DIFFERENT", len(fast.demotions))
-    return _digest({"schema": "trust-monitor-equivalence/v1", "seed_set": seed_set, "paths": len(cells),
-                    "restart_every": restart_every, "all_equal": bool(same), "cells": cells})
-
-
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("command", choices=("select", "false-alarms", "detection", "equivalence"))
+    ap.add_argument("command", choices=("validate", "report", "equivalence", "clustered-thresholds"))
+    ap.add_argument("parts", nargs="*", help="report: the validate outputs to read together")
     ap.add_argument("--seeds", default="development", choices=("development", "validation"))
+    ap.add_argument("--sources", default=",".join(SOURCES))
     ap.add_argument("--paths", type=int)
-    ap.add_argument("--trials", type=int)
-    ap.add_argument("--models")
     ap.add_argument("--out", required=True)
     a = ap.parse_args(argv)
-    if a.command == "select":
-        if a.seeds != "development":
-            ap.error("thresholds are selected on development seeds only")
-        doc = select(**{k: v for k, v in (("paths", a.paths), ("trials", a.trials)) if v})
-    elif a.command == "false-alarms":
-        doc = run_false_alarms(a.seeds, a.paths, a.models.split(",") if a.models else None)
-    elif a.command == "detection":
-        doc = run_detection(a.seeds, **({"trials": a.trials} if a.trials else {}))
+    if a.command == "validate":
+        seeds = _seeds(a.seeds)[:a.paths]
+        doc = validate(a.sources.split(","), seeds, progress=lambda *x: _log("validate", *x))
+    elif a.command == "report":
+        doc = report([json.load(open(p)) for p in a.parts])
+        print(tables(doc))
+    elif a.command == "equivalence":
+        doc = run_equivalence(_seeds(a.seeds), a.paths or 12)
     else:
-        doc = run_equivalence(a.seeds, a.paths or 12)
+        doc = _digest({"schema": "trust-clustered-thresholds/v1", "seeds": [DEVELOPMENT_SEEDS[0], DEVELOPMENT_SEEDS[-1]],
+                       "thresholds": clustered_thresholds()})
     with open(a.out, "w") as fh:
         json.dump(doc, fh, indent=1, sort_keys=True)
-    print(json.dumps({k: doc[k] for k in doc if k not in ("cells", "grid")}, indent=1, sort_keys=True))
+    print(json.dumps({k: doc[k] for k in doc if k not in ("cells", "rows")}, indent=1, sort_keys=True))
     print(f"result sha256 {doc['sha256']} -> {a.out}")
     return 0
 

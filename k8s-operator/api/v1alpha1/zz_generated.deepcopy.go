@@ -233,6 +233,11 @@ func (in *ForecastV2Settings) DeepCopyInto(out *ForecastV2Settings) {
 		*out = new(int32)
 		**out = **in
 	}
+	if in.MinLeadSeconds != nil {
+		in, out := &in.MinLeadSeconds, &out.MinLeadSeconds
+		*out = new(int32)
+		**out = **in
+	}
 	if in.SettlementSeconds != nil {
 		in, out := &in.SettlementSeconds, &out.SettlementSeconds
 		*out = new(int32)

@@ -42,6 +42,17 @@ type ForecastV2Settings struct {
 	// +optional
 	HistoryDays *int32 `json:"historyDays,omitempty"`
 
+	// MinLeadSeconds is the shortest lead the operator selects (default 0: no minimum). The lead is the larger of this
+	// and what the startup budget, the decision interval and the actuation allowance need, rounded up to the forecast
+	// grid; a minimum beyond the horizon is refused, and the measured startup delay is never changed by it. The
+	// forecast covers the window from the next grid step to the lead: a longer lead extends that window, it does not
+	// promise scaling exactly that long before a rise. Predictive eligibility is granted only for validated
+	// configurations (grid, lead, risk and family set); see the user guide.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=3600
+	// +optional
+	MinLeadSeconds *int32 `json:"minLeadSeconds,omitempty"`
+
 	// SettlementSeconds is how long after a grid time its sample counts as final (default 120).
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=900

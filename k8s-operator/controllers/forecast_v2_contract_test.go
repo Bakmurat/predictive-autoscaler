@@ -51,12 +51,14 @@ type v2Fixtures struct {
 			DecisionInterval int64 `json:"decision_interval"`
 			Allowance        int64 `json:"allowance"`
 			Interval         int64 `json:"interval"`
+			MinLead          int64 `json:"min_lead"`
 			Lead             int64 `json:"lead"`
 		} `json:"automatic"`
 		Resolve []struct {
-			Name  string                 `json:"name"`
-			Lead  map[string]interface{} `json:"lead"`
-			Valid bool                   `json:"valid"`
+			Name     string                 `json:"name"`
+			Settings string                 `json:"settings"`
+			Lead     map[string]interface{} `json:"lead"`
+			Valid    bool                   `json:"valid"`
 		} `json:"resolve"`
 		Windows []struct {
 			Origin     string   `json:"origin"`
@@ -107,6 +109,10 @@ type v2Fixtures struct {
 		SettingsSHA256 string `json:"settings_sha256"`
 		EvidenceKey    string `json:"evidence_key"`
 	} `json:"pre_trust_policy"`
+	TrustPolicyV1 struct {
+		SettingsSHA256 string `json:"settings_sha256"`
+		EvidenceKey    string `json:"evidence_key"`
+	} `json:"trust_policy_v1"`
 }
 
 func loadV2Fixtures(t *testing.T) *v2Fixtures {
@@ -221,13 +227,21 @@ func TestV2TrustPolicyIsPartOfTheBoundIdentity(t *testing.T) {
 		t.Fatal("the operator still presents the identity of the earlier trust policy")
 	}
 	canon, _ := v2CanonicalJSON(b.Settings.canonical())
-	for _, want := range []string{`"policy":"` + v2TrustPolicyRevision + `"`, `"rolling_alarm_ppm":`, `"consecutive_alarm_ppm":`, `"day_alarm_ppm":`} {
+	v1 := f.TrustPolicyV1
+	if !v2SHA256.MatchString(v1.SettingsSHA256) || !v2SHA256.MatchString(v1.EvidenceKey) {
+		t.Fatalf("the identity of trust policy v1 is missing from the fixtures: %+v", v1)
+	}
+	if b.SettingsSHA == v1.SettingsSHA256 || b.EvidenceKey == v1.EvidenceKey {
+		t.Fatal("the operator still presents the identity of trust policy budgeted-coverage-tests/v1")
+	}
+	for _, want := range []string{`"policy":"` + v2TrustPolicyRevision + `"`, `"rolling_alarm_ppm":`, `"consecutive_alarm_ppm":`,
+		`"day_alarm_ppm":`, `"seven_day_alarm_ppm":`, `"miss_dependence_bps":`, `"min_lead_seconds":`} {
 		if !strings.Contains(string(canon), want) {
 			t.Fatalf("the canonical settings lack %s: %s", want, canon)
 		}
 	}
 	other := b.Settings
-	other.Trust[len(other.Trust)-3]++ // another rolling budget: another fingerprint, the same evidence epoch
+	other.Trust[len(other.Trust)-5]++ // another rolling budget: another fingerprint, the same evidence epoch
 	if other.fingerprint() == b.Settings.fingerprint() {
 		t.Fatal("a trust budget does not change the settings fingerprint")
 	}
@@ -293,12 +307,15 @@ func TestV2EvidenceKeyMatchesPython(t *testing.T) {
 func TestV2LeadAndWindowMatchPython(t *testing.T) {
 	f := loadV2Fixtures(t)
 	for _, c := range f.Lead.Automatic {
-		if got := v2AutomaticLead(c.Startup, c.DecisionInterval, c.Allowance, c.Interval); got != c.Lead {
+		if got := v2AutomaticLead(c.Startup, c.DecisionInterval, c.Allowance, c.Interval, c.MinLead); got != c.Lead {
 			t.Errorf("automatic lead %+v: got %d", c, got)
 		}
+		if c.MinLead > 0 && c.Lead < c.MinLead {
+			t.Errorf("automatic lead %+v is below the configured minimum", c)
+		}
 	}
-	s := fixtureSettings(t, f, "statistical")
 	for _, c := range f.Lead.Resolve {
+		s := fixtureSettings(t, f, c.Settings)
 		if c.Name == "missing-key" {
 			continue // the Go type always carries every key (TestV2PublishedLeadCarriesEveryKey)
 		}
