@@ -728,6 +728,8 @@ if [ "$REPLACEMENT" = 1 ]; then
   guard
   IPS="$(k -n "$NS" get pods -l "c28.devkuban.com/target=$UNANSWERED" -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}')"
   [ -n "$IPS" ] || die "3. no pod IP of $UNANSWERED"
+  # The ingress before the fault: the pod and container the verdict expects to find again after the recovery.
+  k -n "$NS" get pods -l app.kubernetes.io/name=c28-ingress -o json > "$EV/ingress-pods-before.json"
   T3="$(ms)"
   # The drop rules go into the workload node's FORWARD chain (the node is this run's own kind container). The
   # kubelet's probes are local to the node and keep passing, so the endpoints stay ready and the ingress keeps
@@ -757,6 +759,8 @@ if [ "$REPLACEMENT" = 1 ]; then
   k -n "$NS" describe pod "$IPOD" > "$EV/ingress-describe.txt" || true
   log "collecting five more minutes (recovery, and the last lines)"
   sleep 300
+  # The ingress after the recovery: the status the verdict is decided on (a restart during the recovery counts too).
+  k -n "$NS" get pods -l app.kubernetes.io/name=c28-ingress -o json > "$EV/ingress-pods-final.json"
   T5=$(( $(ms) - 120000 ))
   touch "$EV/stop"; wait "$FOLLOW_PID" || true; FOLLOW_PID=""
 
@@ -786,15 +790,18 @@ limit = sts["spec"]["template"]["spec"]["containers"][0]["resources"]["limits"][
 units = {"Ki": 2**10, "Mi": 2**20, "Gi": 2**30}
 limit_bytes = int(limit[:-2]) * units[limit[-2:]] if limit[-2:] in units else int(limit)
 rw = {r["metric"]["__name__"]: float(r["value"][1]) for r in json.load(open(d + "/remote-write.json"))["data"]["result"]}
-ing = [{"pod": p["metadata"]["name"], "restarts": cs.get("restartCount"),
-        "last_terminated": (cs.get("lastState") or {}).get("terminated")}
-       for p in json.load(open(d + "/ingress-pods.json"))["items"] for cs in p["status"].get("containerStatuses", [])]
+def ingress_statuses(name):
+    return [{"pod": p["metadata"]["name"], "uid": p["metadata"].get("uid"), "container_id": cs.get("containerID"),
+             "restarts": cs.get("restartCount"), "last_terminated": (cs.get("lastState") or {}).get("terminated")}
+            for p in json.load(open(d + "/" + name))["items"] for cs in p["status"].get("containerStatuses", [])]
+ing = ingress_statuses("ingress-pods.json")                      # right after the fault (with the logs and events)
 assert sts["spec"]["replicas"] == 1 and sts["kind"] == "StatefulSet"
 json.dump({"phases": {"restarts": [t0, t1], "replacement": [t1, t2], "steady": [t2, t3], "timeout": [t3, t4],
                       "recovery": [t4, t5]},
            "unanswered_target": sys.argv[8], "min_restarts": int(sys.argv[9]), "memory_limit_bytes": limit_bytes,
-           "remote_write_series": rw, "ingress": ing, "blackhole": {"direction": sys.argv[10], "from_ms": t3,
-                                                                    "to_ms": t4}},
+           "remote_write_series": rw, "ingress": ing, "ingress_before": ingress_statuses("ingress-pods-before.json"),
+           "ingress_final": ingress_statuses("ingress-pods-final.json"),
+           "blackhole": {"direction": sys.argv[10], "from_ms": t3, "to_ms": t4}},
           open(d + "/phases.json", "w"), indent=1)
 print("remote write:", json.dumps(rw))
 assert any(v > 0 for v in rw.values()), "no k6_c28d_* series reached the metrics backend: remote write did not work"

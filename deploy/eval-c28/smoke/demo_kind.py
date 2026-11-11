@@ -433,22 +433,71 @@ def timeout_load(lines, cfg, target, window):
             "dropped_inflight_total": sum(r["dropped_inflight"] for r in rows)}
 
 
-def ingress_evidence_problems(pods, memory, oom_kills):
+# The ingress's OOM counters must be read from the start of the fault to the end of the recovery: within this of
+# each end, and without a longer gap between two readings (the sampler reads once a second).
+OOM_EDGE_MS, OOM_MAX_GAP_MS = 5_000, 15_000
+
+
+def oom_coverage(samples, start_ms, end_ms):
+    """The readings of BOTH oom_kill counters (the container's and the pod's cgroup) in [start_ms, end_ms], with
+    the last one before and the first one after it: how many, the largest gap between two of them, the largest
+    counter, and whether they cover the span from end to end."""
+    valid = sorted((s["t_ms"], max(s["oom_kill"], s["pod_oom_kill"])) for s in samples
+                   if s.get("oom_kill") is not None and s.get("pod_oom_kill") is not None)
+    before = [x for x in valid if x[0] < start_ms][-1:]
+    after = [x for x in valid if x[0] > end_ms][:1]
+    seen = before + [x for x in valid if start_ms <= x[0] <= end_ms] + after
+    times = [t for t, _ in seen]
+    gap = max([b - a for a, b in zip(times, times[1:])] or [0])
+    covered = (len(seen) >= 2 and times[0] <= start_ms + OOM_EDGE_MS and times[-1] >= end_ms - OOM_EDGE_MS
+               and gap <= OOM_MAX_GAP_MS)
+    return {"readings": len(seen), "first_ms": times[0] if times else None, "last_ms": times[-1] if times else None,
+            "max_gap_ms": gap, "max_kills": max([k for _, k in seen], default=None), "covered": covered}
+
+
+def _container_name(container_id):
+    return (container_id or "").split("://")[-1]
+
+
+def ingress_evidence_problems(final, before, memory, oom, sampled):
     """What the verdict needs to have SEEN of the fixture's ingress (the same rule as for the generator: missing
-    evidence never reads as a pass): its container statuses with a restart count of 0, a known memory limit, real
-    samples of its memory in the timeout phase below that limit, and no kernel OOM kill in its cgroups.
-    `pods` is [{pod, restarts, last_terminated}], `memory` a memory_summary of its samples, `oom_kills` the largest
-    oom_kill counter sampled (container and pod cgroup), None when none was read."""
+    evidence never reads as a pass):
+
+    - its container statuses AFTER THE RECOVERY (`final`) with a restart count of 0;
+    - the same pod and container as before the fault (`before`): one of each, UID and container ID unchanged, and
+      the memory sampler saw exactly that container from the fault to the end of the recovery (`sampled`, the
+      container IDs it saw there). A replacement at any point of the fault or the recovery fails;
+    - a known memory limit and real samples of its memory in the timeout phase below it (`memory`);
+    - both OOM counters read from the start of the fault to the end of the recovery (`oom`, an oom_coverage), all 0.
+      A counter that was not read throughout proves nothing.
+
+    `final` and `before` are [{pod, uid, container_id, restarts, last_terminated}]."""
     problems = []
-    if not pods:
-        problems.append("the ingress's container status was not captured: its restart count is unknown")
-    for p in pods or []:
+    if not final:
+        problems.append("the ingress's container status after the recovery was not captured: its restart count is unknown")
+    for p in final or []:
         if not isinstance(p.get("restarts"), int) or isinstance(p.get("restarts"), bool):
             problems.append(f"ingress pod {p.get('pod')}: no restart count")
         elif p["restarts"] != 0:
             t = p.get("last_terminated") or {}
             problems.append(f"ingress pod {p.get('pod')} restarted {p['restarts']} time(s): last termination "
                             f"{t.get('reason')} (exit {t.get('exitCode')}) at {t.get('finishedAt')}")
+
+    def identity(rows):
+        return sorted((p.get("uid"), _container_name(p.get("container_id"))) for p in rows or [])
+    if not before:
+        problems.append("the ingress's pod and container before the fault were not captured: nothing to compare the "
+                        "ingress after the recovery with")
+    elif final:
+        a, b = identity(before), identity(final)
+        if len(a) != 1 or len(b) != 1 or not all(a[0]) or not all(b[0]):
+            problems.append(f"the ingress is not exactly one identified pod and container (before {a}, after {b})")
+        elif a != b:
+            problems.append(f"the ingress pod or container changed between the start of the fault and the end of the "
+                            f"recovery (before {a[0]}, after {b[0]})")
+        elif sorted(sampled or []) != [b[0][1]]:
+            problems.append(f"the memory sampler saw the ingress containers {sorted(sampled or [])} from the fault to "
+                            f"the end of the recovery, not exactly the one in its status ({b[0][1]})")
     limit = memory.get("limit_bytes")
     window = (memory.get("windows") or {}).get("timeout") or {}
     if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
@@ -459,10 +508,13 @@ def ingress_evidence_problems(pods, memory, oom_kills):
                         "above 0 needed): the ingress's memory was not measured")
     elif isinstance(limit, int) and not isinstance(limit, bool) and limit > 0 and memory["max_bytes"] >= limit:
         problems.append(f"the ingress's memory reached its limit ({memory['max_bytes']} of {limit} bytes)")
-    if oom_kills is None:
-        problems.append("the ingress's oom_kill counter was never read")
-    elif oom_kills != 0:
-        problems.append(f"the kernel OOM-killed in the ingress's cgroup ({oom_kills} kill(s))")
+    if not oom or not oom.get("covered"):
+        o = oom or {}
+        problems.append(f"the ingress's oom_kill counters were not read from the start of the fault to the end of the "
+                        f"recovery ({o.get('readings', 0)} readings, largest gap {o.get('max_gap_ms')} ms): that no "
+                        "OOM kill happened is unproven")
+    if oom and oom.get("max_kills"):
+        problems.append(f"the kernel OOM-killed in the ingress's cgroup ({oom['max_kills']} kill(s))")
     return problems
 
 
@@ -503,6 +555,11 @@ def analyse(a):
     kills = [x for s in ing_mem for x in (s.get("oom_kill"), s.get("pod_oom_kill")) if x is not None]
     ingress_memory["oom_kill_max"] = max(kills) if kills else None
     ingress_memory["limits_seen_bytes"] = limits
+    # From the start of the fault to the end of the recovery: the OOM counters' coverage and the containers sampled.
+    span = (phases["timeout"][0], phases["recovery"][1]) if {"timeout", "recovery"} <= set(phases) else None
+    ingress_oom = oom_coverage(ing_mem, *span) if span else None
+    ingress_sampled = sorted({s["container"] for s in ing_mem if span and span[0] <= s["t_ms"] <= span[1]})
+    ingress_memory["oom_coverage"], ingress_memory["containers_in_fault_and_recovery"] = ingress_oom, ingress_sampled
     problems = list(pods["problems"])
     # The longest run of CONSECUTIVE planned restarts in one pod.
     run = best = 0
@@ -530,7 +587,8 @@ def analyse(a):
                             f"flags {i['flags']}")
     problems += evidence_problems(verdicts, memory, tl, phases, list(cfg["targets"]),
                                   ph.get("unanswered_target"))
-    problems += ingress_evidence_problems(ph.get("ingress"), ingress_memory, ingress_memory["oom_kill_max"])
+    problems += ingress_evidence_problems(ph.get("ingress_final"), ph.get("ingress_before"), ingress_memory,
+                                          ingress_oom, ingress_sampled)
     out = {"schema": "c28-demo-kind-smoke/v1", "config_digest": cfg["digest"], "label": cfg["label"],
            "origin_utc": cfg["origin_utc"], "segment_minutes": cfg["segment_minutes"],
            "max_inflight": cfg["max_inflight"], "log": log_stats, "records": red["records"],
@@ -539,7 +597,8 @@ def analyse(a):
                              "ended": "segment-end" if e["end"] else "no end record", "lines": len(e["lines"])}
                             for e in incs],
            "restarts": rs, "consecutive_restarts": best, "container_exits": exits, "pods": pods, "memory": memory,
-           "timeout_load": tl, "ingress": ph.get("ingress"), "ingress_memory": ingress_memory,
+           "timeout_load": tl, "ingress": ph.get("ingress"), "ingress_before": ph.get("ingress_before"),
+           "ingress_final": ph.get("ingress_final"), "ingress_memory": ingress_memory,
            "blackhole": ph.get("blackhole"), "other_log_lines": log_stats["other"], "phases": {k: {"from_ms": v[0], "to_ms": v[1]} for k, v in phases.items()},
            "verdicts": verdicts, "duplicate_generators": red["duplicate_generators"], "problems": problems,
            "result": "PASS" if not problems else "FAIL"}
@@ -681,25 +740,52 @@ def selftest():
     flagged("phase steady is missing", phases={k: v2 for k, v2 in names.items() if k != "steady"})
     flagged("is not one of the targets", unanswered="c28-z")
     flagged("names no target", targets=())
-    # The ingress: a restart count of 0 that was SEEN, real memory samples below a known limit, no OOM kill.
-    imem = dict(memory_summary([{"t_ms": 180_000 + 1_000 * i, "container": "i1", "current": 300 + i, "peak": 400}
+    # The ingress: after the recovery the same pod and container as before the fault with a restart count of 0, real
+    # memory samples below a known limit, and both OOM counters read at 0 from the start of the fault to the end of
+    # the recovery.
+    cid = "c" * 64
+    imem = dict(memory_summary([{"t_ms": 180_000 + 1_000 * i, "container": cid, "current": 300 + i, "peak": 400}
                                 for i in range(MIN_MEMORY_SAMPLES)], 1000, names))
-    ipods = [{"pod": "ing-1", "restarts": 0, "last_terminated": None}]
-    assert ingress_evidence_problems(ipods, imem, 0) == []
+    ipods = [{"pod": "ing-1", "uid": "u-1", "container_id": "containerd://" + cid, "restarts": 0, "last_terminated": None}]
+    span = (180_000, 300_000)                                          # the timeout and recovery phases of `names`
+    isamples = [{"t_ms": t, "container": cid, "oom_kill": 0, "pod_oom_kill": 0} for t in range(179_000, 302_000, 1_000)]
+    ioom = oom_coverage(isamples, *span)
+    assert ioom["covered"] and ioom["max_kills"] == 0 and ioom["max_gap_ms"] == 1_000
+    assert ingress_evidence_problems(ipods, ipods, imem, ioom, [cid]) == []
 
-    def iflag(needle, pods=ipods, mem=imem, kills=0):
-        found = ingress_evidence_problems(pods, mem, kills)
+    def iflag(needle, final=ipods, before=ipods, mem=imem, oom=ioom, sampled=(cid,)):
+        found = ingress_evidence_problems(final, before, mem, oom, list(sampled))
         assert any(needle in p for p in found), (needle, found)
-    iflag("restart count is unknown", pods=[])
-    iflag("restart count is unknown", pods=None)
-    iflag("no restart count", pods=[{"pod": "ing-1", "restarts": None}])
-    iflag("restarted 1 time(s): last termination OOMKilled (exit 137)",
-          pods=[{"pod": "ing-1", "restarts": 1, "last_terminated": {"reason": "OOMKilled", "exitCode": 137, "finishedAt": "t"}}])
+        return found
+    iflag("after the recovery was not captured", final=[])
+    iflag("after the recovery was not captured", final=None)
+    iflag("no restart count", final=[dict(ipods[0], restarts=None)])
+    iflag("restarted 1 time(s): last termination OOMKilled (exit 137)", final=[dict(
+        ipods[0], restarts=1, last_terminated={"reason": "OOMKilled", "exitCode": 137, "finishedAt": "t"})])
+    iflag("before the fault were not captured", before=[])
+    iflag("before the fault were not captured", before=None)
+    iflag("pod or container changed", final=[dict(ipods[0], container_id="containerd://" + "d" * 64)])
+    iflag("pod or container changed", final=[dict(ipods[0], uid="u-2")])        # the pod was replaced, restarts 0
+    iflag("not exactly one identified pod and container", final=ipods * 2)
+    iflag("not exactly one identified pod and container", before=[dict(ipods[0], uid=None)])
+    # A replacement the status captures missed still shows in the samples (one container ID from fault to recovery).
+    iflag("memory sampler saw the ingress containers", sampled=(cid, "replacement-container-after-status-capture"))
+    iflag("memory sampler saw the ingress containers", sampled=())
     iflag("memory was not measured", mem=memory_summary([], 1000, names))
     iflag("memory limit is unknown", mem=dict(imem, limit_bytes=None))
     iflag("reached its limit", mem=dict(imem, limit_bytes=400))
-    iflag("oom_kill counter was never read", kills=None)
-    iflag("OOM-killed in the ingress's cgroup (2 kill(s))", kills=2)
+    # OOM counters: one reading of 0 before the fault proves nothing about the fault and the recovery.
+    unread = [dict(x, oom_kill=None, pod_oom_kill=None) for x in isamples[1:]]
+    iflag("is unproven", oom=oom_coverage(isamples[:1] + unread, *span))
+    iflag("is unproven", oom=oom_coverage([], *span))
+    iflag("is unproven", oom=None)
+    iflag("is unproven", oom=oom_coverage([x for x in isamples if x["t_ms"] <= 240_000], *span))     # stops mid-recovery
+    iflag("is unproven", oom=oom_coverage([x for x in isamples if x["t_ms"] >= 200_000], *span))     # starts mid-fault
+    iflag("is unproven", oom=oom_coverage([x for x in isamples if not 200_000 < x["t_ms"] < 230_000], *span))  # a 30 s hole
+    iflag("is unproven", oom=oom_coverage([dict(x, pod_oom_kill=None) for x in isamples], *span))   # one counter only
+    killed = [dict(x, pod_oom_kill=2) if x["t_ms"] >= 250_000 else x for x in isamples]
+    found = iflag("OOM-killed in the ingress's cgroup (2 kill(s))", oom=oom_coverage(killed, *span))
+    assert not any("unproven" in p for p in found)                    # read throughout, and it shows the kill
     cfg2 = {"origin_ms": 0, "minute_ms": 60_000, "timeout_ms": 2_000, "max_inflight": 505}
     ls = [{"target": t, "minute": 5, "intended": 9000, "dispatched": 9000, "ok": 0, "failed": 9000,
            "failed_by": {"0": 9000}, "dropped": {"inflight": 0}, "lat": {"max_ms": 0}},
