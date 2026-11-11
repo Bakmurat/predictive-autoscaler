@@ -254,7 +254,7 @@ carries the release and its namespace. */}}
   (dict "alert" "PredictiveAutoscalerForecastJournalUnhealthy" "for" $a.journalFor "severity" "warning"
         "expr" (printf "%s > 0" $journal)
         "summary" "predictive-autoscaler statistical forecaster: journal unhealthy"
-        "description" "The statistical forecaster's journal cannot be written or trusted, so it answers 503 and is not ready: autoscalers with engine statistical are reactive only. It retries by itself (5 s, 15 s, 1 min, 5 min and 15 min after the failure, then every 30 min). Still firing: its /ready names the reason; a full state volume or a corrupt journal needs an operator (docs/helm.md).")
+        "description" "The statistical forecaster's journal cannot be written or trusted, so it answers 503 and is not ready: autoscalers with engine statistical are reactive only. It retries by itself: 5 s after the failure, then 15 s, 1 min, 5 min and 15 min after each failed attempt (about 5 s, 20 s, 80 s, 6 min and 21 min after the failure), then every 30 min. Still firing: its /ready names the reason; a full state volume or a corrupt journal needs an operator (docs/helm.md).")
 -}}
 - name: predictive-autoscaler
   rules:

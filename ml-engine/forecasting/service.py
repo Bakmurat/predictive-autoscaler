@@ -52,7 +52,8 @@ refuses to start. Eligibility is an answer, not an action: nothing here assumes 
 
 A failed journal is recovered inside the process (maintain(), called every few seconds by the app): it is reopened
 (ForecastStore.reopen: the start-up checks, every record against its checksum, room for the refused write, one durable
-commit) RECOVERY_BACKOFF_SECONDS after the failure (5 s, then 15 s, 1 min, 5 min and 15 min after each failed attempt).
+commit) 5 s after the failure, then 15 s, 1 min, 5 min and 15 min after each failed attempt (RECOVERY_BACKOFF_SECONDS:
+the waits add up, so the attempts fall about 5 s, 20 s, 80 s, 6 min and 21 min after the failure).
 When those are used up the failure is permanent (an operator must act: the volume is full or the journal corrupt), still
 retried every RECOVERY_SLOW_SECONDS. A recovery that lasts less than RECOVERY_STABLE_SECONDS does not start the schedule
 again, so a journal that fails right after every reopen is never retried in a hot loop. While unhealthy the service is
@@ -124,6 +125,7 @@ SLOT_SWEEP_BUDGET_SECONDS = 10      # ... and one check starts no further lookup
 RECOVERY_BACKOFF_SECONDS = (5, 15, 60, 300, 900)   # a failed journal: the wait before each reopen attempt
 RECOVERY_SLOW_SECONDS = 1800        # ... and between the attempts after those (a permanent failure, still retried)
 RECOVERY_STABLE_SECONDS = 3600      # healthy this long after a recovery: the next failure starts the schedule again
+CLOSE_WAIT_SECONDS = 30             # close() waits this long for a maintenance pass in flight before it closes anyway
 
 logger = logging.getLogger("forecasting.service")
 
@@ -179,6 +181,7 @@ class ForecastService:
         self.store_problem: Optional[str] = None
         self._health_lock = threading.Lock()            # the recovery schedule's state below
         self._recovery_lock = threading.Lock()          # one recovery attempt at a time
+        self._closing = threading.Event()               # close() was called: no pass starts, nothing is reopened
         self._failed_ms: Optional[int] = None           # since when the journal is unhealthy (None: healthy)
         self._attempts = 0                              # reopen attempts since the journal was last healthy for long
         self._next_attempt_ms = 0
@@ -259,10 +262,22 @@ class ForecastService:
         return basis, {k: doc.expires for k, doc in docs.items() if doc is not None}
 
     def close(self) -> None:
-        if self.worker is not None:
-            self.worker.close()
-        if self.store is not None:
-            self.store.close()
+        """Stop for good: no maintenance pass starts any more, the one in flight (it may be reopening the journal in
+        a worker thread that cancelling its caller does not stop) is waited for, and only then are the fit worker and
+        the journal closed. A closed service never opens its journal again."""
+        self._closing.set()
+        waited = self._recovery_lock.acquire(timeout=CLOSE_WAIT_SECONDS)
+        try:
+            if not waited:
+                logger.error("a maintenance pass did not finish within %d s of shutdown; closing anyway (the pass "
+                             "closes the journal again when it returns)", CLOSE_WAIT_SECONDS)
+            if self.worker is not None:
+                self.worker.close()
+            if self.store is not None:
+                self.store.close()
+        finally:
+            if waited:
+                self._recovery_lock.release()
 
     # --- the journal's recovery -----------------------------------------------------------------------------------
 
@@ -294,6 +309,8 @@ class ForecastService:
         if not self._recovery_lock.acquire(blocking=False):
             return
         try:
+            if self._closing.is_set():
+                return
             now = self.clock.now_ms()
             if self.store_healthy:
                 with self._health_lock:
@@ -329,6 +346,8 @@ class ForecastService:
             logger.warning("the forecast journal recovered on attempt %d after %d s; issuance resumes", attempt, down_s)
         finally:
             self._recovery_lock.release()
+            if self._closing.is_set() and self.store is not None:
+                self.store.close()                          # close() gave up waiting for this pass: finish its work
 
     def _reopen_store(self) -> None:
         """Reopen the journal (or open it at last, when it never opened) and forget what was derived from the old

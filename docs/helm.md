@@ -192,7 +192,10 @@ The forecasting service and the trainer share the model volume.
   `/ready` answers 503 with the reason, and the autoscalers are reactive meanwhile. The service then recovers in place,
   without a restart: it reopens the journal 5 s after the failure and, while that fails, 15 s, 1 min, 5 min and 15 min
   after the previous attempt (each attempt: SQLite's checks, every record against its checksum, room for the write
-  that did not fit, one durable commit). After those five attempts the failure is **permanent and needs an operator**;
+  that did not fit, one durable commit). The waits add up: the attempts fall about 5 s, 20 s, 80 s, 6 min and 21 min
+  after the failure. Recovery accepts only the journal the process opened (a journal with another identity is
+  refused) and never creates one: if the file is gone, the service stays not ready until it is restarted, and the
+  restart begins a new journal with no evidence. After those five attempts the failure is **permanent and needs an operator**;
   the service stays up, stays not ready, and tries again every 30 minutes. A recovery that does not last an hour keeps
   its place in this schedule, so a journal that fails again at once is never retried in a tight loop. What to do:
   - *full:* enlarge the volume, raise `stateQuota` (applied by the pod's restart), or wait: retention frees expired

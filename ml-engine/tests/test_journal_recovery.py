@@ -7,6 +7,7 @@ import json
 import os
 import sqlite3
 import sys
+import threading
 
 import pytest
 
@@ -215,6 +216,91 @@ def test_another_stores_journal_is_refused_on_reopen(tmp_path):
     with pytest.raises(StoreCorrupt):
         s.reopen()
     assert not s.healthy and "another store identity" in s.problem
+
+
+def lose_the_file(path):
+    for suffix in ("", "-wal", "-shm"):
+        if os.path.exists(str(path) + suffix):
+            os.unlink(str(path) + suffix)
+
+
+def test_recovery_holds_the_identity_the_process_opened_when_none_was_configured(tmp_path):
+    # The production default: no configured identity, a random one at creation. Recovery still accepts only that
+    # journal: another valid journal at the same path is refused instead of silently becoming the recovered one.
+    path = tmp_path / "j.sqlite"
+    s = ForecastStore(str(path), clock=ManualClock(T0 * 1000))
+    original = s.store_id
+    s.commit_issuance(key(), bundle(), models=MODELS)
+    s._fail("simulated I/O failure")
+    s.close()
+    lose_the_file(path)
+    other = ForecastStore(str(path), clock=ManualClock(T0 * 1000))
+    assert other.store_id != original
+    other.close()
+    for _ in range(2):
+        with pytest.raises(StoreCorrupt):
+            s.reopen()
+        assert not s.healthy and "another store identity" in s.problem and s.store_id == original
+
+
+@pytest.mark.parametrize("configured", [None, "test-store"])
+def test_recovery_never_creates_a_journal(tmp_path, configured):
+    # A journal that is gone is not replaced by an empty one under the old identity: the store stays failed (a restart
+    # is where a new journal, with a new identity when none is configured, begins).
+    path = tmp_path / "j.sqlite"
+    s = ForecastStore(str(path), clock=ManualClock(T0 * 1000), store_id=configured)
+    s.commit_issuance(key(), bundle(), models=MODELS)
+    s._fail("simulated I/O failure")
+    s.close()
+    lose_the_file(path)
+    for _ in range(2):
+        with pytest.raises(StoreCorrupt, match="never starts a new journal"):
+            s.reopen()
+        assert not s.healthy and "gone or empty" in s.problem
+    s.close()
+    assert raw(path).execute("SELECT count(*) FROM sqlite_master").fetchone()[0] == 0     # nothing was created
+    fresh = ForecastStore(str(path), clock=ManualClock(T0 * 1000), store_id=configured)   # the restart
+    assert fresh.healthy and fresh.issuances() == []
+    fresh.close()
+
+
+@pytest.mark.parametrize("key_,value", [("observation_extra_seconds", "not-an-int"), ("created_at_ms", ""),
+                                         ("observation_extra_seconds", None), ("store_id", "")])
+def test_malformed_metadata_is_a_corrupt_journal_and_a_failed_reopen_is_never_healthy(tmp_path, key_, value):
+    path = tmp_path / "j.sqlite"
+    s = ForecastStore(str(path), clock=ManualClock(T0 * 1000))
+    s.commit_issuance(key(), bundle(), models=MODELS)
+    s._db.execute("DROP TRIGGER meta_fixed")
+    s._db.execute("DROP TRIGGER meta_kept")
+    if value is None:
+        s._db.execute("DELETE FROM meta WHERE key = ?", (key_,))
+    else:
+        s._db.execute("UPDATE meta SET value = ? WHERE key = ?", (value, key_))
+    s._fail("simulated I/O failure")
+    for _ in range(2):
+        with pytest.raises(StoreCorrupt):
+            s.reopen()
+        assert not s.healthy and s.problem                         # the service issues nothing while this holds
+    s.close()
+
+
+def test_an_unforeseen_error_in_reopen_leaves_the_store_failed_with_a_store_error(tmp_path):
+    s = open_store(tmp_path / "j.sqlite")
+    s.commit_issuance(key(), bundle(), models=MODELS)
+    s._fail("simulated I/O failure")
+    real = s.verify
+
+    def unforeseen():
+        raise ValueError("a bug nobody foresaw")
+
+    s.verify = unforeseen
+    with pytest.raises(StoreUnavailable, match="unexpected ValueError"):
+        s.reopen()
+    assert not s.healthy and "unexpected ValueError" in s.problem
+    s.verify = real
+    s.reopen()                                                     # and a later attempt can still succeed
+    assert s.healthy and len(s.issuances()) == 1
+    s.close()
 
 
 # --- what was sound stays sound after a reopen -----------------------------------------------------------------------
@@ -485,6 +571,68 @@ def test_a_journal_that_is_corrupt_at_start_stays_failed_until_it_is_replaced(tm
 
 
 # --- R3-10 b: an issuance that no longer fits its request is refused, never a 500 ------------------------------------
+
+def test_shutdown_waits_for_a_recovery_in_flight_and_nothing_reopens_afterwards(tmp_path):
+    # The app cancels the coroutine that awaits the maintenance pass, which does not stop the pass's worker thread.
+    # close() therefore waits for the pass itself, and a closed service never opens its journal again.
+    svc, clock = S.make(tmp_path)
+    svc.store._fail("simulated I/O failure")
+    svc.maintain()                                                 # notes the failure; the first attempt is due in 5 s
+    clock.advance(5000)
+    entered, resume, real = threading.Event(), threading.Event(), svc._reopen_store
+
+    def held_reopen():
+        entered.set()
+        assert resume.wait(10)
+        real()
+
+    svc._reopen_store = held_reopen
+    recovery = threading.Thread(target=svc.maintain)
+    recovery.start()
+    assert entered.wait(10)
+    closer = threading.Thread(target=svc.close)
+    closer.start()
+    closer.join(0.3)
+    assert closer.is_alive()                                       # waiting for the pass in flight, not closing under it
+    resume.set()
+    recovery.join(10)
+    closer.join(10)
+    assert not recovery.is_alive() and not closer.is_alive()
+    with pytest.raises(sqlite3.ProgrammingError):                  # the journal the pass reopened was closed after it
+        svc.store._db.execute("SELECT 1")
+    attempts = svc.journal_recovery_attempts
+    svc._reopen_store = real
+    clock.advance(3600 * 1000)
+    svc.maintain()                                                 # after close: no pass, no reopen
+    assert svc.journal_recovery_attempts == attempts
+    with pytest.raises(sqlite3.ProgrammingError):
+        svc.store._db.execute("SELECT 1")
+
+
+def test_a_pass_that_outlasts_the_shutdown_wait_closes_the_journal_itself(tmp_path, monkeypatch):
+    monkeypatch.setattr(service_module, "CLOSE_WAIT_SECONDS", 0.05)
+    svc, clock = S.make(tmp_path)
+    svc.store._fail("simulated I/O failure")
+    svc.maintain()
+    clock.advance(5000)
+    entered, resume, real = threading.Event(), threading.Event(), svc._reopen_store
+
+    def held_reopen():
+        entered.set()
+        assert resume.wait(10)
+        real()
+
+    svc._reopen_store = held_reopen
+    recovery = threading.Thread(target=svc.maintain)
+    recovery.start()
+    assert entered.wait(10)
+    svc.close()                                                    # gives up after the wait and closes
+    resume.set()
+    recovery.join(10)
+    assert not recovery.is_alive()
+    with pytest.raises(sqlite3.ProgrammingError):                  # what the late pass reopened did not stay open
+        svc.store._db.execute("SELECT 1")
+
 
 def test_a_retry_after_the_published_lead_changed_is_refused_with_422(tmp_path):
     reader = S.Reader()

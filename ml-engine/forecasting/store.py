@@ -20,9 +20,15 @@ What it guarantees (design C2, section 6):
     not. reopen() is a restart of the store inside the process: a new connection, the same start-up checks, every
     record read against its checksum, room for the write the quota refused, and one durable commit. A journal that
     is still full or corrupt stays failed with the new reason; the caller spaces the attempts (forecasting.service).
-    A fresh or lost store starts a new epoch; it never presents itself as evidence it does not hold.
+    A fresh or lost store starts a new epoch; it never presents itself as evidence it does not hold. Recovery
+    accepts only the journal this process opened: the identity is remembered from the first successful open, also
+    when none was configured, and a journal with another identity is refused. Recovery never CREATES a journal
+    either: a file that is gone or empty keeps the store failed until the service is restarted, which is the one
+    place where a new journal (a new identity, evidence from nothing) begins. A recovery that ends in any error,
+    expected or not, leaves the store failed.
 The quota is enforced twice: SQLite's max_page_count (a hard SQLITE_FULL) and a check of database + WAL size plus
-the write's own size (its payload and a measured allowance for rows, indexes and page rounding) before each write, so
+the write's own size (its payload and an allowance for rows, indexes and page rounding: conservative accounting
+from measurements, not an exact guarantee of the physical size of a write) before each write, so
 the check refuses first and knows how much room the refused write needs. A write that does not fit is refused only
 after retention has freed what it may (compaction up to now, the freed pages and the WAL given back); nothing still in
 retention is ever removed to make room. Retention removes an issuance whose window ended more than `retention_seconds`
@@ -270,7 +276,7 @@ class ForecastStore:
         self._problem: Optional[str] = None
         self._recovering = False                                    # inside reopen(): not healthy until it has passed
         self._shortfall = 0                                         # bytes of the write the quota last refused
-        self._requested_id = store_id
+        self._requested_id = store_id                               # then: the identity the first open found
         self._fault_hook: Optional[Callable[[str], None]] = None    # tests: simulate a crash at a named point
         self._connect()
         try:
@@ -278,6 +284,7 @@ class ForecastStore:
         except StoreError:
             self._db.close()
             raise
+        self._requested_id = self.store_id      # recovery must find THIS journal, whether an identity was configured
 
     # --- lifecycle --------------------------------------------------------------------------------------------------
 
@@ -287,10 +294,13 @@ class ForecastStore:
         except sqlite3.Error as e:
             raise StoreUnavailable(f"cannot open the journal: {e}") from e
 
-    def _open(self, store_id: Optional[str]) -> None:
+    def _open(self, store_id: Optional[str], create: bool = True) -> None:
         with self._guard("open"):
             db = self._db
             fresh = db.execute("SELECT count(*) FROM sqlite_master").fetchone()[0] == 0
+            if fresh and not create:
+                raise StoreCorrupt("the journal file is gone or empty; recovery never starts a new journal (restart "
+                                   "the service to begin one: its evidence starts from nothing)")
             if fresh:
                 db.execute("PRAGMA auto_vacuum = INCREMENTAL")      # only effective before the first table
             if db.execute("PRAGMA journal_mode = WAL").fetchone()[0].lower() != "wal":
@@ -316,11 +326,18 @@ class ForecastStore:
             meta = dict(db.execute("SELECT key, value FROM meta").fetchall())
             if meta.get("schema_version") != str(SCHEMA_VERSION):
                 raise StoreCorrupt(f"unsupported journal schema {meta.get('schema_version')!r}")
-            if store_id is not None and meta.get("store_id") != store_id:
+            sid = meta.get("store_id")
+            if not isinstance(sid, str) or not sid:
+                raise StoreCorrupt("the journal has no store identity")
+            if store_id is not None and sid != store_id:
                 raise StoreCorrupt("the journal belongs to another store identity")
-            self.store_id = meta["store_id"]
-            self._obs_extra = int(meta["observation_extra_seconds"])     # the file's own, fixed at creation
-            self.created_at_ms = int(meta["created_at_ms"])
+            try:
+                obs_extra, created = int(meta["observation_extra_seconds"]), int(meta["created_at_ms"])
+            except (KeyError, TypeError, ValueError) as e:
+                raise StoreCorrupt(f"the journal's metadata is malformed ({type(e).__name__}: {e})") from e
+            self.store_id = sid
+            self._obs_extra = obs_extra                                  # the file's own, fixed at creation
+            self.created_at_ms = created
 
     def close(self) -> None:
         with self._lock:
@@ -334,7 +351,9 @@ class ForecastStore:
         passes the start-up checks (WAL mode, quick_check, schema, identity); every record is read against its checksum
         (verify); the write the quota refused must fit now, after retention has freed what it may; and one commit must
         be durable (the retention horizon rewritten with its own value: a WAL append and an fsync, no logical change).
-        Only then is the store healthy again. Otherwise it stays failed with the new reason and the error is raised."""
+        Only then is the store healthy again. Otherwise it stays failed with the new reason and the error is raised:
+        a StoreError, also for an error nothing here expected (never healthy by omission). The journal must be the
+        one this process opened (its identity), and it must exist: recovery creates nothing."""
         with self._lock:
             self._recovering = True
             try:
@@ -346,7 +365,7 @@ class ForecastStore:
                 try:
                     with self._guard("reopen"):
                         self._connect()
-                        self._open(self._requested_id)
+                        self._open(self._requested_id, create=False)
                         self.verify()
                         if self._shortfall and self.usage_bytes() + self._shortfall > self.quota_bytes:
                             self._reclaim()
@@ -359,6 +378,10 @@ class ForecastStore:
                     if self._problem is None:
                         self._problem = f"reopen: {e}"
                     raise
+                except Exception as e:                  # not foreseen: still a failed recovery, with a StoreError
+                    if self._problem is None:
+                        self._problem = f"reopen: unexpected {type(e).__name__}: {e}"
+                    raise StoreUnavailable(self._problem) from e
                 self._shortfall = 0
             finally:
                 self._recovering = False
