@@ -486,11 +486,25 @@ and at most one more fixed label:
 - **Participation:** `predictive_autoscaler_forecast_issued_total`, `predictive_autoscaler_forecast_outcomes_total`
   (`covered`, `missed`, `unscorable`), `predictive_autoscaler_forecast_scored_windows`,
   `predictive_autoscaler_forecast_outcome_availability_ratio` (scored share of the last day's due windows, overdue
-  ones included),
+  ones included), `predictive_autoscaler_forecast_prediction_availability_ratio` (decision origins of the last day
+  that got a forecast, as the trust gate reads it) with its numerator
+  `predictive_autoscaler_forecast_prediction_issued_windows` and denominator
+  `predictive_autoscaler_forecast_prediction_expected_windows` (a denominator of 0 means the ratio is unknown, and
+  the ratio then has no series),
   `predictive_autoscaler_forecast_calibration_windows`, `predictive_autoscaler_forecast_history_seconds`,
   `predictive_autoscaler_forecast_evidence_age_seconds` and `predictive_autoscaler_forecast_fit_failures_total`.
-- **Trust:** `predictive_autoscaler_forecast_trusted` (1 when that model's evidence gates pass) and the latest
-  `predictive_autoscaler_forecast_upper_window_rps` / `predictive_autoscaler_forecast_base_window_rps`.
+- **Trust:** `predictive_autoscaler_forecast_trusted` (1 when that model's evidence gates pass) and
+  `predictive_autoscaler_forecast_trust_reason{reason}` (one series with value 1: the gate's reason for the model
+  when its latest committed forecast was issued, for example `CalibrationInsufficient` or `Ready`). It is the reason
+  at issuance, not a statement that the forecast may act now: for that, read the operator's `PredictionReady`
+  condition and `predictive_autoscaler_prediction_used_family`.
+- **The latest committed forecast** (the newest one in the journal, whichever request finished last), shown for
+  every model in it, trusted or not, so a forecast can be watched before it may act: `predictive_autoscaler_forecast_base_window_rps` (the point maximum over the window) and
+  `predictive_autoscaler_forecast_upper_window_rps` (the upper bound; no series while the model has none, a bound is
+  never made up), with `predictive_autoscaler_forecast_latest_issued_timestamp_seconds`,
+  `predictive_autoscaler_forecast_latest_window_start_timestamp_seconds` and
+  `predictive_autoscaler_forecast_latest_window_end_timestamp_seconds`. The two values are about that future window:
+  compare them with the request rate measured in the window, not with the rate at the time of issuance.
 
 A model is trusted only on **prospective** evidence (forecasts issued live before their outcome; offline replays warm up
 calibration but never count, not even in availability or error figures): at least 48 hours and 64 non-overlapping

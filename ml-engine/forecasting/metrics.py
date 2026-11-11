@@ -37,8 +37,8 @@ from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 from prometheus_client.registry import Collector
 
 from forecasting.calibration import E8
-from forecasting.contracts import MODEL_FAMILIES
-from forecasting.trust import DAY, availability, window_sums
+from forecasting.contracts import MODEL_FAMILIES, REASONS
+from forecasting.trust import DAY, availability, expected_opportunities, window_sums
 
 PREFIX = "predictive_autoscaler_forecast_"
 BASE_LABELS = ("namespace", "autoscaler", "model")
@@ -70,12 +70,33 @@ METRICS: Dict[str, Tuple[str, Optional[str], str]] = {
     "calibration_windows": ("gauge", None, "Cohort scores in the calibration buffer."),
     "evidence_age_seconds": ("gauge", None, "Seconds since the last prospective gate outcome; absent when none."),
     "trusted": ("gauge", None, "1 only for a trusted candidate; otherwise 0."),
-    "upper_window_rps": ("gauge", None, "The latest committed upper bound; absent when none was issued."),
-    "base_window_rps": ("gauge", None, "The latest committed point maximum over the window."),
+    "prediction_availability_ratio": ("gauge", None, "Issued / expected decision origins over the last day, as the "
+                                                     "trust gate reads it; absent when none was expected."),
+    "prediction_issued_windows": ("gauge", None, "Its numerator: decision origins of the last day with an issuance."),
+    "prediction_expected_windows": ("gauge", None, "Its denominator: decision origins of the last day since the first "
+                                                   "issuance (0: nothing was expected yet, the ratio is unknown)."),
+    "trust_reason": ("gauge", "reason", "The trust gate's reason for the candidate when its latest committed forecast "
+                                        "was issued (history, not whether it may act now): one series with value 1; "
+                                        "absent when the candidate was not evaluated."),
+    "upper_window_rps": ("gauge", None, "The latest committed upper bound, trusted or not; absent when none was issued."),
+    "base_window_rps": ("gauge", None, "The latest committed point maximum over the window, trusted or not."),
+    "latest_issued_timestamp_seconds": ("gauge", None, "When the latest committed forecast was issued (Unix seconds)."),
+    "latest_window_start_timestamp_seconds": ("gauge", None, "Start of the future window the latest committed "
+                                              "forecast covers (Unix seconds): its bounds are about that window."),
+    "latest_window_end_timestamp_seconds": ("gauge", None, "End of that window (Unix seconds)."),
     "fit_failures_total": ("counter", "reason", "Fits that failed, by bounded reason."),
 }
 METRIC_NAMES = tuple(PREFIX + k for k in METRICS)
 _EXTRA = {"result": OUTCOME_RESULTS, "cohort": COHORTS, "horizon": HORIZONS, "reason": FIT_FAILURE_REASONS}
+_SUFFIX_ENUM = {"trust_reason": REASONS}          # a label name may carry another fixed enum on one metric
+LATEST_KEYS = ("upper_window_rps", "base_window_rps", "latest_issued_timestamp_seconds",
+               "latest_window_start_timestamp_seconds", "latest_window_end_timestamp_seconds")
+
+
+def label_values(suffix: str) -> Tuple[str, ...]:
+    """The fixed values of the metric's extra label (() when it has none)."""
+    label = METRICS[suffix][1]
+    return () if label is None else _SUFFIX_ENUM.get(suffix, _EXTRA[label])
 
 
 class RegistryFull(Exception):
@@ -91,8 +112,10 @@ Sample = Tuple[str, Tuple[str, ...], float]       # (suffix, extra label values,
 
 def model_samples(*, ledger: dict, calibration: Optional[dict], nominal_miscoverage: float, trusted: bool,
                   history_seconds: int, now_s: int, latest: Optional[Mapping[str, Optional[float]]] = None,
-                  fit_failures: Optional[Mapping[str, int]] = None) -> List[Sample]:
-    """The samples of one model from its evidence ledger (forecasting.trust) and calibration state."""
+                  fit_failures: Optional[Mapping[str, int]] = None, trust_reason: Optional[str] = None) -> List[Sample]:
+    """The samples of one model from its evidence ledger (forecasting.trust) and calibration state. `latest` is the
+    candidate's part of the latest committed forecast (LATEST_KEYS; a missing or None value has no series: a bound is
+    never made up) and `trust_reason` the gate's reason for it there."""
     out: List[Sample] = []
     tot = ledger["totals"]
     w7 = window_sums(ledger, now_s, 7 * DAY)
@@ -106,6 +129,14 @@ def model_samples(*, ledger: dict, calibration: Optional[dict], nominal_miscover
             out.append(("window_coverage_ratio", (cohort,), cv / bd))
     if avail is not None:
         out.append(("outcome_availability_ratio", (), avail))
+    expected = expected_opportunities(ledger, now_s, DAY)             # exactly trust.availability's "predictions"
+    issued = min(window_sums(ledger, now_s, DAY)["iss"], expected)
+    out.append(("prediction_expected_windows", (), float(expected)))
+    out.append(("prediction_issued_windows", (), float(issued)))
+    if expected:
+        out.append(("prediction_availability_ratio", (), issued / expected))
+    if trust_reason is not None:
+        out.append(("trust_reason", (trust_reason,), 1.0))
     if w7["sc"]:
         out.append(("window_mae_rps", (), w7["abs"] / w7["sc"]))
         out.append(("window_bias_rps", (), w7["bias"] / w7["sc"]))
@@ -122,7 +153,7 @@ def model_samples(*, ledger: dict, calibration: Optional[dict], nominal_miscover
     if ledger["last_prospective_outcome_s"] is not None:
         out.append(("evidence_age_seconds", (), float(now_s - ledger["last_prospective_outcome_s"])))
     out.append(("trusted", (), 1.0 if trusted else 0.0))
-    for key in ("upper_window_rps", "base_window_rps"):
+    for key in LATEST_KEYS:
         v = (latest or {}).get(key)
         if v is not None:
             out.append((key, (), float(v)))
@@ -183,7 +214,7 @@ class ForecastMetrics(Collector):
                 raise ValueError(f"model {model!r} is not in the fixed enum {MODEL_FAMILIES}")
             for suffix, extra, value in samples:
                 kind, label, _ = METRICS[suffix]
-                if (label is None) != (not extra) or (label and (len(extra) != 1 or extra[0] not in _EXTRA[label])):
+                if (label is None) != (not extra) or (label and (len(extra) != 1 or extra[0] not in label_values(suffix))):
                     raise ValueError(f"{suffix}: label values {extra!r} are outside the fixed enum")
         if snapshot.series() > self.max_series:
             raise CardinalityExceeded(f"{snapshot.series()} series for {namespace}/{autoscaler} "
