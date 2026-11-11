@@ -2,6 +2,7 @@
 a manual clock): coherent shadow responses, idempotent retries, calibration from matured windows, and restarts that keep
 verified state or start over, never manufacturing trust."""
 
+import copy
 import hashlib
 import json
 import math
@@ -271,6 +272,85 @@ def test_a_late_retry_of_an_older_window_never_replaces_the_newest_forecast(tmp_
     assert e[("latest_issued_timestamp_seconds", None)] == newer.issued_at_ms / 1000
     assert e[("base_window_rps", None)] == newer.base_window_max_rps  # bounds, times and reason from ONE issuance
     assert [k for k in e if k[0] == "trust_reason"] == [("trust_reason", newer.reason)]
+    svc.close()
+
+
+class HeldReader(Reader):
+    """A reader whose read of the autoscaler, on the thread named `held`, returns what the object was when the read
+    began but only after release(): a slow read that delivers an old object late."""
+
+    def __init__(self, pa, held):
+        super().__init__(pa)
+        self.held, self.entered, self.go = held, threading.Event(), threading.Event()
+
+    def get(self, path):
+        value = copy.deepcopy(super().get(path))
+        if "predictiveautoscalers" in path and threading.current_thread().name == self.held and not self.go.is_set():
+            self.entered.set()
+            assert self.go.wait(15)
+        return value
+
+
+def test_a_slow_read_of_the_old_object_cannot_take_the_publication_back(tmp_path):
+    """The race the order of arrival cannot settle: the old request's read of the autoscaler started first and is
+    delivered last, so that request is bound, admitted and finished AFTER the current epoch published."""
+    reader = HeldReader(pa_object(prediction=dict(PREDICTION, updateIntervalSeconds=300)), "old-binding")
+    svc, clock = make(tmp_path, reader=reader)
+    clock.set(T0 * 1000 + 10_000)
+    old, errors = c.resolve_settings(reader.pa).fingerprint(), []
+
+    def work():
+        try:
+            svc.predict(body(T0, old))
+        except Exception as e:                                        # noqa: BLE001 - reported to the test
+            errors.append(f"{type(e).__name__}: {e}")
+    t = threading.Thread(target=work, name="old-binding")
+    t.start()
+    assert reader.entered.wait(5)
+    reader.pa = pa_object(prediction=dict(PREDICTION, updateIntervalSeconds=600))
+    new = c.resolve_settings(reader.pa).fingerprint()
+    current = c.response_from_wire(svc.predict(body(T0, new)))        # the current epoch issues and publishes
+    clock.advance(1_000)
+    reader.go.set()                                                   # the old object is delivered now
+    t.join(15)
+    assert not t.is_alive() and errors == []                          # the old request issued in its own epoch
+    assert len({i.payload()["evidence_key"] for i in svc.store.issuances()}) == 2
+    e = exported(svc)
+    assert e[("latest_issued_timestamp_seconds", None)] == current.issued_at_ms / 1000
+    assert svc._published[("shop", "web-pa")][1] == current.calibration_epoch
+    clock.set((T0 + DT) * 1000 + 10_000)
+    again = c.response_from_wire(svc.predict(body(T0 + DT, new)))
+    assert exported(svc)[("latest_window_start_timestamp_seconds", None)] == again.window_start
+    svc.close()
+
+
+def test_a_real_change_of_epoch_takes_the_publication_over(tmp_path):
+    """The confirmation must not block the legitimate case: after the object changed, the first request of the new
+    epoch publishes it, and a later request with the OLD fingerprint is refused at binding and changes nothing."""
+    reader = Reader(pa_object(prediction=dict(PREDICTION, updateIntervalSeconds=300)))
+    svc, clock = make(tmp_path, reader=reader)
+    old = c.resolve_settings(reader.pa).fingerprint()
+    clock.set(T0 * 1000 + 10_000)
+    first = c.response_from_wire(svc.predict(body(T0, old)))
+    assert svc._published[("shop", "web-pa")][1] == first.calibration_epoch
+    reader.pa = pa_object(prediction=dict(PREDICTION, updateIntervalSeconds=600))
+    new = c.resolve_settings(reader.pa).fingerprint()
+    clock.set((T0 + DT) * 1000 + 10_000)
+    second = c.response_from_wire(svc.predict(body(T0 + DT, new)))
+    assert second.calibration_epoch != first.calibration_epoch
+    assert svc._published[("shop", "web-pa")][1] == second.calibration_epoch
+    assert exported(svc)[("latest_window_start_timestamp_seconds", None)] == second.window_start
+    with pytest.raises(ServiceError):
+        svc.predict(body(T0 + DT, old))
+    assert svc._published[("shop", "web-pa")][1] == second.calibration_epoch
+    # A read that fails during the confirmation is not a confirmation: nothing is taken over.
+    reader.pa = pa_object(prediction=dict(PREDICTION, updateIntervalSeconds=300))
+    third_settings = c.resolve_settings(reader.pa).fingerprint()
+    bound = c.bind_request(body(T0 + DT, third_settings), reader, now_ms=clock.now_ms())
+    reader.fail = LookupFailed("api down")
+    assert svc._still_bound(body(T0 + DT, third_settings), bound, clock.now_ms()) is False
+    reader.fail = None
+    assert svc._still_bound(body(T0 + DT, third_settings), bound, clock.now_ms()) is True
     svc.close()
 
 

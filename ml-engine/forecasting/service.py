@@ -85,7 +85,6 @@ stopped, so slow lookups cannot keep the check from ever reaching a later regist
 
 from __future__ import annotations
 
-import itertools
 import logging
 import os
 import threading
@@ -200,8 +199,7 @@ class ForecastService:
             self.worker = FitWorker(self.artifacts)
         self.metrics = ForecastMetrics(max_autoscalers=config.max_autoscalers)
         self.qualification_metrics = QualificationMetrics(self.qualification_status, D.REFUSALS)
-        self._arrivals = itertools.count(1)                     # the order in which requests read the live object
-        self._published: Dict[tuple, tuple] = {}                # (namespace, autoscaler) -> (token, epoch, arrival)
+        self._published: Dict[tuple, tuple] = {}                # (namespace, autoscaler) -> (token, published epoch)
         self.service_metrics = ServiceMetrics(self.metrics, self.journal_status)
         self._lock = threading.Lock()                   # one writer of the journal and the epoch states
         self._compacted_s: Optional[int] = None
@@ -395,7 +393,6 @@ class ForecastService:
         except LookupFailed as e:
             raise ServiceError(503, "IdentityMismatch", f"the autoscaler could not be read: {e}") from e
         sig = bound.signal
-        arrival = next(self._arrivals)                         # right after the live object was read
         token = self._admit(bound, now_ms)                     # atomic, before any expensive work
         if not self.store_healthy:
             self._note_failure(now_ms)
@@ -423,7 +420,8 @@ class ForecastService:
             try:
                 if not self.store_healthy:                              # it failed, or is not recovered, meanwhile
                     raise StoreUnavailable("the journal is unavailable")
-                return self._issue(bound, grid, self.clock.now_ms(), token, arrival)   # the time after the history and the lock
+                return self._issue(bound, grid, self.clock.now_ms(), token,   # the time after the history and the lock
+                                   current=lambda: self._still_bound(body, bound, now_ms))
             except StoreUnavailable as e:
                 self._note_failure(self.clock.now_ms())
                 raise ServiceError(503, "StateUnavailable", f"the forecast journal failed: {e}") from e
@@ -438,7 +436,17 @@ class ForecastService:
                 raise ServiceError(422, "IdentityMismatch", f"the issuance committed for this decision origin does "
                                                             f"not fit the request: {e}") from e
 
-    def _issue(self, bound: BoundRequest, grid, now_ms: int, token: Optional[int] = None, arrival: int = 0) -> Dict:
+    def _still_bound(self, body, bound: BoundRequest, now_ms: int) -> bool:
+        """Whether the live objects, read again NOW, still give this request's binding (the same evidence key). The
+        request's own time is used, so only the objects can make the answer differ. A refusal or a failed read is
+        not a confirmation."""
+        try:
+            return bind_request(body, self.reader, now_ms=now_ms).evidence_key == bound.evidence_key
+        except (AutoscalerNotFound, ContractRefused, ProvenanceRefused, LookupFailed):
+            return False
+
+    def _issue(self, bound: BoundRequest, grid, now_ms: int, token: Optional[int] = None,
+               current: Optional[Callable[[], bool]] = None) -> Dict:
         store, s, sig, lead = self.store, bound.settings, bound.signal, bound.lead
         ek, t, dt = bound.evidence_key, bound.decision_origin, s.sample_interval_seconds
         window = bound.window
@@ -473,7 +481,7 @@ class ForecastService:
         if self._compacted_s is None or now_s - self._compacted_s >= self.config.compact_every_seconds:
             store.compact(now_s)          # only checkpoint-covered, fully matured windows leave the journal
             self._compacted_s = now_s
-        self._export(bound, state, grid, now_s, token, arrival)
+        self._export(bound, state, grid, now_s, token, current)
         return self._response(bound, iss.payload())
 
     @staticmethod
@@ -711,7 +719,7 @@ class ForecastService:
         return r.to_wire()
 
     def _export(self, bound: BoundRequest, state: Dict, grid, now_s: int, token: Optional[int] = None,
-                arrival: int = 0) -> None:
+                current: Optional[Callable[[], bool]] = None) -> None:
         """Publish the autoscaler's samples (under the service lock). The forecast shown is the epoch's NEWEST
         committed issuance, read from the journal, not the one this request is answered with: a retry of an older
         window that finishes late republishes the newest forecast, never its own. Each candidate of that issuance is
@@ -719,15 +727,16 @@ class ForecastService:
         about and the trust gate's reason for it at issuance (history: whether it may act NOW is the operator's
         acceptance signal). A candidate without an upper bound has none here.
 
-        A request of another epoch (the autoscaler's settings or target changed) takes the publication over only if
-        it read the live object after the request that published the current epoch: stale work never restores an
-        older epoch's snapshot."""
+        A request of another epoch than the published one (the autoscaler's settings or target changed) takes the
+        publication over only after `current()` confirmed, by reading the live objects again here, that its binding
+        is still the one they give. Publications happen one at a time under the service lock, and each take-over reads
+        after every earlier one was decided, so a request whose own read was slow or old cannot bring an earlier
+        epoch back, in whatever order requests were bound or finish. Without a confirmation nothing is published."""
         key = (bound.signal.namespace, bound.autoscaler_name)
         held = self._published.get(key)
-        if held is not None and held[0] == token and held[1] != bound.evidence_key and arrival <= held[2]:
+        if held is not None and held[0] == token and held[1] != bound.evidence_key and not (current and current()):
             return
-        if held is None or held[0] != token or held[1] != bound.evidence_key:
-            self._published[key] = (token, bound.evidence_key, arrival)
+        self._published[key] = (token, bound.evidence_key)
         newest = self.store.latest_issuance(bound.evidence_key)
         issued = None if newest is None else newest.payload()
         trusted = {m: h.get("trusted", False) for m, h in state["trust"].items() if m in RECIPES}
