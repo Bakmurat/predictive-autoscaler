@@ -307,6 +307,13 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		}
 	}
 	r.lastReconcileMap[key] = time.Now()
+	// The stage metrics describe a completed reconcile: one that ends before it has decided removes them.
+	stagesPublished := false
+	defer func() {
+		if !stagesPublished {
+			clearReconcileStages(autoscaler.Namespace, autoscaler.Name)
+		}
+	}()
 
 	log.Info("Reconciling PredictiveAutoscaler",
 		"target", autoscaler.Spec.TargetDeployment.Name,
@@ -315,6 +322,7 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	// The target must be in the autoscaler's own namespace: a namespace-scoped cache could otherwise hide another
 	// autoscaler of the same target from the coexistence check.
 	if tns := autoscaler.Spec.TargetDeployment.Namespace; tns != "" && tns != autoscaler.Namespace {
+		recordIdentity(autoscaler.Namespace, autoscaler.Name, string(autoscaler.UID), "")
 		return r.updateStatusWithError(ctx, &autoscaler, "CrossNamespaceTarget",
 			fmt.Sprintf("targetDeployment.namespace %q differs from the autoscaler's namespace %q", tns, autoscaler.Namespace))
 	}
@@ -324,8 +332,10 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	if err != nil {
 		log.Error(err, "Failed to get target deployment")
 		delete(r.lastReconcileMap, key) // Allow fast retry on error
+		recordIdentity(autoscaler.Namespace, autoscaler.Name, string(autoscaler.UID), "")
 		return r.updateStatusWithError(ctx, &autoscaler, "DeploymentNotFound", err.Error())
 	}
+	recordIdentity(autoscaler.Namespace, autoscaler.Name, string(autoscaler.UID), string(deployment.UID))
 	currentReplicas := *deployment.Spec.Replicas
 	// A target with 0 desired replicas is paused by whoever set it (kubectl scale --replicas=0, a maintenance job):
 	// the decision is still computed and recorded, but nothing is written in any mode until the count is positive
@@ -380,7 +390,6 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	// One resolved capacity for the reactive rule, the forecast rule and the headroom floor (capacity.go). Without one
 	// no replica count is computed: the decision holds the current count and no forecast is requested.
 	capacityRPM, capacitySource, capacityOK := perReplicaCapacityRPM(autoscaler.Spec)
-	recordCapacity(autoscaler.Namespace, autoscaler.Name, capacityRPM, capacitySource, capacityOK)
 
 	// --- STARTUP DELAY AND BLOCKED SCALE-OUTS (startup.go; every engine) ---
 	now := r.now()
@@ -577,11 +586,6 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		dec.V2 = v2out.ledger(v2pol, capacityRPM, capacityOK, mode)
 	}
 	recordV2Metrics(autoscaler.Namespace, autoscaler.Name, v2out, v2pol, reactiveReplicas)
-	if v2out != nil {
-		recordPredictionWindow(autoscaler.Namespace, autoscaler.Name, v2out.Response, v2pol != nil)
-	} else {
-		forgetPredictionWindow(autoscaler.Namespace, autoscaler.Name)
-	}
 
 	// --- ACCURACY METRICS ---
 	// The actual need and the prediction error come from a measured rate and a configured capacity only: without both
@@ -661,7 +665,8 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	// change or a write conflict aborts it (never retried with the old decision) and the next reconcile, with fresh
 	// checks, follows soon.
 	guard, retrySoon := "", false
-	// requested is the count a write was attempted for, whatever became of it; every attempt's outcome is counted.
+	// requested is the count the write path intended: a write attempt's target, whatever became of the attempt (a
+	// final guard may have prevented its submission). Every attempt's outcome is counted.
 	var requested *int32
 	attempt := func(result string, to int32) {
 		recordWrite(autoscaler.Namespace, autoscaler.Name, result, to, float64(r.now().UnixMilli())/1000)
@@ -716,10 +721,20 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 		return true, nil
 	}
 
-	// The replica count at each stage, published once per reconcile, also when a failed write ends it early.
+	// The replica count at each stage, the capacity and the forecast in view, published once per reconcile after the
+	// apply step, also when a failed write ends it early. The forecast counts as used only if it is still accepted
+	// then: a forecast that expired before the write was rejected by the final check.
 	publishStages := func() {
-		recordStages(autoscaler.Namespace, autoscaler.Name, stageReplicas{calculated: desiredReplicas, target: currentReplicas,
+		stagesPublished = true
+		ns, name := autoscaler.Namespace, autoscaler.Name
+		recordStages(ns, name, stageReplicas{calculated: desiredReplicas, target: currentReplicas,
 			ready: deployment.Status.ReadyReplicas, requested: requested})
+		recordCapacity(ns, name, capacityRPM, capacitySource, capacityOK)
+		if v2out != nil {
+			recordPredictionWindow(ns, name, v2out.Response, dec.V2 != nil && dec.V2.Accepted)
+		} else {
+			forgetPredictionWindow(ns, name)
+		}
 	}
 
 	// --- APPLY SCALING ---
@@ -839,7 +854,7 @@ func (r *PredictiveAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl
 	if dec.ForecastStatus == "used" {
 		forecastReplicas = predictedReplicas
 	}
-	// A hold in Active mode asks for the current count; a write attempt asked for its target, whatever became of it.
+	// A hold in Active mode intends the current count; a write attempt intended its target, whatever became of it.
 	if requested == nil && stabilized > 0 {
 		requested = &stabilized
 	}

@@ -2,7 +2,7 @@ package controllers
 
 import (
 	stderrors "errors"
-	"regexp"
+	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -41,11 +41,11 @@ var (
 	}, stageLabels)
 	requestedReplicasGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "predictive_autoscaler_requested_replicas",
-		Help: "Stage 2: the replica count the last reconcile asked for or held after its safeguards (Active mode only; absent when it requested nothing)",
+		Help: "Stage 2: the count the write path intended in the last reconcile: the target of a write attempt (final guards may still have prevented its submission) or the held count (Active mode only; absent when nothing was intended)",
 	}, stageLabels)
 	appliedReplicasGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "predictive_autoscaler_applied_replicas",
-		Help: "Stage 3: the replica count of the last write the API server confirmed to this operator process (absent before its first write)",
+		Help: "Stage 3: the replica count of the last write the API server confirmed to this operator process for this autoscaler and target object (absent before its first write and after either was replaced)",
 	}, stageLabels)
 	appliedTimestampGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "predictive_autoscaler_applied_timestamp_seconds",
@@ -116,8 +116,31 @@ var (
 	// decisionActions are the actions recordDecision is called with (decision_record.go).
 	decisionActions = []string{"scale_up", "scale_down", "hold_stabilizing", "hold_cooldown", "hold_headroom", "at_target",
 		"keep_current", "scale_error", "recommend", "conflict_hold", "target_not_allowed", "guard_abort", "paused"}
-	// A condition reason is a CamelCase word the operator sets from constants; anything else is exported as Other.
-	reasonLabel = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9]{0,62}$`)
+	// conditionReasons is every reason the operator sets on an exported condition; any other value is exported as
+	// Other. TestEveryReasonTheOperatorSetsIsExportedByName scans the sources for reasons missing here.
+	conditionReasons = []string{
+		// Ready and the failure reasons it shares with ScalingActive
+		"ReconcileCompleted", "CrossNamespaceTarget", "DeploymentNotFound", "InvalidMetricQuery", "ScalingError",
+		// ScalingActive
+		"Active", "RecommendMode", "TargetPaused", "TargetNotAllowed", "CheckFailed", "Conflict", "GuardAborted",
+		"BoundsEnforced", "CapacityMissing", "TelemetryHold",
+		// CapacityConfigured
+		"CapacityPerReplica", "DeprecatedTargetRPS", "CapacityInvalid",
+		// TelemetryAvailable
+		"Measured", "MetricsUnavailable",
+		// ForecastAvailable
+		"Used", "Disabled", "Unavailable", "HorizonElapsed", "SanityRejected", "Unauthorized", "Forbidden",
+		"AuthUnavailable", "AuthMisconfigured", "NotTrusted", "Rejected", "LeadInsufficient", "SettingsInvalid",
+		// ConflictDetected, VPAInterference, ScaleOutBlocked, ScaleDownHeadroom
+		"ReplicaWriter", "NoConflict", "VPAUpdatesPods", "None", "FailedCreate", "QuotaExceeded", "Unschedulable",
+		"OwnershipUnresolved", "PodsUnreadable", "Holding", "NotHolding",
+		// PredictionReady: the service's reasons, the operator's own verdicts and request failures
+		"HistoryInsufficient", "CalibrationInsufficient", "ShadowInsufficient", "CoverageLow", "DataUnavailable",
+		"IdentityMismatch", "StateUnavailable", "ConfigurationNotValidated", "ReplayGateMissing", "Ready",
+		"EvidenceInsufficient", "EvidenceStale", "IssuedInFuture", "DeadlinePassed", "ForecastRejected", "RequestRefused",
+	}
+	// appliedOwner remembers, per autoscaler, the autoscaler and target objects (UIDs) its applied stage belongs to.
+	appliedOwner sync.Map
 )
 
 const otherLabel = "Other"
@@ -169,18 +192,38 @@ func recordConditionReason(ns, name, typ string, reason *string) {
 		conditionReasonGauge.DeletePartialMatch(fixed)
 		return
 	}
-	label := *reason
-	if !reasonLabel.MatchString(label) {
-		label = otherLabel
-	}
-	setOnly(conditionReasonGauge, fixed, "reason", label)
+	setOnly(conditionReasonGauge, fixed, "reason", oneOf(*reason, conditionReasons))
 }
 
 func recordDecisionAction(ns, name, action string) {
 	setOnly(decisionActionGauge, prometheus.Labels{"namespace": ns, "autoscaler": name}, "action", oneOf(action, decisionActions))
 }
 
-// stageReplicas is one reconcile's replica count at each stage. requested is nil when the reconcile asked for
+// recordIdentity binds the applied stage to the autoscaler and target objects it was confirmed for. When either is
+// another object now (a replaced Deployment, an autoscaler deleted and created again under its name, a target that
+// cannot be read: targetUID ""), the last confirmed write says nothing about it and is removed. It is called before
+// any write of the reconcile.
+func recordIdentity(ns, name, autoscalerUID, targetUID string) {
+	owner := autoscalerUID + "/" + targetUID
+	if prev, ok := appliedOwner.Swap(ns+"/"+name, owner); !ok || prev != owner {
+		appliedReplicasGauge.DeleteLabelValues(ns, name)
+		appliedTimestampGauge.DeleteLabelValues(ns, name)
+	}
+}
+
+// clearReconcileStages removes what only a completed reconcile can say: a reconcile that ended before its decision
+// (no target, an invalid query) must not leave the previous one's counts, action, capacity or forecast standing as
+// if they were current. The mode, the condition reasons, the write counters and a still valid applied stage stay.
+func clearReconcileStages(ns, name string) {
+	fixed := prometheus.Labels{"namespace": ns, "autoscaler": name}
+	for _, g := range []*prometheus.GaugeVec{calculatedReplicasGauge, requestedReplicasGauge, targetReplicasGauge,
+		targetReadyReplicasGauge, decisionActionGauge, capacityPerReplicaGauge} {
+		g.DeletePartialMatch(fixed)
+	}
+	forgetPredictionWindow(ns, name)
+}
+
+// stageReplicas is one reconcile's replica count at each stage. requested is nil when the write path intended
 // nothing (Recommend mode, a paused target, a refused or blocked write).
 type stageReplicas struct {
 	calculated, target, ready int32
@@ -277,4 +320,5 @@ func forgetStageMetrics(ns, name string) {
 	}
 	scaleWritesTotal.DeletePartialMatch(fixed)
 	forgetPredictionWindow(ns, name)
+	appliedOwner.Delete(ns + "/" + name)
 }

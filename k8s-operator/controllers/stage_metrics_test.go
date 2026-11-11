@@ -3,16 +3,21 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+	appsv1 "k8s.io/api/apps/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -279,9 +284,10 @@ func TestTheForecastWindowIsPublishedAlsoWhenUntrustedAndTheUsedFamilyOnlyWhenAc
 func TestLabelsNeverCarryFreeText(t *testing.T) {
 	ns, name := "ns-l", "pa-l"
 	t.Cleanup(func() { forgetConditionMetrics(ns, name) })
-	recordConditionMetrics(ns, name, "Active", true, []metav1.Condition{
-		{Type: "Ready", Status: metav1.ConditionFalse, Reason: `Get "https://10.0.0.1": dial tcp: i/o timeout`}})
-	wantOnly(t, "reason", seriesOf(t, conditionReasonGauge, ns, name), "reason=Other,type=Ready", 1)
+	for _, text := range []string{`Get "https://10.0.0.1": dial tcp: i/o timeout`, "UserSuppliedValue123", "", "ready"} {
+		recordConditionMetrics(ns, name, "Active", true, []metav1.Condition{{Type: "Ready", Status: metav1.ConditionFalse, Reason: text}})
+		wantOnly(t, "reason "+text, seriesOf(t, conditionReasonGauge, ns, name), "reason=Other,type=Ready", 1)
+	}
 	recordConditionMetrics(ns, name, "Active", true, []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue, Reason: "ReconcileCompleted"}})
 	wantOnly(t, "the previous reason is removed", seriesOf(t, conditionReasonGauge, ns, name), "reason=ReconcileCompleted,type=Ready", 1)
 	recordDecisionAction(ns, name, "rm -rf / ; made up")
@@ -319,4 +325,152 @@ func TestADeletedAutoscalerLeavesNoStageSeries(t *testing.T) {
 	for what, c := range collectors {
 		wantAbsent(t, what+" after the autoscaler was deleted", seriesOf(t, c, req.Namespace, req.Name))
 	}
+}
+
+// The reasons are an explicit list, so the list must keep up with the code: every reason literal the operator's
+// sources pass to a condition is in it. (A reason that is missing would be exported as Other, never as free text.)
+func TestEveryReasonTheOperatorSetsIsExportedByName(t *testing.T) {
+	patterns := []*regexp.Regexp{
+		regexp.MustCompile(`\bset(?:Status)?\("[A-Za-z]+", [A-Za-z.]+, "([A-Za-z0-9]+)"`), // set("Type", ok, "Reason"
+		regexp.MustCompile(`updateStatusWithError\(ctx, [^,]+, "([A-Za-z0-9]+)"`),         // a failed reconcile
+		regexp.MustCompile(`v2Verdict\{(?:Eligible: true, )?Reason: "([A-Za-z0-9]+)"`),    // the operator's verdicts
+		regexp.MustCompile(`return (?:true|false), "([A-Za-z0-9]+)"`),                     // readiness, capacityCondition
+		regexp.MustCompile(`\bBlocked(?:, obs\.BlockedMsg)? = "([A-Za-z0-9]+)"`),          // ScaleOutBlocked
+		regexp.MustCompile(`"[a-z_]+":\s+"([A-Z][A-Za-z0-9]+)"`),                          // forecastReasons
+	}
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := map[string]string{}
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		raw, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, p := range patterns {
+			for _, m := range p.FindAllStringSubmatch(string(raw), -1) {
+				found[m[1]] = f
+			}
+		}
+	}
+	if len(found) < 40 {
+		t.Fatalf("the scan found only %d reasons: its patterns no longer match the sources", len(found))
+	}
+	for _, r := range append(append([]string{}, v2Reasons...), "Unavailable", "DataUnavailable", "ForecastRejected", "RequestRefused") {
+		found[r] = "the forecast contract"
+	}
+	for reason, where := range found {
+		if oneOf(reason, conditionReasons) != reason {
+			t.Errorf("reason %s (%s) is not in conditionReasons: it would be exported as Other", reason, where)
+		}
+	}
+	seen := map[string]bool{}
+	for _, r := range conditionReasons {
+		if seen[r] || r == otherLabel {
+			t.Errorf("conditionReasons lists %s twice or reserves the fallback label", r)
+		}
+		seen[r] = true
+	}
+}
+
+// A forecast that was accepted into the calculation but expired before the write was rejected by the final check:
+// it is not the used family.
+func TestAForecastRejectedByTheFinalCheckIsNotTheUsedFamily(t *testing.T) {
+	f := v2Harness(t, autoscalerv1alpha1.ModeActive, "3000")
+	f.stub.set("eligible", 1000)
+	f.at(284)
+	t.Cleanup(func() { forgetConditionMetrics(f.req.Namespace, f.req.Name) })
+	wrapClient(f.r, interceptor.Funcs{
+		SubResourceGet: func(ctx context.Context, c client.Client, sub string, obj client.Object, out client.Object, opts ...client.SubResourceGetOption) error {
+			if sub == "scale" {
+				f.at(286) // the forecast's validity ends while the fresh Scale is read
+			}
+			return c.SubResource(sub).Get(ctx, obj, out, opts...)
+		},
+	})
+	reconcileOnce(t, f.r, f.req)
+	if d := lastDecision(t, f.path); d.V2 == nil || d.V2.Accepted {
+		t.Fatalf("setup: the forecast must have expired before the write: %+v", d.V2)
+	}
+	ns, name := f.req.Namespace, f.req.Name
+	wantAbsent(t, "used family after the final rejection", seriesOf(t, usedFamilyGauge, ns, name))
+	if got := seriesOf(t, selectedFamilyGauge, ns, name); len(got) != 1 {
+		t.Fatalf("the forecast in view is still shown: %v", got)
+	}
+	wantWrites(t, seriesOf(t, scaleWritesTotal, ns, name), map[string]float64{writeGuardAbort: 1})
+}
+
+// The last confirmed write belongs to the objects it was made for.
+func TestTheAppliedStageDoesNotOutliveItsTargetOrItsAutoscaler(t *testing.T) {
+	r, req, path := stageHarness(t, autoscalerv1alpha1.ModeActive, "3000")
+	ns, name := req.Namespace, req.Name
+	runRPMReconcile(t, r, req, path)
+	wantOnly(t, "applied", seriesOf(t, appliedReplicasGauge, ns, name), "", 5)
+	// A switch to Recommend keeps it, with its time: it is still the last write to this target.
+	a := getPA(t, r, req)
+	a.Spec.Mode = autoscalerv1alpha1.ModeRecommend
+	if err := r.Update(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	at := seriesOf(t, appliedTimestampGauge, ns, name)[""]
+	runRPMReconcile(t, r, req, path)
+	wantOnly(t, "applied after a switch to Recommend", seriesOf(t, appliedReplicasGauge, ns, name), "", 5)
+	wantOnly(t, "its time is unchanged", seriesOf(t, appliedTimestampGauge, ns, name), "", at)
+	// The Deployment is replaced under its name: nothing was written to the new object.
+	var dep appsv1.Deployment
+	if err := r.Get(context.Background(), req.NamespacedName, &dep); err != nil {
+		t.Fatal(err)
+	}
+	dep.UID = types.UID("replacement")
+	if err := r.Update(context.Background(), &dep); err != nil {
+		t.Fatal(err)
+	}
+	runRPMReconcile(t, r, req, path)
+	wantAbsent(t, "applied after the target was replaced", seriesOf(t, appliedReplicasGauge, ns, name))
+	wantAbsent(t, "applied timestamp after the target was replaced", seriesOf(t, appliedTimestampGauge, ns, name))
+	// The autoscaler is deleted and created again between two reconciles (no reconcile saw it missing).
+	recordWrite(ns, name, writeApplied, 7, 1)
+	recordIdentity(ns, name, "autoscaler-1", "replacement")
+	recordWrite(ns, name, writeApplied, 7, 1)
+	recordIdentity(ns, name, "autoscaler-1", "replacement")
+	wantOnly(t, "the same objects keep it", seriesOf(t, appliedReplicasGauge, ns, name), "", 7)
+	recordIdentity(ns, name, "autoscaler-2", "replacement")
+	wantAbsent(t, "applied after the autoscaler was recreated", seriesOf(t, appliedReplicasGauge, ns, name))
+}
+
+// A reconcile that ends before its decision leaves nothing standing that only a completed reconcile can say.
+func TestAReconcileThatEndsEarlyRemovesTheStagesOfThePreviousOne(t *testing.T) {
+	r, req, path := stageHarness(t, autoscalerv1alpha1.ModeActive, "3000")
+	ns, name := req.Namespace, req.Name
+	runRPMReconcile(t, r, req, path)
+	wantOnly(t, "applied", seriesOf(t, appliedReplicasGauge, ns, name), "", 5)
+	var dep appsv1.Deployment
+	if err := r.Get(context.Background(), req.NamespacedName, &dep); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delete(context.Background(), &dep); err != nil {
+		t.Fatal(err)
+	}
+	delete(r.lastReconcileMap, req.NamespacedName.String())
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	for what, c := range map[string]prometheus.Collector{"target": targetReplicasGauge, "ready": targetReadyReplicasGauge,
+		"calculated": calculatedReplicasGauge, "requested": requestedReplicasGauge, "decision": decisionActionGauge,
+		"capacity": capacityPerReplicaGauge, "applied (the target is gone)": appliedReplicasGauge,
+		"applied timestamp": appliedTimestampGauge} {
+		wantAbsent(t, what+" after a reconcile without a target", seriesOf(t, c, ns, name))
+	}
+	// What is still true stays: the mode, why the reconcile failed, and the count of past writes.
+	if got := seriesOf(t, modeGauge, ns, name); got["mode=Active"] != 1 {
+		t.Fatalf("mode: %v", got)
+	}
+	if got := seriesOf(t, conditionReasonGauge, ns, name); got["reason=DeploymentNotFound,type=Ready"] != 1 {
+		t.Fatalf("the failure reason must be exported: %v", got)
+	}
+	wantWrites(t, seriesOf(t, scaleWritesTotal, ns, name), map[string]float64{writeApplied: 1})
 }
