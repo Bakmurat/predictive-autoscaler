@@ -114,6 +114,7 @@
    "grid_seconds": 60,
    "update_interval_seconds": 60
   },
+  "min_lead_seconds": 600,
   "schedule_origin_utc": "2026-11-01T00:00:00Z",
   "peak_multiple": 9,
   "program": {

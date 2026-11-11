@@ -213,6 +213,7 @@ experiment (`full_validation_problems`).
 | `bounds`, `shadow_replicas` | Bounds exactly `{min: 1, max: 12}`; the fixed shadow replica count an integer within them. |
 | `capacity_per_replica_rps`, `capacity_label`, `capacity_source_calibration` | A positive number (the PredictiveAutoscaler's `capacityPerReplica`, already 0.875 x the reviewed rate), the literal `"provisional"`, and the calibration id it comes from (`c28cal-<10 hex>`). |
 | `cadence` | Exactly `{grid_seconds: 60, update_interval_seconds: 60}`. Any other combination is refused, and the rendering is checked against it. |
+| `min_lead_seconds` | Exactly `600`: with the cadence, risk 1000 bps and `["seasonalNaive"]` this is the ONE forecast profile that was qualified (`ml-engine/forecasting/contracts.py` `VALIDATED_PROFILES`). Any other lead is refused. It is rendered as `spec.prediction.minLeadSeconds`; without it the s20 startup profile would let the operator select a 180 s lead, which was never qualified. |
 | `schedule_origin_utc` | ONE UTC midnight (`YYYY-MM-DDT00:00:00Z`), set once at the start of history. Every reader bins from it. |
 | `peak_multiple` | `9`, the ordinary program's peak in units of c. |
 | `program` | `{kind: "ordinary", seed, days}`: a FINITE schedule of `days` whole UTC days from the origin (an integer 1..28; exactly 28 for a demonstration, fewer only render as a smoke). `seed` is the BASE seed: day d (0-based) is `schedule.program("ordinary", seed + d)`, so the seeds are consecutive and predeclared, and none of them (`seed` … `seed + days − 1`) may be a tuning or confirmation seed of the comparison. No day repeats: every day has its own ±5 % per-minute perturbation. After the last day the generator sends nothing. |
@@ -234,8 +235,8 @@ and every object and pod carries `c28.devkuban.com/run=<the demonstration's run 
 |---|---|
 | common | PriorityClass and scoped ResourceQuota (the params' names), the ingress with its ServiceAccount, Role and RoleBinding (routing `/t/<target>/` to the two targets only), `c28-metrics-route` and `c28-forecast-route` with their EMPTY fault ConfigMaps, the route NetworkPolicies when the release enforces them, the scrape object (`render.common_objects`). |
 | targets | Per target an EMPTY fault ConfigMap, the Deployment at `shadow_replicas` and the Service, exactly as the s20 arms are rendered (`render.target_objects`: image by digest, the calibrated resources, probes, placement). |
-| pas | Two PredictiveAutoscalers in Recommend through the arms' own rendering (`render.pa_object`): engine statistical, `prediction.families` from the params, sample and update interval 60 s. The reactive reference is the same object with `predictiveExtra` an explicit `{maxReplicas: 0, maxPercent: 0}`, as PA-R. |
-| generator | ConfigMap `c28-demo-generator` (the script and its configuration) and Deployment `c28-demo-generator`: one replica, strategy Recreate, on S, `k6 run` of the reviewed image. |
+| pas | Two PredictiveAutoscalers in Recommend through the arms' own rendering (`render.pa_object`), pinned to the ONE qualified forecast profile: engine statistical, `sampleIntervalSeconds: 60`, `updateIntervalSeconds: 60`, `minLeadSeconds: 600`, `families: ["seasonalNaive"]`, risk 1000 bps, settlement 120 s, outcome grace 600 s, and NO `calibration` or `trust` block (the defaults apply; `demo.qualified_prediction_problems` refuses anything else at render time). A test resolves the rendered objects with the forecaster's own `contracts.resolve_settings` and requires `contracts.validated_profile(settings, 600)` to be the allowlist entry. The reactive reference is the same object with `predictiveExtra` an explicit `{maxReplicas: 0, maxPercent: 0}`, as PA-R. |
+| generator | ConfigMap `c28-demo-generator` (the script and its configuration), a headless Service and StatefulSet `c28-demo-generator` with ONE replica, on S, `k6 run` of the reviewed image. Its only pod is `c28-demo-generator-0`. |
 
 `python -m c28 residency --params P --stage demonstration` is the stage's admission audit, on
 `render.residency_report`'s machinery and the same 75 % rule: on W both targets at `maxReplicas` plus `overlap_pods`
@@ -262,9 +263,13 @@ non-empty fault schedule, the residency audit and the reservation gate in every 
   `metrics.serviceMonitor.enabled: true`, `annotations` refused for the release. `values_problems` requires exactly
   one. Stage `experiment` writes the overlay it wrote before, unchanged.
 - **Generator.** Created only after `targets` and `pas` (this run's objects, same UIDs, both PAs in Recommend), with the
-  schedule origin not in the future, and only when no other Deployment or Pod carries the generator's name label
-  (strict listings: a failed list is never "no generator"). `verify` checks the fixed shadow count, one replica,
-  strategy Recreate and at most one generator pod.
+  schedule origin not in the future and the finite schedule not yet over (an expired schedule is refused: the
+  generator would send nothing), and only when no other Deployment, StatefulSet or Pod carries the generator's name
+  label (strict listings: a failed list is never "no generator"). The clock is a parameter of `plan`, `apply` and
+  `main` (`now`), so tests never read the real one. `verify` checks the fixed shadow count, that the generator is
+  still a StatefulSet with one replica, that at most ONE generator pod may be running and that it is the
+  StatefulSet's own (`c28-demo-generator-0`, controlled by it). A TERMINATING pod counts as possibly running (a
+  deletion timestamp only asks it to stop); only phase Succeeded or Failed is not a sender.
 
 ### The continuous generator (`load/c28-demo.js`)
 
@@ -308,8 +313,14 @@ non-empty fault schedule, the residency audit and the reservation gate in every 
   next multiple of `segment_hours` from the origin (a UTC midnight, the program's lowest demand; the one after it when
   closer than 5 minutes), writes its end record, and k6 exits 0; the kubelet restarts the container and the next
   incarnation resumes. That bounds anything that could grow with run time.
-- **Single generator.** One Deployment, one replica, strategy Recreate (the old pod is gone before a new one exists);
-  `prepare.py` refuses a second generator and `verify` counts the pods. Detection does not rely on that: every record
+- **Single generator: at most one pod.** A StatefulSet with one replica. Its only pod is always
+  `c28-demo-generator-0`, and the API server never holds two pods of one name: a replacement (an update, a deleted or
+  evicted pod, a drained node) is created only after the old pod object is gone. A Deployment does not give that:
+  strategy Recreate orders an update, but when a pod is merely deleted the ReplicaSet creates its replacement at
+  once while the old pod may still run for its termination grace period. The price is availability, the right side
+  to err on: with S unreachable no replacement starts until the old pod is confirmed gone. The planned restart at a
+  segment end is the kubelet restarting the container inside the same pod. `prepare.py` refuses a second generator
+  and `verify` counts every pod that may still run, terminating ones included. Detection does not rely on that: every record
   names its incarnation, records of two incarnations whose active spans overlap in a minute are
   `duplicate_generators` (the minute is unknown and listed in the reduction's `duplicate_generators`, never summed
   silently), and a generator whose log is missing shows as received ≫ dispatched (`unreconciled`).
@@ -319,10 +330,20 @@ non-empty fault schedule, the residency audit and the reservation gate in every 
   and VU) that the memory limit must cover. The peak is the MAXIMUM minute of the WHOLE table (all days, each day's
   perturbation included; the report names the day and its seed), never one day's. For 17.5 rps per replica the peak
   is about 165 arrivals per second per target, `max_inflight` 505, the estimate about 310 MiB against a 512 MiB
-  limit. The constants are assumptions, not measurements: the kind smoke's full mode prints the generator's
-  `memory.current` so they can be replaced. The ConfigMap carries the script and the whole table (about 0.2 MiB for
+  limit. The constants are assumptions, not measurements. One measurement exists (2026-11-11, real k6 under docker
+  with a 512 MiB limit, a local stand-in server, every minute at the peak of 9,898 arrivals per target, 330 per
+  second in total, `docker stats` every 5 s over two 2-minute incarnations): at most 25.7 MiB. The stand-in answers
+  in about 5 ms, so few requests were in flight and no remote-write output ran: it is a floor for a healthy target,
+  not a worst case, and the estimate stays the admission rule. The kind smoke's full mode prints the generator's
+  `memory.current`. The ConfigMap carries the script and the whole table (about 0.2 MiB for
   28 days); rendering refuses more than three quarters of the 1 MiB limit, and the kind smoke applies it server-side
   (a client-side apply would copy it into an annotation limited to 256 KiB).
+- **The configuration that runs is the one reviewed.** At start the script recomputes the configuration's digest
+  from what it parsed, exactly as `schedule.digest` does (SHA-256 over the JSON with sorted keys, separators `,` and
+  `:`, non-ASCII escaped, the `digest` key left out; `k6/crypto`), and refuses to start on a mismatch: a table edited
+  after rendering cannot run under its old digest. The configuration holds only integers, strings, booleans, arrays
+  and objects (the per-replica capacity is its decimal string): Python and JavaScript write floats differently, so
+  both sides refuse them. The start record carries `config_schema` and `config_digest`.
 - **Records.** One JSON line per target and minute (`c28-demo-minute/v2`, under 800 bytes, with the minute's `day`
   and `day_minute`), written 2.5 s after the minute ends, when every request dispatched in it has its outcome; a
   start and an end record (`c28-demo-incarnation/v2`) frame each incarnation (the start record names its `phase` and
@@ -334,8 +355,9 @@ non-empty fault schedule, the residency audit and the reservation gate in every 
 - **Remote write** (dashboards only): counters `c28d_scheduled`, `c28d_dispatched`, `c28d_dropped{reason}` and
   `c28d_completed{outcome}` per `c28_target`, tagged `c28_run` and `c28_pod`. `c28d_completed` and k6's own
   `http_reqs` are stamped at completion and are never dispatch counts. A missing series is unknown, never zero.
-- **Clock.** Each minute's record carries the first response's `Date` header with the local receive time: evidence of
-  the offset between the generator's and the ingress's clocks. The schedule is never corrected by it.
+- **Clock.** Each minute's record carries the `Date` header of its response with the SHORTEST round trip, with the
+  local receive time and that round trip: the tightest evidence the minute has of the offset between the generator's
+  and the ingress's clocks. The schedule is never corrected by it.
 
 | Count | Timestamp it uses |
 |---|---|
@@ -364,10 +386,10 @@ their own timestamps, `{"<target>": [[t_seconds, value], ...]}` (a range-vector 
 
 | State | Meaning |
 |---|---|
-| `observed` | One incarnation covered the whole minute, its record is self-consistent and equals the plan, the ingress count is known, the clocks agree within the limit, and the running balance reconciles. |
+| `observed` | One incarnation covered the whole minute; that incarnation has a valid start record bound to this configuration; its record is self-consistent, equals the table and accounts for every arrival the schedule places in the minute (`due` is exactly that number); the ingress count is known; the WHOLE interval the clock evidence allows lies inside the limit; and the running balance reconciles. |
 | `partial` | Trustworthy but not a whole, fully observed minute: an incarnation started or ended inside it (`incarnation_boundary`, with the exact active span and counts), the generator was provably absent between an end record and the next start (`generator_gap`), or the ingress count is unknown (`ingress_gap`, `ingress_reset`, `ingress_absent`). |
 | `unscheduled` | The minute is outside the finite schedule (`before_origin`, `schedule_exhausted`) and no generator line claims it: `intended` is null (undefined, never zero), nothing is judged. A line that claims such a minute is a `plan_mismatch`. |
-| `unknown` | The generator's side is missing or cannot be trusted: no record yet for the range's first minutes (`before_first_record`), a killed incarnation's unrecorded tail within the span it declared at its start, up to the next start (`unrecorded_tail`), a lost line (`generator_record_missing`), two incarnations whose active spans overlap in the minute (`duplicate_generators`, also listed per target in the output's `duplicate_generators`), `inconsistent_line`, `plan_mismatch`, `config_mismatch`, `conflicting_lines`, `generator_counter_reset`, `unresolved_outcomes`, a clock offset beyond the limit or no clock evidence (`clock_offset`, `clock_unverified`), or a balance that does not reconcile (`unreconciled`). Never zero, never healthy. |
+| `unknown` | The generator's side is missing or cannot be trusted: no record yet for the range's first minutes (`before_first_record`), a killed incarnation's unrecorded tail within the span it declared at its start, up to the next start (`unrecorded_tail`), a lost line (`generator_record_missing`), two incarnations whose active spans overlap in the minute (`duplicate_generators`, also listed per target in the output's `duplicate_generators`), `inconsistent_line` (also a line outside the span its start record declared), `plan_mismatch`, `config_mismatch`, `conflicting_lines`, `generator_counter_reset`, `unresolved_outcomes`, no valid start record for the incarnation (`start_record_missing`, `start_record_invalid`), a `due` that is not the schedule's arrivals in the active span (`due_mismatch`), a proven clock offset (`clock_offset`), clock evidence that is missing for a contributing incarnation, contradicts itself or only overlaps the limit (`clock_unverified`), or a balance that does not reconcile (`unreconciled`). Never zero, never healthy. |
 
 - The ingress count of a minute is the counter's difference between its two boundaries, each estimated from the
   adjacent raw samples (`received`, with hard `received_bounds` and a stated `received_err`); two missed scrapes
@@ -376,8 +398,20 @@ their own timestamps, `{"<target>": [[t_seconds, value], ...]}` (a range-vector 
   may hold what can be in flight (the timeout plus 1.1 s of arrivals, plus two) and the ingress estimate's error;
   requests without any HTTP response explain a positive imbalance up to their number. Beyond that the minute is
   `unreconciled` and the balance restarts.
-- A clock offset is detected with certainty only beyond the limit plus about one second (the `Date` header has whole
-  seconds); the limit (default 2 s) is recorded in the output.
+- **Provenance.** A minute line counts only under its incarnation's START record, and only when that record is this
+  configuration's: run id, `config_schema`, `config_digest`, origin, schedule end, day count, a segment end that
+  follows from its start time by the script's rule, an incarnation id of `<pod UID>/<start>`, and a declared span
+  that follows from those. Each line must lie in that span with exactly the active part it gives the minute. With
+  the incarnation records removed, no minute is observed.
+- **Accounting.** In its active part of a minute an incarnation owes every arrival the schedule places there: the
+  table row's count, the target's phase and the span give the number exactly (`demo_reduce.scheduled_arrivals`, the
+  script's own arithmetic), and `due` must equal it. A complete minute that reports due = dispatched = dropped = 0
+  against an intended count is `due_mismatch`, not observed, however flat the ingress.
+- **Clock.** The evidence of a minute bounds (generator clock − ingress clock) to an interval at least one second
+  wide (the `Date` header has whole seconds). The minute is trusted only when the WHOLE interval lies inside the limit
+  (default ±2 s, recorded in the output) for EVERY contributing incarnation: bounds of [−2500, 500] are
+  `clock_unverified`, an interval entirely outside is `clock_offset`, and an incarnation without evidence of its own
+  (its sample of the minute or within five minutes) or with samples that cannot both be true is `clock_unverified`.
 - The newest minutes of a running incarnation are `unrecorded_tail` until their lines exist: end the range at least
   three minutes before the log was pulled.
 - Summary totals cover observed minutes only. What is missing is never zero intended traffic: a scheduled minute
@@ -393,10 +427,14 @@ backward clock steps, arrival times, resume, segments, bookkeeping, drops) and t
 script under node with a virtual clock (`harness/tests/demo_sim.js`). k6 itself ran this script only in local
 accounting smokes without a cluster (the reviewed k6 image under docker against a counting stand-in server on
 127.0.0.1, 2026-11-11): unequal adjacent days with a restart across their boundary and with the boundary inside one
-incarnation, per-minute dispatched counts equal to the server's own counts, no drops. That exercises k6's event loop,
-`http.asyncRequest`, `k6/timers`, the stderr record stream and the exit status at a segment end; it is functionality,
-not evidence. **Not run for the 28-day schedule:** `demo-kind.sh --k6-local` (needs k6 on PATH) and the full mode on
-a throwaway kind cluster (the kubelet's restart, the ingress, remote write, the server-side apply of the ConfigMap).
+incarnation (both with the script as it was before the digest check), and, with the present script, every minute at
+the peak rate with the memory sampled, plus an altered table under its old digest, which k6 refused at start
+(`k6/crypto`). In all of them the per-minute dispatched counts equal the server's own counts, with no drops. That
+exercises k6's event loop, `http.asyncRequest`, `k6/timers`, `k6/crypto`, the stderr record stream and the exit
+status at a segment end; it is functionality, not evidence. **Not run for the 28-day schedule:**
+`demo-kind.sh --k6-local` (needs k6 on PATH) and the full mode on a throwaway kind cluster. Nothing on a cluster has
+therefore exercised the StatefulSet and its headless Service, the kubelet's restart of the container at a segment
+end, the ingress, remote write, or the server-side apply of the ConfigMap.
 
 ## Restore to the common starting count
 

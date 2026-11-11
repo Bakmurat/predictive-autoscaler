@@ -92,8 +92,35 @@ def world(tmp_path, api):
     return build
 
 
+NOW = "2026-11-11T00:00:00Z"        # a FIXED clock for every plan and apply: day 10 of the 28-day schedule that starts
+#                                     2026-11-01. No test here reads the real clock for the schedule's origin or end.
+
+
+def _now():
+    return NOW
+
+
+def plan_at(record, kube, phase, now=_now):
+    return prepare.plan(record, kube, phase, now=now)
+
+
+def apply_at(record, kube, phase, plan, digest, now=_now):
+    return prepare.apply(record, kube, phase, plan, digest, now=now)
+
+
+def gen_pod(name, uid=None, phase="Running", terminating=False, owner_kind="StatefulSet"):
+    """A generator pod as the cluster would show it: the name label, optionally controlled by the generator's
+    StatefulSet (uid), optionally terminating (a deletion timestamp: asked to stop, possibly still running)."""
+    pod = F.pod(name, "demo", "worker-s", labels={"app.kubernetes.io/name": GEN, X.RUN_LABEL: DEMO}, phase=phase)
+    if uid is not None:
+        pod["metadata"]["ownerReferences"] = [{"kind": owner_kind, "name": GEN, "uid": uid, "controller": True}]
+    if terminating:
+        pod["metadata"]["deletionTimestamp"] = "2026-11-11T00:00:05Z"
+    return pod
+
+
 def reviewed(record, kube, phase):
-    p = prepare.plan(record, kube, phase)
+    p = plan_at(record, kube, phase)
     saved = X.save_plan(record, "prepare", p, f"plan-{phase}")
     return X.load_plan(saved["plan"]), saved["plan_digest"]
 
@@ -101,7 +128,7 @@ def reviewed(record, kube, phase):
 def run_phase(record, kube, phase):
     plan, digest = reviewed(record, kube, phase)
     assert plan["problems"] == [], plan["problems"]
-    return prepare.apply(record, kube, phase, plan, digest)
+    return apply_at(record, kube, phase, plan, digest)
 
 
 def run_until(record, kube, last):
@@ -112,7 +139,7 @@ def run_until(record, kube, last):
 
 
 def problems(record, kube, phase):
-    return prepare.plan(record, kube, phase)["problems"]
+    return plan_at(record, kube, phase)["problems"]
 
 
 # --- the whole preparation ----------------------------------------------------------------------------------------------
@@ -122,7 +149,7 @@ def test_plans_are_read_only_and_pass_on_a_valid_reference(world):
     run_phase(record, kube, "namespaces")
     world.api.calls.clear()
     for ph in ("namespaces", "storage", "values", "common", "targets", "pas"):
-        p = prepare.plan(record, kube, ph)
+        p = plan_at(record, kube, ph)
         assert p["problems"] == [], (ph, p["problems"])
         assert p["stage"] == "demonstration" and p["run_id"] == DEMO
         assert p["reservation_gate"] == {"owner_run_id": OWNER, "owner_record_sha256": C.sha256_file(world.owner_path),
@@ -150,8 +177,13 @@ def test_full_demonstration_preparation_in_phases(world):
     kinds = {k for (k, _, _) in api.objects}
     assert "horizontalpodautoscalers" not in kinds and "scaledobjects" not in kinds
     assert len([1 for (k, _, _) in api.objects if k == "pa-new"]) == 2
-    gen = api.obj("Deployment", GEN, "demo")
-    assert gen["spec"]["replicas"] == 1 and gen["spec"]["strategy"] == {"type": "Recreate"}
+    gen = api.obj("StatefulSet", GEN, "demo")                              # at most one pod: <name>-0, never two
+    assert gen["spec"]["replicas"] == 1 and gen["spec"]["serviceName"] == GEN
+    assert api.obj("Service", GEN, "demo")["spec"]["clusterIP"] == "None" and api.obj("Deployment", GEN, "demo") is None
+    for name in (N, R):                                                    # the ONE qualified forecast profile
+        pred = api.obj("PredictiveAutoscaler", name, "demo")["spec"]["prediction"]
+        assert (pred["sampleIntervalSeconds"], pred["updateIntervalSeconds"], pred["minLeadSeconds"]) == (60, 60, 600)
+        assert "calibration" not in pred and "trust" not in pred
     assert set(api.obj("ConfigMap", GEN, "demo")["data"]) == {"c28-demo.js", "config.json"}
     assert api.obj("PriorityClass", "c28-demo-fixture") is not None
     assert {v for v, _ in api.mutations()} == {"create"}
@@ -173,14 +205,78 @@ def test_verify_passes_and_reports_the_fixed_shadow_count_and_the_single_generat
     assert out["result"] == "PASS", out["problems"]
     api.obj("Deployment", N, "demo")["spec"]["replicas"] = 2
     api.obj("PredictiveAutoscaler", R, "demo")["spec"]["mode"] = "Active"
-    api.obj("Deployment", GEN, "demo")["spec"]["replicas"] = 2
-    for i in (1, 2):
-        api.put(F.pod(f"{GEN}-{i}", "demo", "worker-s", labels={"app.kubernetes.io/name": GEN, X.RUN_LABEL: DEMO}))
+    api.obj("StatefulSet", GEN, "demo")["spec"]["replicas"] = 2
+    uid = api.obj("StatefulSet", GEN, "demo")["metadata"]["uid"]
+    for i in (0, 1):
+        api.put(gen_pod(f"{GEN}-{i}", uid))
     text = "\n".join(prepare.verify(record, kube)["problems"])
     assert f"{N} has 2 replicas, not the fixed 12" in text
     assert f"PredictiveAutoscaler/{R} is Active, not Recommend" in text
-    assert "must have exactly one replica and strategy Recreate" in text
-    assert "2 generator pods exist" in text and "two generators would send at once" in text
+    assert "must be a StatefulSet with exactly one replica" in text
+    assert "2 generator pods may be running" in text and "two generators would send at once" in text
+
+
+def verified_generator(world):
+    record, kube = world()
+    for ph in ("namespaces", "common", "targets", "pas", "generator"):
+        run_phase(record, kube, ph)
+    sts = world.api.obj("StatefulSet", GEN, "demo")
+    assert sts["spec"]["replicas"] == 1 and sts["spec"]["serviceName"] == GEN
+    assert world.api.obj("Deployment", GEN, "demo") is None              # no Deployment can run a second pod
+    return record, kube, world.api, sts["metadata"]["uid"]
+
+
+def generator_findings(record, kube):
+    return [x for x in prepare.verify(record, kube)["problems"] if "generator" in x]
+
+
+def test_a_terminating_generator_pod_still_counts_as_a_possible_sender(world):
+    """R3 item 1: an old Running pod that is TERMINATING plus a new Running pod are two possible senders. A deletion
+    timestamp only says the pod was asked to stop; only a pod whose phase says its containers stopped is not counted."""
+    record, kube, api, uid = verified_generator(world)
+    api.put(gen_pod(f"{GEN}-0", uid))
+    assert generator_findings(record, kube) == []                         # the StatefulSet's own single pod: fine
+    # The situation a Deployment allows on ordinary Pod replacement: the old pod terminating, a new one running.
+    api.put(gen_pod(f"{GEN}-old", uid, terminating=True))
+    found = generator_findings(record, kube)
+    assert any("2 generator pods may be running" in x and f"{GEN}-old (terminating)" in x
+               and "two generators would send at once" in x for x in found), found
+    # Whatever its name or owner, a terminating pod that may still run is counted ...
+    del api.objects[("pods", "demo", f"{GEN}-old")]
+    api.put(gen_pod("c28-demo-generator-7d9f-abcde", None, terminating=True))
+    found = generator_findings(record, kube)
+    assert any("2 generator pods may be running" in x for x in found), found
+    assert any("c28-demo-generator-7d9f-abcde is not the StatefulSet's own pod" in x for x in found), found
+    # ... until its phase says its containers have stopped.
+    for phase in ("Succeeded", "Failed"):
+        api.put(gen_pod("c28-demo-generator-7d9f-abcde", None, phase=phase, terminating=True))
+        assert generator_findings(record, kube) == [], phase
+    for phase in ("Running", "Pending", "Unknown"):
+        api.put(gen_pod("c28-demo-generator-7d9f-abcde", None, phase=phase, terminating=True))
+        assert any("2 generator pods may be running" in x for x in generator_findings(record, kube)), phase
+
+
+def test_only_the_statefulsets_own_pod_may_be_the_generator(world):
+    record, kube, api, uid = verified_generator(world)
+    # ONE running pod, but not the StatefulSet's: another generator is running in its place.
+    api.put(gen_pod("stray-generator", None))
+    assert any("stray-generator is not the StatefulSet's own pod" in x for x in generator_findings(record, kube))
+    del api.objects[("pods", "demo", "stray-generator")]
+    api.put(gen_pod(f"{GEN}-0", "00000000-0000-4000-8000-00000000dead"))     # the right name, another controller
+    assert any(f"{GEN}-0 is not the StatefulSet's own pod" in x for x in generator_findings(record, kube))
+    api.put(gen_pod(f"{GEN}-0", uid, owner_kind="ReplicaSet"))
+    assert any(f"{GEN}-0 is not the StatefulSet's own pod" in x for x in generator_findings(record, kube))
+    api.put(gen_pod(f"{GEN}-0", uid))
+    assert generator_findings(record, kube) == []
+    # Any other workload that carries the generator's label could start a second pod.
+    for kind in ("Deployment", "StatefulSet"):
+        api.put({"apiVersion": "apps/v1", "kind": kind,
+                 "metadata": {"name": "c28-demo-generator-2", "namespace": "demo",
+                              "labels": {"app.kubernetes.io/name": GEN}}, "spec": {"replicas": 1}})
+        assert any(f"other generator {kind}s exist: ['c28-demo-generator-2']" in x
+                   for x in generator_findings(record, kube)), kind
+        del api.objects[(X.KIND_KEY[kind], "demo", "c28-demo-generator-2")]
+    assert generator_findings(record, kube) == []
 
 
 # --- the reservation is another run's, by explicit reference -------------------------------------------------------------
@@ -195,7 +291,7 @@ def test_without_the_reference_the_demonstrations_pods_are_unplanned_occupants(w
     out = reserve.verify(world.owner, world.owner.kube(api))
     assert out["reservation"] == "FAIL" and any("demo/c28-demo-pa-n-abc" in p and "unplanned" in p
                                                 for p in out["reservation_problems"])
-    assert prepare.plan(record, kube, "targets")["reservation_gate"]["reservation"] == "PASS"   # by reference: accepted
+    assert plan_at(record, kube, "targets")["reservation_gate"]["reservation"] == "PASS"   # by reference: accepted
     occ = reserve.verify(world.owner, world.owner.kube(api), occupant={"run_id": DEMO, "namespaces": ["demo"]})
     assert [e["class"] for e in occ["occupants"]["workload"]] == ["authorized-occupant"]
     # The run label alone is not enough: it must sit in the demonstration's namespaces.
@@ -211,7 +307,7 @@ def test_every_phase_requires_the_owners_live_reservation(world):
     n = world.api.obj("Node", "worker-w")
     n["spec"]["taints"] = []
     for ph in prepare.DEMO_PHASES:
-        p = prepare.plan(record, kube, ph)
+        p = plan_at(record, kube, ph)
         assert any("reservation gate: workload worker-w: the run taint is not exactly" in x for x in p["problems"]), ph
         assert p["reservation_gate"]["reservation"] == "FAIL"
         assert p["reservation_gate"]["ready_for_demonstration"] is False
@@ -225,7 +321,7 @@ def test_a_reservation_lost_between_review_and_apply_creates_nothing(world):
     world.api.calls.clear()
     world.api.obj("Node", "worker-s")["spec"]["taints"] = []
     with pytest.raises(X.StagingError, match="no longer produces the reviewed plan"):
-        prepare.apply(record, kube, "targets", plan, digest)
+        apply_at(record, kube, "targets", plan, digest)
     assert world.api.mutations() == []
     assert not os.path.exists(os.path.join(record.evidence_dir, "targets.json"))
 
@@ -238,7 +334,7 @@ def edit_owner(world, fn):
 
 def gate_text(world, params=None, section=None, **record_over):
     record, kube = world(params=params, section=section, **record_over)
-    p = prepare.plan(record, kube, "namespaces")
+    p = plan_at(record, kube, "namespaces")
     assert p["reservation_gate"]["result"] == "FAIL" and p["reservation_gate"]["ready_for_demonstration"] is False
     return "\n".join(p["problems"])
 
@@ -289,7 +385,7 @@ def test_an_unverifiable_reference_never_asks_the_cluster_for_a_verdict(world):
     p["demonstration"]["reservation_ref"]["nodes"]["support"]["uid"] = "bbbbbbbb-0000-4000-8000-000000000009"
     record, kube = world(params=p)
     world.api.calls.clear()
-    plan = prepare.plan(record, kube, "namespaces")
+    plan = plan_at(record, kube, "namespaces")
     assert plan["reservation_gate"]["reservation"] == "UNVERIFIED"
     assert not [c for c in world.api.calls if "/nodes" in c[1]]
 
@@ -306,7 +402,7 @@ def test_the_stage_and_its_reference_are_explicit(world, section, text):
     s.update(section)
     record, kube = world(section=s)
     with pytest.raises(X.StagingError, match=text):
-        prepare.plan(record, kube, "namespaces")
+        plan_at(record, kube, "namespaces")
 
 
 def test_the_experiment_stage_is_unchanged_and_has_no_generator_phase(world, api):
@@ -317,7 +413,7 @@ def test_the_experiment_stage_is_unchanged_and_has_no_generator_phase(world, api
     open(world.owner_path, "w").write(json.dumps(doc))
     owner = X.load_record(world.owner_path, ("prepare",))
     with pytest.raises(X.StagingError, match="the generator phase belongs to stage demonstration"):
-        prepare.plan(owner, owner.kube(api), "generator")
+        plan_at(owner, owner.kube(api), "generator")
     assert set(prepare.split(owner_params())) == {"common", "targets", "pas", "writers", "generator"}
     assert prepare.split(owner_params())["generator"] == []
 
@@ -331,7 +427,7 @@ def test_the_demonstration_params_need_no_experiment_field_and_the_full_validati
     with pytest.raises(X.StagingError):
         X.load_params(record)                       # the experiment's loader refuses them, as it must
     run_phase(record, kube, "namespaces")
-    assert prepare.plan(record, kube, "common")["problems"] == []
+    assert plan_at(record, kube, "common")["problems"] == []
 
 
 @pytest.mark.parametrize("edit, text", [
@@ -347,7 +443,7 @@ def test_stage_validation_refusals_reach_prepare(world, edit, text):
     edit(p)
     record, kube = world(params=p)
     with pytest.raises(X.StagingError, match=text):
-        prepare.plan(record, kube, "namespaces")
+        plan_at(record, kube, "namespaces")
 
 
 # --- every existing refusal stays --------------------------------------------------------------------------------------------
@@ -395,10 +491,10 @@ def test_an_object_outside_the_c28_names_is_refused(world, monkeypatch):
 
     def renamed(params, *a, **kw):
         parts = real(params, *a, **kw)
-        parts["generator"][1]["metadata"]["name"] = "k6-generator"
+        parts["generator"][2]["metadata"]["name"] = "k6-generator"
         return parts
     monkeypatch.setattr(c28.demo, "render", renamed)
-    assert "Deployment/k6-generator is not a c28-* name" in problems(record, kube, "generator")
+    assert "StatefulSet/k6-generator is not a c28-* name" in problems(record, kube, "generator")
 
 
 def test_every_plan_runs_the_demonstrations_residency_audit(world):
@@ -418,7 +514,7 @@ def test_the_residency_audit_counts_the_release_as_the_final_values_request_it(w
     found = problems(record, kube, "common")
     assert any(x.startswith("residency: support node worker-s: CPU requests 1590m are 79.5%") for x in found), found
     listing = [x for x in found if x.startswith("residency: support")][0]
-    for part in ("Deployment/c28-demo-generator 1x(250m", "operator (chart) 1x(100m", "forecaster (chart) 1x(1000m",
+    for part in ("StatefulSet/c28-demo-generator 1x(250m", "operator (chart) 1x(100m", "forecaster (chart) 1x(1000m",
                  "Deployment/c28-metrics-route 1x(20m"):
         assert part in listing, listing
 
@@ -431,8 +527,8 @@ def test_apply_refuses_a_drifted_render(world):
     p["demonstration"]["schedule_origin_utc"] = "2026-11-02T00:00:00Z"       # another origin after review
     (world.tmp / "demo-params.json").write_text(json.dumps(p))
     with pytest.raises(X.StagingError):
-        prepare.apply(record, kube, "generator", plan, digest)
-    assert world.api.obj("Deployment", GEN, "demo") is None
+        apply_at(record, kube, "generator", plan, digest)
+    assert world.api.obj("StatefulSet", GEN, "demo") is None
 
 
 # --- the values phase ---------------------------------------------------------------------------------------------------------
@@ -533,6 +629,54 @@ def test_an_origin_in_the_future_is_refused_at_the_generator_phase(world, monkey
     assert prepare.generator_problems(record, kube, params, parts, [], now=lambda: "2026-11-01T00:00:00Z") == []
 
 
+def test_an_expired_schedule_is_refused_at_the_generator_phase(world):
+    """R3 item 6: the schedule is finite (28 days from 2026-11-01, so it ends 2026-11-29T00:00:00Z). Creating the
+    generator at or after its end is refused, in the function, in the plan and in apply. The time is PASSED IN: no
+    assertion here depends on the real clock."""
+    record, kube = world()
+    run_until(record, kube, "pas")
+    params = prepare.load_params(record, "demonstration")
+    parts = prepare.split(params, "demonstration")
+    at = lambda t: prepare.generator_problems(record, kube, params, parts, [], now=lambda: t)   # noqa: E731
+    assert at("2026-11-28T23:59:59Z") == []                               # the last second of the last day
+    for late in ("2026-11-29T00:00:00Z", "2026-11-29T00:00:01Z", "2027-03-01T12:00:00Z"):
+        found = at(late)
+        assert len(found) == 1 and "the schedule has expired" in found[0], (late, found)
+        assert "its 28 days from 2026-11-01T00:00:00Z ended at 2026-11-29T00:00:00Z" in found[0]
+        assert "would send nothing" in found[0] and "is in the future" not in found[0]
+    # Through the plan and apply: a plan reviewed in time is refused when applied after the end, nothing is created.
+    plan, digest = reviewed(record, kube, "generator")
+    assert plan["problems"] == []
+    late_plan = plan_at(record, kube, "generator", now=lambda: "2026-11-29T00:00:00Z")
+    assert any("the schedule has expired" in x for x in late_plan["problems"])
+    # (apply re-plans under the lock: the plan now carries the problem, so it is no longer the reviewed plan.)
+    with pytest.raises(X.StagingError, match="no longer produces the reviewed plan"):
+        apply_at(record, kube, "generator", plan, digest, now=lambda: "2026-11-29T00:00:00Z")
+    late_reviewed = X.save_plan(record, "prepare", late_plan, "plan-generator-late")
+    with pytest.raises(X.StagingError, match="the schedule has expired"):
+        apply_at(record, kube, "generator", X.load_plan(late_reviewed["plan"]), late_reviewed["plan_digest"],
+                 now=lambda: "2026-11-29T00:00:00Z")
+    assert world.api.obj("StatefulSet", GEN, "demo") is None and world.api.obj("ConfigMap", GEN, "demo") is None
+    # A shorter (smoke) schedule ends earlier: the day count is the params'.
+    p = json.load(open(world.tmp / "demo-params.json"))
+    p["demonstration"]["program"]["days"] = 3
+    short = prepare.generator_problems(record, kube, p, parts, [], now=lambda: "2026-11-04T00:00:00Z")
+    assert any("its 3 days" in x and "ended at 2026-11-04T00:00:00Z" in x for x in short)
+    assert prepare.generator_problems(record, kube, p, parts, [], now=lambda: "2026-11-03T23:59:00Z") == []
+
+
+def test_the_clock_of_plan_apply_and_the_cli_can_be_passed_in(world, capsys):
+    record, kube = world()
+    run_until(record, kube, "pas")
+    rc = prepare.main(["--record", record.path, "plan", "--phase", "generator"], api=world.api,
+                      now=lambda: "2026-11-29T00:00:00Z")
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 0 and any("the schedule has expired" in x for x in json.load(open(out[0]["plan"]))["problems"])
+    rc = prepare.main(["--record", record.path, "plan", "--phase", "generator"], api=world.api, now=_now)
+    out = json.loads(capsys.readouterr().out)
+    assert json.load(open(out[0]["plan"]))["problems"] == []
+
+
 def test_a_second_generator_is_refused_and_a_failed_listing_is_never_no_generator(world):
     record, kube = world()
     run_until(record, kube, "pas")
@@ -543,9 +687,18 @@ def test_a_second_generator_is_refused_and_a_failed_listing_is_never_no_generato
     assert "another generator exists: Deployment demo/c28-demo-generator-old (one generator only)" in \
         problems(record, kube, "generator")
     del api.objects[("deployments", "demo", "c28-demo-generator-old")]
+    api.put({"apiVersion": "apps/v1", "kind": "StatefulSet",
+             "metadata": {"name": "c28-demo-generator-old", "namespace": "demo",
+                          "labels": {"app.kubernetes.io/name": GEN}}, "spec": {"replicas": 1}})
+    assert "another generator exists: StatefulSet demo/c28-demo-generator-old (one generator only)" in \
+        problems(record, kube, "generator")
+    del api.objects[("statefulsets", "demo", "c28-demo-generator-old")]
     api.put(F.pod("leftover", "demo", "worker-s", labels={"app.kubernetes.io/name": GEN, X.RUN_LABEL: OWNER}))
     found = problems(record, kube, "generator")
     assert "another generator exists: Pod demo/leftover (one generator only)" in found
+    # A TERMINATING leftover may still be sending: it is refused like any other.
+    api.put(gen_pod("leftover", None, terminating=True))
+    assert "another generator exists: Pod demo/leftover (one generator only)" in problems(record, kube, "generator")
     del api.objects[("pods", "demo", "leftover")]
     assert problems(record, kube, "generator") == []
     # R2-16: a list that fails (the API answers "not found" for the collection) must raise, never read as empty.
@@ -557,24 +710,25 @@ def test_a_second_generator_is_refused_and_a_failed_listing_is_never_no_generato
         return real(path)
     api.get = flaky
     with pytest.raises(C.ApiError, match="list Pod: no list response"):
-        prepare.plan(record, kube, "generator")
+        plan_at(record, kube, "generator")
 
 
 def test_the_generator_is_created_once_and_recorded(world):
     record, kube = world()
     run_until(record, kube, "generator")
     created = prepare.created_objects(record)
-    assert ("Deployment", "demo", GEN) in created and ("ConfigMap", "demo", GEN) in created
-    assert f"Deployment demo/{GEN} already exists" not in "\n".join(problems(record, kube, "generator"))   # ours
-    p = prepare.plan(record, kube, "generator")
-    assert p["actions"] == [] and len(p["already_created_by_this_run"]) == 2
+    assert ("StatefulSet", "demo", GEN) in created and ("ConfigMap", "demo", GEN) in created
+    assert ("Service", "demo", GEN) in created and ("Deployment", "demo", GEN) not in created
+    assert f"StatefulSet demo/{GEN} already exists" not in "\n".join(problems(record, kube, "generator"))   # ours
+    p = plan_at(record, kube, "generator")
+    assert p["actions"] == [] and len(p["already_created_by_this_run"]) == 3
     cfg = json.loads(world.api.obj("ConfigMap", GEN, "demo")["data"]["config.json"])
     assert cfg["origin_utc"] == "2026-11-01T00:00:00Z" and cfg["targets"] == [N, R] and cfg["run_id"] == DEMO
 
 
 def test_cli_plans_every_demonstration_phase(world, capsys):
     record, kube = world()
-    rc = prepare.main(["--record", record.path, "plan"], api=world.api)
+    rc = prepare.main(["--record", record.path, "plan"], api=world.api, now=_now)
     out = json.loads(capsys.readouterr().out)
     assert rc == 0 and len(out) == len(prepare.DEMO_PHASES)
     assert [os.path.basename(o["plan"]).split("-")[1] for o in out] == list(prepare.DEMO_PHASES)

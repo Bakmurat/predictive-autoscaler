@@ -15,7 +15,8 @@
 #   deploy/eval-c28/smoke/demo-kind.sh                 FULL mode on a throwaway kind cluster with its own kubeconfig:
 #                                                      reserve two workers for an "owner" run, apply the rendered
 #                                                      demonstration objects of ANOTHER run id, run the generator from
-#                                                      the reviewed k6 image by digest with a 3-minute smoke segment,
+#                                                      the reviewed k6 image by digest with a 3-minute smoke segment
+#                                                      (a StatefulSet with one replica: at most one generator pod),
 #                                                      and check placement, the single generator pod, a planned
 #                                                      restart with exit 0, the records in the pod log, and the
 #                                                      reduction against the ingress's raw samples
@@ -100,8 +101,10 @@ p.pop("residency")|residency is required
 p["demonstration"]["program"]["days"] = 29|demonstration.program.days must be an integer in 1..28
 p["demonstration"]["program"].pop("days")|demonstration.program is missing days
 p["demonstration"]["program"]["seed"] = 180|must not be a tuning or confirmation seed of the comparison
+p["demonstration"]["min_lead_seconds"] = 180|demonstration.min_lead_seconds must be 600
+p["demonstration"].pop("min_lead_seconds")|demonstration is missing min_lead_seconds
 EOF
-  echo "render-only: $n refusals of the params stage (cadence, placeholders, targets, profile, bounds, reservation reference, image, names, residency, the schedule's days and seeds)"
+  echo "render-only: $n refusals of the params stage (cadence, the minimum lead, placeholders, targets, profile, bounds, reservation reference, image, names, residency, the schedule's days and seeds)"
   edit_params "$PARAMS" "$out/extra.json" 'p.update(c0_rps="<measured c0>", hpa_cpu_target_percent="__HPA__", keda="<unused>")'
   c28 validate --params "$out/extra.json" --stage demonstration >/dev/null
   echo "render-only: experiment-only fields are not consumed (placeholders there do not block the stage)"
@@ -132,10 +135,18 @@ assert sorted(o["metadata"]["name"] for o in pas) == sorted(names)
 assert all(o["spec"]["mode"] == "Recommend" for o in pas)
 assert all(o["spec"]["prediction"]["sampleIntervalSeconds"] == 60 == o["spec"]["prediction"]["updateIntervalSeconds"]
            for o in pas)
+# The ONE qualified forecast profile: the minimum lead explicit, no calibration or trust override.
+assert all(o["spec"]["prediction"]["minLeadSeconds"] == 600 and "calibration" not in o["spec"]["prediction"]
+           and "trust" not in o["spec"]["prediction"] and o["spec"]["prediction"]["families"] == ["seasonalNaive"]
+           and demo.qualified_prediction_problems(o["spec"]["prediction"], ["seasonalNaive"]) == [] for o in pas)
 extras = {o["metadata"]["name"]: o["spec"]["prediction"]["predictiveExtra"] for o in pas}
 assert extras[names[1]] == {"maxReplicas": 0, "maxPercent": 0} and extras[names[0]]["maxReplicas"] > 0
-gens = [o for o in objs if o["kind"] == "Deployment" and o["metadata"]["name"] == demo.GENERATOR_NAME]
-assert len(gens) == 1 and gens[0]["spec"]["replicas"] == 1 and gens[0]["spec"]["strategy"] == {"type": "Recreate"}
+# At most one generator pod: ONE StatefulSet with one replica (its pod is always <name>-0), no Deployment.
+gens = [o for o in objs if o["metadata"]["name"] == demo.GENERATOR_NAME and render.pod_templates(o)]
+assert len(gens) == 1 and gens[0]["kind"] == "StatefulSet" and gens[0]["spec"]["replicas"] == 1
+assert gens[0]["spec"]["serviceName"] == demo.GENERATOR_NAME
+assert [o["spec"].get("clusterIP") for o in objs if o["kind"] == "Service"
+        and o["metadata"]["name"] == demo.GENERATOR_NAME] == ["None"]
 assert gens[0]["spec"]["template"]["spec"]["containers"][0]["image"].endswith("@" + demo.GENERATOR_DIGEST)
 # The generator's configuration carries the WHOLE finite schedule: 28 days, one row and one predeclared seed per day.
 cms = [o for o in objs if o["kind"] == "ConfigMap" and o["metadata"]["name"] == demo.GENERATOR_NAME]
@@ -156,7 +167,8 @@ for values, want in (({"operator": {"rbac": {"scaleWrite": True, "scaleTargets":
     assert (got == []) if want is None else any(want in x for x in got), got
 frac = {r: rep["nodes"][r]["fraction"] for r in ("workload", "support")}
 print(f"render-only: {len(objs)} objects, all c28-* under run label {run}, sidecar-free, least-privilege, one "
-      f"Recommend PA per target, one Recreate generator with a finite schedule of {cfg['days']} days (seeds "
+      f"Recommend PA per target at the qualified profile (60 s grid and update, minimum lead 600 s), one generator "
+      f"StatefulSet with one replica and a finite schedule of {cfg['days']} days (seeds "
       f"{cfg['seeds'][0]}..{cfg['seeds'][-1]}); residency {frac} within 75 %; the Active configuration "
       "refuses an empty or partial scaleTargets list")
 PY
@@ -478,10 +490,12 @@ c28 render --params "$PRM" --stage demonstration --part generator --smoke-segmen
 # Server-side: the ConfigMap carries the whole 28-day table (about 0.2 MiB); a client-side apply would copy it into
 # the last-applied annotation, which is limited to 256 KiB.
 k apply --server-side -f "$WORK/generator.yaml" >/dev/null || die "apply generator"
-wait_for 300 "the generator is running" k -n "$NS" rollout status deploy/c28-demo-generator --timeout=5s
+wait_for 300 "the generator is running" k -n "$NS" rollout status statefulset/c28-demo-generator --timeout=5s
 GEN_STARTED="$(date +%s)"
 gen_pods() { k -n "$NS" get pods -l app.kubernetes.io/name=c28-demo-generator --no-headers 2>/dev/null | wc -l; }
 [ "$(gen_pods)" = 1 ] || die "expected exactly one generator pod, found $(gen_pods)"
+[ "$(k -n "$NS" get pods -l app.kubernetes.io/name=c28-demo-generator -o jsonpath='{.items[0].metadata.name}')" = c28-demo-generator-0 ] \
+  || die "the generator pod is not the StatefulSet's c28-demo-generator-0"
 
 # --- placement: every demonstration pod on its role's node ----------------------------------------------------------
 bad="$(k get pods -A -l "c28.devkuban.com/run=$RUN" -o json | "$PY" -c '

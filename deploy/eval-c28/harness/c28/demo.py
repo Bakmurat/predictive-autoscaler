@@ -6,11 +6,14 @@ A real stage of the tools with no experiment-only field and no dummy value. It r
     NetworkPolicies, the scrape object), with the ingress routing only to the stage's two targets;
   * two fixture targets with ONE startup profile, each rendered exactly as the comparison arms are (render.
     target_objects: the calibrated fixture resources, probes and placement), at a fixed shadow replica count;
-  * two PredictiveAutoscalers in Recommend (render.pa_object, the arms' own rendering): the forecast path
-    (prediction.families from the params) and the reactive reference, the same object with the predictive extra an
-    explicit zero, exactly as the PA-R arm is rendered;
-  * ONE continuous generator (a Deployment with one replica and strategy Recreate, the reviewed k6 image by digest, the
-    script load/c28-demo.js and its configuration from a ConfigMap) on the support node, feeding both targets the same
+  * two PredictiveAutoscalers in Recommend (render.pa_object, the arms' own rendering, then pinned to the ONE
+    qualified forecast profile: grid 60 s, update interval 60 s, minLeadSeconds 600, families [seasonalNaive], risk
+    1000 bps and NO calibration or trust override, see QUALIFIED_*): the forecast path and the reactive reference, the
+    same object with the predictive extra an explicit zero, exactly as the PA-R arm is rendered;
+  * ONE continuous generator (a StatefulSet with one replica and its headless Service: at most one generator pod can
+    exist, because the replacement has the old pod's name and is created only once that pod is gone; the reviewed k6
+    image by digest, the script load/c28-demo.js and its configuration from a ConfigMap) on the support node, feeding
+    both targets the same
     FINITE schedule from ONE immutable schedule origin: program.days whole UTC days (28 for a demonstration), day d
     being the ordinary diurnal program of the predeclared seed program.seed + d. The schedule never repeats and never
     wraps: after its last day the generator sends nothing.
@@ -56,6 +59,14 @@ ROLE_ARM = {"forecast": "PA-N", "reactive": "PA-R"}
 PROFILE = "s20"                                   # ONE startup profile (LIVE-DEMO-PLAN section 5)
 FAMILIES = ("seasonalNaive",)                     # the only families the demonstration qualification would admit
 CADENCE = {"grid_seconds": 60, "update_interval_seconds": 60}
+# The ONE qualified forecast profile (ml-engine/forecasting/contracts.py VALIDATED_PROFILES[0]: grid 60 s, update
+# interval 60 s, lead 600 s, miscoverage 1000 bps, families [seasonalNaive], every calibration and trust setting the
+# default). The startup profile s20 alone would let the operator select a 180 s lead, which was never qualified: the
+# rendering states the minimum lead explicitly and leaves the calibration and trust settings to their defaults.
+MIN_LEAD_SECONDS = 600
+QUALIFIED_MISCOVERAGE_BPS = 1000
+QUALIFIED_SETTLEMENT_S, QUALIFIED_GRACE_S = 120, 600
+UNQUALIFIED_OVERRIDES = ("calibration", "trust", "seasonality", "historyDays")   # never rendered: the defaults apply
 BOUNDS = {"min": F.MIN_REPLICAS, "max": F.MAX_REPLICAS}
 CAPACITY_LABEL = "provisional"
 PEAK_MULTIPLE = max(u for _, u in F.DAILY_SHAPE)  # 9: the ordinary cycle's peak in units of c
@@ -101,7 +112,7 @@ _REMOTE_WRITE = re.compile(r"https?://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[
 
 BLOCK_KEYS = ("run_id", "reservation_ref", "targets", "profile", "shadow_replicas", "bounds",
               "capacity_per_replica_rps", "capacity_label", "capacity_source_calibration", "cadence",
-              "schedule_origin_utc", "peak_multiple", "program", "generator")
+              "min_lead_seconds", "schedule_origin_utc", "peak_multiple", "program", "generator")
 GENERATOR_KEYS = ("image", "k6_version", "resources", "segment_hours", "remote_write_url")
 RESOURCE_KEYS = ("cpu_request", "cpu_limit", "memory_request", "memory_limit")
 
@@ -212,6 +223,9 @@ def block_problems(p: Dict) -> List[str]:
     if not isinstance(cad, dict) or cad != CADENCE or any(isinstance(v, bool) for v in cad.values()):
         out.append(f"demonstration.cadence must be exactly {CADENCE}: one issuance per grid step; any other "
                    "combination is refused")
+    if not _int(d["min_lead_seconds"], MIN_LEAD_SECONDS, MIN_LEAD_SECONDS):
+        out.append(f"demonstration.min_lead_seconds must be {MIN_LEAD_SECONDS}: the only lead the forecast profile was "
+                   "qualified for (with the 60 s grid and update interval); any other lead is refused")
     if origin_ms(d["schedule_origin_utc"]) is None:
         out.append("demonstration.schedule_origin_utc must be a UTC midnight (YYYY-MM-DDT00:00:00Z), recorded once")
     if not _int(d["peak_multiple"], PEAK_MULTIPLE, PEAK_MULTIPLE):
@@ -448,11 +462,41 @@ def generator_config(p: Dict, smoke_segment_minutes: Optional[int] = None,
            "max_inflight": generator_sizing(p)["max_inflight_per_target"],
            "latency_bounds_ms": list(LATENCY_BOUNDS_MS),
            "program": {"kind": d["program"]["kind"], "seed": d["program"]["seed"], "days": days,
-                       "capacity_per_replica_rps": float(capacity(p)), "capacity_label": d["capacity_label"],
+                       "capacity_per_replica_rps": capacity(p), "capacity_label": d["capacity_label"],
                        "capacity_source_calibration": d["capacity_source_calibration"]},
            "seeds": schedule_seeds(p), "per_minute_days": table}
+    why = canonical_problems(cfg)
+    if why:
+        raise R.ParamsError("the generator configuration cannot be digested identically by the script: " + "; ".join(why))
     cfg["digest"] = schedule.digest(cfg)
     return cfg
+
+
+def canonical_problems(obj, where: str = "config") -> List[str]:
+    """Why a value could be written differently by Python's json.dumps and by the script's canonical form (so the
+    digest the script recomputes at start would differ): the configuration holds only objects with string keys,
+    arrays, strings, booleans, null and INTEGERS within +-(2^53 - 1). A float is refused even when it is whole (Python
+    writes 2.0 where JavaScript writes 2); the per-replica capacity is therefore carried as its decimal string."""
+    out: List[str] = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if not isinstance(k, str):
+                out.append(f"{where}: a key is not a string")
+            out += canonical_problems(v, f"{where}.{k}")
+    elif isinstance(obj, (list, tuple)):
+        for i, v in enumerate(obj):
+            sub = canonical_problems(v, f"{where}[{i}]")
+            out += sub
+            if len(out) > 8:
+                break
+    elif isinstance(obj, bool) or obj is None or isinstance(obj, str):
+        pass
+    elif isinstance(obj, int):
+        if abs(obj) > 2**53 - 1:
+            out.append(f"{where}: integer beyond 2^53 - 1")
+    else:
+        out.append(f"{where}: {type(obj).__name__} {obj!r} is not an integer, string, boolean or null")
+    return out
 
 
 def config_problems(cfg) -> List[str]:
@@ -486,6 +530,7 @@ def config_problems(cfg) -> List[str]:
         out.append("schedule_minutes and schedule_end_ms must be days x 1440 minutes from the origin")
     if cfg.get("label") == "demonstration" and days != DEMONSTRATION_DAYS:
         out.append(f"a demonstration's schedule has exactly {DEMONSTRATION_DAYS} days")
+    out += canonical_problems({k: v for k, v in cfg.items() if k != "digest"})[:3]
     if schedule.digest(cfg) != cfg.get("digest"):
         out.append("the digest differs")
     return out
@@ -501,10 +546,20 @@ def _generator_labels(p: Dict) -> Dict[str, str]:
 
 
 def generator_objects(p: Dict, smoke_segment_minutes: Optional[int] = None) -> List[Dict]:
-    """The generator: a ConfigMap (the script and its configuration) and ONE Deployment (replicas 1, strategy Recreate:
-    the old pod is gone before a new one is created) on the support node. The container runs `k6 run` once per
-    SEGMENT: the script resumes the program at the wall-clock position, ends at the next segment boundary and k6 exits
-    0, so the kubelet starts the next incarnation (restartPolicy Always)."""
+    """The generator: a ConfigMap (the script and its configuration), a headless Service and ONE StatefulSet with one
+    replica on the support node.
+
+    At most one generator pod can exist. The StatefulSet's only pod is always named <name>-0, and the API server
+    never holds two pods of one name: a replacement (an update, a deleted or evicted pod, a drained node) is created
+    only after the old pod object is gone, that is after its containers stopped or it was force-deleted. A Deployment
+    cannot give that: strategy Recreate orders an UPDATE, but when a pod is merely deleted its ReplicaSet creates the
+    replacement at once, while the old pod may still run for its whole termination grace period. The cost is
+    availability, which is the right side to err on here: with the support node unreachable no replacement starts until
+    the old pod is confirmed gone (the reducer shows the minutes as unrecorded or as a gap, never as double traffic).
+
+    The container runs `k6 run` once per SEGMENT: the script resumes the program at the wall-clock position, ends at
+    the next segment boundary and k6 exits 0, so the kubelet restarts the container in the same pod (restartPolicy
+    Always): the next incarnation."""
     cfg = generator_config(p, smoke_segment_minutes)
     g = p["demonstration"]["generator"]
     ns, labels = p["namespace"], _generator_labels(p)
@@ -538,11 +593,20 @@ def generator_objects(p: Dict, smoke_segment_minutes: Optional[int] = None) -> L
                                                         "capabilities": {"drop": ["ALL"]}},
                                     "volumeMounts": [{"name": "plan", "mountPath": "/plan", "readOnly": True}]}],
                     "volumes": [{"name": "plan", "configMap": {"name": GENERATOR_NAME}}]}}
-    dep = {"apiVersion": "apps/v1", "kind": "Deployment",
+    # The governing Service a StatefulSet names (headless, no port: the generator serves nothing).
+    svc = {"apiVersion": "v1", "kind": "Service", "metadata": {"name": GENERATOR_NAME, "namespace": ns, "labels": labels},
+           "spec": {"clusterIP": "None", "selector": selector}}
+    sts = {"apiVersion": "apps/v1", "kind": "StatefulSet",
            "metadata": {"name": GENERATOR_NAME, "namespace": ns, "labels": labels},
-           "spec": {"replicas": 1, "revisionHistoryLimit": 2, "strategy": {"type": "Recreate"},
+           "spec": {"replicas": 1, "serviceName": GENERATOR_NAME, "podManagementPolicy": "OrderedReady",
+                    "revisionHistoryLimit": 2, "updateStrategy": {"type": "RollingUpdate"},
                     "selector": {"matchLabels": selector}, "template": pod}}
-    return [cm, dep]
+    return [cm, svc, sts]
+
+
+def generator_pod_name() -> str:
+    """The ONE name a generator pod can have (the StatefulSet's ordinal 0)."""
+    return f"{GENERATOR_NAME}-0"
 
 
 # --- rendering ------------------------------------------------------------------------------------------------------
@@ -560,13 +624,49 @@ def render(p: Dict, smoke_segment_minutes: Optional[int] = None) -> Dict[str, Li
     for t in ts:
         labels = {**R._labels(p, t["arm"], d["profile"], t["name"]), DEMO_ROLE_LABEL: t["role"]}
         out["targets"] += R.target_objects(p, t["name"], labels, d["profile"], d["shadow_replicas"])
-        out["pas"].append(R.pa_object(p, t["name"], copy.deepcopy(labels), d["profile"], capacity(p),
-                                      reactive_only=t["role"] == "reactive", families=t["families"]))
+        out["pas"].append(qualified_pa(p, R.pa_object(p, t["name"], copy.deepcopy(labels), d["profile"], capacity(p),
+                                                      reactive_only=t["role"] == "reactive", families=t["families"])))
     objs = flat(out)
     R.audit_rendered(objs)
     R.audit_sidecar_free(objs)
     R.audit_rbac(objs)
     audit(p, out)
+    return out
+
+
+def qualified_pa(p: Dict, pa: Dict) -> Dict:
+    """The arm's PredictiveAutoscaler pinned to the ONE qualified forecast profile (QUALIFIED_* above; both targets:
+    the reactive reference stays the same object with the predictive extra zero). Explicit: the grid, the update
+    interval and the minimum lead from the params (validated to be 60 / 60 / 600), the families, the risk and the
+    outcome timing. Absent, so that the defaults apply: every calibration and trust setting, seasonality, history."""
+    d = p["demonstration"]
+    pred = pa["spec"]["prediction"]
+    pred["sampleIntervalSeconds"] = d["cadence"]["grid_seconds"]
+    pred["updateIntervalSeconds"] = d["cadence"]["update_interval_seconds"]
+    pred["minLeadSeconds"] = d["min_lead_seconds"]
+    for key in UNQUALIFIED_OVERRIDES:
+        pred.pop(key, None)
+    return pa
+
+
+def qualified_prediction_problems(pred: Dict, families: List[str]) -> List[str]:
+    """Why a rendered spec.prediction is not the qualified profile (empty when it is). The harness cannot import the
+    forecaster's contracts; tests resolve the rendered object with ml-engine/forecasting/contracts.py and require the
+    allowlist entry."""
+    out = []
+    want = {"enabled": True, "engine": "statistical", "sampleIntervalSeconds": CADENCE["grid_seconds"],
+            "updateIntervalSeconds": CADENCE["update_interval_seconds"], "minLeadSeconds": MIN_LEAD_SECONDS,
+            "settlementSeconds": QUALIFIED_SETTLEMENT_S, "outcomeGraceSeconds": QUALIFIED_GRACE_S,
+            "risk": {"miscoverageBps": QUALIFIED_MISCOVERAGE_BPS}, "families": list(families)}
+    for key, value in want.items():
+        if key not in pred or pred[key] != value or isinstance(pred[key], bool) != isinstance(value, bool):
+            out.append(f"prediction.{key} must be exactly {value!r} (the qualified profile), not {pred.get(key)!r}")
+    for key in UNQUALIFIED_OVERRIDES:
+        if key in pred:
+            out.append(f"prediction.{key} must not be rendered: the qualified profile uses its default")
+    extra = sorted(set(pred) - set(want) - {"horizonMinutes", "predictiveExtra"} - set(UNQUALIFIED_OVERRIDES))
+    if extra:
+        out.append(f"prediction has settings outside the qualified profile: {', '.join(extra)}")
     return out
 
 
@@ -587,9 +687,10 @@ def render_all(p: Dict) -> List[Dict]:
 
 def audit(p: Dict, parts: Dict[str, List[Dict]]) -> None:
     """The stage's own rendering audit (ParamsError otherwise): names and run labels; two targets at the shadow count
-    with the frozen bounds; both PredictiveAutoscalers in Recommend at exactly the params' cadence, with the
-    forecast path's families, the reactive reference's predictive extra an explicit zero and the forecast path's the
-    frozen one; one generator with one replica, strategy Recreate and the reviewed image."""
+    with the frozen bounds; both PredictiveAutoscalers in Recommend with exactly the qualified forecast profile (grid,
+    update interval, minimum lead, families, risk, outcome timing, and no calibration or trust override), the reactive
+    reference's predictive extra an explicit zero and the forecast path's the frozen one; ONE generator: a StatefulSet
+    with one replica and its headless Service, and no other workload kind that could run a second generator pod."""
     d, bad = p["demonstration"], []
     names = target_names(p)
     for o in flat(parts):
@@ -625,6 +726,9 @@ def audit(p: Dict, parts: Dict[str, List[Dict]]) -> None:
             bad.append(f"{where}: the rendered cadence is not the params' grid/update interval")
         if pred.get("engine") != "statistical" or pred.get("families") != t["families"]:
             bad.append(f"{where}: engine statistical with families {t['families']} is required")
+        if pred.get("minLeadSeconds") != d["min_lead_seconds"]:
+            bad.append(f"{where}: the rendered minLeadSeconds is not the params' min_lead_seconds")
+        bad += [f"{where}: {x}" for x in qualified_prediction_problems(pred, t["families"])]
         want = {"maxReplicas": 0, "maxPercent": 0} if t["role"] == "reactive" else \
             {"maxReplicas": F.EXTRA_MAX_REPLICAS, "maxPercent": F.EXTRA_MAX_PERCENT}
         if pred.get("predictiveExtra") != want:
@@ -633,9 +737,25 @@ def audit(p: Dict, parts: Dict[str, List[Dict]]) -> None:
             bad.append(f"{where}: capacityPerReplica is not the stage's provisional capacity")
     if parts["writers"]:
         bad.append("the demonstration renders no HPA or KEDA writer")
-    gens = [o for o in parts["generator"] if o["kind"] == "Deployment"]
-    if len(gens) != 1 or gens[0]["spec"]["replicas"] != 1 or gens[0]["spec"]["strategy"] != {"type": "Recreate"}:
-        bad.append("exactly one generator Deployment with one replica and strategy Recreate is required")
+    # At most one generator pod: ONE StatefulSet with one replica is the only object of the stage's generator phase
+    # that carries a pod template (a Deployment, Job or bare Pod could run a second pod beside it).
+    workloads = [o for o in parts["generator"] if R.pod_templates(o)]
+    gens = [o for o in workloads if o["kind"] == "StatefulSet"]
+    if len(workloads) != 1 or len(gens) != 1:
+        bad.append("exactly one generator workload is required, and it must be a StatefulSet (found "
+                   f"{sorted(o['kind'] + '/' + o['metadata']['name'] for o in workloads)})")
+    else:
+        gs = gens[0]["spec"]
+        if gs.get("replicas") != 1 or isinstance(gs.get("replicas"), bool):
+            bad.append("the generator StatefulSet must have exactly one replica (two replicas are two generators)")
+        if gs.get("podManagementPolicy", "OrderedReady") != "OrderedReady":
+            bad.append("the generator StatefulSet must keep podManagementPolicy OrderedReady")
+        if gs.get("serviceName") != gens[0]["metadata"]["name"] or not any(
+                o["kind"] == "Service" and o["metadata"]["name"] == gs.get("serviceName")
+                and o["spec"].get("clusterIP") == "None" for o in parts["generator"]):
+            bad.append("the generator StatefulSet needs its headless Service of the same name")
+        if (gens[0]["spec"]["template"]["spec"].get("restartPolicy") or "Always") != "Always":
+            bad.append("the generator pod must restart its container in place (restartPolicy Always)")
     if bad:
         raise R.ParamsError("demonstration rendering audit: " + "; ".join(bad))
 

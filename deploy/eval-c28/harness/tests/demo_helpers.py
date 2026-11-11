@@ -78,15 +78,22 @@ def node():
     return exe
 
 
-def simulate(tmp_path, cfg, scenario):
-    """Run demo_sim.js: the real script's generator on a virtual clock. Returns its JSON output."""
+def run_sim(tmp_path, cfg, scenario):
+    """demo_sim.js on a configuration: (exit status, its JSON output). The script's init code runs first, as under
+    k6: a configuration it refuses (checkConfig, the digest) ends the run with exit 1 and {"error": ...}."""
     cpath, spath = tmp_path / "config.json", tmp_path / "scenario.json"
     cpath.write_text(json.dumps(cfg))
     spath.write_text(json.dumps(scenario))
     out = subprocess.run([node(), SIM, SCRIPT, str(cpath), str(spath)], capture_output=True, text=True, timeout=300,
                          env={"PATH": os.environ.get("PATH", ""), "KUBECONFIG": "/dev/null"})
     doc = json.loads(out.stdout.strip().splitlines()[-1]) if out.stdout.strip() else {"error": out.stderr}
-    assert out.returncode == 0 and "error" not in doc, doc.get("error") or out.stderr
+    return out.returncode, doc
+
+
+def simulate(tmp_path, cfg, scenario):
+    """Run demo_sim.js: the real script's generator on a virtual clock. Returns its JSON output."""
+    rc, doc = run_sim(tmp_path, cfg, scenario)
+    assert rc == 0 and "error" not in doc, doc.get("error")
     return doc
 
 

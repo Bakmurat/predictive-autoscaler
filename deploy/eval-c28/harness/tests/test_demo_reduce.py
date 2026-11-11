@@ -672,3 +672,306 @@ def test_a_configuration_whose_schedule_cannot_be_read_is_refused(edit, why):
     edit(cfg)
     with pytest.raises(ValueError, match=why):
         DR.reduce(cfg, [], {}, PEAK, PEAK + MIN)
+
+
+# --- provenance: no minute is observed without its incarnation's valid start record (R3 item 3a) -------------------
+
+def test_without_any_incarnation_record_no_minute_is_observed(tmp_path):
+    """The reviewer's case: every incarnation record removed, the minute lines left. Nothing binds those lines to
+    this configuration (run, digest, origin, schema, segment end), so none of their minutes is observed."""
+    cfg, out = sim(tmp_path, [{"pod_uid": "pod-a", "start_ms": PEAK - 3 * MIN}])
+    full = reduced(cfg, out)
+    assert full["targets"][N]["summary"]["states"]["observed"] == 11
+    only_lines = [l for l in out["lines"] if l["schema"] == DR.MINUTE]
+    assert len(only_lines) < len(out["lines"])
+    red = reduced(cfg, out, records=only_lines)
+    for t in (N, R):
+        s = red["targets"][t]["summary"]
+        assert s["states"]["observed"] == 0 and s["states"]["unknown"] == 11, s
+        assert s["reasons"]["start_record_missing"] == 11
+        assert s["observed_totals"]["dispatched"] == 0 and s["unobserved_intended"] == s["scheduled_intended"] > 0
+    assert {i["start_record"] for i in red["incarnations"]} == {"no start record"}
+    # Only the START record matters for the binding: without the end record the minutes stay observed.
+    no_end = [l for l in out["lines"] if l.get("event") != "end"]
+    assert reduced(cfg, out, records=no_end)["targets"][N]["summary"]["states"]["observed"] == 11
+    # One target's start record lost: that target's minutes only.
+    lost = [l for l in out["lines"] if not (l.get("event") == "start" and l["target"] == N)]
+    red = reduced(cfg, out, records=lost)
+    assert red["targets"][N]["summary"]["states"]["observed"] == 0
+    assert red["targets"][R]["summary"]["states"]["observed"] == 11
+
+
+@pytest.mark.parametrize("edit, why", [
+    (lambda st: st.update(config_digest="0" * 64), "config_digest is not the configuration's"),
+    (lambda st: st.update(config_schema="c28-demo-generator/v1"), "config_schema is not the configuration's"),
+    (lambda st: st.pop("config_schema"), "config_schema is not the configuration's"),
+    (lambda st: st.update(origin_ms=st["origin_ms"] + DAY), "origin_ms is not the configuration's"),
+    (lambda st: st.update(schedule_end_ms=st["schedule_end_ms"] + DAY), "schedule_end_ms is not the configuration's"),
+    (lambda st: st.update(days=27), "days is not the configuration's"),
+    (lambda st: st.update(segment_end_ms=st["segment_end_ms"] + DAY, send_to_ms=st["send_to_ms"] + DAY),
+     "segment_end_ms is not the segment end of its start time"),
+    (lambda st: st.update(segment_end_ms=None), "must be integers"),
+    (lambda st: st.update(started_ms=st["started_ms"] - 5 * MIN), "the incarnation id is not"),
+    (lambda st: st.update(send_from_ms=st["send_from_ms"] - 90_000), "the declared span or phase does not follow"),
+    (lambda st: st.update(send_to_ms=st["send_to_ms"] + MIN), "the declared span or phase does not follow"),
+    (lambda st: st.update(phase="pre-origin"), "the declared span or phase does not follow"),
+    (lambda st: st.update(schema="c28-demo-incarnation/v1"), None),          # not a record at all: missing
+    (lambda st: st.update(run="c28-other-run"), None),                       # another run's record: missing
+])
+def test_a_start_record_that_is_not_this_configurations_does_not_bind_its_lines(tmp_path, edit, why):
+    cfg, out = sim(tmp_path, [{"pod_uid": "pod-a", "start_ms": PEAK - 3 * MIN + 4_000}])
+    recs = copy.deepcopy(out["lines"])
+    for l in recs:
+        if l.get("event") == "start" and l["target"] == N:
+            edit(l)
+    recs = [l for l in recs if l.get("schema") in (DR.MINUTE, DR.INCARNATION)]
+    red = reduced(cfg, out, records=recs)
+    s = red["targets"][N]["summary"]
+    assert s["states"]["observed"] == 0, s
+    flag = "start_record_invalid" if why else "start_record_missing"
+    assert s["reasons"][flag] == 11
+    inc = [i for i in red["incarnations"] if i["target"] == N][0]
+    assert (why or "no start record") in inc["start_record"], inc["start_record"]
+    assert red["targets"][R]["summary"]["states"]["observed"] >= 9          # the other target's binding is intact
+    assert [i["start_record"] for i in red["incarnations"] if i["target"] == R] == ["valid"]
+
+
+def test_a_line_must_lie_in_the_span_its_start_record_declared(tmp_path):
+    start = PEAK - 3 * MIN + 4_000
+    cfg, out = sim(tmp_path, [{"pod_uid": "pod-a", "start_ms": start}])
+    assert rows(reduced(cfg, out))[-2]["state"] == "observed"
+    # The start minute's line claims the WHOLE minute, though the incarnation started 4 s into it.
+    recs = copy.deepcopy(out["lines"])
+    first = [l for l in recs if l["schema"] == DR.MINUTE and l["minute"] == BASE - 3 and l["target"] == N][0]
+    assert first["active"] == [4_000, MIN]
+    first["active"] = [0, MIN]
+    red = DR.reduce(cfg, recs, out["ingress"], PEAK - 3 * MIN, PEAK + 9 * MIN)
+    row = {r["minute"] - BASE: r for r in red["targets"][N]["rows"]}[-3]
+    assert row["state"] == "unknown" and "inconsistent_line" in row["reasons"]
+    # A line for a minute BEFORE the incarnation started (copied from another minute) is outside its span.
+    recs = copy.deepcopy(out["lines"])
+    ghost = copy.deepcopy([l for l in recs if l["schema"] == DR.MINUTE and l["minute"] == BASE and l["target"] == N][0])
+    m = BASE - 5
+    ghost.update(minute=m, day_minute=m % 1440, intended=cfg["per_minute_days"][10][m % 1440], n=500)
+    ghost["due"] = ghost["dispatched"] = ghost["ok"] = ghost["intended"]
+    ghost["lat"]["counts"] = [0, 0, ghost["ok"]] + [0] * 10
+    red = DR.reduce(cfg, recs + [ghost], out["ingress"], PEAK - 6 * MIN, PEAK + 9 * MIN)
+    row = {r["minute"] - BASE: r for r in red["targets"][N]["rows"]}[-5]
+    assert row["state"] == "unknown" and "inconsistent_line" in row["reasons"]
+
+
+# --- accounting: every arrival the schedule places in the active span is owed (R3 item 4) --------------------------
+
+def test_scheduled_arrivals_is_the_scripts_own_count_for_any_span(tmp_path):
+    cfg = config()
+    m = BASE + 2
+    from demo_helpers import simulate as run_probe
+    out = run_probe(tmp_path, cfg, {"incarnations": [], "until_ms": PEAK,
+                                    "probes": [{"fn": "arrivals", "minute": m, "target_index": i} for i in (0, 1)]})
+    lo = ORIGIN + m * MIN
+    n = cfg["per_minute_days"][10][1082]
+    for target, f in zip((N, R), out["functions"]):
+        offsets = [t - lo for t in f["times"]]
+        assert len(offsets) == n == DR.scheduled_arrivals(cfg, target, m, 0, MIN)
+        for a0, a1 in ((0, 1), (0, 30_000), (4_000, MIN), (59_999, MIN), (12_345, 54_321), (30_000, 30_000),
+                       (offsets[7], offsets[8]), (offsets[7] + 1, offsets[9]), (0, offsets[0]), (0, offsets[0] + 1)):
+            assert DR.scheduled_arrivals(cfg, target, m, a0, a1) == sum(1 for o in offsets if a0 <= o < a1), (a0, a1)
+    assert DR.scheduled_arrivals(cfg, N, -1, 0, MIN) is None and DR.scheduled_arrivals(cfg, N, 28 * 1440, 0, MIN) is None
+    assert DR.scheduled_arrivals(cfg, "c28-other", m, 0, MIN) is None
+
+
+def test_a_full_minute_that_sent_nothing_of_its_intended_arrivals_is_not_observed(tmp_path):
+    """The reviewer's case: a complete minute with intended > 1,000 and due = dispatched = dropped = 0, the ingress
+    flat. The record is self-consistent (0 = 0 - 0 + 0 + 0) and nothing contradicts it at the ingress; but the
+    schedule places `intended` arrivals in that span and none is accounted for."""
+    cfg, out = sim(tmp_path, [{"pod_uid": "pod-a", "start_ms": PEAK - 3 * MIN}])
+    recs = copy.deepcopy(out["lines"])
+    for l in recs:
+        if l["schema"] == DR.MINUTE and l["target"] == N:
+            assert l["intended"] > 1_000 and l["active"] == [0, MIN]
+            l.update(due=0, dispatched=0, ok=0, failed=0, unresolved=0, carried=[0, 0],
+                     dropped={"late": 0, "inflight": 0}, late_max_ms=0)
+            l["lat"] = {"counts": [0] * 13, "max_ms": 0}
+            l["cum"] = {k: 0 for k in l["cum"]}
+    flat = dict(out["ingress"], **{N: [[t, 100] for t, _ in out["ingress"][N]]})      # the ingress received nothing
+    red = reduced(cfg, out, records=recs, ingress=flat)
+    s = red["targets"][N]["summary"]
+    assert s["states"] == {"observed": 0, "partial": 0, "unknown": 11, "unscheduled": 0}, s
+    assert s["reasons"]["due_mismatch"] == 11
+    for row in red["targets"][N]["rows"]:
+        assert row["state"] == "unknown" and row["reasons"] == ["due_mismatch"], row
+        assert row["intended"] > 1_000 and row["generator"]["due"] == 0
+    assert s["observed_totals"]["intended"] == 0 and s["unobserved_intended"] == s["scheduled_intended"]
+    assert red["targets"][R]["summary"]["states"]["observed"] == 11
+
+
+@pytest.mark.parametrize("delta", [-1, 1, -200])
+def test_due_must_be_exactly_the_scheduled_arrivals_of_the_active_span(tmp_path, delta):
+    """One arrival silently omitted (or invented) while the line's own identity still holds."""
+    start = PEAK - 3 * MIN + 4_000
+    cfg, out = sim(tmp_path, [{"pod_uid": "pod-a", "start_ms": start}])
+    for k in (-3, 2):                                                       # the partial start minute and a full one
+        recs = copy.deepcopy(out["lines"])
+        line = [l for l in recs if l["schema"] == DR.MINUTE and l["minute"] == BASE + k and l["target"] == N][0]
+        span = line["active"]
+        assert line["due"] == DR.scheduled_arrivals(cfg, N, BASE + k, *span)
+        line["due"] += delta
+        line["dispatched"] += delta
+        line["ok"] += delta
+        line["lat"]["counts"][2] += delta
+        assert line["due"] == line["dispatched"] == line["ok"] == sum(line["lat"]["counts"])
+        red = DR.reduce(cfg, recs, out["ingress"], PEAK - 3 * MIN, PEAK + 9 * MIN)
+        row = {r["minute"] - BASE: r for r in red["targets"][N]["rows"]}[k]
+        assert row["state"] == "unknown" and "due_mismatch" in row["reasons"], (k, row["reasons"])
+
+
+def test_dropped_arrivals_are_accounted_and_keep_the_minute_observed(tmp_path):
+    """Accounting is not delivery: a minute whose arrivals were all DUE and partly dropped (recorded) is observed."""
+    cfg = edited(config(), max_inflight=5)
+    cfg, out = sim(tmp_path, [{"pod_uid": "pod-a", "start_ms": PEAK - 3 * MIN}], cfg=cfg, latency_ms=900)
+    got = rows(reduced(cfg, out))
+    for k in (1, 2, 3):
+        g = got[k]["generator"]
+        assert got[k]["state"] == "observed", got[k]
+        assert g["dropped"]["inflight"] > 0 and g["due"] == got[k]["intended"] == g["dispatched"] + g["dropped"]["inflight"]
+
+
+# --- clock evidence: the WHOLE interval inside the limit, for every contributing incarnation (R3 item 5) -----------
+
+def with_clock(lines, lo, hi, pred=lambda l: True):
+    """The minute lines with clock evidence that bounds (generator clock - ingress clock) to [lo, hi] ms."""
+    out = copy.deepcopy(lines)
+    for l in out:
+        if l["schema"] == DR.MINUTE and pred(l):
+            rt = hi - lo - 1000
+            assert rt >= 0
+            date_s = (ORIGIN + l["minute"] * MIN) // 1000 + 30
+            l["clock"] = {"date_s": date_s, "recv_ms": date_s * 1000 + hi, "rt_ms": rt}
+    return out
+
+
+@pytest.mark.parametrize("lo, hi, reason", [
+    (-2500, 500, "clock_unverified"),      # the reviewer's case: it only OVERLAPS the limit of +-2000
+    (-500, 2500, "clock_unverified"),
+    (-2001, 0, "clock_unverified"),
+    (0, 2001, "clock_unverified"),
+    (-4000, 4000, "clock_unverified"),
+    (2001, 3100, "clock_offset"),          # entirely outside: a proven offset
+    (-9000, -2001, "clock_offset"),
+    (-2000, -1000, None),                  # entirely inside, at the limit
+    (1000, 2000, None),
+    (-600, 500, None),
+])
+def test_the_whole_clock_interval_must_lie_inside_the_limit(tmp_path, lo, hi, reason):
+    cfg, out = sim(tmp_path, [{"pod_uid": "pod-a", "start_ms": PEAK - 3 * MIN}])
+    red = reduced(cfg, out, records=with_clock(out["lines"], lo, hi))
+    for row in red["targets"][N]["rows"]:
+        assert row["clock_offset_ms"] == [lo, hi]
+        if reason is None:
+            assert row["state"] == "observed", row
+        else:
+            assert row["state"] == "unknown" and row["reasons"] == [reason], row
+    assert DR._clock_minute({"i": {5: (lo, hi)}}, ["i"], 5, 2000)[1] == reason
+
+
+def test_every_contributing_incarnation_needs_its_own_clock_evidence(tmp_path):
+    """Evidence of one incarnation says nothing about another's clock (another process, possibly another pod): an
+    incarnation without evidence of its own is unverified, however good its predecessor's was."""
+    cfg = config(smoke_segment_minutes=3)
+    a, b = PEAK - 3 * MIN, PEAK + 2_000
+    cfg, out = sim(tmp_path, [{"pod_uid": "pod-a", "start_ms": a}, {"pod_uid": "pod-b", "start_ms": b}], cfg=cfg,
+                   minutes_after=8)
+    red = reduced(cfg, out, end=PEAK + 3 * MIN)
+    assert rows(red)[0]["state"] == "partial" and rows(red)[0]["reasons"] == ["incarnation_boundary"]
+    assert rows(red)[-1]["state"] == "observed" and rows(red)[1]["state"] == "observed"
+    # The second incarnation without any clock evidence: its minutes are unverified (the first's last sample is one
+    # minute away, but it is another incarnation's), the first's stay observed.
+    recs = copy.deepcopy(out["lines"])
+    for l in recs:
+        if l["schema"] == DR.MINUTE and l["inc"] == f"pod-b/{b}":
+            l["clock"] = None
+    got = rows(reduced(cfg, out, records=recs, end=PEAK + 3 * MIN))
+    assert got[-1]["state"] == "observed" and got[-2]["state"] == "observed"
+    for k in (0, 1, 2):
+        assert got[k]["generator"]["incarnations"] == [f"pod-b/{b}"]
+        assert got[k]["state"] == "unknown" and "clock_unverified" in got[k]["reasons"], got[k]
+    # Two incarnations in one minute (a duplicate): BOTH need evidence inside the limit.
+    # Unit: missing for one, contradictory, neighbours.
+    ok, far = (-600, 500), (5_000, 6_100)
+    assert DR._clock_minute({"a": {7: ok}}, ["a", "b"], 7, 2000) == ([-600, 500], "clock_unverified")
+    assert DR._clock_minute({"a": {7: ok}, "b": {7: ok}}, ["a", "b"], 7, 2000) == ([-600, 500], None)
+    assert DR._clock_minute({"a": {7: ok}, "b": {7: far}}, ["a", "b"], 7, 2000) == ([-600, 6_100], "clock_offset")
+    assert DR._clock_minute({"a": {7: (400, -200)}}, ["a"], 7, 2000) == ([400, -200], "clock_unverified")   # empty
+    assert DR._clock_minute({"a": {5: ok}}, ["a"], 7, 2000) == ([-600, 500], None)           # a neighbour, 2 min away
+    assert DR._clock_minute({"a": {1: ok}}, ["a"], 7, 2000) == (None, "clock_unverified")    # 6 minutes: too far
+    assert DR._clock_minute({"a": {6: ok, 8: (-2_400, -1_300)}}, ["a"], 7, 2000) == ([-2_400, 500], "clock_unverified")
+    assert DR._clock_minute({}, [], 7, 2000) == (None, "clock_unverified")
+
+
+def test_contradictory_clock_evidence_within_one_minute_is_unverified(tmp_path):
+    """The two targets' samples of one minute are the same pod's clock: when they cannot both be true (the clock
+    stepped inside the minute), the minute is unverified, whichever sample looks fine."""
+    cfg, out = sim(tmp_path, [{"pod_uid": "pod-a", "start_ms": PEAK - 3 * MIN}])
+    recs = with_clock(out["lines"], 800, 1_900, lambda l: l["target"] == R and l["minute"] == BASE + 2)
+    recs = with_clock(recs, -1_900, -800, lambda l: l["target"] == N and l["minute"] == BASE + 2)
+    red = reduced(cfg, out, records=recs)
+    for t in (N, R):
+        row = rows(red, t)[2]
+        assert row["state"] == "unknown" and row["reasons"] == ["clock_unverified"], row
+        assert row["clock_offset_ms"][0] > row["clock_offset_ms"][1]         # an empty interval
+        assert rows(red, t)[1]["state"] == "observed" and rows(red, t)[3]["state"] == "observed"
+
+
+def test_a_slow_response_does_not_cost_the_minute_its_clock_evidence(tmp_path):
+    """With the strict rule a 1.5 s first response alone would leave the minute unverified ([-2500, ...]); the
+    generator records the shortest round trip of the minute, so the evidence stays tight."""
+    slow = [{"from_ms": PEAK + 2 * MIN, "to_ms": PEAK + 2 * MIN + 5_000, "latency_ms": 1_500}]
+    cfg, out = sim(tmp_path, [{"pod_uid": "pod-a", "start_ms": PEAK - 3 * MIN}], latencies=slow)
+    got = rows(reduced(cfg, out))
+    assert got[2]["state"] == "observed" and got[2]["generator"]["latency"]["max_ms"] == 1_500
+    lo, hi = got[2]["clock_offset_ms"]
+    assert -1_100 <= lo <= 0 <= hi <= 1_100
+
+
+# --- pod replacement under load: two incarnations at once are detected, never summed silently (R3 item 1) ----------
+
+def test_a_pod_replaced_under_load_while_the_old_one_still_runs_is_flagged(tmp_path):
+    """What a Deployment allows on ordinary Pod replacement (not an update): the old pod is deleted and keeps
+    running for its 15 s termination grace period while the ReplicaSet's new pod already sends, at the daily peak.
+    (The rendered StatefulSet cannot do this: test_the_render_never_allows_two_generator_pods; prepare.py's verify
+    counts a terminating pod.) If it happens anyway, the records show it: every minute in which both incarnations
+    were active is unknown, reason duplicate_generators, and listed."""
+    old, new = PEAK - 3 * MIN, PEAK + 2 * MIN + 20_000
+    cfg, out = sim(tmp_path, [{"pod_uid": "pod-old", "start_ms": old, "kill_ms": new + 15_000},
+                              {"pod_uid": "pod-new", "start_ms": new}])
+    # Under load both really sent: in the overlap minute the ingress received about a quarter more than one schedule.
+    truth = out["truth"][N][str(BASE + 2)]
+    assert truth["dispatched"] > intended(cfg, BASE + 2) * 1.15
+    red = reduced(cfg, out)
+    got = rows(red)
+    for k in (-2, -1, 0):
+        check_observed(got[k], out)
+    # Minute 1: the old pod's last written line. Minute 2: both active (the old one's line was never written: it
+    # was killed first), so the old pod's unrecorded tail makes it unknown; with BOTH lines it is a duplicate.
+    assert got[2]["state"] == "unknown" and "unrecorded_tail" in got[2]["reasons"]
+    for k in (3, 4, 5, 6):
+        check_observed(got[k], out)
+    # The same replacement where the old pod lived long enough to write its line (a longer grace period).
+    cfg, out = sim(tmp_path, [{"pod_uid": "pod-old", "start_ms": old, "kill_ms": new + 50_000},
+                              {"pod_uid": "pod-new", "start_ms": new}])
+    red = reduced(cfg, out)
+    got = rows(red)
+    assert got[2]["state"] == "unknown" and "duplicate_generators" in got[2]["reasons"], got[2]
+    assert sorted(got[2]["generator"]["incarnations"]) == [f"pod-new/{new}", f"pod-old/{old}"]
+    assert got[2]["generator"]["dispatched"] == out["truth"][N][str(BASE + 2)]["dispatched"] > 1.5 * intended(cfg, BASE + 2)
+    assert [d["minute"] - BASE for d in red["duplicate_generators"][N]] == [2]
+    assert red["duplicate_generators"][N][0]["incarnations"] == got[2]["generator"]["incarnations"]
+    assert got[3]["state"] == "unknown"                                    # the old pod's tail up to its kill
+    for k in (-2, -1, 0, 1, 4, 5, 6):
+        check_observed(got[k], out)
+    s = red["targets"][N]["summary"]
+    assert s["observed_totals"]["dispatched"] == sum(got[k]["generator"]["dispatched"] for k in (-2, -1, 0, 1, 4, 5, 6, 7, 8))
+    # With the OLD pod's log lost entirely, the surplus still shows: the ingress received more than was dispatched.
+    only_new = [l for l in out["lines"] if l["inc"].startswith("pod-new/")]
+    got = rows(reduced(cfg, out, records=only_new))
+    assert got[2]["state"] != "observed" and got[3]["state"] == "unknown" and got[3]["reasons"] == ["unreconciled"]

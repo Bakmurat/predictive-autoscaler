@@ -10,6 +10,13 @@
 // arrivals per minute (the same for every target). Python computed every number; this script reads the table and
 // never draws a random number. The schedule is FINITE: it never repeats and never wraps.
 //
+// The configuration that RUNS is the configuration that was reviewed: at start the script recomputes the digest of
+// the parsed configuration exactly as the harness does (schedule.digest: SHA-256 over the JSON with sorted keys,
+// separators "," and ":", non-ASCII escaped, the digest key left out) and refuses to start when it differs from the
+// configuration's own digest, so a table edited after rendering cannot run under the old digest. The configuration
+// holds only objects, arrays, strings, booleans, null and integers (no float: the two languages write them
+// differently), which checkConfig enforces.
+//
 // How it runs
 //   * One k6 scenario per target, each with ONE virtual user whose single iteration runs an event loop: arrivals are
 //     timed by setTimeout against wall-clock time and sent with http.asyncRequest, so no arrival ever waits for a
@@ -57,14 +64,16 @@
 //                0 = no HTTP response: timeout or connection failure); never a completion-stamped count
 //   lat          latency bucket counts of the ok responses (bounds in the start record) and their maximum
 //   late_max_ms  the worst dispatch lateness against the schedule
-//   clock        the first response's Date header (seconds) with the local receive time and its round trip: evidence
-//                of the offset between this pod's clock and the ingress's; the schedule is NEVER corrected by it
+//   clock        the Date header (seconds) of the minute's response with the SHORTEST round trip, with the local
+//                receive time and that round trip: the tightest evidence the minute has of the offset between this
+//                pod's clock and the ingress's; the schedule is NEVER corrected by it
 //   cum          cumulative counts of this incarnation and target (a lost line or a reset is detectable)
 // Identity of every line: due = dispatched - carried[0] + carried[1] + dropped.late + dropped.inflight, and
 // dispatched = ok + failed + unresolved. A start and an end record (schema c28-demo-incarnation/v2) frame each
 // incarnation; the start record names its phase and the span [send_from_ms, send_to_ms) it will schedule (null when
 // it sends nothing). The lines do not depend on remote-write delivery. The custom counters below go to the
 // remote-write output for dashboards only; a missing remote-write series means unknown, never zero.
+import crypto from 'k6/crypto';
 import http from 'k6/http';
 import exec from 'k6/execution';
 import { Counter } from 'k6/metrics';
@@ -74,7 +83,40 @@ import { setTimeout } from 'k6/timers';
 
 const MAX_SLEEP_MS = 60000;   // the longest single sleep: a wall-clock step is noticed within a minute
 
-function checkConfig(cfg) {
+// The canonical JSON of a value, byte for byte what Python's json.dumps(value, sort_keys=True, separators=(",", ":"))
+// writes (ensure_ascii, its default): object keys sorted by code point, no white space, every character outside
+// " ".."~" escaped as \uXXXX (lower-case hex, UTF-16 units). Integers only: a non-integer or unsafe number throws,
+// because Python and JavaScript format floats differently (2.0 against 2, 1e-07 against 1e-7).
+function canonicalJson(v) {
+  if (v === null) return 'null';
+  if (v === true) return 'true';
+  if (v === false) return 'false';
+  if (typeof v === 'number') {
+    if (!Number.isSafeInteger(v)) throw new Error(`c28-demo config: ${v} is not a safe integer (no floats in the configuration)`);
+    return String(v);
+  }
+  if (typeof v === 'string') {
+    return JSON.stringify(v).replace(/[\u007f-\uffff]/g, (c) => `\\u${(`000${c.charCodeAt(0).toString(16)}`).slice(-4)}`);
+  }
+  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(',')}]`;
+  if (typeof v === 'object') {
+    const keys = Object.keys(v).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    return `{${keys.map((k) => `${canonicalJson(k)}:${canonicalJson(v[k])}`).join(',')}}`;
+  }
+  throw new Error(`c28-demo config: a ${typeof v} cannot be part of the configuration`);
+}
+
+// The configuration's digest as the harness computes it (schedule.digest): SHA-256, hex, of the canonical JSON of
+// the configuration without its "digest" key. sha256hex(text) -> lower-case hex (k6/crypto here, node's crypto in the
+// tests).
+function configDigest(cfg, sha256hex) {
+  const body = {};
+  for (const k of Object.keys(cfg)) if (k !== 'digest') body[k] = cfg[k];
+  return sha256hex(canonicalJson(body));
+}
+
+// checkConfig(cfg, sha256hex): the structural checks, then the digest of what was actually parsed.
+function checkConfig(cfg, sha256hex) {
   const fail = (why) => { throw new Error(`c28-demo config: ${why}`); };
   const int = (v, lo, hi) => Number.isInteger(v) && v >= lo && v <= hi;
   if (!cfg || cfg.schema !== 'c28-demo-generator/v2') fail('schema must be c28-demo-generator/v2');
@@ -121,6 +163,11 @@ function checkConfig(cfg) {
     fail('latency_bounds_ms must be increasing');
   }
   if (typeof cfg.run_id !== 'string' || typeof cfg.digest !== 'string') fail('run_id and digest are required');
+  if (typeof sha256hex !== 'function') fail('no SHA-256 function: the configuration cannot be verified');
+  const actual = configDigest(cfg, sha256hex);
+  if (actual !== cfg.digest) {
+    fail(`the configuration is not the one its digest names (recomputed ${actual}, stated ${cfg.digest}): refusing to start`);
+  }
   return cfg;
 }
 
@@ -256,9 +303,11 @@ function createGenerator(cfg, index, shared, deps) {
       if (key in r.failed_by || Object.keys(r.failed_by).length < 8) r.failed_by[key] = (r.failed_by[key] || 0) + 1;
       else r.failed_by.other = (r.failed_by.other || 0) + 1;
     }
-    if (r.clock === null) {
+    // Clock evidence: keep the response with the shortest round trip (the narrowest bounds on the offset).
+    const rt = Math.round(durationMs);
+    if (r.clock === null || rt < r.clock.rt_ms) {
       const d = httpDateSeconds(dateHeader);
-      if (d !== null) r.clock = { date_s: d, recv_ms: recvMs, rt_ms: Math.round(durationMs) };
+      if (d !== null) r.clock = { date_s: d, recv_ms: recvMs, rt_ms: rt };
     }
   }
 
@@ -379,7 +428,7 @@ function createGenerator(cfg, index, shared, deps) {
         active_from_ms: activeFrom, origin_ms: cfg.origin_ms, phase: where, minute: m0,
         day: sends ? dayIndex(cfg, m0) : null, send_from_ms: sends ? sendFrom : null, send_to_ms: sends ? sendTo : null,
         segment_end_ms: endMs, schedule_end_ms: scheduleEnd, days: cfg.days,
-        config_digest: cfg.digest, label: cfg.label || null, timeout_ms: cfg.timeout_ms,
+        config_schema: cfg.schema, config_digest: cfg.digest, label: cfg.label || null, timeout_ms: cfg.timeout_ms,
         max_late_ms: cfg.max_late_ms, max_inflight: cfg.max_inflight, lat_bounds_ms: cfg.latency_bounds_ms });
       seq += 1;
       tick();
@@ -390,7 +439,7 @@ function createGenerator(cfg, index, shared, deps) {
 
 // --- k6 wiring ------------------------------------------------------------------------------------------------------
 
-const cfg = checkConfig(JSON.parse(open(__ENV.C28D_CONFIG)));
+const cfg = checkConfig(JSON.parse(open(__ENV.C28D_CONFIG)), (text) => crypto.sha256(text, 'hex'));
 
 const counters = {
   scheduled: new Counter('c28d_scheduled'),       // arrivals that came due (dispatched or dropped)

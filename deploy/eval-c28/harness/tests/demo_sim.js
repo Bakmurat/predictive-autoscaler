@@ -10,6 +10,7 @@
 //                      "stalls": [{"at_ms": T, "for_ms": D}],            start/kill/stalls in TRUE time
 //                      "clock_steps": [{"at_ms": T, "by_ms": D}]}],      its clock steps by D (+ forward, - back) at T
 //    "latency_ms": 20,                              response time of a healthy request
+//    "latencies": [{"from_ms": T, "to_ms": T, "latency_ms": D}],   another response time for requests sent in a span
 //    "faults": [{"target": "...", "from_ms": T, "to_ms": T, "mode": "timeout" | "status", "status": 503}],
 //    "network_ms": 1,                               dispatch -> ingress receipt
 //    "scrape": {"interval_ms": 15000, "offset_ms": 3000, "from_ms": T, "to_ms": T,
@@ -26,10 +27,15 @@
 //   of the pure functions for "probes"...}}
 'use strict';
 const fs = require('fs');
+const nodeCrypto = require('crypto');
+
+// What k6/crypto's sha256(text, 'hex') returns: the SHA-256 of the text's UTF-8 bytes, lower-case hex.
+const sha256hex = (text) => nodeCrypto.createHash('sha256').update(text, 'utf8').digest('hex');
 
 function loadScript(scriptPath, configPath) {
   let src = fs.readFileSync(scriptPath, 'utf8');
   const edits = [
+    ["import crypto from 'k6/crypto';", 'const crypto = __stubs.crypto;'],
     ["import http from 'k6/http';", 'const http = __stubs.http;'],
     ["import exec from 'k6/execution';", 'const exec = __stubs.exec;'],
     ["import { Counter } from 'k6/metrics';", 'const Counter = __stubs.Counter;'],
@@ -44,13 +50,14 @@ function loadScript(scriptPath, configPath) {
   }
   if (/^\s*(import|export)\s/m.test(src)) throw new Error('c28-demo.js has an import or export the loader does not know');
   const stubs = {
+    crypto: { sha256: (text, enc) => { if (enc !== 'hex') throw new Error('only hex is stubbed'); return sha256hex(text); } },
     http: { asyncRequest: () => { throw new Error('http is not available under node'); } },
     exec: { scenario: { name: 't0' } },
     Counter: function Counter(name) { this.name = name; this.add = () => null; },
     setTimeout: () => { throw new Error('timers are not available at init'); },
   };
   const open = (p) => fs.readFileSync(p, 'utf8');
-  const body = `${src}\nreturn { checkConfig, minuteIndex, minuteStart, scheduled, dayIndex, dayMinute, intended,
+  const body = `${src}\nreturn { canonicalJson, configDigest, checkConfig, minuteIndex, minuteStart, scheduled, dayIndex, dayMinute, intended,
     targetPhase, arrivalTime, firstIndexAtOrAfter, segmentEnd, incarnationId, okStatus, httpDateSeconds,
     createGenerator, cfg, options, setup, run };`;
   // eslint-disable-next-line no-new-func
@@ -108,6 +115,10 @@ function simulate(mod, sc) {
   const network = sc.network_ms === undefined ? 1 : sc.network_ms;
   const latency = sc.latency_ms === undefined ? 20 : sc.latency_ms;
   const fault = (target, t) => (sc.faults || []).find((f) => f.target === target && t >= f.from_ms && t < f.to_ms);
+  const latencyAt = (t) => {
+    const w = (sc.latencies || []).find((x) => t >= x.from_ms && t < x.to_ms);
+    return w ? w.latency_ms : latency;
+  };
 
   for (const t of sc.ingress_restarts || []) {
     q.push(t, () => { for (const k of Object.keys(counters)) counters[k] = null; }, null);
@@ -158,7 +169,7 @@ function simulate(mod, sc) {
               at(sent + timeoutMs, () => done(0, timeoutMs, undefined));
             } else {
               const status = f ? f.status : 200;
-              const lat = f ? Math.min(latency, timeoutMs) : latency;
+              const lat = f ? Math.min(latencyAt(sent), timeoutMs) : latencyAt(sent);
               at(sent + lat, () => done(status, lat, new Date(Math.floor((sent + network) / 1000) * 1000).toUTCString()));
             }
           },
@@ -198,15 +209,26 @@ function probes(mod, list) {
       return { minute: p.minute, times: ts };
     }
     if (p.fn === 'httpdate') return { seconds: mod.httpDateSeconds(p.text) };
+    if (p.fn === 'digest') return { digest: mod.configDigest(cfg, sha256hex), stated: cfg.digest };
+    if (p.fn === 'canonical') {
+      try { return { text: mod.canonicalJson(p.value) }; } catch (e) { return { error: String(e.message) }; }
+    }
     if (p.fn === 'check') {
       // override: fields to replace; day_rows: {"<day>": row} replaces single rows of the table (the config is large).
+      // The digest is recomputed for the edited configuration unless keep_digest is set (then the OLD digest stays,
+      // as when a table is altered after rendering).
       try {
         const c = Object.assign({}, cfg, p.override);
         if (p.day_rows) {
           c.per_minute_days = c.per_minute_days.slice();
           for (const [d, row] of Object.entries(p.day_rows)) c.per_minute_days[Number(d)] = row;
         }
-        mod.checkConfig(c);
+        if (p.cells) {                              // [[day, minute, value], ...]: single counts of the table
+          c.per_minute_days = c.per_minute_days.map((row) => row.slice());
+          for (const [d, m, v] of p.cells) c.per_minute_days[d][m] = v;
+        }
+        if (!p.keep_digest) { try { c.digest = mod.configDigest(c, sha256hex); } catch (e) { /* checkConfig reports */ } }
+        mod.checkConfig(c, p.no_hash ? undefined : sha256hex);
         return { ok: true };
       } catch (e) { return { ok: false, error: String(e.message) }; }
     }

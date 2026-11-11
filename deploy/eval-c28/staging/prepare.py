@@ -43,8 +43,9 @@ The record's run_id is the demonstration's own (its objects, receipts and journa
 for the demonstration stage only (render.validate_stage: no c0_rps, HPA target or KEDA setting is read). The phases
 are the same six, rendered by the harness's demo module (two targets at the fixed shadow replica count, two
 PredictiveAutoscalers in Recommend, the common objects with the ingress routing to those two targets), plus
-  generator   the ONE continuous generator (ConfigMap and Deployment, one replica, strategy Recreate), created only
-              after targets and pas, with its schedule origin in the past, and only when no other generator exists
+  generator   the ONE continuous generator (ConfigMap, headless Service and a StatefulSet with one replica: at most one
+              generator pod can exist), created only after targets and pas, with its schedule origin in the past and
+              its finite schedule not yet over, and only when no other generator exists
 Every refusal above stays. What differs:
   * The reservation is ANOTHER run's. Nodes are never retagged and reserve.py's ownership checks are not relaxed:
     the gate loads the owner's record (bound by sha256), checks the params' reference against it (owner run id, taint
@@ -554,11 +555,13 @@ def demonstration_gate(record: X.Record, kube: X.Kube, params: Dict, s: Dict, pa
 def generator_problems(record: X.Record, kube: X.Kube, params: Dict, parts: Dict, ours: List[Dict],
                        now: Callable[[], str] = X.utcnow) -> List[str]:
     """What the generator phase needs beyond the common refusals: the recorded schedule origin already passed (the
-    program resumes at the wall-clock position; an origin in the future is not a record of anything), the targets and
-    their PredictiveAutoscalers created by THIS run and still the same objects, both PAs in Recommend, the ingress
-    present, and no other generator: single ownership is one Deployment with one replica and strategy Recreate, and
-    any other Deployment or Pod that carries the generator's name label in the namespace is refused. Listings are
-    strict: a failed list is never "no generator"."""
+    program resumes at the wall-clock position; an origin in the future is not a record of anything) and the finite
+    schedule not yet over (after its last day the generator would send nothing: an expired schedule is refused, never
+    wrapped), the targets and their PredictiveAutoscalers created by THIS run and still the same objects, both PAs in
+    Recommend, the ingress present, and no other generator: single ownership is one StatefulSet with one replica, and
+    any other Deployment, StatefulSet or Pod that carries the generator's name label in the namespace is refused
+    (a terminating pod included: it may still be sending). Listings are strict: a failed list is never "no
+    generator". `now` is the caller's clock (tests pass a fixed time)."""
     c28 = X.import_harness()
     out: List[str] = []
     d, ns = params["demonstration"], params["namespace"]
@@ -567,6 +570,13 @@ def generator_problems(record: X.Record, kube: X.Kube, params: Dict, parts: Dict
     if origin is None or origin > now_ms:
         out.append(f"demonstration.schedule_origin_utc {d['schedule_origin_utc']} is in the future: the origin is "
                    "recorded once, at or before the start")
+    else:
+        end_ms = c28.demo.schedule_end_ms(params)
+        if now_ms >= end_ms:
+            end = datetime.fromtimestamp(end_ms / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            out.append(f"the schedule has expired: its {d['program']['days']} days from {d['schedule_origin_utc']} "
+                       f"ended at {end}; a generator created now would send nothing (the schedule is finite and is "
+                       "never wrapped or restarted under the same origin)")
     created = created_objects(record)
     for name in c28.demo.target_names(params):
         for kind in ("Deployment", "PredictiveAutoscaler"):
@@ -583,7 +593,7 @@ def generator_problems(record: X.Record, kube: X.Kube, params: Dict, parts: Dict
         out.append(f"Deployment {ns}/c28-ingress was not created by this run or was replaced (phase common first)")
     mine = {(r["kind"], r["name"]) for r in ours}
     label = {"app.kubernetes.io/name": c28.demo.GENERATOR_NAME}
-    for kind in ("Deployment", "Pod"):
+    for kind in ("Deployment", "StatefulSet", "Pod"):
         for o in kube.list(kind, ns, labels=label, strict=True):
             if (kind, o["metadata"]["name"]) not in mine:
                 out.append(f"another generator exists: {kind} {ns}/{o['metadata']['name']} (one generator only)")
@@ -616,7 +626,9 @@ def _objects_for(phase: str, record: X.Record, params: Dict, s: Dict, parts: Dic
     return copy.deepcopy(parts[phase])
 
 
-def plan(record: X.Record, kube: X.Kube, phase: str, fetch: Optional[Fetch] = None) -> Dict:
+def plan(record: X.Record, kube: X.Kube, phase: str, fetch: Optional[Fetch] = None,
+         now: Callable[[], str] = X.utcnow) -> Dict:
+    """`now` is the clock the generator phase judges the schedule's origin and end by (tests pass a fixed time)."""
     s = _section(record)
     stage = stage_of(s)
     if phase not in phases_of(stage):
@@ -699,7 +711,7 @@ def plan(record: X.Record, kube: X.Kube, phase: str, fetch: Optional[Fetch] = No
         if os.path.exists(os.path.join(record.evidence_dir, "targets.json")):
             problems.append("targets.json exists: targets are created once per run")
     if phase == "generator":
-        problems += generator_problems(record, kube, params, parts, ours)
+        problems += generator_problems(record, kube, params, parts, ours, now)
     if phase == "common":
         rq = [o for o in create if o["kind"] == "ResourceQuota"]
         if len(rq) != 1 or rq[0]["spec"]["hard"]["pods"] != str(params["quota"]["pods_normal"]):
@@ -711,9 +723,9 @@ def plan(record: X.Record, kube: X.Kube, phase: str, fetch: Optional[Fetch] = No
 
 
 def apply(record: X.Record, kube: X.Kube, phase: str, reviewed: Dict, reviewed_digest: str,
-          fetch: Optional[Fetch] = None) -> Dict:
+          fetch: Optional[Fetch] = None, now: Callable[[], str] = X.utcnow) -> Dict:
     with X.mutating(record, kube, HELPER, {"phase": phase}):
-        p = plan(record, kube, phase, fetch)            # validated under the shared lock (anonymous pulls checked again)
+        p = plan(record, kube, phase, fetch, now)       # validated under the shared lock (anonymous pulls checked again)
         X.require_live(reviewed, reviewed_digest, HELPER, record, _review_times(p, reviewed))
         if p["problems"]:
             raise X.StagingError("the plan has problems: " + "; ".join(p["problems"]))
@@ -810,29 +822,40 @@ def verify(record: X.Record, kube: X.Kube) -> Dict:
 
 
 def generator_verify_problems(kube: X.Kube, params: Dict, seen: List[Dict]) -> List[str]:
-    """Single-generator ownership, checked live (strict listings): the generator this run created still has one
-    replica and strategy Recreate, and at most one generator pod exists that is not already terminating. More than
-    one is two generators sending at once."""
+    """Single-generator ownership, checked live (strict listings): the generator this run created is still a
+    StatefulSet with one replica, at most ONE generator pod may be running, that pod is the StatefulSet's own
+    (<name>-0, controlled by it), and no other workload carries the generator's name label.
+
+    A TERMINATING pod counts: a deletion timestamp only says the pod was asked to stop, its containers may run until
+    the end of the grace period (or indefinitely on an unreachable node). Only a pod whose phase says its containers
+    have stopped (Succeeded, Failed) is not a possible sender."""
     c28 = X.import_harness()
     ns, name = params["namespace"], c28.demo.GENERATOR_NAME
-    if not any(r["kind"] == "Deployment" and r["namespace"] == ns and r["name"] == name for r in seen):
+    if not any(r["kind"] == "StatefulSet" and r["namespace"] == ns and r["name"] == name for r in seen):
         return []
     out = []
-    live = kube.get("Deployment", name, ns)
+    live = kube.get("StatefulSet", name, ns)
     spec = (live or {}).get("spec") or {}
-    if spec.get("replicas") != 1 or (spec.get("strategy") or {}).get("type") != "Recreate":
-        out.append(f"{name} must have exactly one replica and strategy Recreate (single generator ownership)")
+    if spec.get("replicas") != 1 or isinstance(spec.get("replicas"), bool):
+        out.append(f"{name} must be a StatefulSet with exactly one replica (at most one generator pod)")
     label = {"app.kubernetes.io/name": name}
     pods = [p for p in kube.list("Pod", ns, labels=label, strict=True)
-            if not p["metadata"].get("deletionTimestamp") and (p.get("status") or {}).get("phase") not in
-            ("Succeeded", "Failed")]
+            if (p.get("status") or {}).get("phase") not in ("Succeeded", "Failed")]
     if len(pods) > 1:
-        out.append(f"{len(pods)} generator pods exist ({sorted(p['metadata']['name'] for p in pods)}): two "
-                   "generators would send at once")
-    others = [d["metadata"]["name"] for d in kube.list("Deployment", ns, labels=label, strict=True)
-              if d["metadata"]["name"] != name]
-    if others:
-        out.append(f"other generator Deployments exist: {sorted(others)}")
+        shown = sorted(p["metadata"]["name"] + (" (terminating)" if p["metadata"].get("deletionTimestamp") else "")
+                       for p in pods)
+        out.append(f"{len(pods)} generator pods may be running ({shown}): two generators would send at once")
+    own, uid = c28.demo.generator_pod_name(), ((live or {}).get("metadata") or {}).get("uid")
+    for p in pods:
+        owners = [o for o in p["metadata"].get("ownerReferences") or [] if o.get("controller")]
+        if p["metadata"]["name"] != own or [(o.get("kind"), o.get("uid")) for o in owners] != [("StatefulSet", uid)]:
+            out.append(f"generator pod {p['metadata']['name']} is not the StatefulSet's own pod {own}: another "
+                       "generator is running")
+    for kind in ("Deployment", "StatefulSet"):
+        others = [d["metadata"]["name"] for d in kube.list(kind, ns, labels=label, strict=True)
+                  if (kind, d["metadata"]["name"]) != ("StatefulSet", name)]
+        if others:
+            out.append(f"other generator {kind}s exist: {sorted(others)}")
     return out
 
 
@@ -842,7 +865,7 @@ def injection_problems(kube: X.Kube, params: Dict) -> List[str]:
     return X.injection_problems(kube, params)
 
 
-def main(argv=None, api=None, fetch: Optional[Fetch] = None) -> int:
+def main(argv=None, api=None, fetch: Optional[Fetch] = None, now: Callable[[], str] = X.utcnow) -> int:
     ap = argparse.ArgumentParser(prog="prepare.py", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--record", required=True)
@@ -861,12 +884,12 @@ def main(argv=None, api=None, fetch: Optional[Fetch] = None) -> int:
                 raise X.StagingError("recover needs --plan <the reviewed recover plan> and --plan-digest")
             X.emit(X.recover(record, kube, X.load_plan(args.plan), args.plan_digest))
         elif args.command == "plan":
-            X.emit([X.cli_plan(record, HELPER, plan(record, kube, ph, fetch), f"plan-{ph}")
+            X.emit([X.cli_plan(record, HELPER, plan(record, kube, ph, fetch, now), f"plan-{ph}")
                     for ph in ([args.phase] if args.phase else phases_of(stage_of(_section(record))))])
         elif args.command == "apply":
             if not args.phase or not args.plan:
                 raise X.StagingError("apply needs --phase and --plan: phases are applied one reviewed plan at a time")
-            X.emit(apply(record, kube, args.phase, X.load_plan(args.plan), args.plan_digest, fetch))
+            X.emit(apply(record, kube, args.phase, X.load_plan(args.plan), args.plan_digest, fetch, now))
         else:
             out = verify(record, kube)
             X.emit(out)

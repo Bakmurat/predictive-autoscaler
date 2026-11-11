@@ -90,14 +90,155 @@ def test_any_cadence_but_60_60_is_refused(cadence):
     refused(changed(prod_like(), "demonstration.cadence", cadence), "demonstration.cadence must be exactly")
 
 
-def test_the_rendered_cadence_is_the_params_cadence(monkeypatch):
+def test_the_rendered_cadence_and_lead_are_the_params_and_the_qualified_ones(monkeypatch):
     p = prod_like()
     for pa in demo.render(p)["pas"]:
         assert pa["spec"]["prediction"]["sampleIntervalSeconds"] == 60
         assert pa["spec"]["prediction"]["updateIntervalSeconds"] == 60
-    monkeypatch.setattr(F, "DECISION_INTERVAL_S", 30)                # the frozen constants drifting is caught
-    with pytest.raises(render.ParamsError, match="rendered cadence"):
-        demo.render(p)
+        assert pa["spec"]["prediction"]["minLeadSeconds"] == 600 == p["demonstration"]["min_lead_seconds"]
+    # The comparison's frozen cadence drifting does not move the demonstration: it renders the params' (60/60/600).
+    monkeypatch.setattr(F, "DECISION_INTERVAL_S", 30)
+    monkeypatch.setattr(F, "SAMPLE_INTERVAL_S", 300)
+    for pa in demo.render(p)["pas"]:
+        pred = pa["spec"]["prediction"]
+        assert (pred["sampleIntervalSeconds"], pred["updateIntervalSeconds"], pred["minLeadSeconds"]) == (60, 60, 600)
+    # A frozen value OUTSIDE the qualified profile is caught by the rendering audit.
+    for name, value, text in (("SETTLEMENT_S", 60, "prediction.settlementSeconds must be exactly 120"),
+                              ("GRACE_S", 300, "prediction.outcomeGraceSeconds must be exactly 600"),
+                              ("MISCOVERAGE_BPS", 500, "prediction.risk must be exactly")):
+        with monkeypatch.context() as m:
+            m.setattr(F, name, value)
+            with pytest.raises(render.ParamsError, match=text):
+                demo.render(p)
+
+
+@pytest.mark.parametrize("value", [0, 60, 180, 540, 660, 900, "600", 600.0, True, None, KeyError])
+def test_any_minimum_lead_but_600_is_refused(value):
+    text = "is missing min_lead_seconds" if value is KeyError else "demonstration.min_lead_seconds must be 600"
+    refused(changed(prod_like(), "demonstration.min_lead_seconds", value), text)
+
+
+# --- the qualified forecast profile, judged by the forecaster's own contracts (R3 item 2) --------------------------
+
+def contracts():
+    import os
+    import sys
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", "ml-engine")
+    if os.path.abspath(root) not in sys.path:
+        sys.path.insert(0, os.path.abspath(root))
+    from forecasting import contracts as C
+    return C
+
+
+def profile_of(C, pa):
+    """The allowlist entry the rendered object's settings resolve to at the 600 s lead (None: not a qualified
+    configuration; a refused object is not one either)."""
+    try:
+        return C.validated_profile(C.resolve_settings(pa), 600)
+    except C.ContractRefused:
+        return None
+
+
+def test_both_rendered_predictiveautoscalers_resolve_to_the_one_qualified_profile():
+    C = contracts()
+    assert len(C.VALIDATED_PROFILES) == 1
+    want = C.VALIDATED_PROFILES[0]
+    assert (want.sample_interval_seconds, want.update_interval_seconds, want.lead_seconds, want.miscoverage_bps,
+            want.families) == (60, 60, 600, 1000, ("seasonalNaive",))
+    for p in (prod_like(), params()):
+        pas = {o["metadata"]["labels"][demo.DEMO_ROLE_LABEL]: o for o in demo.render(p)["pas"]}
+        assert sorted(pas) == ["forecast", "reactive"]
+        for role, pa in pas.items():
+            pred = pa["spec"]["prediction"]
+            # Explicit in the object: the grid, the update interval, the minimum lead and the families.
+            assert (pred["sampleIntervalSeconds"], pred["updateIntervalSeconds"], pred["minLeadSeconds"],
+                    pred["families"]) == (60, 60, 600, ["seasonalNaive"])
+            assert "calibration" not in pred and "trust" not in pred       # NO override: the defaults apply
+            s = C.resolve_settings(pa)
+            assert (s.calibration, s.trust) == (C.CalibrationSettings(), C.TrustSettings())
+            assert (s.min_lead_seconds, C.minimum_lead_seconds(s)) == (600, 600)
+            assert C.validated_profile(s, 600) is want, role
+            # The lead the operator selects for this object IS the qualified one: startup profile s20 alone would
+            # give 180 s (startup 30 + decision 60 + allowance 15 + one grid step), which was never qualified.
+            st = pa["spec"]["behavior"]["startup"]
+            lead = C.automatic_lead_seconds(st["minimumDelaySeconds"], s.update_interval_seconds,
+                                            st["actuationAllowanceSeconds"], s.sample_interval_seconds,
+                                            s.min_lead_seconds)
+            assert lead == 600 and C.validated_profile(s, lead) is want
+            short = C.automatic_lead_seconds(st["minimumDelaySeconds"], 60, st["actuationAllowanceSeconds"], 60, 0)
+            assert short == 180 and C.validated_profile(s, short) is None
+        # The reactive reference is the same object with the predictive extra an explicit zero.
+        f, r = pas["forecast"]["spec"]["prediction"], pas["reactive"]["spec"]["prediction"]
+        assert r["predictiveExtra"] == {"maxReplicas": 0, "maxPercent": 0}
+        assert {k: v for k, v in f.items() if k != "predictiveExtra"} == \
+            {k: v for k, v in r.items() if k != "predictiveExtra"}
+
+
+@pytest.mark.parametrize("edit", [
+    lambda pred: pred.update(sampleIntervalSeconds=300),
+    lambda pred: pred.update(updateIntervalSeconds=30),
+    lambda pred: pred.update(updateIntervalSeconds=300),
+    lambda pred: pred.pop("updateIntervalSeconds") and pred.update(updateIntervalSeconds=120),
+    lambda pred: pred.update(families=["seasonalNaive", "statistical"]),
+    lambda pred: pred.update(risk={"miscoverageBps": 500}),
+    lambda pred: pred.update(trust={"minShadowHours": 24}),
+    lambda pred: pred.update(trust={"acuteConsecutiveMisses": 6}),
+    lambda pred: pred.update(calibration={"minWindows": 64}),
+    lambda pred: pred.update(calibration={"etaBps": 100}),
+    lambda pred: pred.update(settlementSeconds=60),
+    lambda pred: pred.update(outcomeGraceSeconds=300),
+    lambda pred: pred.update(engine="legacyLstm"),
+])
+def test_a_rendered_object_with_any_qualified_setting_changed_is_not_the_profile(edit):
+    C = contracts()
+    p = prod_like()
+    for pa in demo.render(p)["pas"]:
+        assert profile_of(C, pa) is C.VALIDATED_PROFILES[0]
+        changed_pa = copy.deepcopy(pa)
+        edit(changed_pa["spec"]["prediction"])
+        assert profile_of(C, changed_pa) is None
+        # ... and the stage's own audit refuses to render it.
+        fams = pa["spec"]["prediction"]["families"]
+        assert demo.qualified_prediction_problems(changed_pa["spec"]["prediction"], fams)
+        assert demo.qualified_prediction_problems(pa["spec"]["prediction"], fams) == []
+
+
+@pytest.mark.parametrize("lead", [0, 60, 180, 540, 660, 1200])
+def test_another_minimum_lead_is_not_the_qualified_profile(lead):
+    """minLeadSeconds decides the lead the operator selects: with any other value the selected lead is not 600 s, and
+    the configuration at that lead is not on the allowlist. (Absent is 0.)"""
+    C = contracts()
+    pa = copy.deepcopy(demo.render(prod_like())["pas"][0])
+    pred = pa["spec"]["prediction"]
+    pred["minLeadSeconds"] = lead
+    if lead == 0:
+        del pred["minLeadSeconds"]
+    s = C.resolve_settings(pa)
+    st = pa["spec"]["behavior"]["startup"]
+    selected = C.automatic_lead_seconds(st["minimumDelaySeconds"], s.update_interval_seconds,
+                                        st["actuationAllowanceSeconds"], s.sample_interval_seconds, s.min_lead_seconds)
+    assert selected == max(180, lead) != 600
+    assert C.validated_profile(s, selected) is None
+    assert any("minLeadSeconds" in x for x in demo.qualified_prediction_problems(pred, pred["families"]))
+
+
+def test_the_audit_refuses_a_rendering_outside_the_qualified_profile(monkeypatch):
+    p = prod_like()
+    real = demo.qualified_pa
+    for edit, text in ((lambda pred: pred.update(calibration={"minWindows": 128, "maxScores": 512, "retentionDays": 7}),
+                        "prediction.calibration must not be rendered"),
+                       (lambda pred: pred.update(trust={}), "prediction.trust must not be rendered"),
+                       (lambda pred: pred.pop("minLeadSeconds"), "minLeadSeconds"),
+                       (lambda pred: pred.update(minLeadSeconds=300), "minLeadSeconds"),
+                       (lambda pred: pred.update(historyDays=7), "prediction.historyDays must not be rendered"),
+                       (lambda pred: pred.update(somethingNew=1), "settings outside the qualified profile")):
+        def altered(params, pa, edit=edit):
+            out = real(params, pa)
+            edit(out["spec"]["prediction"])
+            return out
+        monkeypatch.setattr(demo, "qualified_pa", altered)
+        with pytest.raises(render.ParamsError, match=text):
+            demo.render(p)
 
 
 @pytest.mark.parametrize("targets, text", [
@@ -269,7 +410,8 @@ def test_rendered_objects():
                                          "Service": ["c28-demo-pa-n", "c28-demo-pa-r"]}
     assert by_kind(parts["pas"]) == {"PredictiveAutoscaler": ["c28-demo-pa-n", "c28-demo-pa-r"]}
     assert parts["writers"] == []
-    assert by_kind(parts["generator"]) == {"ConfigMap": ["c28-demo-generator"], "Deployment": ["c28-demo-generator"]}
+    assert by_kind(parts["generator"]) == {"ConfigMap": ["c28-demo-generator"], "Service": ["c28-demo-generator"],
+                                           "StatefulSet": ["c28-demo-generator"]}
     for o in demo.flat(parts):
         assert o["metadata"]["name"].startswith("c28-")
         assert o["metadata"]["labels"][render.RUN_LABEL] == "c28-demo-1"
@@ -346,9 +488,13 @@ def test_pas_reuse_the_arm_rendering_forecast_path_and_reactive_reference():
     b = json.loads(json.dumps(r).replace("c28-demo-pa-r", "T"))
     a["prediction"].pop("predictiveExtra"), b["prediction"].pop("predictiveExtra")
     assert a == b
-    # And apart from capacity and families, the forecast path is the PA-N arm's spec.
+    # And apart from capacity, families and the qualified profile (the explicit minimum lead; no calibration
+    # override, so the defaults apply), the forecast path is the PA-N arm's spec.
     x = json.loads(json.dumps(ref_n).replace("c28-pa-n-s20", "c28-demo-pa-n"))
     x["metrics"]["requests"]["capacityPerReplica"] = "17.5"
+    assert "minLeadSeconds" not in x["prediction"] and "calibration" in x["prediction"]
+    x["prediction"]["minLeadSeconds"] = 600
+    del x["prediction"]["calibration"]
     assert x == n
 
 
@@ -376,11 +522,22 @@ def test_every_pod_is_sidecar_free_least_privilege_and_placed():
             assert t["spec"]["automountServiceAccountToken"] is False
 
 
-def test_the_generator_is_one_recreate_deployment_on_the_support_node():
+def test_the_generator_is_one_statefulset_with_one_replica_on_the_support_node():
+    """At most one generator pod: the StatefulSet's single pod is always <name>-0, and its replacement is created
+    only after the old pod object is gone (a Deployment creates the replacement of a deleted pod at once)."""
     p = prod_like()
-    cm, dep = demo.render(p)["generator"]
+    cm, svc, dep = demo.render(p)["generator"]
+    assert (dep["kind"], dep["apiVersion"]) == ("StatefulSet", "apps/v1") and demo.generator_pod_name() == "c28-demo-generator-0"
     spec = dep["spec"]
-    assert spec["replicas"] == 1 and spec["strategy"] == {"type": "Recreate"}
+    assert spec["replicas"] == 1 and spec["podManagementPolicy"] == "OrderedReady"
+    assert "strategy" not in spec and spec["updateStrategy"] == {"type": "RollingUpdate"}
+    assert spec["serviceName"] == svc["metadata"]["name"] == "c28-demo-generator"
+    assert svc["kind"] == "Service" and svc["spec"] == {"clusterIP": "None", "selector": spec["selector"]["matchLabels"]}
+    assert spec["selector"]["matchLabels"].items() <= spec["template"]["metadata"]["labels"].items()
+    assert "restartPolicy" not in spec["template"]["spec"]                 # Always: the next segment in the same pod
+    assert not [o for part in demo.render(p).values() for o in part
+                if o["kind"] in ("Deployment", "Job", "Pod", "DaemonSet", "CronJob", "ReplicaSet")
+                and o["metadata"]["name"].startswith("c28-demo-generator")]
     pod = spec["template"]["spec"]
     c = pod["containers"][0]
     assert c["image"] == "grafana/k6@" + demo.GENERATOR_DIGEST
@@ -400,6 +557,35 @@ def test_the_generator_is_one_recreate_deployment_on_the_support_node():
     ann = spec["template"]["metadata"]["annotations"]
     assert ann["c28.devkuban.com/generator-config"] == cfg["digest"]
     assert ann["c28.devkuban.com/generator-script"] == hashlib.sha256(cm["data"]["c28-demo.js"].encode()).hexdigest()
+
+
+@pytest.mark.parametrize("edit, text", [
+    (lambda g: g[2]["spec"].update(replicas=2), "exactly one replica"),
+    (lambda g: g[2]["spec"].update(replicas=0), "exactly one replica"),
+    (lambda g: g[2].update(kind="Deployment"), "must be a StatefulSet"),
+    (lambda g: g.append(dict(copy.deepcopy(g[2]), kind="Deployment")), "exactly one generator workload"),
+    (lambda g: g.append(json.loads(json.dumps(g[2]).replace("c28-demo-generator", "c28-demo-generator-b"))),
+     "exactly one generator workload"),
+    (lambda g: g.append({"apiVersion": "v1", "kind": "Pod",
+                         "metadata": dict(copy.deepcopy(g[2]["spec"]["template"]["metadata"]),
+                                          name="c28-demo-generator-x", namespace=g[2]["metadata"]["namespace"]),
+                         "spec": copy.deepcopy(g[2]["spec"]["template"]["spec"])}), "exactly one generator workload"),
+    (lambda g: g[2]["spec"].update(podManagementPolicy="Parallel"), "podManagementPolicy OrderedReady"),
+    (lambda g: g.pop(1), "needs its headless Service"),
+    (lambda g: g[1]["spec"].pop("clusterIP"), "needs its headless Service"),
+    (lambda g: g[2]["spec"]["template"]["spec"].update(restartPolicy="Never"), "restartPolicy Always"),
+])
+def test_the_render_never_allows_two_generator_pods(monkeypatch, edit, text):
+    """The rendering audit: one StatefulSet with one replica and nothing else that carries a pod template."""
+    real = demo.generator_objects
+
+    def altered(params, smoke=None):
+        objs = real(params, smoke)
+        edit(objs)
+        return objs
+    monkeypatch.setattr(demo, "generator_objects", altered)
+    with pytest.raises(render.ParamsError, match=text):
+        demo.render(prod_like())
 
 
 def test_the_generator_config_is_the_finite_schedule_of_28_days_from_one_origin():
@@ -426,7 +612,7 @@ def test_the_generator_config_is_the_finite_schedule_of_28_days_from_one_origin(
     assert all(a != b for a, b in zip(table, table[1:]))                   # unequal adjacent days
     assert cfg["timeout_ms"] == 2000 and cfg["segment_minutes"] == 1440 and cfg["label"] == "demonstration"
     assert cfg["digest"] == schedule.digest(cfg) and demo.config_problems(cfg) == []
-    assert cfg["program"] == {"kind": "ordinary", "seed": 301, "days": 28, "capacity_per_replica_rps": 17.5,
+    assert cfg["program"] == {"kind": "ordinary", "seed": 301, "days": 28, "capacity_per_replica_rps": "17.5",
                               "capacity_label": "provisional", "capacity_source_calibration": "c28cal-0000000000"}
     peak = max(map(max, table))
     assert peak <= 9 * 1.05 * 17.5 * 60 + 1 and peak > 9 * 17.5 * 60 * 0.95
@@ -564,9 +750,9 @@ def test_residency_counts_both_targets_at_max_with_overlap_and_everything_on_s()
         assert w[f"Deployment/{t} overlap"]["pods"] == 2                  # rollout/termination overlap, each target
     assert w["Deployment/c28-ingress"]["pods"] == 1 and "node system pods" in w
     assert set(s) == {"Deployment/c28-metrics-route", "Deployment/c28-forecast-route",
-                      "Deployment/c28-demo-generator", "operator (chart)", "forecaster (chart)", "node system pods"}
+                      "StatefulSet/c28-demo-generator", "operator (chart)", "forecaster (chart)", "node system pods"}
     assert "generator Jobs" not in s                                       # the rendered generator, counted once
-    assert s["Deployment/c28-demo-generator"]["per_pod_cpu"] == "250m"
+    assert s["StatefulSet/c28-demo-generator"]["per_pod_cpu"] == "250m"
     assert s["forecaster (chart)"]["per_pod_cpu"] == "1000m" and s["operator (chart)"]["per_pod_cpu"] == "100m"
     total = sum(c["cpu_m"] for c in w.values())
     assert rep["nodes"]["workload"]["total"]["cpu_m"] == total == 2 * 14 * 50 + 100 + 300
@@ -653,7 +839,7 @@ def test_cli_validate_render_residency_and_plan(tmp_path, capsys):
     objs = list(yaml.safe_load_all(out))
     assert rc == 0 and objs == json.loads(json.dumps(demo.render_all(p)))
     rc, out = cli(tmp_path, capsys, p, "render", "--stage", "demonstration", "--part", "generator")
-    assert [o["kind"] for o in yaml.safe_load_all(out)] == ["ConfigMap", "Deployment"]
+    assert [o["kind"] for o in yaml.safe_load_all(out)] == ["ConfigMap", "Service", "StatefulSet"]
     rc, out = cli(tmp_path, capsys, p, "residency", "--stage", "demonstration")
     assert rc == 0 and json.loads(out)["problems"] == []
     tight = prod_like()

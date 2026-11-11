@@ -664,3 +664,107 @@ def test_a_backward_clock_step_never_sends_an_arrival_twice(tmp_path):
     running = out["sends"][N] - sum(l["dispatched"] for l in lines)
     assert 0 <= running <= intended(cfg, base + 5)
     assert [l["n"] for l in lines] == list(range(1, 6)) and events(out, "start", N)[0]["n"] == 0
+
+
+# --- the configuration that runs is the configuration that was reviewed (R3 item 3b) --------------------------------
+
+def real_configs():
+    from demo_helpers import prod_like
+    return {"kind": config(), "prod-like": config(prod_like()),
+            "smoke": config(smoke_segment_minutes=2, smoke_origin_ms=ORIGIN + 17 * 3600_000 + 23 * MIN),
+            "two-days": config(changed(params(), "demonstration.program.days", 2), smoke_segment_minutes=7)}
+
+
+@pytest.mark.parametrize("name", ["kind", "prod-like", "smoke", "two-days"])
+def test_the_script_recomputes_the_digest_of_the_real_configuration_exactly_as_python_does(tmp_path, name):
+    """schedule.digest in Python and configDigest in the script give the same SHA-256 for the REAL generated
+    configuration (the whole table, every number and string in it); the script loaded it, so its init check passed."""
+    from c28 import schedule
+    cfg = real_configs()[name]
+    assert demo.canonical_problems(cfg) == []                              # integers, strings, booleans only
+    assert isinstance(cfg["program"]["capacity_per_replica_rps"], str)     # "2", never 2.0: one spelling in both
+    _, out = run(tmp_path, [], PEAK, cfg=cfg, probes=[{"fn": "digest"}])
+    got = out["functions"][0]
+    assert got["digest"] == got["stated"] == cfg["digest"] == schedule.digest(cfg)
+    import hashlib
+    body = json.dumps({k: v for k, v in cfg.items() if k != "digest"}, sort_keys=True, separators=(",", ":"))
+    assert hashlib.sha256(body.encode()).hexdigest() == got["digest"]
+
+
+def test_the_canonical_form_is_pythons_byte_for_byte(tmp_path):
+    values = [
+        {"b": 1, "a": [3, 2, 1], "Z": None, "a10": True, "a9": False, "": 0, "nested": {"y": {"k": -7}, "x": []}},
+        [0, -1, 2**53 - 1, -(2**53 - 1), 1794367800000, 600000],
+        "plain", "", "quote\" backslash\\ slash/ </script>", "tab\tnewline\ncr\r bell\u0007 del\u007f nul\u0000",
+        "café 中文 \U0001f600   ퟿ ￿", {"clé": "valeur", "a": "é"},
+        [], {}, [[], {}, [{}]], True, False, None, 0,
+    ]
+    cfg = config()
+    _, out = run(tmp_path, [], PEAK, cfg=cfg, probes=[{"fn": "canonical", "value": v} for v in values])
+    for v, got in zip(values, out["functions"]):
+        assert got.get("text") == json.dumps(v, sort_keys=True, separators=(",", ":")), (v, got)
+    # A float cannot be written identically (Python 2.5e-07 / JavaScript 2.5e-7; Python 2.0 / JavaScript 2): the
+    # script refuses any non-integer, and Python refuses every float before the configuration is digested.
+    _, out = run(tmp_path, [], PEAK, cfg=cfg, probes=[{"fn": "canonical", "value": v} for v in (1.5, [1, 2.5e-07], {"a": 0.1})])
+    assert all("is not a safe integer" in f["error"] for f in out["functions"])
+    for bad in ({"a": 2.0}, {"a": [1, 1.5]}, {"a": 2**53}, {"a": {"b": 1e-7}}):
+        assert demo.canonical_problems(bad), bad
+    assert demo.canonical_problems({"a": [1, "x", True, None, {"b": -5}]}) == []
+
+
+def test_an_altered_table_with_its_old_digest_is_refused_at_start(tmp_path):
+    """The reviewer's case: one count of one day edited after rendering, the digest left as it was. Every structural
+    check still passes; the recomputed digest does not."""
+    from demo_helpers import run_sim
+    cfg = config()
+    table = [list(r) for r in cfg["per_minute_days"]]
+    table[17][600] += 1
+    altered = dict(cfg, per_minute_days=table)                             # the OLD digest
+    rc, doc = run_sim(tmp_path, altered, {"incarnations": [{"pod_uid": "pod-a", "start_ms": PEAK}], "until_ms": PEAK + MIN})
+    assert rc == 1 and "is not the one its digest names" in doc["error"] and "refusing to start" in doc["error"]
+    assert cfg["digest"] in doc["error"] and "lines" not in doc            # nothing ran, nothing was sent
+    rc, doc = run_sim(tmp_path, edited(cfg, per_minute_days=table), {"incarnations": [], "until_ms": PEAK})
+    assert rc == 0                                                         # the same table under ITS digest runs
+    probes = [
+        {"fn": "check", "cells": [[17, 600, table[17][600]]], "keep_digest": True},
+        {"fn": "check", "cells": [[0, 0, cfg["per_minute_days"][0][0] + 1]], "keep_digest": True},
+        {"fn": "check", "cells": [[27, 1439, 0]], "keep_digest": True},
+        {"fn": "check", "day_rows": {"3": cfg["per_minute_days"][4], "4": cfg["per_minute_days"][3]}, "keep_digest": True},
+        {"fn": "check", "override": {"max_inflight": cfg["max_inflight"] + 1}, "keep_digest": True},
+        {"fn": "check", "override": {"base_url": "http://elsewhere.demo.svc"}, "keep_digest": True},
+        {"fn": "check", "override": {"targets": list(reversed(cfg["targets"]))}, "keep_digest": True},
+        {"fn": "check", "override": {"origin_ms": ORIGIN + DAY, "schedule_end_ms": ORIGIN + 29 * DAY}, "keep_digest": True},
+        {"fn": "check", "override": {"run_id": "c28-other"}, "keep_digest": True},
+        {"fn": "check", "override": {"program": dict(cfg["program"], capacity_per_replica_rps="3")}, "keep_digest": True},
+        {"fn": "check", "override": {"digest": "0" * 64}, "keep_digest": True},
+        {"fn": "check", "override": {}, "keep_digest": True},                         # untouched: accepted
+        {"fn": "check", "cells": [[17, 600, table[17][600]]]},                        # edited AND re-digested: accepted
+        {"fn": "check", "override": {}, "no_hash": True},                             # no hash function: refused
+    ]
+    _, out = run(tmp_path, [], PEAK, cfg=cfg, probes=probes)
+    got = out["functions"]
+    for g in got[:11]:
+        assert g["ok"] is False and "is not the one its digest names" in g["error"], g
+    assert got[11] == {"ok": True} and got[12] == {"ok": True}
+    assert got[13]["ok"] is False and "no SHA-256 function" in got[13]["error"]
+
+
+def test_the_start_record_names_the_configuration_it_runs(tmp_path):
+    cfg, out = run(tmp_path, [{"pod_uid": "pod-a", "start_ms": PEAK}], PEAK + 2 * MIN)
+    st = events(out, "start", N)[0]
+    assert (st["config_schema"], st["config_digest"], st["origin_ms"], st["schedule_end_ms"], st["run"]) == \
+        ("c28-demo-generator/v2", cfg["digest"], ORIGIN, ORIGIN + 28 * DAY, cfg["run_id"])
+
+
+def test_the_clock_evidence_of_a_minute_is_its_response_with_the_shortest_round_trip(tmp_path):
+    """A slow first response (1.5 s) would bound the offset only to about 2.5 s; the minute keeps the tightest
+    evidence it saw instead."""
+    slow = [{"from_ms": PEAK + MIN, "to_ms": PEAK + MIN + 5_000, "latency_ms": 1_500}]
+    _, out = run(tmp_path, [{"pod_uid": "pod-a", "start_ms": PEAK}], PEAK + 4 * MIN, latencies=slow)
+    lines = minutes(out, N)
+    assert lines[1]["lat"]["max_ms"] == 1_500                              # the slow responses are in the minute
+    for l in lines:
+        c = l["clock"]
+        assert c["rt_ms"] == 20                                            # ... but not its clock evidence
+        lo, hi = c["recv_ms"] - c["rt_ms"] - c["date_s"] * 1000 - 1000, c["recv_ms"] - c["date_s"] * 1000
+        assert -1_100 <= lo <= 0 <= hi <= 1_100

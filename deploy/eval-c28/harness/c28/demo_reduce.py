@@ -20,6 +20,21 @@ missing (state partial, reason generator_gap: dispatched 0 against the intended 
 EVIDENCE is missing (state unknown). The summary states the intended arrivals of all scheduled minutes and of those
 that were not observed.
 
+Provenance. A minute line counts only when the incarnation that wrote it has a VALID START RECORD bound to this
+configuration: the run id, the configuration's schema and digest, the origin, the schedule's end, and the segment end
+that follows from its start time by the script's own rule; the span it declares must be the one that follows from
+those, and every line must lie in that span with exactly the active part the span gives it. Without such a start
+record (missing, or not this configuration's) the incarnation's minutes are never observed.
+
+Accounting. In its active part of a minute an incarnation owes EVERY arrival the schedule places there: the table
+row's count, the target's phase and the span give the number exactly (the script's own arithmetic), and `due` must
+equal it. With due = dispatched - carried_in + carried_out + dropped, every omitted arrival is then accounted for; a
+line that says nothing was due where the table schedules arrivals is not observed (due_mismatch).
+
+Clock. A minute is trusted only when the WHOLE interval that the evidence allows for (generator clock - ingress
+clock) lies inside the limit, for every incarnation that contributes to it. An interval that only overlaps the limit,
+an incarnation without evidence, or evidence that contradicts itself is unverified, never accepted.
+
 Which timestamp each count uses
   intended     the table (per_minute_days[m // 1440][m % 1440]); no timestamp
   due          the arrival's SCHEDULED time, inside the incarnation's active span
@@ -143,7 +158,86 @@ def schedule_problem(cfg) -> Optional[str]:
     if not _int(cfg.get("origin_ms")) or cfg.get("schedule_minutes") != days * dm \
             or cfg.get("schedule_end_ms") != cfg["origin_ms"] + days * dm * 60_000:
         return "schedule_minutes and schedule_end_ms must be days x 1440 minutes from the origin"
+    if not all(_int(cfg.get(k)) and cfg[k] >= 0 for k in ("segment_minutes", "min_segment_ms", "pre_origin_max_ms")) \
+            or cfg["segment_minutes"] < 1:
+        return "segment_minutes, min_segment_ms and pre_origin_max_ms must be non-negative integers"
+    targets = cfg.get("targets")
+    if not (isinstance(targets, list) and targets and all(isinstance(t, str) for t in targets)
+            and len(set(targets)) == len(targets)):
+        return "targets must be distinct names"
     return None
+
+
+def segment_end(cfg: Dict, start_ms: int) -> int:
+    """The end of the segment an incarnation that started at start_ms runs: load/c28-demo.js segmentEnd, the same
+    rule (the next multiple of segment_minutes from the origin, the one after it when closer than min_segment_ms;
+    before the origin: the first segment when at most pre_origin_max_ms early, else an idle span that ends half of
+    pre_origin_max_ms before the origin)."""
+    seg = cfg["segment_minutes"] * cfg["minute_ms"]
+    origin = cfg["origin_ms"]
+    if start_ms < origin:
+        if origin - start_ms <= cfg["pre_origin_max_ms"]:
+            return origin + seg
+        return min(start_ms + seg, origin - cfg["pre_origin_max_ms"] // 2)
+    end = origin + ((start_ms - origin) // seg + 1) * seg
+    if end - start_ms < cfg["min_segment_ms"]:
+        end += seg
+    return end
+
+
+def _arrival_offset(cfg: Dict, n: int, j: int, phase: float) -> int:
+    """Arrival j of a minute with n arrivals, in ms from the minute's start: the script's arrivalTime, in the same
+    floating-point operations (so the result is the same integer)."""
+    return math.floor(((j + phase) * cfg["minute_ms"]) / n)
+
+
+def _first_index(cfg: Dict, n: int, offset: int, phase: float) -> int:
+    """The first arrival index at or after `offset` ms into the minute (n when none): the script's
+    firstIndexAtOrAfter."""
+    if n <= 0:
+        return 0
+    j = max(0, min(n, math.ceil((offset * n) / cfg["minute_ms"] - phase) - 1))
+    while j < n and _arrival_offset(cfg, n, j, phase) < offset:
+        j += 1
+    while j > 0 and _arrival_offset(cfg, n, j - 1, phase) >= offset:
+        j -= 1
+    return j
+
+
+def scheduled_arrivals(cfg: Dict, target: str, m: int, a0: int, a1: int) -> Optional[int]:
+    """How many arrivals the schedule places for `target` in [a0, a1) ms of minute m: from the table row's count,
+    the target's phase (evenly spaced arrivals, the targets interleaved) and the span. None outside the schedule."""
+    n = intended(cfg, m)
+    if n is None or target not in cfg["targets"]:
+        return None
+    phase = (cfg["targets"].index(target) + 0.5) / len(cfg["targets"])
+    return _first_index(cfg, n, a1, phase) - _first_index(cfg, n, a0, phase)
+
+
+def start_problems(cfg: Dict, st, inc: str) -> List[str]:
+    """Why an incarnation's start record does not bind its lines to this configuration (empty when it does)."""
+    if not isinstance(st, dict):
+        return ["no start record"]
+    out = []
+    for key, want in (("schema", INCARNATION), ("run", cfg["run_id"]), ("config_schema", cfg["schema"]),
+                      ("config_digest", cfg.get("digest")), ("origin_ms", cfg["origin_ms"]),
+                      ("schedule_end_ms", cfg["schedule_end_ms"]), ("days", cfg["days"])):
+        if st.get(key) != want or isinstance(st.get(key), bool):
+            out.append(f"{key} is not the configuration's")
+    started, active, seg_end = st.get("started_ms"), st.get("active_from_ms"), st.get("segment_end_ms")
+    if not (_int(started) and _int(active) and _int(seg_end)) or active < started:
+        return out + ["started_ms, active_from_ms and segment_end_ms must be integers, in that order of time"]
+    if seg_end != segment_end(cfg, started):
+        out.append("segment_end_ms is not the segment end of its start time")
+    if inc != f"{st.get('pod_uid') or 'no-pod-uid'}/{started}":
+        out.append("the incarnation id is not <pod UID>/<start>")
+    lo, hi = max(active, cfg["origin_ms"]), min(seg_end, cfg["schedule_end_ms"])
+    phase = "schedule-exhausted" if active >= cfg["schedule_end_ms"] else "pre-origin" if active < cfg["origin_ms"] \
+        else "scheduled"
+    want_span = (lo, hi) if lo < hi else (None, None)
+    if (st.get("send_from_ms"), st.get("send_to_ms")) != want_span or st.get("phase") != phase:
+        out.append("the declared span or phase does not follow from its start time, the origin and the ends")
+    return out
 
 
 def scheduled(cfg: Dict, m: int) -> bool:
@@ -182,9 +276,14 @@ def _line_problems(cfg: Dict, r: Dict) -> List[str]:
     if not 0 <= a0 <= a1 <= cfg["minute_ms"]:
         out.append("inconsistent_line")
     elif r["due"] != r["dispatched"] - r["carried"][0] + r["carried"][1] + r["dropped"]["late"] + r["dropped"]["inflight"] \
-            or r["dispatched"] != r["ok"] + r["failed"] + r["unresolved"] or sum(counts) != r["ok"] \
-            or r["due"] > r["intended"]:
+            or r["dispatched"] != r["ok"] + r["failed"] + r["unresolved"] or sum(counts) != r["ok"]:
         out.append("inconsistent_line")
+    elif "plan_mismatch" not in out:
+        # Every arrival the schedule places in the active span is owed: due must be exactly that number (and the
+        # identity above then accounts for each one as dispatched, carried or dropped).
+        owed = scheduled_arrivals(cfg, r.get("target"), m, a0, a1)
+        if owed is None or r["due"] != owed:
+            out.append("due_mismatch")
     if r["unresolved"]:
         out.append("unresolved_outcomes")
     return out
@@ -198,6 +297,7 @@ class _Stream:
         self.start: Optional[Dict] = None
         self.end: Optional[Dict] = None
         self.exhausted: Optional[Dict] = None          # its "schedule-exhausted" record, if it wrote one
+        self.start_problems: List[str] = []            # why its start record does not bind it to the configuration
         self.minutes: Dict[int, Dict] = {}
         self.problems: Dict[int, List[str]] = {}
         self.flags: List[str] = []
@@ -239,6 +339,25 @@ class _Stream:
     def finish(self, cfg: Dict) -> None:
         if self.start is not None and self.start.get("config_digest") != cfg.get("digest"):
             self.flags.append("config_mismatch")
+        # Provenance: the lines count only under a valid start record bound to this configuration.
+        if self.start is None:
+            self.start_problems = ["no start record"]
+            if self.minutes:
+                self.flags.append("start_record_missing")
+        else:
+            self.start_problems = start_problems(cfg, self.start, self.inc)
+            if self.start_problems:
+                self.flags.append("start_record_invalid")
+        w = self.window if not self.start_problems else None
+        for m, r in self.minutes.items():
+            # A line must lie in the span the start record declared, with exactly the active part that span gives it.
+            lo = cfg["origin_ms"] + m * cfg["minute_ms"]
+            if w is None:
+                continue
+            want = None if w == (None, None) or lo + cfg["minute_ms"] <= w[0] or lo >= w[1] else \
+                [max(0, w[0] - lo), min(cfg["minute_ms"], w[1] - lo)]
+            if r["active"] != want and "inconsistent_line" not in self.problems.get(m, []):
+                self.problems.setdefault(m, []).append("inconsistent_line")
         ordered = [self.minutes[m] for m in sorted(self.minutes)]
         for a, b in zip(ordered, ordered[1:]):
             if any(b["cum"].get(k, 0) < a["cum"].get(k, 0) for k in ("due", "dispatched", "dropped", "ok", "failed")) \
@@ -361,7 +480,7 @@ def _generator_minute(cfg: Dict, streams: List[_Stream], m: int) -> Dict:
     out = {"state": "unknown", "reasons": reasons, "incarnations": [s.inc for s, _ in lines], "active_ms": 0}
     blocking = ("unrecorded_tail", "generator_record_missing", "conflicting_lines", "malformed_line",
                 "config_mismatch", "generator_counter_reset", "plan_mismatch", "inconsistent_line",
-                "unresolved_outcomes")
+                "unresolved_outcomes", "start_record_missing", "start_record_invalid", "due_mismatch")
     spans = sorted((r["active"][0], r["active"][1]) for _, r in lines)
     if any(b[0] < a[1] for a, b in zip(spans, spans[1:])):
         reasons.append("duplicate_generators")
@@ -437,24 +556,38 @@ def _clock(streams_by_target: Dict[str, List[_Stream]]) -> Dict[str, Dict[int, T
 
 
 def _clock_minute(clock: Dict, incs: List[str], m: int, limit_ms: float) -> Tuple[Optional[List[float]], Optional[str]]:
-    """The offset bounds that apply to minute m (its own sample, else the nearest within CLOCK_NEIGHBOUR_MINUTES of
-    the same incarnation) and the reason the timing cannot be trusted, if any."""
-    best = None
+    """The offset bounds that apply to minute m and the reason the timing cannot be trusted, if any.
+
+    EVERY contributing incarnation needs its own evidence: its sample of minute m, else its nearest samples within
+    CLOCK_NEIGHBOUR_MINUTES (both neighbours at that distance, taken together). The minute is trusted only when the
+    WHOLE interval of every incarnation lies inside +-limit_ms. Otherwise:
+      clock_offset      an interval lies entirely outside the limit: the offset is proven;
+      clock_unverified  an incarnation has no evidence, its evidence contradicts itself (an empty interval), or its
+                        interval only overlaps the limit (an offset beyond the limit is possible)."""
+    bounds, missing, contradictory = [], False, False
     for inc in incs:
         series = clock.get(inc, {})
+        found = None
         for d in range(CLOCK_NEIGHBOUR_MINUTES + 1):
-            for k in ((m,) if d == 0 else (m - d, m + d)):
-                if k in series:
-                    best = series[k] if best is None else (min(best[0], series[k][0]), max(best[1], series[k][1]))
-                    break
-            else:
-                continue
-            break
-    if best is None:
+            near = [series[k] for k in ((m,) if d == 0 else (m - d, m + d)) if k in series]
+            if near:
+                found = (min(x[0] for x in near), max(x[1] for x in near))
+                contradictory = contradictory or any(x[0] > x[1] for x in near)
+                break
+        if found is None:
+            missing = True
+        else:
+            bounds.append(found)
+    if not incs or not bounds:
         return None, "clock_unverified"
-    if best[0] > limit_ms or best[1] < -limit_ms:
-        return [best[0], best[1]], "clock_offset"
-    return [best[0], best[1]], None
+    span = [min(b[0] for b in bounds), max(b[1] for b in bounds)]
+    if missing or contradictory:
+        return span, "clock_unverified"
+    if any(b[0] > limit_ms or b[1] < -limit_ms for b in bounds):
+        return span, "clock_offset"
+    if any(b[0] < -limit_ms or b[1] > limit_ms for b in bounds):
+        return span, "clock_unverified"
+    return span, None
 
 
 # --- the ingress's side -----------------------------------------------------------------------------------------------
@@ -632,6 +765,7 @@ def reduce(cfg: Dict, records: List[Dict], ingress: Dict[str, List], start_ms: i
                 "last_minute": s.last_minute, "minute_records": len(s.minutes),
                 "ended": "segment-end" if s.end is not None else "no end record",
                 "schedule_exhausted": s.exhausted is not None,
+                "start_record": "valid" if not s.start_problems else "; ".join(s.start_problems),
                 "lost_lines": s.lost_lines(), "flags": sorted(set(s.flags))})
     return out
 
