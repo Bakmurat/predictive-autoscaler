@@ -118,6 +118,67 @@ with a capacity it records `capacity_source` (`capacityPerReplica` or `targetRPS
 Recommend mode still writes nothing. Creating or updating an object without a capacity is still accepted, so existing
 objects keep working while they are migrated; a later release will require a capacity for Active mode.
 
+### Waiting for the forecasting service and the metrics backend
+The forecast and the current request rate are requested inside the reconcile, before the decision, and one worker
+reconciles every autoscaler in turn, so whatever one request waits is added to the decisions queued behind it. The
+operator therefore accounts these waits **cumulatively, per service**: every request draws its deadline from an
+allowance, and the time it really waited is charged back, whatever came of it: an answer, an error status, a refusal
+or a timeout. A slow success costs what a timeout costs.
+
+| | value | meaning |
+|---|---|---|
+| request deadline | 5 s | the longest one request to the forecasting service, or one metrics query, waits (connect, headers and body) |
+| fleet allowance | 5 s, refilled completely in 30 s | what all requests of all autoscalers to that service may wait together |
+| autoscaler allowance | 5 s, refilled completely in 60 s | what one autoscaler's requests to that service may wait |
+| minimum | 0.25 s | with less than this left in either allowance, the request is not sent |
+
+A request's deadline is the smaller of the two allowances. All requests to one service together therefore wait, in any
+window of `W` seconds, at most `5 s + W/6`: 10 s in a 30-second round that starts with a full allowance, and 5 s per 30
+seconds for as long as the service stays slow or silent (plus at most one request's overrun past its deadline, which is
+charged and repaid before the next request is sent). This holds for any number of autoscalers and any mix of slow
+answers, slow error statuses and requests that never answer; the forecasting service and the metrics backend each have
+their own allowance, so together they are bounded by twice that. The autoscaler's own allowance keeps one autoscaler
+whose requests hang from taking the fleet allowance in every round: it can take it once, then only what its own
+allowance has regained. Recovery needs nothing special: quick answers cost little, the allowances refill with time,
+and the next request has a full deadline again.
+
+When a request is **not sent** or **runs out of its deadline** (it is then cancelled), the decision is made without
+it, as after any failed request. The deadline decides, not the result: a complete answer that arrives after the
+deadline is a timeout too (legacy attempt record `outcome: timeout`, statistical ledger `v2.request: timeout`), and
+it is neither cached nor used.
+
+- **Forecast:** on the legacy engine a cached forecast less than ten minutes old may stand in, otherwise the decision
+  is reactive; on the statistical engine the decision of that origin is reactive. Nothing is fetched in the background.
+  `ForecastAvailable` is then False (`Unavailable`) unless a cached forecast was used; on the statistical engine
+  `PredictionReady` is False (`DataUnavailable`, "did not answer within …" or "was not asked …").
+- **Request rate:** it is unavailable, never zero, and the count is held (`TelemetryAvailable=False`,
+  `MetricsUnavailable`, with the same two messages), exactly as for any other unusable metrics answer.
+
+**What these figures are, and are not.** They are a declared policy, fixed in this version. They are sized for about
+20 autoscalers on one operator (20 answers of 0.25 s are one round's refill); that is a sizing assumption, not a
+supported limit and not a cadence guarantee. With more autoscalers, or with answers slower than that, some requests of
+a round are not sent: the bound is kept at the price of forecasts (reactive decisions) or measurements (holds) for
+those autoscalers in that round. The bound covers these two services only. A reconcile also waits for the Kubernetes
+API, bounded per reconcile and not across the fleet: reading the target's ReplicaSets and pods (3 s each), the
+coexistence check (10 s), the identity guard before a write (5 s) and the scale write (10 s), besides the status
+updates. A slow API server therefore still delays a round by up to those figures per autoscaler.
+
+**Compatibility.** The 5-second request deadline replaces a 120-second client timeout for the forecasting service
+(both engines) and a 10-second one for the metrics query. A forecast, also a valid one, that takes longer than its
+deadline is not received: the legacy engine then falls back to its cached forecast or to the reactive rule as above.
+This version states nothing about how long the forecasting service takes; if yours regularly needs more than 5 s, its
+forecasts will not be used.
+
+**Issued, received, used.** These are three different things and the records keep them apart. The forecasting service
+*issues* (and journals) an answer when it has computed one, also when the operator has already given up; a request the
+operator cancelled may therefore have left an issuance on the service, which is never evidence that the operator
+received or used it. The operator *received* an answer when it read a complete, verified one before the deadline:
+legacy attempt `outcome: decoded_response`; statistical ledger `v2.request: answered` (with `v2.issuance_id`). The
+operator *used* it when `forecast_status` is `used` (`v2.accepted: true`). A request that ran out of its deadline is
+`outcome: timeout` / `v2.request: timeout`; one that was not sent is `not_sent` (the legacy attempt record then has
+`error_class: wait_allowance`); `v2.request` is `cached` when the verified answer of the same origin was reused
+without a request, and `failed` for any other error.
+
 ### Measuring capacityPerReplica
 `capacityPerReplica` is the rate one replica sustains **while meeting its SLO**, not the most it completes while requests
 time out. Measure it on one replica with the production resources (CPU and memory requests and limits, concurrency
@@ -163,7 +224,10 @@ has the evidence, a calibrated **upper bound** `U` of that peak, in requests per
    change, or a pod that started between two reconciles) gives no sample, and neither does a pod that lost readiness
    and recovered: a pod's `Ready` condition keeps only its latest transition, which says nothing reliable about the
    first. So samples accumulate more slowly than pods start, slow starts are more likely to be watched than fast
-   ones, and until 20 watched starts exist the configured fallback applies. Only Ready pods count as serving, and
+   ones, and until 20 watched starts exist the configured fallback applies. The samples are **observed starts only**
+   (pods the operator watched from never Ready to Ready), not an unbiased sample of the startup distribution: they
+   skew towards slow starts, so the measured budget tends to be longer than the typical start, never a fair estimate
+   of it. Only Ready pods count as serving, and
    pods of other owners or older ReplicaSets that share the selector are ignored. It does not include the time from the scale request to the pod's creation, which the actuation
    allowance `A` covers (`status.prediction.startup.measures: podCreationToReady`); the configured fallback should cover
    the whole scale request to Ready. When the current ReplicaSet cannot be identified with certainty, nothing is
@@ -206,7 +270,9 @@ has the evidence, a calibrated **upper bound** `U` of that peak, in requests per
    echo (autoscaler and target UIDs, generation, query hash, settings fingerprint, origin, lead), the evidence epoch,
    the window and its targets, `valid_until`, finite non-negative rates in requests per second. A cached answer is reused
    only for the same request and only while its own window is still actionable (`now + A` before the first target and
-   before `valid_until`); it is never moved to a later window.
+   before `valid_until`); it is never moved to a later window. The request is bounded by the wait allowance
+   ([Waiting for the forecasting service and the metrics backend](#waiting-for-the-forecasting-service-and-the-metrics-backend));
+   without an answer in time, or when it is not sent, the decision of that origin is reactive.
 3. **Decides eligibility independently** of the service's flag: trust state `Trusted` and reason `Ready`, an upper bound,
    at least `calibration.minWindows` calibration and `trust.minProspectiveWindows` prospective windows, a recent evidence
    cutoff, an issue time not ahead of its clock, and the remaining window.
@@ -230,7 +296,8 @@ has the evidence, a calibrated **upper bound** `U` of that peak, in requests per
 The decision ledger records `forecast_contract: window-max-rps/v1` and a `v2` block per decision: `issuance_id`,
 `decision_origin`, `valid_until`, `cached`, the service's `trust_state`, `service_reason` and `service_eligible`, the
 operator's `accepted` and `verdict`, `base_window_max_rps`, `upper_window_max_rps`, `capacity_rpm_per_replica`,
-`predictive_replicas_uncapped`, `predictive_extra_allowance`, `predictive_replicas` and `predictive_cap_binding`, the
+`predictive_replicas_uncapped`, `predictive_extra_allowance`, `predictive_replicas` and `predictive_cap_binding`,
+`request` (`answered`, `cached`, `timeout`, `not_sent`, `failed` or `none`: what became of this decision's request), the
 lead and the startup budget. The capped value is a budget, not the quantile: both are kept. Metrics:
 `predictive_autoscaler_predictive_extra_replicas`, `predictive_autoscaler_predictive_capped` and
 `predictive_autoscaler_prediction_gate{phase}`; `predictive_autoscaler_predicted_rpm` shows `U` (in requests per

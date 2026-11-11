@@ -252,7 +252,9 @@ type StartupStatus struct {
 	Method string `json:"method,omitempty"`
 	// SampleCount is the number of completed starts of the current ReplicaSet's pods in the last 7 days that the
 	// operator watched (it saw the pod before it was Ready, then Ready). Pods that were already Ready when first
-	// seen, for example after an operator restart, and pods that recovered readiness are not samples.
+	// seen, for example after an operator restart, and pods that recovered readiness are not samples. The samples are
+	// therefore observed starts only, not an unbiased sample of the startup distribution: a slow start is more likely
+	// to be watched than a fast one, so they skew towards slow starts.
 	SampleCount int32 `json:"sampleCount"`
 	// MeasuredP90Seconds is the 90th percentile of those starts (absent with fewer than 20).
 	// +optional

@@ -980,8 +980,10 @@ func mlAPIBaseURL() string {
 }
 
 // fetchV2 returns a verified answer for binding b: the cached one when it was made for exactly this request and its
-// window is still actionable, otherwise a fresh POST /v2/predict. A refused, unauthorized or incoherent answer drops the
-// cache. There is no stale reuse: an answer past its deadline is never used.
+// window is still actionable, otherwise a fresh POST /v2/predict, bounded by the forecast wait allowance
+// (forecast_wait.go). A refused, unauthorized or incoherent answer drops the cache. There is no stale reuse: an answer
+// past its deadline is never used, and a request that ran out of its deadline is cancelled, so no late answer exists
+// here (the service may still have journalled an issuance for it: that is not delivery, and never use).
 func (r *PredictiveAutoscalerReconciler) fetchV2(ctx context.Context, key string, b v2Binding, now time.Time) (*v2Response, bool, error) {
 	if r.v2Cache == nil {
 		r.v2Cache = map[string]*v2CachedForecast{}
@@ -997,32 +999,45 @@ func (r *PredictiveAutoscalerReconciler) fetchV2(ctx context.Context, key string
 	if err != nil {
 		return nil, false, err
 	}
+	fctx, answered, err := r.forecastContext(ctx, key)
+	if err != nil {
+		return nil, false, err // not sent
+	}
+	out, err := r.requestV2(fctx, b, body)
+	if err = answered(err); err != nil {
+		return nil, false, err // also a verified answer that arrived after the deadline: v2.request is then "timeout"
+	}
+	r.v2Cache[key] = &v2CachedForecast{resp: out, binding: b.key()}
+	return out, false, nil
+}
+
+// requestV2 is one POST /v2/predict: the answer read within its size limit, decoded strictly and bound to b.
+func (r *PredictiveAutoscalerReconciler) requestV2(ctx context.Context, b v2Binding, body []byte) (*v2Response, error) {
 	resp, err := r.mlAPI().post(ctx, mlAPIBaseURL()+"/v2/predict", body)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, v2MaxResponseBytes+1))
 	if err != nil {
-		return nil, false, fmt.Errorf("read the v2 answer: %w", err)
+		return nil, fmt.Errorf("read the v2 answer: %w", err)
 	}
 	switch {
 	case resp.StatusCode >= 400 && resp.StatusCode < 500:
-		return nil, false, &forecastRefusedError{status: resp.StatusCode, body: string(raw)}
+		return nil, &forecastRefusedError{status: resp.StatusCode, body: string(raw)}
 	case resp.StatusCode != http.StatusOK:
-		return nil, false, &forecastServerError{status: resp.StatusCode, body: string(raw)}
+		return nil, &forecastServerError{status: resp.StatusCode, body: string(raw)}
 	case len(raw) > v2MaxResponseBytes:
-		return nil, false, fmt.Errorf("%w: the answer exceeds %d bytes", errV2Refused, v2MaxResponseBytes)
+		return nil, fmt.Errorf("%w: the answer exceeds %d bytes", errV2Refused, v2MaxResponseBytes)
 	}
 	out, err := decodeV2Response(raw)
 	if err == nil {
 		err = out.bound(b)
 	}
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
-	r.v2Cache[key] = &v2CachedForecast{resp: out, binding: b.key()}
-	return out, false, nil
+	return out, nil
 }
 
 // v2FailureReason is the PredictionReady reason for a failed request.

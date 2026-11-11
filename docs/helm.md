@@ -97,9 +97,13 @@ has:
 - Upgrading the forecasting service is a short outage: it is one replica with the Recreate strategy (its model volume
   may be ReadWriteOnce), so the old pod stops before the new one is ready. While the operator keeps running it uses a
   usable cached forecast, or else the reactive rule on live telemetry, subject to the usual scaling safeguards
-  (headroom, stabilization, cooldown, conflict checks). Losing the forecaster adds no hold of its own; missing telemetry
-  triggers the existing telemetry hold (user guide, [section 7](user-guide.md#7-get-forecasts)). Upgrade outside your
-  peak if you rely on the forecast's lead time.
+  (headroom, stabilization, cooldown, conflict checks). Losing the forecaster adds no hold of its own, and only a
+  bounded wait: a refused connection costs nothing, and whatever else the forecaster does (accept requests without
+  answering, drop packets, answer slowly), all forecast requests of all autoscalers together wait at most 5 s plus
+  one sixth of the elapsed time, 10 s in a 30-second round
+  ([configuration.md](configuration.md#waiting-for-the-forecasting-service-and-the-metrics-backend)). Missing telemetry triggers the existing
+  telemetry hold (user guide, [section 7](user-guide.md#7-get-forecasts)). Upgrade outside your peak if you rely on
+  the forecast's lead time.
 
 - The CRD carries a revision label (`autoscaling.devkuban.com/crd-revision`). The operator reads it before starting.
   Revisions: 1 = the first `autoscaling.devkuban.com` schema; 2 = adds `spec.behavior.scaleDown.headroomPercent`;

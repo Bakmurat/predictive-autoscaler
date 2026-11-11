@@ -1,5 +1,13 @@
 # Upgrading
 
+## Wait allowances for the forecasting service and the metrics backend (behaviour change)
+
+One request to the forecasting service now waits at most 5 s (the client used to wait up to 120 s) and one metrics
+query at most 5 s (was 10 s), and all such waits are accounted across autoscalers
+([configuration.md](configuration.md#waiting-for-the-forecasting-service-and-the-metrics-backend)). On the legacy engine
+a forecast that takes longer than 5 s is no longer received: the cached forecast (under ten minutes old) or the
+reactive rule applies instead. No CRD change.
+
 ## Pending starts (no new CRD revision)
 
 `status.prediction.startup.pendingEvidence` is new and only informative. The CRD revision stays 5: on a CRD without
