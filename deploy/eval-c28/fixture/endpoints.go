@@ -129,6 +129,8 @@ type rrRouter struct {
 	byService  map[string]*rrTarget // by Service name
 	now        func() time.Time
 	staleAfter time.Duration
+	// dialTimeout bounds every connection attempt to an endpoint (upstreamTransport): the ingress's request timeout.
+	dialTimeout time.Duration
 
 	mu      sync.Mutex            // serializes apply(); guards slices and retired
 	slices  map[string]sliceEntry // the discovered EndpointSlices by name
@@ -170,13 +172,17 @@ func parseServiceHost(base, namespace string) (string, error) {
 	return parts[0], nil
 }
 
-func newRRRouter(upstreams map[string]string, namespace string, staleAfter time.Duration,
+func newRRRouter(upstreams map[string]string, namespace string, staleAfter, dialTimeout time.Duration,
 	now func() time.Time) (*rrRouter, error) {
 	if namespace == "" || staleAfter <= 0 {
 		return nil, fmt.Errorf("endpoints-rr needs a namespace and a positive stale bound")
 	}
+	if dialTimeout <= 0 {
+		return nil, fmt.Errorf("endpoints-rr needs a positive dial timeout")
+	}
 	r := &rrRouter{namespace: namespace, targets: map[string]*rrTarget{}, byService: map[string]*rrTarget{},
-		now: now, staleAfter: staleAfter, slices: map[string]sliceEntry{}, retired: map[string]time.Time{}}
+		now: now, staleAfter: staleAfter, dialTimeout: dialTimeout, slices: map[string]sliceEntry{},
+		retired: map[string]time.Time{}}
 	for target, base := range upstreams {
 		svc, err := parseServiceHost(base, namespace)
 		if err != nil {
@@ -367,8 +373,17 @@ func (r *rrRouter) validateSlice(s endpointSlice) (sliceEntry, error) {
 
 func isTrue(b *bool) bool { return b != nil && *b }
 
-func newEndpointTransport() *http.Transport {
-	return &http.Transport{MaxIdleConnsPerHost: 1024, IdleConnTimeout: 90 * time.Second}
+// upstreamTransport is the ingress's connection pool to one upstream. Its dial is bounded by the request timeout.
+// net/http keeps a dial running after the request that started it has ended, so that a later request can use the
+// connection. Without a bound, a dial to an address that drops the SYN (a pod that is gone but still listed, a
+// network blackhole) lasts until the kernel gives up, about two minutes, and every request starts another one, so
+// dials and their goroutines pile up at the request rate (measured outside a cluster: about 6,000 goroutines after
+// 20 s at 150 requests a second, against a flat 900 with the bound). On kind the ingress container restarted about a
+// minute into such a blackhole (2026-11-11); that it was killed at its memory limit is inferred, its exit reason was
+// not captured. A restart of the ingress interrupts every target's traffic, not only the unreachable one's.
+func upstreamTransport(dialTimeout time.Duration) *http.Transport {
+	return &http.Transport{MaxIdleConnsPerHost: 1024, IdleConnTimeout: 90 * time.Second,
+		DialContext: (&net.Dialer{Timeout: dialTimeout}).DialContext}
 }
 
 // replaceAll installs a fresh LIST as the whole state, only when EVERY slice validates (else nothing changes);
@@ -443,7 +458,7 @@ func (r *rrRouter) applyLocked() {
 		for _, ref := range refs {
 			e := keep[ref]
 			if e == nil {
-				e = &endpoint{key: ref.key, pod: ref.pod, tr: newEndpointTransport()}
+				e = &endpoint{key: ref.key, pod: ref.pod, tr: upstreamTransport(r.dialTimeout)}
 			}
 			delete(keep, ref)
 			delete(r.retired, dispatchLabel(t.name, ref.pod))
@@ -561,6 +576,16 @@ type kubeAPI struct {
 	token  func() (string, error)
 }
 
+// discoveryDialTimeout bounds connecting to the API server: the LIST's whole budget (list, below). Only the connection
+// attempt is bounded; an established WATCH keeps its own, longer lifetime.
+const discoveryDialTimeout = 10 * time.Second
+
+func discoveryTransport(pool *x509.CertPool, dialTimeout time.Duration) *http.Transport {
+	return &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
+		IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 10 * time.Second,
+		DialContext: (&net.Dialer{Timeout: dialTimeout}).DialContext}
+}
+
 func inClusterAPI() (*kubeAPI, string, error) {
 	host, port := os.Getenv("KUBERNETES_SERVICE_HOST"), os.Getenv("KUBERNETES_SERVICE_PORT")
 	if host == "" || port == "" {
@@ -578,8 +603,7 @@ func inClusterAPI() (*kubeAPI, string, error) {
 	if err != nil {
 		return nil, "", fmt.Errorf("namespace: %w", err)
 	}
-	tr := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
-		IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 10 * time.Second}
+	tr := discoveryTransport(pool, discoveryDialTimeout)
 	token := func() (string, error) {
 		b, err := os.ReadFile(saDir + "/token")
 		if err != nil {
