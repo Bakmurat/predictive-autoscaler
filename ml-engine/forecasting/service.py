@@ -72,7 +72,7 @@ from forecasting.statistical import RECIPE_E1, RECIPE_NAIVE, KernelSettings, Ker
     forecast_e1, seasonal_naive
 from forecasting.store import DEFAULT_QUOTA_BYTES, ForecastStore, IssuanceKey, StoreError, StoreUnavailable
 
-STATE_SCHEMA = "statistical-service-state/v1"
+STATE_SCHEMA = "statistical-service-state/v2"       # v2: normalized calibration scores and the scale in force
 DAY = 86400
 REFIT_SECONDS = 6 * 3600
 RECIPES = {"seasonal_naive": RECIPE_NAIVE, "statistical": RECIPE_E1}
@@ -280,7 +280,8 @@ class ForecastService:
 
     def _initial(self, ek: str) -> Dict:
         return {"schema": STATE_SCHEMA, "epoch": ek, "last_outcome_seq": 0, "last_issuance_seq": 0, "models": {},
-                "trust": {}, "pairs": {"statistical": T.new_pairs(ek, "statistical", RECIPE_E1, RECIPE_NAIVE)}}
+                "scale": None, "trust": {},
+                "pairs": {"statistical": T.new_pairs(ek, "statistical", RECIPE_E1, RECIPE_NAIVE)}}
 
     def _model_state(self, state: Dict, model: str, recipe: str, policy, ek: str, dt: int) -> Dict:
         m = state["models"].get(model)
@@ -296,6 +297,9 @@ class ForecastService:
         if state is None:
             cp = store.latest_checkpoint(ek)
             state = dict(cp.state) if cp is not None else self._initial(ek)
+            if state.get("schema") != STATE_SCHEMA:
+                # A checkpoint of another calibration method: its scores and its trust are never read as this one's.
+                raise StoreError(f"the epoch's checkpoint has state schema {state.get('schema')!r}, not {STATE_SCHEMA}")
         state = {**state, "models": {k: dict(v) for k, v in state["models"].items()}, "pairs": dict(state["pairs"])}
         dt = s.sample_interval_seconds
         for iss in store.issuances_after(ek, state["last_issuance_seq"]):
@@ -349,6 +353,25 @@ class ForecastService:
                     pass
         return fit, sha
 
+    @staticmethod
+    def _scale_in_force(state: Dict, series: Series, input_end: int, origin: int, policy) -> Optional[cal.Scale]:
+        """The calibration scale for an issuance at `origin` (forecasting.calibration): fitted from the finalized
+        history at the first origin that has enough day-lag pairs, refitted at the first origin of each UTC day, and
+        kept in the epoch's state in between. A refit without enough pairs keeps the scale in force."""
+        cur, day = state.get("scale"), origin // DAY
+        if cur is None or cur["params"] is None or cur["day"] != day:
+            slots = DAY // series.interval
+            levels, residuals = cal.season_pairs(series.values[:series.index(input_end) + 1].tolist(), slots)
+            fit = cal.fit_scale(levels, residuals, policy, slots)
+            if fit is not None:
+                cur = {"day": day, "fit_origin": origin, "pairs": len(levels), "params": fit.to_wire()}
+            elif cur is None or cur["params"] is None:
+                cur = {"day": day, "fit_origin": None, "pairs": len(levels), "params": None}
+            else:
+                cur = {**cur, "day": day}
+            state["scale"] = cur
+        return None if cur["params"] is None else cal.Scale.from_wire(cur["params"])
+
     def _build(self, bound: BoundRequest, grid, state: Dict, policy) -> Dict:
         now_ms = self.clock.now_ms()
         s, lead, window, t = bound.settings, bound.lead, bound.window, bound.decision_origin
@@ -375,11 +398,12 @@ class ForecastService:
         if not points:
             raise ServiceError(503, "HistoryInsufficient", "no forecast family has the history it needs yet")
         first_obs = next(ts for ts, v in zip(grid.timestamps, grid.values) if v is not None)
+        scale = self._scale_in_force(state, series, input_end, t, policy)
         cands, inputs = {}, []
         for model, p in points.items():
             m = self._model_state(state, model, RECIPES[model], policy, bound.evidence_key, dt)
             base = max(p["point_rps"])
-            upper, info = cal.upper_bound(m["calibration"], policy, base, t)
+            upper, info = cal.upper_bound(m["calibration"], policy, base, t, scale)
             cands[model] = {"recipe": RECIPES[model], "point_rps": [float(x) for x in p["point_rps"]],
                             "base_window_max_rps": base, "upper_window_max_rps": upper, "calibration": info,
                             "fit_cutoff": p["fit_cutoff"], "artifact_sha256": p["artifact_sha256"]}
@@ -414,6 +438,7 @@ class ForecastService:
                 "valid_until": window.valid_until(lead), "input_end": input_end,
                 "input_received_through_ms": through, "nominal_miscoverage_bps": policy.nominal_bps,
                 "candidates": cands, "selected": verdict.selected, "release_gate": gate,
+                "calibration_scale": {k: state["scale"][k] for k in ("fit_origin", "pairs")},
                 "policy_sha256": policy_sha,
                 "costs": {m: {"shortage": v["shortage"], "replica_time": v["replica_time"],
                               "window": v["binding"]["window"], "paired_decisions": v["paired_decisions"],

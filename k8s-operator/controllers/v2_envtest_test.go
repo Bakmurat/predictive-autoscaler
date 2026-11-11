@@ -93,6 +93,49 @@ func TestEnvtestV2ActiveWritesOnlyAVerifiedForecast(t *testing.T) {
 	}
 }
 
+// The CRD's rule on spec.prediction and the operator's resolver decide historyDays alike: engine statistical needs two
+// days (the calibration scale is fitted from residuals one day apart), the legacy engine keeps one. An absent engine
+// is the v1 path: admitted, and the v2 resolver is never consulted for it.
+func TestEnvtestV2HistoryDaysAdmissionMatchesResolver(t *testing.T) {
+	f := envHarness(t, autoscalerv1alpha1.ModeRecommend)
+	ctx := context.Background()
+	for _, c := range []struct {
+		name     string
+		pred     map[string]interface{}
+		admitted bool
+		v2Path   bool
+	}{
+		{"hist-statistical-1", map[string]interface{}{"engine": "statistical", "historyDays": int64(1)}, false, true},
+		{"hist-statistical-2", map[string]interface{}{"engine": "statistical", "historyDays": int64(2)}, true, true},
+		{"hist-legacy-1", map[string]interface{}{"engine": "legacyLstm", "sampleIntervalSeconds": int64(600), "historyDays": int64(1)}, true, true},
+		{"hist-no-engine-1", map[string]interface{}{"historyDays": int64(1)}, true, false},
+	} {
+		u := &unstructured.Unstructured{Object: map[string]interface{}{
+			"apiVersion": autoscalerv1alpha1.GroupVersion.String(), "kind": "PredictiveAutoscaler",
+			"metadata": map[string]interface{}{"name": c.name, "namespace": f.req.Namespace},
+			"spec": map[string]interface{}{"targetDeployment": map[string]interface{}{"name": "web", "namespace": f.req.Namespace},
+				"minReplicas": int64(1), "maxReplicas": int64(3), "prediction": c.pred}}}
+		err := f.c.Create(ctx, u)
+		if (err == nil) != c.admitted {
+			t.Errorf("%s: admission accepted=%v, want %v (%v)", c.name, err == nil, c.admitted, err)
+		}
+		if err != nil && !strings.Contains(err.Error(), "historyDays must be at least 2 with engine statistical") {
+			t.Errorf("%s: the refusal does not name the rule: %v", c.name, err)
+		}
+		if !c.v2Path {
+			continue
+		}
+		raw, _ := json.Marshal(c.pred)
+		var spec autoscalerv1alpha1.PredictiveAutoscalerSpec
+		if jerr := json.Unmarshal(raw, &spec.Prediction); jerr != nil {
+			t.Fatal(jerr)
+		}
+		if _, rerr := resolveV2Settings(spec); (rerr == nil) != c.admitted {
+			t.Errorf("%s: the resolver accepted=%v but admission accepted=%v (%v)", c.name, rerr == nil, c.admitted, rerr)
+		}
+	}
+}
+
 func TestEnvtestV2SchemaValidates(t *testing.T) {
 	f := envHarness(t, autoscalerv1alpha1.ModeRecommend)
 	ctx := context.Background()

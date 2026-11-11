@@ -35,7 +35,8 @@ type ForecastV2Settings struct {
 	// +optional
 	Seasonality string `json:"seasonality,omitempty"`
 
-	// HistoryDays is the history the models learn from (default 14).
+	// HistoryDays is the history the models learn from (default 14). Engine statistical needs at least 2 (its
+	// calibration scale is fitted from residuals one day apart); the legacy engine accepts 1.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=28
 	// +optional

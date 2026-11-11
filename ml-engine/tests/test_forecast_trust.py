@@ -508,7 +508,8 @@ def test_evidence_records_come_from_the_journal_with_their_mode_and_step_errors(
     targets = [origin + L, origin + 2 * L, origin + 3 * L]
     bundle = {"decision_origin": origin, "target_timestamps": targets, "sample_interval_seconds": L,
               "model_family": "seasonal_naive", "model_recipe": "r", "point_rps": [1.0, 2.0, 3.0],
-              "base_window_max_rps": 3.0, "upper_window_max_rps": 5.0, "evidence_mode": "prospective"}
+              "base_window_max_rps": 3.0, "upper_window_max_rps": 5.0, "evidence_mode": "prospective",
+              "calibration": {"scale": {"s_min": 1.0, "a": 1.0, "beta": 0.0}}}
     data = c.canonical_json(bundle)
     iss = Issuance(1, "iss-1", IssuanceKey(EPOCH, origin, origin, targets[-1], "5" * 64), data, c.sha256_hex(data),
                    ("seasonal_naive",), 0)

@@ -235,6 +235,7 @@ type MetricSourceStatus struct {
 }
 
 // PredictionConfig defines prediction settings
+// +kubebuilder:validation:XValidation:rule="!has(self.engine) || self.engine != 'statistical' || !has(self.historyDays) || self.historyDays >= 2",message="historyDays must be at least 2 with engine statistical (the calibration scale is fitted from residuals one day apart)"
 type PredictionConfig struct {
 	// Enabled turns the forecasting component on or off. When false the operator scales the target from
 	// the reactive request-rate rule only, which makes it a matched reactive-only control for benchmarks.

@@ -46,6 +46,11 @@ const (
 	v2DefaultActuationSecs = 15
 )
 
+// v2CalibrationPolicyRevision is contracts.CALIBRATION_POLICY_REVISION: the calibration method revision. It is part of
+// the settings fingerprint and (through the calibration settings) of the evidence key, so an operator and a forecaster
+// that disagree about the score's meaning can never exchange an accepted answer.
+const v2CalibrationPolicyRevision = "normalized-window-score/two-part-scale/v1"
+
 var (
 	v2AllowedIntervals = []int64{60, 120, 180, 240, 300, 360, 480, 600}
 	v2Phases           = []string{"Collecting", "Calibrating", "Shadow", "Trusted", "Degraded"}
@@ -85,7 +90,7 @@ type v2Settings struct {
 	SettlementSeconds     int64
 	OutcomeGraceSeconds   int64
 	MiscoverageBps        int64
-	Calibration           [6]int64 // min_windows, max_scores, retention_days, eta_bps, min/max_miscoverage_bps
+	Calibration           [9]int64 // v2CalibrationKeys; the last three are the method's scale-fit constants (not in the spec)
 	Trust                 [15]int64
 	ExtraMaxReplicas      int64
 	ExtraMaxPercent       int64
@@ -95,8 +100,8 @@ type v2Settings struct {
 // v2Families are the forecast families spec.prediction.families may list.
 var v2Families = []string{"seasonalNaive", "statistical"}
 
-var v2CalibrationKeys = [6]string{"min_windows", "max_scores", "retention_days", "eta_bps", "min_miscoverage_bps",
-	"max_miscoverage_bps"}
+var v2CalibrationKeys = [9]string{"min_windows", "max_scores", "retention_days", "eta_bps", "min_miscoverage_bps",
+	"max_miscoverage_bps", "scale_bins", "scale_floor_bps", "scale_min_season_bps"}
 var v2TrustKeys = [15]string{"min_shadow_hours", "min_prospective_windows", "coverage_tolerance_bps",
 	"worst_day_min_outcomes", "min_availability_bps", "acute_consecutive_misses", "acute_recent_windows",
 	"repromotion_hours", "repromotion_windows", "challenger_min_pairs", "challenger_min_hours",
@@ -130,7 +135,7 @@ const (
 func v2Default() v2Settings {
 	return v2Settings{Engine: autoscalerv1alpha1.EngineStatistical, SampleIntervalSeconds: 300, Seasonality: "daily",
 		HistoryDays: 14, HorizonSeconds: 3600, SettlementSeconds: 120, OutcomeGraceSeconds: 600, MiscoverageBps: 1000,
-		Calibration:      [6]int64{128, 512, 7, 50, 100, 2500},
+		Calibration:      [9]int64{128, 512, 7, 50, 100, 2500, 8, 500, 8000},
 		Trust:            [15]int64{48, 64, 500, 24, 9500, 5, 32, 24, 32, 64, 48, 9500, 10000, 10200, 12},
 		ExtraMaxReplicas: 2, ExtraMaxPercent: 50, Families: []string{"seasonalNaive", "statistical"}}
 }
@@ -297,6 +302,10 @@ func (s v2Settings) feasible() error {
 			"exceeds the sample count")
 	case c[v2CalRetentionDays]*86400/s.HorizonSeconds < c[v2CalMinWindows]:
 		return fmt.Errorf("calibration.retentionDays cannot hold minWindows nonoverlapping windows at this horizon")
+	case s.Engine == autoscalerv1alpha1.EngineStatistical && s.HistoryDays < 2:
+		// The legacy engine fits no scale and keeps its one-day minimum (the CRD's rule on spec.prediction agrees).
+		return fmt.Errorf("historyDays must be at least 2 with engine statistical: the calibration scale is fitted " +
+			"from residuals one day apart")
 	case s.Trust[v2TrustAcuteRecentWindows] > c[v2CalMaxScores] || s.Trust[v2TrustMinProspectiveWindows] > c[v2CalMaxScores]:
 		return fmt.Errorf("trust window counts exceed the calibration buffer")
 	case s.Trust[v2TrustChallengerExitLossRatio] < s.Trust[v2TrustChallengerLossRatio]:
@@ -320,7 +329,9 @@ func (s v2Settings) riskMap() map[string]interface{} {
 }
 
 func (s v2Settings) calibrationMap() map[string]interface{} {
-	return s.group(v2CalibrationKeys[:], s.Calibration[:])
+	m := s.group(v2CalibrationKeys[:], s.Calibration[:])
+	m["method"] = v2CalibrationPolicyRevision
+	return m
 }
 
 // canonical is contracts.ForecastSettings.canonical(): {"schema": ..., "settings": asdict(settings)}.
