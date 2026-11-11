@@ -68,6 +68,13 @@ forecaster:
       size: 2Gi
       retain: true
     stateQuota: 1536Mi       # the journal's own budget inside the volume (database + WAL)
+    # The autoscalers (namespace/name) the service registers at once; one more is refused with 503
+    # AutoscalerLimitReached and that autoscaler stays reactive. The resources and stateQuota above are sized for 8
+    # (hack/statistical-envelope.py): raise them with it. A registration is released when the Kubernetes API says its
+    # autoscaler is deleted (404) or replaced (another UID), never because a lookup failed. See docs/helm.md
+    maxAutoscalers: 8
+    # ... and when no request arrived for it for this many hours (0: never). Its journal evidence is kept either way.
+    autoscalerIdleReleaseHours: 24
     # C2.8 lab evaluation ONLY: a reviewed lab-qualification/v1 file (docs/helm.md) in a ConfigMap you create. The
     # image must be the EVALUATION build of exactly the source tree the file names, or the forecaster does not start
     # (a release image never honours it); it stands in for the release gate for the named cluster UID, namespaces and

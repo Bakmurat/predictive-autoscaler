@@ -11,7 +11,9 @@ forecasting.contracts) and bounded admission (api/admission.py, the same rule as
 api/serve.py (`python -m api.serve statistical`), which also restarts it when the TLS files rotate.
 
 Configuration (environment): PROMETHEUS_URL (required), FORECAST_STATE_DIR (default /state: the journal and fit
-artifacts, a retained volume), FORECAST_STATE_QUOTA_BYTES, FORECAST_ADMISSION, FORECAST_FIT_MODE (worker | off) and
+artifacts, a retained volume), FORECAST_STATE_QUOTA_BYTES, FORECAST_ADMISSION, FORECAST_FIT_MODE (worker | off),
+FORECAST_MAX_AUTOSCALERS (default 8: the autoscalers registered at once; one more gets 503 AutoscalerLimitReached),
+FORECAST_AUTOSCALER_IDLE_SECONDS (default 86400: a registration without a request this long is released; 0: never) and
 the FORECASTER_AUTH* / FORECASTER_TLS_* settings of api/auth.py. FORECAST_LAB_QUALIFICATION names a reviewed
 lab-qualification/v1 file (forecasting.qualification): honoured only by the evaluation build and image digest
 (FORECAST_IMAGE_DIGEST) it names; in any other image, or malformed, expired or for another source tree, the app does
@@ -46,6 +48,10 @@ BENCHMARK_SWITCHES = ("ALLOW_BENCHMARK_EXPERIMENTS", "SEASONAL_EXPERIMENT", "ENS
 MAX_BODY = 64 << 10
 
 
+MIN_STATE_QUOTA_BYTES, MAX_STATE_QUOTA_BYTES = 1 << 20, 1 << 40    # FORECAST_STATE_QUOTA_BYTES: 1 MiB to 1 TiB
+MAX_ADMISSION = 64                                                 # FORECAST_ADMISSION: 1 to 64 requests at once
+
+
 class Refused(Exception):
     """The configuration asks for something this service never does: it does not start."""
 
@@ -55,6 +61,17 @@ def refuse_benchmark_switches(env: Mapping[str, str]) -> None:
     if present:
         raise Refused(f"the statistical forecasting service has no benchmark or legacy experiment modes; refusing "
                       f"{', '.join(present)}")
+
+
+def _int_env(env: Mapping[str, str], name: str, default: int, minimum: int, maximum: Optional[int] = None) -> int:
+    try:
+        value = int(env.get(name, str(default)))
+    except ValueError:
+        value = None
+    if value is None or value < minimum or (maximum is not None and value > maximum):
+        bounds = f"at least {minimum}" if maximum is None else f"{minimum} to {maximum}"
+        raise Refused(f"{name} must be an integer of {bounds}, got {env.get(name)!r}")
+    return value
 
 
 def default_service(env: Mapping[str, str]):
@@ -83,9 +100,12 @@ def default_service(env: Mapping[str, str]):
     except Q.QualificationRefused as e:
         raise Refused(f"the demonstration qualification is refused: {e}") from e
     cfg = ServiceConfig(prometheus_url=url, state_dir=env.get("FORECAST_STATE_DIR", "/state"),
-                        quota_bytes=int(env.get("FORECAST_STATE_QUOTA_BYTES", str(1536 << 20))),
-                        fit_mode=env.get("FORECAST_FIT_MODE", "worker"), build=build, lab_qualification=lab,
-                        demonstration_qualification=demo)
+                        quota_bytes=_int_env(env, "FORECAST_STATE_QUOTA_BYTES", 1536 << 20, MIN_STATE_QUOTA_BYTES,
+                                             MAX_STATE_QUOTA_BYTES),
+                        fit_mode=env.get("FORECAST_FIT_MODE", "worker"),
+                        max_autoscalers=_int_env(env, "FORECAST_MAX_AUTOSCALERS", 8, 1),
+                        slot_idle_seconds=_int_env(env, "FORECAST_AUTOSCALER_IDLE_SECONDS", 86400, 0),
+                        build=build, lab_qualification=lab, demonstration_qualification=demo)
     if lab is not None:
         logger.warning("LAB QUALIFICATION %s active for cluster %s, namespaces %s, %d targets, until %s (evaluation "
                        "build %s)", lab.sha256, lab.cluster_uid, sorted(lab.namespaces), len(lab.targets),
@@ -119,7 +139,7 @@ def create_app(env: Mapping[str, str] = os.environ, service_factory: Optional[Ca
                   docs_url=None, redoc_url=None, openapi_url=None)
     if auth_config.enabled:
         app.add_middleware(AuthMiddleware, config=auth_config, reviewer=TokenReviewer(auth_config))
-    admission = Admission(int(env.get("FORECAST_ADMISSION", "4")))
+    admission = Admission(_int_env(env, "FORECAST_ADMISSION", 4, 1, MAX_ADMISSION))
     registry = CollectorRegistry()
     ProcessCollector(registry=registry)
 
@@ -156,6 +176,7 @@ def create_app(env: Mapping[str, str] = os.environ, service_factory: Optional[Ca
             basis = getattr(svc, "qualification_metrics", None)
             if basis is not None:
                 extra.register(basis)
+            extra.register(svc.service_metrics)
             body += generate_latest(extra)
         return Response(body, media_type=CONTENT_TYPE_LATEST)
 

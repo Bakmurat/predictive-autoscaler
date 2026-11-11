@@ -8,7 +8,12 @@ the service account's token re-read on every call) and accepts the request only 
   hash: request == status == sha256(status query); contract: the supported one everywhere;
   target: the PA's spec target, in the PA's namespace (the request's application/namespace must name it).
 A resolved incompatibility (including a PA or Deployment that does not exist) is ProvenanceRefused (HTTP 422); a lookup
-that could not be completed (transport, timeout, 401/403, 5xx) is LookupFailed (HTTP 503).
+that could not be completed (transport, timeout, 401/403, 5xx, an unusable CA file) is LookupFailed (HTTP 503).
+
+"Does not exist" is only the API server's own answer about that object: HTTP 404 with a Status of reason NotFound whose
+details name the requested object, resource and group. Any other 404 (an API path that is not served, e.g. the CRD is
+not installed; a proxy's or load balancer's page; a malformed body; a Status about another object) says nothing about
+the object and is LookupFailed.
 """
 
 from __future__ import annotations
@@ -33,10 +38,42 @@ MAX_RESPONSE_BYTES = 1 << 20   # one object
 _DNS_LABEL = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
 _DNS_SUBDOMAIN = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+# The object paths this module can prove absent: a namespaced object of a named API group, or a core namespace.
+_GROUP_OBJECT = re.compile(r"/apis/(?P<group>[^/]+)/[^/]+/namespaces/[^/]+/(?P<resource>[^/]+)/(?P<name>[^/]+)")
+_CORE_NAMESPACE = re.compile(r"/api/v1/(?P<resource>namespaces)/(?P<name>[^/]+)")
+
+
+def definite_not_found(path: str, body) -> bool:
+    """Whether a 404's body is the API server's NotFound Status for exactly the object `path` names."""
+    m = _GROUP_OBJECT.fullmatch(path) or _CORE_NAMESPACE.fullmatch(path)
+    if m is None:
+        return False
+    try:
+        st = json.loads(body)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(st, dict) or (st.get("kind"), st.get("status"), st.get("reason")) != \
+            ("Status", "Failure", "NotFound") or st.get("code") != 404:
+        return False
+    details = st.get("details")
+    if not isinstance(details, dict):
+        return False
+    want = m.groupdict()
+    return (details.get("name"), details.get("kind"), details.get("group") or "") == \
+        (want["name"], want["resource"], want.get("group") or "")
 
 
 class ProvenanceRefused(Exception):
     """The request does not match the autoscaler's current compiled query (HTTP 422)."""
+
+
+class AutoscalerNotFound(ProvenanceRefused):
+    """The Kubernetes API answered a definite 404 for the PredictiveAutoscaler itself: it does not exist. Never raised
+    for a lookup that could not be completed (that is LookupFailed)."""
+
+    def __init__(self, namespace: str, name: str):
+        super().__init__(f"PredictiveAutoscaler {namespace}/{name} not found")
+        self.namespace, self.name = namespace, name
 
 
 class LookupFailed(Exception):
@@ -65,7 +102,8 @@ def valid_name(v) -> bool:
 
 
 class KubeReader:
-    """GET JSON objects from the Kubernetes API with the pod's service account (bounded exchange). None for 404."""
+    """GET JSON objects from the Kubernetes API with the pod's service account (bounded exchange). None only for the
+    API server's NotFound about the requested object itself (definite_not_found); any other 404 is LookupFailed."""
 
     def __init__(self, host: Optional[str] = None, sa_dir: str = SA_DIR, fetch: Callable = bounded_get):
         if host is None:
@@ -82,14 +120,20 @@ class KubeReader:
         except OSError as e:
             raise LookupFailed(f"service account token unreadable: {e}") from e
         ca = os.path.join(self.sa_dir, "ca.crt")
-        ctx = ssl.create_default_context(cafile=ca) if os.path.exists(ca) else ssl.create_default_context()
+        try:
+            ctx = ssl.create_default_context(cafile=ca) if os.path.exists(ca) else ssl.create_default_context()
+        except OSError as e:                                     # unreadable, or not a certificate (ssl.SSLError)
+            raise LookupFailed(f"service account CA unusable: {e}") from e
         try:
             status, body = self.fetch(f"{self.host}{path}", headers={"Authorization": f"Bearer {token}"},
                                       deadline_s=DEADLINE_S, max_bytes=MAX_RESPONSE_BYTES, ssl_context=ctx)
         except (TransportFailure, BodyTooLarge) as e:
             raise LookupFailed(f"Kubernetes API read failed: {e}") from e
         if status == 404:
-            return None
+            if definite_not_found(path, body):
+                return None
+            raise LookupFailed(f"Kubernetes API answered HTTP 404 for {path} without a NotFound status naming that "
+                               "object (the API path may not be served)")
         if status != 200:
             raise LookupFailed(f"Kubernetes API answered HTTP {status} for {path}")
         try:
@@ -127,7 +171,7 @@ def resolve_autoscaler(reader: KubeReader, pa_ns: str, pa_name: str) -> Resolved
         raise ProvenanceRefused(f"malformed autoscaler reference {pa_ns!r}/{pa_name!r}")
     pa = reader.get(f"/apis/{API_GROUP}/{API_VERSION}/namespaces/{pa_ns}/predictiveautoscalers/{pa_name}")
     if pa is None:
-        raise ProvenanceRefused(f"PredictiveAutoscaler {pa_ns}/{pa_name} not found")
+        raise AutoscalerNotFound(pa_ns, pa_name)
     meta, spec, status = _obj(pa, "metadata"), _obj(pa, "spec"), _obj(pa, "status")
     uid, generation = meta.get("uid"), meta.get("generation")
     if not isinstance(uid, str) or not uid or not isinstance(generation, int) or isinstance(generation, bool):

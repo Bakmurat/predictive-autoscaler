@@ -75,6 +75,10 @@ spec:
               value: /state
             - name: FORECAST_STATE_QUOTA_BYTES
               value: {{ include "pa.stateQuotaBytes" . | quote }}
+            - name: FORECAST_MAX_AUTOSCALERS
+              value: {{ .Values.forecaster.statistical.maxAutoscalers | quote }}
+            - name: FORECAST_AUTOSCALER_IDLE_SECONDS
+              value: {{ mul (int .Values.forecaster.statistical.autoscalerIdleReleaseHours) 3600 | quote }}
             {{- if include "pa.labQualification" . }}
             - name: FORECAST_LAB_QUALIFICATION
               value: /etc/predictive-autoscaler/lab-qualification/lab-qualification.json

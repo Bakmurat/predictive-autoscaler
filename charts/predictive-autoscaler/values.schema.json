@@ -128,6 +128,8 @@
               }
             },
             "stateQuota": {"type": "string", "pattern": "^[0-9]+(Mi|Gi)$"},
+            "maxAutoscalers": {"type": "integer", "minimum": 1, "maximum": 64, "description": "Autoscalers the statistical forecaster registers at once; one more is refused (503 AutoscalerLimitReached). Resources and stateQuota are sized for 8."},
+            "autoscalerIdleReleaseHours": {"type": "integer", "minimum": 0, "maximum": 8760, "description": "A registration without a request for this many hours is released (its journal evidence is kept); 0: never."},
             "labQualification": {
               "type": "object",
               "additionalProperties": false,

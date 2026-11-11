@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from api import serve, statistical  # noqa: E402
-from forecasting.metrics import ForecastMetrics  # noqa: E402
+from forecasting.metrics import ForecastMetrics, ServiceMetrics  # noqa: E402
 from forecasting.service import ServiceError  # noqa: E402
 
 OPERATOR = "system:serviceaccount:pa-system:pa-operator"
@@ -20,6 +20,7 @@ class FakeService:
     def __init__(self, answer=None, error=None, ready=True):
         self.answer, self.error, self.calls, self.closed = answer or {"ok": True}, error, [], False
         self.metrics, self._ready = ForecastMetrics(), ready
+        self.service_metrics = ServiceMetrics(self.metrics)
 
     def ready(self):
         return self._ready
@@ -54,6 +55,31 @@ def test_the_service_needs_a_prometheus_url(tmp_path):
         statistical.default_service({"FORECAST_STATE_DIR": str(tmp_path)})
 
 
+def test_the_registration_limit_and_idle_period_come_from_the_environment(tmp_path, monkeypatch):
+    monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+    env = {"PROMETHEUS_URL": "http://prom", "FORECAST_STATE_DIR": str(tmp_path), "FORECAST_FIT_MODE": "off"}
+    svc = statistical.default_service(env)
+    assert (svc.config.max_autoscalers, svc.config.slot_idle_seconds) == (8, 86400)       # the documented defaults
+    svc.close()
+    svc = statistical.default_service({**env, "FORECAST_MAX_AUTOSCALERS": "20",
+                                       "FORECAST_AUTOSCALER_IDLE_SECONDS": "0"})
+    assert (svc.config.max_autoscalers, svc.config.slot_idle_seconds) == (20, 0)
+    assert svc.metrics.max_autoscalers == 20
+    svc.close()
+    for bad in ({"FORECAST_MAX_AUTOSCALERS": "0"}, {"FORECAST_MAX_AUTOSCALERS": "eight"},
+                {"FORECAST_AUTOSCALER_IDLE_SECONDS": "-1"}, {"FORECAST_AUTOSCALER_IDLE_SECONDS": "1d"},
+                {"FORECAST_STATE_QUOTA_BYTES": "1536Mi"}, {"FORECAST_STATE_QUOTA_BYTES": "0"},
+                {"FORECAST_STATE_QUOTA_BYTES": str((1 << 40) + 1)}):
+        with pytest.raises(statistical.Refused):
+            statistical.default_service({**env, **bad})
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "four", "65", ""])
+def test_the_admission_limit_is_bounded_and_a_bad_value_is_a_configuration_error(value):
+    with pytest.raises(statistical.Refused, match="FORECAST_ADMISSION"):
+        statistical.create_app({"FORECAST_ADMISSION": value}, service_factory=FakeService)
+
+
 def test_predict_health_ready_and_metrics(tmp_path):
     c, svc = client()
     with c:
@@ -63,13 +89,14 @@ def test_predict_health_ready_and_metrics(tmp_path):
         assert r.status_code == 200 and r.json() == {"ok": True} and svc.calls == [{"x": 1}]
         m = c.get("/metrics")
         assert m.status_code == 200 and "process_" in m.text
+        assert "predictive_autoscaler_forecaster_autoscaler_slot_limit 8.0" in m.text
         assert c.post("/v2/predict", content=b"not json").status_code == 422
         assert c.post("/v2/predict", content=b"x" * (statistical.MAX_BODY + 1)).status_code == 413
     assert svc.closed
 
 
 @pytest.mark.parametrize("status,reason", [(422, "IdentityMismatch"), (503, "StateUnavailable"),
-                                           (503, "LeadInsufficient")])
+                                           (503, "LeadInsufficient"), (503, "AutoscalerLimitReached")])
 def test_service_errors_keep_their_status(status, reason):
     c, _ = client(svc=FakeService(error=ServiceError(status, reason, "why")))
     with c:

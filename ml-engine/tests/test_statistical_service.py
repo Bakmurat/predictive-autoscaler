@@ -153,15 +153,20 @@ def test_refusals_and_unavailability(tmp_path):
 
 
 def test_the_registration_limit_answers_503(tmp_path):
-    svc, clock = make(tmp_path, max_autoscalers=1)
+    class TwoPAs(Reader):                                  # both autoscalers are live (tests/test_forecaster_slots.py
+        def get(self, path):                               # covers the releases)
+            if path.endswith("/predictiveautoscalers/api-pa"):
+                return pa_object(uid="pa-2")
+            return super().get(path)
+
+    svc, clock = make(tmp_path, reader=TwoPAs(), max_autoscalers=1)
     ask(svc, clock, T0)
-    other = pa_object(uid="pa-2")
-    svc.reader = Reader(other)
     b = dict(body(T0 + DT), autoscaler_name="api-pa", autoscaler_uid="pa-2")
     clock.set((T0 + DT) * 1000 + 10_000)
     with pytest.raises(ServiceError) as e:
         svc.predict(b)
-    assert e.value.status == 503
+    assert (e.value.status, e.value.reason) == (503, "AutoscalerLimitReached")
+    assert svc.metrics.registered() == [("shop", "web-pa")]
 
 
 # --- evidence over time -------------------------------------------------------------------------------------------
@@ -323,13 +328,15 @@ def test_a_crash_at_either_boundary_recovers_exactly(tmp_path, monkeypatch, boun
 def test_concurrent_new_autoscalers_cannot_exceed_the_limit(tmp_path):
     # Codex repro: with max_autoscalers=1, two new autoscalers both committed issuances.
     import threading
-    barrier = threading.Barrier(2, timeout=10)
+    barrier, together = threading.Barrier(2, timeout=10), set()
 
     class TwoPAs:
         def get(self, path):
             name = path.rsplit("/", 1)[1]
             if "predictiveautoscalers" in path:
-                barrier.wait()                             # both requests pass identity together
+                if name not in together:                   # (the refused one's check of the full registry reads the
+                    together.add(name)                     # admitted autoscaler again, alone)
+                    barrier.wait()                         # both requests pass identity together
                 return pa_object(uid="pa-1" if name == "web-pa" else "pa-2")
             return {"metadata": {"uid": "dep-uid"}}
 

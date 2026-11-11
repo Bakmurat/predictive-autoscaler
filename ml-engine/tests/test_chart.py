@@ -805,6 +805,7 @@ def test_the_statistical_profile_runs_the_light_image_with_its_own_state(render)
     assert dep["spec"]["strategy"] == {"type": "Recreate"} and dep["spec"]["replicas"] == 1
     env = {e["name"]: e.get("value") for e in c["env"]}
     assert env["FORECAST_STATE_DIR"] == "/state" and env["FORECAST_STATE_QUOTA_BYTES"] == str(1536 << 20)
+    assert env["FORECAST_MAX_AUTOSCALERS"] == "8" and env["FORECAST_AUTOSCALER_IDLE_SECONDS"] == "86400"
     assert "MODEL_DIR" not in env and not set(env) & {"COLD_START_CRONJOB", "ALLOW_BENCHMARK_EXPERIMENTS",
                                                       "ENSEMBLE_EXPERIMENT", "SEASONAL_EXPERIMENT"}
     assert env["FORECASTER_AUTH"] == "tokenreview"                              # the same caller authentication
@@ -868,9 +869,25 @@ def test_switching_profiles_keeps_the_service_and_both_volumes(render):
 @pytest.mark.parametrize("bad", [{"forecaster": {"engine": "prophet"}},
                                  {"forecaster": {"statistical": {"persistence": {"accessMode": "ReadWriteMany"}}}},
                                  {"forecaster": {"statistical": {"stateQuota": "1.5G"}}},
-                                 {"forecaster": {"statistical": {"replicas": 2}}}])
+                                 {"forecaster": {"statistical": {"replicas": 2}}},
+                                 {"forecaster": {"statistical": {"maxAutoscalers": 0}}},
+                                 {"forecaster": {"statistical": {"maxAutoscalers": 65}}},
+                                 {"forecaster": {"statistical": {"maxAutoscalers": "8"}}},
+                                 {"forecaster": {"statistical": {"autoscalerIdleReleaseHours": -1}}},
+                                 {"forecaster": {"statistical": {"autoscalerIdleReleaseHours": "24h"}}}])
 def test_the_statistical_values_are_validated(render, bad):
     assert render(_merge(STAT, bad), check=False).returncode != 0
+
+
+def test_the_autoscaler_limit_and_idle_release_are_values(render):
+    docs = render(_merge(STAT, {"forecaster": {"statistical": {"maxAutoscalers": 24, "autoscalerIdleReleaseHours": 0}}}))
+    env = {e["name"]: e.get("value") for e in forecaster_of(docs)["spec"]["template"]["spec"]["containers"][0]["env"]}
+    assert env["FORECAST_MAX_AUTOSCALERS"] == "24" and env["FORECAST_AUTOSCALER_IDLE_SECONDS"] == "0"
+    legacy = {e["name"] for e in forecaster_of(render())["spec"]["template"]["spec"]["containers"][0]["env"]}
+    assert not legacy & {"FORECAST_MAX_AUTOSCALERS", "FORECAST_AUTOSCALER_IDLE_SECONDS"}    # the statistical engine's only
+    helm_doc = (ROOT / "docs" / "helm.md").read_text()
+    assert all(v in helm_doc for v in ("forecaster.statistical.maxAutoscalers", "AutoscalerLimitReached",
+                                       "forecaster.statistical.autoscalerIdleReleaseHours"))
 
 
 def test_a_lab_qualification_is_opt_in_read_only_and_statistical_only(render):
