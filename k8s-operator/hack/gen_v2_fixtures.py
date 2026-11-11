@@ -54,7 +54,20 @@ SETTINGS_CASES = [
                               "challengerCostRatioBps": 10100, "maxFitAgeHours": 6},
                     "predictiveExtra": {"maxReplicas": 0, "maxPercent": 25}}),
     ("naive-only", {"engine": "statistical", "families": ["seasonalNaive"]}),
+    # the validated profile (trust-repair protocol, amendment 2): 60 s grid, a 600 s minimum lead, seasonal-naive only
+    ("min-lead-600", {"engine": "statistical", "sampleIntervalSeconds": 60, "families": ["seasonalNaive"],
+                      "minLeadSeconds": 600}),
+    ("min-lead-rounded", {"engine": "statistical", "minLeadSeconds": 541}),
+    ("min-lead-equals-horizon", {"engine": "statistical", "sampleIntervalSeconds": 60, "horizonMinutes": 10,
+                                 "minLeadSeconds": 600}),
     ("families-reordered", {"engine": "statistical", "families": ["statistical", "seasonalNaive"]}),
+    # the operator's update interval is part of the identity: the validated profile's 60 s, the operator's default
+    # for 0 (60 s) and its floor (30 s); every other case carries the CRD's default, 300 s
+    ("update-60", {"engine": "statistical", "sampleIntervalSeconds": 60, "families": ["seasonalNaive"],
+                   "minLeadSeconds": 600, "updateIntervalSeconds": 60}),
+    ("update-zero-is-default", {"engine": "statistical", "updateIntervalSeconds": 0}),
+    ("update-below-floor", {"engine": "statistical", "updateIntervalSeconds": 10}),
+    ("update-120", {"engine": "statistical", "updateIntervalSeconds": 120}),
     # refused
     ("disabled", {"engine": "statistical", "enabled": False}),
     ("families-without-naive", {"engine": "statistical", "families": ["statistical"]}),
@@ -81,6 +94,10 @@ SETTINGS_CASES = [
     ("history-too-long", {"engine": "statistical", "historyDays": 29}),
     ("settlement-too-long", {"engine": "statistical", "settlementSeconds": 901}),
     ("history-one-day", {"engine": "statistical", "historyDays": 1}),
+    ("min-lead-out-of-range", {"engine": "statistical", "minLeadSeconds": 3601}),
+    ("min-lead-rounds-beyond-horizon", {"engine": "statistical", "sampleIntervalSeconds": 60, "horizonMinutes": 10,
+                                        "minLeadSeconds": 601}),
+    ("prospective-below-acute", {"engine": "statistical", "trust": {"minProspectiveWindows": 32}}),
 ]
 
 # The identity of the calibration method BEFORE normalized-window-score/two-part-scale/v1 (the additive score Y - b),
@@ -89,6 +106,20 @@ SETTINGS_CASES = [
 LEGACY_ADDITIVE = {"settings_sha256": "a57283c74f3167299d2dbf72eb0193aa1157a1b79691570e68ebed5561848bcf",
                    "evidence_key": "58daefce56ef9b2b7244d2d565538b5edc5ce0bf78d09cc9a51c882cc4478c00"}
 _ADDED_CALIBRATION_KEYS = ("method", "scale_bins", "scale_floor_bps", "scale_min_season_bps")
+# The identity of the calibration change BEFORE trust policy budgeted-coverage-tests/v1 (the last 32 gate windows at
+# least 85 % covered, the worst-day rule on partial days), frozen from the fixtures of that
+# change: an operator or a forecaster one revision back presents these.
+PRE_TRUST_POLICY = {"settings_sha256": "c8e281dc189bde4582db5085810598484abc9789a1c32a29b9f0388342936b9c",
+                    "evidence_key": "e147997ab6f5181c96583aae60d6c9d477368a0a81ceb000ed450b59401905ad"}
+_ADDED_TRUST_KEYS = ("policy", "rolling_alarm_ppm", "consecutive_alarm_ppm", "day_alarm_ppm", "seven_day_alarm_ppm",
+                     "miss_dependence_bps")
+# The identity of trust policy budgeted-coverage-tests/v1 (three budgeted rules for independent misses, the seven-day
+# gate an unbudgeted ratio, no minimum lead), frozen from the fixtures of that policy (commit a774a68).
+TRUST_POLICY_V1 = {"settings_sha256": "294957d5a0d715cf320838f6ef3a6b60525564b6370581581597759ba4592215",
+                   "evidence_key": "41563d86004f1ebdf435ff704b9cb6bd6ad541dbfd78eac9b657c4ae910e1fea"}
+_V1_TRUST = {"policy": "budgeted-coverage-tests/v1", "rolling_alarm_ppm": 35_000}
+_ADDED_BY_V2 = ("seven_day_alarm_ppm", "miss_dependence_bps")
+_EARLIER_TRUST_DEFAULTS = {"acute_recent_windows": 32}
 
 SIGNAL = ResolvedSignal(namespace="shop", name="web", metric="requests", query="q", sha256=SHA, contract=CONTRACT,
                         autoscaler_uid="pa-uid", target_uid="dep-uid", generation=3)
@@ -121,7 +152,8 @@ def settings_cases():
 
 def evidence_cases():
     out = []
-    for name, pred in SETTINGS_CASES[:8]:
+    cadence = [case for case in SETTINGS_CASES if case[0] in ("update-60", "update-120")]
+    for name, pred in SETTINGS_CASES[:8] + cadence:
         s = c.resolve_settings(pa_with(pred))
         for lead in sorted({s.sample_interval_seconds * 2, s.horizon_seconds}):
             out.append({"settings_case": name, "lead_seconds": lead,
@@ -135,7 +167,35 @@ def legacy_identity():
     """The frozen pre-change identity, re-derived: the current canonical settings and evidence-key body WITHOUT the
     keys this method added hash to exactly the frozen values, so nothing else moved the identity."""
     s = c.resolve_settings(pa_with({"engine": "statistical"}))
+    # Trust policy v1: today's identity without what v2 added (two trust keys, the minimum lead), under v1's name
+    # and rolling budget.
     canon = s.canonical()
+    for k in _ADDED_BY_V2:
+        canon["settings"]["trust"].pop(k)
+    canon["settings"]["trust"].update(_V1_TRUST)
+    canon["settings"].pop("min_lead_seconds")
+    canon["settings"].pop("update_interval_seconds")
+    v1_body = {k: v for k, v in _evidence_body(s).items()
+               if k not in ("min_lead_seconds", "update_interval_seconds")}
+    v1_body["trust_policy"] = _V1_TRUST["policy"]
+    v1 = {"settings_sha256": c.sha256_hex(c.canonical_json(canon)),
+          "evidence_key": c.sha256_hex(c.canonical_json(v1_body))}
+    if v1 != TRUST_POLICY_V1:
+        raise SystemExit(f"the identity of trust policy v1 no longer re-derives: {v1}")
+    if s.fingerprint() == v1["settings_sha256"] or c.evidence_key(SIGNAL, s, 1200) == v1["evidence_key"]:
+        raise SystemExit("the trust policy revision does not change the settings fingerprint and the evidence key")
+    canon = s.canonical()
+    for k in _ADDED_TRUST_KEYS:
+        canon["settings"]["trust"].pop(k)
+    canon["settings"]["trust"].update(_EARLIER_TRUST_DEFAULTS)
+    canon["settings"].pop("min_lead_seconds")
+    canon["settings"].pop("update_interval_seconds")
+    pre = {"settings_sha256": c.sha256_hex(c.canonical_json(canon)),
+           "evidence_key": c.sha256_hex(c.canonical_json({k: v for k, v in _evidence_body(s).items()
+                                                          if k not in ("trust_policy", "min_lead_seconds",
+                                                                       "update_interval_seconds")}))}
+    if pre != PRE_TRUST_POLICY:
+        raise SystemExit(f"the pre-trust-policy identity no longer re-derives: {pre}")
     for k in _ADDED_CALIBRATION_KEYS:
         canon["settings"]["calibration"].pop(k)
     cal = dict(canon["settings"]["calibration"])
@@ -154,10 +214,23 @@ def legacy_identity():
     return {**LEGACY_ADDITIVE, "method": "additive-window-score (revision 1, unnamed)"}
 
 
+def _evidence_body(s):
+    """contracts.evidence_key's body for the fixture signal at lead 1200 s."""
+    return {"schema": c.EVIDENCE_SCHEMA, "autoscaler_uid": SIGNAL.autoscaler_uid, "target_uid": SIGNAL.target_uid,
+            "query_sha256": SIGNAL.sha256, "signal_contract": SIGNAL.contract,
+            "forecast_contract": c.FORECAST_CONTRACT, "interval_seconds": s.sample_interval_seconds,
+            "lead_seconds": 1200, "min_lead_seconds": s.min_lead_seconds,
+            "update_interval_seconds": s.update_interval_seconds, "engine": s.engine,
+            "seasonality": s.seasonality, "history_days": s.history_days,
+            "settlement_seconds": s.settlement_seconds, "outcome_grace_seconds": s.outcome_grace_seconds,
+            "risk": dataclasses.asdict(s.risk), "calibration": dataclasses.asdict(s.calibration),
+            "trust_policy": s.trust.policy}
+
+
 def lead_cases():
-    auto = [{"startup": d, "decision_interval": dt, "allowance": a, "interval": dt,
-             "lead": c.automatic_lead_seconds(d, dt, a, dt)}
-            for d in (0, 1, 59, 60, 420, 899) for dt in (60, 300, 600) for a in (0, 15, 30)]
+    auto = [{"startup": d, "decision_interval": dt, "allowance": a, "interval": dt, "min_lead": m,
+             "lead": c.automatic_lead_seconds(d, dt, a, dt, m)}
+            for d in (0, 1, 59, 60, 420, 899) for dt in (60, 300, 600) for a in (0, 15, 30) for m in (0, 541, 600, 3600)]
     settings = c.resolve_settings(pa_with({"engine": "statistical"}))
     checks = []
     base = {"seconds": 1200, "startupDelaySeconds": 420, "actuationAllowanceSeconds": 30, "method": "measured",
@@ -170,11 +243,21 @@ def lead_cases():
     for name, upd in variants:
         lead = {**base, **upd}
         sel, why = c.resolve_lead(pa_with({"engine": "statistical"}, lead), settings, 3)
-        checks.append({"name": name, "lead": lead, "valid": sel is not None, "why": why})
+        checks.append({"name": name, "settings": "statistical", "lead": lead, "valid": sel is not None, "why": why})
+    # The validated profile's settings: a published lead below the configured minimum is refused.
+    profile = dict(next(p for n, p in SETTINGS_CASES if n == "min-lead-600"))
+    profile_settings = c.resolve_settings(pa_with(profile))
+    short = {"seconds": 180, "startupDelaySeconds": 30, "actuationAllowanceSeconds": 15, "method": "measured",
+             "sampleCount": 25, "observedGeneration": 3}
+    for name, upd in (("below-minimum", {}), ("at-minimum", {"seconds": 600}), ("above-minimum", {"seconds": 660})):
+        lead = {**short, **upd}
+        sel, why = c.resolve_lead(pa_with(profile, lead), profile_settings, 3)
+        checks.append({"name": name, "settings": "min-lead-600", "lead": lead, "valid": sel is not None, "why": why})
     missing = dict(base)
     missing.pop("sampleCount")
     sel, why = c.resolve_lead(pa_with({"engine": "statistical"}, missing), settings, 3)
-    checks.append({"name": "missing-key", "lead": missing, "valid": sel is not None, "why": why})
+    checks.append({"name": "missing-key", "settings": "statistical", "lead": missing, "valid": sel is not None,
+                   "why": why})
     windows = []
     for dt, lead_s, d, a in ((300, 1200, 420, 30), (60, 600, 120, 15), (600, 3600, 900, 0), (300, 900, 570, 30)):
         sel = c.LeadSelection(lead_s, d, a, "configured", 0, 3)
@@ -289,6 +372,12 @@ def response_cases():
         # A forecaster of the additive method answering this operator: its fingerprint, or its evidence epoch.
         "legacy-additive-settings": _mutate(wire, settings_sha256=LEGACY_ADDITIVE["settings_sha256"]),
         "legacy-additive-epoch": _mutate(wire, calibration_epoch=LEGACY_ADDITIVE["evidence_key"]),
+        # A forecaster of the calibration change without this trust policy.
+        "pre-trust-policy-settings": _mutate(wire, settings_sha256=PRE_TRUST_POLICY["settings_sha256"]),
+        "pre-trust-policy-epoch": _mutate(wire, calibration_epoch=PRE_TRUST_POLICY["evidence_key"]),
+        # An operator or forecaster of trust policy budgeted-coverage-tests/v1.
+        "trust-policy-v1-settings": _mutate(wire, settings_sha256=TRUST_POLICY_V1["settings_sha256"]),
+        "trust-policy-v1-epoch": _mutate(wire, calibration_epoch=TRUST_POLICY_V1["evidence_key"]),
     }
     # A different lead and origin must be internally coherent to reach the binding check.
     shifted = dataclasses.replace(r, decision_origin=ORIGIN + 300, window_start=ORIGIN + 300,
@@ -323,6 +412,8 @@ def generate() -> str:
            "forecast_contract": c.FORECAST_CONTRACT, "settings_schema": c.SETTINGS_SCHEMA,
            "evidence_schema": c.EVIDENCE_SCHEMA, "unit": c.UNIT, "allowed_intervals": list(c.ALLOWED_INTERVALS),
            "calibration_method": c.CALIBRATION_POLICY_REVISION, "legacy_additive": legacy_identity(),
+           "trust_policy": c.TRUST_POLICY_REVISION, "pre_trust_policy": dict(PRE_TRUST_POLICY),
+           "trust_policy_v1": dict(TRUST_POLICY_V1),
            "phases": list(c.PHASES), "reasons": list(c.REASONS), "model_families": list(c.MODEL_FAMILIES),
            "settings": settings_cases(), "evidence": evidence_cases(), "lead": lead_cases(),
            "responses": response_cases()}

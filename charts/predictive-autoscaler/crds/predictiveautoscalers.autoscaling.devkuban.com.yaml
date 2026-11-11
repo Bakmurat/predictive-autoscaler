@@ -326,6 +326,18 @@ spec:
                     format: int32
                     minimum: 1
                     type: integer
+                  minLeadSeconds:
+                    description: |-
+                      MinLeadSeconds is the shortest lead the operator selects (default 0: no minimum). The lead is the larger of this
+                      and what the startup budget, the decision interval and the actuation allowance need, rounded up to the forecast
+                      grid; a minimum beyond the horizon is refused, and the measured startup delay is never changed by it. The
+                      forecast covers the window from the next grid step to the lead: a longer lead extends that window, it does not
+                      promise scaling exactly that long before a rise. Predictive eligibility is granted only for validated
+                      configurations (grid, lead, risk and family set); see the user guide.
+                    format: int32
+                    maximum: 3600
+                    minimum: 0
+                    type: integer
                   outcomeGraceSeconds:
                     description: |-
                       OutcomeGraceSeconds is how long a forecast window's outcome may stay incomplete before it is unscorable

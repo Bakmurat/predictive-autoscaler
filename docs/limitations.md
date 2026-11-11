@@ -31,7 +31,17 @@ production-ready. Known limits, most important first:
    yet.
 9. **Heavy footprint:** the forecasting image includes TensorFlow (about 1 CPU / 1 GiB requested); the neural component
    has not shown a consistent advantage over the seasonal pattern in the evaluations so far.
-10. **No published images, chart or releases yet:** the chart is installed from the source tree (helm.md); images are
+10. **Statistical forecasts are eligible in one validated configuration only** (engine `statistical`): a 60-second
+    grid, a 60-second update interval (`updateIntervalSeconds: 60`; the CRD's default is 300), a 600-second lead, the default 90 % target and the seasonal-naive family alone, with default calibration and
+    trust settings. Any other grid, lead, target or family set is forecast and scored but stays reactive
+    (`ConfigurationNotValidated`): at shorter leads the trust rules either demoted a correctly calibrated forecast too
+    often on autocorrelated noise or detected a bad one too slowly, and nothing else has been validated. The rules'
+    thresholds are computed under one stated model of the misses and qualified by simulation on named noise models;
+    they are not a guarantee for real traffic, they need about 10 hours 40 minutes (64 windows) to detect a bound
+    that misses 40 % of the time, and they do not detect a mild sustained undercoverage. The calibration itself is
+    not validated for workloads that idle at or near zero (user guide, section 11: coverage about 80 % instead of
+    90 % at low discrete load in the acceptance simulations).
+11. **No published images, chart or releases yet:** the chart is installed from the source tree (helm.md); images are
     built from source (getting-started.md).
 
 The plan to address these is tracked by the maintainers; items 1–2 come first.

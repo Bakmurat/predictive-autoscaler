@@ -448,7 +448,17 @@ def test_a_one_minute_sixty_step_bundle_fits(tmp_path):
 
 # --- C2.8a: same-policy costs, families and the lab qualification ---------------------------------------------------
 
-FAST_TRUST = {"minShadowHours": 1, "minProspectiveWindows": 4, "worstDayMinOutcomes": 1, "repromotionWindows": 4,
+@pytest.fixture(autouse=True)
+def validated_configuration(request, monkeypatch):
+    """These tests drive the service with short test settings. Whether a configuration is on the allowlist of
+    validated profiles is a separate gate (contracts.validated_profile; tests/test_trust_monitor.py): here every test
+    runs as a validated configuration, except the one that tests the refusal."""
+    if not request.node.name.startswith("test_an_unvalidated_configuration"):
+        import forecasting.service as service_module
+        monkeypatch.setattr(service_module, "validated_profile", lambda s, lead: c.VALIDATED_PROFILES[0])
+
+
+FAST_TRUST = {"minShadowHours": 1, "minProspectiveWindows": 4, "acuteRecentWindows": 4, "worstDayMinOutcomes": 1, "repromotionWindows": 4,
               "challengerMinPairs": 4, "challengerMinHours": 1, "repromotionHours": 0, "challengerLossRatioBps": 10000}
 NOISY = lambda t: round(rps(t) + ((t * 2654435761) % 997) / 997 - 0.5, 6)   # noqa: E731  (E1 refuses a smooth AR)
 
@@ -615,6 +625,50 @@ def test_a_lab_qualification_stands_in_for_the_release_gate_and_nothing_else(tmp
     assert first_ready > 0 and all(not c.response_from_wire(w).predictive_eligible for w in got["lab"][0][:first_ready])
     assert all(a["verdict"]["reason"] == b["verdict"]["reason"]
                for a, b in zip(got["lab"][1][:first_ready], got["plain"][1][:first_ready]))
+
+
+def test_a_change_of_the_update_interval_starts_a_new_epoch_and_reuses_no_stored_answer(tmp_path):
+    """The operator's update interval is bound into the settings fingerprint and the evidence key: after the live
+    object changes it, the answer stored for the same decision origin is not reused, the old fingerprint is refused,
+    and the evidence starts again in a new epoch (so trust earned at one cadence never serves another)."""
+    reader = Reader(pa_object(prediction=dict(PREDICTION, updateIntervalSeconds=300)))
+    svc, clock = make(tmp_path, reader=reader)
+    old = c.resolve_settings(reader.pa).fingerprint()
+    clock.set(T0 * 1000 + 10_000)
+    first = c.response_from_wire(svc.predict(body(T0, old)))
+    assert c.response_from_wire(svc.predict(body(T0, old))).issuance_id == first.issuance_id     # the stored answer
+    reader.pa = pa_object(prediction=dict(PREDICTION, updateIntervalSeconds=600))
+    new = c.resolve_settings(reader.pa).fingerprint()
+    assert new != old
+    with pytest.raises(ServiceError) as e:
+        svc.predict(body(T0, old))                               # the object no longer has these settings
+    assert e.value.status == 422
+    second = c.response_from_wire(svc.predict(body(T0, new)))
+    assert second.issuance_id != first.issuance_id and second.calibration_epoch != first.calibration_epoch
+    assert second.prospective_windows == 0                       # nothing earned before counts in the new epoch
+    svc.close()
+
+
+def test_an_unvalidated_configuration_is_never_eligible(tmp_path):
+    """The same lab-qualified run without the allowlist override: the naive is trusted and selected, the release
+    gate's stand-in holds, every bound is issued, and the answer is not eligible: ConfigurationNotValidated."""
+    from forecasting import qualification as Q
+    pa = pa_object(prediction=dict(PREDICTION, trust=FAST_TRUST))
+    svc, clock = make(tmp_path, reader=ClusterReader(pa), store_id="journal-1", build=Q.BuildInfo(TREE, True),
+                      lab_qualification=lab())
+    settings = c.resolve_settings(pa).fingerprint()
+    assert c.validated_profile(c.resolve_settings(pa), LEAD) is None
+    wire = None
+    for i in range(90):
+        clock.set(max(clock.now_ms(), (T0 + i * DT) * 1000 + 10_000))
+        wire = svc.predict(body(T0 + i * DT, settings))
+    last = svc.store.issuances()[-1].payload()
+    assert last["selected"] == "seasonal_naive" and last["release_gate"]["passed"] is True
+    assert last["verdict"]["candidates"]["seasonal_naive"]["trusted"] is True
+    assert (last["verdict"]["reason"], last["verdict"]["prediction_ready"]) == ("ConfigurationNotValidated", False)
+    r = c.response_from_wire(wire)
+    assert (r.predictive_eligible, r.reason, r.trust_state) == (False, "ConfigurationNotValidated", "Trusted")
+    assert r.upper_window_max_rps is not None                 # served and bounded as always
 
 
 def test_a_lab_qualification_fails_closed(tmp_path):

@@ -34,6 +34,17 @@ PREDICTION = {"horizonMinutes": 60, "sampleIntervalSeconds": G, "historyDays": 2
               "calibration": {"minWindows": 16, "maxScores": 64, "minMiscoverageBps": 600}}
 
 
+@pytest.fixture(scope="module", autouse=True)
+def allowlisted():
+    """These tests are about the demonstration basis, which stands in for the RELEASE GATE only. Their fast
+    configuration (a short lead, quick trust settings) is not a validated profile, and the allowlist is a separate gate
+    (contracts.validated_profile; tests/test_trust_monitor.py), so it is passed here, except in the one test below
+    that shows a demonstration qualification never overrides it."""
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(S, "validated_profile", lambda s, lead: c.VALIDATED_PROFILES[0])
+        yield
+
+
 def demand(t):
     """Exactly daily-periodic demand with a deterministic ripple: the seasonal-naive forecast earns trust quickly."""
     d = t % DAY
@@ -161,6 +172,17 @@ def test_a_demonstration_qualification_stands_in_for_the_release_gate_and_nothin
     assert {"CalibrationInsufficient", "ShadowInsufficient"} <= {b["verdict"]["reason"] for b in demo_b[:first_ready]}
 
 
+def test_a_demonstration_qualification_never_overrides_the_allowlist(trusted, tmp_path, monkeypatch):
+    """With the real allowlist the same trusted run under the same admitted documents is not eligible: this fast
+    configuration was never validated. A demonstration needs a contract for a validated profile."""
+    monkeypatch.setattr(S, "validated_profile", c.validated_profile)
+    svc, clock, _pa, settings = reopen(trusted, tmp_path, demonstration_qualification=trusted["doc"])
+    r = c.response_from_wire(ask(svc, clock, LAST + G, settings))
+    assert (r.predictive_eligible, r.reason, r.trust_state) == (False, "ConfigurationNotValidated", "Trusted")
+    assert gate(svc)["basis"] == "demonstration"                 # the release gate's stand-in held; the allowlist did not
+    svc.close()
+
+
 def test_a_failing_coverage_gate_still_blocks_eligibility(trusted, tmp_path):
     backend = base.Backend(lambda t: demand(t) * (3.0 if t > LAST else 1.0))       # demand leaves every bound behind
     svc, clock, _pa, settings = reopen(trusted, tmp_path, backend=backend, demonstration_qualification=trusted["doc"])
@@ -250,8 +272,15 @@ def test_a_live_configuration_that_differs_from_the_contract_is_not_eligible(tru
     assert c.response_from_wire(wire).predictive_eligible is False and refusals(svc) == {why: 1}
     svc.close()
     # And an answer that WAS eligible stops being so the moment the live autoscaler drifts from the contract (the
-    # forecast settings, and with them the stored issuance, are unchanged by a policy or cadence field).
-    if why in ("bounds", "capacity") or change.get("prediction", {}).get("updateIntervalSeconds", 60) != 60:
+    # forecast settings, and with them the stored issuance, are unchanged by a policy field). A change of the update
+    # interval is a change of the forecast settings themselves: another fingerprint, another evidence epoch, so the
+    # stored answer cannot even be asked for (the first half above is its whole story). An object WITHOUT the field
+    # resolves to the operator's default, the same 60 s and the same fingerprint, and the contract still refuses it:
+    # it names the field's value in the object.
+    update = change.get("prediction", {}).get("updateIntervalSeconds", 60)
+    if update not in (60, None):
+        assert settings != trusted["settings"]
+    if why in ("bounds", "capacity") or update is None:
         drifted, _clock, _pa, settings = reopen(trusted, tmp_path, pa=pa, demonstration_qualification=trusted["doc"])
         assert settings == trusted["settings"]
         r = retry_last(drifted, settings)

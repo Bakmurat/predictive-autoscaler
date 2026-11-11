@@ -51,12 +51,14 @@ type v2Fixtures struct {
 			DecisionInterval int64 `json:"decision_interval"`
 			Allowance        int64 `json:"allowance"`
 			Interval         int64 `json:"interval"`
+			MinLead          int64 `json:"min_lead"`
 			Lead             int64 `json:"lead"`
 		} `json:"automatic"`
 		Resolve []struct {
-			Name  string                 `json:"name"`
-			Lead  map[string]interface{} `json:"lead"`
-			Valid bool                   `json:"valid"`
+			Name     string                 `json:"name"`
+			Settings string                 `json:"settings"`
+			Lead     map[string]interface{} `json:"lead"`
+			Valid    bool                   `json:"valid"`
 		} `json:"resolve"`
 		Windows []struct {
 			Origin     string   `json:"origin"`
@@ -102,6 +104,15 @@ type v2Fixtures struct {
 		SettingsSHA256 string `json:"settings_sha256"`
 		EvidenceKey    string `json:"evidence_key"`
 	} `json:"legacy_additive"`
+	TrustPolicy    string `json:"trust_policy"`
+	PreTrustPolicy struct {
+		SettingsSHA256 string `json:"settings_sha256"`
+		EvidenceKey    string `json:"evidence_key"`
+	} `json:"pre_trust_policy"`
+	TrustPolicyV1 struct {
+		SettingsSHA256 string `json:"settings_sha256"`
+		EvidenceKey    string `json:"evidence_key"`
+	} `json:"trust_policy_v1"`
 }
 
 func loadV2Fixtures(t *testing.T) *v2Fixtures {
@@ -199,6 +210,63 @@ func TestV2CalibrationMethodIsPartOfTheBoundIdentity(t *testing.T) {
 	}
 }
 
+// The trust-policy revision and its budgets are part of the fingerprint, the revision part of the evidence key: the
+// identity one revision back (the calibration change without this trust policy, frozen in the fixtures) is neither
+// sent nor accepted, so trust earned under the earlier rules can never be presented to this operator as current.
+func TestV2TrustPolicyIsPartOfTheBoundIdentity(t *testing.T) {
+	f := loadV2Fixtures(t)
+	if f.TrustPolicy != v2TrustPolicyRevision {
+		t.Fatalf("trust policy %q, contracts.py has %q", v2TrustPolicyRevision, f.TrustPolicy)
+	}
+	b := fixtureBinding(t, f)
+	pre := f.PreTrustPolicy
+	if !v2SHA256.MatchString(pre.SettingsSHA256) || !v2SHA256.MatchString(pre.EvidenceKey) {
+		t.Fatalf("the pre-policy identity is missing from the fixtures: %+v", pre)
+	}
+	if b.SettingsSHA == pre.SettingsSHA256 || b.EvidenceKey == pre.EvidenceKey {
+		t.Fatal("the operator still presents the identity of the earlier trust policy")
+	}
+	canon, _ := v2CanonicalJSON(b.Settings.canonical())
+	v1 := f.TrustPolicyV1
+	if !v2SHA256.MatchString(v1.SettingsSHA256) || !v2SHA256.MatchString(v1.EvidenceKey) {
+		t.Fatalf("the identity of trust policy v1 is missing from the fixtures: %+v", v1)
+	}
+	if b.SettingsSHA == v1.SettingsSHA256 || b.EvidenceKey == v1.EvidenceKey {
+		t.Fatal("the operator still presents the identity of trust policy budgeted-coverage-tests/v1")
+	}
+	for _, want := range []string{`"policy":"` + v2TrustPolicyRevision + `"`, `"rolling_alarm_ppm":`, `"consecutive_alarm_ppm":`,
+		`"day_alarm_ppm":`, `"seven_day_alarm_ppm":`, `"miss_dependence_bps":`, `"min_lead_seconds":`} {
+		if !strings.Contains(string(canon), want) {
+			t.Fatalf("the canonical settings lack %s: %s", want, canon)
+		}
+	}
+	other := b.Settings
+	other.Trust[len(other.Trust)-5]++ // another rolling budget: another fingerprint, the same evidence epoch
+	if other.fingerprint() == b.Settings.fingerprint() {
+		t.Fatal("a trust budget does not change the settings fingerprint")
+	}
+	if v2EvidenceKey(b.AutoscalerUID, b.TargetUID, b.QuerySHA, other, int64(b.Lead.Seconds)) != b.EvidenceKey {
+		t.Fatal("a trust threshold alone must keep the evidence epoch")
+	}
+	refused := 0
+	for _, c := range f.Responses.Invalid {
+		if c.Name != "pre-trust-policy-settings" && c.Name != "pre-trust-policy-epoch" {
+			continue
+		}
+		r, err := decodeV2Response(c.Wire)
+		if err != nil {
+			t.Fatalf("%s: must reach the binding check: %v", c.Name, err)
+		}
+		if err := r.bound(b); !errors.Is(err, errV2Refused) {
+			t.Errorf("%s: an answer of the earlier trust policy was not refused: %v", c.Name, err)
+		}
+		refused++
+	}
+	if refused != 2 {
+		t.Fatalf("the pre-policy answers are missing from the fixtures: %d", refused)
+	}
+}
+
 func TestV2SettingsFingerprintMatchesPython(t *testing.T) {
 	f := loadV2Fixtures(t)
 	if len(f.Settings) < 20 {
@@ -239,12 +307,15 @@ func TestV2EvidenceKeyMatchesPython(t *testing.T) {
 func TestV2LeadAndWindowMatchPython(t *testing.T) {
 	f := loadV2Fixtures(t)
 	for _, c := range f.Lead.Automatic {
-		if got := v2AutomaticLead(c.Startup, c.DecisionInterval, c.Allowance, c.Interval); got != c.Lead {
+		if got := v2AutomaticLead(c.Startup, c.DecisionInterval, c.Allowance, c.Interval, c.MinLead); got != c.Lead {
 			t.Errorf("automatic lead %+v: got %d", c, got)
 		}
+		if c.MinLead > 0 && c.Lead < c.MinLead {
+			t.Errorf("automatic lead %+v is below the configured minimum", c)
+		}
 	}
-	s := fixtureSettings(t, f, "statistical")
 	for _, c := range f.Lead.Resolve {
+		s := fixtureSettings(t, f, c.Settings)
 		if c.Name == "missing-key" {
 			continue // the Go type always carries every key (TestV2PublishedLeadCarriesEveryKey)
 		}

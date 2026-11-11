@@ -22,6 +22,7 @@ H, DAY = 3600, 86400
 START = 1_793_923_200 - 1_793_923_200 % DAY
 TS = c.TrustSettings()
 NOMINAL = 0.10
+LIMITS = T.coverage_limits(TS, L, 1000, 2)   # lead 600 s, two families: 19 misses in the last 64, or 7 in a row
 GRACE = 720                                # settlement 120 + grace 600
 
 
@@ -46,7 +47,7 @@ class Feed:
         cal = CalibrationRecord(seq, self.epoch, self.model, recipe or self.recipe, f"iss-{seq}", origin, origin + L, 4.0,
                                 upper, status, y if status == "scored" else None)
         r = T.EvidenceRecord(cal, mode, (origin + L) * 1000, (1.0, 2.0, 3.0) if status == "scored" else None)
-        self.ledger = T.note_outcome(self.ledger, r, lead_s=L, nominal_miscoverage=NOMINAL, recent_n=32)
+        self.ledger = T.note_outcome(self.ledger, r, lead_s=L, nominal_miscoverage=NOMINAL, limits=LIMITS)
         return r
 
     def window(self, origin, *, mode="prospective", bounded=True, **kw):
@@ -67,7 +68,7 @@ POLICY = "p" * 64
 
 
 def glob(now, **kw):
-    return T.Global(now_s=now, lead_seconds=L, nominal_miscoverage=NOMINAL, **{"replay_suite_passed": True,
+    return T.Global(now_s=now, lead_seconds=L, nominal_miscoverage=NOMINAL, **{"replay_suite_passed": True, "configuration_validated": True,
                                                                                "startup_budget_valid": True,
                                                                                "policy_sha256": POLICY, **kw})
 
@@ -254,29 +255,40 @@ def test_coverage_below_nominal_minus_tolerance_fails():
 
 
 def test_the_worst_day_must_also_meet_the_threshold():
-    f = Feed().run(24, covered=lambda t: mostly(t, 4))               # day 1: 75%
-    f.run(24 * 6, start=START + DAY, covered=True)                   # six perfect days: 7-day coverage ~96%
-    gates, info = T.candidate_gates(inputs(f), glob(START + 7 * DAY), TS)
+    f = Feed().run(24, covered=lambda t: mostly(t, 4))               # day 1: 75%, far beyond its count's limit
+    f.run(24 * 6 - 1, start=START + DAY, covered=True)               # then perfect days: 7-day coverage ~96%
+    gates, info = T.candidate_gates(inputs(f), glob(START + 7 * DAY - H), TS)
     assert info["coverage_gate"] > 0.95 and not gates["coverage"]
+    assert info["coverage"]["failing"] == ["day"] and info["coverage"]["failed_days"] == [START // DAY]
 
 
 def test_acute_misses_demote_a_trusted_candidate_at_once():
     f = good()
     v, h = verdict(f)
     assert v.selected == "seasonal_naive"
-    for i in range(5):                                               # five misses in a row
+    n = LIMITS.consecutive                                           # 6: the budget does not hold five at this lead
+    for i in range(n - 1):                                           # one short of the limit: still trusted
         f.window(NOW + i * L, covered=False)
-    v2, h2 = verdict(f, now=NOW + 5 * L, hyst=h)
+    assert verdict(f, now=NOW + (n - 1) * L, hyst=h)[0].selected == "seasonal_naive"
+    f.window(NOW + (n - 1) * L, covered=False)                       # the limit: misses in a row
+    v2, h2 = verdict(f, now=NOW + n * L, hyst=h)
     assert v2.selected is None and v2.candidates["seasonal_naive"].phase == "Degraded"
-    assert h2["seasonal_naive"]["demoted_at_s"] == NOW + 5 * L
+    assert h2["seasonal_naive"]["demoted_at_s"] == NOW + n * L
+    assert v2.candidates["seasonal_naive"].coverage_failing == ("consecutive", "alarm")
 
 
-def test_the_recent_32_bounds_must_hold_the_threshold():
+def test_the_recent_bounds_must_stay_below_the_rolling_limit():
     f = good()
-    for i in range(32):                                              # 32 recent bounds at 75%, no 5-miss streak
-        f.window(NOW + i * L, covered=i % 4 != 0)
-    gates, _ = T.candidate_gates(inputs(f), glob(NOW + 32 * L), TS)
-    assert not gates["coverage"] and f.ledger["consecutive_misses"] < 5
+    assert LIMITS.recent_n == 64 and LIMITS.rolling_misses == 19
+    for i in range(64):                                              # 64 recent bounds with 22 misses, never 2 in a row
+        f.window(NOW + i * L, covered=i % 3 != 0)
+    gates, info = T.candidate_gates(inputs(f), glob(NOW + 64 * L), TS)
+    assert not gates["coverage"] and f.ledger["consecutive_misses"] < 2
+    assert info["coverage"]["failing"] == ["rolling"] and info["coverage"]["rolling"] == [22, 64, 19]
+    g = good()
+    for i in range(64):                                              # 16 misses in 64 (75 % covered): within the limit
+        g.window(NOW + i * L, covered=i % 4 != 0)
+    assert T.candidate_gates(inputs(g), glob(NOW + 64 * L), TS)[0]["coverage"]
 
 
 # --- hour-granular windows (decision 1) -------------------------------------------------------------------------
@@ -494,13 +506,13 @@ def test_ledger_updates_are_exactly_once():
     f = Feed()
     r = f.window(START)
     before = f.ledger
-    assert T.note_outcome(before, r, lead_s=L, nominal_miscoverage=NOMINAL, recent_n=32) is before
+    assert T.note_outcome(before, r, lead_s=L, nominal_miscoverage=NOMINAL, limits=LIMITS) is before
     assert T.note_issuance(before, seq=1, issuance_id="iss-1", epoch=EPOCH, model="seasonal_naive", recipe="r",
                            origin=START, window_end=START + L, deadline_s=START + L + GRACE, lead_s=L,
                            mode="prospective", bounded=True) is before
     with pytest.raises(T.TrustError):
         T.note_outcome(T.new_ledger(EPOCH, "statistical", "r", L), dataclasses.replace(r, cal=dataclasses.replace(
-            r.cal, seq=9)), lead_s=L, nominal_miscoverage=NOMINAL, recent_n=32)
+            r.cal, seq=9)), lead_s=L, nominal_miscoverage=NOMINAL, limits=LIMITS)
 
 
 def test_evidence_records_come_from_the_journal_with_their_mode_and_step_errors():

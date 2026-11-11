@@ -51,11 +51,18 @@ const (
 // that disagree about the score's meaning can never exchange an accepted answer.
 const v2CalibrationPolicyRevision = "normalized-window-score/two-part-scale/v1"
 
+// v2TrustPolicyRevision is contracts.TRUST_POLICY_REVISION: what the forecaster's coverage rules mean. It is part of
+// the settings fingerprint (with the policy's four false-alarm budgets and the dependence of the model its thresholds
+// are computed under) and of the evidence key. The thresholds themselves are the forecaster's (forecasting/trust.py);
+// the operator never receives miss history.
+const v2TrustPolicyRevision = "budgeted-coverage-tests/v2"
+
 var (
 	v2AllowedIntervals = []int64{60, 120, 180, 240, 300, 360, 480, 600}
 	v2Phases           = []string{"Collecting", "Calibrating", "Shadow", "Trusted", "Degraded"}
 	v2Reasons          = []string{"HistoryInsufficient", "CalibrationInsufficient", "ShadowInsufficient", "CoverageLow",
-		"DataUnavailable", "IdentityMismatch", "StateUnavailable", "LeadInsufficient", "ReplayGateMissing", "Ready"}
+		"DataUnavailable", "IdentityMismatch", "StateUnavailable", "ConfigurationNotValidated", "LeadInsufficient",
+		"ReplayGateMissing", "Ready"}
 	v2ModelFamilies = []string{"seasonal_naive", "statistical", "lstm"}
 	v2SHA256        = regexp.MustCompile(`^[0-9a-f]{64}$`)
 	v2GridTime      = regexp.MustCompile(`^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z$`)
@@ -87,11 +94,13 @@ type v2Settings struct {
 	Seasonality           string
 	HistoryDays           int64
 	HorizonSeconds        int64
+	MinLeadSeconds        int64 // the lead is never shorter than this, rounded up to the grid (0: no minimum)
+	UpdateIntervalSeconds int64 // the reconcile period as applied (v2EffectiveUpdateInterval): part of the identity
 	SettlementSeconds     int64
 	OutcomeGraceSeconds   int64
 	MiscoverageBps        int64
 	Calibration           [9]int64 // v2CalibrationKeys; the last three are the method's scale-fit constants (not in the spec)
-	Trust                 [15]int64
+	Trust                 [20]int64
 	ExtraMaxReplicas      int64
 	ExtraMaxPercent       int64
 	Families              []string // sorted; seasonalNaive always present
@@ -102,10 +111,14 @@ var v2Families = []string{"seasonalNaive", "statistical"}
 
 var v2CalibrationKeys = [9]string{"min_windows", "max_scores", "retention_days", "eta_bps", "min_miscoverage_bps",
 	"max_miscoverage_bps", "scale_bins", "scale_floor_bps", "scale_min_season_bps"}
-var v2TrustKeys = [15]string{"min_shadow_hours", "min_prospective_windows", "coverage_tolerance_bps",
+
+// The last five are the trust policy's four false-alarm budgets and the dependence of the model its thresholds are
+// computed under: resolved, never read from the spec.
+var v2TrustKeys = [20]string{"min_shadow_hours", "min_prospective_windows", "coverage_tolerance_bps",
 	"worst_day_min_outcomes", "min_availability_bps", "acute_consecutive_misses", "acute_recent_windows",
 	"repromotion_hours", "repromotion_windows", "challenger_min_pairs", "challenger_min_hours",
-	"challenger_loss_ratio_bps", "challenger_exit_loss_ratio_bps", "challenger_cost_ratio_bps", "max_fit_age_hours"}
+	"challenger_loss_ratio_bps", "challenger_exit_loss_ratio_bps", "challenger_cost_ratio_bps", "max_fit_age_hours",
+	"rolling_alarm_ppm", "consecutive_alarm_ppm", "day_alarm_ppm", "seven_day_alarm_ppm", "miss_dependence_bps"}
 
 const (
 	v2CalMinWindows = iota
@@ -134,9 +147,11 @@ const (
 
 func v2Default() v2Settings {
 	return v2Settings{Engine: autoscalerv1alpha1.EngineStatistical, SampleIntervalSeconds: 300, Seasonality: "daily",
-		HistoryDays: 14, HorizonSeconds: 3600, SettlementSeconds: 120, OutcomeGraceSeconds: 600, MiscoverageBps: 1000,
-		Calibration:      [9]int64{128, 512, 7, 50, 100, 2500, 8, 500, 8000},
-		Trust:            [15]int64{48, 64, 500, 24, 9500, 5, 32, 24, 32, 64, 48, 9500, 10000, 10200, 12},
+		HistoryDays: 14, HorizonSeconds: 3600, UpdateIntervalSeconds: defaultReconcileSeconds,
+		SettlementSeconds: 120, OutcomeGraceSeconds: 600, MiscoverageBps: 1000,
+		Calibration: [9]int64{128, 512, 7, 50, 100, 2500, 8, 500, 8000},
+		Trust: [20]int64{48, 64, 500, 24, 9500, 5, 64, 24, 32, 64, 48, 9500, 10000, 10200, 12, 33000, 7000, 8000, 2000,
+			1750},
 		ExtraMaxReplicas: 2, ExtraMaxPercent: 50, Families: []string{"seasonalNaive", "statistical"}}
 }
 
@@ -144,6 +159,19 @@ type v2Bound struct {
 	key    string
 	value  *int32
 	lo, hi int64
+}
+
+// v2EffectiveUpdateInterval is contracts.effective_update_interval: spec.prediction.updateIntervalSeconds as the
+// reconciler applies it (absent or 0: defaultReconcileSeconds; never below minReconcileSeconds). It decides how often
+// a bound is issued, so it is part of the settings fingerprint and of the evidence key.
+func v2EffectiveUpdateInterval(configured int32) int64 {
+	switch {
+	case configured == 0:
+		return defaultReconcileSeconds
+	case configured < minReconcileSeconds:
+		return minReconcileSeconds
+	}
+	return int64(configured)
 }
 
 func v2Set(dst *int64, b v2Bound) error {
@@ -163,6 +191,7 @@ func v2Set(dst *int64, b v2Bound) error {
 func resolveV2Settings(spec autoscalerv1alpha1.PredictiveAutoscalerSpec) (v2Settings, error) {
 	p := spec.Prediction
 	s := v2Default()
+	s.UpdateIntervalSeconds = v2EffectiveUpdateInterval(p.UpdateIntervalSeconds)
 	if p.Enabled != nil && !*p.Enabled {
 		return s, fmt.Errorf("forecasting is disabled for this autoscaler (spec.prediction.enabled)")
 	}
@@ -210,6 +239,7 @@ func resolveV2Settings(spec autoscalerv1alpha1.PredictiveAutoscalerSpec) (v2Sett
 		b   v2Bound
 	}{
 		{&s.HistoryDays, v2Bound{"historyDays", p.HistoryDays, 1, v2MaxHistoryDays}},
+		{&s.MinLeadSeconds, v2Bound{"minLeadSeconds", p.MinLeadSeconds, 0, v2MaxHorizonSeconds}},
 		{&s.SettlementSeconds, v2Bound{"settlementSeconds", p.SettlementSeconds, 0, 900}},
 		{&s.OutcomeGraceSeconds, v2Bound{"outcomeGraceSeconds", p.OutcomeGraceSeconds, 0, 3600}},
 	} {
@@ -312,6 +342,11 @@ func (s v2Settings) feasible() error {
 		return fmt.Errorf("trust.challengerExitLossRatioBps must not be below challengerLossRatioBps")
 	case s.Trust[v2TrustMinShadowHours] > c[v2CalRetentionDays]*24:
 		return fmt.Errorf("trust.minShadowHours exceeds the retention")
+	case s.Trust[v2TrustMinProspectiveWindows] < s.Trust[v2TrustAcuteRecentWindows]:
+		// The forecaster's rolling threshold is computed for a full window.
+		return fmt.Errorf("trust.minProspectiveWindows must be at least acuteRecentWindows")
+	case v2MinimumLead(s) > s.HorizonSeconds:
+		return fmt.Errorf("minLeadSeconds, rounded up to the cadence, exceeds the horizon")
 	}
 	return nil
 }
@@ -334,13 +369,21 @@ func (s v2Settings) calibrationMap() map[string]interface{} {
 	return m
 }
 
+func (s v2Settings) trustMap() map[string]interface{} {
+	m := s.group(v2TrustKeys[:], s.Trust[:])
+	m["policy"] = v2TrustPolicyRevision
+	return m
+}
+
 // canonical is contracts.ForecastSettings.canonical(): {"schema": ..., "settings": asdict(settings)}.
 func (s v2Settings) canonical() map[string]interface{} {
 	return map[string]interface{}{"schema": v2SettingsSchema, "settings": map[string]interface{}{
 		"engine": s.Engine, "sample_interval_seconds": s.SampleIntervalSeconds, "seasonality": s.Seasonality,
-		"history_days": s.HistoryDays, "horizon_seconds": s.HorizonSeconds, "settlement_seconds": s.SettlementSeconds,
+		"history_days": s.HistoryDays, "horizon_seconds": s.HorizonSeconds, "min_lead_seconds": s.MinLeadSeconds,
+		"update_interval_seconds": s.UpdateIntervalSeconds,
+		"settlement_seconds":      s.SettlementSeconds,
 		"outcome_grace_seconds": s.OutcomeGraceSeconds, "risk": s.riskMap(), "calibration": s.calibrationMap(),
-		"trust":            s.group(v2TrustKeys[:], s.Trust[:]),
+		"trust":            s.trustMap(),
 		"predictive_extra": map[string]interface{}{"max_replicas": s.ExtraMaxReplicas, "max_percent": s.ExtraMaxPercent},
 		"families":         s.Families,
 	}}
@@ -378,17 +421,31 @@ func (s v2Settings) fingerprint() string { return v2Hash(s.canonical()) }
 func v2EvidenceKey(paUID, targetUID, querySHA string, s v2Settings, leadSeconds int64) string {
 	return v2Hash(map[string]interface{}{"schema": v2EvidenceSchema, "autoscaler_uid": paUID, "target_uid": targetUID,
 		"query_sha256": querySHA, "signal_contract": metricContract, "forecast_contract": forecastContractV2,
-		"interval_seconds": s.SampleIntervalSeconds, "lead_seconds": leadSeconds, "engine": s.Engine,
+		"interval_seconds": s.SampleIntervalSeconds, "lead_seconds": leadSeconds,
+		"min_lead_seconds": s.MinLeadSeconds, "update_interval_seconds": s.UpdateIntervalSeconds, "engine": s.Engine,
 		"seasonality": s.Seasonality, "history_days": s.HistoryDays, "settlement_seconds": s.SettlementSeconds,
-		"outcome_grace_seconds": s.OutcomeGraceSeconds, "risk": s.riskMap(), "calibration": s.calibrationMap()})
+		"outcome_grace_seconds": s.OutcomeGraceSeconds, "risk": s.riskMap(), "calibration": s.calibrationMap(),
+		"trust_policy": v2TrustPolicyRevision})
 }
 
 // --- lead and window ------------------------------------------------------------------------------------------
 
-// v2AutomaticLead is contracts.automatic_lead_seconds: L = ceil((D + C + A + Δ) / Δ) * Δ.
-func v2AutomaticLead(startup, decisionInterval, allowance, interval int64) int64 {
+// v2AutomaticLead is contracts.automatic_lead_seconds: L = max(ceil((D + C + A + Δ) / Δ), ceil(M / Δ)) * Δ, with M the
+// configured minimum lead (spec.prediction.minLeadSeconds). The startup budget D is an input only: a minimum lead
+// lengthens the forecast window and never changes the measured startup delay.
+func v2AutomaticLead(startup, decisionInterval, allowance, interval, minLead int64) int64 {
 	total := startup + decisionInterval + allowance + interval
-	return (total + interval - 1) / interval * interval
+	steps := (total + interval - 1) / interval
+	if m := (minLead + interval - 1) / interval; m > steps {
+		steps = m
+	}
+	return steps * interval
+}
+
+// v2MinimumLead is contracts.minimum_lead_seconds: the configured minimum lead rounded up to the grid.
+func v2MinimumLead(s v2Settings) int64 {
+	dt := s.SampleIntervalSeconds
+	return (s.MinLeadSeconds + dt - 1) / dt * dt
 }
 
 // v2LeadProblem mirrors contracts.resolve_lead for a lead the operator is about to publish: "" when the service will
@@ -412,6 +469,9 @@ func v2LeadProblem(l *autoscalerv1alpha1.PredictionLead, s v2Settings, generatio
 	}
 	if L < int64(l.StartupDelaySeconds)+dt+int64(l.ActuationAllowanceSeconds) {
 		return "the lead does not cover startup delay + decision interval + actuation allowance"
+	}
+	if L < v2MinimumLead(s) {
+		return "the lead is below the configured minimum lead (spec.prediction.minLeadSeconds)"
 	}
 	return ""
 }

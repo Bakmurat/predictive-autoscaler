@@ -106,15 +106,18 @@ func (r *PredictiveAutoscalerReconciler) prepareV2(ctx context.Context, a *autos
 			out.leadProblem = "no startup budget: set spec.behavior.startup.fallbackDelaySeconds until enough " +
 				fmt.Sprintf("starts are measured (%d completed starts of the current pod template)", startupMinSamples)
 		default:
-			lead := v2AutomaticLead(d, c, cfg.Allowance, s.SampleIntervalSeconds)
+			// The larger of what startup, decision interval and allowance need and the configured minimum lead, on the
+			// grid. The startup budget d is published as measured or configured: the minimum never alters it.
+			lead := v2AutomaticLead(d, c, cfg.Allowance, s.SampleIntervalSeconds, s.MinLeadSeconds)
 			if frozen > lead {
 				lead = frozen // never shorten automatically within one basis
 			}
 			if lead > s.HorizonSeconds {
 				// Never shortened to fit, whatever raised it (a pending start included): a forecast for a window that
 				// ends before the scale-out is usable must not become eligible. The decision stays reactive.
-				out.leadProblem = fmt.Sprintf("the lead %d s (startup %d s + decision interval %d s + allowance %d s, on "+
-					"the %d s grid) exceeds the %d s horizon", lead, d, c, cfg.Allowance, s.SampleIntervalSeconds, s.HorizonSeconds)
+				out.leadProblem = fmt.Sprintf("the lead %d s (startup %d s + decision interval %d s + allowance %d s, "+
+					"minimum lead %d s, on the %d s grid) exceeds the %d s horizon", lead, d, c, cfg.Allowance,
+					s.MinLeadSeconds, s.SampleIntervalSeconds, s.HorizonSeconds)
 				if obs.Pending != nil && *obs.Pending >= d {
 					out.leadProblem += fmt.Sprintf(": a pod of the current ReplicaSet has not become Ready for %d s", *obs.Pending)
 					if obs.PendingEvidence == pendingUncertain {
