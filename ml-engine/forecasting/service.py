@@ -61,7 +61,9 @@ continues exactly where it was.
 A request works under the registration it was admitted to (forecasting.metrics.Reservation). If that registration is
 replaced or released while the request is still reading history, the request is refused (503, retryable) before it
 issues, and whatever it would publish is dropped: old work never overwrites a replacement, never brings a released
-registration back and never refills its caches. A full registry is checked in name order from where the last check
+registration back and never refills its caches. The same holds before admission: a request bound with a UID
+other than the registered one may carry the stale lookup, so the live object is read again and the registration is
+replaced only for the live UID, and only the registration that was seen (compare and swap). A full registry is checked in name order from where the last check
 stopped, so slow lookups cannot keep the check from ever reaching a later registration.
 """
 
@@ -87,7 +89,7 @@ from forecasting.contracts import FAMILY_MODELS, FORECAST_CONTRACT, UNIT, BoundR
     bind_request, canonical_json, check_response, sha256_hex
 from forecasting.history import HistoryRefused, HistoryUnavailable, read_rps_history
 from forecasting.maturation import candidate, issued_outcome
-from forecasting.metrics import ForecastMetrics, RegistryFull, ServiceMetrics, Snapshot, model_samples
+from forecasting.metrics import ForecastMetrics, RegistryFull, ServiceMetrics, Snapshot, UidConflict, model_samples
 from forecasting.qualification_metrics import QualificationMetrics
 from forecasting.statistical import RECIPE_E1, RECIPE_NAIVE, KernelSettings, KernelUnavailable, Series, fit_e1, \
     forecast_e1, seasonal_naive
@@ -564,12 +566,12 @@ class ForecastService:
                 if (s_ns, s_name) != (ns, name) and now_ms - seen >= idle_ms:
                     self._release(s_ns, s_name, "idle", uid=s_uid, seen_ms=seen)
         try:
-            held = self.metrics.reserve(ns, name, uid, now_ms)
+            held = self._reserve(ns, name, uid, now_ms)
         except RegistryFull:
             try:
                 if not self._sweep_slots(now_ms):
                     raise
-                held = self.metrics.reserve(ns, name, uid, now_ms)
+                held = self._reserve(ns, name, uid, now_ms)
             except RegistryFull as e:
                 self.metrics.count_refusal()
                 raise ServiceError(503, "AutoscalerLimitReached", f"the service's registration limit is reached: {e}; "
@@ -579,6 +581,32 @@ class ForecastService:
             logger.info("autoscaler %s/%s was replaced (UID %s, now %s): registered as a new identity", ns, name,
                         held.replaced, uid)
         return held.token
+
+    def _reserve(self, ns: str, name: str, uid: str, now_ms: int):
+        """Reserve the name for this request's UID. When it is registered to ANOTHER UID, the identity this request was
+        bound with may be the stale one: its lookup can be older than the registration (the object was replaced and
+        the new one registered while this request waited). So the live object is read again, and the registration is
+        replaced only if the live UID still is this request's, and only the registration that was seen (compare and
+        swap). A request whose UID is no longer the live object's is refused and changes nothing."""
+        replacing = None
+        for _ in range(3):
+            try:
+                return self.metrics.reserve(ns, name, uid, now_ms, replacing=replacing)
+            except UidConflict as e:
+                try:
+                    pa = self.reader.get(f"/apis/{API_GROUP}/{API_VERSION}/namespaces/{ns}/predictiveautoscalers/"
+                                         f"{name}")
+                except LookupFailed as lf:
+                    raise ServiceError(503, "IdentityMismatch", "the autoscaler could not be read again to decide "
+                                       f"which object holds its registration: {lf}") from lf
+                meta = pa.get("metadata") if isinstance(pa, dict) else None
+                live = meta.get("uid") if isinstance(meta, dict) else None
+                if live != uid:
+                    raise ServiceError(422, "IdentityMismatch", "the autoscaler was replaced while this request was "
+                                       "in flight (its UID is no longer the live object's); nothing is changed") from e
+                replacing = e.held
+        raise ServiceError(503, "IdentityMismatch", "the autoscaler's registration changed repeatedly while this "
+                           "request was admitted; retry")
 
     def _sweep_slots(self, now_ms: int) -> bool:
         """The registry is full: look up the registered autoscalers and release those the API says are gone (a

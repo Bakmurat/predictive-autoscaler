@@ -401,6 +401,53 @@ def test_an_old_request_never_overwrites_the_registration_that_replaced_it(tmp_p
     svc.close()
 
 
+def test_a_stale_identity_lookup_never_replaces_the_newer_registration(tmp_path):
+    # The old request's identity lookup succeeds (old UID); before it is admitted, the object is replaced and the new
+    # one registers. The old request then meets a registration with another UID: it must not win it back on the
+    # strength of a lookup that is older than the registration. The live object is read again and decides.
+    cluster = Cluster({"web-pa": "old-uid"})
+    svc, clock = make(tmp_path, reader=cluster, max_autoscalers=1)
+    ask(svc, clock, T0, "web-pa", "old-uid")
+    entered, go, result, real = threading.Event(), threading.Event(), {}, svc._admit
+
+    def held_admit(bound, now_ms):
+        if threading.current_thread().name == "held-request":
+            entered.set()                                       # bound with the old UID, not admitted yet
+            assert go.wait(10)
+        return real(bound, now_ms)
+
+    svc._admit = held_admit
+
+    def held():
+        try:
+            result["answer"] = ask(svc, clock, T0 + DT, "web-pa", "old-uid")
+        except ServiceError as e:
+            result["error"] = e
+
+    thread = threading.Thread(target=held, name="held-request")
+    thread.start()
+    assert entered.wait(10)
+    cluster.live["web-pa"] = "new-uid"
+    ask(svc, clock, T0 + DT, "web-pa", "new-uid")
+    before = svc.metrics.slots()
+    assert [s[2] for s in before] == ["new-uid"] and svc.metrics.released["replaced"] == 1
+    go.set()
+    thread.join(10)
+    assert not thread.is_alive() and "answer" not in result
+    assert (result["error"].status, result["error"].reason) == (422, "IdentityMismatch")
+    assert svc.metrics.slots() == before and svc.metrics.released["replaced"] == 1     # untouched, its clock too
+    # While the live object cannot be read, neither side is believed: the registration stays as it is.
+    cluster.fail["web-pa"] = LookupFailed("deadline exceeded")
+    svc._admit = real
+    with pytest.raises(ServiceError) as e:
+        svc._reserve("shop", "web-pa", "old-uid", clock.now_ms())
+    assert (e.value.status, e.value.reason) == (503, "IdentityMismatch") and svc.metrics.slots() == before
+    del cluster.fail["web-pa"]
+    ask(svc, clock, T0 + 2 * DT, "web-pa", "new-uid")
+    assert [s[2] for s in svc.metrics.slots()] == ["new-uid"]
+    svc.close()
+
+
 def test_an_old_request_never_brings_a_released_registration_back(tmp_path):
     cluster = Cluster({"pa-0": "uid-0"})
     svc, clock, join = in_flight(tmp_path, cluster, "pa-0", "uid-0")

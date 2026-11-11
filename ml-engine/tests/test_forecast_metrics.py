@@ -179,7 +179,12 @@ def test_a_registration_names_its_uid_and_a_new_uid_starts_empty():
     assert samples(registry(m), "web")
     assert m.reserve("shop", "web", "uid-1", 2000) == first            # the same object: its series and token stay
     assert samples(registry(m), "web") and m.slots() == [("shop", "web", "uid-1", 2000)]
-    second = m.reserve("shop", "web", "uid-2", 3000)                   # replaced: the slot is the new object's ...
+    with pytest.raises(M.UidConflict) as conflict:                     # another UID: the registry does not decide
+        m.reserve("shop", "web", "uid-2", 3000)
+    assert conflict.value.held == "uid-1" and m.slots() == [("shop", "web", "uid-1", 2000)]   # nothing was touched
+    with pytest.raises(M.UidConflict):
+        m.reserve("shop", "web", "uid-2", 3000, replacing="uid-0")     # not the registration that is held
+    second = m.reserve("shop", "web", "uid-2", 3000, replacing="uid-1")   # replaced: the slot is the new object's ...
     assert second.replaced == "uid-1" and second.token != first.token
     assert m.update("shop", "web", snapshot(uid="uid-1"), first.token) is False     # old work is shut out
     assert samples(registry(m), "web") == [] and m.slots() == [("shop", "web", "uid-2", 3000)]   # ... and empty

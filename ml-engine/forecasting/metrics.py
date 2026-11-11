@@ -145,6 +145,15 @@ class Snapshot:
         return sum(len(v) for v in self.models.values())
 
 
+class UidConflict(Exception):
+    """The name is registered to another UID. Which of the two objects is live is not the registry's to decide: the
+    caller confirms it and then names the UID it replaces (reserve(replacing=...))."""
+
+    def __init__(self, held: str):
+        super().__init__(f"registered to UID {held}")
+        self.held = held
+
+
 class Reservation(NamedTuple):
     token: int                    # the registration this request was admitted under
     replaced: Optional[str]       # the UID whose registration this request's UID replaced, if any
@@ -194,10 +203,12 @@ class ForecastMetrics(Collector):
         self._issued_tokens += 1
         return self._issued_tokens
 
-    def reserve(self, namespace: str, autoscaler: str, uid: str = "", now_ms: int = 0) -> Reservation:
+    def reserve(self, namespace: str, autoscaler: str, uid: str = "", now_ms: int = 0,
+                replacing: Optional[str] = None) -> Reservation:
         """Admit an autoscaler before any work is done for it (atomic; an empty snapshot until its first update) and
-        note the request's time. A registration held by another UID is replaced by an empty one for `uid` (the same
-        slot, a new identity with a new token: none of the old object's series survive) and that old UID is returned
+        note the request's time. A registration held by another UID raises UidConflict and nothing changes, unless
+        `replacing` names exactly that UID (compare and swap): then it is replaced by an empty one for `uid` (the same
+        slot, a new identity with a new token: none of the old object's series survive) and the old UID is returned
         with the token. Raises RegistryFull when the limit is reached and it is not registered yet."""
         key = (namespace, autoscaler)
         with self._lock:
@@ -207,6 +218,8 @@ class ForecastMetrics(Collector):
                     raise RegistryFull(f"{self.max_autoscalers} autoscalers are already registered")
                 self._snaps[key] = Snapshot(uid, {})
                 self._tokens[key] = self._new_token()
+            elif uid and have.uid and have.uid != uid and replacing != have.uid:
+                raise UidConflict(have.uid)                       # before anything is touched, the last request too
             self._seen[key] = max(now_ms, self._seen.get(key, 0))
             if have is None or not uid or have.uid == uid:
                 return Reservation(self._tokens[key], None)
