@@ -50,7 +50,9 @@ jobs:
   python:
     name: forecaster + evaluation tooling (pytest, scorer, archive)
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    # The suite takes 30 to 40 minutes on a hosted runner and grows with every fix; at 40 the job was cancelled on a
+    # slow runner with every test passing so far. The limit only bounds a hung job: no test is skipped to fit it.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
         with:
