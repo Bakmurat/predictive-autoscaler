@@ -30,7 +30,9 @@ The demonstration stage (LIVE-DEMO-PLAN sections 5-6; its own params stage, neve
                                                                origin and the FINITE schedule's table, one row of
                                                                per-minute arrivals and one seed per day (JSON)
                          (--smoke-segment-minutes N, here and with render --part generator: the kind smoke's short
-                         segment; the configuration is then labelled smoke, never a demonstration)
+                         segment; the configuration is then labelled smoke, never a demonstration.
+                         --smoke-origin-utc YYYY-MM-DDTHH:MM:00Z, only with it: an origin on any whole minute, so
+                         a smoke can sit at a chosen time of the schedule's day, for example its daily peak)
   python -m c28 demo-sizing --params P                         the generator's limits against the peak rate and the
                                                                timeout, with the arithmetic (JSON)
   python -m c28 demo-reduce --config FILE --log FILE [--log FILE ...] --ingress FILE --start S --end E [--out FILE]
@@ -71,6 +73,17 @@ def _load(path: str):
 
 def _utc(text: str) -> datetime:
     return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+def _smoke_origin(args):
+    """--smoke-origin-utc in epoch milliseconds (None when absent); demo.generator_config refuses it without a smoke
+    segment and off a whole minute."""
+    if getattr(args, "smoke_origin_utc", None) is None:
+        return None
+    try:
+        return int(_utc(args.smoke_origin_utc).timestamp()) * 1000
+    except ValueError:
+        raise render.ParamsError("--smoke-origin-utc must be YYYY-MM-DDTHH:MM:SSZ")
 
 
 class BindingError(ValueError):
@@ -196,6 +209,9 @@ def main(argv=None) -> int:
     for sp in (r, dp):
         sp.add_argument("--smoke-segment-minutes", type=int, default=None,
                         help="kind smoke only: a short generator segment; the configuration is labelled smoke")
+        sp.add_argument("--smoke-origin-utc", default=None,
+                        help="kind smoke only, with --smoke-segment-minutes: the schedule origin on any whole "
+                             "minute (YYYY-MM-DDTHH:MM:00Z) instead of the params' UTC midnight")
     ds = sub.add_parser("demo-sizing"); ds.add_argument("--params", required=True)
     dr = sub.add_parser("demo-reduce"); dr.add_argument("--config", required=True)
     dr.add_argument("--log", action="append", required=True, help="a pod log file, repeatable")
@@ -238,9 +254,11 @@ def main(argv=None) -> int:
     elif args.cmd in ("render", "release-values", "residency") and args.stage == demo.STAGE:
         params = _load(args.params)
         if args.cmd == "render":
-            if args.smoke_segment_minutes is not None and args.part != "generator":
-                raise render.ParamsError("--smoke-segment-minutes renders only --part generator")
-            objs = demo.render(params, args.smoke_segment_minutes)[args.part] if args.part else demo.render_all(params)
+            if (args.smoke_segment_minutes is not None or args.smoke_origin_utc is not None) and \
+                    args.part != "generator":
+                raise render.ParamsError("--smoke-segment-minutes and --smoke-origin-utc render only --part generator")
+            objs = demo.render(params, args.smoke_segment_minutes, _smoke_origin(args))[args.part] if args.part \
+                else demo.render_all(params)
             _write(yaml.safe_dump_all(objs, sort_keys=True), args.out)
         elif args.cmd == "release-values":
             _write(yaml.safe_dump(demo.release_values(params), sort_keys=True), args.out)
@@ -249,7 +267,8 @@ def main(argv=None) -> int:
             _write(_json(out), args.out)
             return 1 if out["problems"] else 0
     elif args.cmd == "demo-plan":
-        _write(_json(demo.generator_config(_load(args.params), args.smoke_segment_minutes)), args.out)
+        _write(_json(demo.generator_config(_load(args.params), args.smoke_segment_minutes, _smoke_origin(args))),
+               args.out)
     elif args.cmd == "demo-sizing":
         params = _load(args.params)
         demo.validate(params)
@@ -270,7 +289,7 @@ def main(argv=None) -> int:
         out["log"] = stats
         _write(_json(out), args.out)
     elif args.cmd == "render":
-        if args.part or args.smoke_segment_minutes is not None:
+        if args.part or args.smoke_segment_minutes is not None or args.smoke_origin_utc is not None:
             raise render.ParamsError("--part and --smoke-segment-minutes belong to --stage demonstration")
         _write(yaml.safe_dump_all(render.render_all(_load(args.params)), sort_keys=True), args.out)
     elif args.cmd == "release-values":
