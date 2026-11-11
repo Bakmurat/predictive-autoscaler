@@ -601,6 +601,14 @@ class ForecastStore:
                 "ORDER BY i.window_end, i.seq", (evidence_key, window_end_at_most, model)).fetchall()
             return [i for i in map(self._row_to_issuance, rows) if model in i.models]
 
+    def latest_issuance(self, evidence_key: str) -> Optional[Issuance]:
+        """The epoch's committed issuance with the newest decision origin: its newest forecast, whichever request
+        committed it and in whatever order requests finish."""
+        with self._lock, self._guard("read issuance"):
+            row = self._db.execute(f"SELECT {self._ISSUANCE_COLS} FROM issuances WHERE evidence_key = ? "
+                                   "ORDER BY decision_origin DESC, seq DESC LIMIT 1", (evidence_key,)).fetchone()
+        return None if row is None else self._row_to_issuance(row)
+
     def issuances_after(self, evidence_key: str, after_seq: int) -> List[Issuance]:
         """An epoch's issuances committed after `after_seq`, in commit order (for exactly-once folding)."""
         with self._lock, self._guard("read issuances"):

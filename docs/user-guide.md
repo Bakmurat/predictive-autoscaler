@@ -494,10 +494,12 @@ and at most one more fixed label:
   `predictive_autoscaler_forecast_calibration_windows`, `predictive_autoscaler_forecast_history_seconds`,
   `predictive_autoscaler_forecast_evidence_age_seconds` and `predictive_autoscaler_forecast_fit_failures_total`.
 - **Trust:** `predictive_autoscaler_forecast_trusted` (1 when that model's evidence gates pass) and
-  `predictive_autoscaler_forecast_trust_reason{reason}` (one series with value 1: the gate's reason for the model in
-  its latest committed forecast, for example `CalibrationInsufficient` or `Ready`).
-- **The latest committed forecast**, shown for every model in it, trusted or not, so a forecast can be watched before
-  it may act: `predictive_autoscaler_forecast_base_window_rps` (the point maximum over the window) and
+  `predictive_autoscaler_forecast_trust_reason{reason}` (one series with value 1: the gate's reason for the model
+  when its latest committed forecast was issued, for example `CalibrationInsufficient` or `Ready`). It is the reason
+  at issuance, not a statement that the forecast may act now: for that, read the operator's `PredictionReady`
+  condition and `predictive_autoscaler_prediction_used_family`.
+- **The latest committed forecast** (the newest one in the journal, whichever request finished last), shown for
+  every model in it, trusted or not, so a forecast can be watched before it may act: `predictive_autoscaler_forecast_base_window_rps` (the point maximum over the window) and
   `predictive_autoscaler_forecast_upper_window_rps` (the upper bound; no series while the model has none, a bound is
   never made up), with `predictive_autoscaler_forecast_latest_issued_timestamp_seconds`,
   `predictive_autoscaler_forecast_latest_window_start_timestamp_seconds` and

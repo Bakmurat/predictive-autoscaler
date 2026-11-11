@@ -75,8 +75,9 @@ METRICS: Dict[str, Tuple[str, Optional[str], str]] = {
     "prediction_issued_windows": ("gauge", None, "Its numerator: decision origins of the last day with an issuance."),
     "prediction_expected_windows": ("gauge", None, "Its denominator: decision origins of the last day since the first "
                                                    "issuance (0: nothing was expected yet, the ratio is unknown)."),
-    "trust_reason": ("gauge", "reason", "The trust gate's reason for the candidate in its latest committed forecast: "
-                                        "one series with value 1; absent when the candidate was not evaluated."),
+    "trust_reason": ("gauge", "reason", "The trust gate's reason for the candidate when its latest committed forecast "
+                                        "was issued (history, not whether it may act now): one series with value 1; "
+                                        "absent when the candidate was not evaluated."),
     "upper_window_rps": ("gauge", None, "The latest committed upper bound, trusted or not; absent when none was issued."),
     "base_window_rps": ("gauge", None, "The latest committed point maximum over the window, trusted or not."),
     "latest_issued_timestamp_seconds": ("gauge", None, "When the latest committed forecast was issued (Unix seconds)."),

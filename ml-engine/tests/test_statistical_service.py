@@ -8,6 +8,7 @@ import math
 import os
 import shutil
 import sys
+import threading
 import urllib.parse
 
 import pytest
@@ -221,6 +222,81 @@ def test_the_committed_forecast_is_exported_while_untrusted(tmp_path):
     assert e[("latest_window_start_timestamp_seconds", None)] == last.window_start > first.window_start
     assert [k for k in e if k[0] == "trust_reason"] == [("trust_reason", last.reason)]      # one reason, the current one
     assert not exported(svc, "statistical").keys() & {("base_window_rps", None), ("trust_reason", last.reason)}
+    svc.close()
+
+
+def held_request(svc, clock, origin, settings=None):
+    """Start a request for `origin` on another thread and hold it while it loads its history; returns (release,
+    errors). Calling release() lets it finish and waits for it."""
+    entered, go, errors = threading.Event(), threading.Event(), []
+    name = f"held-{origin}"
+
+    def hook():
+        if threading.current_thread().name == name:
+            entered.set()
+            if not go.wait(15):
+                raise RuntimeError("the held request was never released")
+    svc._test_backend.on_fetch = hook
+
+    def work():
+        try:
+            clock.set(max(clock.now_ms(), origin * 1000 + 10_000))
+            svc.predict(body(origin, settings))
+        except Exception as e:                                        # noqa: BLE001 - reported to the test
+            errors.append(f"{type(e).__name__}: {e}")
+    t = threading.Thread(target=work, name=name)
+    t.start()
+    assert entered.wait(5), "the held request never reached its history load"
+
+    def release():
+        go.set()
+        t.join(15)
+        assert not t.is_alive()
+    return release, errors
+
+
+def test_a_late_retry_of_an_older_window_never_replaces_the_newest_forecast(tmp_path):
+    backend = Backend()
+    svc, clock = make(tmp_path, backend=backend)
+    svc._test_backend = backend
+    first = c.response_from_wire(ask(svc, clock, T0))
+    release, errors = held_request(svc, clock, T0)                    # a retry of 00:00, held in its history load
+    newer = c.response_from_wire(ask(svc, clock, T0 + DT))            # 00:05 is issued and published meanwhile
+    assert exported(svc)[("latest_window_start_timestamp_seconds", None)] == newer.window_start
+    release()                                                         # the old retry finishes last
+    assert errors == []
+    e = exported(svc)
+    assert e[("latest_window_start_timestamp_seconds", None)] == newer.window_start > first.window_start
+    assert e[("latest_window_end_timestamp_seconds", None)] == newer.window_end
+    assert e[("latest_issued_timestamp_seconds", None)] == newer.issued_at_ms / 1000
+    assert e[("base_window_rps", None)] == newer.base_window_max_rps  # bounds, times and reason from ONE issuance
+    assert [k for k in e if k[0] == "trust_reason"] == [("trust_reason", newer.reason)]
+    svc.close()
+
+
+def test_stale_work_of_an_older_epoch_never_restores_its_snapshot(tmp_path):
+    backend = Backend()
+    reader = Reader(pa_object(prediction=dict(PREDICTION, updateIntervalSeconds=300)))
+    svc, clock = make(tmp_path, reader=reader, backend=backend)
+    svc._test_backend = backend
+    old = c.resolve_settings(reader.pa).fingerprint()
+    release, errors = held_request(svc, clock, T0, old)               # bound to the old settings, held
+    reader.pa = pa_object(prediction=dict(PREDICTION, updateIntervalSeconds=600))
+    new = c.resolve_settings(reader.pa).fingerprint()
+    current = c.response_from_wire(svc.predict(body(T0, new)))        # the new epoch issues and publishes
+    assert exported(svc)[("latest_issued_timestamp_seconds", None)] == current.issued_at_ms / 1000
+    clock.advance(1_000)
+    release()                                                         # the old epoch's request finishes last,
+    assert errors == []                                               # in time: it issues in ITS epoch and is answered
+    epochs = {i.payload()["evidence_key"] for i in svc.store.issuances()}
+    assert len(epochs) == 2 and current.calibration_epoch in epochs
+    e = exported(svc)                                                 # but the published snapshot stays the current one
+    assert e[("latest_issued_timestamp_seconds", None)] == current.issued_at_ms / 1000
+    clock.set((T0 + DT) * 1000 + 10_000)
+    again = c.response_from_wire(svc.predict(body(T0 + DT, new)))     # and the current epoch keeps publishing
+    assert again.calibration_epoch == current.calibration_epoch
+    assert exported(svc)[("latest_window_start_timestamp_seconds", None)] == again.window_start
+    svc.close()
 
 
 # --- restarts: keep verified state, or start over -----------------------------------------------------------------

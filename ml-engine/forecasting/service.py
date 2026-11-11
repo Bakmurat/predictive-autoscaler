@@ -85,6 +85,7 @@ stopped, so slow lookups cannot keep the check from ever reaching a later regist
 
 from __future__ import annotations
 
+import itertools
 import logging
 import os
 import threading
@@ -199,6 +200,8 @@ class ForecastService:
             self.worker = FitWorker(self.artifacts)
         self.metrics = ForecastMetrics(max_autoscalers=config.max_autoscalers)
         self.qualification_metrics = QualificationMetrics(self.qualification_status, D.REFUSALS)
+        self._arrivals = itertools.count(1)                     # the order in which requests read the live object
+        self._published: Dict[tuple, tuple] = {}                # (namespace, autoscaler) -> (token, epoch, arrival)
         self.service_metrics = ServiceMetrics(self.metrics, self.journal_status)
         self._lock = threading.Lock()                   # one writer of the journal and the epoch states
         self._compacted_s: Optional[int] = None
@@ -392,6 +395,7 @@ class ForecastService:
         except LookupFailed as e:
             raise ServiceError(503, "IdentityMismatch", f"the autoscaler could not be read: {e}") from e
         sig = bound.signal
+        arrival = next(self._arrivals)                         # right after the live object was read
         token = self._admit(bound, now_ms)                     # atomic, before any expensive work
         if not self.store_healthy:
             self._note_failure(now_ms)
@@ -419,7 +423,7 @@ class ForecastService:
             try:
                 if not self.store_healthy:                              # it failed, or is not recovered, meanwhile
                     raise StoreUnavailable("the journal is unavailable")
-                return self._issue(bound, grid, self.clock.now_ms(), token)   # the time after the history and the lock
+                return self._issue(bound, grid, self.clock.now_ms(), token, arrival)   # the time after the history and the lock
             except StoreUnavailable as e:
                 self._note_failure(self.clock.now_ms())
                 raise ServiceError(503, "StateUnavailable", f"the forecast journal failed: {e}") from e
@@ -434,7 +438,7 @@ class ForecastService:
                 raise ServiceError(422, "IdentityMismatch", f"the issuance committed for this decision origin does "
                                                             f"not fit the request: {e}") from e
 
-    def _issue(self, bound: BoundRequest, grid, now_ms: int, token: Optional[int] = None) -> Dict:
+    def _issue(self, bound: BoundRequest, grid, now_ms: int, token: Optional[int] = None, arrival: int = 0) -> Dict:
         store, s, sig, lead = self.store, bound.settings, bound.signal, bound.lead
         ek, t, dt = bound.evidence_key, bound.decision_origin, s.sample_interval_seconds
         window = bound.window
@@ -469,9 +473,8 @@ class ForecastService:
         if self._compacted_s is None or now_s - self._compacted_s >= self.config.compact_every_seconds:
             store.compact(now_s)          # only checkpoint-covered, fully matured windows leave the journal
             self._compacted_s = now_s
-        payload = iss.payload()
-        self._export(bound, state, grid, now_s, token, payload)
-        return self._response(bound, payload)
+        self._export(bound, state, grid, now_s, token, arrival)
+        return self._response(bound, iss.payload())
 
     @staticmethod
     def _refuse_late(bound: BoundRequest, now_ms: int) -> None:
@@ -708,10 +711,25 @@ class ForecastService:
         return r.to_wire()
 
     def _export(self, bound: BoundRequest, state: Dict, grid, now_s: int, token: Optional[int] = None,
-                issued: Optional[Dict] = None) -> None:
-        """Publish the autoscaler's samples. `issued` is the committed forecast this request answers with: each of
-        its candidates is shown as issued, trusted or not (a shadow candidate is visible before it may act), with the
-        window it is about and the trust gate's reason for it. A candidate without an upper bound has none here."""
+                arrival: int = 0) -> None:
+        """Publish the autoscaler's samples (under the service lock). The forecast shown is the epoch's NEWEST
+        committed issuance, read from the journal, not the one this request is answered with: a retry of an older
+        window that finishes late republishes the newest forecast, never its own. Each candidate of that issuance is
+        shown as issued, trusted or not (a shadow candidate is visible before it may act), with the window it is
+        about and the trust gate's reason for it at issuance (history: whether it may act NOW is the operator's
+        acceptance signal). A candidate without an upper bound has none here.
+
+        A request of another epoch (the autoscaler's settings or target changed) takes the publication over only if
+        it read the live object after the request that published the current epoch: stale work never restores an
+        older epoch's snapshot."""
+        key = (bound.signal.namespace, bound.autoscaler_name)
+        held = self._published.get(key)
+        if held is not None and held[0] == token and held[1] != bound.evidence_key and arrival <= held[2]:
+            return
+        if held is None or held[0] != token or held[1] != bound.evidence_key:
+            self._published[key] = (token, bound.evidence_key, arrival)
+        newest = self.store.latest_issuance(bound.evidence_key)
+        issued = None if newest is None else newest.payload()
         trusted = {m: h.get("trusted", False) for m, h in state["trust"].items() if m in RECIPES}
         latest, reasons = {}, {}
         for model, c in ((issued or {}).get("candidates") or {}).items():
@@ -843,6 +861,7 @@ class ForecastService:
         with self._lock:
             self._uppers.pop((namespace, autoscaler), None)
             self._costs.pop((namespace, autoscaler), None)
+            self._published.pop((namespace, autoscaler), None)
 
     # --- families, the release gate and same-policy costs -------------------------------------------------------------
 
