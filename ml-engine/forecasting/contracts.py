@@ -13,7 +13,16 @@ query, a model, a looser risk or a wider horizon. Unknown request fields are ref
 Settings come from spec.prediction. The v2 keys are proposals until the CRD carries them (design C2, section 4); absent
 keys take the defaults below, unknown keys are refused, and the fingerprint covers every resolved value. Ratios are
 integer basis points so the fingerprint is exact. The lead L comes from status.prediction.lead (written by the operator,
-bound to the observed generation); without a valid one no window can be issued (reason LeadInsufficient).
+bound to the observed generation); without a valid one no window can be issued (reason LeadInsufficient). The operator
+chooses L as the larger of what startup, decision and actuation need and spec.prediction.minLeadSeconds, on the grid
+(automatic_lead_seconds); a lead below the configured minimum is refused here, and a minimum beyond the horizon is
+refused with the settings. The forecast covers the window from the next grid step to L: a longer lead extends that
+window, it does not promise scaling exactly L before a rise. The measured startup delay is never altered by it.
+
+Predictive eligibility needs a VALIDATED configuration: VALIDATED_PROFILES lists the configurations (grid, lead, risk,
+family set, with the default calibration, trust and outcome-timing settings) for which the trust policy's operating
+characteristics were qualified (evaluation/trust_qualification.py). Any other configuration is served and shadowed as
+always and is never eligible (reason ConfigurationNotValidated). The list grows only with evidence.
 
 Refusals are ContractRefused (HTTP 422); identity refusals and lookup failures keep api.identity's ProvenanceRefused
 (422) and LookupFailed (503). No model code is imported here.
@@ -44,8 +53,11 @@ CALIBRATION_POLICY_REVISION = "normalized-window-score/two-part-scale/v1"
 # The trust-policy revision (forecasting.trust): what the coverage rules mean. Part of the settings fingerprint (the
 # trust settings' field `policy`) and of the evidence key, so trust earned under other rules is never carried into
 # these. Revision 1 (implicit, never named) was "the last 32 gate windows at least 85 % covered" with an unadjusted
-# worst-day rule on partial days. A stable name: other modules pin and compare it.
-TRUST_POLICY_REVISION = "budgeted-coverage-tests/v1"
+# worst-day rule on partial days. budgeted-coverage-tests/v1 derived three budgeted rules for independent misses and
+# kept the seven-day gate as an unbudgeted ratio. v2 derives all four rules under a stated transition model (a
+# two-state Markov chain with P(miss | previous miss) = miss_dependence_bps) and budgets the seven-day gate as a
+# count-dependent tail test. A stable name: other modules pin and compare it.
+TRUST_POLICY_REVISION = "budgeted-coverage-tests/v2"
 UNIT = "requests/second"
 
 # Minute multiples in 60..600 that divide a UTC day, so a one-day lag lands on the same epoch grid. 7- and 9-minute
@@ -59,7 +71,8 @@ ENGINES = ("statistical", "legacyLstm")
 SEASONALITIES = ("daily",)            # dailyWeekly is admitted once the weekly implementation and its tests ship
 PHASES = ("Collecting", "Calibrating", "Shadow", "Trusted", "Degraded")
 REASONS = ("HistoryInsufficient", "CalibrationInsufficient", "ShadowInsufficient", "CoverageLow", "DataUnavailable",
-           "IdentityMismatch", "StateUnavailable", "LeadInsufficient", "ReplayGateMissing", "Ready")
+           "IdentityMismatch", "StateUnavailable", "ConfigurationNotValidated", "LeadInsufficient",
+           "ReplayGateMissing", "Ready")
 MODEL_FAMILIES = ("seasonal_naive", "statistical", "lstm")
 LEAD_METHODS = ("configured", "measured")
 BPS = 10_000
@@ -138,12 +151,16 @@ def sha256_hex(data: bytes) -> str:
 
 # --- settings ---------------------------------------------------------------------------------------------------
 
-# Frozen by the threshold-selection procedure of the trust-repair protocol (evaluation/trust_qualification.py).
+# Frozen for the trust-repair protocol, amendment 2 (evaluation/trust_qualification.py), before any validation seed
+# was read: the rolling window, the four false-alarm budgets (ppm per target and 7 days) and the dependence of the
+# transition model the thresholds are computed under (forecasting.trust).
 ACUTE_RECENT_WINDOWS = 64
-ROLLING_ALARM_PPM = 35_000
+ROLLING_ALARM_PPM = 33_000
 CONSECUTIVE_ALARM_PPM = 7_000
 DAY_ALARM_PPM = 8_000
-COVERAGE_ALARM_BUDGET_PPM = 50_000           # the target: 5 % per target and 7 days, the three rules together
+SEVEN_DAY_ALARM_PPM = 2_000
+MISS_DEPENDENCE_BPS = 1_750                  # the model's P(miss | previous miss): 0.175
+COVERAGE_ALARM_BUDGET_PPM = 50_000           # the target: 5 % per target and 7 days, the four rules together
 
 
 @dataclass(frozen=True)
@@ -184,13 +201,15 @@ class TrustSettings:
     challenger_exit_loss_ratio_bps: int = 10000  # leave (no safety failure): only once worse than the naive
     challenger_cost_ratio_bps: int = 10200
     max_fit_age_hours: int = 12
-    # The policy revision and the false-alarm budgets its thresholds are derived from (forecasting.trust). Resolved,
-    # never read from the spec; each is a probability per target and 7 days under independent nominal misses, in ppm,
-    # shared equally by the enabled families.
+    # The policy revision, the false-alarm budgets its thresholds are computed for and the dependence of the model
+    # they are computed under (forecasting.trust). Resolved, never read from the spec; each budget is a probability
+    # per target and 7 days under that model, in ppm, shared equally by the enabled families.
     policy: str = TRUST_POLICY_REVISION
     rolling_alarm_ppm: int = ROLLING_ALARM_PPM
     consecutive_alarm_ppm: int = CONSECUTIVE_ALARM_PPM
     day_alarm_ppm: int = DAY_ALARM_PPM
+    seven_day_alarm_ppm: int = SEVEN_DAY_ALARM_PPM
+    miss_dependence_bps: int = MISS_DEPENDENCE_BPS
 
 
 @dataclass(frozen=True)
@@ -206,6 +225,7 @@ class ForecastSettings:
     seasonality: str = "daily"
     history_days: int = 14
     horizon_seconds: int = 3600
+    min_lead_seconds: int = 0                # the lead is never shorter than this (rounded up to the grid)
     settlement_seconds: int = 120
     outcome_grace_seconds: int = 600
     risk: RiskSettings = field(default_factory=RiskSettings)
@@ -252,7 +272,7 @@ _TRUST = (("minShadowHours", "min_shadow_hours", 1, 24 * 28), ("minProspectiveWi
           ("maxFitAgeHours", "max_fit_age_hours", 1, 24))
 _EXTRA = (("maxReplicas", "max_replicas", 0, 1000), ("maxPercent", "max_percent", 0, 1000))
 _TOP = ("engine", "sampleIntervalSeconds", "seasonality", "historyDays", "settlementSeconds", "outcomeGraceSeconds",
-        "risk", "calibration", "trust", "predictiveExtra", "families")
+        "risk", "calibration", "trust", "predictiveExtra", "families", "minLeadSeconds")
 FAMILIES = ("seasonalNaive", "statistical")
 FAMILY_MODELS = {"seasonalNaive": "seasonal_naive", "statistical": "statistical"}   # spec name -> model family
 
@@ -320,6 +340,9 @@ def resolve_settings(pa: Mapping) -> ForecastSettings:
     history_days = pred.get("historyDays", d.history_days)
     if not _is_int(history_days) or not 1 <= history_days <= MAX_HISTORY_DAYS:
         raise ContractRefused(f"spec.prediction.historyDays must be in 1..{MAX_HISTORY_DAYS}, got {history_days!r}")
+    min_lead = pred.get("minLeadSeconds", d.min_lead_seconds)
+    if not _is_int(min_lead) or not 0 <= min_lead <= MAX_HORIZON_SECONDS:
+        raise ContractRefused(f"spec.prediction.minLeadSeconds must be in 0..{MAX_HORIZON_SECONDS}, got {min_lead!r}")
     settle = pred.get("settlementSeconds", d.settlement_seconds)
     if not _is_int(settle) or not 0 <= settle <= 900:
         raise ContractRefused(f"spec.prediction.settlementSeconds must be in 0..900, got {settle!r}")
@@ -342,7 +365,8 @@ def resolve_settings(pa: Mapping) -> ForecastSettings:
         raise ContractRefused("spec.prediction.families must include seasonalNaive (the statistical family is selected "
                               "only over a trusted seasonal-naive forecast)")
     s = ForecastSettings(engine=engine, sample_interval_seconds=interval, seasonality=seasonality,
-                         history_days=history_days, horizon_seconds=horizon, settlement_seconds=settle,
+                         history_days=history_days, horizon_seconds=horizon, min_lead_seconds=min_lead,
+                         settlement_seconds=settle,
                          outcome_grace_seconds=grace, risk=risk, calibration=cal, trust=trust, predictive_extra=extra,
                          families=tuple(sorted(families)))
     _check_feasible(s)
@@ -375,8 +399,55 @@ def _check_feasible(s: ForecastSettings) -> None:
         raise ContractRefused("trust.challengerExitLossRatioBps must not be below challengerLossRatioBps")
     if t.min_shadow_hours > c.retention_days * 24:
         raise ContractRefused("trust.minShadowHours exceeds the retention")
-    if t.rolling_alarm_ppm + t.consecutive_alarm_ppm + t.day_alarm_ppm > COVERAGE_ALARM_BUDGET_PPM:
+    if t.rolling_alarm_ppm + t.consecutive_alarm_ppm + t.day_alarm_ppm + t.seven_day_alarm_ppm > \
+            COVERAGE_ALARM_BUDGET_PPM:
         raise ContractRefused("the coverage rules' false-alarm budgets exceed the 5 % target")
+    # The rolling rule's threshold is computed for a full window: a candidate must not be trusted on fewer outcomes.
+    if t.min_prospective_windows < t.acute_recent_windows:
+        raise ContractRefused("trust.minProspectiveWindows must be at least acuteRecentWindows")
+    if minimum_lead_seconds(s) > s.horizon_seconds:
+        raise ContractRefused("minLeadSeconds, rounded up to the cadence, exceeds the horizon")
+
+
+def minimum_lead_seconds(s: ForecastSettings) -> int:
+    """spec.prediction.minLeadSeconds rounded up to the grid (0: no configured minimum)."""
+    dt = s.sample_interval_seconds
+    return -(-s.min_lead_seconds // dt) * dt
+
+
+@dataclass(frozen=True)
+class ValidatedProfile:
+    """A configuration the trust policy's operating characteristics were qualified for (module docstring)."""
+    sample_interval_seconds: int
+    lead_seconds: int
+    miscoverage_bps: int
+    families: Tuple[str, ...]                # sorted spec names
+    evidence: str                            # where the qualification is recorded
+
+
+# Trust-repair protocol, amendment 2: one profile first. A second family, another lead, grid or risk needs its own
+# evidence; the seasonal-naive result is not doubled for the statistical family. The entry was committed together
+# with the frozen thresholds, acceptance rules and validation seeds, BEFORE the validation ran (the protocol's
+# order): it stands only with a validation record whose verdict is "qualified", and is removed otherwise.
+VALIDATED_PROFILES = (
+    ValidatedProfile(60, 600, 1000, ("seasonalNaive",),
+                     "trust-repair protocol, amendment 2: evaluation/trust_qualification.py, validation record R9"),
+)
+
+
+def validated_profile(s: ForecastSettings, lead_seconds: int) -> Optional[ValidatedProfile]:
+    """The allowlist entry this configuration matches, or None. Besides grid, lead, risk and family set, the engine,
+    the seasonality, the outcome timing and every calibration and trust setting must be the defaults: those are
+    what was qualified, and a monitor with other thresholds is another monitor."""
+    d = ForecastSettings()
+    if (s.engine, s.seasonality, s.settlement_seconds, s.outcome_grace_seconds, s.calibration, s.trust) != \
+            (d.engine, d.seasonality, d.settlement_seconds, d.outcome_grace_seconds, d.calibration, d.trust):
+        return None
+    for p in VALIDATED_PROFILES:
+        if (p.sample_interval_seconds, p.lead_seconds, p.miscoverage_bps, p.families) == \
+                (s.sample_interval_seconds, lead_seconds, s.risk.miscoverage_bps, s.families):
+            return p
+    return None
 
 
 # --- lead and window --------------------------------------------------------------------------------------------
@@ -397,10 +468,13 @@ _LEAD_KEYS = {"seconds": "lead_seconds", "startupDelaySeconds": "startup_delay_s
               "sampleCount": "sample_count", "observedGeneration": "observed_generation"}
 
 
-def automatic_lead_seconds(startup_delay_s: int, decision_interval_s: int, allowance_s: int, interval_s: int) -> int:
-    """L = ceil((D + C + A + Δ) / Δ) * Δ: covers D + C + A with a full grid interval of origin-age slack."""
+def automatic_lead_seconds(startup_delay_s: int, decision_interval_s: int, allowance_s: int, interval_s: int,
+                           min_lead_s: int = 0) -> int:
+    """L = max(ceil((D + C + A + Δ) / Δ), ceil(M / Δ)) * Δ: covers D + C + A with a full grid interval of origin-age
+    slack, and is never below the configured minimum lead M (spec.prediction.minLeadSeconds) rounded up to the grid.
+    The startup budget D is an input only: a minimum lead does not change it."""
     total = startup_delay_s + decision_interval_s + allowance_s + interval_s
-    return -(-total // interval_s) * interval_s
+    return max(-(-total // interval_s), -(-min_lead_s // interval_s)) * interval_s
 
 
 def resolve_lead(pa: Mapping, settings: ForecastSettings, generation: int) -> Tuple[Optional[LeadSelection], str]:
@@ -425,6 +499,8 @@ def resolve_lead(pa: Mapping, settings: ForecastSettings, generation: int) -> Tu
         return None, "the lead must be a positive multiple of the cadence within the horizon"
     if sel.lead_seconds < sel.startup_delay_seconds + dt + sel.actuation_allowance_seconds:
         return None, "the lead does not cover startup delay + decision interval + actuation allowance"
+    if sel.lead_seconds < minimum_lead_seconds(settings):
+        return None, "the lead is below the configured minimum lead (spec.prediction.minLeadSeconds)"
     return sel, ""
 
 
@@ -469,9 +545,9 @@ def make_window(origin: int, settings: ForecastSettings, lead: LeadSelection) ->
 
 
 def evidence_key(signal: ResolvedSignal, settings: ForecastSettings, lead_seconds: int) -> str:
-    """The identity forecast evidence belongs to. A new PA or Deployment, query, cadence, lead, seasonality, engine,
-    risk, calibration policy (its method included), outcome timing or trust-policy REVISION starts a new key (a new
-    epoch); a generation that changes only other fields (mode, caps, trust thresholds) keeps it, and callers check the
+    """The identity forecast evidence belongs to. A new PA or Deployment, query, cadence, lead, configured minimum
+    lead, seasonality, engine, risk, calibration policy (its method included), outcome timing or trust-policy REVISION
+    starts a new key (a new epoch); a generation that changes only other fields (mode, caps, trust thresholds) keeps it, and callers check the
     generation separately.
 
     Keeping forecast evidence is not keeping policy readiness: a change of capacity, predictive-extra caps or trust
@@ -479,7 +555,7 @@ def evidence_key(signal: ResolvedSignal, settings: ForecastSettings, lead_second
     body = {"schema": EVIDENCE_SCHEMA, "autoscaler_uid": signal.autoscaler_uid, "target_uid": signal.target_uid,
             "query_sha256": signal.sha256, "signal_contract": signal.contract, "forecast_contract": FORECAST_CONTRACT,
             "interval_seconds": settings.sample_interval_seconds, "lead_seconds": lead_seconds,
-            "engine": settings.engine, "seasonality": settings.seasonality, "history_days": settings.history_days,
+            "min_lead_seconds": settings.min_lead_seconds, "engine": settings.engine, "seasonality": settings.seasonality, "history_days": settings.history_days,
             "settlement_seconds": settings.settlement_seconds,
             "outcome_grace_seconds": settings.outcome_grace_seconds,
             "risk": asdict(settings.risk), "calibration": asdict(settings.calibration),

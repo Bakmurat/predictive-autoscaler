@@ -5,11 +5,12 @@ completed-day rule, the policy as part of the bound identity, and the PERMANENT 
 evaluation/trust_qualification.py)."""
 
 import dataclasses
+import functools
 import json
 import os
 import sys
 from fractions import Fraction
-from math import comb
+from math import comb, gcd
 
 import numpy as np
 import pytest
@@ -17,6 +18,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import tests.test_statistical_service as svc_helpers  # noqa: E402
+from evaluation import calibration_acceptance as acceptance  # noqa: E402
 from evaluation import trust_qualification as Q  # noqa: E402
 from forecasting import contracts as c  # noqa: E402
 from forecasting import trust as T  # noqa: E402
@@ -29,10 +31,16 @@ EPOCH = "e" * 64
 START = 1_793_923_200 - 1_793_923_200 % DAY
 TS = c.TrustSettings()
 A = Fraction(1, 10)
+QM = Fraction(7, 40)               # the model's P(miss | previous miss): 0.175
 # The settings fingerprint of the default statistical settings BEFORE this trust policy (calibration method
 # normalized-window-score/two-part-scale/v1 with "the last 32 gate windows at least 85 % covered"), frozen from the
 # fixtures of the calibration change.
-PRE_POLICY_ADDED = ("policy", "rolling_alarm_ppm", "consecutive_alarm_ppm", "day_alarm_ppm")
+PRE_POLICY_ADDED = ("policy", "rolling_alarm_ppm", "consecutive_alarm_ppm", "day_alarm_ppm", "seven_day_alarm_ppm",
+                    "miss_dependence_bps")
+# The identity of trust policy budgeted-coverage-tests/v1 for the service tests' autoscaler, frozen from the code of
+# that policy (commit a774a68): what an operator or a forecaster one revision back presents.
+POLICY_V1_IDENTITY = ("fd30e6a0d857054071bfffa53d1d2db229b22d39e937180470a7e453bf6eb87b",
+                      "53b55a6d085491bf1ab92912a04cb5efc961ce6698825320286ca44248c5d796")
 
 
 def tail(n, k, a=A):
@@ -75,8 +83,8 @@ def inputs(feed):
 
 
 def glob(now, **kw):
-    return T.Global(now_s=now, lead_seconds=L, nominal_miscoverage=0.1, replay_suite_passed=True,
-                    startup_budget_valid=True, **kw)
+    return T.Global(now_s=now, lead_seconds=L, nominal_miscoverage=0.1,
+                    **{"replay_suite_passed": True, "startup_budget_valid": True, "configuration_validated": True, **kw})
 
 
 def evaluate(feed, now, hyst=None, **kw):
@@ -87,132 +95,306 @@ def spread(t, every=20):
     return (t // L) % every != 0
 
 
-# --- exact thresholds ---------------------------------------------------------------------------------------------------
+# --- thresholds under the stated transition model ---------------------------------------------------------------------------
 
 def test_binomial_tails_are_exact_and_match_the_protocols_reference_values():
-    for n, k in ((32, 5), (32, 8), (32, 9), (32, 12), (63, 18), (480, 73), (1440, 185), (10, 0), (10, 11)):
+    for n, k in ((32, 5), (32, 8), (32, 9), (32, 12), (64, 15), (24, 4), (480, 72)):
         assert Fraction(T.binomial_tail(n, 1000, k), T.BPS ** n) == tail(n, k), (n, k)
-    assert float(tail(32, 5)) == pytest.approx(0.2115, abs=5e-5)                 # the old rule: 5 misses in 32
+    assert float(tail(32, 5)) == pytest.approx(0.2115, abs=5e-5)           # the old rule: 5 misses of 32
     assert float(tail(32, 8)) == pytest.approx(0.011685, abs=5e-7)
     assert float(tail(32, 9)) == pytest.approx(0.003295, abs=5e-7)
     assert float(tail(32, 12)) == pytest.approx(0.000033, abs=5e-7)
     assert Fraction(T.binomial_tail(40, 250, 3), T.BPS ** 40) == tail(40, 3, Fraction(1, 40))   # another nominal rate
+    assert T.binomial_tail(10, 1000, 0) == T.BPS ** 10 and T.binomial_tail(10, 1000, 11) == 0
 
 
-@pytest.mark.parametrize("n, looks, ppm, families", [(32, 3360, 15000, 2), (64, 3360, 30000, 2), (64, 2016, 30000, 1),
-                                                     (48, 504, 20000, 2), (16, 168, 5000, 1)])
-def test_the_rolling_limit_is_the_smallest_count_within_its_budget(n, looks, ppm, families):
-    k = T.rolling_limit(n, 1000, looks, ppm, families)
-    bound = lambda kk: looks * A * tail(n - 1, kk - 1) * families                # noqa: E731
-    assert bound(k) <= Fraction(ppm, T.PPM)                                      # within the budget
-    assert k == 1 or bound(k - 1) > Fraction(ppm, T.PPM)                         # and one less would not be
+@functools.lru_cache(maxsize=None)
+def model_counts(m, a=A, q=QM, start="stationary"):
+    """The stated model, recomputed here from its definition (exact): [covered, missed] with [j] = the numerator of
+    P(S_m = j, last outcome) over den. start: "stationary", or "covered" (one covered outcome BEFORE the m counted)."""
+    p01 = a * (1 - q) / (1 - a)
+    d = (p01.denominator * q.denominator) // gcd(p01.denominator, q.denominator)
+    w01, w11 = int(p01 * d), int(q * d)
+    w00, w10 = d - w01, d - w11
+    scale = a.denominator
+    cov, mis = [0] * (m + 2), [0] * (m + 2)
+    if start == "stationary":
+        cov[0], mis[1] = int((1 - a) * scale), int(a * scale)
+        steps, den = m - 1, scale * d ** (m - 1)
+    else:
+        cov[0] = int((1 - a) * scale)
+        steps, den = m, scale * d ** m
+    for _ in range(steps):
+        cov, mis = ([w00 * cov[j] + w10 * mis[j] for j in range(m + 2)],
+                    [0] + [w01 * cov[j] + w11 * mis[j] for j in range(m + 1)])
+    return cov, mis, den
+
+
+def model_tail(m, k, a=A, q=QM):
+    cov, mis, den = model_counts(m, a, q)
+    return Fraction(sum(cov[max(k, 0):]) + sum(mis[max(k, 0):]), den)
+
+
+def test_the_model_is_a_stationary_chain_with_the_stated_rates():
+    """What the arithmetic assumes (trust module docstring): P(miss) = a at every position, P(miss | miss) = q, and
+    q = a is independence. Nothing about other miss processes follows from it."""
+    w00, w01, w10, w11, d = T._transitions(1000, TS.miss_dependence_bps)
+    assert (Fraction(w01, d), Fraction(w11, d)) == (A * (1 - QM) / (1 - A), QM) == (Fraction(11, 120), Fraction(7, 40))
+    assert w00 + w01 == w10 + w11 == d
+    for m in (1, 2, 7, 64):                                # stationary: the last outcome is a miss with probability a
+        cov, mis, den = model_counts(m)
+        assert Fraction(sum(mis), den) == A and Fraction(sum(cov) + sum(mis), den) == 1
+    assert model_tail(64, 9, q=A) == tail(64, 9)           # q = a: the binomial
+    assert T.model_dependence_bps(1000, 1750) == 1750 and T.model_dependence_bps(2500, 1750) == 2500   # never below a
+    assert model_tail(64, 19) > tail(64, 19)               # dependence fattens the tail: a higher threshold follows
+
+
+@pytest.mark.parametrize("n, looks, ppm, families, q", [(64, 1008, 33000, 1, 1750), (64, 3360, 33000, 2, 1750),
+                                                        (64, 2016, 30000, 1, 1000), (48, 504, 20000, 2, 3000),
+                                                        (16, 168, 5000, 1, 2000)])
+def test_the_rolling_limit_is_the_smallest_count_whose_onsets_fit_the_budget(n, looks, ppm, families, q):
+    """First-passage form: the rule starts failing only when the outcome that left was covered, the n - 1 between
+    hold exactly k - 1 misses and the newest is a miss. The expected number of onsets in 7 days is within the budget
+    from k on, and not at k - 1."""
+    k = T.rolling_limit(n, 1000, q, looks, ppm, families)
+    qq = Fraction(q, T.BPS)
+    cov, mis, den = model_counts(n - 1, q=qq, start="covered")
+    p01 = A * (1 - qq) / (1 - A)
+    onset = lambda kk: (p01 * cov[kk - 1] + qq * mis[kk - 1]) / den                 # noqa: E731
+    budget = Fraction(ppm, T.PPM * families)
+    assert all(looks * onset(kk) <= budget for kk in range(k, n + 1))
+    assert k == 1 or looks * onset(k - 1) > budget
     assert 1 <= k <= n + 1
+    if q == 1000:                                          # independence: a (1 - a) x the binomial point probability
+        assert onset(k) == A * (1 - A) * comb(n - 1, k - 1) * A ** (k - 1) * (1 - A) ** (n - k)
 
 
-def test_the_day_limit_depends_on_the_days_count_and_stays_within_its_budget():
-    budget = Fraction(TS.day_alarm_ppm, T.PPM)
-    for m in (24, 72, 144, 288, 480, 1440):
-        for families in (1, 2):
-            k = T.day_limit(m, 1000, TS.day_alarm_ppm, families)
-            assert 7 * families * tail(m, k) <= budget < 7 * families * tail(m, k - 1), (m, families)
-    # Count-dependent: never the old flat 85 % (15 % of the day's outcomes), which on 24 outcomes is 4 misses.
-    assert T.day_limit(24, 1000, TS.day_alarm_ppm, 2) > 4
-    assert T.day_limit(480, 1000, TS.day_alarm_ppm, 2) / 480 < 0.16
-    assert T.day_limit(3, 1000, TS.day_alarm_ppm, 2) == 4                        # no count is unlikely enough: m + 1
+def test_the_day_and_seven_day_limits_are_the_models_tails_and_far_from_a_rounding_decision():
+    """count_limits works in double precision; at the allowlisted profile every threshold it gives is the exact
+    model's (recomputed here in integers), and no decision is closer than one part in a million to its boundary."""
+    lim = limits(600, 1)
+    day_alpha = Fraction(TS.day_alarm_ppm, T.PPM * 7)
+    for m in (24, 72, 143, 144, 145):
+        k = lim.day_misses(m)
+        assert model_tail(m, k) < day_alpha * (1 - Fraction(1, 10 ** 6)), m
+        assert model_tail(m, k - 1) > day_alpha * (1 + Fraction(1, 10 ** 6)), m
+    week_alpha = Fraction(TS.seven_day_alarm_ppm, T.PPM * (lim.looks + 168))
+    for m in (64, 288, 1008):
+        k = lim.seven_day_misses(m)
+        assert model_tail(m, k) < week_alpha * (1 - Fraction(1, 10 ** 6)), m
+        assert model_tail(m, k - 1) > week_alpha * (1 + Fraction(1, 10 ** 6)), m
+    # Count-dependent: never the old flat 85 % on a small day (15 % of 24 outcomes is 4 misses).
+    assert limits(3600, 1).day_misses(24) > 4 and lim.day_misses(144) / 144 > 0.15
+    assert T.count_limits(3, 1000, 1750, 1, 10 ** 9) == (1, 2, 3, 4)       # no count is unlikely enough: m + 1
+    # Beyond the table every further outcome counts as a possible miss, which keeps the bound valid.
+    table = T.count_limits(10, 1000, 1750, 1, 100)
+    assert T._limit_at(table, 10) == table[10] and T._limit_at(table, 15) == table[10] + 5
 
 
 def test_the_consecutive_rule_is_inside_the_budget():
-    # Protocol T2: "under independent 10 % misses and three-minute gate windows its own false-alarm probability is
-    # about 2.98 % in seven days" for five misses; the bound used here is (N (1 - a) + 1) a^c.
-    assert T.consecutive_bound_ppm(5, 1000, 3360) == pytest.approx(30250, rel=1e-6)
-    assert T.consecutive_bound_ppm(6, 1000, 3360) == pytest.approx(3025, rel=1e-6)
-    # The limit is the smallest run, not below the configured least (5), whose bound fits the budget share: it stays
-    # at five only where the combined budget holds.
-    for lead, families, want in ((180, 2, 6), (180, 1, 6), (300, 2, 6), (120, 2, 7), (1200, 2, 6), (1200, 1, 5),
-                                 (3600, 2, 5)):
+    # With q = a the bound is the earlier (N (1 - a) + 1) a^c: 3.0 % for five misses at a 180 s lead (protocol T2).
+    assert T.consecutive_bound_ppm(5, 1000, 1000, 3360) == pytest.approx(30250, rel=1e-6)
+    assert T.consecutive_bound_ppm(6, 1000, 1000, 3360) == pytest.approx(3025, rel=1e-6)
+    for lead, families, want in ((600, 1, 7), (600, 2, 7), (180, 2, 8), (1200, 1, 6), (3600, 1, 6)):
         looks = 7 * DAY // lead
-        cc = T.consecutive_limit(5, 1000, looks, TS.consecutive_alarm_ppm, families)
-        assert cc == want, (lead, families)
-        assert families * T.consecutive_bound_ppm(cc, 1000, looks) <= TS.consecutive_alarm_ppm
-        assert cc == 5 or families * T.consecutive_bound_ppm(cc - 1, 1000, looks) > TS.consecutive_alarm_ppm
-    assert T.consecutive_limit(8, 1000, 3360, TS.consecutive_alarm_ppm, 2) == 8      # never below the configured least
-    assert T.consecutive_limit(5, 2500, 3360, TS.consecutive_alarm_ppm, 2) == 10     # a 25 % nominal rate needs ten
-    # The same bound against the exact probability of a run of c misses in N independent outcomes.
-    for cc, n in ((5, 3360), (6, 3360), (6, 2016)):
+        cc = T.consecutive_limit(5, 1000, 1750, looks, TS.consecutive_alarm_ppm, families)
+        assert cc == want == limits(lead, families).consecutive, (lead, families)
+        assert families * T.consecutive_bound_ppm(cc, 1000, 1750, looks) <= TS.consecutive_alarm_ppm
+        assert families * T.consecutive_bound_ppm(cc - 1, 1000, 1750, looks) > TS.consecutive_alarm_ppm
+    assert T.consecutive_limit(12, 1000, 1750, 1008, TS.consecutive_alarm_ppm, 1) == 12   # never below the least
+    # The bound against the exact probability of a run of c misses in N outcomes of the model.
+    p01, q = 0.1 * 0.825 / 0.9, 0.175
+    for cc, n in ((7, 1008), (8, 3360)):
         p = [0.0] * (cc + 1)                                # p[j]: P(no run yet, current streak j)
-        p[0] = 1.0
-        for _ in range(n):
-            q = [0.0] * (cc + 1)
-            q[0] = 0.9 * sum(p[:cc])
-            for j in range(1, cc):
-                q[j] = 0.1 * p[j - 1]
-            q[cc] = p[cc] + 0.1 * p[cc - 1]
-            p = q
-        assert p[cc] * T.PPM <= T.consecutive_bound_ppm(cc, 1000, n)
-        assert p[cc] * T.PPM == pytest.approx(T.consecutive_bound_ppm(cc, 1000, n), rel=0.05)
+        p[0], p[1] = 0.9, 0.1
+        for _ in range(n - 1):
+            nxt = [0.0] * (cc + 1)
+            nxt[0] = (1 - p01) * p[0] + (1 - q) * sum(p[1:cc])
+            nxt[1] = p01 * p[0]
+            for j in range(2, cc):
+                nxt[j] = q * p[j - 1]
+            nxt[cc] = p[cc] + q * p[cc - 1]
+            p = nxt
+        assert p[cc] * T.PPM <= T.consecutive_bound_ppm(cc, 1000, 1750, n)
+        assert p[cc] * T.PPM == pytest.approx(T.consecutive_bound_ppm(cc, 1000, 1750, n), rel=0.05)
 
 
 def test_the_frozen_thresholds():
-    """The thresholds frozen by the selection procedure (evaluation/trust_qualification.py select), and the limits they
-    give at the declared leads."""
-    assert (TS.policy, TS.acute_recent_windows, TS.acute_consecutive_misses) == (c.TRUST_POLICY_REVISION, FROZEN["n"], 5)
-    assert (TS.rolling_alarm_ppm, TS.consecutive_alarm_ppm, TS.day_alarm_ppm) == \
-        (FROZEN["rolling_ppm"], FROZEN["consecutive_ppm"], FROZEN["day_ppm"])
-    assert TS.rolling_alarm_ppm + TS.consecutive_alarm_ppm + TS.day_alarm_ppm <= c.COVERAGE_ALARM_BUDGET_PPM == 50_000
-    over = dataclasses.replace(c.ForecastSettings(), trust=dataclasses.replace(TS, day_alarm_ppm=8_001))
+    """Frozen for the trust-repair protocol, amendment 2, before any validation seed was read: the budgets, the
+    model's dependence and the thresholds they give at the allowlisted profile (and, for reference, elsewhere)."""
+    assert (TS.policy, TS.acute_recent_windows, TS.acute_consecutive_misses) == \
+        (c.TRUST_POLICY_REVISION, 64, 5) and c.TRUST_POLICY_REVISION == "budgeted-coverage-tests/v2"
+    assert (TS.rolling_alarm_ppm, TS.consecutive_alarm_ppm, TS.day_alarm_ppm, TS.seven_day_alarm_ppm,
+            TS.miss_dependence_bps) == (33_000, 7_000, 8_000, 2_000, 1_750)
+    assert TS.rolling_alarm_ppm + TS.consecutive_alarm_ppm + TS.day_alarm_ppm + TS.seven_day_alarm_ppm == \
+        c.COVERAGE_ALARM_BUDGET_PPM == 50_000
+    over = dataclasses.replace(c.ForecastSettings(), trust=dataclasses.replace(TS, seven_day_alarm_ppm=2_001))
     with pytest.raises(c.ContractRefused, match="budgets exceed"):
         c._check_feasible(over)
+    short = dataclasses.replace(c.ForecastSettings(), trust=dataclasses.replace(TS, min_prospective_windows=63))
+    with pytest.raises(c.ContractRefused, match="minProspectiveWindows must be at least acuteRecentWindows"):
+        c._check_feasible(short)                         # the rolling threshold is computed for a full window
     assert (TS.coverage_tolerance_bps, TS.worst_day_min_outcomes, TS.repromotion_hours, TS.repromotion_windows) == \
-        (500, 24, 24, 32)                                                        # unchanged: 7-day gate, dwell
-    for lead, families, k, run in FROZEN["limits"]:
-        lim = limits(lead, families)
-        assert (lim.recent_n, lim.rolling_misses, lim.consecutive, lim.looks) == \
-            (FROZEN["n"], k, run, 7 * DAY // lead), (lead, families)
+        (500, 24, 24, 32)
+    lim = limits(600, 1)                                 # the profile: 60 s grid, 600 s lead, one family
+    assert (lim.recent_n, lim.rolling_misses, lim.consecutive, lim.looks, lim.dependence_bps) == (64, 18, 7, 1008, 1750)
+    assert lim.day_misses(144) == 29
+    assert [lim.seven_day_misses(m) for m in (64, 288, 1008)] == [23, 59, 153]
+    rep = Q.limits_report()
+    assert (rep["rolling_misses"], rep["consecutive"], rep["day_outcomes"], rep["day_misses"]) == (18, 7, 144, 29)
+    assert rep["seven_day"][-1] == {"outcomes": 1008, "count_condition": 153, "coverage_condition": 152,
+                                    "misses_to_fail": 153}
+    assert rep["seven_day"][2] == {"outcomes": 288, "count_condition": 59, "coverage_condition": 44,
+                                   "misses_to_fail": 59}
+    # Elsewhere (never eligible: not on the allowlist), for reference: (lead, families) -> (k of 64, run).
+    for lead, families, k, run in ((180, 2, 20, 8), (300, 1, 19, 7), (1200, 1, 18, 6), (3600, 1, 16, 6)):
+        other = limits(lead, families)
+        assert (other.rolling_misses, other.consecutive) == (k, run), (lead, families)
     with pytest.raises(T.TrustError):
-        T.coverage_limits(dataclasses.replace(TS, policy="last-32-at-85-percent"), 180, 1000, 2)
+        T.coverage_limits(dataclasses.replace(TS, policy="budgeted-coverage-tests/v1"), 600, 1000, 1)
 
 
-# (lead, families, rolling limit k of n, consecutive limit c)
-FROZEN = {"n": 64, "rolling_ppm": 35000, "consecutive_ppm": 7000, "day_ppm": 8000,
-          "limits": ((180, 1, 19, 6), (180, 2, 19, 6), (300, 1, 18, 6), (300, 2, 19, 6), (1200, 1, 17, 5),
-                     (1200, 2, 18, 6))}
+# --- the allowlist of validated configurations and the minimum lead -------------------------------------------------------
+
+def profile_settings(**pred):
+    spec = {"engine": "statistical", "sampleIntervalSeconds": 60, "families": ["seasonalNaive"], "minLeadSeconds": 600}
+    spec.update(pred)
+    return c.resolve_settings({"spec": {"prediction": spec}})
+
+
+def test_only_the_validated_profile_is_on_the_allowlist():
+    """Amendment 2: grid 60 s, lead 600 s, risk 10 %, seasonal-naive only, with the default calibration, trust and
+    timing settings. Anything else is not validated, whatever its evidence."""
+    assert c.VALIDATED_PROFILES == (c.ValidatedProfile(60, 600, 1000, ("seasonalNaive",),
+                                                       c.VALIDATED_PROFILES[0].evidence),)
+    assert c.validated_profile(profile_settings(), 600) is c.VALIDATED_PROFILES[0]
+    assert c.validated_profile(profile_settings(minLeadSeconds=0), 600) is c.VALIDATED_PROFILES[0]   # the lead decides
+    assert c.validated_profile(profile_settings(historyDays=7, horizonMinutes=30), 600) is not None
+    for lead in (60, 180, 300, 540, 660, 1200, 3600):
+        if lead != 600:
+            assert c.validated_profile(profile_settings(), lead) is None, lead
+    for other in ({"sampleIntervalSeconds": 300}, {"sampleIntervalSeconds": 120},
+                  {"families": ["seasonalNaive", "statistical"]}, {"risk": {"miscoverageBps": 500}},
+                  {"trust": {"acuteConsecutiveMisses": 6}}, {"trust": {"minShadowHours": 24}},
+                  {"calibration": {"etaBps": 25}}, {"settlementSeconds": 60}, {"outcomeGraceSeconds": 300}):
+        assert c.validated_profile(profile_settings(**other), 600) is None, other
+    default = c.resolve_settings({"spec": {"prediction": {}}})               # 300 s grid, both families
+    assert all(c.validated_profile(default, lead) is None for lead in (600, 1200))
+    assert (Q.GRID, Q.LEAD, Q.NOMINAL_BPS, Q.FAMILIES) == (60, 600, 1000, 1)  # what the qualification job measures
+
+
+def test_an_unvalidated_configuration_is_trusted_and_reported_but_never_ready():
+    f = Feed().run(72, covered=spread)
+    now = START + 72 * H
+    ready, _ = evaluate(f, now)
+    assert (ready.selected, ready.reason, ready.prediction_ready) == ("seasonal_naive", "Ready", True)
+    v, h = evaluate(f, now, configuration_validated=False)
+    assert (v.selected, v.phase, v.reason, v.prediction_ready) == \
+        ("seasonal_naive", "Trusted", "ConfigurationNotValidated", False)
+    assert v.candidates["seasonal_naive"].trusted and v.candidates["seasonal_naive"].reason == "Ready"
+    assert h["seasonal_naive"]["trusted"]                 # the evidence, the gates and the hysteresis are the same
+    assert T.Global(now_s=now, lead_seconds=L, nominal_miscoverage=0.1).configuration_validated is False   # default
+    # It is named before the release gate and the lead: neither of them can stand in for a validation.
+    v, _ = evaluate(f, now, configuration_validated=False, replay_suite_passed=False, startup_budget_valid=False)
+    assert v.reason == "ConfigurationNotValidated"
+    assert "ConfigurationNotValidated" in c.REASONS and "ConfigurationNotValidated" in T.REASON_ORDER
+
+
+def test_the_lead_is_never_below_the_configured_minimum():
+    """lead = grid-rounded max(configured minimum, startup + decision + actuation requirement). The startup budget is
+    an input only and is not altered; a minimum beyond the horizon is refused with the settings."""
+    assert c.automatic_lead_seconds(30, 60, 15, 60) == 180 == c.automatic_lead_seconds(30, 60, 15, 60, 0)
+    assert c.automatic_lead_seconds(30, 60, 15, 60, 600) == 600
+    assert c.automatic_lead_seconds(30, 60, 15, 60, 541) == 600            # rounded up to the grid
+    assert c.automatic_lead_seconds(30, 60, 15, 60, 120) == 180            # the requirement, when it is the larger
+    assert c.automatic_lead_seconds(700, 60, 15, 60, 600) == 840
+    assert c.automatic_lead_seconds(30, 300, 15, 300, 700) == 900
+    s = profile_settings()
+    assert (s.min_lead_seconds, c.minimum_lead_seconds(s)) == (600, 600)
+    assert c.minimum_lead_seconds(profile_settings(minLeadSeconds=541)) == 600
+    assert c.resolve_settings({"spec": {"prediction": {}}}).min_lead_seconds == 0
+    for bad in (-1, 3601, 1.5, "600", True):
+        with pytest.raises(c.ContractRefused, match="minLeadSeconds"):
+            profile_settings(minLeadSeconds=bad)
+    with pytest.raises(c.ContractRefused, match="exceeds the horizon"):
+        profile_settings(minLeadSeconds=601, horizonMinutes=10)
+    assert profile_settings(minLeadSeconds=600, horizonMinutes=10).horizon_seconds == 600
+    # The forecaster refuses a published lead below the minimum; the startup delay it records is the operator's.
+    lead = {"seconds": 180, "startupDelaySeconds": 30, "actuationAllowanceSeconds": 15, "method": "measured",
+            "sampleCount": 25, "observedGeneration": 3}
+    pa = {"spec": {"prediction": {"engine": "statistical", "sampleIntervalSeconds": 60, "minLeadSeconds": 600}},
+          "status": {"prediction": {"lead": lead}}}
+    sel, why = c.resolve_lead(pa, c.resolve_settings(pa), 3)
+    assert sel is None and "below the configured minimum lead" in why
+    pa["status"]["prediction"]["lead"] = {**lead, "seconds": 600}
+    sel, why = c.resolve_lead(pa, c.resolve_settings(pa), 3)
+    assert why == "" and (sel.lead_seconds, sel.startup_delay_seconds) == (600, 30)
+    # The setting is part of the identity: the fingerprint and the evidence key.
+    a, b = profile_settings(), profile_settings(minLeadSeconds=540)
+    assert a.fingerprint() != b.fingerprint() and a.canonical()["settings"]["min_lead_seconds"] == 600
+    sig = c.bind_request(svc_helpers.body(svc_helpers.T0), svc_helpers.Reader(),
+                         now_ms=svc_helpers.T0 * 1000 + 10_000).signal
+    assert c.evidence_key(sig, a, 600) != c.evidence_key(sig, b, 600)
 
 
 # --- the permanent guard of the operating characteristics (T5) ----------------------------------------------------------
 
-@pytest.mark.parametrize("lead", [180, 300])
-@pytest.mark.parametrize("families", [1, 2])
-def test_the_exact_false_alarm_budget_of_a_target_is_within_five_percent(lead, families):
-    """Under independent misses at the nominal rate, P(any rolling, consecutive or day alarm of any enabled family
-    within 7 days) is at most the sum of the rules' union bounds: exact arithmetic, no simulation."""
-    lim = limits(lead, families)
-    looks, n, k = lim.looks, lim.recent_n, lim.rolling_misses
-    rolling = looks * A * tail(n - 1, k - 1)
-    consecutive = (looks * (1 - A) + 1) * A ** lim.consecutive
-    per_day = DAY // lead
-    day = 7 * tail(per_day, lim.day_misses(per_day))
-    total = families * (rolling + consecutive + day)
-    assert total <= Fraction(5, 100), float(total)
-    ub = Q.union_bound_ppm(TS, lead, families)
-    assert ub["total"] == pytest.approx(float(total) * T.PPM, rel=1e-9)
-    assert families * rolling <= Fraction(TS.rolling_alarm_ppm, T.PPM)
-    assert families * consecutive <= Fraction(TS.consecutive_alarm_ppm, T.PPM)
-    assert families * day <= Fraction(TS.day_alarm_ppm, T.PPM)
+def test_the_qualification_declarations_are_fixed():
+    """Frozen before any validation seed was read: a change here is a change of the protocol."""
+    assert Q.DEVELOPMENT_SEEDS == tuple(range(310_000, 311_000))
+    assert Q.VALIDATION_SEEDS == tuple(range(1_260_000, 1_264_000))
+    assert not set(Q.DEVELOPMENT_SEEDS) & set(Q.VALIDATION_SEEDS)
+    assert (Q.FALSE_ALARM_TARGET, Q.DETECTION_TARGET, Q.DETECTION_OUTCOMES) == (0.05, 0.95, 64)
+    assert Q.SOURCES == ("bernoulli", "additive", "proportional", "mixed", "additive_ar1", "proportional_ar1",
+                         "mixed_ar1")
+    assert Q.CRITERION_CASES == ("independent 40 %", "clustered 40 %")
+    assert Q.INDEPENDENT_CASES == (("independent 40 %", 0.4), ("independent 50 %", 0.5), ("all-miss step", 1.0))
+    assert set(Q.CLUSTERED_SCORE) == set(Q.SOURCES[1:]) and Q.CLUSTERED_SCORE == CLUSTERED_SCORE
+    assert all(q60 > q50 for q60, q50 in Q.CLUSTERED_SCORE.values())     # 60th percentile, 50th percentile
+    assert Q.wall_deadline_seconds() == 64 * 600 + 120 + 60 == 38_580      # 10 h 43 min
+    assert acceptance.AR_RHO == 0.7 and (Q.BERNOULLI_STREAM, Q.CHANGE_STREAM, Q.PATH_DAYS) == (1001, 1002, 12)
+    assert Q.reading_at_most(0.01, 0.02, 0.03, 0.05) == "MET" and Q.reading_at_most(0.03, 0.04, 0.06, 0.05) == \
+        "INCONCLUSIVE" and Q.reading_at_most(0.05, 0.06, 0.07, 0.05) == "NOT MET"
+    assert Q.reading_at_least(0.96, 0.97, 0.98, 0.95) == "MET" and Q.reading_at_least(0.93, 0.94, 0.96, 0.95) == \
+        "NOT MET" and Q.reading_at_least(0.94, 0.96, 0.98, 0.95) == "INCONCLUSIVE"
 
 
-@pytest.mark.parametrize("lead", [180, 300])
-@pytest.mark.parametrize("families", [1, 2])
-def test_a_sustained_forty_percent_miscoverage_is_detected_within_64_outcomes(lead, families):
-    """Fixed seed, 60,000 independent trials: the lower end of the 95 % interval is at least 95 %. Also the 50 % case
-    and the all-miss step (detected by the consecutive rule after exactly c outcomes)."""
-    lim = limits(lead, families)
-    d = Q.detection(lim, 0.4, trials=60_000, seed=20261110)
+CLUSTERED_SCORE = {
+    "additive": (0.1464, 0.0),
+    "proportional": (0.1401, 0.0003),
+    "mixed": (0.1427, -0.0003),
+    "additive_ar1": (0.1931, 0.0008),
+    "proportional_ar1": (0.1868, 0.0005),
+    "mixed_ar1": (0.1905, 0.0006),
+}
+
+
+def test_the_simulated_false_alarm_rate_at_nominal_stays_inside_the_budget():
+    """Fixed seeds, independent nominal misses through the four rules, the shadow gate and the hysteresis
+    (fast_monitor, which another test ties to the product's functions): the upper end of the 95 % interval of the
+    false-alarm probability is within 5 %, at the profile and at a 3,600 s lead, where the unbudgeted seven-day
+    gate of the earlier policy demoted about one path in six."""
+    for lead, grid, days, paths in ((600, 60, 12, 400), (3600, 300, 14, 300)):
+        alarms = trusted = 0
+        for seed in range(paths):
+            r = Q.fast_monitor(Q.bernoulli_outcomes(seed, grid, lead, days), TS, 1)
+            trusted += r.trusted_at is not None
+            alarms += r.false_alarm is not None
+        assert trusted == paths
+        assert Q.wilson(alarms, trusted)[1] <= 0.05, (lead, alarms, trusted)
+
+
+def test_a_sustained_forty_percent_miscoverage_is_detected_within_64_outcomes():
+    """The cheap guard, on a SEPARATE latent model (independent misses, then 40 %): the rolling and consecutive
+    rules of the profile detect it within 64 outcomes with the interval's lower end at 95 % or more. The
+    qualification job measures the complete monitor on the named models."""
+    lim = limits(600, 1)
+    d = Q.latent_detection(lim, 0.4, trials=60_000, seed=20261111)
     assert d["lo"] >= 0.95, d
-    assert d["failing_before_change"] < 0.001
-    assert Q.detection(lim, 0.5, trials=20_000, seed=20261110)["lo"] >= 0.99
-    step = Q.detection(lim, 1.0, trials=2_000, seed=20261110)
-    assert step["probability"] == 1.0 and step["p95_outcomes"] <= lim.consecutive
-    assert Q.wall_seconds(lim.consecutive, lead, 60) == lim.consecutive * lead + 180
+    assert d["excluded"] <= 0.01 * d["trials"]
+    assert Q.latent_detection(lim, 0.5, trials=20_000, seed=20261111)["lo"] >= 0.99
+    step = Q.latent_detection(lim, 1.0, trials=2_000, seed=20261111)
+    assert step["probability"] == 1.0 and step["p95_outcomes"] <= lim.consecutive == 7
 
 
 def test_detection_is_conditional_on_an_eligible_state_at_the_change():
@@ -220,34 +402,81 @@ def test_detection_is_conditional_on_an_eligible_state_at_the_change():
     reported, never counted as a detection. With limits that often alarm at the nominal rate and (almost) no miss
     after the change, nothing can be detected on an eligible path: the earlier reading counted the paths that were
     already failing."""
-    loose = dataclasses.replace(limits(180, 2), recent_n=8, rolling_misses=2, consecutive=2)
-    d = Q.detection(loose, 1e-9, trials=4_000, seed=20261110)
+    loose = dataclasses.replace(limits(600, 1), recent_n=8, rolling_misses=2, consecutive=2)
+    d = Q.latent_detection(loose, 1e-9, trials=4_000, seed=20261110)
     assert d["excluded"] > 0 and d["eligible"] > 0 and d["eligible"] + d["excluded"] == d["trials"] == 4_000
     assert d["failing_before_change"] > 0.05                  # many paths fail AT the change ...
     assert d["unconditional"] >= d["failing_before_change"] * 0.5 > 0     # ... and the earlier reading counted them
     assert d["detected"] == 0 and d["probability"] == 0.0     # none of them is a detection of the change
-    # The interval is over the eligible paths only.
-    assert (d["lo"], d["hi"]) == Q.wilson(0, d["eligible"])
-    # A real change is detected on the eligible paths, and only they are counted.
-    step = Q.detection(loose, 1.0, trials=4_000, seed=20261110)
+    assert (d["lo"], d["hi"]) == Q.wilson(0, d["eligible"])   # the interval is over the eligible paths only
+    step = Q.latent_detection(loose, 1.0, trials=4_000, seed=20261110)
     assert step["eligible"] == d["eligible"] and step["detected"] == step["eligible"] and step["probability"] == 1.0
-    # With the frozen limits almost every path is eligible, and the two readings differ by at most the excluded share.
-    lim = limits(180, 2)
-    f = Q.detection(lim, 0.4, trials=20_000, seed=20261110)
-    assert f["excluded"] <= 0.01 * f["trials"] and f["failing_before_change"] <= f["excluded"] / f["trials"]
-    assert abs(f["probability"] - f["unconditional"]) <= f["excluded"] / f["eligible"]
+    # The complete monitor uses the same notion: Trusted without interruption up to the change.
+    res = Q.MonitorResult(1000, [{"at": 5000, "rules": ["rolling"], "repromoted_at": 9000, "seen": 80}], 500)
+    assert Q.trusted_throughout(res, 4000) and Q.trusted_throughout(res, 9001)
+    assert not Q.trusted_throughout(res, 6000) and not Q.trusted_throughout(res, 9000)
+    assert not Q.trusted_throughout(Q.MonitorResult(None, [], 0), 10 ** 9)
+    assert not Q.trusted_throughout(Q.MonitorResult(1000, [], 0), 1000)
 
 
-def test_the_simulated_detection_is_the_products_own_rule():
-    """The vectorized detection simulation and trust.note_outcome agree miss sequence by miss sequence."""
-    lim = limits(180, 2)
+def test_one_validation_path_goes_through_the_complete_monitor():
+    """A path of the profile: first trust after the 48 h shadow, the change a day or two later, every case decided
+    by a coverage demotion of the complete monitor; the all-miss step is caught by the run rule after at most c
+    outcomes, and the wall time counts the lead, the settlement and the request."""
+    got = Q.path_result("bernoulli", 5)
+    assert got["trusted"] and got["false_alarm"] is None and set(got["detection"]) == {c_ for c_, _ in
+                                                                                    Q.INDEPENDENT_CASES}
+    step = got["detection"]["all-miss step"]              # misses just before the change count towards the run
+    assert (step["state"], step["detected"], step["post_miss_rate"], step["rules"]) == \
+        ("eligible", True, 1.0, ["consecutive"])
+    assert 1 <= step["outcomes"] <= 7 and step["wall_seconds"] == step["outcomes"] * 600 + 120 + 1
+    forty = got["detection"]["independent 40 %"]
+    assert forty["state"] == "eligible" and 0.2 < forty["post_miss_rate"] < 0.6
+    if forty["detected"]:
+        assert 1 <= forty["outcomes"] <= 64 and forty["wall_seconds"] <= Q.wall_deadline_seconds()
+    cal_path = Q.path_result("mixed_ar1", 310_000)           # a development seed: clustered cases on a calibrated path
+    assert set(cal_path["detection"]) == {"independent 40 %", "independent 50 %", "all-miss step", "clustered 40 %",
+                                          "clustered 50 %"}
+    out = Q.gate_outcomes("mixed_ar1", 310_000)
+    assert out.score is not None and len(out.score) == len(out.miss) and (out.grid, out.lead) == (60, 600)
+    assert Q.fold_origin(600, 60) == 720 and Q.fold_origin(601, 60) == 720 and Q.fold_origin(541, 60) == 660
+
+
+def test_the_validation_report_reads_every_source_once_and_needs_every_criterion():
+    seeds = Q.DEVELOPMENT_SEEDS[:3]
+    a = Q.validate(("bernoulli", "additive", "proportional", "mixed"), seeds)
+    b = Q.validate(Q.DEPENDENT_MODELS, seeds)
+    doc = Q.report([a, b])
+    assert [r["source"] for r in doc["rows"]] == list(Q.SOURCES) and doc["parts"] == [a["sha256"], b["sha256"]]
+    assert doc["qualified"] is False                       # three paths decide nothing: every interval is too wide
+    assert doc["limits"]["rolling_misses"] == 18 and doc["profile"]["lead_seconds"] == 600
+    for r in doc["rows"]:
+        assert r["false_alarms"]["paths"] == 3 and r["false_alarms"]["reading"] in ("MET", "INCONCLUSIVE", "NOT MET")
+        want = 3 if r["source"] == "bernoulli" else 5
+        assert len(r["detection"]) == want
+        assert [k for k, d in r["detection"].items() if d["criterion"]] == \
+            (["independent 40 %"] if r["source"] == "bernoulli" else ["independent 40 %", "clustered 40 %"])
+    text = Q.tables(doc)
+    assert text.count("\n") == 2 + 7 + 1 + 2 + 3 + 6 * 5 - 1 and "clustered 40 %" in text
+    with pytest.raises(ValueError, match="every source exactly once"):
+        Q.report([a])
+    with pytest.raises(ValueError, match="every source exactly once"):
+        Q.report([a, b, b])
+    other = Q.validate(Q.DEPENDENT_MODELS, Q.DEVELOPMENT_SEEDS[:2])
+    with pytest.raises(ValueError, match="disagree on seeds"):
+        Q.report([a, other])
+
+
+def test_the_latent_guard_is_the_products_own_rule():
+    """The vectorized latent simulation's rule states are trust.note_outcome's, miss sequence by miss sequence."""
+    lim = limits(600, 1)
     rng = np.random.default_rng(7)
     for trial in range(40):
         seq = np.concatenate([rng.random(4 * lim.recent_n) < 0.1, rng.random(64) < 0.4])
-        f = Feed(lim, lead=180)
+        f = Feed(lim, lead=600)
         first = None
         for i, miss in enumerate(seq):
-            f.window(START + i * 180, covered=not miss)
+            f.window(START + i * 600, covered=not miss)
             state = T.rolling_state(f.ledger["recent"], f.ledger["consecutive_misses"], lim)
             if first is None and i >= 4 * lim.recent_n and (state["rolling"] or state["consecutive"]):
                 first = i - 4 * lim.recent_n + 1
@@ -275,48 +504,22 @@ def bernoulli_outcomes(seed, lead, grid, days, rate=0.1, burst=None):
     return Q.GateOutcomes(grid, lead, ends, miss, first, int(ends[-1]) - lead)
 
 
-def test_the_simulated_false_alarm_rate_at_nominal_stays_inside_the_budget():
-    """Fixed seeds, independent nominal misses through the coverage gate and the hysteresis (fast_monitor, which the
-    next test ties to the product's functions): the upper end of the 95 % interval of the TARGET's false-alarm
-    probability (two families) is within 5 %."""
-    alarms = trusted = 0
-    for seed in range(400):
-        r = Q.fast_monitor(bernoulli_outcomes(seed, 300, 60, 10), TS, 2)
-        trusted += r.trusted_at is not None
-        alarms += r.false_alarm is not None
-    assert trusted == 400
-    lo, hi = Q.wilson(alarms, trusted)
-    assert 2 * hi <= 0.05, (alarms, trusted)
-
-
-@pytest.mark.parametrize("seed, burst", [(1, None), (2, (160, 60, 0.5)), (3, (200, 30, 1.0)), (4, (150, 300, 0.3))])
-def test_the_fast_monitor_is_the_products_trust_evaluation(seed, burst):
+@pytest.mark.parametrize("lead, grid, families, seed, burst", [
+    (600, 60, 1, 1, None), (600, 60, 1, 2, (320, 60, 0.5)), (1200, 300, 2, 3, (200, 30, 1.0)),
+    (1200, 300, 2, 4, (150, 300, 0.3)), (3600, 300, 1, 6, (70, 40, 0.45))])
+def test_the_fast_monitor_is_the_products_trust_evaluation(lead, grid, families, seed, burst):
     """The product's functions at every request (issuances, outcomes, evaluate with its hysteresis; the state
     through JSON every 97 requests, as after a restart) and the event-driven simulation give the same first trust,
-    the same demotions by the same rules at the same requests and the same re-promotions."""
-    out = bernoulli_outcomes(seed, 1200, 300, 9, burst=burst)
-    fast = Q.fast_monitor(out, TS, 2)
-    real = Q.real_monitor(out, TS, 2, restart_every=97)
-    assert fast.trusted_at == real.trusted_at == out.first_bound_origin + 48 * H
+    the same demotions by the same rules at the same requests and the same re-promotions: the profile, and two other
+    leads for the seven-day rule's count condition (which decides at long leads)."""
+    out = bernoulli_outcomes(seed, lead, grid, 9 if lead < 3600 else 12, burst=burst)
+    fast = Q.fast_monitor(out, TS, families)
+    real = Q.real_monitor(out, TS, families, restart_every=97)
+    assert fast.trusted_at == real.trusted_at and fast.trusted_at is not None
     assert [(d["at"], d["rules"], d["repromoted_at"]) for d in fast.demotions] == \
         [(d["at"], d["rules"], d["repromoted_at"]) for d in real.demotions]
     if burst:
         assert fast.demotions and fast.false_alarm is not None
-
-
-def test_the_qualification_declarations_are_fixed():
-    assert Q.DEVELOPMENT_SEEDS == tuple(range(200_000, 201_000))
-    assert Q.VALIDATION_SEEDS == tuple(range(950_000, 951_000))
-    assert (Q.PATHS_DEPENDENT, Q.PATHS_REPORTED) == (500, 300)
-    assert not set(Q.DEVELOPMENT_SEEDS) & set(Q.VALIDATION_SEEDS)
-    assert Q.DETECTION_DEVELOPMENT_SEED != Q.DETECTION_VALIDATION_SEED
-    assert (Q.FALSE_ALARM_TARGET, Q.DETECTION_TARGET, Q.DETECTION_OUTCOMES) == (0.05, 0.95, 64)
-    assert Q.CONFIGS == ((60, 180, True), (60, 300, True), (300, 1200, False))
-    assert Q.NOMINAL_MODELS == ("additive", "proportional", "mixed")
-    assert Q.reading_at_most(0.01, 0.02, 0.03, 0.05) == "MET" and Q.reading_at_most(0.03, 0.04, 0.06, 0.05) == \
-        "INCONCLUSIVE" and Q.reading_at_most(0.05, 0.06, 0.07, 0.05) == "NOT MET"
-    assert Q.reading_at_least(0.96, 0.97, 0.98, 0.95) == "MET" and Q.reading_at_least(0.93, 0.94, 0.96, 0.95) == \
-        "NOT MET"
 
 
 # --- looks happen on new evidence only -------------------------------------------------------------------------------------
@@ -342,7 +545,7 @@ def test_polling_unchanged_evidence_cannot_alarm_again_or_count_twice():
     f = Feed().run(72, covered=spread)
     v, h = evaluate(f, START + 72 * H)
     assert v.candidates["seasonal_naive"].trusted
-    run = f.lim.consecutive                                           # 6 at this lead with two families
+    run = f.lim.consecutive                                           # 7 at this lead with two families
     for i in range(run):
         f.window(START + 72 * H + i * L, covered=False)
     now = START + 72 * H + run * L
@@ -357,7 +560,7 @@ def test_polling_unchanged_evidence_cannot_alarm_again_or_count_twice():
     assert f.ledger["monitor"] == mon                                # evaluating never touches the ledger's account
     why = h["seasonal_naive"]["last_demotion"]
     assert why["at_s"] == now and why["gates"] == ["coverage"] and why["coverage"]["failing"] == ["consecutive"]
-    assert why["coverage"]["consecutive"] == [run, run] and run == 6 > TS.acute_consecutive_misses
+    assert why["coverage"]["consecutive"] == [run, run] and run == 7 > TS.acute_consecutive_misses
     assert why["latched_alarm"]["rule"] == "consecutive"
     # More misses while the rule already fails are the same alarm, not new ones.
     f.window(now, covered=False)
@@ -504,15 +707,25 @@ def test_missing_outcomes_are_an_availability_matter_not_a_miss():
     assert row[1] == row[2] and 70 <= row[1] <= 74 and row[3] == limits().day_misses(row[1])   # scored ones, all covered
 
 
-# --- the seven-day gate and the dwell are unchanged ---------------------------------------------------------------------
+# --- the seven-day rule: low coverage AND a significant count; the dwell is unchanged ------------------------------------
 
-def test_the_seven_day_gate_and_the_repromotion_dwell_are_unchanged():
-    low = Feed().run(72, covered=lambda t: (t // L) % 6 != 0)        # 83.3 % < 85 %, 11 misses in every 64
+def test_the_seven_day_rule_needs_low_coverage_and_a_significant_count_and_the_dwell_is_unchanged():
+    k7 = limits().seven_day_misses(432)
+    low = Feed().run(72, covered=lambda t: (t // L) % 6 != 0)        # 83.3 % < 85 %: 72 misses of 432
     gates, info = T.candidate_gates(inputs(low), glob(START + 72 * H), TS)
-    assert not gates["coverage"] and info["coverage"]["failing"] == ["seven_day"]
-    assert info["coverage"]["seven_day"] == [360, 432]
-    ok = Feed().run(72, covered=lambda t: (t // L) % 8 != 0)         # 87.5 %
-    assert T.candidate_gates(inputs(ok), glob(START + 72 * H), TS)[0]["coverage"]
+    assert info["coverage"]["seven_day"] == [360, 432, k7] and 72 < k7 < 108
+    assert gates["coverage"] and info["coverage"]["failing"] == []   # below 85 %, within the noise of 432 outcomes
+    lower = Feed().run(72, covered=lambda t: (t // L) % 4 != 0)      # 75 %: 108 misses of 432
+    gates, info = T.candidate_gates(inputs(lower), glob(START + 72 * H), TS)
+    assert not gates["coverage"] and "seven_day" in info["coverage"]["failing"]
+    many = Feed(limits(600, 2)).run(72, covered=lambda t: (t // L) % 8 != 0)   # 87.5 %: the coverage condition holds
+    gates, info = T.candidate_gates(inputs(many), glob(START + 72 * H), TS)
+    assert gates["coverage"] and info["coverage"]["seven_day"][:2] == [378, 432]
+    none = T.candidate_gates(inputs(Feed()), glob(START + 72 * H), TS)[1]["coverage"]
+    assert "seven_day" in none["failing"] and none["seven_day"][:2] == [0, 0]   # no outcome at all: never holding
+    # With a week of outcomes at a short lead the coverage condition is the binding one, as it always was.
+    week = limits(180, 2)
+    assert week.seven_day_misses(week.looks) < 15 * week.looks // 100 + 1
     led = T.new_ledger(EPOCH, "seasonal_naive", "r", L)
     h = T.step(T.new_hysteresis("r", EPOCH), True, led, 0, TS)
     h = T.step(h, False, led, 100, TS, {"gates": ["coverage"]})
@@ -529,12 +742,15 @@ def test_the_trust_policy_and_its_thresholds_are_in_the_fingerprint_and_the_poli
     pa = svc_helpers.pa_object()
     s = c.resolve_settings(pa)
     canon = s.canonical()["settings"]["trust"]
-    assert canon["policy"] == c.TRUST_POLICY_REVISION == "budgeted-coverage-tests/v1"
-    assert (canon["rolling_alarm_ppm"], canon["consecutive_alarm_ppm"], canon["day_alarm_ppm"]) == \
-        (TS.rolling_alarm_ppm, TS.consecutive_alarm_ppm, TS.day_alarm_ppm) == (35_000, 7_000, 8_000)
+    assert canon["policy"] == c.TRUST_POLICY_REVISION == "budgeted-coverage-tests/v2"
+    assert (canon["rolling_alarm_ppm"], canon["consecutive_alarm_ppm"], canon["day_alarm_ppm"],
+            canon["seven_day_alarm_ppm"], canon["miss_dependence_bps"]) == \
+        (TS.rolling_alarm_ppm, TS.consecutive_alarm_ppm, TS.day_alarm_ppm, TS.seven_day_alarm_ppm,
+         TS.miss_dependence_bps) == (33_000, 7_000, 8_000, 2_000, 1_750)
     assert (canon["acute_recent_windows"], canon["acute_consecutive_misses"]) == (64, 5)
     assert s.trust.policy == c.TRUST_POLICY_REVISION                 # the resolved-settings field
     for name, value in (("rolling_alarm_ppm", 1), ("consecutive_alarm_ppm", 1), ("day_alarm_ppm", 1),
+                        ("seven_day_alarm_ppm", 1), ("miss_dependence_bps", 1000),
                         ("policy", "other/v9"), ("acute_recent_windows", 32), ("acute_consecutive_misses", 6)):
         other = dataclasses.replace(s, trust=dataclasses.replace(s.trust, **{name: value}))
         assert other.fingerprint() != s.fingerprint(), name
@@ -545,7 +761,8 @@ def test_the_trust_policy_and_its_thresholds_are_in_the_fingerprint_and_the_poli
     assert c.evidence_key(sig, revised, svc_helpers.LEAD) != key     # a policy revision is a new evidence epoch
     budget = dataclasses.replace(s, trust=dataclasses.replace(s.trust, rolling_alarm_ppm=1))
     assert c.evidence_key(sig, budget, svc_helpers.LEAD) == key      # thresholds alone keep the evidence (as before)
-    for key_name in ("policy", "rollingAlarmPpm", "consecutiveAlarmPpm", "dayAlarmPpm"):   # not in the spec
+    for key_name in ("policy", "rollingAlarmPpm", "consecutiveAlarmPpm", "dayAlarmPpm", "sevenDayAlarmPpm",
+                     "missDependenceBps"):                           # resolved, never read from the spec
         with pytest.raises(c.ContractRefused, match="unknown"):
             c.resolve_settings({"spec": {"prediction": {"trust": {key_name: 1}}}})
 
@@ -558,6 +775,7 @@ def pre_policy_identity(pa, lead_seconds):
     for k in PRE_POLICY_ADDED:
         canon["settings"]["trust"].pop(k)
     canon["settings"]["trust"].update(acute_recent_windows=32)
+    canon["settings"].pop("min_lead_seconds")
     body = {"schema": c.EVIDENCE_SCHEMA, "autoscaler_uid": pa["metadata"]["uid"],
             "target_uid": pa["status"]["metricSource"]["targetUID"],
             "query_sha256": pa["status"]["metricSource"]["sha256"], "signal_contract": svc_helpers.CONTRACT,
@@ -569,9 +787,35 @@ def pre_policy_identity(pa, lead_seconds):
     return c.sha256_hex(c.canonical_json(canon)), c.sha256_hex(c.canonical_json(body))
 
 
-def test_a_peer_of_the_earlier_trust_policy_gets_no_forecast(tmp_path):
+def policy_v1_identity(pa, lead_seconds):
+    """(settings fingerprint, evidence key) of trust policy budgeted-coverage-tests/v1, re-derived: today's canonical
+    settings and evidence-key body without what v2 added, with v1's name and rolling budget."""
+    s = c.resolve_settings(pa)
+    canon = s.canonical()
+    for k in ("seven_day_alarm_ppm", "miss_dependence_bps"):
+        canon["settings"]["trust"].pop(k)
+    canon["settings"]["trust"].update(policy="budgeted-coverage-tests/v1", rolling_alarm_ppm=35_000)
+    canon["settings"].pop("min_lead_seconds")
+    body = {"schema": c.EVIDENCE_SCHEMA, "autoscaler_uid": pa["metadata"]["uid"],
+            "target_uid": pa["status"]["metricSource"]["targetUID"],
+            "query_sha256": pa["status"]["metricSource"]["sha256"], "signal_contract": svc_helpers.CONTRACT,
+            "forecast_contract": c.FORECAST_CONTRACT, "interval_seconds": s.sample_interval_seconds,
+            "lead_seconds": lead_seconds, "engine": s.engine, "seasonality": s.seasonality,
+            "history_days": s.history_days, "settlement_seconds": s.settlement_seconds,
+            "outcome_grace_seconds": s.outcome_grace_seconds, "risk": dataclasses.asdict(s.risk),
+            "calibration": dataclasses.asdict(s.calibration), "trust_policy": "budgeted-coverage-tests/v1"}
+    return c.sha256_hex(c.canonical_json(canon)), c.sha256_hex(c.canonical_json(body))
+
+
+def test_the_identity_of_policy_v1_is_what_its_code_computed():
+    """Nothing but the policy revision, its budgets and the minimum lead moved the identity since v1."""
+    assert policy_v1_identity(svc_helpers.pa_object(), svc_helpers.LEAD) == POLICY_V1_IDENTITY
+
+
+@pytest.mark.parametrize("earlier", [pre_policy_identity, policy_v1_identity])
+def test_a_peer_of_the_earlier_trust_policy_gets_no_forecast(tmp_path, earlier):
     svc, clock = svc_helpers.make(tmp_path)
-    old_sha, old_ek = pre_policy_identity(svc_helpers.pa_object(), svc_helpers.LEAD)
+    old_sha, old_ek = earlier(svc_helpers.pa_object(), svc_helpers.LEAD)
     bound = c.bind_request(svc_helpers.body(svc_helpers.T0), svc_helpers.Reader(),
                            now_ms=svc_helpers.T0 * 1000 + 10_000)
     assert bound.settings_sha256 != old_sha and bound.evidence_key != old_ek
@@ -581,11 +825,12 @@ def test_a_peer_of_the_earlier_trust_policy_gets_no_forecast(tmp_path):
     assert (e.value.status, e.value.reason) == (422, "IdentityMismatch") and svc.store.issuances() == []
 
 
-def test_an_old_trusted_state_does_not_survive_the_policy_change(tmp_path):
-    """A journal holding a Trusted checkpoint of the earlier trust policy (its own evidence key, the earlier state and
-    ledger schemas): this policy starts a new epoch with no evidence and no trust, and leaves the old one alone."""
+@pytest.mark.parametrize("earlier", [pre_policy_identity, policy_v1_identity])
+def test_an_old_trusted_state_does_not_survive_the_policy_change(tmp_path, earlier):
+    """A journal holding a Trusted checkpoint of an earlier trust policy (its own evidence key, an earlier ledger
+    schema): this policy starts a new epoch with no evidence and no trust, and leaves the old one alone."""
     svc, clock = svc_helpers.make(tmp_path)
-    _, old_ek = pre_policy_identity(svc_helpers.pa_object(), svc_helpers.LEAD)
+    _, old_ek = earlier(svc_helpers.pa_object(), svc_helpers.LEAD)
     old_ledger = {k: v for k, v in T.new_ledger(old_ek, "seasonal_naive", "seasonal-naive/daily/v1", 300).items()
                   if k != "monitor"}
     old_ledger["schema"] = "evidence-ledger/v2"

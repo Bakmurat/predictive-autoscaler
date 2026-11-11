@@ -22,7 +22,7 @@ H, DAY = 3600, 86400
 START = 1_793_923_200 - 1_793_923_200 % DAY
 TS = c.TrustSettings()
 NOMINAL = 0.10
-LIMITS = T.coverage_limits(TS, L, 1000, 2)   # lead 600 s, two families: 18 misses in the last 64, or 6 in a row
+LIMITS = T.coverage_limits(TS, L, 1000, 2)   # lead 600 s, two families: 19 misses in the last 64, or 7 in a row
 GRACE = 720                                # settlement 120 + grace 600
 
 
@@ -68,7 +68,7 @@ POLICY = "p" * 64
 
 
 def glob(now, **kw):
-    return T.Global(now_s=now, lead_seconds=L, nominal_miscoverage=NOMINAL, **{"replay_suite_passed": True,
+    return T.Global(now_s=now, lead_seconds=L, nominal_miscoverage=NOMINAL, **{"replay_suite_passed": True, "configuration_validated": True,
                                                                                "startup_budget_valid": True,
                                                                                "policy_sha256": POLICY, **kw})
 
@@ -279,12 +279,12 @@ def test_acute_misses_demote_a_trusted_candidate_at_once():
 
 def test_the_recent_bounds_must_stay_below_the_rolling_limit():
     f = good()
-    assert LIMITS.recent_n == 64 and LIMITS.rolling_misses == 18
+    assert LIMITS.recent_n == 64 and LIMITS.rolling_misses == 19
     for i in range(64):                                              # 64 recent bounds with 22 misses, never 2 in a row
         f.window(NOW + i * L, covered=i % 3 != 0)
     gates, info = T.candidate_gates(inputs(f), glob(NOW + 64 * L), TS)
     assert not gates["coverage"] and f.ledger["consecutive_misses"] < 2
-    assert info["coverage"]["failing"] == ["rolling"] and info["coverage"]["rolling"] == [22, 64, 18]
+    assert info["coverage"]["failing"] == ["rolling"] and info["coverage"]["rolling"] == [22, 64, 19]
     g = good()
     for i in range(64):                                              # 16 misses in 64 (75 % covered): within the limit
         g.window(NOW + i * L, covered=i % 4 != 0)

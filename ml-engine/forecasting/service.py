@@ -26,6 +26,11 @@ those pairs, with the issued bounds from the journal and the measured rates as t
 models, recipes, window and policy fingerprint, and trust uses it only when all of them match.
 spec.prediction.families restricts what is forecast at all (seasonalNaive only: E1 is never a candidate).
 
+Predictive eligibility also needs a validated configuration (contracts.VALIDATED_PROFILES: grid, lead, risk and family
+set the trust policy was qualified for, with the default calibration, trust and timing settings). Any other
+configuration is forecast, calibrated, scored and reported exactly the same, and its verdict is never PredictionReady
+(reason ConfigurationNotValidated), under a release gate or a lab qualification alike.
+
 This preview is shadow only: the release gates (G0-G5, C2.8) have not passed, so the verdict's PredictionReady and every
 response's predictive_eligible are false whatever the evidence says, except under a verified LAB qualification
 (forecasting.qualification) in an evaluation build, for the named cluster, namespaces and target UIDs only: it stands in
@@ -53,7 +58,7 @@ from forecasting import trust as T
 from forecasting.artifacts import ArtifactRefused, ArtifactStore, Binding, encode_e1, fit_payload
 from forecasting.clock import ReceiptClock
 from forecasting.contracts import FAMILY_MODELS, FORECAST_CONTRACT, UNIT, BoundRequest, ContractRefused, V2Response, \
-    bind_request, canonical_json, check_response, sha256_hex
+    bind_request, canonical_json, check_response, sha256_hex, validated_profile
 from forecasting.history import HistoryRefused, HistoryUnavailable, read_rps_history
 from forecasting.maturation import candidate, issued_outcome
 from forecasting.metrics import ForecastMetrics, RegistryFull, Snapshot, model_samples
@@ -374,7 +379,8 @@ class ForecastService:
                      identity_ok=True, store_healthy=self.store_healthy, replay_suite_passed=gate["passed"],
                      startup_budget_valid=True, policy_sha256=policy_sha,
                      outcome_deadline_seconds=s.settlement_seconds + s.outcome_grace_seconds,
-                     families=len(s.families))
+                     families=len(s.families),
+                     configuration_validated=validated_profile(s, lead.lead_seconds) is not None)
         pairs = state["pairs"] if "seasonal_naive" in points else {}   # paired evidence needs its naive baseline
         verdict, new_h = T.evaluate(inputs, state["trust"], g, s.trust, pairs=pairs, costs=costs)
         state["trust"] = new_h

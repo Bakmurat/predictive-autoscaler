@@ -27,27 +27,53 @@ Gates per candidate (all thresholds are TrustSettings parameters, fingerprinted 
                     (scored / (scored + unscorable + overdue)) and (b) the expected forecast opportunities issued
                     (issued origins / grid origins since the first issuance); None (nothing to count) fails
                                                                                                else DataUnavailable
-Coverage rules (policy budgeted-coverage-tests/v1). Each is a test of "the bound misses at the nominal rate a" on
-prospective gate outcomes (cohort windows with an issued bound), and their false-alarm probabilities share one budget:
-P(any false coverage demotion of a target within 7 days) under independent misses at the nominal rate.
-  rolling      the last acute_recent_windows (n) gate outcomes hold at least k misses, with k the smallest count whose
-               union bound over the N = 7 d / lead looks of 7 days, N * a * P(Bin(n - 1, a) >= k - 1), is within the
-               rule's budget (rolling_alarm_ppm / enabled families). The bound is exact arithmetic (integers), valid
-               for any overlap of the windows; it is evaluated on the misses among the outcomes seen so far, so fewer
-               than n outcomes can already alarm (k misses in fewer trials is the stronger evidence).
+Coverage rules (policy budgeted-coverage-tests/v2). Each is a test on prospective gate outcomes (cohort windows with
+an issued bound). Their thresholds are COMPUTED UNDER ONE STATED MODEL of the miss sequence, and their computed
+false-alarm probabilities share one budget (rolling + consecutive + day + seven-day = 5 % per target and 7 days,
+divided equally among the enabled families).
+
+  The model (what the arithmetic assumes, nothing more). The gate misses X_1, X_2, ... are a stationary two-state
+  Markov chain: P(X = 1) = a, the nominal miscoverage, and P(X_t = 1 | X_{t-1} = 1) = q, with
+  q = max(miss_dependence_bps, a) (0.175 by default); so P(X_t = 1 | X_{t-1} = 0) = a (1 - q) / (1 - a). Initialization:
+  every probability below is computed with the chain in its stationary distribution at the first outcome of the
+  window (or with the outcome leaving the window covered, where stated). q = a is independence.
+  What this is NOT: a guarantee for every miss process whose measured P(miss | previous miss) is at most q. A
+  process with that lag-1 dependence need not be first-order Markov, and the boundaries are not shown conservative
+  over a class of processes. The policy is QUALIFIED EMPIRICALLY under named models (independent misses; the misses
+  of the calibrated bound on independent noise and on AR(1) noise with rho = 0.7), on an allowlist of configurations
+  (contracts.VALIDATED_PROFILES; evaluation/trust_qualification.py). Outside the allowlist predictive eligibility
+  is refused (reason ConfigurationNotValidated); the rules still run and are reported.
+
+  rolling      the last acute_recent_windows (n) gate outcomes hold at least k misses. k is the smallest count such
+               that, for every count from k on, N x P(the rule STARTS failing at a look) is within the rule's budget
+               (rolling_alarm_ppm / families), N = 7 d / lead looks. The rule starts failing at a look only if the
+               newest outcome is a miss, the outcome that left the window was covered, and the n - 1 between them
+               hold exactly k - 1 misses; that probability is computed for the model in exact integer arithmetic.
+               The expected number of such onsets in 7 days bounds the probability of any. It needs a full window,
+               which a trusted candidate has: the settings require min_prospective_windows >= acute_recent_windows.
   consecutive  c gate outcomes in a row missed, with c the smallest count, not below acute_consecutive_misses (5),
-               whose bound (N (1 - a) + 1) a^c on the probability of such a run within 7 days is within the rule's
-               budget (consecutive_alarm_ppm / families). At lead 180 s and a = 0.1 the bound is 3.0 % for c = 5 and
-               0.30 % for c = 6, so the rule stays at five only where the budget holds (long leads) and is six at the
-               evaluation leads.
+               with (N a (1 - q) + a) q^(c - 1) within the budget (consecutive_alarm_ppm / families): the expected
+               number of runs of c that start in 7 days, plus one already under way (exact integers).
   day          a COMPLETED UTC day (inside the 7-day window, past its outcome deadline: day end + settlement + grace,
                with at least worst_day_min_outcomes gate outcomes) holds at least k_m misses among its m outcomes,
-               k_m the smallest count with P(Bin(m, a) >= k_m) <= (day_alarm_ppm / families) / 7: one test per day,
-               seven days in the window. The evidence of a completed day is final, so every later evaluation reads
-               the same answer: the day is looked at once. A failed day keeps the rule failed while it is inside the
-               7-day window (until an hour before its start leaves it), as the worst-day rule always did. The
-               current, partial day is never tested.
-  seven_day    prospective gate coverage over the trailing 7 days >= nominal - coverage_tolerance (unchanged).
+               k_m the smallest count with P(S_m >= k_m) <= (day_alarm_ppm / families) / 7 under the model: one
+               test per day, seven days in the window. The evidence of a completed day is final, so every later
+               evaluation reads the same answer: the day is looked at once. A failed day keeps the rule failed while
+               it is inside the 7-day window (until an hour before its start leaves it). The current, partial day is
+               never tested.
+  seven_day    prospective gate coverage over the trailing 7 days is below nominal - coverage_tolerance AND the m
+               gate outcomes of that window hold at least k7_m misses, k7_m the smallest count with
+               (N + 168) x P(S_m >= k7_m) within the budget (seven_day_alarm_ppm / families): a union over every new
+               outcome and every hourly shift of the window in 7 days. With many outcomes the coverage condition is
+               the binding one (the rule is then what it always was); with few (long leads, a young candidate) the
+               count is, so that a nominal bound is not demoted by the noise of a small sample. THE PRICE: at long
+               leads the rule no longer reacts to a moderate sustained undercoverage that a week's outcomes cannot
+               tell from noise at this false-alarm budget. At a 600 s lead, one family: a full week needs 153
+               of 1,008 outcomes missed where the coverage condition alone needed 152; a two-day window needs 59 of
+               288 (20.5 %) where it needed 44; at a 3,600 s lead a full week needs 39 of 168 where it needed 26.
+  The tail probabilities P(S_m >= k) of the day and seven-day rules are computed by the model's recursion in
+  double precision (count_limits); the rolling and consecutive thresholds are exact. The thresholds of the
+  allowlisted configurations are pinned by tests.
 A statistical LOOK of the rolling and consecutive rules happens when a new gate outcome is folded into the ledger
 (exactly once, by its journal sequence number), never at a poll: the ledger's monitor counts each ALARM (a rule going
 from holding to failing at a look) and remembers the last one. An evaluation between two looks reads the same ledger
@@ -78,8 +104,10 @@ selected only after its promotion criteria have held continuously for repromotio
 until its paired loss is worse than challenger_exit_loss_ratio x the naive's or its costs fail. Marginal superiority
 therefore cannot make the selection flap. The selection state is bound to the epoch: a new epoch starts it over. Never
 an untrusted naive because a richer model failed.
-PredictionReady additionally needs the activation evidence this service can check (versioned replay suite, startup
-budget): it means "ready to activate"; Recommend still makes no writes, and it says nothing about a workload's SLO.
+PredictionReady additionally needs a VALIDATED CONFIGURATION (the caller says whether grid, lead, risk and family set
+are on the allowlist the trust policy was qualified for; otherwise the reason is ConfigurationNotValidated whatever the
+evidence) and the activation evidence this service can check (versioned replay suite, startup budget): it means "ready
+to activate"; Recommend still makes no writes, and it says nothing about a workload's SLO.
 """
 
 from __future__ import annotations
@@ -89,11 +117,13 @@ import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
+import numpy as np
+
 from forecasting.calibration import CalibrationRecord, in_cohort, pinball_rps
 from forecasting.contracts import TRUST_POLICY_REVISION, TrustSettings
 from forecasting.maturation import candidate
 
-LEDGER_SCHEMA = "evidence-ledger/v3"
+LEDGER_SCHEMA = "evidence-ledger/v4"
 PPM = 1_000_000
 BPS = 10_000
 COVERAGE_RULES = ("rolling", "consecutive", "day", "seven_day")
@@ -104,8 +134,8 @@ NAIVE = "seasonal_naive"
 MODES = ("prospective", "replay")
 SELECTION = "_selection"
 REASON_ORDER = ("IdentityMismatch", "StateUnavailable", "DataUnavailable", "HistoryInsufficient",
-                "CalibrationInsufficient", "ShadowInsufficient", "CoverageLow", "LeadInsufficient",
-                "ReplayGateMissing", "Ready")
+                "CalibrationInsufficient", "ShadowInsufficient", "CoverageLow", "ConfigurationNotValidated",
+                "LeadInsufficient", "ReplayGateMissing", "Ready")
 # The candidate history minimums of the cold-start ladder (design C2, section 4); an optional LSTM brings its own.
 REQUIRED_HISTORY_SECONDS = {"seasonal_naive": DAY, "statistical": 7 * DAY}
 # Prospective: issued (all, gate), scored/unscorable (all, gate), bounded/covered (all, gate), pinball, error sums.
@@ -119,11 +149,12 @@ class TrustError(Exception):
     pass
 
 
-# --- coverage limits: exact binomial arithmetic ----------------------------------------------------------------------
+# --- coverage limits: thresholds under the stated transition model (module docstring) -----------------------------------
 
 @functools.lru_cache(maxsize=4096)
 def binomial_tail(n: int, miss_bps: int, k: int) -> int:
-    """The numerator of P(Bin(n, miss_bps / 10^4) >= k) over the denominator 10^(4 n): an exact integer."""
+    """The numerator of P(Bin(n, miss_bps / 10^4) >= k) over the denominator 10^(4 n): an exact integer. (Independent
+    misses, the model's q = a case: kept as the reference the model's thresholds are checked against.)"""
     if k <= 0:
         return BPS ** n
     a, b = miss_bps, BPS - miss_bps
@@ -134,43 +165,91 @@ def binomial_tail(n: int, miss_bps: int, k: int) -> int:
     return total
 
 
-@functools.lru_cache(maxsize=1024)
-def rolling_limit(n: int, miss_bps: int, looks: int, budget_ppm: int, families: int) -> int:
-    """The smallest k in 1..n with looks * a * P(Bin(n - 1, a) >= k - 1) <= budget_ppm / families (per 7 days), or
-    n + 1 when there is none (the rule then never alarms). The left side bounds the probability that some look of
-    7 days is an alarm ONSET (the newest outcome a miss with at least k - 1 misses among the n - 1 before it)."""
-    for k in range(1, n + 1):
-        if looks * miss_bps * binomial_tail(n - 1, miss_bps, k - 1) * PPM * families <= budget_ppm * BPS ** n:
-            return k
-    return n + 1
+def model_dependence_bps(miss_bps: int, dependence_bps: int) -> int:
+    """q of the model in basis points: the configured P(miss | previous miss), never below the miss rate itself (the
+    model has no negative dependence)."""
+    return max(miss_bps, dependence_bps)
 
 
-@functools.lru_cache(maxsize=4096)
-def day_limit(m: int, miss_bps: int, budget_ppm: int, families: int) -> int:
-    """The smallest k with P(Bin(m, a) >= k) <= (budget_ppm / families) / 7 for a day of m gate outcomes (m + 1: no
-    count of misses is that unlikely, so the day cannot fail)."""
-    for k in range(0, m + 1):
-        if binomial_tail(m, miss_bps, k) * PPM * families * 7 <= budget_ppm * BPS ** m:
-            return k
-    return m + 1
+def _transitions(miss_bps: int, dependence_bps: int) -> Tuple[int, int, int, int, int]:
+    """(w00, w01, w10, w11, D): the chain's transition probabilities as integers over the common denominator D.
+    From covered: miss with a (1 - q) / (1 - a); from a miss: miss with q."""
+    a, q = miss_bps, model_dependence_bps(miss_bps, dependence_bps)
+    d = BPS * (BPS - a)
+    w01, w11 = a * (BPS - q), q * (BPS - a)
+    w00, w10 = d - w01, d - w11
+    g = math.gcd(math.gcd(w00, w01), math.gcd(math.gcd(w10, w11), d))
+    return w00 // g, w01 // g, w10 // g, w11 // g, d // g
 
 
 @functools.lru_cache(maxsize=1024)
-def consecutive_limit(least: int, miss_bps: int, looks: int, budget_ppm: int, families: int) -> int:
-    """The smallest c >= least with (looks (1 - a) + 1) a^c <= budget_ppm / families (per 7 days): a bound on the
-    probability that a run of c misses starts at some look of 7 days. Exact integers."""
+def rolling_limit(n: int, miss_bps: int, dependence_bps: int, looks: int, budget_ppm: int, families: int) -> int:
+    """The smallest k in 1..n such that, for every count from k on, looks x P(onset) <= budget_ppm / families, or
+    n + 1 when there is none (the rule then never alarms). Onset at a look of a full window: the outcome that left
+    was covered, the n - 1 between hold exactly k - 1 misses, the newest is a miss. Exact integers: numerators over
+    BPS x D^n, the chain stationary at the outcome that left."""
+    w00, w01, w10, w11, d = _transitions(miss_bps, dependence_bps)
+    cov, mis = [0] * (n + 1), [0] * (n + 1)          # numerators by miss count: last outcome covered / missed
+    cov[0] = BPS - miss_bps                          # the outcome that left the window: covered, stationary
+    for _ in range(n - 1):
+        new_cov = [w00 * cov[j] + w10 * mis[j] for j in range(n + 1)]
+        new_mis = [0] + [w01 * cov[j] + w11 * mis[j] for j in range(n)]
+        cov, mis = new_cov, new_mis
+    onset = [w01 * cov[j] + w11 * mis[j] for j in range(n + 1)]     # onset[j]: j misses between, then a miss
+    scale = budget_ppm * BPS * d ** n
+    k = n + 1
+    while k > 1 and looks * onset[k - 2] * PPM * families <= scale:
+        k -= 1
+    return k
+
+
+@functools.lru_cache(maxsize=1024)
+def consecutive_limit(least: int, miss_bps: int, dependence_bps: int, looks: int, budget_ppm: int,
+                      families: int) -> int:
+    """The smallest c >= least with (looks a (1 - q) + a) q^(c - 1) <= budget_ppm / families (per 7 days): the
+    expected number of runs of c misses that start at a look of 7 days, plus one under way at their start. Exact."""
+    a, q = miss_bps, model_dependence_bps(miss_bps, dependence_bps)
     c = max(1, least)
-    while (looks * (BPS - miss_bps) + BPS) * miss_bps ** c * PPM * families > budget_ppm * BPS ** (c + 1):
+    while (looks * a * (BPS - q) + a * BPS) * q ** (c - 1) * PPM * families > budget_ppm * BPS ** (c + 1):
         c += 1
         if c > 4096:
             raise TrustError("no run length fits the consecutive rule's budget")
     return c
 
 
-def consecutive_bound_ppm(c: int, miss_bps: int, looks: int) -> float:
-    """An upper bound, in ppm, of P(c consecutive misses somewhere in `looks` outcomes) under independent misses."""
-    a = miss_bps / BPS
-    return (looks * (1.0 - a) + 1.0) * a ** c * PPM
+def consecutive_bound_ppm(c: int, miss_bps: int, dependence_bps: int, looks: int) -> float:
+    """The model's bound, in ppm, on P(c consecutive misses somewhere in `looks` outcomes)."""
+    a, q = miss_bps / BPS, model_dependence_bps(miss_bps, dependence_bps) / BPS
+    return (looks * a * (1.0 - q) + a) * q ** (c - 1) * PPM
+
+
+@functools.lru_cache(maxsize=64)
+def count_limits(upto: int, miss_bps: int, dependence_bps: int, alpha_num: int, alpha_den: int) -> Tuple[int, ...]:
+    """k[m] for m = 0..upto: the smallest count with P(S_m >= k) <= alpha_num / alpha_den, S_m the misses among m
+    consecutive outcomes of the model started in its stationary distribution (m + 1: no count is that unlikely).
+    Double precision; the recursion adds non-negative terms only and the tail is summed from its small end."""
+    w00, w01, w10, w11, d = _transitions(miss_bps, dependence_bps)
+    p00, p01, p10, p11 = w00 / d, w01 / d, w10 / d, w11 / d
+    alpha = alpha_num / alpha_den
+    cov, mis = np.zeros(upto + 2), np.zeros(upto + 2)
+    cov[0], mis[1] = 1.0 - miss_bps / BPS, miss_bps / BPS
+    out = [1] + [0] * upto
+    for m in range(1, upto + 1):
+        if m > 1:
+            new_cov = p00 * cov + p10 * mis
+            new_mis = np.zeros(upto + 2)
+            new_mis[1:] = p01 * cov[:-1] + p11 * mis[:-1]
+            cov, mis = new_cov, new_mis
+        tail = np.cumsum((cov[:m + 2] + mis[:m + 2])[::-1])[::-1]       # tail[k] = P(S_m >= k); tail[m + 1] = 0
+        out[m] = int(np.count_nonzero(tail > alpha))                    # the tail is non-increasing in k
+    return tuple(out)
+
+
+def _limit_at(table: Tuple[int, ...], outcomes: int) -> int:
+    """The table's threshold for a count of outcomes; beyond the table every further outcome is taken as a possible
+    miss (P(S_m >= k + m - M) <= P(S_M >= k)), which keeps the bound valid."""
+    top = len(table) - 1
+    return table[outcomes] if outcomes <= top else table[top] + (outcomes - top)
 
 
 @dataclass(frozen=True)
@@ -183,11 +262,22 @@ class CoverageLimits:
     consecutive: int                    # alarm at this many gate outcomes missed in a row (budget-derived)
     looks: int                          # gate outcomes per 7 days
     miss_bps: int
+    dependence_bps: int                 # the model's P(miss | previous miss), basis points
     day_alarm_ppm: int
+    seven_day_alarm_ppm: int
     families: int
 
     def day_misses(self, outcomes: int) -> int:
-        return day_limit(outcomes, self.miss_bps, self.day_alarm_ppm, self.families)
+        """A completed day of this many gate outcomes fails at this many misses."""
+        table = count_limits(self.looks // 7 + 2, self.miss_bps, self.dependence_bps, self.day_alarm_ppm,
+                             PPM * self.families * 7)
+        return _limit_at(table, outcomes)
+
+    def seven_day_misses(self, outcomes: int) -> int:
+        """The seven-day rule's count condition: at least this many misses among the window's gate outcomes."""
+        table = count_limits(self.looks + 64, self.miss_bps, self.dependence_bps, self.seven_day_alarm_ppm,
+                             PPM * self.families * (self.looks + 168))
+        return _limit_at(table, outcomes)
 
 
 def coverage_limits(t: TrustSettings, lead_seconds: int, miss_bps: int, families: int) -> CoverageLimits:
@@ -196,10 +286,12 @@ def coverage_limits(t: TrustSettings, lead_seconds: int, miss_bps: int, families
     if lead_seconds <= 0 or not 0 < miss_bps < BPS or families < 1:
         raise TrustError("coverage limits need a lead, a nominal miscoverage and at least one family")
     looks = max(1, 7 * DAY // lead_seconds)
+    q = model_dependence_bps(miss_bps, t.miss_dependence_bps)
     return CoverageLimits(t.policy, t.acute_recent_windows,
-                          rolling_limit(t.acute_recent_windows, miss_bps, looks, t.rolling_alarm_ppm, families),
-                          consecutive_limit(t.acute_consecutive_misses, miss_bps, looks, t.consecutive_alarm_ppm,
-                                            families), looks, miss_bps, t.day_alarm_ppm, families)
+                          rolling_limit(t.acute_recent_windows, miss_bps, q, looks, t.rolling_alarm_ppm, families),
+                          consecutive_limit(t.acute_consecutive_misses, miss_bps, q, looks, t.consecutive_alarm_ppm,
+                                            families), looks, miss_bps, q, t.day_alarm_ppm, t.seven_day_alarm_ppm,
+                          families)
 
 
 # --- evidence records and ledgers -----------------------------------------------------------------------------------
@@ -540,6 +632,9 @@ class Global:
     policy_sha256: Optional[str] = None       # the policy the costs must have been simulated under
     outcome_deadline_seconds: int = 720       # settlement + outcome grace: when a UTC day's outcomes are final
     families: int = 2                         # enabled families: they share the target's false-alarm budget
+    # The configuration (grid, lead, risk, family set) is on the allowlist the trust policy was qualified for
+    # (contracts.validated_profile). False, the default: never PredictionReady, whatever the evidence.
+    configuration_validated: bool = False
 
     @property
     def miss_bps(self) -> int:
@@ -600,14 +695,16 @@ def candidate_gates(ci: CandidateInputs, g: Global, t: TrustSettings) -> Tuple[D
     acute = rolling_state(recent, led["consecutive_misses"], limits)
     days = [[d, bd, cv, limits.day_misses(bd)] for d, bd, cv in completed_days(led, now, g.outcome_deadline_seconds)
             if bd >= t.worst_day_min_outcomes]
+    bd7, cv7 = int(w7["g_bd"]), int(w7["g_cv"])
+    k7 = limits.seven_day_misses(bd7)
     failing = {"rolling": acute["rolling"], "consecutive": acute["consecutive"],
                "day": any(bd - cv >= k for _, bd, cv, k in days),
-               "seven_day": cov_gate is None or cov_gate < threshold}
+               "seven_day": cov_gate is None or (cov_gate < threshold and bd7 - cv7 >= k7)}
     coverage = {"failing": [r for r in COVERAGE_RULES if failing[r]],
                 "rolling": [len(recent) - sum(recent), len(recent), limits.rolling_misses],
                 "consecutive": [led["consecutive_misses"], limits.consecutive],
                 "days": days, "failed_days": [d for d, bd, cv, k in days if bd - cv >= k],
-                "seven_day": [int(w7["g_cv"]), int(w7["g_bd"])], "looks": led["monitor"]["looks"],
+                "seven_day": [cv7, bd7, k7], "looks": led["monitor"]["looks"],
                 "alarms": sum(led["monitor"]["alarms"].values())}
     fresh_fit = ci.fit_age_seconds is None or ci.fit_age_seconds <= t.max_fit_age_hours * HOUR
     floor = t.min_availability_bps / 10_000
@@ -839,7 +936,9 @@ def evaluate(cands: Sequence[CandidateInputs], hyst: Mapping[str, dict], g: Glob
         if best and best.trusted:                         # trusted but not (yet) selected over a trusted naive
             reason, phase = "ShadowInsufficient", "Shadow"
         return Verdict(None, phase, reason, False, verdicts, promoted), new_h
-    if not g.replay_suite_passed:
+    if not g.configuration_validated:
+        ready_reason = "ConfigurationNotValidated"
+    elif not g.replay_suite_passed:
         ready_reason = "ReplayGateMissing"
     elif not g.startup_budget_valid:
         ready_reason = "LeadInsufficient"

@@ -28,17 +28,19 @@ EPOCH = "e" * 64
 DAY = 86400
 ADDED_KEYS = ("method", "scale_bins", "scale_floor_bps", "scale_min_season_bps")
 # What trust policy budgeted-coverage-tests/v1 (stacked on this method) added to and changed in the trust settings.
-ADDED_TRUST_KEYS = ("policy", "rolling_alarm_ppm", "consecutive_alarm_ppm", "day_alarm_ppm")
+ADDED_TRUST_KEYS = ("policy", "rolling_alarm_ppm", "consecutive_alarm_ppm", "day_alarm_ppm", "seven_day_alarm_ppm",
+                    "miss_dependence_bps")
 
 
 def strip_to_additive(canon):
     """The canonical settings as the additive method's revision hashed them: without the keys of the calibration
-    method and of the trust policy, and with that revision's rolling window."""
+    method, of the trust policy and the minimum lead, and with that revision's rolling window."""
     for k in ADDED_KEYS:
         canon["settings"]["calibration"].pop(k)
     for k in ADDED_TRUST_KEYS:
         canon["settings"]["trust"].pop(k)
     canon["settings"]["trust"]["acute_recent_windows"] = 32
+    canon["settings"].pop("min_lead_seconds", None)      # the minimum lead came with trust policy v2
     return canon
 # The default statistical settings and the fixture binding's evidence key under the additive method, frozen from
 # k8s-operator/controllers/testdata/v2-contract-fixtures.json at commit 44f65cf (the Go tests use the same constants).

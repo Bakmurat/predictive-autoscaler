@@ -669,6 +669,70 @@ func TestV2SchedulingIsAnchoredToTheDecisionOrigin(t *testing.T) {
 }
 
 // The lead covers the decision interval the scheduler actually keeps: C plus the start offset and jitter.
+// The lead is the grid-rounded larger of the configured minimum (spec.prediction.minLeadSeconds) and what startup,
+// decision interval and allowance need. The minimum lengthens the window only: the published startup budget stays
+// what was measured or configured, the setting is part of the settings fingerprint, and a minimum beyond the horizon
+// is refused with the settings.
+func TestV2LeadIsNeverBelowTheConfiguredMinimum(t *testing.T) {
+	f := v2Harness(t, autoscalerv1alpha1.ModeRecommend, "3000")
+	f.reconcile(t)
+	base := f.pa(t).Status.Prediction
+	if base.Lead == nil {
+		t.Fatal("precondition: a lead from the configured budget")
+	}
+	s, err := resolveV2Settings(f.pa(t).Spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dt := int32(s.SampleIntervalSeconds)
+	min := base.Lead.Seconds + 1 // rounds up to the next grid step
+	a := f.pa(t)
+	a.Spec.Prediction.MinLeadSeconds = &min
+	if err := f.r.Update(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	f.reconcile(t)
+	got := f.pa(t).Status.Prediction
+	if got.Lead == nil || got.Lead.Seconds != base.Lead.Seconds+dt {
+		t.Fatalf("lead with minimum %d on the %d s grid: %+v (was %d)", min, dt, got.Lead, base.Lead.Seconds)
+	}
+	if got.Lead.StartupDelaySeconds != base.Lead.StartupDelaySeconds || got.Lead.Method != base.Lead.Method ||
+		got.Lead.ActuationAllowanceSeconds != base.Lead.ActuationAllowanceSeconds {
+		t.Fatalf("a minimum lead must not alter the startup budget: %+v, was %+v", got.Lead, base.Lead)
+	}
+	if got.SettingsSHA256 == base.SettingsSHA256 || got.LeadBasis == base.LeadBasis {
+		t.Fatal("the minimum lead is not part of the settings fingerprint and the lead basis")
+	}
+	// A minimum below what startup needs changes nothing but the fingerprint.
+	low := int32(1)
+	a = f.pa(t)
+	a.Spec.Prediction.MinLeadSeconds = &low
+	if err := f.r.Update(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	f.reconcile(t)
+	if l := f.pa(t).Status.Prediction.Lead; l == nil || l.Seconds != base.Lead.Seconds {
+		t.Fatalf("a small minimum must leave the required lead: %+v", l)
+	}
+	// Beyond the horizon: refused with the settings, on the grid-rounded value.
+	spec := f.pa(t).Spec
+	horizon := int32(s.HorizonSeconds)
+	over := horizon - dt + 1
+	spec.Prediction.MinLeadSeconds = &over
+	if _, err := resolveV2Settings(spec); err != nil {
+		t.Fatalf("a minimum that rounds to the horizon is valid: %v", err)
+	}
+	over = horizon + 1
+	if _, err := resolveV2Settings(spec); err == nil || (horizon < v2MaxHorizonSeconds && !strings.Contains(err.Error(), "exceeds the horizon")) {
+		t.Fatalf("a minimum beyond the horizon must be refused: %v", err)
+	}
+	// The forecaster's rule, mirrored: a published lead below the minimum is not accepted.
+	s.MinLeadSeconds = int64(base.Lead.Seconds) + 1
+	if p := v2LeadProblem(base.Lead, s, base.Lead.ObservedGeneration); !strings.Contains(p, "below the configured minimum lead") {
+		t.Fatalf("lead problem: %q", p)
+	}
+}
+
 func TestV2LeadCoversTheScheduledDecisionInterval(t *testing.T) {
 	for _, c := range []struct {
 		interval time.Duration
