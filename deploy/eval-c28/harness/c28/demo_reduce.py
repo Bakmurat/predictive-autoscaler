@@ -31,6 +31,12 @@ row's count, the target's phase and the span give the number exactly (the script
 equal it. With due = dispatched - carried_in + carried_out + dropped, every omitted arrival is then accounted for; a
 line that says nothing was due where the table schedules arrivals is not observed (due_mismatch).
 
+Conservation. A carried arrival never leaves its incarnation: what a line carries OUT (due here, dispatched in the
+next minute) must be what the next line of the SAME incarnation carries IN, an incarnation's first line carries
+nothing in and its last line nothing out. A carry without its counterpart (carry_unmatched) means requests were sent
+that no line records (or a line is missing), and neither minute is observed. The script never sends at or after the
+end of its span: an arrival it still owes there is a recorded drop (dropped.segment_end).
+
 Clock. A minute is trusted only when the WHOLE interval that the evidence allows for (generator clock - ingress
 clock) lies inside the limit, for every incarnation that contributes to it. An interval that only overlaps the limit,
 an incarnation without evidence, or evidence that contradicts itself is unverified, never accepted.
@@ -39,7 +45,7 @@ Which timestamp each count uses
   intended     the table (per_minute_days[m // 1440][m % 1440]); no timestamp
   due          the arrival's SCHEDULED time, inside the incarnation's active span
   dispatched   the generator's clock immediately before the send (dispatch time)
-  dropped      the scheduled time of the arrival the generator did not send (late / inflight)
+  dropped      the scheduled time of the arrival the generator did not send (late / inflight / segment_end)
   ok, failed   the terminal outcome of the requests DISPATCHED in the minute (attributed to the dispatch minute, never
                to the completion time)
   received     the ingress's clock when the request arrived (c28_ingress_requests_total), from RAW samples with their
@@ -73,9 +79,10 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from . import frozen as F
 from . import reduce as _reduce
 
-SCHEMA = "c28-demo-reduction/v2"
+SCHEMA = "c28-demo-reduction/v3"
 CONFIG = "c28-demo-generator/v2"
-MINUTE = "c28-demo-minute/v2"
+MINUTE = "c28-demo-minute/v3"
+DROPS = ("late", "inflight", "segment_end")
 INCARNATION = "c28-demo-incarnation/v2"
 MAX_DAYS = 28
 MAX_LINE_BYTES = 16_384
@@ -258,7 +265,7 @@ def _line_problems(cfg: Dict, r: Dict) -> List[str]:
     try:
         fields = [r["minute"], r["day"], r["day_minute"], r["intended"], r["due"], r["dispatched"], r["ok"],
                   r["failed"], r["unresolved"], r["carried"][0], r["carried"][1], r["dropped"]["late"],
-                  r["dropped"]["inflight"], r["active"][0], r["active"][1], r["n"]]
+                  r["dropped"]["inflight"], r["dropped"]["segment_end"], r["active"][0], r["active"][1], r["n"]]
         counts = r["lat"]["counts"]
     except (KeyError, IndexError, TypeError):
         return ["malformed_line"]
@@ -275,7 +282,7 @@ def _line_problems(cfg: Dict, r: Dict) -> List[str]:
     a0, a1 = r["active"]
     if not 0 <= a0 <= a1 <= cfg["minute_ms"]:
         out.append("inconsistent_line")
-    elif r["due"] != r["dispatched"] - r["carried"][0] + r["carried"][1] + r["dropped"]["late"] + r["dropped"]["inflight"] \
+    elif r["due"] != r["dispatched"] - r["carried"][0] + r["carried"][1] + sum(r["dropped"][k] for k in DROPS) \
             or r["dispatched"] != r["ok"] + r["failed"] + r["unresolved"] or sum(counts) != r["ok"]:
         out.append("inconsistent_line")
     elif "plan_mismatch" not in out:
@@ -348,6 +355,15 @@ class _Stream:
             self.start_problems = start_problems(cfg, self.start, self.inc)
             if self.start_problems:
                 self.flags.append("start_record_invalid")
+        # Conservation of carried arrivals inside the incarnation: a carry-out is the next line's carry-in. A carry
+        # with no counterpart (the next or previous line is absent, or says something else) is unmatched on both
+        # sides: requests were dispatched that no line of this incarnation records.
+        for m, r in self.minutes.items():
+            nxt, prev = self.minutes.get(m + 1), self.minutes.get(m - 1)
+            if r["carried"][1] != (nxt["carried"][0] if nxt is not None else 0) or \
+                    r["carried"][0] != (prev["carried"][1] if prev is not None else 0):
+                if "carry_unmatched" not in self.problems.get(m, []):
+                    self.problems.setdefault(m, []).append("carry_unmatched")
         w = self.window if not self.start_problems else None
         for m, r in self.minutes.items():
             # A line must lie in the span the start record declared, with exactly the active part that span gives it.
@@ -480,13 +496,14 @@ def _generator_minute(cfg: Dict, streams: List[_Stream], m: int) -> Dict:
     out = {"state": "unknown", "reasons": reasons, "incarnations": [s.inc for s, _ in lines], "active_ms": 0}
     blocking = ("unrecorded_tail", "generator_record_missing", "conflicting_lines", "malformed_line",
                 "config_mismatch", "generator_counter_reset", "plan_mismatch", "inconsistent_line",
-                "unresolved_outcomes", "start_record_missing", "start_record_invalid", "due_mismatch")
+                "unresolved_outcomes", "start_record_missing", "start_record_invalid", "due_mismatch",
+                "carry_unmatched")
     spans = sorted((r["active"][0], r["active"][1]) for _, r in lines)
     if any(b[0] < a[1] for a, b in zip(spans, spans[1:])):
         reasons.append("duplicate_generators")
     for key in ("due", "dispatched", "ok", "failed", "unresolved"):
         out[key] = sum(r[key] for _, r in lines)
-    out["dropped"] = {k: sum(r["dropped"][k] for _, r in lines) for k in ("late", "inflight")}
+    out["dropped"] = {k: sum(r["dropped"][k] for _, r in lines) for k in DROPS}
     out["no_response"] = sum(int((r.get("failed_by") or {}).get("0", 0)) for _, r in lines)
     out["active_ms"] = sum(b - a for a, b in spans)
     out["late_max_ms"] = max([r.get("late_max_ms", 0) for _, r in lines] or [0])
@@ -788,7 +805,7 @@ def _summary(rows: List[Dict]) -> Dict:
             totals["intended"] += row["intended"]
             for k in ("due", "dispatched", "ok", "failed"):
                 totals[k] += g[k]
-            totals["dropped"] += g["dropped"]["late"] + g["dropped"]["inflight"]
+            totals["dropped"] += sum(g["dropped"].values())
             totals["received"] += row["ingress"]["received"]
     return {"minutes": len(rows), "states": states, "reasons": dict(sorted(reasons.items())),
             "observed_totals": {k: round(v, 3) for k, v in totals.items()},

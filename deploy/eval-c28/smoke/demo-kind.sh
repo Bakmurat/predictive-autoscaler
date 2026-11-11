@@ -301,7 +301,7 @@ for t in cfg["targets"]:
     ok = sum(r["ok"] for r in mins if r["target"] == t)
     got = served.get(f"/t/{t}/work", 0)
     assert sent == ok == got and sent > 0, (t, sent, ok, got)
-    assert sum(r["dropped"]["late"] + r["dropped"]["inflight"] for r in mins if r["target"] == t) == 0
+    assert sum(sum(r["dropped"].values()) for r in mins if r["target"] == t) == 0
 print(f"k6-local: PASS - two incarnations exited 0 at their segment boundary, {len(mins)} minute records all "
       f"self-consistent, dispatched == answered == the server's own count for every target; "
       f"{stats['other']} other log lines")

@@ -393,7 +393,7 @@ def test_summary_counts_only_observed_minutes(tmp_path):
 # --- reading the pod log --------------------------------------------------------------------------------------------
 
 def test_parse_lines_reads_the_records_in_every_k6_log_format():
-    rec = {"schema": "c28-demo-minute/v2", "run": "r", "inc": "p/1", "n": 1, "target": N, "minute": 3, "day": 0,
+    rec = {"schema": "c28-demo-minute/v3", "run": "r", "inc": "p/1", "n": 1, "target": N, "minute": 3, "day": 0,
            "failed_by": {"503": 2}}
     raw = json.dumps(rec)
     lines = [
@@ -434,7 +434,7 @@ def test_cli_demo_reduce(tmp_path, capsys):
     doc = json.loads(capsys.readouterr().out)
     assert doc["targets"] == reduced(cfg, out)["targets"]
     assert doc["log"] == {"lines": 38, "records": 37, "other": 1, "oversize": 0}
-    assert doc["records"]["duplicate_lines"] == 5 and doc["schema"] == "c28-demo-reduction/v2"
+    assert doc["records"]["duplicate_lines"] == 5 and doc["schema"] == "c28-demo-reduction/v3"
     assert doc["schedule"] == {"days": 28, "seeds": list(range(301, 329)), "minutes": 28 * 1440,
                                "end_ms": ORIGIN + 28 * DAY}
     table = copy.deepcopy(cfg["per_minute_days"])
@@ -790,7 +790,7 @@ def test_a_full_minute_that_sent_nothing_of_its_intended_arrivals_is_not_observe
         if l["schema"] == DR.MINUTE and l["target"] == N:
             assert l["intended"] > 1_000 and l["active"] == [0, MIN]
             l.update(due=0, dispatched=0, ok=0, failed=0, unresolved=0, carried=[0, 0],
-                     dropped={"late": 0, "inflight": 0}, late_max_ms=0)
+                     dropped={"late": 0, "inflight": 0, "segment_end": 0}, late_max_ms=0)
             l["lat"] = {"counts": [0] * 13, "max_ms": 0}
             l["cum"] = {k: 0 for k in l["cum"]}
     flat = dict(out["ingress"], **{N: [[t, 100] for t, _ in out["ingress"][N]]})      # the ingress received nothing
@@ -975,3 +975,120 @@ def test_a_pod_replaced_under_load_while_the_old_one_still_runs_is_flagged(tmp_p
     only_new = [l for l in out["lines"] if l["inc"].startswith("pod-new/")]
     got = rows(reduced(cfg, out, records=only_new))
     assert got[2]["state"] != "observed" and got[3]["state"] == "unknown" and got[3]["reasons"] == ["unreconciled"]
+
+
+# --- conservation: a carried arrival never leaves its incarnation (R4) ---------------------------------------------
+
+def stalled_across_the_segment_end(tmp_path):
+    """The reviewer's case on the real script: a two-minute segment [PEAK, PEAK + 2 min), a stall that starts 100 ms
+    before its end and lasts 500 ms."""
+    cfg = config(smoke_segment_minutes=2)
+    end = PEAK + 2 * MIN
+    sc = {"incarnations": [{"pod_uid": "pod-a", "start_ms": PEAK, "stalls": [{"at_ms": end - 100, "for_ms": 500}]}],
+          "until_ms": end + 3 * MIN, "ingress_initial": 100, "scrape": scrape(PEAK - 2 * MIN, end + 3 * MIN)}
+    return cfg, simulate(tmp_path, cfg, sc)
+
+
+def test_arrivals_owed_at_the_segment_end_are_recorded_drops_and_the_minute_stays_accounted(tmp_path):
+    cfg, out = stalled_across_the_segment_end(tmp_path)
+    red = DR.reduce(cfg, out["lines"], out["ingress"], PEAK, PEAK + 2 * MIN)
+    for t in (N, R):
+        first, last = red["targets"][t]["rows"]
+        g = last["generator"]
+        assert g["dropped"] == {"late": 0, "inflight": 0, "segment_end": 2}
+        assert g["due"] == last["intended"] == g["dispatched"] + 2
+        assert g["dispatched"] == out["truth"][t][str(last["minute"])]["dispatched"]
+        assert "carry_unmatched" not in last["reasons"] and last["generator_state"] == "complete"
+        assert last["state"] == "observed" and last["reconciled"] is True, last
+        assert out["sends"][t] == first["generator"]["dispatched"] + g["dispatched"] == 2176
+        assert red["targets"][t]["summary"]["observed_totals"]["dropped"] == 2
+
+
+def test_the_old_scripts_records_of_that_case_are_not_observed(tmp_path):
+    """What the script wrote for the same case BEFORE the fix: it dispatched the two delayed arrivals after the
+    segment end, so its final row says carried = [0, 2] with no drop, and the minute those two were dispatched in has
+    no line (2,178 requests sent, 2,176 recorded). The row is self-consistent and was "observed". A carry out of an
+    incarnation's last line has no counterpart: carry_unmatched, not observed."""
+    cfg, out = stalled_across_the_segment_end(tmp_path)
+    recs = copy.deepcopy(out["lines"])
+    for l in recs:
+        if l["schema"] == DR.MINUTE and l["minute"] == BASE + 1:
+            assert l["dropped"]["segment_end"] == 2 and l["carried"] == [0, 0]
+            l["dropped"]["segment_end"] = 0
+            l["carried"] = [0, 2]                                          # due here, dispatched after the end
+            l["cum"]["dropped"] -= 2
+            l["cum"]["dispatched"] += 2
+        if l.get("event") == "end":
+            l["cum"]["dropped"] -= 2
+            l["cum"]["dispatched"] += 2
+    # The ingress as the old script left it: the two late requests arrived in the minute after the segment.
+    ingress = {t: [[ts, v + (2 if ts * 1000 >= PEAK + 2 * MIN + 400 else 0)] for ts, v in out["ingress"][t]]
+               for t in out["ingress"]}
+    red = DR.reduce(cfg, recs, ingress, PEAK, PEAK + 3 * MIN)
+    for t in (N, R):
+        first, last, after = red["targets"][t]["rows"]
+        assert DR._line_problems(cfg, [l for l in recs if l["schema"] == DR.MINUTE and l["minute"] == BASE + 1
+                                       and l["target"] == t][0]) == []      # the line alone looks fine
+        assert last["state"] == "unknown" and last["reasons"] == ["carry_unmatched"], last
+        assert first["state"] == "observed"
+        assert after["state"] != "observed"
+        s = red["targets"][t]["summary"]
+        assert s["reasons"]["carry_unmatched"] == 1 and s["states"]["observed"] == 1
+
+
+def test_a_carry_must_be_matched_by_the_next_line_of_the_same_incarnation(tmp_path):
+    stall = {"at_ms": PEAK + 2 * MIN - 300, "for_ms": 600}                 # across an ordinary minute boundary
+    cfg, out = sim(tmp_path, [{"pod_uid": "pod-a", "start_ms": PEAK - 3 * MIN, "stalls": [stall]}])
+    line = lambda recs, k, t=N: [l for l in recs if l["schema"] == DR.MINUTE and l["minute"] == BASE + k  # noqa: E731
+                                 and l["target"] == t][0]
+    carried = line(out["lines"], 1)["carried"][1]
+    assert carried > 0 and line(out["lines"], 2)["carried"] == [carried, 0]
+    got = rows(reduced(cfg, out))
+    assert got[1]["state"] == "observed" and got[2]["state"] == "observed"  # a matched carry is fine
+    # The next line says it carried in fewer than this one carried out (its own identity kept intact).
+    recs = copy.deepcopy(out["lines"])
+    nxt = line(recs, 2)
+    nxt["carried"][0] -= 1
+    nxt["dispatched"] -= 1
+    nxt["ok"] -= 1
+    nxt["lat"]["counts"][2] -= 1
+    assert DR._line_problems(cfg, nxt) == []
+    got = rows(reduced(cfg, out, records=recs))
+    for k in (1, 2):
+        assert got[k]["state"] == "unknown" and "carry_unmatched" in got[k]["reasons"], got[k]
+    assert got[0]["state"] == "observed" and got[3]["state"] == "observed"
+    # The next line is lost: the carry-out has no counterpart at all.
+    recs = [l for l in out["lines"] if not (l["schema"] == DR.MINUTE and l["minute"] == BASE + 2 and l["target"] == N)]
+    got = rows(reduced(cfg, out, records=recs))
+    assert got[1]["state"] == "unknown" and got[1]["reasons"] == ["carry_unmatched"]
+    assert got[2]["state"] == "unknown" and got[2]["reasons"] == ["generator_record_missing"]
+    # The previous line is lost: the carry-in has no counterpart.
+    recs = [l for l in out["lines"] if not (l["schema"] == DR.MINUTE and l["minute"] == BASE + 1 and l["target"] == N)]
+    got = rows(reduced(cfg, out, records=recs))
+    assert got[2]["state"] == "unknown" and got[2]["reasons"] == ["carry_unmatched"]
+    # A carry-in on an incarnation's FIRST line, or a carry-out on its LAST, can never be matched.
+    cfg2, out2 = stalled_across_the_segment_end(tmp_path)
+    for k, idx in ((0, 0), (1, 1)):
+        recs = copy.deepcopy(out2["lines"])
+        l = line(recs, k)
+        l["carried"][idx] += 3
+        l["dispatched"] += 3 if idx == 0 else -3
+        l["ok"] += 3 if idx == 0 else -3
+        l["lat"]["counts"][2] += 3 if idx == 0 else -3
+        assert DR._line_problems(cfg2, l) == []
+        red = DR.reduce(cfg2, recs, out2["ingress"], PEAK, PEAK + 2 * MIN)
+        row = red["targets"][N]["rows"][k]
+        assert row["state"] == "unknown" and "carry_unmatched" in row["reasons"], (k, row["reasons"])
+    # The other target is untouched throughout.
+    assert rows(reduced(cfg, out), R)[1]["state"] == "observed"
+
+
+def test_a_line_without_the_segment_end_drop_field_is_malformed(tmp_path):
+    cfg, out = sim(tmp_path, [{"pod_uid": "pod-a", "start_ms": PEAK - 3 * MIN}])
+    recs = copy.deepcopy(out["lines"])
+    for l in recs:
+        if l["schema"] == DR.MINUTE and l["minute"] == BASE + 2 and l["target"] == N:
+            del l["dropped"]["segment_end"]                                 # a v2-shaped line
+    red = reduced(cfg, out, records=recs)
+    assert [i["flags"] for i in red["incarnations"] if i["target"] == N] == [["malformed_line"]]
+    assert rows(red)[1]["state"] == "unknown"

@@ -44,12 +44,16 @@
 //     the Deployment's container is then restarted and the next incarnation resumes. Memory is bounded per segment.
 //   * Nothing is retried. An arrival more than max_late_ms late (a stalled process, a forward clock step) is DROPPED,
 //     reason "late", never sent in a burst; an arrival that would exceed max_inflight requests in flight is DROPPED,
-//     reason "inflight". Both are the generator's drops (this script, not k6's arrival-rate executors, schedules the
-//     arrivals, so k6's own dropped_iterations metric does not apply and stays absent). The position in the schedule
+//     reason "inflight"; and an arrival that is owed but whose send would happen AT OR AFTER the end of this
+//     incarnation's span (its segment end or the schedule's end: the process was delayed across it) is DROPPED, reason
+//     "segment-end": nothing is ever sent at or after the span's end, so every request this incarnation sends is in
+//     one of the minute lines it writes. All three are the generator's drops (this script, not k6's arrival-rate
+//     executors, schedules the arrivals, so k6's own dropped_iterations metric does not apply and stays absent). The
+//     position in the schedule
 //     only moves forward: after a BACKWARD clock step the generator waits until the clock reaches the next arrival
 //     again and never sends an arrival twice. It sleeps at most MAX_SLEEP_MS, so a clock step is seen within a minute.
 //
-// What it records, per target and per minute, as ONE JSON line (schema c28-demo-minute/v2), written timeout_ms +
+// What it records, per target and per minute, as ONE JSON line (schema c28-demo-minute/v3), written timeout_ms +
 // flush_grace_ms after the minute ends, when every request dispatched in it has a terminal outcome. The records are
 // written with console.log: k6 writes console.log to STDERR (not stdout), so they are in the process's stderr; a
 // pod's log carries both streams.
@@ -59,7 +63,7 @@
 //   due          arrivals of this minute scheduled inside the active span
 //   dispatched   requests whose DISPATCH timestamp (taken immediately before the send) fell in this minute
 //   carried      [in, out]: dispatched here but scheduled in the previous minute / due here but dispatched in the next
-//   dropped      {late, inflight}: due arrivals this generator did not send
+//   dropped      {late, inflight, segment_end}: due arrivals this generator did not send
 //   ok, failed, failed_by, unresolved   terminal outcomes of the requests DISPATCHED in this minute (by status;
 //                0 = no HTTP response: timeout or connection failure); never a completion-stamped count
 //   lat          latency bucket counts of the ok responses (bounds in the start record) and their maximum
@@ -68,7 +72,9 @@
 //                receive time and that round trip: the tightest evidence the minute has of the offset between this
 //                pod's clock and the ingress's; the schedule is NEVER corrected by it
 //   cum          cumulative counts of this incarnation and target (a lost line or a reset is detectable)
-// Identity of every line: due = dispatched - carried[0] + carried[1] + dropped.late + dropped.inflight, and
+// Identity of every line: due = dispatched - carried[0] + carried[1] + dropped.late + dropped.inflight +
+// dropped.segment_end, and a carry never leaves the incarnation's span: what one line carries out is what the next
+// line of the same incarnation carries in, and its first line carries nothing in, its last nothing out. Also
 // dispatched = ok + failed + unresolved. A start and an end record (schema c28-demo-incarnation/v2) frame each
 // incarnation; the start record names its phase and the span [send_from_ms, send_to_ms) it will schedule (null when
 // it sends nothing). The lines do not depend on remote-write delivery. The custom counters below go to the
@@ -261,7 +267,7 @@ function createGenerator(cfg, index, shared, deps) {
   function rec(m) {
     let r = minutes.get(m);
     if (!r) {
-      r = { due: 0, dispatched: 0, in: 0, out: 0, late: 0, inflight: 0, ok: 0, failed: 0, failed_by: {},
+      r = { due: 0, dispatched: 0, in: 0, out: 0, late: 0, inflight: 0, end: 0, ok: 0, failed: 0, failed_by: {},
         lat: new Array(B + 1).fill(0), lat_max: 0, late_max: 0, clock: null };
       minutes.set(m, r);
     }
@@ -321,12 +327,20 @@ function createGenerator(cfg, index, shared, deps) {
       if (deps.count) deps.count('dropped', { c28_target: target, reason: 'late' });
       return;
     }
+    const stamp = deps.now();                       // the DISPATCH timestamp
+    if (stamp >= sendTo) {
+      // The span is over (the process was delayed across its segment end or the schedule's end): the arrival is owed
+      // but is NOT sent. A send here would fall into a minute this incarnation never writes a line for.
+      r.end += 1; cum.dropped += 1;
+      if (deps.count) deps.count('dropped', { c28_target: target, reason: 'segment-end' });
+      return;
+    }
     if (inflight >= cfg.max_inflight) {
       r.inflight += 1; cum.dropped += 1;
       if (deps.count) deps.count('dropped', { c28_target: target, reason: 'inflight' });
       return;
     }
-    const stamp = deps.now();                       // the DISPATCH timestamp
+    // stamp < sendTo, so the dispatch minute is at most this incarnation's last minute: its line will be written.
     const md = Math.max(a.m, minuteIndex(cfg, stamp));   // never an earlier (already written) minute
     const rd = md === a.m ? r : rec(md);
     rd.dispatched += 1; cum.dispatched += 1;
@@ -345,9 +359,10 @@ function createGenerator(cfg, index, shared, deps) {
     const start = minuteStart(cfg, m);
     const from = Math.max(0, sendFrom - start);
     const to = Math.min(cfg.minute_ms, sendTo - start);
-    deps.emit({ schema: 'c28-demo-minute/v2', run: cfg.run_id, inc, n: seq, target, minute: m,
+    deps.emit({ schema: 'c28-demo-minute/v3', run: cfg.run_id, inc, n: seq, target, minute: m,
       day: dayIndex(cfg, m), day_minute: dayMinute(cfg, m), intended: intended(cfg, m), active: [from, to],
-      due: r.due, dispatched: r.dispatched, carried: [r.in, r.out], dropped: { late: r.late, inflight: r.inflight },
+      due: r.due, dispatched: r.dispatched, carried: [r.in, r.out],
+      dropped: { late: r.late, inflight: r.inflight, segment_end: r.end },
       ok: r.ok, failed: r.failed, failed_by: r.failed_by, unresolved: r.dispatched - r.ok - r.failed,
       lat: { counts: r.lat, max_ms: Math.round(r.lat_max) }, late_max_ms: Math.round(r.late_max), clock: r.clock,
       cum: cumNow() });
@@ -444,7 +459,7 @@ const cfg = checkConfig(JSON.parse(open(__ENV.C28D_CONFIG)), (text) => crypto.sh
 const counters = {
   scheduled: new Counter('c28d_scheduled'),       // arrivals that came due (dispatched or dropped)
   dispatched: new Counter('c28d_dispatched'),     // added at dispatch
-  dropped: new Counter('c28d_dropped'),           // tag reason: late | inflight
+  dropped: new Counter('c28d_dropped'),           // tag reason: late | inflight | segment-end
   completed: new Counter('c28d_completed'),       // added at COMPLETION (tag outcome); never a dispatch count
 };
 

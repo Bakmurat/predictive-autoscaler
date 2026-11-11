@@ -16,7 +16,7 @@ N, R = "c28-demo-pa-n", "c28-demo-pa-r"
 
 
 def minutes(out, target, inc=None):
-    return [l for l in out["lines"] if l["schema"] == "c28-demo-minute/v2" and l["target"] == target
+    return [l for l in out["lines"] if l["schema"] == "c28-demo-minute/v3" and l["target"] == target
             and (inc is None or l["inc"] == inc)]
 
 
@@ -27,7 +27,8 @@ def events(out, event, target=None):
 
 def identity(line):
     d = line["dropped"]
-    assert line["due"] == line["dispatched"] - line["carried"][0] + line["carried"][1] + d["late"] + d["inflight"], line
+    assert sorted(d) == ["inflight", "late", "segment_end"], line
+    assert line["due"] == line["dispatched"] - line["carried"][0] + line["carried"][1] + sum(d.values()), line
     assert line["dispatched"] == line["ok"] + line["failed"] + line["unresolved"], line
     assert sum(line["lat"]["counts"]) == line["ok"], line
 
@@ -196,7 +197,7 @@ def test_a_start_any_time_after_a_minute_boundary_resumes_without_replay(tmp_pat
         assert first["dispatched"] < first["intended"]                    # what was missed is NOT sent later
     for l in lines:
         identity(l)
-        assert l["dropped"] == {"late": 0, "inflight": 0} and l["failed"] == 0 and l["unresolved"] == 0
+        assert l["dropped"] == {"late": 0, "inflight": 0, "segment_end": 0} and l["failed"] == 0 and l["unresolved"] == 0
         assert l["dispatched"] == out["truth"][N][str(l["minute"])]["dispatched"]
     for l in lines[1:]:
         assert l["active"] == [0, MIN] and l["due"] == l["intended"] == intended(cfg, l["minute"])
@@ -283,7 +284,7 @@ def test_a_failing_target_never_delays_the_other_targets_arrivals(tmp_path):
         identity(l)
         assert l["failed"] == l["dispatched"] and l["ok"] == 0 and l["failed_by"] == {"0": l["failed"]}
         assert l["unresolved"] == 0                                        # every request has its terminal outcome
-        assert l["dropped"] == {"late": 0, "inflight": 0}                  # the in-flight bound holds 2 s of arrivals
+        assert l["dropped"] == {"late": 0, "inflight": 0, "segment_end": 0}                  # the in-flight bound holds 2 s of arrivals
     assert bad[0]["failed"] == 0 and bad[6]["failed"] == 0
 
 
@@ -323,7 +324,7 @@ def test_an_arrival_late_across_a_minute_boundary_is_counted_at_its_dispatch_tim
     assert after["dispatched"] == after["due"] + after["carried"][0]
     for l in lines:
         identity(l)
-        assert l["dropped"] == {"late": 0, "inflight": 0}
+        assert l["dropped"] == {"late": 0, "inflight": 0, "segment_end": 0}
         assert l["dispatched"] == out["truth"][N][str(l["minute"])]["dispatched"]   # the dispatch-time truth
     assert 300 <= after["late_max_ms"] <= 1000
 
@@ -366,7 +367,7 @@ def test_records_are_bounded_in_size_and_the_log_volume_is_stated(tmp_path):
     fault = [{"target": N, "from_ms": PEAK + MIN, "to_ms": PEAK + 2 * MIN, "mode": "status", "status": 503}]
     _, out = run(tmp_path, [{"pod_uid": "0f2f6a3e-7d1c-4c55-9a53-5b7a0f7c1a11", "start_ms": PEAK}], PEAK + 6 * MIN,
                  faults=fault)
-    sizes = [len(json.dumps(l, separators=(",", ":"))) for l in out["lines"] if l["schema"] == "c28-demo-minute/v2"]
+    sizes = [len(json.dumps(l, separators=(",", ":"))) for l in out["lines"] if l["schema"] == "c28-demo-minute/v3"]
     assert max(sizes) < 800
     per_day = 2 * 1440 * 800                                               # two targets, one line a minute
     assert per_day < 2.4 * 2**20 and 14 * per_day < 33 * 2**20             # < 2.4 MiB a day, < 33 MiB in 14 days
@@ -385,7 +386,7 @@ def test_the_prod_shaped_peak_fits_the_in_flight_bound(tmp_path):
                  faults=[{"target": N, "from_ms": PEAK, "to_ms": PEAK + 3 * MIN, "mode": "timeout"}])
     for l in minutes(out, N):
         identity(l)
-        assert l["dropped"] == {"late": 0, "inflight": 0} and l["dispatched"] == l["due"]
+        assert l["dropped"] == {"late": 0, "inflight": 0, "segment_end": 0} and l["dispatched"] == l["due"]
         assert l["failed"] == l["dispatched"]
 
 
@@ -417,7 +418,7 @@ def test_a_utc_day_change_inside_one_incarnation_uses_the_next_days_row(tmp_path
         row = cfg["per_minute_days"][l["day"]]
         assert l["intended"] == row[l["day_minute"]] == l["due"] == l["dispatched"]   # that day's own row
         assert l["dispatched"] == out["truth"][N][str(l["minute"])]["dispatched"]
-        assert l["active"] == [0, MIN] and l["dropped"] == {"late": 0, "inflight": 0}
+        assert l["active"] == [0, MIN] and l["dropped"] == {"late": 0, "inflight": 0, "segment_end": 0}
     before, after = lines[2], lines[3]
     assert after["intended"] < 0.6 * before["intended"]                    # the counts switch AT the boundary
     assert after["intended"] != cfg["per_minute_days"][10][0]              # and not to day 10's minute 0 (no wrap)
@@ -653,7 +654,7 @@ def test_a_backward_clock_step_never_sends_an_arrival_twice(tmp_path):
     for l in lines:
         identity(l)
         assert l["due"] == l["dispatched"] == l["intended"] == intended(cfg, l["minute"])   # once each, never twice
-        assert l["dropped"] == {"late": 0, "inflight": 0}
+        assert l["dropped"] == {"late": 0, "inflight": 0, "segment_end": 0}
     # While its clock repeated the 45 s it had already covered, it sent NOTHING: in TRUE time, minute 1 holds only
     # the 30 s before the step, and minute 2 the rest of its minute 1 (30 s) and the first 15 s of its minute 2.
     truth = out["truth"][N]
@@ -768,3 +769,81 @@ def test_the_clock_evidence_of_a_minute_is_its_response_with_the_shortest_round_
         assert c["rt_ms"] == 20                                            # ... but not its clock evidence
         lo, hi = c["recv_ms"] - c["rt_ms"] - c["date_s"] * 1000 - 1000, c["recv_ms"] - c["date_s"] * 1000
         assert -1_100 <= lo <= 0 <= hi <= 1_100
+
+
+# --- nothing is sent at or after the end of the span; what is owed there is a recorded drop (R4) -------------------
+
+def scheduled_in(cfg, target, minute, a0, a1):
+    from c28 import demo_reduce
+    return demo_reduce.scheduled_arrivals(cfg, target, minute, a0, a1)
+
+
+@pytest.mark.parametrize("where, before_ms, for_ms", [
+    ("segment-end", 100, 500),         # the reviewer's case: 2,178 sends against 2,176 recorded dispatches per target
+    ("schedule-end", 100, 500),        # the same at the final schedule boundary
+    ("segment-end", 600, 1_000),
+    ("schedule-end", 600, 1_000),
+    ("segment-end", 1_500, 2_000),     # longer than max_late_ms: the older arrivals are "late", the rest "segment-end"
+    ("schedule-end", 1_500, 2_000),
+    ("segment-end", 100, 70_000),      # a stall of more than a minute across the end
+])
+def test_a_process_delayed_across_the_end_of_its_span_sends_nothing_after_it(tmp_path, where, before_ms, for_ms):
+    """A stall that begins shortly before the segment end (or the schedule's end) and ends after it. The arrivals of
+    the stalled stretch are still owed when the process wakes, less than max_late_ms late, but the span is over: a
+    send now would fall into a minute this incarnation never writes a line for. They are dropped, reason
+    segment-end, and ACTUAL SENDS EQUAL RECORDED DISPATCHES."""
+    cfg = config(smoke_segment_minutes=2)
+    end = PEAK + 2 * MIN if where == "segment-end" else ORIGIN + 28 * DAY
+    start = end - 2 * MIN
+    stall = {"at_ms": end - before_ms, "for_ms": for_ms}
+    _, out = run(tmp_path, [{"pod_uid": "pod-a", "start_ms": start, "stalls": [stall]}], end + 3 * MIN, cfg=cfg)
+    m_last = (end - ORIGIN) // MIN - 1
+    owed_total = 0
+    for t in (N, R):
+        lines = minutes(out, t)
+        assert [l["minute"] for l in lines] == [m_last - 1, m_last]
+        for l in lines:
+            identity(l)
+            assert l["due"] == l["intended"] and l["active"] == [0, MIN]
+        recorded = sum(l["dispatched"] for l in lines)
+        assert out["sends"][t] == recorded                                 # every send is a recorded dispatch
+        truth = out["truth"][t]
+        assert sorted(int(m) for m in truth) == [m_last - 1, m_last]       # and lies in a minute with an emitted line
+        assert max(int(m) for m in truth) < (end - ORIGIN) // MIN          # nothing at or after the end
+        for l in lines:
+            assert truth[str(l["minute"])]["dispatched"] == l["dispatched"]
+        last = lines[-1]
+        assert last["carried"] == [0, 0] and lines[0]["carried"] == [0, 0]  # nothing is carried out of the span
+        stalled = scheduled_in(cfg, t, m_last, MIN - before_ms, MIN)       # the arrivals of the stalled stretch
+        late_part = scheduled_in(cfg, t, m_last, MIN - before_ms, MIN - before_ms + max(0, for_ms - cfg["max_late_ms"]))
+        late_part = min(late_part, stalled)
+        assert last["dropped"] == {"late": late_part, "inflight": 0, "segment_end": stalled - late_part}, last
+        assert last["dispatched"] == last["intended"] - stalled
+        owed_total += stalled
+        fin = events(out, "end", t)
+        assert len(fin) == 1 and fin[0]["cum"]["dispatched"] == recorded == out["sends"][t]
+        assert fin[0]["cum"]["dropped"] == stalled and fin[0]["inflight"] == 0
+    assert owed_total > 0                                                  # the case really had owed arrivals
+    if (where, before_ms, for_ms) == ("segment-end", 100, 500):            # the reviewer's numbers, after the fix
+        assert out["sends"] == {N: 2176, R: 2176}                          # was 2,178 sent against 2,176 recorded
+        assert [minutes(out, t)[-1]["dropped"]["segment_end"] for t in (N, R)] == [2, 2]
+    if (where, before_ms, for_ms) == ("schedule-end", 100, 500):
+        assert out["sends"] == {N: 484, R: 483}                            # was 484 sent against 484 / 483 recorded
+        assert [minutes(out, t)[-1]["dropped"]["segment_end"] for t in (N, R)] == [0, 1]
+        assert len(events(out, "exhausted", N)) == 1
+
+
+def test_a_short_stall_inside_the_span_still_carries_into_the_next_minute_and_is_recorded_there(tmp_path):
+    """The drop applies only at the END of the span: across an ordinary minute boundary a delayed arrival is still
+    sent, carried out of its minute and into the next line of the same incarnation."""
+    cfg = config(smoke_segment_minutes=4)
+    start = PEAK                                                           # segment [PEAK, PEAK + 4 min)
+    stall = {"at_ms": PEAK + 2 * MIN - 300, "for_ms": 600}
+    _, out = run(tmp_path, [{"pod_uid": "pod-a", "start_ms": start, "stalls": [stall]}], PEAK + 7 * MIN, cfg=cfg)
+    for t in (N, R):
+        lines = minutes(out, t)
+        assert len(lines) == 4
+        assert [l["carried"] for l in lines] == [[0, 0], [0, lines[1]["carried"][1]], [lines[1]["carried"][1], 0], [0, 0]]
+        assert lines[1]["carried"][1] > 0
+        assert all(l["dropped"] == {"late": 0, "inflight": 0, "segment_end": 0} for l in lines)
+        assert out["sends"][t] == sum(l["dispatched"] for l in lines) == sum(l["intended"] for l in lines)

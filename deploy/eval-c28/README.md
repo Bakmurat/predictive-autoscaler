@@ -306,8 +306,10 @@ non-empty fault schedule, the residency audit and the reservation gate in every 
 - **Resume, no replay, no reset.** The position is a pure function of wall-clock time and the origin. A process that
   starts at any time sends only what is scheduled from then on. An arrival more than 1 s late (a stalled process, a
   forward clock step) is dropped with reason `late`, never sent in a burst (a whole skipped minute is accounted in
-  one step); one that would exceed `max_inflight` requests in flight is dropped with reason `inflight`. Nothing is
-  retried or caught up. The position only moves forward: after a backward clock step the generator waits until its
+  one step); one that would exceed `max_inflight` requests in flight is dropped with reason `inflight`; and one that
+  is still owed when the incarnation's span is over (the process was delayed across its segment end or the
+  schedule's end) is dropped with reason `segment-end`: nothing is ever sent at or after the end of the span, so
+  every request an incarnation sends is in one of the minute lines it writes. Nothing is retried or caught up. The position only moves forward: after a backward clock step the generator waits until its
   clock reaches the next arrival again and never sends an arrival twice.
 - **Segments and incarnations.** One k6 process is one incarnation, id `<pod UID>/<start, epoch ms>`. It runs to the
   next multiple of `segment_hours` from the origin (a UTC midnight, the program's lowest demand; the one after it when
@@ -344,7 +346,7 @@ non-empty fault schedule, the residency audit and the reservation gate in every 
   after rendering cannot run under its old digest. The configuration holds only integers, strings, booleans, arrays
   and objects (the per-replica capacity is its decimal string): Python and JavaScript write floats differently, so
   both sides refuse them. The start record carries `config_schema` and `config_digest`.
-- **Records.** One JSON line per target and minute (`c28-demo-minute/v2`, under 800 bytes, with the minute's `day`
+- **Records.** One JSON line per target and minute (`c28-demo-minute/v3`, under 800 bytes, with the minute's `day`
   and `day_minute`), written 2.5 s after the minute ends, when every request dispatched in it has its outcome; a
   start and an end record (`c28-demo-incarnation/v2`) frame each incarnation (the start record names its `phase` and
   the span it will schedule), and the `exhausted` record marks the schedule's end. Two targets write at most
@@ -352,7 +354,7 @@ non-empty fault schedule, the residency audit and the reservation gate in every 
   process's stderr; the pod's log carries both streams and does not depend on remote-write delivery. **The API serves only the
   current and the previous container's log**, and each segment is a new container: with 24-hour segments the logs
   must be collected at least daily (or kept by the cluster's log pipeline).
-- **Remote write** (dashboards only): counters `c28d_scheduled`, `c28d_dispatched`, `c28d_dropped{reason}` and
+- **Remote write** (dashboards only): counters `c28d_scheduled`, `c28d_dispatched`, `c28d_dropped{reason}` (`late`, `inflight`, `segment-end`) and
   `c28d_completed{outcome}` per `c28_target`, tagged `c28_run` and `c28_pod`. `c28d_completed` and k6's own
   `http_reqs` are stamped at completion and are never dispatch counts. A missing series is unknown, never zero.
 - **Clock.** Each minute's record carries the `Date` header of its response with the SHORTEST round trip, with the
@@ -365,11 +367,13 @@ non-empty fault schedule, the residency audit and the reservation gate in every 
 | `due` | the arrival's scheduled time, inside the incarnation's active span (`active: [from, to]` ms of the minute) |
 | `dispatched` | the generator's clock immediately before the send (dispatch time) |
 | `carried` | `[in, out]`: dispatched in this minute but scheduled in the previous one / due here but dispatched in the next |
-| `dropped.late`, `dropped.inflight` | the scheduled time of an arrival the generator did not send |
+| `dropped.late`, `dropped.inflight`, `dropped.segment_end` | the scheduled time of an arrival the generator did not send |
 | `ok`, `failed`, `failed_by`, `unresolved` | the outcome of the requests dispatched in the minute (never the completion time); status `0` is no HTTP response |
 | received (reducer) | the ingress's clock at arrival (`c28_ingress_requests_total`) |
 
-Every line satisfies `due = dispatched − carried[0] + carried[1] + dropped.late + dropped.inflight` and
+Every line satisfies `due = dispatched − carried[0] + carried[1] + dropped.late + dropped.inflight +
+dropped.segment_end`; a carry never leaves the incarnation (a line's carry-out is the next line's carry-in, the first
+line carries nothing in, the last nothing out); and
 `dispatched = ok + failed + unresolved`.
 
 ### The reducer (`python -m c28 demo-reduce`)
@@ -389,7 +393,7 @@ their own timestamps, `{"<target>": [[t_seconds, value], ...]}` (a range-vector 
 | `observed` | One incarnation covered the whole minute; that incarnation has a valid start record bound to this configuration; its record is self-consistent, equals the table and accounts for every arrival the schedule places in the minute (`due` is exactly that number); the ingress count is known; the WHOLE interval the clock evidence allows lies inside the limit; and the running balance reconciles. |
 | `partial` | Trustworthy but not a whole, fully observed minute: an incarnation started or ended inside it (`incarnation_boundary`, with the exact active span and counts), the generator was provably absent between an end record and the next start (`generator_gap`), or the ingress count is unknown (`ingress_gap`, `ingress_reset`, `ingress_absent`). |
 | `unscheduled` | The minute is outside the finite schedule (`before_origin`, `schedule_exhausted`) and no generator line claims it: `intended` is null (undefined, never zero), nothing is judged. A line that claims such a minute is a `plan_mismatch`. |
-| `unknown` | The generator's side is missing or cannot be trusted: no record yet for the range's first minutes (`before_first_record`), a killed incarnation's unrecorded tail within the span it declared at its start, up to the next start (`unrecorded_tail`), a lost line (`generator_record_missing`), two incarnations whose active spans overlap in the minute (`duplicate_generators`, also listed per target in the output's `duplicate_generators`), `inconsistent_line` (also a line outside the span its start record declared), `plan_mismatch`, `config_mismatch`, `conflicting_lines`, `generator_counter_reset`, `unresolved_outcomes`, no valid start record for the incarnation (`start_record_missing`, `start_record_invalid`), a `due` that is not the schedule's arrivals in the active span (`due_mismatch`), a proven clock offset (`clock_offset`), clock evidence that is missing for a contributing incarnation, contradicts itself or only overlaps the limit (`clock_unverified`), or a balance that does not reconcile (`unreconciled`). Never zero, never healthy. |
+| `unknown` | The generator's side is missing or cannot be trusted: no record yet for the range's first minutes (`before_first_record`), a killed incarnation's unrecorded tail within the span it declared at its start, up to the next start (`unrecorded_tail`), a lost line (`generator_record_missing`), two incarnations whose active spans overlap in the minute (`duplicate_generators`, also listed per target in the output's `duplicate_generators`), `inconsistent_line` (also a line outside the span its start record declared), `plan_mismatch`, `config_mismatch`, `conflicting_lines`, `generator_counter_reset`, `unresolved_outcomes`, no valid start record for the incarnation (`start_record_missing`, `start_record_invalid`), a `due` that is not the schedule's arrivals in the active span (`due_mismatch`), a carry without its counterpart in the same incarnation (`carry_unmatched`), a proven clock offset (`clock_offset`), clock evidence that is missing for a contributing incarnation, contradicts itself or only overlaps the limit (`clock_unverified`), or a balance that does not reconcile (`unreconciled`). Never zero, never healthy. |
 
 - The ingress count of a minute is the counter's difference between its two boundaries, each estimated from the
   adjacent raw samples (`received`, with hard `received_bounds` and a stated `received_err`); two missed scrapes
@@ -407,6 +411,11 @@ their own timestamps, `{"<target>": [[t_seconds, value], ...]}` (a range-vector 
   table row's count, the target's phase and the span give the number exactly (`demo_reduce.scheduled_arrivals`, the
   script's own arithmetic), and `due` must equal it. A complete minute that reports due = dispatched = dropped = 0
   against an intended count is `due_mismatch`, not observed, however flat the ingress.
+- **Conservation.** A carry-out must be matched by the carry-in of the following minute of the SAME incarnation
+  (and a carry-in by the previous line's carry-out). An unmatched carry is `carry_unmatched` and neither minute is
+  observed: it means requests were dispatched that no line records. The script cannot produce one (it never sends
+  at or after the end of its span and records what it still owes there as `dropped.segment_end`); the records of the
+  script before that fix (a final row with `carried: [0, 2]`) are caught by this rule.
 - **Clock.** The evidence of a minute bounds (generator clock − ingress clock) to an interval at least one second
   wide (the `Date` header has whole seconds). The minute is trusted only when the WHOLE interval lies inside the limit
   (default ±2 s, recorded in the output) for EVERY contributing incarnation: bounds of [−2500, 500] are
