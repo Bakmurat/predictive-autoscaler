@@ -280,6 +280,9 @@ def test_scale_target_names_are_dns_1123_subdomains_label_by_label(tmp_path, ski
     for bad in (["web", "web"], [f"d{i}" for i in range(65)], [7], ["web", None]):   # distinct, at most 64, strings
         p = run(bad)
         assert p.returncode != 0 and "scaleTargets" in p.stderr, bad
+    for not_a_list in (None, {}, {"web": True}, "", "web", 0, False):                # null would drop the names silently
+        p = run(not_a_list)
+        assert p.returncode != 0 and "scaleTargets" in p.stderr, repr(not_a_list)
     assert run([f"d{i}" for i in range(64)]).returncode == 0
 
 
@@ -341,6 +344,14 @@ def test_a_write_allowlist_that_cannot_be_applied_exactly_is_refused(tmp_path, s
         assert p.returncode != 0 and want in p.stderr, (operator, p.stderr[-300:])
     assert run({"writeAllowlist": [dict(web, name=f"d{i}") for i in range(64)]}).returncode == 0
     assert run({"writeAllowlist": [], "rbac": {"scaleWrite": False}}).returncode == 0
+    # The value itself must be a list. null removes the chart's default before the schema sees it, and a map or a
+    # scalar has nothing to iterate: each would render an operator with no restriction at all.
+    for not_a_list in (None, {}, {"shop/web": UID_WEB}, "", f"shop/web={UID_WEB}", 0, False):
+        p = run({"writeAllowlist": not_a_list})
+        assert p.returncode != 0 and "writeAllowlist" in p.stderr, repr(not_a_list)
+        assert "SCALE_WRITE_ALLOWLIST" not in p.stdout
+    p = run({})                                                                      # omitted: the default, no restriction
+    assert p.returncode == 0 and "SCALE_WRITE_ALLOWLIST" not in p.stdout
 
 
 def test_the_scale_targets_ci_value_set_lists_the_reviewed_uids(tmp_path):

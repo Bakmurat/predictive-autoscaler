@@ -3,8 +3,12 @@
 operator.writeAllowlist: the reviewed Deployments, by UID, the operator may scale (SCALE_WRITE_ALLOWLIST, entries
 namespace/name=uid). The schema checks the same; the template repeats it for --skip-schema-validation and checks what
 a schema cannot: one entry per Deployment, and every entry inside the namespaces and names the write role covers (an
-entry outside them could never be written, so it is a mistake, not a narrower grant).
+entry outside them could never be written, so it is a mistake, not a narrower grant). The value itself must be a
+list: null (which removes the default before the schema sees it) or a map would otherwise render no restriction.
 */}}
+{{- if not (kindIs "slice" .Values.operator.writeAllowlist) }}
+{{- fail "operator.writeAllowlist must be a list (use [] for no restriction by UID): null or any other value would silently remove the restriction" }}
+{{- end }}
 {{- $allowlist := list }}
 {{- $allowSeen := dict }}
 {{- range $i, $e := .Values.operator.writeAllowlist }}
