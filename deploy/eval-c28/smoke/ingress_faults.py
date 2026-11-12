@@ -42,13 +42,19 @@ from typing import Dict, List, Optional, Tuple
 import demo_kind as K
 
 PHASES = ("steady1", "fault1", "recovery1", "steady2", "fault2", "recovery2")
-TRANSITIONS = ("fault1", "recovery1", "fault2", "recovery2")       # their first minute is not judged for traffic
+# The transition minutes: the last minute of each steady phase (the blackhole is installed in its last seconds, so
+# that it is complete when the fault begins) and the first minute of each recovery (it is removed when the fault
+# ends). Their accounting is judged like every other minute's; only the split between successes and failures is not.
+TRANSITION_LAST = ("steady1", "steady2")
+TRANSITION_FIRST = ("recovery1", "recovery2")
 COMPARED = ("fault1", "recovery1", "fault2", "recovery2")
 FAULTS = {"fault1": ["c28-demo-pa-r"], "fault2": ["c28-demo-pa-n", "c28-demo-pa-r"]}
 LIMIT_BYTES = 128 * 2**20
 PEAK_MAX_BYTES = 64 * 2**20
 PLATEAU_RATIO = 1.10
 MIN_FAULT_MS, MIN_STEADY_MS = 300_000, 180_000
+INSTALL_LEAD_MS = 60_000           # the blackhole's installation starts within the steady phase's last minute
+REMOVE_WITHIN_MS = 60_000          # and its removal completes within the recovery's first minute
 EDGE_MS, MAX_GAP_MS = 5_000, 15_000
 MIN_RUNTIME_S = 600
 MAX_FIRST_SEND_MS = 10_000
@@ -68,10 +74,10 @@ class Verdict:
         return "FAIL" if self.fail else ("UNPROVEN" if self.unproven else "PASS")
 
 
-def coverage(samples, a: int, b: int) -> Dict:
+def coverage(samples, a: int, b: int, field: str = "current") -> Dict:
     """memory.current readings in [a, b), with the last one before and the first one after: covered when readings lie
     within EDGE_MS of both edges and no two consecutive readings are more than MAX_GAP_MS apart."""
-    t = sorted(s["t_ms"] for s in samples if s.get("current") is not None)
+    t = sorted(s["t_ms"] for s in samples if s.get(field) is not None)
     inside = [x for x in t if a <= x < b]
     near = [x for x in t if x < a][-1:] + inside + [x for x in t if x >= b][:1]
     gap = max([y - x for x, y in zip(near, near[1:])] or [b - a])
@@ -104,6 +110,22 @@ def setup_problems(phases: Dict, ph: Dict, cfg: Dict, limits: List[int], incs: L
         out.append(f"the faults are {ph.get('faults')}, the test's are {FAULTS}")
     if (ph.get("blackhole") or {}).get("direction") != "requests":
         out.append("the blackhole direction is not requests")
+    # The observed installation and removal: the fault phase is fully blackholed for its whole recorded length, and
+    # the recovery has at least MIN_FAULT_MS without any rule after the removal completed.
+    for fault, rec in (("fault1", "recovery1"), ("fault2", "recovery2")):
+        act = (ph.get("actions") or {}).get(fault) or {}
+        keys = ("install_started_ms", "install_done_ms", "remove_started_ms", "remove_done_ms")
+        if not all(isinstance(act.get(k), int) for k in keys):
+            out.append(f"{fault}: the observed installation and removal times are missing")
+            continue
+        f0, f1, r1 = phases[fault][0], phases[fault][1], phases[rec][1]
+        if not (f0 - INSTALL_LEAD_MS <= act["install_started_ms"] <= act["install_done_ms"] <= f0):
+            out.append(f"{fault}: the blackhole was not complete at the fault's start ({act})")
+        if not (f1 <= act["remove_started_ms"] <= act["remove_done_ms"] <= f1 + REMOVE_WITHIN_MS):
+            out.append(f"{fault}: the blackhole was not kept to the fault's end, or its removal was late ({act})")
+        elif r1 - act["remove_done_ms"] < MIN_FAULT_MS:
+            out.append(f"{rec}: {(r1 - act['remove_done_ms']) // 1000} s after the removal completed (at least "
+                       f"{MIN_FAULT_MS // 1000} s)")
     if limits != [LIMIT_BYTES]:
         out.append(f"the ingress limits seen are {limits}, the test's is exactly {LIMIT_BYTES}")
     if (cfg.get("program") or {}).get("kind") != "constant-peak" or cfg.get("label") != "smoke":
@@ -125,8 +147,8 @@ def traffic(red: Dict, phases: Dict, cfg: Dict, targets: List[str], peak: int, v
     detail = {}
     for name in PHASES:
         a, b = phases[name]
-        first = (a - origin) // m + (1 if name in TRANSITIONS else 0)
-        minutes = list(range(first, (b - origin) // m))
+        minutes = list(range((a - origin) // m, (b - origin) // m))
+        mixed = {minutes[-1]} if name in TRANSITION_LAST else {minutes[0]} if name in TRANSITION_FIRST else set()
         down = FAULTS.get(name, [])
         for t in targets:
             rows = [r for r in ((red.get("targets") or {}).get(t) or {}).get("rows", []) if r["minute"] in minutes]
@@ -144,9 +166,13 @@ def traffic(red: Dict, phases: Dict, cfg: Dict, targets: List[str], peak: int, v
                     v.add("unproven", f"{name} {t} minute {mm}: state {r['state']} {r.get('reasons')}")
                     continue
                 drops = sum(g["dropped"].get(k, 0) for k in ("late", "inflight", "segment_end"))
-                if r["intended"] != peak or g["dispatched"] != peak or drops:
-                    bad.append(f"minute {mm}: intended {r['intended']}, dispatched {g['dispatched']}, dropped {drops} "
-                               f"(the constant peak is {peak})")
+                if r["intended"] != peak or g["dispatched"] != peak or drops or \
+                        g["ok"] + g["failed"] != g["dispatched"]:
+                    bad.append(f"minute {mm}: intended {r['intended']}, dispatched {g['dispatched']}, dropped {drops}, "
+                               f"{g['ok']} ok + {g['failed']} failed (the constant peak is {peak}, every request "
+                               "resolved)")
+                elif mm in mixed:
+                    continue                                   # a transition minute: any split of ok and failed
                 elif t in down and (g["ok"] != 0 or g["failed"] != g["dispatched"]):
                     bad.append(f"minute {mm}: unreachable, yet {g['ok']} ok and {g['failed']} failed of {g['dispatched']}")
                 elif t not in down and (g["ok"] != g["dispatched"] or g["failed"]):
@@ -158,16 +184,20 @@ def traffic(red: Dict, phases: Dict, cfg: Dict, targets: List[str], peak: int, v
 
 
 def ingress_memory(samples, phases: Dict, v: Verdict) -> Dict:
-    peaks = [s["peak"] for s in samples if s.get("peak") is not None]
+    run = (phases["steady1"][0], phases["recovery2"][1])
     span = (phases["fault1"][0], phases["recovery2"][1])
-    cov = coverage(samples, *span)
-    out = {"peak_bytes": max(peaks, default=None), "span_coverage": cov, "phases": {}}
+    peaks = [s["peak"] for s in samples if s.get("peak") is not None and run[0] <= s["t_ms"] <= run[1]]
+    currents = [s["current"] for s in samples if s.get("current") is not None and run[0] <= s["t_ms"] <= run[1]]
+    cov, pcov = coverage(samples, *span), coverage(samples, *run, field="peak")
+    out = {"peak_bytes": max(peaks, default=None), "current_max_bytes": max(currents, default=None),
+           "span_coverage": cov, "peak_coverage": pcov, "phases": {}}
     if not cov["covered"]:
         v.add("unproven", f"I3: memory.current does not cover the fault span ({cov})")
-    if out["peak_bytes"] is None:
-        v.add("unproven", "I2: no memory.peak reading")
-    elif out["peak_bytes"] > PEAK_MAX_BYTES:
-        v.add("fail", f"I2: ingress memory.peak {out['peak_bytes']} B is above {PEAK_MAX_BYTES} B")
+    high = max([x for x in (out["peak_bytes"], out["current_max_bytes"]) if x is not None], default=None)
+    if high is not None and high > PEAK_MAX_BYTES:
+        v.add("fail", f"I2: ingress memory reached {high} B, above {PEAK_MAX_BYTES} B")
+    elif not pcov["covered"]:
+        v.add("unproven", f"I2: memory.peak readings do not cover the run ({pcov}): the high-water mark is unknown")
     for name in COMPARED:
         a, b = phases[name]
         w2, wl = (a + 60_000, a + 120_000), (b - 60_000, b)
@@ -192,6 +222,8 @@ def _epoch_ms(text) -> Optional[int]:
 
 def generator_restarts(red: Dict, incs: List[Dict], exits: List[Dict], targets: List[str], v: Verdict) -> Dict:
     first = {(i["incarnation"], i["target"]): i.get("first_send_ms") for i in red.get("incarnations", [])}
+    invalid = {(i["incarnation"], i["target"]): i.get("first_send_problems") for i in red.get("incarnations", [])
+               if i.get("first_send_problems")}
     rows, run, best = [], 0, 0
     for a, b in zip(incs, incs[1:]):
         if a["start"].get("pod_uid") != b["start"].get("pod_uid") or a["end"] is None:
@@ -222,7 +254,9 @@ def generator_restarts(red: Dict, incs: List[Dict], exits: List[Dict], targets: 
         if started < ended:
             why.append("the next incarnation started before this one ended")
         for t, d in row["first_send_after_segment_end_ms"].items():
-            if d is None:
+            if invalid.get((b["inc"], t)):
+                why.append(f"invalid first_send of {t}: {invalid[(b['inc'], t)]}")
+            elif d is None:
                 why.append(f"no first_send record of {t}")
             elif not 0 <= d <= MAX_FIRST_SEND_MS:
                 why.append(f"first send to {t} {d} ms after the segment end")
@@ -231,8 +265,10 @@ def generator_restarts(red: Dict, incs: List[Dict], exits: List[Dict], targets: 
         best = max(best, run)
         rows.append(row)
     if best < MIN_RESTARTS:
-        missing = any("no first_send" in w or "matching container" in w for r in rows for w in r["why_not"])
-        v.add("unproven" if missing and len(rows) >= MIN_RESTARTS else "fail",
+        # Evidence that is absent makes it unproven; evidence that is present and wrong (a short or failed container,
+        # a late or invalid first send, overlapping incarnations) makes it a failure.
+        broken = any(not (w.startswith("no first_send") or "matching container" in w) for r in rows for w in r["why_not"])
+        v.add("fail" if broken or len(rows) < MIN_RESTARTS else "unproven",
               f"G1: {best} consecutive planned restarts met the budget (at least {MIN_RESTARTS}): "
               f"{[(r['from'], r['why_not']) for r in rows]}")
     return {"restarts": rows, "consecutive_meeting_budget": best}
@@ -303,29 +339,31 @@ def analyse(a) -> int:
 
 def selftest() -> int:
     A, B = "c28-demo-pa-n", "c28-demo-pa-r"
-    PEAK = 9000
-    cfg = {"origin_ms": 0, "minute_ms": 60_000, "targets": [A, B], "label": "smoke", "program": {"kind": "constant-peak"},
+    PEAK, M = 9000, 60_000
+    cfg = {"origin_ms": 0, "minute_ms": M, "targets": [A, B], "label": "smoke", "program": {"kind": "constant-peak"},
            "per_minute_days": [[PEAK] * 1440]}
-    M = 60_000
-    phases = {"steady1": (M, 4 * M), "fault1": (4 * M, 9 * M), "recovery1": (9 * M, 14 * M),
-              "steady2": (16 * M, 19 * M), "fault2": (19 * M, 24 * M), "recovery2": (24 * M, 29 * M)}
-    ph = {"faults": FAULTS, "blackhole": {"direction": "requests"}}
+    # 20-minute segments: incarnation i1 [0, 20 min), i2 [20 min + 3 s, 40 min), i3 from 40 min + 3 s.
+    phases = {"steady1": (M, 4 * M), "fault1": (4 * M, 9 * M), "recovery1": (9 * M, 15 * M),
+              "steady2": (21 * M, 24 * M), "fault2": (24 * M, 29 * M), "recovery2": (29 * M, 35 * M)}
+    acts = {f: {"install_started_ms": phases[f][0] - 5_000, "install_done_ms": phases[f][0] - 4_000,
+                "remove_started_ms": phases[f][1] + 500, "remove_done_ms": phases[f][1] + 1_500} for f in FAULTS}
+    ph = {"faults": FAULTS, "blackhole": {"direction": "requests"}, "actions": acts}
 
     def start(inc, started, seg_end):
         return {"inc": inc, "start": {"started_ms": started, "segment_end_ms": seg_end, "pod_uid": "p"},
                 "end": None, "lines": []}
-    incs = [start("i1", 0, 15 * M), start("i2", 15 * M + 3_000, 30 * M), start("i3", 30 * M + 3_000, 45 * M)]
-    incs[0]["end"], incs[1]["end"] = {"ended_ms": 15 * M + 2_000}, {"ended_ms": 30 * M + 2_000}
+    incs = [start("i1", 0, 20 * M), start("i2", 20 * M + 3_000, 40 * M), start("i3", 40 * M + 3_000, 60 * M)]
+    incs[0]["end"], incs[1]["end"] = {"ended_ms": 20 * M + 2_000}, {"ended_ms": 40 * M + 2_000}
 
     def iso(ms):
         return datetime.fromtimestamp(ms / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    exits = [{"pod_uid": "p", "reason": "Completed", "exit_code": 0, "started_at": iso(0), "finished_at": iso(15 * M + 2_000)},
-             {"pod_uid": "p", "reason": "Completed", "exit_code": 0, "started_at": iso(15 * M + 3_000),
-              "finished_at": iso(30 * M + 2_000)}]
+    exits = [{"pod_uid": "p", "reason": "Completed", "exit_code": 0, "started_at": iso(0), "finished_at": iso(20 * M + 2_000)},
+             {"pod_uid": "p", "reason": "Completed", "exit_code": 0, "started_at": iso(20 * M + 3_000),
+              "finished_at": iso(40 * M + 2_000)}]
 
     def red_for(edit=None):
         rows = {A: [], B: []}
-        for mm in range(0, 31):
+        for mm in range(0, 41):
             t0 = mm * M
             for t in (A, B):
                 down = any(t in FAULTS[f] and phases[f][0] <= t0 < phases[f][1] for f in FAULTS)
@@ -333,12 +371,12 @@ def selftest() -> int:
                      "dropped": {"late": 0, "inflight": 0, "segment_end": 0}}
                 rows[t].append({"minute": mm, "state": "observed", "reasons": [], "intended": PEAK, "generator": g})
         red = {"targets": {t: {"rows": r} for t, r in rows.items()},
-               "incarnations": [{"incarnation": i, "target": t, "first_send_ms": s}
-                                for i, s in (("i2", 15 * M + 4_000), ("i3", 30 * M + 4_000)) for t in (A, B)]}
+               "incarnations": [{"incarnation": i, "target": t, "first_send_ms": s, "first_send_problems": []}
+                                for i, s in (("i2", 20 * M + 4_000), ("i3", 40 * M + 4_000)) for t in (A, B)]}
         if edit:
             edit(red)
         return red
-    ing = [{"t_ms": t, "container": "c1", "current": 30_000_000, "peak": 31_000_000} for t in range(0, 31 * M, 1000)]
+    ing = [{"t_ms": t, "container": "c1", "current": 30_000_000, "peak": 31_000_000} for t in range(0, 41 * M, 1000)]
     kw = dict(red=red_for(), phases=phases, ph=ph, cfg=cfg, ing=ing, identity=[], limits=[LIMIT_BYTES], incs=incs,
               exits=exits)
     good = judge(**kw)
@@ -350,60 +388,73 @@ def selftest() -> int:
     def rows_of(red, t):
         return red["targets"][t]["rows"]
 
-    def zero_unreachable(red):                      # Codex's counterexample 1: no dispatch and no failure at all
+    def must(out, result, needle):
+        texts = out["fail"] if result == "FAIL" else out["unproven"]
+        assert out["result"] == result and any(needle in p for p in texts), (result, needle, out)
+
+    # Transition minutes: a mixed split is allowed; their accounting is not optional (Codex, second review, 1).
+    out = r(red=red_for(lambda red: rows_of(red, B)[3]["generator"].update(ok=PEAK - 70, failed=70)))
+    assert out["result"] == "PASS", out                                   # steady1's last minute: mixed is fine
+    out = r(red=red_for(lambda red: [rows_of(red, t).pop(9) for t in (A, B)]))  # recovery1's first minute deleted
+    must(out, "UNPROVEN", "minute 9: 0 reducer rows")
+    must(r(red=red_for(lambda red: rows_of(red, B)[9]["generator"].update(dispatched=0, ok=0, failed=0))), "FAIL",
+         "recovery1 c28-demo-pa-r")
+    # Counterexamples of the first review.
+    def zero_unreachable(red):
         for row in rows_of(red, B):
             if phases["fault1"][0] <= row["minute"] * M < phases["fault1"][1]:
                 row["generator"].update(dispatched=0, failed=0)
-    out = r(red=red_for(zero_unreachable))
-    assert out["result"] == "FAIL" and any("fault1 c28-demo-pa-r" in p for p in out["fail"]), out
-    out = r(red=red_for(lambda red: rows_of(red, A).pop(6)))        # the second minute of fault1 deleted
-    assert out["result"] == "UNPROVEN" and any("minute 6: 0 reducer rows" in p for p in out["unproven"]), out
-    out = r(red=red_for(lambda red: rows_of(red, A)[20].update(state="partial", reasons=["ingress_gap"])))
-    assert out["result"] == "UNPROVEN", out
-    out = r(red=red_for(lambda red: rows_of(red, A)[11]["generator"].update(ok=PEAK - 3, failed=3)))
-    assert out["result"] == "FAIL" and any("recovery1 c28-demo-pa-n" in p for p in out["fail"]), out
-    out = r(red=red_for(lambda red: rows_of(red, A)[2].update(intended=PEAK - 1)))
-    assert out["result"] == "FAIL", out
-    hole = [s for s in ing if not (phases["recovery1"][0] + 70_000 <= s["t_ms"] < phases["recovery1"][0] + 100_000)]
-    out = r(ing=hole)                                                # Codex's counterexample 4: 30 s without readings
-    assert out["result"] == "UNPROVEN" and any("I3" in p for p in out["unproven"]), out
-    grow = [dict(s, current=s["current"] + 20_000_000) if phases["fault2"][1] - M <= s["t_ms"] < phases["fault2"][1]
-            else s for s in ing]
-    out = r(ing=grow)
-    assert out["result"] == "FAIL" and any("I3 fault2" in p for p in out["fail"]), out
-    out = r(ing=[dict(s, peak=70 * 2**20) for s in ing])
-    assert out["result"] == "FAIL" and any(p.startswith("I2") for p in out["fail"]), out
-    out = r(limits=[256 * 2**20])                                    # Codex's counterexample 5
-    assert out["result"] == "FAIL" and any("limits seen" in p for p in out["fail"]), out
-    short = dict(phases, fault1=(4 * M, 8 * M), recovery1=(8 * M, 14 * M))
-    out = r(phases=short)
-    assert out["result"] == "FAIL" and any("fault1 lasts 240 s" in p for p in out["fail"]), out
-    out = r(phases=dict(phases, steady1=(M + 30_000, 4 * M)))
-    assert any("schedule minute" in p for p in r(phases=dict(phases, steady1=(M + 30_000, 4 * M)))["fail"])
-    out = r(ph=dict(ph, faults={"fault1": [A], "fault2": [A, B]}))
-    assert out["result"] == "FAIL", out
-    out = r(incs=[incs[0], start("i2", 15 * M + 3_000, 20 * M)] + incs[2:])     # group 2 outside one incarnation
-    assert out["result"] == "FAIL" and any("incarnations" in p for p in out["fail"]), out
-    out = r(identity=[("unproven", "x not captured")])
-    assert out["result"] == "UNPROVEN"
-    out = r(identity=[("fail", "restarted 1 time(s)")])
-    assert out["result"] == "FAIL"
-    # G1: Codex's counterexample 3: two unrelated one-second exits do not count; the actual first send is used.
-    out = r(exits=[dict(e, started_at=e["finished_at"]) for e in exits])     # exits that are not these containers
-    assert out["result"] != "PASS" and any("matching container terminations" in p for p in out["unproven"]), out
-    brief = [start("i1", 10 * M, 15 * M)] + incs[1:]
-    brief[0]["end"] = {"ended_ms": 15 * M + 2_000}
-    out = r(incs=brief, exits=[dict(exits[0], started_at=iso(10 * M))] + exits[1:])
+    must(r(red=red_for(zero_unreachable)), "FAIL", "fault1 c28-demo-pa-r")
+    must(r(red=red_for(lambda red: rows_of(red, A).pop(5))), "UNPROVEN", "minute 5: 0 reducer rows")
+    must(r(red=red_for(lambda red: rows_of(red, A)[25].update(state="partial", reasons=["ingress_gap"]))), "UNPROVEN",
+         "state partial")
+    must(r(red=red_for(lambda red: rows_of(red, A)[11]["generator"].update(ok=PEAK - 3, failed=3))), "FAIL",
+         "recovery1 c28-demo-pa-n")
+    hole = [x for x in ing if not (phases["recovery1"][0] + 70_000 <= x["t_ms"] < phases["recovery1"][0] + 100_000)]
+    must(r(ing=hole), "UNPROVEN", "I3 recovery1")
+    grow = [dict(x, current=x["current"] + 20_000_000) if phases["fault2"][1] - M <= x["t_ms"] < phases["fault2"][1]
+            else x for x in ing]
+    must(r(ing=grow), "FAIL", "I3 fault2")
+    must(r(limits=[256 * 2**20]), "FAIL", "limits seen")
+    must(r(phases=dict(phases, fault1=(4 * M, 8 * M), recovery1=(8 * M, 15 * M)),
+           ph=dict(ph, actions=dict(acts, fault1=dict(acts["fault1"], remove_started_ms=8 * M + 500,
+                                                       remove_done_ms=8 * M + 1_500)))), "FAIL", "fault1 lasts 240 s")
+    must(r(phases=dict(phases, steady1=(M + 30_000, 4 * M))), "FAIL", "schedule minute")
+    must(r(ph=dict(ph, faults={"fault1": [A], "fault2": [A, B]})), "FAIL", "the faults are")
+    must(r(incs=[incs[0], start("i2", 20 * M + 3_000, 30 * M)] + incs[2:]), "FAIL", "incarnations")
+    must(r(identity=[("unproven", "x not captured")]), "UNPROVEN", "I1")
+    must(r(identity=[("fail", "restarted 1 time(s)")]), "FAIL", "I1")
+    # Peak (second review, 2): a stale early reading cannot hide a high current; peaks must cover the run.
+    stale = [dict(x, peak=None if x["t_ms"] > 0 else 31_000_000, current=80 * 2**20) for x in ing]
+    must(r(ing=stale), "FAIL", "I2")
+    must(r(ing=[dict(x, peak=None) if x["t_ms"] > 2 * M else x for x in ing]), "UNPROVEN", "I2")
+    must(r(ing=[dict(x, peak=70 * 2**20) for x in ing]), "FAIL", "I2")
+    # First sends (second review, 3): an invalid record of the third incarnation fails; a missing one is unproven.
+    must(r(red=red_for(lambda red: red["incarnations"][2].update(
+        first_send_ms=None, first_send_problems=["first_send before the incarnation started"]))), "FAIL", "invalid first_send")
+    must(r(red=red_for(lambda red: red["incarnations"][3].update(first_send_ms=40 * M + 12_000))), "FAIL",
+         "first send to c28-demo-pa-r 12000 ms")
+    must(r(red=red_for(lambda red: red["incarnations"][0].update(first_send_ms=None))), "UNPROVEN", "no first_send")
+    # Containers (first review, 3).
+    must(r(exits=[dict(e, started_at=e["finished_at"]) for e in exits]), "UNPROVEN", "matching container terminations")
+    brief = [start("i1", 15 * M, 20 * M)] + incs[1:]
+    brief[0]["end"] = {"ended_ms": 20 * M + 2_000}
+    out = r(incs=brief, exits=[dict(exits[0], started_at=iso(15 * M))] + exits[1:])
     assert out["result"] == "FAIL" and any("ran 302 s" in p for p in out["fail"]), out
-    late = red_for(lambda red: red["incarnations"][3].update(first_send_ms=30 * M + 12_000))
-    out = r(red=late)
-    assert out["result"] == "FAIL" and any("first send to c28-demo-pa-r 12000 ms" in p for p in out["fail"]), out
-    out = r(red=red_for(lambda red: red["incarnations"][0].update(first_send_ms=None)))
-    assert out["result"] in ("UNPROVEN", "FAIL") and any("no first_send" in p for p in out["fail"] + out["unproven"])
-    out = r(exits=[dict(exits[0], reason="Error", exit_code=137), exits[1]])
-    assert out["result"] == "FAIL", out
-    print("ingress_faults selftest: setup, every judged minute from the reducer, memory coverage and plateau, peak, "
-          "identity classes and the generator's restart budget from terminations and first sends: OK")
+    must(r(exits=[dict(exits[0], reason="Error", exit_code=137), exits[1]]), "FAIL", "terminated Error")
+    # Observed boundaries (second review, 4).
+    def act(fault, **over):
+        return dict(ph, actions=dict(acts, **{fault: dict(acts[fault], **over)}))
+    must(r(ph=act("fault1", install_done_ms=phases["fault1"][0] + 2_000)), "FAIL", "not complete at the fault's start")
+    must(r(ph=act("fault2", remove_started_ms=phases["fault2"][1] - 1_000)), "FAIL", "not kept to the fault's end")
+    must(r(ph=act("fault2", remove_done_ms=phases["fault2"][1] + 61_000)), "FAIL", "not kept to the fault's end")
+    must(r(ph=act("fault1", remove_started_ms=phases["fault1"][1] + 59_000,
+                  remove_done_ms=phases["fault1"][1] + 59_500), phases=dict(phases, recovery1=(9 * M, 14 * M))),
+         "FAIL", "recovery1: 240 s after the removal")
+    must(r(ph=dict(ph, actions={})), "FAIL", "observed installation and removal times are missing")
+    print("ingress_faults selftest: setup and observed blackhole times, every minute's accounting from the reducer "
+          "(transition minutes included), memory coverage, plateau and peak, identity classes, and the generator's "
+          "restart budget from terminations and validated first sends: OK")
     return 0
 
 

@@ -1092,3 +1092,25 @@ def test_a_line_without_the_segment_end_drop_field_is_malformed(tmp_path):
     red = reduced(cfg, out, records=recs)
     assert [i["flags"] for i in red["incarnations"] if i["target"] == N] == [["malformed_line"]]
     assert rows(red)[1]["state"] == "unknown"
+
+
+def test_a_first_send_record_binds_only_its_own_incarnations_first_send():
+    from c28.demo_reduce import _Stream, first_send_problems
+    cfg = {"run_id": "r", "origin_ms": 0, "minute_ms": 60_000}
+    st = {"started_ms": 900_000, "send_from_ms": 900_100, "send_to_ms": 1_800_000}
+
+    def fs(**over):
+        return {"schema": "c28-demo-incarnation/v2", "event": "first_send", "run": "r", "inc": "i2", "target": "a",
+                "n": None, "sent_ms": 904_000, "minute": 15, **over}
+    assert first_send_problems(cfg, fs(), st, "i2", "a") == []
+    for bad, why in ((fs(run="x"), "another run"), (fs(target="b"), "another run"), (fs(inc="i3"), "another run"),
+                     (fs(sent_ms="904000"), "integer"), (fs(sent_ms=896_000, minute=14), "before the incarnation"),
+                     (fs(sent_ms=1_800_000, minute=30), "sending span"), (fs(minute=16), "not the minute")):
+        assert any(why in p for p in first_send_problems(cfg, bad, st, "i2", "a")), (bad, why)
+    assert first_send_problems(cfg, fs(), None, "i2", "a") == ["first_send without a start record"]
+    s = _Stream("i2", "a")
+    s.add(cfg, fs())
+    s.add(cfg, fs())                                                   # an identical reread is the same record
+    assert s.first_send == fs() and "conflicting_first_send" not in s.flags
+    s.add(cfg, fs(sent_ms=905_000))                                    # a different one: the first send is unknown
+    assert "conflicting_first_send" in s.flags and s.first_send == fs()

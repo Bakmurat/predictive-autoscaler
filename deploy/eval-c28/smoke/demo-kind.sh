@@ -414,11 +414,12 @@ REGISTRY_IMAGE=registry:2.8.3
 VM_IMAGE=victoriametrics/victoria-metrics@sha256:5eff7af5341e401471002f58d106d399e614a62f3d240f2dbc21901e49eed5dd   # v1.153.0
 SEGMENT_MINUTES="${SEGMENT_MINUTES:-3}"
 # --ingress-faults: the final-image ingress fault test (live-demo/INGRESS-FAULT-TEST-CRITERIA.md and Codex's 2026-11-12
-# decisions; verdict: ingress_faults.py). Fixed here, not by the caller: 15-minute segments (two planned restarts in the
-# run, each after more than 600 s), the constant-peak smoke schedule, request-direction blackholes, 300 s faults and
-# recoveries.
+# decisions; verdict: ingress_faults.py). Fixed here, not by the caller: 20-minute segments (two planned restarts in the
+# run, each after more than 600 s, and room in one incarnation for steady + fault + recovery), the constant-peak smoke
+# schedule, request-direction blackholes, 300 s faults, 360 s recoveries (at least 300 s after the removal completed).
 if [ "$INGRESS_FAULTS" = 1 ]; then
-  SEGMENT_MINUTES=15 DEMO_BLACKHOLE=requests FAULT_SECONDS=300 RECOVERY_SECONDS=300 STEADY_SECONDS=180
+  SEGMENT_MINUTES=20 DEMO_BLACKHOLE=requests FAULT_SECONDS=300 RECOVERY_SECONDS=360 STEADY_SECONDS=180
+  INSTALL_LEAD_MS=10000
 fi
 # --replacement: the per-replica rate and the fixture's work per request for the smoke's own params (a light fixture,
 # so the healthy target carries the rate on a small bed), where in the schedule's day the generator starts (the daily
@@ -711,16 +712,22 @@ if [ "$REPLACEMENT" = 1 ]; then
     # first planned restart; steady2, fault2 (both unreachable), recovery2 in the second; then the second restart.
     # =================================================================================================================
     ips_of() { k -n "$NS" get pods -l "c28.devkuban.com/target=$1" -o jsonpath='{range .items[*]}{.status.podIP}{" "}{end}'; }
+    # Each sets <prefix>_STARTED/_DONE to the observed epoch ms of the action (the verdict checks them against the
+    # phase boundaries: complete before the fault begins, kept to its end, removed within the recovery's first minute).
     blackhole_on() {
-      local ip
+      local pfx="$1" ip; shift
       [ -n "$*" ] || die "no pod IP to blackhole"
+      eval "${pfx}_INSTALL_STARTED=$(ms)"
       UNANSWERED_IPS="$*"
       for ip in $*; do docker exec "$W" iptables -I FORWARD 1 $(drop_rule "$ip") || die "iptables on $W"; done
+      eval "${pfx}_INSTALL_DONE=$(ms)"
     }
     blackhole_off() {
-      local ip
+      local pfx="$1" ip
+      eval "${pfx}_REMOVE_STARTED=$(ms)"
       for ip in $UNANSWERED_IPS; do docker exec "$W" iptables -D FORWARD $(drop_rule "$ip") || die "iptables -D on $W"; done
       UNANSWERED_IPS=""
+      eval "${pfx}_REMOVE_DONE=$(ms)"
     }
     into_segment() { echo $(( ($(date +%s) - ORIGIN_S) % SEG_S )); }
     restart_count() { k -n "$NS" get pod "$POD" -o jsonpath='{.status.containerStatuses[0].restartCount}'; }
@@ -740,8 +747,10 @@ if [ "$REPLACEMENT" = 1 ]; then
     k -n "$NS" get pods -l app.kubernetes.io/name=c28-ingress -o json > "$EV/ingress-pods-before.json"
     F1=$(( S1 + STEADY_SECONDS * 1000 )); R1=$(( F1 + FAULT_SECONDS * 1000 )); R1E=$(( R1 + RECOVERY_SECONDS * 1000 ))
     sleep_until_ms "$S1"; log "steady1 ${STEADY_SECONDS}s"
-    sleep_until_ms "$F1"; blackhole_on $(ips_of "$UNANSWERED"); log "fault1: $UNANSWERED unreachable for ${FAULT_SECONDS}s"
-    sleep_until_ms "$R1"; blackhole_off; log "recovery1 ${RECOVERY_SECONDS}s"
+    sleep_until_ms $(( F1 - INSTALL_LEAD_MS )); blackhole_on FA1 $(ips_of "$UNANSWERED")
+    [ "$FA1_INSTALL_DONE" -le "$F1" ] || die "fault1: the blackhole was not complete at the fault's start"
+    log "fault1: $UNANSWERED unreachable for ${FAULT_SECONDS}s"
+    sleep_until_ms "$R1"; blackhole_off FA1; log "recovery1 ${RECOVERY_SECONDS}s"
     sleep_until_ms "$R1E"
     RC1="$(restart_count)"
     log "waiting for the first planned restart (restart count $RC1 now)"
@@ -752,9 +761,10 @@ if [ "$REPLACEMENT" = 1 ]; then
     R2E=$(( R2 + RECOVERY_SECONDS * 1000 ))
     [ $(( R2E + 60000 )) -le $(( SEG_END_MS + SEG_S * 1000 )) ] || die "group 2 does not fit in the second incarnation"
     sleep_until_ms "$S2"; log "steady2 ${STEADY_SECONDS}s"
-    sleep_until_ms "$F2"; blackhole_on $(ips_of c28-demo-pa-n) $(ips_of c28-demo-pa-r)
+    sleep_until_ms $(( F2 - INSTALL_LEAD_MS )); blackhole_on FA2 $(ips_of c28-demo-pa-n) $(ips_of c28-demo-pa-r)
+    [ "$FA2_INSTALL_DONE" -le "$F2" ] || die "fault2: the blackhole was not complete at the fault's start"
     log "fault2: both targets unreachable for ${FAULT_SECONDS}s"
-    sleep_until_ms "$R2"; blackhole_off
+    sleep_until_ms "$R2"; blackhole_off FA2
     k -n "$NS" get pods -l app.kubernetes.io/name=c28-ingress -o json > "$EV/ingress-pods.json"
     IPOD="$(k -n "$NS" get pods -l app.kubernetes.io/name=c28-ingress -o jsonpath='{.items[0].metadata.name}')"
     k -n "$NS" logs "$IPOD" --previous > "$EV/ingress-previous.log" 2> "$EV/ingress-previous.err" || true
@@ -773,10 +783,14 @@ if [ "$REPLACEMENT" = 1 ]; then
       k get --raw "/api/v1/namespaces/monitoring/services/vm:8428/proxy/api/v1/query?query=c28_ingress_requests_total%7Btarget%3D%22$t%22%7D%5B90m%5D" \
         > "$EV/ingress-$t.json" || die "the ingress samples of $t could not be read"
     done
-    "$PY" - "$EV" "$S1" "$F1" "$R1" "$R1E" "$S2" "$F2" "$R2" "$R2E" "$UNANSWERED" <<'PY'
+    "$PY" - "$EV" "$S1" "$F1" "$R1" "$R1E" "$S2" "$F2" "$R2" "$R2E" "$UNANSWERED" \
+      "$FA1_INSTALL_STARTED" "$FA1_INSTALL_DONE" "$FA1_REMOVE_STARTED" "$FA1_REMOVE_DONE" \
+      "$FA2_INSTALL_STARTED" "$FA2_INSTALL_DONE" "$FA2_REMOVE_STARTED" "$FA2_REMOVE_DONE" <<'PY'
 import json, sys
 d = sys.argv[1]
 s1, f1, r1, r1e, s2, f2, r2, r2e = map(int, sys.argv[2:10])
+keys = ("install_started_ms", "install_done_ms", "remove_started_ms", "remove_done_ms")
+actions = {"fault1": dict(zip(keys, map(int, sys.argv[11:15]))), "fault2": dict(zip(keys, map(int, sys.argv[15:19])))}
 out = {}
 for t in ("c28-demo-pa-n", "c28-demo-pa-r"):
     res = json.load(open(f"{d}/ingress-{t}.json"))["data"]["result"]
@@ -792,7 +806,8 @@ json.dump({"kind": "ingress-faults",
                       "fault2": [f2, r2], "recovery2": [r2, r2e]},
            "faults": {"fault1": [sys.argv[10]], "fault2": ["c28-demo-pa-n", "c28-demo-pa-r"]},
            "ingress_before": statuses("ingress-pods-before.json"), "ingress": statuses("ingress-pods.json"),
-           "ingress_final": statuses("ingress-pods-final.json"), "blackhole": {"direction": "requests"}},
+           "ingress_final": statuses("ingress-pods-final.json"), "blackhole": {"direction": "requests"},
+           "actions": actions},
           open(d + "/phases.json", "w"), indent=1)
 PY
     rc=0

@@ -514,11 +514,11 @@ into an in-cluster VictoriaMetrics.
   `DEMO_BLACKHOLE=requests` are recorded with the evidence, not here.
 - *The ingress fault test on the final images* (`demo-kind.sh --ingress-faults --images <images.json>`; verdict
   `smoke/ingress_faults.py`, criteria fixed before any run in `c28-staging/live-demo/INGRESS-FAULT-TEST-CRITERIA.md`
-  and Codex's decisions of 2026-11-12). Fixed by the script, not the caller: 15-minute segments, the constant-peak
+  and Codex's decisions of 2026-11-12). Fixed by the script, not the caller: 20-minute segments, the constant-peak
   smoke schedule (`--smoke-constant-peak`: every minute holds the full schedule's largest minute count, program kind
   `constant-peak`, label `smoke`, digest-bound), request-direction blackholes, the ingress at the params' 128Mi. In the
-  first incarnation: steady 180 s, one target unreachable 300 s, recovery 300 s; then the first planned restart; in
-  the second: steady 180 s, both targets unreachable 300 s, recovery 300 s; then the second restart. The result is
+  first incarnation: steady 180 s, one target unreachable 300 s, recovery 360 s; then the first planned restart; in
+  the second: steady 180 s, both targets unreachable 300 s, recovery 360 s; then the second restart. The result is
   PASS, FAIL or UNPROVEN: the ingress keeps its pod and container with no OOM kill from the first fault to the end
   of the last recovery, its memory.peak stays at most half the limit, and in every fault and recovery its largest
   memory in the last minute is at most 110 % of the second minute's, compared only between minutes with identical
@@ -532,7 +532,14 @@ into an in-cluster VictoriaMetrics.
   readings within 5 s of each edge and no gap over 15 s; the run must be the frozen test (limit exactly 128 MiB, the
   prescribed faults and durations, each phase group inside one incarnation); and the restart budget is read from the
   container terminations and the generator's new unnumbered `first_send` record (the actual instant of an
-  incarnation's first send, per target), not from the scheduling span.
+  incarnation's first send, per target), not from the scheduling span. After the second review: every minute's
+  accounting is judged, the transition minutes included (the last minute of a steady phase, where the blackhole is
+  installed in its last seconds, and the first minute of a recovery, where it is removed); the observed installation
+  and removal times must show the fault fully blackholed for its whole length and at least 300 s of recovery after
+  the removal completed (hence 360 s recoveries and 20-minute segments); any memory reading above 64 MiB fails and
+  memory.peak readings must cover the run; and first_send records are validated by the reducer (run, target,
+  incarnation, integer time, its minute, after the start, inside the declared sending span; a conflicting reread
+  makes it unknown).
 - *Not shown.* A pod that needs its whole grace period to stop, a node failure, the `--k6-local` mode and the
   default full mode of this script, 24-hour segments, the operator and the forecaster (not installed), and any rate
   above the one used.

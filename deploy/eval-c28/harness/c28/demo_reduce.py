@@ -296,6 +296,28 @@ def _line_problems(cfg: Dict, r: Dict) -> List[str]:
     return out
 
 
+def first_send_problems(cfg: Dict, fs: Dict, st: Optional[Dict], inc: str, target: str) -> List[str]:
+    """Why a first_send record does not bind this incarnation's first send: another run, target or incarnation; a
+    timestamp that is not an integer; no valid start record to place it; a send before the incarnation started or
+    outside its declared sending span; a minute that is not the timestamp's."""
+    out = []
+    if fs.get("run") != cfg.get("run_id") or fs.get("target") != target or fs.get("inc") != inc:
+        out.append("first_send of another run, target or incarnation")
+    t, m = fs.get("sent_ms"), fs.get("minute")
+    if not _int(t) or not _int(m):
+        return out + ["first_send without integer sent_ms and minute"]
+    if m != (t - cfg["origin_ms"]) // cfg["minute_ms"]:
+        out.append(f"first_send minute {m} is not the minute of sent_ms {t}")
+    if st is None:
+        return out + ["first_send without a start record"]
+    a, b = st.get("send_from_ms"), st.get("send_to_ms")
+    if not _int(st.get("started_ms")) or t < st["started_ms"]:
+        out.append("first_send before the incarnation started")
+    if not (_int(a) and _int(b) and a <= t < b):
+        out.append("first_send outside the incarnation's declared sending span")
+    return out
+
+
 class _Stream:
     """One incarnation's records for one target."""
 
@@ -305,6 +327,7 @@ class _Stream:
         self.end: Optional[Dict] = None
         self.exhausted: Optional[Dict] = None          # its "schedule-exhausted" record, if it wrote one
         self.first_send: Optional[Dict] = None         # its "first_send" record: the actual instant of its first send
+        self.first_send_problems: List[str] = []       # why that record does not bind this incarnation's first send
         self.start_problems: List[str] = []            # why its start record does not bind it to the configuration
         self.minutes: Dict[int, Dict] = {}
         self.problems: Dict[int, List[str]] = {}
@@ -331,7 +354,12 @@ class _Stream:
             elif r.get("event") == "exhausted":
                 self.exhausted = r
             elif r.get("event") == "first_send":
-                self.first_send = r
+                # Unnumbered, so a reread is recognised by its content: an identical one is the same record, a
+                # different one makes the incarnation's first send unknown.
+                if self.first_send is None:
+                    self.first_send = r
+                elif json.dumps(self.first_send, sort_keys=True) != body and "conflicting_first_send" not in self.flags:
+                    self.flags.append("conflicting_first_send")
             return
         probs = _line_problems(cfg, r)
         if "malformed_line" in probs:
@@ -358,6 +386,10 @@ class _Stream:
             self.start_problems = start_problems(cfg, self.start, self.inc)
             if self.start_problems:
                 self.flags.append("start_record_invalid")
+        self.first_send_problems = first_send_problems(cfg, self.first_send, self.start, self.inc, self.target) \
+            if self.first_send is not None else []
+        if "conflicting_first_send" in self.flags:
+            self.first_send_problems.append("conflicting first_send records")
         # Conservation of carried arrivals inside the incarnation: a carry-out is the next line's carry-in. A carry
         # with no counterpart (the next or previous line is absent, or says something else) is unmatched on both
         # sides: requests were dispatched that no line of this incarnation records.
@@ -785,7 +817,8 @@ def reduce(cfg: Dict, records: List[Dict], ingress: Dict[str, List], start_ms: i
                 "last_minute": s.last_minute, "minute_records": len(s.minutes),
                 "ended": "segment-end" if s.end is not None else "no end record",
                 "schedule_exhausted": s.exhausted is not None,
-                "first_send_ms": (s.first_send or {}).get("sent_ms"),
+                "first_send_ms": None if s.first_send_problems else (s.first_send or {}).get("sent_ms"),
+                "first_send_problems": s.first_send_problems,
                 "start_record": "valid" if not s.start_problems else "; ".join(s.start_problems),
                 "lost_lines": s.lost_lines(), "flags": sorted(set(s.flags))})
     return out
