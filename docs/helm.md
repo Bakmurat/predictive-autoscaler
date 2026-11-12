@@ -332,7 +332,30 @@ The forecasting service and the trainer share the model volume.
     PredictiveAutoscaler object as the API server returns it, never from a number typed again. Two more keys of
     `checked` are **reserved and not enforced by this build**: `calibration_policy_revision` and
     `trust_policy_revision`. A contract that carries either is refused, so that nobody takes them for compared before
-    they are. Every digest, time, name and number in both files is matched whole: no trailing newline passes.
+    they are. The two revisions are nevertheless bound: they are fields of the resolved settings, so
+    `settings_sha256` changes with either. Every digest, time, name and number in both files is matched whole: no
+    trailing newline passes.
+
+    **Writing them:** `python -m forecasting.demonstration_tool` (in `ml-engine`) generates both files from the
+    objects themselves and refuses anything the forecaster would refuse:
+    - `contract --pa PA.json [--pa PA2.json] --deployment DEP.json [--deployment DEP2.json] --expires-not-after T
+      --out contract.json`, from `kubectl get -o json` of the autoscalers and their target Deployments. Each
+      autoscaler must be in Recommend mode and the one validated profile, stated in the object: 60 s grid,
+      `updateIntervalSeconds: 60`, `minLeadSeconds: 600`, risk 1000 bps, `[seasonalNaive]`, default calibration and
+      trust. The operator's selected lead (`status.prediction.lead`, for the object's current generation) must be
+      600 s. The target UID comes from the Deployment and must equal the autoscaler's
+      `status.metricSource.targetUID` when the status has one.
+      The unchecked part records the calibration and trust policy revisions, the lead and the autoscalers' UIDs and
+      generations for the reader.
+    - `qualification --contract contract.json --source-tree TREE --image-digest sha256:... --cluster-uid UID
+      --reviewer A --reviewer B --not-before T --expires T --out qualification.json`: namespace, targets and families
+      are taken from the contract.
+    - `check --qualification ... --contract ... --source-tree ... --image-digest ... [--at T]` runs the forecaster's
+      own admission on the two files.
+    Both files are canonical JSON of at most the forecaster's 64 KiB per mounted file, each is admitted by the
+    forecaster's parser before it is written, and an existing
+    file is never overwritten. The tool reads no cluster: the cluster UID (the `kube-system` namespace's UID) is an
+    input, and the forecaster compares everything with the live objects at every answer.
 
   - **At start-up** the forecaster refuses to start unless all of this holds: the image is the evaluation build of
     the `source_tree` the qualification names, run by the `image_digest` it names
