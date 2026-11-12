@@ -390,6 +390,9 @@ class _Stream:
             if self.first_send is not None else []
         if "conflicting_first_send" in self.flags:
             self.first_send_problems.append("conflicting first_send records")
+        if self.first_send is not None and self.start is not None and self.start_problems:
+            # A first send counts only under a start record bound to this configuration (provenance, as for lines).
+            self.first_send_problems.append("the incarnation's start record is invalid: " + "; ".join(self.start_problems))
         # Conservation of carried arrivals inside the incarnation: a carry-out is the next line's carry-in. A carry
         # with no counterpart (the next or previous line is absent, or says something else) is unmatched on both
         # sides: requests were dispatched that no line of this incarnation records.

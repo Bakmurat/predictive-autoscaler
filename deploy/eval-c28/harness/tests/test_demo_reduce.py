@@ -1114,3 +1114,20 @@ def test_a_first_send_record_binds_only_its_own_incarnations_first_send():
     assert s.first_send == fs() and "conflicting_first_send" not in s.flags
     s.add(cfg, fs(sent_ms=905_000))                                    # a different one: the first send is unknown
     assert "conflicting_first_send" in s.flags and s.first_send == fs()
+
+
+def test_a_first_send_under_an_invalid_start_record_is_invalid():
+    from c28.demo_reduce import _Stream
+    cfg = {"run_id": "r", "origin_ms": 0, "minute_ms": 60_000, "digest": "d" * 64}
+    s = _Stream("i3", "a")
+    s.start = {"started_ms": 900_000, "send_from_ms": 900_100, "send_to_ms": 1_800_000, "config_digest": "e" * 64}
+    s.first_send = {"run": "r", "inc": "i3", "target": "a", "sent_ms": 904_000, "minute": 15}
+    s.start_problems = []
+    import c28.demo_reduce as DRM
+    real = DRM.start_problems
+    try:
+        DRM.start_problems = lambda cfg, st, inc: ["the start record names another configuration digest"]
+        s.finish(cfg)
+    finally:
+        DRM.start_problems = real
+    assert any("start record is invalid" in p for p in s.first_send_problems), s.first_send_problems

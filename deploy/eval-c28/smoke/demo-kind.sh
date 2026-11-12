@@ -777,6 +777,7 @@ if [ "$REPLACEMENT" = 1 ]; then
     k -n "$NS" get pods -l app.kubernetes.io/name=c28-ingress -o json > "$EV/ingress-pods-final.json"
     k -n "$NS" describe pod "$IPOD" > "$EV/ingress-describe.txt" || true
     touch "$EV/stop"; wait "$FOLLOW_PID" || true; FOLLOW_PID=""
+    COLLECTION_END="$(ms)"
     guard
     k -n "$NS" get configmap "$GEN" -o jsonpath='{.data.config\.json}' > "$EV/config.json"
     for t in c28-demo-pa-n c28-demo-pa-r; do
@@ -785,7 +786,7 @@ if [ "$REPLACEMENT" = 1 ]; then
     done
     "$PY" - "$EV" "$S1" "$F1" "$R1" "$R1E" "$S2" "$F2" "$R2" "$R2E" "$UNANSWERED" \
       "$FA1_INSTALL_STARTED" "$FA1_INSTALL_DONE" "$FA1_REMOVE_STARTED" "$FA1_REMOVE_DONE" \
-      "$FA2_INSTALL_STARTED" "$FA2_INSTALL_DONE" "$FA2_REMOVE_STARTED" "$FA2_REMOVE_DONE" <<'PY'
+      "$FA2_INSTALL_STARTED" "$FA2_INSTALL_DONE" "$FA2_REMOVE_STARTED" "$FA2_REMOVE_DONE" "$COLLECTION_END" <<'PY'
 import json, sys
 d = sys.argv[1]
 s1, f1, r1, r1e, s2, f2, r2, r2e = map(int, sys.argv[2:10])
@@ -807,7 +808,7 @@ json.dump({"kind": "ingress-faults",
            "faults": {"fault1": [sys.argv[10]], "fault2": ["c28-demo-pa-n", "c28-demo-pa-r"]},
            "ingress_before": statuses("ingress-pods-before.json"), "ingress": statuses("ingress-pods.json"),
            "ingress_final": statuses("ingress-pods-final.json"), "blackhole": {"direction": "requests"},
-           "actions": actions},
+           "actions": actions, "collection_end_ms": int(sys.argv[19])},
           open(d + "/phases.json", "w"), indent=1)
 PY
     rc=0

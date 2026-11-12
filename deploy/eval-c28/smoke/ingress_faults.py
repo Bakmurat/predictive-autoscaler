@@ -183,8 +183,13 @@ def traffic(red: Dict, phases: Dict, cfg: Dict, targets: List[str], peak: int, v
     return detail
 
 
-def ingress_memory(samples, phases: Dict, v: Verdict) -> Dict:
-    run = (phases["steady1"][0], phases["recovery2"][1])
+def ingress_memory(samples, phases: Dict, v: Verdict, collection_end_ms: Optional[int] = None) -> Dict:
+    # I2 covers every collected reading, from steady1 to the end of the collection (through the second restart);
+    # the plateau and OOM spans are defined separately.
+    if not isinstance(collection_end_ms, int) or collection_end_ms < phases["recovery2"][1]:
+        v.add("unproven", f"I2: the collection end is unknown or before recovery2's end ({collection_end_ms})")
+        collection_end_ms = phases["recovery2"][1]
+    run = (phases["steady1"][0], collection_end_ms)
     span = (phases["fault1"][0], phases["recovery2"][1])
     peaks = [s["peak"] for s in samples if s.get("peak") is not None and run[0] <= s["t_ms"] <= run[1]]
     currents = [s["current"] for s in samples if s.get("current") is not None and run[0] <= s["t_ms"] <= run[1]]
@@ -222,6 +227,7 @@ def _epoch_ms(text) -> Optional[int]:
 
 def generator_restarts(red: Dict, incs: List[Dict], exits: List[Dict], targets: List[str], v: Verdict) -> Dict:
     first = {(i["incarnation"], i["target"]): i.get("first_send_ms") for i in red.get("incarnations", [])}
+    starts = {(i["incarnation"], i["target"]): i.get("start_record") for i in red.get("incarnations", [])}
     invalid = {(i["incarnation"], i["target"]): i.get("first_send_problems") for i in red.get("incarnations", [])
                if i.get("first_send_problems")}
     rows, run, best = [], 0, 0
@@ -254,7 +260,9 @@ def generator_restarts(red: Dict, incs: List[Dict], exits: List[Dict], targets: 
         if started < ended:
             why.append("the next incarnation started before this one ended")
         for t, d in row["first_send_after_segment_end_ms"].items():
-            if invalid.get((b["inc"], t)):
+            if starts.get((b["inc"], t)) != "valid":
+                why.append(f"invalid start record of {t}: {starts.get((b['inc'], t))}")
+            elif invalid.get((b["inc"], t)):
                 why.append(f"invalid first_send of {t}: {invalid[(b['inc'], t)]}")
             elif d is None:
                 why.append(f"no first_send record of {t}")
@@ -282,7 +290,8 @@ def judge(*, red, phases, ph, cfg, ing, identity, limits, incs, exits) -> Dict:
     if any(p not in phases for p in PHASES):
         return {"result": v.result, "fail": v.fail, "unproven": v.unproven}
     peak = cfg["per_minute_days"][0][0]
-    detail = {"traffic": traffic(red, phases, cfg, targets, peak, v), "ingress": ingress_memory(ing, phases, v)}
+    detail = {"traffic": traffic(red, phases, cfg, targets, peak, v),
+              "ingress": ingress_memory(ing, phases, v, ph.get("collection_end_ms"))}
     for cls, text in identity:
         v.add(cls, f"I1: {text}")
     detail["generator"] = generator_restarts(red, incs, exits, targets, v)
@@ -347,7 +356,7 @@ def selftest() -> int:
               "steady2": (21 * M, 24 * M), "fault2": (24 * M, 29 * M), "recovery2": (29 * M, 35 * M)}
     acts = {f: {"install_started_ms": phases[f][0] - 5_000, "install_done_ms": phases[f][0] - 4_000,
                 "remove_started_ms": phases[f][1] + 500, "remove_done_ms": phases[f][1] + 1_500} for f in FAULTS}
-    ph = {"faults": FAULTS, "blackhole": {"direction": "requests"}, "actions": acts}
+    ph = {"faults": FAULTS, "blackhole": {"direction": "requests"}, "actions": acts, "collection_end_ms": 41 * M}
 
     def start(inc, started, seg_end):
         return {"inc": inc, "start": {"started_ms": started, "segment_end_ms": seg_end, "pod_uid": "p"},
@@ -371,7 +380,8 @@ def selftest() -> int:
                      "dropped": {"late": 0, "inflight": 0, "segment_end": 0}}
                 rows[t].append({"minute": mm, "state": "observed", "reasons": [], "intended": PEAK, "generator": g})
         red = {"targets": {t: {"rows": r} for t, r in rows.items()},
-               "incarnations": [{"incarnation": i, "target": t, "first_send_ms": s, "first_send_problems": []}
+               "incarnations": [{"incarnation": i, "target": t, "first_send_ms": s, "first_send_problems": [],
+                                 "start_record": "valid"}
                                 for i, s in (("i2", 20 * M + 4_000), ("i3", 40 * M + 4_000)) for t in (A, B)]}
         if edit:
             edit(red)
@@ -429,6 +439,11 @@ def selftest() -> int:
     must(r(ing=stale), "FAIL", "I2")
     must(r(ing=[dict(x, peak=None) if x["t_ms"] > 2 * M else x for x in ing]), "UNPROVEN", "I2")
     must(r(ing=[dict(x, peak=70 * 2**20) for x in ing]), "FAIL", "I2")
+    tail = [dict(x, current=80 * 2**20, peak=80 * 2**20) if x["t_ms"] > phases["recovery2"][1] else x for x in ing]
+    must(r(ing=tail), "FAIL", "I2")                               # third review, 2: the collection tail counts
+    must(r(ph=dict(ph, collection_end_ms=None)), "UNPROVEN", "collection end")
+    must(r(red=red_for(lambda red: red["incarnations"][2].update(start_record="config_mismatch"))), "FAIL",
+         "invalid start record")                                  # third review, 1: incarnation three's provenance
     # First sends (second review, 3): an invalid record of the third incarnation fails; a missing one is unproven.
     must(r(red=red_for(lambda red: red["incarnations"][2].update(
         first_send_ms=None, first_send_problems=["first_send before the incarnation started"]))), "FAIL", "invalid first_send")
