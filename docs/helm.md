@@ -342,7 +342,9 @@ The forecasting service and the trainer share the model volume.
       --out contract.json`, from `kubectl get -o json` of the autoscalers and their target Deployments. Each
       autoscaler must be in Recommend mode and the one validated profile, stated in the object: 60 s grid,
       `updateIntervalSeconds: 60`, `minLeadSeconds: 600`, risk 1000 bps, `[seasonalNaive]`, default calibration and
-      trust. The target UID comes from the Deployment and must equal the autoscaler's `status.metricSource.targetUID`.
+      trust. The operator's selected lead (`status.prediction.lead`, for the object's current generation) must be
+      600 s. The target UID comes from the Deployment and must equal the autoscaler's
+      `status.metricSource.targetUID` when the status has one.
       The unchecked part records the calibration and trust policy revisions, the lead and the autoscalers' UIDs and
       generations for the reader.
     - `qualification --contract contract.json --source-tree TREE --image-digest sha256:... --cluster-uid UID
@@ -350,7 +352,8 @@ The forecasting service and the trainer share the model volume.
       are taken from the contract.
     - `check --qualification ... --contract ... --source-tree ... --image-digest ... [--at T]` runs the forecaster's
       own admission on the two files.
-    Both files are canonical JSON, each is admitted by the forecaster's parser before it is written, and an existing
+    Both files are canonical JSON of at most the forecaster's 64 KiB per mounted file, each is admitted by the
+    forecaster's parser before it is written, and an existing
     file is never overwritten. The tool reads no cluster: the cluster UID (the `kube-system` namespace's UID) is an
     input, and the forecaster compares everything with the live objects at every answer.
 

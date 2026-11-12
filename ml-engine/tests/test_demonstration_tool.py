@@ -16,7 +16,8 @@ NS = "demo"
 NOT_BEFORE, EXPIRES, NOT_AFTER = H.ts(H.NOW - 3600), H.ts(H.NOW + 14 * 86400), H.ts(H.NOW + 20 * 86400)
 
 
-def pa(name="c28-demo-pa-n", target="c28-demo-pa-n", uid="pa-uid-1", dep_uid="dep-uid-1", **prediction):
+def pa(name="c28-demo-pa-n", target="c28-demo-pa-n", uid="pa-uid-1", dep_uid="dep-uid-1", lead=600, generation=2,
+       **prediction):
     pred = {"sampleIntervalSeconds": 60, "updateIntervalSeconds": 60, "minLeadSeconds": 600,
             "families": ["seasonalNaive"], **prediction}
     return {"apiVersion": "autoscaling.devkuban.com/v1alpha1", "kind": "PredictiveAutoscaler",
@@ -24,7 +25,10 @@ def pa(name="c28-demo-pa-n", target="c28-demo-pa-n", uid="pa-uid-1", dep_uid="de
             "spec": {"targetDeployment": {"name": target, "namespace": NS}, "mode": "Recommend",
                      "minReplicas": 1, "maxReplicas": 12, "metrics": {"requests": {"capacityPerReplica": "17.5"}},
                      "prediction": {k: v for k, v in pred.items() if v is not None}},
-            "status": {"metricSource": {"targetUID": dep_uid}}}
+            "status": {"metricSource": {"targetUID": dep_uid},
+                       "prediction": {"lead": {"seconds": lead, "startupDelaySeconds": 420,
+                                               "actuationAllowanceSeconds": 30, "method": "configured",
+                                               "sampleCount": 0, "observedGeneration": generation}}}}
 
 
 def dep(name="c28-demo-pa-n", uid="dep-uid-1"):
@@ -81,7 +85,7 @@ def test_the_two_files_are_admitted_by_the_service_and_bind_what_was_reviewed():
     ({"minLeadSeconds": None}, "minLeadSeconds must be 600"),
     ({"minLeadSeconds": 900}, "minLeadSeconds must be 600"),
     ({"families": ["seasonalNaive", "statistical"]}, "not the validated profile"),
-    ({"sampleIntervalSeconds": 300}, "not the validated profile"),
+    ({"sampleIntervalSeconds": 300}, "no valid selected lead"),     # 600 s cannot cover startup + a 300 s step
     ({"risk": {"miscoverageBps": 500}}, "not the validated profile"),
     ({"trust": {"minShadowHours": 2}}, "not the validated profile"),
     ({"calibration": {"etaBps": 11}}, "not the validated profile"),
@@ -149,3 +153,30 @@ def test_the_command_line_writes_both_files_and_checks_them(tmp_path, capsys):
     assert sha256_hex(c.read_bytes()) in out and '"targets": 2' in out
     assert T.main(["check", "--qualification", str(q), "--contract", str(c), "--source-tree", H.TREE,
                    "--image-digest", "sha256:" + "e" * 64, "--at", at]) == 1
+
+
+def test_the_lead_the_operator_selected_must_be_600():
+    pas, deps = two()
+    pas[0] = pa(lead=900)                                   # minLeadSeconds 600, but a longer startup budget won
+    refused(lambda: contract(pas, deps), "selected a lead of 900 s")
+    pas[0] = pa(generation=1)                               # selected for an older generation
+    refused(lambda: contract(pas, deps), "no valid selected lead")
+    nolead = pa()
+    del nolead["status"]["prediction"]
+    pas[0] = nolead
+    refused(lambda: contract(pas, deps), "no valid selected lead")
+
+
+def test_files_larger_than_the_forecaster_reads_are_never_written_or_passed():
+    c = contract()
+    q = qualification(c)
+    assert len(c) <= D.MAX_BYTES and len(q) <= D.MAX_BYTES
+    refused(lambda: T.check(q + b" " * (D.MAX_BYTES - len(q) + 1), c, source_tree=H.TREE, image_digest=H.DIGEST,
+                            now_s=H.NOW), "at most 65536 bytes")
+    refused(lambda: T.check(q, c + b" " * (D.MAX_BYTES - len(c) + 1), source_tree=H.TREE, image_digest=H.DIGEST,
+                            now_s=H.NOW), "at most 65536 bytes")
+    exact = q + b" " * (D.MAX_BYTES - len(q))               # exactly at the limit: admitted (JSON allows the spaces)
+    assert len(exact) == D.MAX_BYTES
+    T.check(exact, c, source_tree=H.TREE, image_digest=H.DIGEST, now_s=H.NOW)
+    refused(lambda: qualification(c, reviewers=["claude", "codex"] + [f"r{i:05d}" * 20 for i in range(600)]),
+            "at most 65536 bytes")                          # a qualification that would grow past the limit

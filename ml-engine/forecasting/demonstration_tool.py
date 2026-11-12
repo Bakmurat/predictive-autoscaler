@@ -37,7 +37,7 @@ from typing import Dict, List, Mapping, Optional, Sequence
 from forecasting import demonstration as D
 from forecasting import qualification as Q
 from forecasting.contracts import (CALIBRATION_POLICY_REVISION, TRUST_POLICY_REVISION, ContractRefused, canonical_json,
-                                   resolve_settings, sha256_hex, validated_profile)
+                                   resolve_lead, resolve_settings, sha256_hex, validated_profile)
 
 TOOL = "forecasting.demonstration_tool/v1"
 # The one validated profile's lead (contracts.VALIDATED_PROFILES): spec.prediction.minLeadSeconds must state it.
@@ -88,7 +88,17 @@ def contract_target(pa: Mapping, deployment: Mapping) -> Dict:
         settings = resolve_settings(pa)
     except ContractRefused as e:
         raise ToolRefused(f"{where}: its forecast settings do not resolve: {e}") from e
-    if validated_profile(settings, DEMONSTRATION_LEAD_SECONDS) is None:
+    # The profile is decided by the lead the operator SELECTED (status.prediction.lead, for the object's current
+    # generation), not by the minimum: a startup budget can make the selected lead longer than 600 s, and then the
+    # configuration is not the validated one and could never become eligible.
+    lead, why = resolve_lead(pa, settings, _obj(pa, "metadata.generation"))
+    if lead is None:
+        raise ToolRefused(f"{where}: no valid selected lead for its current generation ({why}): wait for the operator "
+                          "to publish one, then read the object again")
+    if lead.lead_seconds != DEMONSTRATION_LEAD_SECONDS:
+        raise ToolRefused(f"{where}: the operator selected a lead of {lead.lead_seconds} s, the validated profile's is "
+                          f"{DEMONSTRATION_LEAD_SECONDS} s")
+    if validated_profile(settings, lead.lead_seconds) is None:
         raise ToolRefused(f"{where}: its settings are not the validated profile (60 s grid and update interval, "
                           f"lead {DEMONSTRATION_LEAD_SECONDS} s, risk 1000 bps, [seasonalNaive], default calibration "
                           "and trust)")
@@ -142,7 +152,7 @@ def write_contract(pas: Sequence[Mapping], deployments: Sequence[Mapping], expir
                          "autoscalers": autoscalers,
                          "note": "settings_sha256 binds both revisions and every forecast setting; the service "
                                  "compares it with the live autoscaler at every answer"}}
-    data = canonical_json(doc)
+    data = _bounded(canonical_json(doc), "the contract")
     try:
         D.parse_contract(data)
     except Q.QualificationRefused as e:
@@ -159,23 +169,33 @@ def write_qualification(contract: bytes, *, source_tree: str, image_digest: str,
     doc = json.loads(contract)
     targets = [{"namespace": t["namespace"], "name": t["name"], "uid": t["uid"]} for t in doc["checked"]["targets"]]
     namespaces = {t["namespace"] for t in targets}
-    data = canonical_json({"schema": D.SCHEMA, "source_tree": source_tree, "image_digest": image_digest,
+    data = _bounded(canonical_json({"schema": D.SCHEMA, "source_tree": source_tree, "image_digest": image_digest,
                            "contract_sha256": c.sha256, "reviewers": list(reviewers), "not_before": not_before,
                            "expires": expires, "families": doc["checked"]["families"],
                            "scope": {"cluster_uid": cluster_uid, "namespace": next(iter(namespaces)),
-                                     "targets": targets}})
+                                     "targets": targets}}), "the qualification")
     check(data, contract, source_tree=source_tree, image_digest=image_digest, now_s=now_s)
     return data
 
 
 def check(qualification: bytes, contract: bytes, *, source_tree: str, image_digest: str, now_s: int) -> Dict:
-    """The service's own admission of the two files for this build and image at `now_s`, or ToolRefused."""
+    """The service's own admission of the two files for this build and image at `now_s`, or ToolRefused. The size
+    limit of the mounted files (D.MAX_BYTES) applies here too: the service reads at most that many bytes."""
+    _bounded(qualification, "the qualification")
+    _bounded(contract, "the contract")
     try:
         q = D.parse(qualification, contract, Q.BuildInfo(source_tree, True), now_s, image_digest)
     except Q.QualificationRefused as e:
         raise ToolRefused(f"the service would refuse these files: {e}") from e
     return {**q.summary(), "contract_targets": [t.__dict__ for t in q.contract.targets],
             "not_before": q.not_before}
+
+
+def _bounded(data: bytes, what: str) -> bytes:
+    if len(data) > D.MAX_BYTES:
+        raise ToolRefused(f"{what} is {len(data)} bytes; the forecaster reads a mounted file of at most "
+                          f"{D.MAX_BYTES} bytes")
+    return data
 
 
 def _read_json(path: str) -> Mapping:
