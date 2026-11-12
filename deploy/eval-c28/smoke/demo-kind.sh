@@ -420,6 +420,7 @@ SEGMENT_MINUTES="${SEGMENT_MINUTES:-3}"
 if [ "$INGRESS_FAULTS" = 1 ]; then
   SEGMENT_MINUTES=20 DEMO_BLACKHOLE=requests FAULT_SECONDS=300 RECOVERY_SECONDS=360 STEADY_SECONDS=180
   INSTALL_LEAD_MS=10000
+  REMOVE_HOLD_MS=3000     # amendment 1: the fault's end + the 2 s request timeout + 1 s before the removal starts
 fi
 # --replacement: the per-replica rate and the fixture's work per request for the smoke's own params (a light fixture,
 # so the healthy target carries the rate on a small bed), where in the schedule's day the generator starts (the daily
@@ -750,7 +751,7 @@ if [ "$REPLACEMENT" = 1 ]; then
     sleep_until_ms $(( F1 - INSTALL_LEAD_MS )); blackhole_on FA1 $(ips_of "$UNANSWERED")
     [ "$FA1_INSTALL_DONE" -le "$F1" ] || die "fault1: the blackhole was not complete at the fault's start"
     log "fault1: $UNANSWERED unreachable for ${FAULT_SECONDS}s"
-    sleep_until_ms "$R1"; blackhole_off FA1; log "recovery1 ${RECOVERY_SECONDS}s"
+    sleep_until_ms $(( R1 + REMOVE_HOLD_MS )); blackhole_off FA1; log "recovery1 ${RECOVERY_SECONDS}s"
     sleep_until_ms "$R1E"
     RC1="$(restart_count)"
     log "waiting for the first planned restart (restart count $RC1 now)"
@@ -764,7 +765,7 @@ if [ "$REPLACEMENT" = 1 ]; then
     sleep_until_ms $(( F2 - INSTALL_LEAD_MS )); blackhole_on FA2 $(ips_of c28-demo-pa-n) $(ips_of c28-demo-pa-r)
     [ "$FA2_INSTALL_DONE" -le "$F2" ] || die "fault2: the blackhole was not complete at the fault's start"
     log "fault2: both targets unreachable for ${FAULT_SECONDS}s"
-    sleep_until_ms "$R2"; blackhole_off FA2
+    sleep_until_ms $(( R2 + REMOVE_HOLD_MS )); blackhole_off FA2
     k -n "$NS" get pods -l app.kubernetes.io/name=c28-ingress -o json > "$EV/ingress-pods.json"
     IPOD="$(k -n "$NS" get pods -l app.kubernetes.io/name=c28-ingress -o jsonpath='{.items[0].metadata.name}')"
     k -n "$NS" logs "$IPOD" --previous > "$EV/ingress-previous.log" 2> "$EV/ingress-previous.err" || true

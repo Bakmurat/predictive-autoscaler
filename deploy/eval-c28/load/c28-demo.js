@@ -260,6 +260,7 @@ function createGenerator(cfg, index, shared, deps) {
   let lastMinute = -1;        // the last minute index this incarnation writes (below nextEmit: none)
   let exhaustedNoted = false; // the "exhausted" record is written once
   let firstSendNoted = false; // the "first_send" record: when this incarnation really sent its first request
+  let probeMinute = -1;       // the last minute a clock probe was sent in (deps.probe: at most one per minute)
   let inflight = 0;
   let seq = 0;
   let finished = false;
@@ -269,7 +270,7 @@ function createGenerator(cfg, index, shared, deps) {
     let r = minutes.get(m);
     if (!r) {
       r = { due: 0, dispatched: 0, in: 0, out: 0, late: 0, inflight: 0, end: 0, ok: 0, failed: 0, failed_by: {},
-        lat: new Array(B + 1).fill(0), lat_max: 0, late_max: 0, clock: null };
+        lat: new Array(B + 1).fill(0), lat_max: 0, late_max: 0, clock: null, probe_clock: null };
       minutes.set(m, r);
     }
     return r;
@@ -373,13 +374,36 @@ function createGenerator(cfg, index, shared, deps) {
       dropped: { late: r.late, inflight: r.inflight, segment_end: r.end },
       ok: r.ok, failed: r.failed, failed_by: r.failed_by, unresolved: r.dispatched - r.ok - r.failed,
       lat: { counts: r.lat, max_ms: Math.round(r.lat_max) }, late_max_ms: Math.round(r.late_max), clock: r.clock,
+      probe_clock: r.probe_clock,
       cum: cumNow() });
     seq += 1;
+  }
+
+  // Clock evidence that does not depend on the targets: once per minute of the sending span, a GET of the ingress's
+  // own /healthz (answered before any routing; never counted as an arrival, a dispatch or a workload outcome). Its
+  // Date header and round trip are kept apart as the minute's probe_clock, so a minute in which no target answers
+  // still has its clock bounded. Only with deps.probe (the k6 wiring); a test harness without it sends no probe.
+  function probe(now) {
+    const m = minuteIndex(cfg, now);
+    if (!deps.probe || m === probeMinute || m < nextEmit || m > lastMinute || now < sendFrom || now >= sendTo) return;
+    probeMinute = m;
+    const sentMs = now;
+    deps.probe(cfg.timeout_ms, (status, durationMs, dateHeader) => {
+      const r = minutes.get(m);
+      if (!r || status !== 200) return;                  // its line is written, or the probe failed: no evidence
+      const recvMs = deps.now();
+      const rt = Math.max(Math.round(durationMs), recvMs - sentMs);
+      const d = httpDateSeconds(dateHeader);
+      if (d !== null && (r.probe_clock === null || rt < r.probe_clock.rt_ms)) {
+        r.probe_clock = { date_s: d, recv_ms: recvMs, rt_ms: rt };
+      }
+    });
   }
 
   function tick() {
     if (finished) return;
     let now = deps.now();
+    probe(now);
     while (cursor !== null && cursor.t <= now) {
       const nextStart = minuteStart(cfg, cursor.m + 1);
       if (now - nextStart >= cfg.max_late_ms && nextStart <= sendTo) {
@@ -511,6 +535,14 @@ export function run(shared) {
     send: (url, _timeoutMs, done) => {
       const t0 = Date.now();
       http.asyncRequest('GET', url, null, { timeout, tags: { name: 'work', c28_target: cfg.targets[index] } }).then(
+        (res) => done(res.status || 0, res.timings ? res.timings.duration : Date.now() - t0,
+          res.headers ? res.headers.Date : undefined),
+        () => done(0, Date.now() - t0, undefined),
+      );
+    },
+    probe: (_timeoutMs, done) => {
+      const t0 = Date.now();
+      http.asyncRequest('GET', `${cfg.base_url}/healthz`, null, { timeout, tags: { name: 'clock-probe' } }).then(
         (res) => done(res.status || 0, res.timings ? res.timings.duration : Date.now() - t0,
           res.headers ? res.headers.Date : undefined),
         () => done(0, Date.now() - t0, undefined),

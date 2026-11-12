@@ -102,11 +102,12 @@ function simulate(mod, sc) {
   const lines = [];
   const truth = {};
   const sends = {};
+  const probesSent = {};
   const counters = {};                             // the ingress's counters (reset by a restart)
   const samples = {};
   // ingress_initial: the counters' value when the simulation begins (earlier traffic); absent = no series yet.
   const initial = sc.ingress_initial === undefined ? null : sc.ingress_initial;
-  for (const t of cfg.targets) { truth[t] = {}; sends[t] = 0; counters[t] = initial; samples[t] = []; }
+  for (const t of cfg.targets) { truth[t] = {}; sends[t] = 0; probesSent[t] = 0; counters[t] = initial; samples[t] = []; }
   const bump = (target, tMs, key) => {
     const m = String(mod.minuteIndex(cfg, tMs));
     const row = truth[target][m] || (truth[target][m] = { dispatched: 0, received: 0 });
@@ -153,7 +154,15 @@ function simulate(mod, sc) {
       const started = T + skewAt(T);
       const shared = { started_ms: started, segment_end_ms: mod.segmentEnd(cfg, started), pod_uid: inc.pod_uid, pod: `gen-${n}` };
       cfg.targets.forEach((target, i) => {
+        // sc.clock_probe: the ingress answers /healthz itself, whatever happens to the targets (never an arrival).
+        const probe = !sc.clock_probe ? null : (timeoutMs, done) => {
+          const sent = T;
+          probesSent[target] += 1;
+          at(sent + 2 * network, () => done(200, 2 * network,
+            new Date(Math.floor((sent + network) / 1000) * 1000).toUTCString()));
+        };
         const d = Object.assign({}, deps, {
+          probe,
           send: (url, timeoutMs, done) => {
             const sent = T;
             if (url !== `${cfg.base_url}/t/${target}/work`) throw new Error(`unexpected URL ${url}`);
@@ -188,7 +197,7 @@ function simulate(mod, sc) {
     if (e.owner === null || e.owner.alive) e.fn();
     if ((guard += 1) > 50_000_000) throw new Error('the simulation does not terminate');
   }
-  return { lines, truth, sends, ingress: samples };
+  return { lines, truth, sends, probes: probesSent, ingress: samples };
 }
 
 function probes(mod, list) {

@@ -55,6 +55,10 @@ PLATEAU_RATIO = 1.10
 MIN_FAULT_MS, MIN_STEADY_MS = 300_000, 180_000
 INSTALL_LEAD_MS = 60_000           # the blackhole's installation starts within the steady phase's last minute
 REMOVE_WITHIN_MS = 60_000          # and its removal completes within the recovery's first minute
+# Amendment 1 (2026-11-12, after run 1): the blackhole is kept until the fault's end + the request timeout + 1 s, so
+# that no request dispatched inside the fault can still complete after the removal (run 1: about 300 requests of the
+# fault's last 2 s completed after it; the transport mechanism is inferred).
+REMOVE_HOLD_MS = 3_000
 EDGE_MS, MAX_GAP_MS = 5_000, 15_000
 MIN_RUNTIME_S = 600
 MAX_FIRST_SEND_MS = 10_000
@@ -121,7 +125,7 @@ def setup_problems(phases: Dict, ph: Dict, cfg: Dict, limits: List[int], incs: L
         f0, f1, r1 = phases[fault][0], phases[fault][1], phases[rec][1]
         if not (f0 - INSTALL_LEAD_MS <= act["install_started_ms"] <= act["install_done_ms"] <= f0):
             out.append(f"{fault}: the blackhole was not complete at the fault's start ({act})")
-        if not (f1 <= act["remove_started_ms"] <= act["remove_done_ms"] <= f1 + REMOVE_WITHIN_MS):
+        if not (f1 + REMOVE_HOLD_MS <= act["remove_started_ms"] <= act["remove_done_ms"] <= f1 + REMOVE_WITHIN_MS):
             out.append(f"{fault}: the blackhole was not kept to the fault's end, or its removal was late ({act})")
         elif r1 - act["remove_done_ms"] < MIN_FAULT_MS:
             out.append(f"{rec}: {(r1 - act['remove_done_ms']) // 1000} s after the removal completed (at least "
@@ -355,7 +359,7 @@ def selftest() -> int:
     phases = {"steady1": (M, 4 * M), "fault1": (4 * M, 9 * M), "recovery1": (9 * M, 15 * M),
               "steady2": (21 * M, 24 * M), "fault2": (24 * M, 29 * M), "recovery2": (29 * M, 35 * M)}
     acts = {f: {"install_started_ms": phases[f][0] - 5_000, "install_done_ms": phases[f][0] - 4_000,
-                "remove_started_ms": phases[f][1] + 500, "remove_done_ms": phases[f][1] + 1_500} for f in FAULTS}
+                "remove_started_ms": phases[f][1] + 3_200, "remove_done_ms": phases[f][1] + 3_500} for f in FAULTS}
     ph = {"faults": FAULTS, "blackhole": {"direction": "requests"}, "actions": acts, "collection_end_ms": 41 * M}
 
     def start(inc, started, seg_end):
@@ -462,6 +466,8 @@ def selftest() -> int:
         return dict(ph, actions=dict(acts, **{fault: dict(acts[fault], **over)}))
     must(r(ph=act("fault1", install_done_ms=phases["fault1"][0] + 2_000)), "FAIL", "not complete at the fault's start")
     must(r(ph=act("fault2", remove_started_ms=phases["fault2"][1] - 1_000)), "FAIL", "not kept to the fault's end")
+    must(r(ph=act("fault1", remove_started_ms=phases["fault1"][1] + 500, remove_done_ms=phases["fault1"][1] + 800)),
+         "FAIL", "not kept to the fault's end")                      # amendment 1: held 3 s past the fault's end
     must(r(ph=act("fault2", remove_done_ms=phases["fault2"][1] + 61_000)), "FAIL", "not kept to the fault's end")
     must(r(ph=act("fault1", remove_started_ms=phases["fault1"][1] + 59_000,
                   remove_done_ms=phases["fault1"][1] + 59_500), phases=dict(phases, recovery1=(9 * M, 14 * M))),

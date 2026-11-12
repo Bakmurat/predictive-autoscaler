@@ -540,6 +540,10 @@ into an in-cluster VictoriaMetrics.
   memory.peak readings must cover the run; and first_send records are validated by the reducer (run, target,
   incarnation, integer time, its minute, after the start, inside the declared sending span; a conflicting reread
   makes it unknown).
+  Amendment 1 (after run 1, which stays FAIL): the blackhole is held until the fault's end + the request timeout + 1 s
+  (`REMOVE_HOLD_MS` 3,000), and the generator sends one clock probe per minute, a GET of the ingress's own /healthz,
+  recorded apart as the minute line's `probe_clock` and intersected by the reducer with the workload's clock sample;
+  probes are never dispatches, arrivals or outcomes.
 - *Not shown.* A pod that needs its whole grace period to stop, a node failure, the `--k6-local` mode and the
   default full mode of this script, 24-hour segments, the operator and the forecaster (not installed), and any rate
   above the one used.
