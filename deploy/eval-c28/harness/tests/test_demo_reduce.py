@@ -433,7 +433,7 @@ def test_cli_demo_reduce(tmp_path, capsys):
     assert main(argv) == 0
     doc = json.loads(capsys.readouterr().out)
     assert doc["targets"] == reduced(cfg, out)["targets"]
-    assert doc["log"] == {"lines": 38, "records": 37, "other": 1, "oversize": 0}
+    assert doc["log"] == {"lines": 40, "records": 39, "other": 1, "oversize": 0}   # incl. one first_send per target
     assert doc["records"]["duplicate_lines"] == 5 and doc["schema"] == "c28-demo-reduction/v3"
     assert doc["schedule"] == {"days": 28, "seeds": list(range(301, 329)), "minutes": 28 * 1440,
                                "end_ms": ORIGIN + 28 * DAY}

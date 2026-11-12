@@ -551,8 +551,11 @@ def test_the_schedule_ends_inside_an_incarnation_and_nothing_wraps(tmp_path):
     assert len(fin) == 1 and fin[0]["ended_ms"] == seg_end and fin[0]["exhausted"] is True   # it idled to its segment end
     assert fin[0]["reason"] == "segment-end" and fin[0]["inflight"] == 0
     assert fin[0]["cum"]["dispatched"] == sum(l["dispatched"] for l in lines)
-    ns = [l["n"] for l in out["lines"] if l["target"] == N]
+    ns = [l["n"] for l in out["lines"] if l["target"] == N and l.get("event") != "first_send"]
     assert ns == list(range(len(ns)))                                      # start, 3 lines, exhausted, end: no gap
+    first = [l for l in out["lines"] if l["target"] == N and l.get("event") == "first_send"]
+    assert len(first) == 1 and first[0]["n"] is None                       # one unnumbered first-send record
+    assert first[0]["sent_ms"] >= next(l for l in out["lines"] if l["target"] == N and l.get("event") == "start")["started_ms"]
 
 
 def test_an_incarnation_started_after_the_end_writes_the_record_sends_nothing_and_idles_to_its_segment_end(tmp_path):

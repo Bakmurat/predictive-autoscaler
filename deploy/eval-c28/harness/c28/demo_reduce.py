@@ -304,6 +304,7 @@ class _Stream:
         self.start: Optional[Dict] = None
         self.end: Optional[Dict] = None
         self.exhausted: Optional[Dict] = None          # its "schedule-exhausted" record, if it wrote one
+        self.first_send: Optional[Dict] = None         # its "first_send" record: the actual instant of its first send
         self.start_problems: List[str] = []            # why its start record does not bind it to the configuration
         self.minutes: Dict[int, Dict] = {}
         self.problems: Dict[int, List[str]] = {}
@@ -329,6 +330,8 @@ class _Stream:
                 self.end = r
             elif r.get("event") == "exhausted":
                 self.exhausted = r
+            elif r.get("event") == "first_send":
+                self.first_send = r
             return
         probs = _line_problems(cfg, r)
         if "malformed_line" in probs:
@@ -782,6 +785,7 @@ def reduce(cfg: Dict, records: List[Dict], ingress: Dict[str, List], start_ms: i
                 "last_minute": s.last_minute, "minute_records": len(s.minutes),
                 "ended": "segment-end" if s.end is not None else "no end record",
                 "schedule_exhausted": s.exhausted is not None,
+                "first_send_ms": (s.first_send or {}).get("sent_ms"),
                 "start_record": "valid" if not s.start_problems else "; ".join(s.start_problems),
                 "lost_lines": s.lost_lines(), "flags": sorted(set(s.flags))})
     return out

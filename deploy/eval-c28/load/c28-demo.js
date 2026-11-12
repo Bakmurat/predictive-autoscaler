@@ -259,6 +259,7 @@ function createGenerator(cfg, index, shared, deps) {
   let nextEmit = 0;           // the next minute index to write
   let lastMinute = -1;        // the last minute index this incarnation writes (below nextEmit: none)
   let exhaustedNoted = false; // the "exhausted" record is written once
+  let firstSendNoted = false; // the "first_send" record: when this incarnation really sent its first request
   let inflight = 0;
   let seq = 0;
   let finished = false;
@@ -348,6 +349,13 @@ function createGenerator(cfg, index, shared, deps) {
     if (late > rd.late_max) rd.late_max = late;
     inflight += 1;
     if (deps.count) deps.count('dispatched', { c28_target: target });
+    if (!firstSendNoted) {
+      // The actual instant of the first send (not the scheduling span's start): a restart's gap is measured from it.
+      firstSendNoted = true;
+      // Unnumbered (n null): it is a timestamp beside the numbered records, so their sequence stays as it was.
+      deps.emit({ schema: 'c28-demo-incarnation/v2', event: 'first_send', run: cfg.run_id, inc, target, n: null,
+        sent_ms: deps.now(), minute: md });
+    }
     deps.send(url, cfg.timeout_ms, (status, durationMs, dateHeader) => {
       complete(md, status, durationMs, dateHeader, deps.now());
     });

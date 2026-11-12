@@ -298,7 +298,8 @@ def container_exits(events, polls):
         if t and key not in seen:
             seen.add(key)
             out.append({"pod_uid": v.get("uid"), "exit_code": t.get("exitCode"), "reason": t.get("reason"),
-                        "started_at": t.get("startedAt"), "finished_at": t.get("finishedAt")})
+                        "started_at": t.get("startedAt"), "finished_at": t.get("finishedAt"),
+                        "container_id": t.get("containerID")})
     return sorted(out, key=lambda x: str(x["finished_at"]))
 
 
@@ -459,8 +460,8 @@ def _container_name(container_id):
     return (container_id or "").split("://")[-1]
 
 
-def ingress_evidence_problems(final, before, memory, oom, sampled):
-    """What the verdict needs to have SEEN of the fixture's ingress (the same rule as for the generator: missing
+def ingress_evidence_classified(final, before, memory, oom, sampled):
+    """[(class, text)] with class "fail" (seen broken) or "unproven" (not seen). What the verdict needs to have SEEN of the fixture's ingress (the same rule as for the generator: missing
     evidence never reads as a pass):
 
     - its container statuses AFTER THE RECOVERY (`final`) with a restart count of 0;
@@ -473,49 +474,57 @@ def ingress_evidence_problems(final, before, memory, oom, sampled):
 
     `final` and `before` are [{pod, uid, container_id, restarts, last_terminated}]."""
     problems = []
+
+    def add(cls, text):
+        problems.append((cls, text))
     if not final:
-        problems.append("the ingress's container status after the recovery was not captured: its restart count is unknown")
+        add("unproven", "the ingress's container status after the recovery was not captured: its restart count is unknown")
     for p in final or []:
         if not isinstance(p.get("restarts"), int) or isinstance(p.get("restarts"), bool):
-            problems.append(f"ingress pod {p.get('pod')}: no restart count")
+            add("unproven", f"ingress pod {p.get('pod')}: no restart count")
         elif p["restarts"] != 0:
             t = p.get("last_terminated") or {}
-            problems.append(f"ingress pod {p.get('pod')} restarted {p['restarts']} time(s): last termination "
+            add("fail", f"ingress pod {p.get('pod')} restarted {p['restarts']} time(s): last termination "
                             f"{t.get('reason')} (exit {t.get('exitCode')}) at {t.get('finishedAt')}")
 
     def identity(rows):
         return sorted((p.get("uid"), _container_name(p.get("container_id"))) for p in rows or [])
     if not before:
-        problems.append("the ingress's pod and container before the fault were not captured: nothing to compare the "
+        add("unproven", "the ingress's pod and container before the fault were not captured: nothing to compare the "
                         "ingress after the recovery with")
     elif final:
         a, b = identity(before), identity(final)
         if len(a) != 1 or len(b) != 1 or not all(a[0]) or not all(b[0]):
-            problems.append(f"the ingress is not exactly one identified pod and container (before {a}, after {b})")
+            add("fail", f"the ingress is not exactly one identified pod and container (before {a}, after {b})")
         elif a != b:
-            problems.append(f"the ingress pod or container changed between the start of the fault and the end of the "
+            add("fail", f"the ingress pod or container changed between the start of the fault and the end of the "
                             f"recovery (before {a[0]}, after {b[0]})")
         elif sorted(sampled or []) != [b[0][1]]:
-            problems.append(f"the memory sampler saw the ingress containers {sorted(sampled or [])} from the fault to "
+            add("fail" if sampled else "unproven", f"the memory sampler saw the ingress containers {sorted(sampled or [])} from the fault to "
                             f"the end of the recovery, not exactly the one in its status ({b[0][1]})")
     limit = memory.get("limit_bytes")
     window = (memory.get("windows") or {}).get("timeout") or {}
     if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
-        problems.append(f"the ingress's memory limit is unknown ({limit!r})")
+        add("unproven", f"the ingress's memory limit is unknown ({limit!r})")
     if window.get("samples", 0) < MIN_MEMORY_SAMPLES or window.get("max_current_bytes", 0) <= 0:
-        problems.append(f"the timeout phase holds {window.get('samples', 0)} samples of the ingress's memory with a "
+        add("unproven", f"the timeout phase holds {window.get('samples', 0)} samples of the ingress's memory with a "
                         f"largest value of {window.get('max_current_bytes', 0)} bytes (at least {MIN_MEMORY_SAMPLES} "
                         "above 0 needed): the ingress's memory was not measured")
     elif isinstance(limit, int) and not isinstance(limit, bool) and limit > 0 and memory["max_bytes"] >= limit:
-        problems.append(f"the ingress's memory reached its limit ({memory['max_bytes']} of {limit} bytes)")
+        add("fail", f"the ingress's memory reached its limit ({memory['max_bytes']} of {limit} bytes)")
     if not oom or not oom.get("covered"):
         o = oom or {}
-        problems.append(f"the ingress's oom_kill counters were not read from the start of the fault to the end of the "
+        add("unproven", f"the ingress's oom_kill counters were not read from the start of the fault to the end of the "
                         f"recovery ({o.get('readings', 0)} readings, largest gap {o.get('max_gap_ms')} ms): that no "
                         "OOM kill happened is unproven")
     if oom and oom.get("max_kills"):
-        problems.append(f"the kernel OOM-killed in the ingress's cgroup ({oom['max_kills']} kill(s))")
+        add("fail", f"the kernel OOM-killed in the ingress's cgroup ({oom['max_kills']} kill(s))")
     return problems
+
+
+def ingress_evidence_problems(final, before, memory, oom, sampled):
+    """ingress_evidence_classified's texts (a missing piece of evidence and a seen failure alike are problems)."""
+    return [text for _cls, text in ingress_evidence_classified(final, before, memory, oom, sampled)]
 
 
 def analyse(a):

@@ -525,7 +525,14 @@ into an in-cluster VictoriaMetrics.
   intended and dispatched counts per target; the unaffected target is served during the single fault; both fail
   cleanly, nothing dropped, in the double fault; every steady and recovery phase is served; and two consecutive
   planned restarts, each after more than 600 s, have their first dispatch to each target within 10 s of the segment
-  end (the restart-gap budget; this alone does not prove the absence of kubelet back-off).
+  end (the restart-gap budget; this alone does not prove the absence of kubelet back-off). After review: every phase
+  boundary is a schedule minute; the traffic of every minute except the transition minute (the first of each fault
+  and recovery) is judged from the reducer's rows (one observed row per target, the constant peak intended and
+  dispatched, nothing dropped, every request failed when unreachable and served otherwise); memory windows need
+  readings within 5 s of each edge and no gap over 15 s; the run must be the frozen test (limit exactly 128 MiB, the
+  prescribed faults and durations, each phase group inside one incarnation); and the restart budget is read from the
+  container terminations and the generator's new unnumbered `first_send` record (the actual instant of an
+  incarnation's first send, per target), not from the scheduling span.
 - *Not shown.* A pod that needs its whole grace period to stop, a node failure, the `--k6-local` mode and the
   default full mode of this script, 24-hour segments, the operator and the forecaster (not installed), and any rate
   above the one used.

@@ -724,30 +724,45 @@ if [ "$REPLACEMENT" = 1 ]; then
     }
     into_segment() { echo $(( ($(date +%s) - ORIGIN_S) % SEG_S )); }
     restart_count() { k -n "$NS" get pod "$POD" -o jsonpath='{.status.containerStatuses[0].restartCount}'; }
-    NEED=$(( STEADY_SECONDS + FAULT_SECONDS + RECOVERY_SECONDS + 90 ))
-    # Phases lie inside ONE incarnation each: start 25 s after a segment boundary unless enough of this one is left.
-    if [ $(( SEG_S - $(into_segment) )) -lt "$NEED" ]; then sleep $(( SEG_S - $(into_segment) + 25 )); fi
+    # Every phase boundary is a schedule minute (origin-aligned), so the compared second and last minutes of a phase
+    # are whole schedule minutes for the traffic AND the memory. The blackhole is put on or taken off at the boundary;
+    # the first minute of each fault and recovery is the transition minute the verdict does not judge for traffic.
+    next_minute_ms() { echo $(( ORIGIN_S * 1000 + ( ( $(ms) - ORIGIN_S * 1000 ) / 60000 + 1 ) * 60000 )); }
+    sleep_until_ms() { local d=$(( $1 - $(ms) )); [ "$d" -le 0 ] || sleep "$(printf '%d.%03d' $(( d / 1000 )) $(( d % 1000 )))"; }
+    GROUP_MS=$(( (STEADY_SECONDS + FAULT_SECONDS + RECOVERY_SECONDS) * 1000 ))
+    # Group 1 lies inside the current incarnation, ending at least 60 s before its segment end; else the next one.
+    S1="$(next_minute_ms)"
+    SEG_END_MS=$(( (ORIGIN_S + ( ($(date +%s) - ORIGIN_S) / SEG_S + 1 ) * SEG_S) * 1000 ))
+    if [ $(( S1 + GROUP_MS + 60000 )) -gt "$SEG_END_MS" ]; then
+      sleep_until_ms $(( SEG_END_MS + 25000 )); S1="$(next_minute_ms)"
+    fi
     [ "$(pod_uid)" = "$FIRST_UID" ] || die "the generator pod changed before the fault test"
     k -n "$NS" get pods -l app.kubernetes.io/name=c28-ingress -o json > "$EV/ingress-pods-before.json"
-    S1="$(ms)"; log "steady1 ${STEADY_SECONDS}s"; sleep "$STEADY_SECONDS"
-    F1="$(ms)"; blackhole_on $(ips_of "$UNANSWERED"); log "fault1: $UNANSWERED unreachable for ${FAULT_SECONDS}s"
-    sleep "$FAULT_SECONDS"; blackhole_off; R1="$(ms)"
-    log "recovery1 ${RECOVERY_SECONDS}s"; sleep "$RECOVERY_SECONDS"; R1E="$(ms)"
+    F1=$(( S1 + STEADY_SECONDS * 1000 )); R1=$(( F1 + FAULT_SECONDS * 1000 )); R1E=$(( R1 + RECOVERY_SECONDS * 1000 ))
+    sleep_until_ms "$S1"; log "steady1 ${STEADY_SECONDS}s"
+    sleep_until_ms "$F1"; blackhole_on $(ips_of "$UNANSWERED"); log "fault1: $UNANSWERED unreachable for ${FAULT_SECONDS}s"
+    sleep_until_ms "$R1"; blackhole_off; log "recovery1 ${RECOVERY_SECONDS}s"
+    sleep_until_ms "$R1E"
     RC1="$(restart_count)"
     log "waiting for the first planned restart (restart count $RC1 now)"
-    sleep $(( SEG_S - $(into_segment) + 25 ))
+    SEG_END_MS=$(( (ORIGIN_S + ( ($(date +%s) - ORIGIN_S) / SEG_S + 1 ) * SEG_S) * 1000 ))
+    sleep_until_ms $(( SEG_END_MS + 25000 ))
     [ "$(pod_uid)" = "$FIRST_UID" ] && [ "$(restart_count)" -gt "$RC1" ] || die "no planned restart in the same pod"
-    S2="$(ms)"; log "steady2 ${STEADY_SECONDS}s"; sleep "$STEADY_SECONDS"
-    F2="$(ms)"; blackhole_on $(ips_of c28-demo-pa-n) $(ips_of c28-demo-pa-r)
-    log "fault2: both targets unreachable for ${FAULT_SECONDS}s"; sleep "$FAULT_SECONDS"; blackhole_off; R2="$(ms)"
+    S2="$(next_minute_ms)"; F2=$(( S2 + STEADY_SECONDS * 1000 )); R2=$(( F2 + FAULT_SECONDS * 1000 ))
+    R2E=$(( R2 + RECOVERY_SECONDS * 1000 ))
+    [ $(( R2E + 60000 )) -le $(( SEG_END_MS + SEG_S * 1000 )) ] || die "group 2 does not fit in the second incarnation"
+    sleep_until_ms "$S2"; log "steady2 ${STEADY_SECONDS}s"
+    sleep_until_ms "$F2"; blackhole_on $(ips_of c28-demo-pa-n) $(ips_of c28-demo-pa-r)
+    log "fault2: both targets unreachable for ${FAULT_SECONDS}s"
+    sleep_until_ms "$R2"; blackhole_off
     k -n "$NS" get pods -l app.kubernetes.io/name=c28-ingress -o json > "$EV/ingress-pods.json"
     IPOD="$(k -n "$NS" get pods -l app.kubernetes.io/name=c28-ingress -o jsonpath='{.items[0].metadata.name}')"
     k -n "$NS" logs "$IPOD" --previous > "$EV/ingress-previous.log" 2> "$EV/ingress-previous.err" || true
     k -n "$NS" get events --field-selector "involvedObject.name=$IPOD" -o json > "$EV/ingress-events.json" || true
-    log "recovery2 ${RECOVERY_SECONDS}s"; sleep "$RECOVERY_SECONDS"; R2E="$(ms)"
+    log "recovery2 ${RECOVERY_SECONDS}s"; sleep_until_ms "$R2E"
     RC2="$(restart_count)"
     log "waiting for the second planned restart and its first dispatches"
-    sleep $(( SEG_S - $(into_segment) + 75 ))
+    sleep_until_ms $(( SEG_END_MS + SEG_S * 1000 + 75000 ))
     [ "$(pod_uid)" = "$FIRST_UID" ] && [ "$(restart_count)" -gt "$RC2" ] || die "no second planned restart in the same pod"
     k -n "$NS" get pods -l app.kubernetes.io/name=c28-ingress -o json > "$EV/ingress-pods-final.json"
     k -n "$NS" describe pod "$IPOD" > "$EV/ingress-describe.txt" || true
