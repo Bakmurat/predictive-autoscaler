@@ -519,6 +519,10 @@ def ingress_evidence_problems(final, before, memory, oom, sampled):
 
 
 def analyse(a):
+    with open(a.phases) as fh:
+        if json.load(fh).get("kind") == "ingress-faults":     # demo-kind.sh --ingress-faults: its own verdict
+            import ingress_faults
+            return ingress_faults.analyse(a)
     sys.path.insert(0, a.harness)
     from c28 import demo, demo_reduce as DR
     cfg = json.load(open(a.config))
@@ -813,7 +817,12 @@ def main(argv=None):
         an.add_argument(f"--{name}", required=True)
     sub.add_parser("selftest")
     a = ap.parse_args(argv)
-    return {"follow": follow, "analyse": analyse, "selftest": lambda _a: selftest()}[a.cmd](a)
+    return {"follow": follow, "analyse": analyse, "selftest": lambda _a: _selftests()}[a.cmd](a)
+
+
+def _selftests():
+    import ingress_faults
+    return selftest() or ingress_faults.selftest()
 
 
 if __name__ == "__main__":

@@ -67,7 +67,7 @@ PY="${PYTHON:-python3}"
 case "$PY" in */*) PY="$(cd "$(dirname "$PY")" && pwd)/$(basename "$PY")" ;; esac
 c28() { (cd "$HARNESS" && KUBECONFIG=/dev/null "$PY" -m c28 "$@"); }
 SMOKE_DIR="$ROOT/deploy/eval-c28/smoke"
-MODE=full IMAGES_FILE="" REPLACEMENT=0
+MODE=full IMAGES_FILE="" REPLACEMENT=0 INGRESS_FAULTS=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --render-only) MODE=render ;;
@@ -75,6 +75,7 @@ while [ $# -gt 0 ]; do
     --images) [ $# -ge 2 ] || { echo "demo smoke: --images needs a file" >&2; exit 2; }; IMAGES_FILE="$2"; shift ;;
     --images=*) IMAGES_FILE="${1#--images=}" ;;
     --replacement) REPLACEMENT=1 ;;
+    --ingress-faults) REPLACEMENT=1 INGRESS_FAULTS=1 ;;
     *) echo "demo smoke: unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -412,6 +413,13 @@ NODE_IMAGE="${NODE_IMAGE:-kindest/node:v1.35.8@sha256:07b2536e30b803ed61d1677a79
 REGISTRY_IMAGE=registry:2.8.3
 VM_IMAGE=victoriametrics/victoria-metrics@sha256:5eff7af5341e401471002f58d106d399e614a62f3d240f2dbc21901e49eed5dd   # v1.153.0
 SEGMENT_MINUTES="${SEGMENT_MINUTES:-3}"
+# --ingress-faults: the final-image ingress fault test (live-demo/INGRESS-FAULT-TEST-CRITERIA.md and Codex's 2026-11-12
+# decisions; verdict: ingress_faults.py). Fixed here, not by the caller: 15-minute segments (two planned restarts in the
+# run, each after more than 600 s), the constant-peak smoke schedule, request-direction blackholes, 300 s faults and
+# recoveries.
+if [ "$INGRESS_FAULTS" = 1 ]; then
+  SEGMENT_MINUTES=15 DEMO_BLACKHOLE=requests FAULT_SECONDS=300 RECOVERY_SECONDS=300 STEADY_SECONDS=180
+fi
 # --replacement: the per-replica rate and the fixture's work per request for the smoke's own params (a light fixture,
 # so the healthy target carries the rate on a small bed), where in the schedule's day the generator starts (the daily
 # peak is at 18:00), how many consecutive planned restarts are required and how long one target does not answer.
@@ -654,7 +662,10 @@ if [ "$REPLACEMENT" = 1 ]; then
   SMOKE_ORIGIN=(--smoke-origin-utc "$(date -u -d "@$ORIGIN_S" +%Y-%m-%dT%H:%M:%SZ)")
   log "replacement smoke: origin ${SMOKE_ORIGIN[1]} (the generator starts at $DEMO_START_AT of day 0), $DEMO_CAPACITY_RPS rps per replica, ${SEGMENT_MINUTES}-minute segments"
 fi
+PEAK_FLAG=()
+[ "$INGRESS_FAULTS" = 1 ] && PEAK_FLAG=(--smoke-constant-peak)
 c28 render --params "$PRM" --stage demonstration --part generator --smoke-segment-minutes "$SEGMENT_MINUTES" \
+  ${PEAK_FLAG[@]+"${PEAK_FLAG[@]}"} \
   ${SMOKE_ORIGIN[@]+"${SMOKE_ORIGIN[@]}"} --out "$WORK/generator.yaml"
 # Server-side: the ConfigMap carries the whole 28-day table (about 0.2 MiB); a client-side apply would copy it into
 # the last-applied annotation, which is limited to 256 KiB.
@@ -693,6 +704,89 @@ if [ "$REPLACEMENT" = 1 ]; then
   FOLLOW_PID=$!
   T0=$(( GEN_STARTED * 1000 ))
   FIRST_UID="$(pod_uid)"
+
+  if [ "$INGRESS_FAULTS" = 1 ]; then
+    # =================================================================================================================
+    # The ingress fault test: steady1, fault1 (c28-demo-pa-r unreachable), recovery1 in the first incarnation; the
+    # first planned restart; steady2, fault2 (both unreachable), recovery2 in the second; then the second restart.
+    # =================================================================================================================
+    ips_of() { k -n "$NS" get pods -l "c28.devkuban.com/target=$1" -o jsonpath='{range .items[*]}{.status.podIP}{" "}{end}'; }
+    blackhole_on() {
+      local ip
+      [ -n "$*" ] || die "no pod IP to blackhole"
+      UNANSWERED_IPS="$*"
+      for ip in $*; do docker exec "$W" iptables -I FORWARD 1 $(drop_rule "$ip") || die "iptables on $W"; done
+    }
+    blackhole_off() {
+      local ip
+      for ip in $UNANSWERED_IPS; do docker exec "$W" iptables -D FORWARD $(drop_rule "$ip") || die "iptables -D on $W"; done
+      UNANSWERED_IPS=""
+    }
+    into_segment() { echo $(( ($(date +%s) - ORIGIN_S) % SEG_S )); }
+    restart_count() { k -n "$NS" get pod "$POD" -o jsonpath='{.status.containerStatuses[0].restartCount}'; }
+    NEED=$(( STEADY_SECONDS + FAULT_SECONDS + RECOVERY_SECONDS + 90 ))
+    # Phases lie inside ONE incarnation each: start 25 s after a segment boundary unless enough of this one is left.
+    if [ $(( SEG_S - $(into_segment) )) -lt "$NEED" ]; then sleep $(( SEG_S - $(into_segment) + 25 )); fi
+    [ "$(pod_uid)" = "$FIRST_UID" ] || die "the generator pod changed before the fault test"
+    k -n "$NS" get pods -l app.kubernetes.io/name=c28-ingress -o json > "$EV/ingress-pods-before.json"
+    S1="$(ms)"; log "steady1 ${STEADY_SECONDS}s"; sleep "$STEADY_SECONDS"
+    F1="$(ms)"; blackhole_on $(ips_of "$UNANSWERED"); log "fault1: $UNANSWERED unreachable for ${FAULT_SECONDS}s"
+    sleep "$FAULT_SECONDS"; blackhole_off; R1="$(ms)"
+    log "recovery1 ${RECOVERY_SECONDS}s"; sleep "$RECOVERY_SECONDS"; R1E="$(ms)"
+    RC1="$(restart_count)"
+    log "waiting for the first planned restart (restart count $RC1 now)"
+    sleep $(( SEG_S - $(into_segment) + 25 ))
+    [ "$(pod_uid)" = "$FIRST_UID" ] && [ "$(restart_count)" -gt "$RC1" ] || die "no planned restart in the same pod"
+    S2="$(ms)"; log "steady2 ${STEADY_SECONDS}s"; sleep "$STEADY_SECONDS"
+    F2="$(ms)"; blackhole_on $(ips_of c28-demo-pa-n) $(ips_of c28-demo-pa-r)
+    log "fault2: both targets unreachable for ${FAULT_SECONDS}s"; sleep "$FAULT_SECONDS"; blackhole_off; R2="$(ms)"
+    k -n "$NS" get pods -l app.kubernetes.io/name=c28-ingress -o json > "$EV/ingress-pods.json"
+    IPOD="$(k -n "$NS" get pods -l app.kubernetes.io/name=c28-ingress -o jsonpath='{.items[0].metadata.name}')"
+    k -n "$NS" logs "$IPOD" --previous > "$EV/ingress-previous.log" 2> "$EV/ingress-previous.err" || true
+    k -n "$NS" get events --field-selector "involvedObject.name=$IPOD" -o json > "$EV/ingress-events.json" || true
+    log "recovery2 ${RECOVERY_SECONDS}s"; sleep "$RECOVERY_SECONDS"; R2E="$(ms)"
+    RC2="$(restart_count)"
+    log "waiting for the second planned restart and its first dispatches"
+    sleep $(( SEG_S - $(into_segment) + 75 ))
+    [ "$(pod_uid)" = "$FIRST_UID" ] && [ "$(restart_count)" -gt "$RC2" ] || die "no second planned restart in the same pod"
+    k -n "$NS" get pods -l app.kubernetes.io/name=c28-ingress -o json > "$EV/ingress-pods-final.json"
+    k -n "$NS" describe pod "$IPOD" > "$EV/ingress-describe.txt" || true
+    touch "$EV/stop"; wait "$FOLLOW_PID" || true; FOLLOW_PID=""
+    guard
+    k -n "$NS" get configmap "$GEN" -o jsonpath='{.data.config\.json}' > "$EV/config.json"
+    for t in c28-demo-pa-n c28-demo-pa-r; do
+      k get --raw "/api/v1/namespaces/monitoring/services/vm:8428/proxy/api/v1/query?query=c28_ingress_requests_total%7Btarget%3D%22$t%22%7D%5B90m%5D" \
+        > "$EV/ingress-$t.json" || die "the ingress samples of $t could not be read"
+    done
+    "$PY" - "$EV" "$S1" "$F1" "$R1" "$R1E" "$S2" "$F2" "$R2" "$R2E" "$UNANSWERED" <<'PY'
+import json, sys
+d = sys.argv[1]
+s1, f1, r1, r1e, s2, f2, r2, r2e = map(int, sys.argv[2:10])
+out = {}
+for t in ("c28-demo-pa-n", "c28-demo-pa-r"):
+    res = json.load(open(f"{d}/ingress-{t}.json"))["data"]["result"]
+    assert len(res) == 1, f"{t}: expected one raw series, got {len(res)}"
+    out[t] = [[float(ts), float(v)] for ts, v in res[0]["values"]]
+json.dump(out, open(d + "/ingress.json", "w"))
+def statuses(name):
+    return [{"pod": p["metadata"]["name"], "uid": p["metadata"].get("uid"), "container_id": cs.get("containerID"),
+             "restarts": cs.get("restartCount"), "last_terminated": (cs.get("lastState") or {}).get("terminated")}
+            for p in json.load(open(d + "/" + name))["items"] for cs in p["status"].get("containerStatuses", [])]
+json.dump({"kind": "ingress-faults",
+           "phases": {"steady1": [s1, f1], "fault1": [f1, r1], "recovery1": [r1, r1e], "steady2": [s2, f2],
+                      "fault2": [f2, r2], "recovery2": [r2, r2e]},
+           "faults": {"fault1": [sys.argv[10]], "fault2": ["c28-demo-pa-n", "c28-demo-pa-r"]},
+           "ingress_before": statuses("ingress-pods-before.json"), "ingress": statuses("ingress-pods.json"),
+           "ingress_final": statuses("ingress-pods-final.json"), "blackhole": {"direction": "requests"}},
+          open(d + "/phases.json", "w"), indent=1)
+PY
+    rc=0
+    "$PY" "$SMOKE_DIR/demo_kind.py" analyse --dir "$EV" --harness "$HARNESS" --config "$EV/config.json" \
+      --ingress "$EV/ingress.json" --phases "$EV/phases.json" --out "$EV/summary.json" || rc=$?
+    [ "$rc" = 0 ] || die "the ingress fault test is not a PASS (see $EV/summary.json)"
+    pass "ingress fault test PASS: $EV/summary.json"
+    exit 0
+  fi
 
   # --- 1. planned restarts: the segment ends, k6 exits 0, the kubelet restarts the container in the same pod -------
   restarts_done() {

@@ -80,6 +80,7 @@ GENERATOR_SCRIPT = "c28-demo.js"
 GENERATOR_CONFIG = "config.json"
 GENERATOR_CONFIG_SCHEMA = "c28-demo-generator/v2"
 DEMONSTRATION_DAYS = 28                           # the finite schedule of a demonstration: 28 predeclared days
+CONSTANT_PEAK = "constant-peak"                   # program.kind of a smoke schedule held at the peak (smoke only)
 MAX_DAYS = 28                                     # program.days is 1..28 (fewer than 28 only renders as a smoke)
 GENERATOR_USER = 12345                            # the k6 image's user
 K6_OUTPUT = "experimental-prometheus-rw"          # as staging/session.py's generator Job
@@ -444,7 +445,7 @@ def sizing_problems(p: Dict) -> List[str]:
 
 
 def generator_config(p: Dict, smoke_segment_minutes: Optional[int] = None,
-                     smoke_origin_ms: Optional[int] = None) -> Dict:
+                     smoke_origin_ms: Optional[int] = None, smoke_constant_peak: bool = False) -> Dict:
     """The configuration load/c28-demo.js reads (schema c28-demo-generator/v2), with its digest.
 
     It carries the WHOLE finite schedule: per_minute_days (one row of 1,440 intended arrivals per day), the seed of
@@ -456,7 +457,10 @@ def generator_config(p: Dict, smoke_segment_minutes: Optional[int] = None,
       smoke_segment_minutes  a short segment so a planned restart happens within minutes (and fewer days are allowed);
       smoke_origin_ms        (only together with smoke_segment_minutes) an origin on any whole minute instead of the
                              params' UTC midnight, so a smoke can put a day boundary of the table a few minutes ahead
-                             of its start. The script accepts such an origin only under the label "smoke"."""
+                             of its start. The script accepts such an origin only under the label "smoke".
+      smoke_constant_peak    (only under the label "smoke") every minute of every day holds the full schedule's
+                             largest minute count, and program.kind is "constant-peak": a fault test compares windows
+                             under the same intended rate. The digest covers it like everything else."""
     validate(p)
     d = p["demonstration"]
     table = day_table(p)
@@ -476,6 +480,12 @@ def generator_config(p: Dict, smoke_segment_minutes: Optional[int] = None,
             raise R.ParamsError("smoke_origin_ms must be a whole minute in epoch milliseconds")
         origin = smoke_origin_ms
         origin_utc = datetime.fromtimestamp(origin // 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    kind = d["program"]["kind"]
+    if smoke_constant_peak:
+        if label != "smoke":
+            raise R.ParamsError("smoke_constant_peak is a smoke-only option: it needs smoke_segment_minutes")
+        peak = max(max(row) for row in table)
+        table, kind = [[peak] * schedule.MINUTES for _ in table], CONSTANT_PEAK
     if label == "demonstration" and days != DEMONSTRATION_DAYS:
         raise R.ParamsError(f"a demonstration's schedule has exactly {DEMONSTRATION_DAYS} days; demonstration.program."
                             f"days {days} renders only as a smoke (smoke_segment_minutes)")
@@ -490,7 +500,7 @@ def generator_config(p: Dict, smoke_segment_minutes: Optional[int] = None,
            "timeout_ms": F.REQUEST_TIMEOUT_S * 1000, "max_late_ms": MAX_LATE_MS, "flush_grace_ms": FLUSH_GRACE_MS,
            "max_inflight": generator_sizing(p)["max_inflight_per_target"],
            "latency_bounds_ms": list(LATENCY_BOUNDS_MS),
-           "program": {"kind": d["program"]["kind"], "seed": d["program"]["seed"], "days": days,
+           "program": {"kind": kind, "seed": d["program"]["seed"], "days": days,
                        "capacity_per_replica_rps": capacity(p), "capacity_label": d["capacity_label"],
                        "capacity_source_calibration": d["capacity_source_calibration"]},
            "seeds": schedule_seeds(p), "per_minute_days": table}
@@ -559,6 +569,10 @@ def config_problems(cfg) -> List[str]:
         out.append("schedule_minutes and schedule_end_ms must be days x 1440 minutes from the origin")
     if cfg.get("label") == "demonstration" and days != DEMONSTRATION_DAYS:
         out.append(f"a demonstration's schedule has exactly {DEMONSTRATION_DAYS} days")
+    if (cfg.get("program") or {}).get("kind") == CONSTANT_PEAK and (cfg.get("label") != "smoke" or not (
+            isinstance(table, list) and table and all(isinstance(r, list) and r and len(set(r)) == 1 for r in table)
+            and len({r[0] for r in table}) == 1)):
+        out.append("a constant-peak schedule is a smoke schedule with one count for every minute of every day")
     out += canonical_problems({k: v for k, v in cfg.items() if k != "digest"})[:3]
     if schedule.digest(cfg) != cfg.get("digest"):
         out.append("the digest differs")
@@ -575,7 +589,7 @@ def _generator_labels(p: Dict) -> Dict[str, str]:
 
 
 def generator_objects(p: Dict, smoke_segment_minutes: Optional[int] = None,
-                      smoke_origin_ms: Optional[int] = None) -> List[Dict]:
+                      smoke_origin_ms: Optional[int] = None, smoke_constant_peak: bool = False) -> List[Dict]:
     """The generator: a ConfigMap (the script and its configuration), a headless Service and ONE StatefulSet with one
     replica on the support node.
 
@@ -590,7 +604,7 @@ def generator_objects(p: Dict, smoke_segment_minutes: Optional[int] = None,
     The container runs `k6 run` once per SEGMENT: the script resumes the program at the wall-clock position, ends at
     the next segment boundary and k6 exits 0, so the kubelet restarts the container in the same pod (restartPolicy
     Always): the next incarnation."""
-    cfg = generator_config(p, smoke_segment_minutes, smoke_origin_ms)
+    cfg = generator_config(p, smoke_segment_minutes, smoke_origin_ms, smoke_constant_peak)
     g = p["demonstration"]["generator"]
     ns, labels = p["namespace"], _generator_labels(p)
     selector = {"app.kubernetes.io/name": GENERATOR_NAME, R.RUN_LABEL: p["run_id"]}
@@ -642,7 +656,7 @@ def generator_pod_name() -> str:
 # --- rendering ------------------------------------------------------------------------------------------------------
 
 def render(p: Dict, smoke_segment_minutes: Optional[int] = None,
-           smoke_origin_ms: Optional[int] = None) -> Dict[str, List[Dict]]:
+           smoke_origin_ms: Optional[int] = None, smoke_constant_peak: bool = False) -> Dict[str, List[Dict]]:
     """The stage's objects by preparation phase: common, targets (Deployment, Service, EMPTY faults ConfigMap), pas
     (both in Recommend), writers (always empty: the stage has no HPA or KEDA writer) and generator. Audited: every
     target has exactly its PredictiveAutoscaler, every pod template is sidecar-free and least-privilege, every object
@@ -652,7 +666,8 @@ def render(p: Dict, smoke_segment_minutes: Optional[int] = None,
     ts = targets(p)
     out: Dict[str, List[Dict]] = {"common": R.common_objects(p, [t["name"] for t in ts]), "targets": [], "pas": [],
                                   "writers": [],
-                                  "generator": generator_objects(p, smoke_segment_minutes, smoke_origin_ms)}
+                                  "generator": generator_objects(p, smoke_segment_minutes, smoke_origin_ms,
+                                                                 smoke_constant_peak)}
     for t in ts:
         labels = {**R._labels(p, t["arm"], d["profile"], t["name"]), DEMO_ROLE_LABEL: t["role"]}
         out["targets"] += R.target_objects(p, t["name"], labels, d["profile"], d["shadow_replicas"])

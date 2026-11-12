@@ -512,6 +512,20 @@ into an in-cluster VictoriaMetrics.
   container and counters at 0 throughout for the new build. The fixture's ingress bounds its upstream dials by the request
   timeout since PR #76; the two runs that compare the reviewed image with a build of that source under
   `DEMO_BLACKHOLE=requests` are recorded with the evidence, not here.
+- *The ingress fault test on the final images* (`demo-kind.sh --ingress-faults --images <images.json>`; verdict
+  `smoke/ingress_faults.py`, criteria fixed before any run in `c28-staging/live-demo/INGRESS-FAULT-TEST-CRITERIA.md`
+  and Codex's decisions of 2026-11-12). Fixed by the script, not the caller: 15-minute segments, the constant-peak
+  smoke schedule (`--smoke-constant-peak`: every minute holds the full schedule's largest minute count, program kind
+  `constant-peak`, label `smoke`, digest-bound), request-direction blackholes, the ingress at the params' 128Mi. In the
+  first incarnation: steady 180 s, one target unreachable 300 s, recovery 300 s; then the first planned restart; in
+  the second: steady 180 s, both targets unreachable 300 s, recovery 300 s; then the second restart. The result is
+  PASS, FAIL or UNPROVEN: the ingress keeps its pod and container with no OOM kill from the first fault to the end
+  of the last recovery, its memory.peak stays at most half the limit, and in every fault and recovery its largest
+  memory in the last minute is at most 110 % of the second minute's, compared only between minutes with identical
+  intended and dispatched counts per target; the unaffected target is served during the single fault; both fail
+  cleanly, nothing dropped, in the double fault; every steady and recovery phase is served; and two consecutive
+  planned restarts, each after more than 600 s, have their first dispatch to each target within 10 s of the segment
+  end (the restart-gap budget; this alone does not prove the absence of kubelet back-off).
 - *Not shown.* A pod that needs its whole grace period to stop, a node failure, the `--k6-local` mode and the
   default full mode of this script, 24-hour segments, the operator and the forecaster (not installed), and any rate
   above the one used.
