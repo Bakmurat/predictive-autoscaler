@@ -22,15 +22,17 @@ c = 0.875 c0 (render.capacity_rps). It qualifies nothing else: not the HPA targe
 twelve-replica layout; burst behaviour is fixture characterization only (no claim that autoscaling covers single-pod
 bursts); no prospective history or confirmation evidence starts during calibration.
 
-The calibration contract (record section "calibrate": {"contract": "<file>"}, schema c28-calibration-contract/v3; v1,
+The calibration contract (record section "calibrate": {"contract": "<file>"}, schema c28-calibration-contract/v4; v1,
 which predates the endpoints-rr ingress and its discovery gate, is refused, while recorded v1 bundles still reduce; v2,
-whose dispatch identity omits the ingress's no-ready rejections, is read-only: status, verify, stop and recover of its
-own calibration and the reduction of its bundles are unchanged, plan and apply refuse it) is
+whose dispatch identity omits the ingress's no-ready rejections, and v3, whose quiet readings end at the query time
+and do not rest on distinct raw observations (see "Readings in time"), are read-only: status, verify, stop and
+recover of their own calibration and the reduction of their bundles are unchanged, plan and apply refuse them) is
 frozen independently of the unfinished experiment params (only the reservation stage of the params is read). It binds
 the cluster and node UIDs, the namespace, the source commit and load-script hash, the S1 images.json and its fixture and
 generator digests, the candidate fixture configuration (resources, max_inflight, max_queue, queue timeout, GOMAXPROCS,
 response size, startup delay), the work_iterations selection, the ingress and generator resources, the observer (query
-API, the evaluation's 15 s scrape cadence, staleness, scrape kind, the exact queries, and observer.discovery: the
+API and (v4) its declared latency offset, the evaluation's 15 s scrape cadence, staleness, scrape kind, the exact
+queries, and observer.discovery: the
 ingress's synced/stale gauges, its scrape timestamp, endpoint membership, per-endpoint dispatch and (v3) its
 no-ready-endpoint rejections), the criteria (the manifest's
 numbers, which may not be changed, the queue rule, the limit bounds, the 1.2 ceiling factor), the search (bounds,
@@ -93,7 +95,8 @@ Measurement (per trial, evaluate_trial, recomputed by the reducer from the raw f
     outcomes), http_req_failed and http_req_duration p95/p99 (ALL requests, timeouts included);
   * the ingress counters before the trial and after it plus completion_grace_s, both read as quiet (three or more
     fresh, equal samples; a target's counter that does not exist yet reads 0 only while the ingress scrape is proven
-    up and fresh): received arrivals and responses (contract v3: and the no-ready rejections, same rule);
+    up and fresh): received arrivals and responses (contract v3: and the no-ready rejections, same rule). Contract
+    v4: both readings are history and each rests on three distinct raw observations (see "Readings in time");
   * the observer's range queries over the measurement window [the measure scenario's ACTUAL start as k6 recorded it
     (exec.scenario.startTime, in the summary), + measure_s] at the 15 s cadence, never the container start plus the
     nominal settling: the fixture's WAITING queue, its in-flight gauge (recorded separately), fixture CPU and
@@ -147,9 +150,13 @@ raw sample is from that same scrape, compared with the pods this calibration own
 measurement every poll re-checks it (a stale flag, a missing or old discovery metric or a membership mismatch stops
 the trial as incomplete evidence), and evaluate_trial re-checks every evaluation of the measurement window from the
 recorded series, so a blip between two polls invalidates the result. Each trial records the per-endpoint dispatch:
-every arrival dispatched exactly once or (contract v3) answered 503 by the ingress because its set had no READY
-endpoint (c28_ingress_no_ready_endpoints_total, read before and after with the received counter: the sum of the
-per-endpoint deltas plus the no-ready delta equals the ingress's received arrivals; v2 requires the sum alone to
+every arrival dispatched exactly once (a series that vanished between the two readings is a counter that went
+backwards, unless its endpoint is proven retired, retired_endpoints: the ingress prunes a retired endpoint's counter
+15 minutes after it left, and the trial's dispatch span, recorded from the before-reading to the after-reading, must
+show that the endpoint is not one of the trial's pods, was never in the endpoint set and that its counter never
+moved; it then contributes 0 and is listed as pruned) or (contract v3) answered 503 by the ingress because its set
+had no READY endpoint (c28_ingress_no_ready_endpoints_total, read before and after with the received counter: the sum
+of the per-endpoint deltas plus the no-ready delta equals the ingress's received arrivals; v2 requires the sum alone to
 equal them) and only to the trial's fixture pods; the spread is reported, never judged. The no-ready 503s are request
 failures k6 already counts (failure fraction, latency), reported in the dispatch detail and never judged again; an
 absent no-ready counter is 0 only from a successful query of the proven fresh, unchanged ingress, while a failed or
@@ -162,6 +169,31 @@ matrix, a well-formed result list) before anything is read from it, so an error 
 (v1/v2 readings keep the earlier rule, so their bundles reduce unchanged). This accounting waives no discovery,
 membership or stray-endpoint check.
 
+Readings in time (contract v4; review 2026-11-10 F3). VictoriaMetrics documents that a range query answers the points
+newer than now minus its latency offset (-search.latencyOffset, 30 s by default) with older samples; the recorded
+evidence shows it (the last two 15 s points of every query that ended at the query time repeat the third-last). The
+contract therefore declares the offset (observer.latency_offset_s, validated >= 30: this deployment's setting is not
+assumed) and the executor keeps two kinds of reading apart:
+  * COMPLETENESS readings (the ingress counters before and after a trial, the per-endpoint dispatch and its span, the
+    selection's idle proof, every measurement-window query) are read as HISTORY: their range ends at least
+    history_offset_s = latency_offset_s + 2 x step_s before the query. The before-reading is taken at now minus that
+    (nothing flows before a trial; a stray arrival in the gap would break the exact reconciliation, never pass); the
+    executor sleeps completion_grace_s plus the offset after the Job completed and reads the after-reading at now
+    minus the offset, asserted to be at least the grace after the completion; the idle interval's queries are asked
+    the offset after it ended. A quiet counter is proven by DISTINCT raw observations, not by equal values: each
+    reading records the raw scrape timestamps of its evaluations ("raw": observer.discovery.scrape_timestamp), three
+    distinct ones are required (raw_observations), and the counter must be equal at every evaluation from the oldest
+    of them on, so points that merely repeat one sample can never show a moving counter as quiet. The result names
+    each reading's instant and the raw timestamps it used (criteria.ingress_readings).
+  * LIVE gates (pods up, raw-sample freshness, discovery membership, the interference stop) still judge the present
+    as well as the data allows: they query up to now, take the NEWEST raw sample timestamp in the answer as the
+    instant they judge, and require it within latency_offset_s + max_staleness_s of now (live_freshness), instead of
+    trusting the last evaluated points. What each gate judged is in its message when it fails, in verify's output,
+    and per trial in trials/<id>/gates.json (every gate's time and, per source, the raw instant it judged).
+The validator binds the contract to these rules: completion_grace_s >= request timeout + latency_offset_s + 2 x
+step_s, and max_staleness_s >= two intervals of the slowest declared scrape (cpu_scrape_interval_s), so that one
+missed scrape is not a stale source.
+
 Guards added before the contract freeze. The rollout guard judges OnDelete DaemonSets and StatefulSets (which
 deliberately keep pods on an older template) by observed generation, the expected pod count in status and their own
 pods all Running, Ready and non-terminating, never by revision lag; RollingUpdate objects keep the strict rules; the
@@ -170,13 +202,14 @@ owners' UIDs, generations and pod UID/revision/restart sets are recorded (platea
 stops on a replacement, restart, revision or template change. Raw samples: for every expected source (each fixture
 pod's own metrics and CPU, the ingress pod, the generator pod while it runs, W and S for steal) a timestamp() query
 (observer.freshness) must return exactly one series per source with its newest raw sample at most max_staleness_s old
-at every evaluation of the window, live at every gate and in the evidence (raw_freshness), so a missing pod cannot
-vanish inside a sum; every evaluation step must be present (no missing tail or interior gap) and the newest raw sample
-is judged against the gate time itself. New pods get a bounded observer warm-up (observer.readiness_timeout_s): the
-queries are polled, with every safety guard active, until they see the live pods, and the idle interval or the load
-begins only then. Dispatched, received and answered arrivals reconcile with tolerance 0/0 (the contract allows nothing
-else). The selection's idle CPU is averaged only after a washout of the 60 s rate window plus one CPU scrape interval
-(observer.cpu_scrape_interval_s), and idle_s must cover the washout plus 120 s of averaging.
+at every evaluation of the window in the evidence (raw_freshness: every evaluation step present, no missing tail or
+interior gap), so a missing pod cannot vanish inside a sum; live, at every gate, the same query's newest raw sample is
+judged against the gate time itself (live_freshness, "Readings in time"). New pods get a bounded observer warm-up
+(observer.readiness_timeout_s): the queries are polled, with every safety guard active, until they see the live pods,
+and the idle interval or the load begins only then. Dispatched, received and answered arrivals reconcile with
+tolerance 0/0 (the contract allows nothing else). The selection's idle CPU is averaged only after a washout of the
+60 s rate window plus one CPU scrape interval (observer.cpu_scrape_interval_s), and idle_s must cover the washout
+plus 120 s of averaging.
 
 Writer API availability. Every writer census (plan, every gate and poll, immediately before every /scale write inside
 its journalled step and before every generator Job) uses FRESH, uncached discovery (Kube.discover_fresh). A served
@@ -190,16 +223,39 @@ VerticalPodAutoscalers as resource writers: a VPA on a calibration object is all
 Off (the plan's resource_writers); any other mode, including the API's default Auto, or a change away from Off, is a
 stop.
 
+Failed reads. Every Kubernetes read (KubectlApi.get) and every observer query (Context.fetch) is retried a bounded
+number of times (common_records.READ_RETRY: three attempts over 20 s; a refusal such as 403 or an HTTP 4xx is an answer
+and is not retried); a mutation is never retried. Each failed attempt is kept as a fixed category (timeout, connection,
+...; never the error's text) and journalled as a read-retried receipt with the executor's next receipt; a retried
+evidence query also carries failed_attempts in its own record. An observer query that still fails stays a missing
+observation (the trial stops as incomplete, as before). A Kubernetes read that still fails inside a trial stops that
+trial as incomplete evidence (trial-stopped, or trial-not-started before its begin; Halt incomplete), not as an
+executor error that closes the calibration STOPPED; a failed read between trials, inside a journalled scale step or
+during cleanup keeps its earlier handling, and a failed writer discovery or reservation read stays the gate problem
+it was.
+
 Interruption. Everything runs under the shared evaluation lock (execlib.mutating) with intents before and outcomes
 after each create, delete and /scale step; an unknown outcome keeps the lock until `recover`. Trial boundaries
 (trial-begin, trial-result, trial-stopped, trial-interrupted) and every decision are receipts. Cleanup deletes the
 generator Jobs first and proves their pods gone before touching the fixture; an ambiguous write or an unproven cleanup
 keeps the lock. An interrupted measurement stays recorded as interrupted and is never resumed: after a crash, recover
-and stop close the calibration as STOPPED; a new attempt is a new contract.attempt and a new ID. `status` (read-only)
+and stop close the calibration as STOPPED; a new attempt is a new contract.attempt and a new ID. A journal whose last
+line is a torn append (the executor killed inside a receipt's write) refuses plan, apply, verify, stop and stop-plan
+(TornReceipt, a StagingError naming the line and byte offset); status and request-stop read past it and status reports
+it (journal.torn_tail); recover-plan lists it and recover, once the executor is proven ended, copies the torn bytes
+into the evidence (receipts/calibrate.jsonl.torn-<offset>-<sha12>), cuts them off the log, records
+journal-tail-repaired and reconciles the half-recorded step like any unresolved intent. `status` (read-only)
 reports an unfinished trial as running only while the calibrate executor that took the lock before its trial-begin is
 still alive (executor_liveness: same host and boot, PID and process start time, not a zombie), as unverified when
 that cannot be established here (another host, an unreadable lock or process, an ambiguous lock/begin time order), and
 as interrupted otherwise.
+
+Environment. The plan, the calibration-begin receipt and the certificate record what was measured on: for W and S the
+node name and UID and status.nodeInfo's kernelVersion, osImage, containerRuntimeVersion, kubeletVersion, bootID and
+machineID (environment; read-only, from the Node objects the gates read anyway). It binds a capacity to the
+environment that produced it and is never a gate, with one exception: apply refuses when it differs from the reviewed
+plan's (the environment changed after review, said field by field). status prints the recorded one, verify the
+recorded and the live one with their differences.
 
 Evidence (evidence/calibrate/<id>/): contract.json, objects/, trials/<tNNN>/ (job, pods at begin and end, the generator
 pod with its termination message, the raw observer responses, the derived result), then at close manifest.json (every
@@ -234,7 +290,8 @@ import reserve
 
 HELPER = "calibrate"
 STOP = "calibrate-stop"
-CONTRACT_SCHEMA = "c28-calibration-contract/v3"
+CONTRACT_SCHEMA = "c28-calibration-contract/v4"
+SCHEMA_V2, SCHEMA_V3 = "c28-calibration-contract/v2", "c28-calibration-contract/v3"
 # v1 contracts predate the endpoints-rr ingress and its discovery gate (observer.discovery): refused for new
 # calibrations (a v2 contract is a new calibration ID). Recorded v1 bundles still reduce: evaluate_trial applies the
 # discovery checks only to a contract that carries observer.discovery.
@@ -245,7 +302,19 @@ REFUSED_CONTRACT_SCHEMAS = ("c28-calibration-contract/v1",)
 # status, verify, stop-plan/stop and recover of its own calibration work unchanged and its bundles reduce exactly as
 # before (evaluate_trial applies the v3 accounting only to a contract that carries observer.discovery.no_ready); plan,
 # and so apply, refuses it: a new calibration writes a v3 contract (a new calibration ID).
-READ_ONLY_CONTRACT_SCHEMAS = ("c28-calibration-contract/v2",)
+# v3 contracts read every "now" reading with a range that ends at query time. VictoriaMetrics documents that it
+# substitutes the points newer than now - search.latencyOffset there (review 2026-11-10 F3: in the recorded evidence
+# the last two 15 s points repeat the third-last), so "three equal samples" compared one observation with two copies
+# of itself, and the live freshness gates saw every raw sample older than it was. v4 adds observer.latency_offset_s
+# (the query API's declared latency offset, at least LATENCY_OFFSET_MIN_S) and with it: completeness readings (the
+# ingress counters before and after a trial, the selection's idle proof) are HISTORICAL (their ranges end at least
+# history_offset_s before the query) and a quiet counter needs three DISTINCT raw observations (the reading's "raw"
+# scrape timestamps); live gates judge the newest raw sample against the query time, allowing latency_offset_s +
+# max_staleness_s; and the contract's grace and staleness must cover what those rules need. A v3 contract is
+# read-only like v2 (status, verify, stop and recover of its own calibration; its bundles reduce exactly as before:
+# evaluate_trial applies the v4 rules only to a contract that carries observer.latency_offset_s).
+READ_ONLY_CONTRACT_SCHEMAS = (SCHEMA_V2, SCHEMA_V3)
+LATENCY_OFFSET_MIN_S = 30        # VictoriaMetrics' documented default -search.latencyOffset; a contract declares >= it
 CERT_SCHEMA = "c28-calibration-certificate/v1"
 RESULT_SCHEMA = "c28-calibration-trial/v1"
 K6_SCHEMA = "c28-calibration-k6/v1"
@@ -472,6 +541,16 @@ def contract_problems(con, record: X.Record, params: Dict) -> List[str]:
     out += _criteria_problems(con["criteria"])
     out += _stops_problems(con["stops"])
     out += _search_problems(con["search"])
+    se = con["search"]
+    if isinstance(ob, dict) and isinstance(se, dict) and _int(ob.get("latency_offset_s")) and \
+            ob.get("step_s") == FROZEN["step_s"] and _int(se.get("completion_grace_s")):
+        need = REQUEST_TIMEOUT_S + ob["latency_offset_s"] + 2 * ob["step_s"]
+        if se["completion_grace_s"] < need:
+            out.append(f"search.completion_grace_s must be at least {need} s: after the Job completes, requests in "
+                       f"flight end within the {REQUEST_TIMEOUT_S} s request timeout, a scrape of the final counts "
+                       f"needs up to observer.latency_offset_s ({ob['latency_offset_s']} s) to become queryable, and "
+                       f"the after-reading must then see two more scrapes (2 x step_s = {2 * ob['step_s']} s) for "
+                       "its three distinct raw observations")
     adm = con["admission"]
     if not (isinstance(adm, dict) and set(adm) == {"limit_fraction", "overlap_pods"}):
         out.append("admission must be exactly {limit_fraction, overlap_pods}")
@@ -522,9 +601,25 @@ def _work_selection_problems(ws, cr) -> List[str]:
 def _observer_problems(ob, R, schema: str = CONTRACT_SCHEMA) -> List[str]:
     keys = {"query_api", "step_s", "max_staleness_s", "scrape", "queries", "pods", "pod_label", "freshness",
             "cpu_scrape_interval_s", "readiness_timeout_s", "discovery"}
+    current = schema not in READ_ONLY_CONTRACT_SCHEMAS         # v4: + latency_offset_s and the bounds that follow
+    if current:
+        keys = keys | {"latency_offset_s"}
     if not (isinstance(ob, dict) and set(ob) == keys):
         return [f"observer must be exactly {sorted(keys)}"]
     out = []
+    if current and not (_int(ob["latency_offset_s"]) and LATENCY_OFFSET_MIN_S <= ob["latency_offset_s"] <= 300):
+        out.append("observer.latency_offset_s must be the query API's latency offset in whole seconds "
+                   f"(VictoriaMetrics -search.latencyOffset: points newer than now minus it may be substituted), in "
+                   f"{LATENCY_OFFSET_MIN_S}..300: never below the documented default {LATENCY_OFFSET_MIN_S} s, so an "
+                   "under-declared value cannot put a completeness reading into the substituted tail")
+    if current and _int(ob["max_staleness_s"]) and _int(ob["cpu_scrape_interval_s"]) and \
+            ob["step_s"] == FROZEN["step_s"] and ob["max_staleness_s"] < 2 * max(ob["step_s"],
+                                                                                ob["cpu_scrape_interval_s"]):
+        out.append("observer.max_staleness_s must be at least "
+                   f"{2 * max(ob['step_s'], ob['cpu_scrape_interval_s'])} s: two intervals of the slowest declared "
+                   f"scrape (cpu_scrape_interval_s {ob['cpu_scrape_interval_s']} s, step_s {ob['step_s']} s), so "
+                   "that one missed scrape of a healthy source is not a stale source (a live gate allows "
+                   "latency_offset_s on top of it, a recorded window nothing)")
     if not _URL.match(str(ob["query_api"])):
         out.append("observer.query_api must be an http(s) URL without credentials")
     if ob["step_s"] != FROZEN["step_s"] or isinstance(ob["step_s"], bool):
@@ -554,7 +649,7 @@ def _observer_problems(ob, R, schema: str = CONTRACT_SCHEMA) -> List[str]:
                 out.append(f"observer.freshness.{name} must be a timestamp() query" +
                            (f" using {token}" if token else ""))
     dq = ob["discovery"]
-    want = DISCOVERY_V2 if schema in READ_ONLY_CONTRACT_SCHEMAS else tuple(DISCOVERY_TOKENS)
+    want = DISCOVERY_V2 if schema == SCHEMA_V2 else tuple(DISCOVERY_TOKENS)
     if not (isinstance(dq, dict) and set(dq) == set(want)):
         out.append(f"observer.discovery must be exactly {sorted(want)} (the ingress's endpoint discovery: synced, "
                    "stale, its scrape timestamp, endpoint membership and per-endpoint dispatch" +
@@ -1014,7 +1109,8 @@ def _uncapped_plateaus(con: Dict, n: int) -> int:
 def _fixed_overhead_s(con: Dict) -> int:
     """Time outside the trials, at its bound: a convergence wait per scale step and the selection's idle intervals."""
     se, ws = con["search"], con["work_selection"]
-    return (len(se["replica_counts"]) + 4) * se["converge_timeout_s"] + len(ws["values"]) * ws["idle_s"]
+    return (len(se["replica_counts"]) + 4) * se["converge_timeout_s"] + \
+        len(ws["values"]) * (ws["idle_s"] + history_offset_s(con))
 
 
 # What the plan's modelled durations leave out (Codex: label them modelled estimates with exclusions).
@@ -1055,7 +1151,7 @@ def search_budget(con: Dict) -> Dict:
     bisect = max(0, int(math.ceil(math.log2((se["bracket_factor"] - 1) / se["resolution"]))))
     plateaus = sum(min(_uncapped_plateaus(con, n), 2 + bisect) for n in se["replica_counts"])
     selection = len(ws["values"])
-    sel_s = sum(durations(con, "selection")) + se["job_slack_s"] + se["completion_grace_s"]
+    sel_s = sum(durations(con, "selection")) + se["job_slack_s"] + se["completion_grace_s"] + history_offset_s(con)
     search_trials = min(plateaus * se["repetitions"] + 1, max(0, se["max_trials"] - selection))   # + ceiling
     return {
         "uncapped_search_bound": bound,
@@ -1073,8 +1169,10 @@ def search_budget(con: Dict) -> Dict:
 
 
 def trial_seconds(con: Dict) -> int:
+    """A search trial at its bound: the Job's deadline, the completion grace, and the wait that makes the
+    after-reading historical (history_offset_s)."""
     se = con["search"]
-    return se["settle_s"] + se["measure_s"] + se["job_slack_s"] + se["completion_grace_s"]
+    return se["settle_s"] + se["measure_s"] + se["job_slack_s"] + se["completion_grace_s"] + history_offset_s(con)
 
 
 def plateau_verdict(verdicts: List[str], reps: int) -> str:
@@ -1099,9 +1197,12 @@ def resolve_query(con: Dict, target: str, name: str, pods: str = "") -> str:
     return q.replace("__NAMESPACE__", con["namespace"]).replace("__TARGET__", target).replace("__PODS__", pods)
 
 
-def query_range(fetch: Callable[[str], Dict], con: Dict, query: str, start: int, end: int) -> Dict:
-    """One raw range query, recorded as asked and as answered (a failure is recorded, never a value)."""
-    step = con["observer"]["step_s"]
+def query_range(fetch: Callable[[str], Dict], con: Dict, query: str, start: int, end: int,
+                step: Optional[int] = None) -> Dict:
+    """One raw range query, recorded as asked and as answered (a failure is recorded, never a value). Through
+    Context.fetch a failed read is retried (C.RetryingFetch); the failed attempts of this query are recorded with it
+    as fixed categories (failed_attempts), whether it then answered or stayed a missing observation."""
+    step = con["observer"]["step_s"] if step is None else step
     q = urllib.parse.urlencode({"query": query, "start": start, "end": end, "step": step})
     rec = {"query": query, "start": start, "end": end, "step": step}
     try:
@@ -1109,6 +1210,8 @@ def query_range(fetch: Callable[[str], Dict], con: Dict, query: str, start: int,
         rec["response"] = json.loads(json.dumps(doc, allow_nan=False))
     except Exception as e:          # noqa: BLE001 - any failure is a missing observation
         rec["error"] = type(e).__name__
+    if getattr(fetch, "last", None):
+        rec["failed_attempts"] = list(fetch.last)
     return rec
 
 
@@ -1165,6 +1268,52 @@ def v3(con: Dict) -> bool:
     return "no_ready" in (con["observer"].get("discovery") or {})
 
 
+def v4(con: Dict) -> bool:
+    """A contract v4 (observer.latency_offset_s): quiet readings proven by distinct raw observations."""
+    return "latency_offset_s" in con["observer"]
+
+
+def latency_offset_s(con: Dict) -> int:
+    """The query API's latency offset: the contract's (v4), else the documented default (a v2/v3 contract's live
+    gates in verify and stop)."""
+    return int(con["observer"].get("latency_offset_s", LATENCY_OFFSET_MIN_S))
+
+
+def history_offset_s(con: Dict) -> int:
+    """A range that ends at least this long before it is queried is HISTORICAL: past the latency offset, where the
+    query API substitutes nothing, plus two steps for the scrape and its ingestion."""
+    return latency_offset_s(con) + 2 * int(con["observer"]["step_s"])
+
+
+def reading_raw(con: Dict, reading: Dict) -> Optional[Dict]:
+    """The raw-timestamp query of an ingress reading, for quiet_value: None before v4 (the earlier rule); under v4
+    always a dict, so a reading recorded without one cannot pass."""
+    return ((reading or {}).get("raw") or {}) if v4(con) else None
+
+
+def raw_observations(raw: Optional[Dict], at: int, con: Dict) -> Tuple[Optional[Dict], str]:
+    """The DISTINCT raw observations behind a reading at `at`: `raw` is the reading's timestamp() query of the one
+    ingress pod's scrape (each evaluation valued with the raw sample's own timestamp). Returns ({"by_evaluation":
+    {t: raw timestamp}, "used": the three newest distinct raw timestamps}, '') or (None, why): one series, no raw
+    timestamp from the future, at least three distinct ones (evaluation points that repeat an older sample, as the
+    query API's tail substitution produces, are one observation, not three), the newest at most max_staleness_s
+    before `at`."""
+    pts, why = series(raw or {})
+    if pts is None:
+        return None, f"raw sample timestamps: {why}"
+    step = con["observer"]["step_s"]
+    by = {t: v for t, v in pts if t <= at}
+    if any(v > t + step for t, v in by.items()):
+        return None, "raw sample timestamps: a raw sample timestamped in the future"
+    distinct = sorted(set(by.values()))
+    if len(distinct) < 3:
+        return None, (f"fewer than three distinct raw observations (raw sample timestamps {distinct}): repeated or "
+                      "substituted evaluation points prove nothing")
+    if at - distinct[-1] > con["observer"]["max_staleness_s"]:
+        return None, "the newest raw observation is stale"
+    return {"by_evaluation": by, "used": distinct[-3:]}, ""
+
+
 def envelope(obs: Dict) -> str:
     """'' when a recorded range query answered a successful Prometheus range response: status "success",
     data.resultType "matrix", data.result a list of {metric: object, values: list}; otherwise why not. Contract v3
@@ -1185,12 +1334,16 @@ def envelope(obs: Dict) -> str:
 
 
 def quiet_value(obs: Dict, at: int, con: Dict, up: Optional[Dict] = None,
-                strict: bool = False) -> Tuple[Optional[float], str]:
+                strict: bool = False, raw: Optional[Dict] = None) -> Tuple[Optional[float], str]:
     """A counter read while nothing flows: at least three samples in the recorded range, all equal, the last fresh.
     A per-target counter that does not exist yet (the ingress has seen no arrival for that target since it started)
     reads 0 only while the ingress scrape itself is proven fresh and up (`up`, the ingress_up range). strict (contract
     v3): the counter's response and, for an absent counter, the up response must be successful range responses
-    (envelope) first; v1/v2 readings keep the earlier rule unchanged."""
+    (envelope) first; v1/v2 readings keep the earlier rule unchanged. raw (contract v4, reading_raw): the reading's
+    raw scrape timestamps; the proof then needs three DISTINCT raw observations (raw_observations), and the counter
+    must have a sample, all equal, at every evaluation from the oldest of those three on, so evaluation points that
+    only repeat one observation can never show a moving counter as quiet. An absent counter needs the same three
+    observations of the ingress."""
     if strict:
         why = envelope(obs)
         if why:
@@ -1199,6 +1352,11 @@ def quiet_value(obs: Dict, at: int, con: Dict, up: Optional[Dict] = None,
             why = envelope(up or {})
             if why:
                 return None, f"no series, and ingress_up: {why}"
+    seen = None
+    if raw is not None:
+        seen, why = raw_observations(raw, at, con)
+        if seen is None:
+            return None, why
     if isinstance(obs, dict) and isinstance(((obs.get("response") or {}).get("data") or {}).get("result"), list) \
             and obs["response"]["data"]["result"] == []:
         why = _up(up or {}, at, con)
@@ -1211,12 +1369,22 @@ def quiet_value(obs: Dict, at: int, con: Dict, up: Optional[Dict] = None,
         return None, "fewer than three samples"
     if at - pts[-1][0] > con["observer"]["max_staleness_s"]:
         return None, "the last sample is stale"
-    if len({v for _, v in pts[-3:]}) != 1:
+    if seen is None:
+        if len({v for _, v in pts[-3:]}) != 1:
+            return None, "the counter is still moving (not quiet)"
+        return pts[-1][1], ""
+    have = dict(pts)
+    over = [t for t, r in sorted(seen["by_evaluation"].items()) if r >= seen["used"][0]]
+    if any(t not in have for t in over):
+        return None, "the counter has no sample at an evaluation of its three raw observations"
+    if len({have[t] for t in over}) != 1:
         return None, "the counter is still moving (not quiet)"
     return pts[-1][1], ""
 
 
 def ingress_reading(fetch, con: Dict, cal: str, target: str, at: int) -> Dict:
+    """The ingress counters of a target over the four steps up to `at`, for quiet_value. The executor takes it as
+    HISTORY (run_trial: `at` is at least history_offset_s before the query), never at the query time."""
     span = 4 * con["observer"]["step_s"]
     out = {"at": at, **{k: query_range(fetch, con, resolve_query(con, target, f"ingress_{k}"), at - span, at)
                         for k in ("requests", "responses")}}
@@ -1226,6 +1394,9 @@ def ingress_reading(fetch, con: Dict, cal: str, target: str, at: int) -> Dict:
         out["dispatched"] = query_range(fetch, con, resolve_discovery(con, "dispatched", target), at - span, at)
         if "no_ready" in con["observer"]["discovery"]:          # v3: read with the same aligned readings
             out["no_ready"] = query_range(fetch, con, resolve_discovery(con, "no_ready", target), at - span, at)
+        if v4(con):          # the raw scrape timestamps behind those evaluations: the distinct observations
+            out["raw"] = query_range(fetch, con, resolve_discovery(con, "scrape_timestamp", target,
+                                                                   names(cal)["ingress_pods"]), at - span, at)
     return out
 
 
@@ -1355,14 +1526,7 @@ def steal_verdict(con: Dict, obs: Optional[Dict], start: int, end: int) -> Tuple
 
 
 def steal_query(fetch, con: Dict, start: int, end: int) -> Dict:
-    q = urllib.parse.urlencode({"query": con["stops"]["steal_query"], "start": start, "end": end, "step": 60})
-    rec = {"query": con["stops"]["steal_query"], "start": start, "end": end, "step": 60}
-    try:
-        rec["response"] = json.loads(json.dumps(fetch(f"{con['observer']['query_api'].rstrip('/')}"
-                                                      f"/api/v1/query_range?{q}"), allow_nan=False))
-    except Exception as e:          # noqa: BLE001 - any failure is a missing observation
-        rec["error"] = type(e).__name__
-    return rec
+    return query_range(fetch, con, con["stops"]["steal_query"], start, end, step=60)
 
 
 def pods_up(obs: Dict, expected: List[str], at_start: int, at_end: int, con: Dict) -> str:
@@ -1426,6 +1590,40 @@ def raw_freshness(con: Dict, obs: Optional[Dict], expected: List[str], label: st
     return "; ".join(out), detail
 
 
+def live_freshness(con: Dict, obs: Optional[Dict], expected: List[str], label: str, now: int) -> Tuple[str, Dict]:
+    """A LIVE freshness gate at `now`, from a timestamp() query whose range ends at `now`. There the query API may
+    answer the newest points with older samples (its latency offset), so the last evaluated points are not trusted:
+    per expected source (exactly one series each, as in raw_freshness) the NEWEST raw sample timestamp anywhere in the
+    answer is the instant the gate judges, and it must lie at most latency_offset_s + max_staleness_s before `now`
+    (the observer's own delay in showing a sample, plus the staleness the contract tolerates) and not in the future.
+    Returns (why, {name: {"judged_at": that raw timestamp, "age_s": now - it}}): the gate says what instant it
+    judged."""
+    step, allowed = con["observer"]["step_s"], latency_offset_s(con) + con["observer"]["max_staleness_s"]
+    by, why = series_by_label(obs or {}, label)
+    if by is None:
+        return f"raw freshness query unusable ({why})", {}
+    if not expected:
+        return "no expected source to check", {}
+    out, detail = [], {}
+    missing, extra = sorted(set(expected) - set(by)), sorted(set(by) - set(expected))
+    if missing:
+        out.append(f"no raw samples for {missing}")
+    if extra:
+        out.append(f"unexpected sources {extra}")
+    for name in sorted(set(expected) & set(by)):
+        newest = max((v for _, v in by[name]), default=None)
+        if newest is None:
+            out.append(f"{name}: no evaluation in the interval")
+            continue
+        detail[name] = {"judged_at": newest, "age_s": now - newest}
+        if newest > now + step:
+            out.append(f"{name}: a raw sample timestamped in the future")
+        elif now - newest > allowed:
+            out.append(f"{name}: the newest raw sample ({_ts(newest)}) is {now - newest:.0f} s old at the gate "
+                       f"({_ts(now)}); allowed {allowed} s (latency_offset_s + max_staleness_s)")
+    return "; ".join(out), detail
+
+
 def idle_verdict(con: Dict, obs: Dict, readings: Dict) -> Tuple[str, Dict]:
     """The selection's idle interval was idle: the ingress counters fresh, quiet and unchanged from its start to the
     trial's before-reading; the fixture's own request counter unchanged over it (no direct-to-fixture traffic; an
@@ -1449,7 +1647,7 @@ def idle_verdict(con: Dict, obs: Dict, readings: Dict) -> Tuple[str, Dict]:
     start_reading = obs.get("ingress_idle_start") or {}
     for k in ("requests", "responses"):
         v0, why0 = quiet_value(start_reading.get(k) or {}, int(start_reading.get("at") or 0), con,
-                               start_reading.get("up"), v3(con))
+                               start_reading.get("up"), v3(con), reading_raw(con, start_reading))
         v1 = (readings.get("before") or {}).get(k, (None, ""))[0]
         if start_reading.get("at") != s0:
             out.append("the idle start reading is not at the idle window's start")
@@ -1495,10 +1693,14 @@ def discovery_verdict(con: Dict, obs: Dict, ingress_pod: str, expected: List[str
     """The ingress's endpoint discovery over [start, end] from recorded range queries (obs: synced, stale,
     scrape_timestamp, endpoints): the ingress pod's newest scrape fresh at every evaluation (raw_freshness), synced 1
     and stale 0 at every evaluation, and at every evaluation the CURRENT membership (endpoint series whose raw sample
-    is from that same scrape) exactly the expected fixture pods. live=True judges only the newest evaluation (the
-    live gate); otherwise every evaluation must be present (the measurement window). Returns (problems, detail)."""
+    is from that same scrape) exactly the expected fixture pods. live=True is the live gate at `end` = now: the
+    scrape is judged by its newest raw sample (live_freshness) and synced, stale and the membership at the newest
+    evaluation, all of which the query API answers from that same scrape (detail["scrape"] names its instant);
+    otherwise every evaluation must be present (the measurement window). Returns (problems, detail)."""
     step, out, detail = con["observer"]["step_s"], [], {}
-    why, fd = raw_freshness(con, obs.get("scrape_timestamp"), [ingress_pod], con["observer"]["pod_label"], start, end)
+    judge = live_freshness if live else raw_freshness
+    why, fd = judge(con, obs.get("scrape_timestamp"), [ingress_pod], con["observer"]["pod_label"],
+                    *((end,) if live else (start, end)))
     detail["scrape"] = fd
     if why:
         return [f"discovery metrics missing or old: {why}"], detail
@@ -1584,7 +1786,7 @@ def no_ready_rejections(con: Dict, obs: Dict, prior: Optional[Dict] = None) -> T
     for s in ("before", "after"):
         r = obs.get(f"ingress_{s}") or {}
         o = r.get("no_ready") or {}
-        v, why = quiet_value(o, int(r.get("at") or 0), con, r.get("up"), strict=True)
+        v, why = quiet_value(o, int(r.get("at") or 0), con, r.get("up"), strict=True, raw=reading_raw(con, r))
         if v is None:
             return None, [f"no-ready rejections {s} the trial: {why}"], {}
         if v < 0:
@@ -1608,15 +1810,84 @@ def no_ready_rejections(con: Dict, obs: Dict, prior: Optional[Dict] = None) -> T
     return delta, [], dict(detail, rejected=delta)
 
 
+DISPATCH_SPAN = ("dispatched", "endpoints", "scrape_timestamp")
+
+
+def retired_endpoints(con: Dict, obs: Dict, expected: List[str], vanished: Dict[str, float],
+                      ingress_pod: Optional[str]) -> Tuple[Dict[str, Dict], Dict[str, str]]:
+    """Which per-endpoint dispatch series that were present in the before-reading and are absent from the
+    after-reading belong to an endpoint PROVEN retired, so that the series was pruned by the ingress (it drops a
+    retired endpoint's counter 15 minutes after the endpoint left: fixture/endpoints.go, retiredSeriesKeep) and not
+    lost or reset. The proof is the trial's dispatch span (obs["dispatch_span"]: the dispatch counters, the endpoint
+    membership and the ingress's scrape timestamps, each recorded from the before-reading to the after-reading), and
+    ALL of:
+      * the endpoint's pod is not one of the trial's fixture pods;
+      * the ingress's own scrapes cover the whole span (raw_freshness: every evaluation present and fresh);
+      * the endpoint was at no evaluation of the span a member of the ingress's endpoint set (no membership series
+        whose raw sample is from that evaluation's scrape);
+      * its dispatch counter never moved: its samples run from the before-reading on, one per step without a gap, and
+        each equals the before-reading's value up to its last sample.
+    Returns ({pod: {"before", "samples", "last_sample"}} proven, {pod: why} unproven). Without a recorded span (every
+    bundle before this rule) nothing is proven."""
+    span, step = obs.get("dispatch_span") or {}, con["observer"]["step_s"]
+    start, end = int((obs.get("ingress_before") or {}).get("at") or 0), int((obs.get("ingress_after") or {}).get(
+        "at") or 0)
+    proven: Dict[str, Dict] = {}
+    unproven: Dict[str, str] = {}
+    shared = ""
+    if any((span.get(k) or {}).get("start") != start or (span.get(k) or {}).get("end") != end for k in DISPATCH_SPAN):
+        shared = "no dispatch span is recorded from the before-reading to the after-reading"
+    elif not ingress_pod:
+        shared = "the trial does not have exactly one ingress pod"
+    else:
+        why, _ = raw_freshness(con, span["scrape_timestamp"], [ingress_pod], con["observer"]["pod_label"], start, end)
+        if why:
+            shared = f"the ingress's scrapes do not cover the span ({why})"
+    eps = disp = ref = None
+    if not shared:
+        eps, why_e = series_by_label(span["endpoints"], ENDPOINT_LABEL)
+        disp, why_d = series_by_label(span["dispatched"], ENDPOINT_LABEL)
+        scr, _ = series_by_label(span["scrape_timestamp"], con["observer"]["pod_label"])
+        if eps is None or disp is None:
+            shared = f"the dispatch span is unusable ({why_e or why_d})"
+        else:
+            ref = {t: v for t, v in scr[ingress_pod] if start - step <= t <= end}
+    for pod, before in sorted(vanished.items()):
+        if pod in expected:
+            unproven[pod] = "it is one of the trial's fixture pods"
+            continue
+        if shared:
+            unproven[pod] = shared
+            continue
+        member = [t for t, v in eps.get(pod, []) if t in ref and v == ref[t]]
+        pts = [(t, v) for t, v in disp.get(pod, []) if start - step <= t <= end]
+        ts = [t for t, _ in pts]
+        if member:
+            unproven[pod] = f"it was in the ingress's endpoint set during the trial (at {_ts(member[0])})"
+        elif not pts or ts[0] > start + step or any(b - a != step for a, b in zip(ts, ts[1:])):
+            unproven[pod] = "its dispatch counter is not recorded without a gap from the before-reading on"
+        elif any(v != before for _, v in pts):
+            unproven[pod] = "its dispatch counter moved after the before-reading"
+        else:
+            proven[pod] = {"before": before, "samples": len(pts), "last_sample": ts[-1]}
+    return proven, unproven
+
+
 def dispatch_counts(con: Dict, obs: Dict, expected: List[str], received: Optional[float],
-                    prior: Optional[Dict] = None) -> Tuple[List[str], Dict]:
+                    prior: Optional[Dict] = None, ingress_pod: Optional[str] = None) -> Tuple[List[str], Dict]:
     """Per-endpoint dispatch during the trial (after - before of c28_ingress_dispatched_total by endpoint_pod; a
     counter that does not exist yet is 0): every arrival dispatched exactly once (sum = the ingress's received, no
     retry or duplicate) and only to the trial's fixture pods. Balance is reported, never judged. Contract v3: every
     arrival is dispatched exactly once OR answered 503 for no ready endpoint (received = sum + no-ready rejections,
     no_ready_rejections); those 503s are request failures already counted by k6, so they stay inside the failure
     fraction and latency and are reported here, never judged again. A post-observation accounting term only: every
-    discovery, membership and stray-endpoint check is unchanged."""
+    discovery, membership and stray-endpoint check is unchanged.
+    A series present before and absent after is a counter that went backwards (a lost series, a restart or a reset:
+    incomplete), with ONE exception: an endpoint proven retired (retired_endpoints: not this trial's pod, never in
+    the endpoint set during the trial, its counter never moved) had its series pruned by the ingress; it contributes
+    0 and is listed under "pruned" with its proof. Anything not proven stays incomplete, and the aggregate identity
+    above is required either way. Equal per-endpoint totals do not prove a constant endpoint set; the membership
+    check over the window does that."""
     side = {}
     for s in ("before", "after"):
         r = obs.get(f"ingress_{s}") or {}
@@ -1624,7 +1895,10 @@ def dispatch_counts(con: Dict, obs: Dict, expected: List[str], received: Optiona
         if v is None:
             return [f"per-endpoint dispatch {s} the trial: {why}"], {}
         side[s] = v
-    by = {k: side["after"].get(k, 0.0) - side["before"].get(k, 0.0) for k in set(side["after"]) | set(side["before"])}
+    pruned, unproven = retired_endpoints(con, obs, expected, {k: v for k, v in side["before"].items()
+                                                              if k not in side["after"]}, ingress_pod)
+    by = {k: side["after"].get(k, 0.0) - side["before"].get(k, 0.0)
+          for k in (set(side["after"]) | set(side["before"])) - set(pruned)}
     by = {k: v for k, v in by.items() if v != 0 or k in expected}
     for k in expected:
         by.setdefault(k, 0.0)
@@ -1636,8 +1910,13 @@ def dispatch_counts(con: Dict, obs: Dict, expected: List[str], received: Optiona
               "max_share": (max(vals) / total) if total > 0 else None,
               "cv": (math.sqrt(sum((v - mean) ** 2 for v in vals) / len(vals)) / mean) if mean > 0 else None}
     out = []
+    if pruned:
+        detail["pruned"] = pruned
     if any(v < 0 for v in by.values()):
         out.append("a per-endpoint dispatch counter went backwards (an ingress restart or reset)")
+    if "dispatch_span" in obs:
+        out += [f"the dispatch series of endpoint {k} disappeared during the trial and the endpoint is not proven "
+                f"retired: {why}" for k, why in sorted(unproven.items())]
     stray = sorted(k for k, v in by.items() if v > 0 and k not in expected)
     if stray:
         out.append(f"arrivals were dispatched to pods outside the trial's fixture pods: {stray}")
@@ -1715,11 +1994,15 @@ def evaluate_trial(con: Dict, raw: Dict, history: Optional[List[Dict]] = None) -
     readings = {}
     for side in ("before", "after"):
         r = obs.get(f"ingress_{side}") or {}
-        readings[side] = {k: quiet_value(r.get(k) or {}, int(r.get("at") or 0), con, r.get("up"), v3(con))
-                          for k in ("requests", "responses")}
+        readings[side] = {k: quiet_value(r.get(k) or {}, int(r.get("at") or 0), con, r.get("up"), v3(con),
+                                         reading_raw(con, r)) for k in ("requests", "responses")}
         for k, (v, why) in readings[side].items():
             if v is None:
                 incomplete.append(f"ingress {k} {side} the trial: {why}")
+        if v4(con):                                 # what each reading rests on: its instant and raw observations
+            seen, _ = raw_observations(r.get("raw"), int(r.get("at") or 0), con)
+            crit.setdefault("ingress_readings", {})[side] = {"at": r.get("at"),
+                                                             "raw_timestamps": (seen or {}).get("used")}
     ing = {}
     if not any(v is None for side in readings.values() for v, _ in side.values()) and summary and \
             None not in (counts["settle"]["dispatched"], counts["measure"]["dispatched"]):
@@ -1746,7 +2029,9 @@ def evaluate_trial(con: Dict, raw: Dict, history: Optional[List[Dict]] = None) -
         if v3(con):
             key = ingress_key((raw.get("pods_begin") or {}).get("ingress"))
             prior = no_ready_prior(history or [], t["target"], key)
-        why_x, dx = dispatch_counts(con, obs, fx_names, ing.get("received"), prior)
+        ing_names = [(p.get("metadata") or {}).get("name") for p in (raw.get("pods_begin") or {}).get("ingress") or []]
+        why_x, dx = dispatch_counts(con, obs, fx_names, ing.get("received"), prior,
+                                    ing_names[0] if len(ing_names) == 1 else None)
         if v3(con) and dx.get("no_ready") is not None:
             dx["no_ready"].update(target=t["target"], ingress=key)
         crit["dispatch"] = dx
@@ -2166,9 +2451,18 @@ def summarize(con: Dict, cal: str, con_sha: str, trials: List[Dict], halt: Optio
 # --- the live context -----------------------------------------------------------------------------------------------
 
 class Context:
+    """The live calibration: record, cluster, observer, clock. `retry` is the policy of the observer's reads (fetch
+    is wrapped in C.RetryingFetch; the Kubernetes reads carry their own in KubectlApi); tests pass their own policy
+    and clock, so nothing sleeps for real."""
+
     def __init__(self, record: X.Record, kube: X.Kube, fetch: Callable[[str], Dict] = _http_json,
-                 now: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep):
-        self.record, self.kube, self.fetch, self.sleep = record, kube, fetch, sleep
+                 now: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep,
+                 retry: C.RetryPolicy = C.READ_RETRY):
+        self.record, self.kube, self.sleep, self.retry = record, kube, sleep, retry
+        self.read_failures: List[Dict] = []     # failed observer read attempts not yet journalled
+        self.judged: Dict[str, Dict] = {}       # per live gate source: the raw instant its newest check judged
+        self.gate_log: List[Dict] = []          # the running trial's gates: when each ran and what it judged
+        self.fetch = fetch
         self._now = now
         self.c28 = X.import_harness()
         if self.c28.frozen.REQUEST_TIMEOUT_S != REQUEST_TIMEOUT_S:      # pragma: no cover
@@ -2180,6 +2474,14 @@ class Context:
         self.nm = names(self.cal)
         self.dir = os.path.join(record.evidence_dir, "calibrate", self.cal)
 
+    @property
+    def fetch(self) -> Callable[[str], Dict]:
+        return self._fetch
+
+    @fetch.setter
+    def fetch(self, fn: Callable[[str], Dict]) -> None:
+        self._fetch = C.RetryingFetch(fn, self.retry, lambda s: self.sleep(s), self.read_failures)
+
     def now(self) -> int:
         return int(self._now())
 
@@ -2187,7 +2489,26 @@ class Context:
         return X.receipts(self.record, HELPER)
 
     def receipt(self, event: str, data: Dict) -> Dict:
+        self.journal_read_failures()
         return X.receipt(self.record, HELPER, event, {"calibration": self.cal, **data})
+
+    def journal_read_failures(self) -> None:
+        """A read-retried receipt for the failed read attempts since the last one (Kubernetes: KubectlApi's
+        read_failures; observer: this context's), as counts per fixed category, so the evidence shows that a retry
+        happened. Written with the executor's next receipt; the read-only commands never call it."""
+        api_log = getattr(self.kube.api, "read_failures", None) or []
+        logs = {"kubernetes": list(api_log), "observer": list(self.read_failures)}
+        del api_log[:], self.read_failures[:]
+        if not any(logs.values()):
+            return
+        data = {"calibration": self.cal}
+        for source, log in logs.items():
+            by: Dict[str, int] = {}
+            for f in log:
+                by[f["category"]] = by.get(f["category"], 0) + 1
+            data[source] = {"failed_attempts": len(log), "by_category": dict(sorted(by.items()))}
+        data["kubernetes"]["paths"] = sorted({f["path"] for f in logs["kubernetes"]})[:20]
+        X.receipt(self.record, HELPER, "read-retried", data)
 
     def own(self) -> List[Dict]:
         return owned_objects(self.entries(), self.cal)
@@ -2798,11 +3119,12 @@ def steal_problems(ctx: Context) -> List[str]:
 
 
 def live_raw(ctx: Context, source: str, expected: List[str], regex: str, label: Optional[str] = None) -> str:
-    """'' when every expected source has a fresh raw sample now (raw_freshness over the last four evaluations)."""
+    """'' when every expected source has a fresh raw sample now (live_freshness: the newest raw sample of the last
+    four evaluations against the query time). What it judged is kept in ctx.judged[source]."""
     con, now = ctx.con, ctx.now()
     span = 4 * con["observer"]["step_s"]
     obs = query_range(ctx.fetch, con, resolve_fresh(con, source, regex), now - span, now)
-    why, _ = raw_freshness(con, obs, expected, label or con["observer"]["pod_label"], now - span, now)
+    why, ctx.judged[source] = live_freshness(con, obs, expected, label or con["observer"]["pod_label"], now)
     return f"raw {source}: {why}" if why else ""
 
 
@@ -2827,7 +3149,8 @@ def discovery_problems(ctx: Context, role: Optional[str]) -> List[str]:
                           if not (p.get("metadata") or {}).get("deletionTimestamp"))
     else:
         q["endpoints"], expected = {"response": {"data": {"result": []}}}, []
-    why, _ = discovery_verdict(con, q, ing[0], expected, now - span, now, live=True)
+    why, detail = discovery_verdict(con, q, ing[0], expected, now - span, now, live=True)
+    ctx.judged["discovery"] = detail.get("scrape") or {}
     return [f"observer: {w}" for w in why]
 
 
@@ -2860,6 +3183,36 @@ def observer_problems(ctx: Context, role: Optional[str]) -> List[str]:
                 out.append(f"observer: {why}")
     if "discovery" in con["observer"]:
         out += discovery_problems(ctx, role)
+    return out
+
+
+ENVIRONMENT_FIELDS = ("kernelVersion", "osImage", "containerRuntimeVersion", "kubeletVersion", "bootID", "machineID")
+
+
+def environment(ctx: Context) -> Dict:
+    """What the calibration measures ON: per reserved node (workload, support) its name, its live UID and, from
+    status.nodeInfo, the kernel, OS image, container runtime and kubelet versions, the boot ID and the machine ID
+    (None for a field the node does not expose). Read-only, from the Node objects the gates read anyway. It is
+    RECORDED (the plan, calibration-begin, the certificate; status and verify print it) so that a capacity is bound to
+    the environment that produced it; it is never a gate. Only a change between the reviewed plan and apply's start
+    refuses (environment_changes): what was reviewed is no longer what would be measured."""
+    out = {}
+    for role in ("workload", "support"):
+        want = ctx.con["nodes"][role]
+        node = ctx.kube.get("Node", want["name"]) or {}
+        info = (node.get("status") or {}).get("nodeInfo") or {}
+        out[role] = {"name": want["name"], "uid": (node.get("metadata") or {}).get("uid"),
+                     **{k: info.get(k) for k in ENVIRONMENT_FIELDS}}
+    return out
+
+
+def environment_changes(recorded: Optional[Dict], live: Optional[Dict]) -> List[str]:
+    """Every field of the environment record that differs between two readings, as "<role> node <field>: a -> b"."""
+    out = []
+    for role in ("workload", "support"):
+        a, b = (recorded or {}).get(role) or {}, (live or {}).get(role) or {}
+        out += [f"{role} node {k}: {a.get(k)!r} -> {b.get(k)!r}" for k in ("name", "uid") + ENVIRONMENT_FIELDS
+                if a.get(k) != b.get(k)]
     return out
 
 
@@ -2901,10 +3254,13 @@ def plan(ctx: Context) -> Dict:
     if X.open_intents(entries):
         problems.append("the calibrate journal has intents with unknown outcomes: run recover first")
     if ctx.con["schema"] != CONTRACT_SCHEMA:
+        lacks = ("it reconciles the per-endpoint dispatch without the ingress's no-ready rejections"
+                 if ctx.con["schema"] == SCHEMA_V2 else
+                 "its quiet readings end at the query time, where the query API may substitute the newest points, "
+                 "and do not rest on distinct raw observations")
         problems.append(f"contract schema {ctx.con['schema']} is read-only (status, verify, stop and recover of its "
-                        "own calibration; its bundles reduce): it reconciles the per-endpoint dispatch without the "
-                        f"ingress's no-ready rejections; write a {CONTRACT_SCHEMA} contract with "
-                        "observer.discovery.no_ready (a new calibration)")
+                        f"own calibration; its bundles reduce): {lacks}; write a {CONTRACT_SCHEMA} contract with "
+                        "observer.discovery.no_ready and observer.latency_offset_s (a new calibration)")
     script = _load_script()
     objs = render_objects(ctx.con, ctx.cal, ctx.params, script)
     for o in objs:
@@ -2948,7 +3304,8 @@ def plan(ctx: Context) -> Dict:
                               "deadline_utc": ctx.con["search"]["deadline_utc"], **budget,
                               "generator_job_deadline_s": ctx.con["search"]["settle_s"] +
                               ctx.con["search"]["measure_s"] + ctx.con["search"]["job_slack_s"]},
-                      admission=adm, writer_apis=apis, resource_writers=recorded, problems=problems,
+                      admission=adm, writer_apis=apis, resource_writers=recorded, environment=environment(ctx),
+                      problems=problems,
                       never=["scale anything but the calibration fixture", "write a writer", "touch a confirmation "
                              "target, the quota or a fault schedule", "resume an interrupted measurement",
                              "a rate outside the plan's bounds"])
@@ -3095,12 +3452,30 @@ def trial_meta(ctx: Context, index: int, kind: str, role: str, n: int, rate: int
 
 
 def run_trial(ctx: Context, meta: Dict, decision_sha: str, guard: Optional[Dict] = None) -> Dict:
+    """One trial (_trial). A Kubernetes read that still fails after its retries (X.ReadFailed: no answer, nothing
+    written) is incomplete evidence about this trial, never an executor error: before trial-begin it is recorded as
+    trial-not-started, after it the trial is stopped like any other (stop_trial: arrivals first, its pods proven
+    gone), and either way Halt("incomplete") ends the search through the usual path. A failed MUTATION is not
+    converted: its unknown outcome still keeps the lock for recover."""
+    state: Dict = {"begun": False, "juid": "", "files": []}
+    try:
+        return _trial(ctx, meta, decision_sha, guard, state)
+    except X.ReadFailed as e:
+        reason = f"a Kubernetes read failed after its retries ({e}): incomplete evidence, not a measured outcome"
+        if state["begun"]:
+            stop_trial(ctx, meta, state["juid"], reason, "incomplete", state["files"])
+        ctx.receipt("trial-not-started", {"trial": meta, "problems": [reason]})
+        raise Halt("incomplete", reason) from e
+
+
+def _trial(ctx: Context, meta: Dict, decision_sha: str, guard: Optional[Dict], state: Dict) -> Dict:
     """One trial: gate (configuration, writers, reservation, steal, observer proof, ...), for a selection the idle
     interval with its proof, a quiet ingress reading, the Job, monitoring every poll_s, a final gate once the Job
     completed, the after reading past the grace period, raw observations over the ACTUAL measurement window (the k6
     measure scenario's recorded start), the Job's deletion with its pods proven gone, then the verdict (evaluate_trial
     on the raw files). A gate violation stops the trial and raises Halt. `guard`: the plateau's recorded rollout-guard
-    snapshot (guard_snapshot), compared at every gate: a replacement, restart or template change stops the trial."""
+    snapshot (guard_snapshot), compared at every gate: a replacement, restart or template change stops the trial.
+    `state` tells run_trial how far the trial got (begun, the Job's UID, its evidence files)."""
     se, con = ctx.con["search"], ctx.con
     guard = guard if guard is not None else guard_snapshot(ctx)
     trial, n, rate = meta["id"], meta["n"], meta["rate_per_min"]
@@ -3113,20 +3488,29 @@ def run_trial(ctx: Context, meta: Dict, decision_sha: str, guard: Optional[Dict]
     fstate = {"name": fx["name"], "uid": fx["uid"], "replicas": n, "generation": dep["metadata"].get("generation")}
     tdir = f"trials/{trial}"
     observations: Dict = {}
+    past = history_offset_s(con)        # a completeness reading ends at least this long before it is queried
+    ctx.gate_log = []
 
     await_observer(ctx, meta, fstate, guard)
 
     def pre_gate() -> Tuple[List[str], str]:
-        return gate_problems(ctx, fstate, guard=guard) + converged(ctx, fx["name"], fx["uid"], n) + \
+        ctx.judged = {}
+        out = gate_problems(ctx, fstate, guard=guard) + converged(ctx, fx["name"], fx["uid"], n) + \
             observer_problems(ctx, meta["variant"]), fresh(ctx.fetch, con, ctx.cal, ctx.now())
+        ctx.gate_log.append({"at": ctx.now(), "phase": "before", "judged": ctx.judged})
+        return out
     problems, stale = pre_gate()
     if not problems and not stale and meta["kind"] == "selection":
         idle_s = con["work_selection"]["idle_s"]
         t0 = ctx.now()
-        observations["ingress_idle_start"] = ingress_reading(ctx.fetch, con, ctx.cal, meta["target"], t0)
         ctx.sleep(idle_s)
         t1 = t0 + idle_s
         problems, stale = pre_gate()
+    if not problems and not stale and meta["kind"] == "selection":
+        # the idle proof is read as history: every range below ends at t1 or earlier, `past` before the query
+        ctx.sleep(past)
+        _historical(ctx, t1)
+        observations["ingress_idle_start"] = ingress_reading(ctx.fetch, con, ctx.cal, meta["target"], t0)
         q = lambda name, pods="": query_range(ctx.fetch, con, resolve_query(con, meta["target"], name, pods),  # noqa
                                               t0, t1)
         a0 = t0 + washout_s(con)            # the idle CPU average starts after the rate window's washout
@@ -3146,8 +3530,9 @@ def run_trial(ctx: Context, meta: Dict, decision_sha: str, guard: Optional[Dict]
     if problems or stale:
         ctx.receipt("trial-not-started", {"trial": meta, "problems": problems + ([stale] if stale else [])})
         raise Halt("incomplete" if stale and not problems else "stopped", "; ".join(problems + [stale]).strip("; "))
-    before = ingress_reading(ctx.fetch, con, ctx.cal, meta["target"], ctx.now())
-    if any(quiet_value(before[k], before["at"], con, before["up"], v3(con))[0] is None
+    # nothing has flowed since the last trial or the idle interval: the state `past` ago is the state before this one
+    before = ingress_reading(ctx.fetch, con, ctx.cal, meta["target"], ctx.now() - past)
+    if any(quiet_value(before[k], before["at"], con, before["up"], v3(con), reading_raw(con, before))[0] is None
            for k in ("requests", "responses")):
         ctx.receipt("trial-not-started", {"trial": meta, "problems": ["the ingress is not quiet and fresh before the "
                                                                       "trial"]})
@@ -3158,6 +3543,7 @@ def run_trial(ctx: Context, meta: Dict, decision_sha: str, guard: Optional[Dict]
     files = [ctx.write(f"{tdir}/job.json", job), ctx.write(f"{tdir}/pods-begin.json", pods_begin)]
     ctx.receipt("trial-begin", {"trial": meta, "decision_sha256": decision_sha, "job_sha256": X.json_digest(job),
                                 "guard_sha256": X.json_digest(guard), "files": files})
+    state.update(begun=True, files=files)
     wp = writer_problems(ctx)                    # fresh discovery immediately before the load write
     if wp:
         # No Job was created. stop_trial with an empty UID deletes nothing; its pod proof covers only this
@@ -3169,7 +3555,7 @@ def run_trial(ctx: Context, meta: Dict, decision_sha: str, guard: Optional[Dict]
         stop_trial(ctx, meta, "", "before the generator Job: " + "; ".join(wp) + note, "stopped", files)
     ctx.kube.journal.context = {"calibration": ctx.cal, "phase": "trial", "trial": trial, "role": "generator"}
     created = ctx.kube.create(job, pre_write=_census_pre_write(ctx, f"Job/{job['metadata']['name']}"))
-    juid = created["metadata"]["uid"]
+    juid = state["juid"] = created["metadata"]["uid"]
     hard = ctx.now() + job["spec"]["activeDeadlineSeconds"] + 120
     gen_re = f"{job['metadata']['name']}-[a-z0-9]+"
     while True:
@@ -3181,6 +3567,7 @@ def run_trial(ctx: Context, meta: Dict, decision_sha: str, guard: Optional[Dict]
         if not done and ctx.now() >= hard:
             stop_trial(ctx, meta, juid, "the generator Job outlived its deadline", "stopped", files)
         # every poll AND once more after completion: the final interval must also have been clean
+        ctx.judged = {}
         problems = gate_problems(ctx, fstate, guard=guard)
         stale = fresh(ctx.fetch, con, ctx.cal, ctx.now()) or "; ".join(observer_problems(ctx, meta["variant"]))
         if not done and not stale and ctx.now() - created_at(created, ctx) >= 2 * con["observer"]["max_staleness_s"]:
@@ -3194,6 +3581,7 @@ def run_trial(ctx: Context, meta: Dict, decision_sha: str, guard: Optional[Dict]
                          if _controller_uid(p, "Job") == juid]
                 raw_why = live_raw(ctx, "generator_cpu", gpods, gen_re)
                 stale = f"observer: {raw_why}" if raw_why else ""
+        ctx.gate_log.append({"at": ctx.now(), "phase": "final" if done else "poll", "judged": ctx.judged})
         if stale:                                   # missing observer data first: incomplete evidence
             stop_trial(ctx, meta, juid, "; ".join([stale] + problems), "incomplete", files)
         if problems:
@@ -3202,12 +3590,23 @@ def run_trial(ctx: Context, meta: Dict, decision_sha: str, guard: Optional[Dict]
         if done:
             break
         ctx.sleep(se["poll_s"])
+    done_at = ctx.now()
     gpod = next((p for p in owned_pods(ctx.kube, ctx.ns, ctx.own())["generator"]
                  if _controller_uid(p, "Job") == juid), None)
     gsnap = C.sanitize_object(gpod) if gpod else None
-    ctx.sleep(se["completion_grace_s"])
+    # the after-reading: at least the completion grace after the Job completed (it had completed by done_at), and
+    # read as history, `past` after that instant
+    ctx.sleep(se["completion_grace_s"] + past)
+    after_at = ctx.now() - past
+    if after_at < done_at + se["completion_grace_s"]:           # pragma: no cover - only if the clock stepped back
+        raise X.StagingError("the after-reading would fall inside the completion grace (the clock stepped back?)")
     observations.update(ingress_before=before,
-                        ingress_after=ingress_reading(ctx.fetch, con, ctx.cal, meta["target"], ctx.now()))
+                        ingress_after=ingress_reading(ctx.fetch, con, ctx.cal, meta["target"],
+                                                      _historical(ctx, after_at)))
+    if "discovery" in con["observer"]:              # what proves a vanished dispatch series pruned (retired_endpoints)
+        observations["dispatch_span"] = {
+            k: query_range(ctx.fetch, con, resolve_discovery(con, k, meta["target"], ctx.nm["ingress_pods"]),
+                           before["at"], observations["ingress_after"]["at"]) for k in DISPATCH_SPAN}
     term = _terminated(gpod, "k6")
     try:
         started = _utc(term["startedAt"]) if term else None
@@ -3239,6 +3638,7 @@ def run_trial(ctx: Context, meta: Dict, decision_sha: str, guard: Optional[Dict]
     remove_jobs(ctx, [{"name": job["metadata"]["name"], "uid": juid}])
     files += [ctx.write(f"{tdir}/generator-pod.json", gsnap), ctx.write(f"{tdir}/observations.json", observations),
               ctx.write(f"{tdir}/pods-end.json", pods_end)]
+    _write_gate_log(ctx, meta, files)
     result = evaluate_trial(con, {"trial": meta, "generator_pod": gsnap, "pods_begin": pods_begin,
                                   "pods_end": pods_end, "observations": observations},
                             trial_history(ctx.entries(), ctx.cal, ctx.dir))
@@ -3278,6 +3678,23 @@ def se_step(con: Dict) -> int:
     return con["observer"]["step_s"]
 
 
+def _historical(ctx: Context, end: int) -> int:
+    """`end`, asserted to be history at this moment: at least history_offset_s before now (run_trial sleeps first
+    where the reading must cover something that has just happened)."""
+    if ctx.now() - end < history_offset_s(ctx.con):
+        raise X.StagingError(f"a completeness reading ending {_ts(end)} is not yet history at {_ts(ctx.now())}")
+    return end
+
+
+def _write_gate_log(ctx: Context, meta: Dict, files: List[Dict]) -> None:
+    """trials/<id>/gates.json: every live gate of the trial (before, each poll, the final one) with the time it ran
+    and, per source, the raw instant it judged (live_freshness). Evidence of what the live gates saw; the verdict
+    never reads it."""
+    if ctx.gate_log:
+        files.append(ctx.write(f"trials/{meta['id']}/gates.json", ctx.gate_log))
+        ctx.gate_log = []
+
+
 def created_at(obj: Dict, ctx: Context) -> int:
     """When a created object came into being: its creationTimestamp, else the first time this run saw it."""
     ts = (obj.get("metadata") or {}).get("creationTimestamp")
@@ -3293,6 +3710,7 @@ def stop_trial(ctx: Context, meta: Dict, juid: str, reason: str, category: str, 
     """Arrivals first: delete the trial's Job and prove its pods gone; the trial is recorded as STOPPED."""
     ctx.receipt("trial-stopping", {"trial": meta, "reason": reason[:500]})
     remove_jobs(ctx, [{"name": job_name(ctx.cal, int(meta["id"][1:])), "uid": juid}])
+    _write_gate_log(ctx, meta, files)
     ctx.receipt("trial-stopped", {"trial": meta, "reason": reason[:500], "category": category, "files": files})
     raise Halt(category, reason)
 
@@ -3412,7 +3830,7 @@ def close(ctx: Context, outcome: str, halt: Optional[Dict]) -> Dict:
                 manifest[rel] = C.sha256_file(p)
     mfile = ctx.write("manifest.json", {"calibration_id": ctx.cal, "files": manifest})
     cert = summarize(ctx.con, ctx.cal, ctx.sha, trials, halt)
-    cert.update(outcome=outcome, manifest_sha256=mfile["sha256"])
+    cert.update(outcome=outcome, manifest_sha256=mfile["sha256"], **_begin_environment(ctx.entries(), ctx.cal))
     cfile = ctx.write("certificate.json", cert)
     ctx.receipt("calibration-closed", {"outcome": outcome, "verdict": cert["verdict"], "halt": halt,
                                        "certificate_sha256": cfile["sha256"], "manifest_sha256": mfile["sha256"],
@@ -3428,6 +3846,13 @@ def close(ctx: Context, outcome: str, halt: Optional[Dict]) -> Dict:
             "certificate": os.path.join(ctx.dir, "certificate.json")}
 
 
+def _begin_environment(entries: List[Dict], cal: str) -> Dict:
+    """{"environment": ...} as calibration-begin recorded it at apply's start (equal to the reviewed plan's, or apply
+    refused); {} for a calibration begun before the environment was recorded, whose certificate has no such key."""
+    begin = next((e["data"] for e in entries if _mine(e, cal) and e["event"] == "calibration-begin"), {})
+    return {"environment": begin["environment"]} if "environment" in begin else {}
+
+
 def record_contract_path(record: X.Record) -> str:
     return record.resolve(str(record.section("calibrate")["contract"]))
 
@@ -3435,12 +3860,18 @@ def record_contract_path(record: X.Record) -> str:
 def apply(ctx: Context, reviewed: Dict, reviewed_digest: str) -> Dict:
     with X.mutating(ctx.record, ctx.kube, HELPER, {"calibration": ctx.cal}) as lock:
         live = plan(ctx)                       # recomputed UNDER the shared lock
+        C.require_reviewed(reviewed, reviewed_digest, HELPER, ctx.record.doc)
+        moved = environment_changes(reviewed.get("environment"), live["environment"])
+        if moved:                              # said by name; require_live below would only say "changed"
+            raise X.StagingError("the calibration plan has problems: the environment changed after review (" +
+                                 "; ".join(moved) + "): plan and review again")
         X.require_live(reviewed, reviewed_digest, HELPER, ctx.record, live)
         if live["problems"]:
             raise X.StagingError("the calibration plan has problems: " + "; ".join(live["problems"]))
         ctx.writer_apis_bound = dict(live["writer_apis"])      # every later census must find exactly this
         ctx.receipt("calibration-begin", {"plan_sha256": reviewed_digest, "contract_sha256": ctx.sha,
-                                          "algorithm": SEARCH_ALGORITHM, "writer_apis": ctx.writer_apis_bound})
+                                          "algorithm": SEARCH_ALGORITHM, "writer_apis": ctx.writer_apis_bound,
+                                          "environment": live["environment"]})
         try:
             with open(record_contract_path(ctx.record), "rb") as fh:
                 C.write_once(os.path.join(ctx.dir, "contract.json"), fh.read())
@@ -3624,7 +4055,8 @@ def stop(ctx: Context, reviewed: Dict, reviewed_digest: str, reason: str = "oper
 
 
 def request_stop(ctx: Context, reason: str) -> Dict:
-    if calibration_state(ctx.entries(), ctx.cal) != "open":
+    # read past a torn last line: this runs beside the live executor, whose append in progress must not refuse a stop
+    if calibration_state(X.receipts_scan(ctx.record, HELPER)[0], ctx.cal) != "open":
         raise X.StagingError(f"calibration {ctx.cal} is not open")
     out = ctx.write("stop-request.json", {"reason": reason[:300], "at": _ts(ctx.now())})
     return {"calibration_id": ctx.cal, "stop_request": out}
@@ -3744,8 +4176,10 @@ def _orders_before(lock_at, begin_at) -> bool:
 def status(ctx: Context) -> Dict:
     """Read-only. interrupted lists the unfinished trials whose executor has ended (or cannot have written them);
     running the one trial a live executor is measuring now; unverified one whose executor cannot be established here
-    as alive or ended (unfinished_trials, executor_liveness)."""
-    entries = ctx.entries()
+    as alive or ended (unfinished_trials, executor_liveness). A torn last journal line (an append cut by a kill, or
+    one being written this instant) is read past and reported under journal.torn_tail; every other command refuses
+    it until recover has set it aside."""
+    entries, torn = X.receipts_scan(ctx.record, HELPER)
     trials, _ = _trial_records(entries, ctx.cal, ctx.dir) if os.path.isdir(ctx.dir) else ([], [])
     state = calibration_state(entries, ctx.cal)
     liveness = executor_liveness(ctx.record) if state == "open" else None
@@ -3760,26 +4194,36 @@ def status(ctx: Context) -> Dict:
             "running": unfinished["running"], "unverified": unfinished["unverified"],
             "interrupted": unfinished["interrupted"], "executor": liveness,
             "decisions": [e["data"]["step"] for e in entries if _mine(e, ctx.cal) and e["event"] == "decision"],
-            "closed": closed, "open_intents": X.open_intents(entries)}
+            "closed": closed, "open_intents": X.open_intents(entries),
+            "environment": _begin_environment(entries, ctx.cal).get("environment"),
+            "journal": {"receipts": len(entries), "torn_tail": None if torn is None else dict(
+                torn, note="the last line is a torn append and is ignored here" if torn["state"] == "partial" else
+                "the last receipt is complete but lacks its line end; it is counted here")}}
 
 
 def verify(ctx: Context) -> Dict:
     state = calibration_state(ctx.entries(), ctx.cal)
     if state == "closed":
-        return {"helper": HELPER, "state": state, "bundle": reduce_bundle(ctx.dir)}
+        return {"helper": HELPER, "state": state, "bundle": reduce_bundle(ctx.dir),
+                "environment": _begin_environment(ctx.entries(), ctx.cal).get("environment")}
     if state != "open":
         return {"helper": HELPER, "state": state, "stops": []}
     begin = next((e["data"] for e in ctx.entries() if _mine(e, ctx.cal) and e["event"] == "calibration-begin"), {})
     if begin.get("writer_apis"):
         ctx.writer_apis_bound = dict(begin["writer_apis"])
+    ctx.judged = {}
     stops = gate_problems(ctx)
     stale = fresh(ctx.fetch, ctx.con, ctx.cal, ctx.now())
     if stale:
         stops.append(stale)
     if X.open_intents(ctx.entries()):
         stops.append("intents with unknown outcomes: recovery needed")
+    recorded, live = begin.get("environment"), environment(ctx)
     return {"helper": HELPER, "state": state, "calibration_id": ctx.cal, "stops": stops,
-            "result": "OK" if not stops else "STOP"}
+            "result": "OK" if not stops else "STOP", "judged": {"at": ctx.now(), "raw_instants": ctx.judged},
+            # reported, never a stop: what was recorded at apply's start against the nodes as they are now
+            "environment": {"recorded": recorded, "live": live,
+                            "changed": environment_changes(recorded, live) if recorded else None}}
 
 
 # --- the offline reducer ---------------------------------------------------------------------------------------------
@@ -3840,13 +4284,14 @@ def reduce_bundle(bundle: str) -> Dict:
             trials.append(_stopped_result(d["trial"], d))
     cert = load("certificate.json")
     again = summarize(con, cal, con_sha, trials, closed[0]["halt"])
-    again.update(outcome=closed[0]["outcome"], manifest_sha256=idx["manifest_sha256"])
+    again.update(outcome=closed[0]["outcome"], manifest_sha256=idx["manifest_sha256"],
+                 **_begin_environment(entries, cal))
     if C.digest(again) != C.digest(cert):
         diff = sorted(k for k in set(again) | set(cert) if again.get(k) != cert.get(k))
         raise X.StagingError(f"the recomputed certificate differs from the recorded one in {diff}")
     return {"reproduced": True, "calibration_id": cal, "verdict": again["verdict"], "reasons": again["reasons"],
             "c0_rps": again["c0_rps"], "c_rps": again["c_rps"], "linearity": again["linearity"],
-            "trials": len(trials)}
+            "trials": len(trials), "environment": again.get("environment")}
 
 
 # --- CLI ------------------------------------------------------------------------------------------------------------

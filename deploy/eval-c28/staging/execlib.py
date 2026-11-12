@@ -11,7 +11,9 @@ legacy_allowlist names the legacy API group. This module only adds what part 2 n
   * Kube: typed access by kind over the raw API (the extra kinds part 2 touches: ConfigMaps, ResourceQuotas,
     ReplicaSets, PriorityClasses, StorageClasses, NetworkPolicies, scrape objects, the ingress's ServiceAccount, Role and
     RoleBinding), with client-side filtering only
-    (nothing is selected server-side by label or name substring), update = read, mutate a copy, then replace with the
+    (nothing is selected server-side by label or name substring; a LIST is always strict: an answer that is not a
+    list, "not found" included, is a failed read and never "no objects"), update = read, mutate a copy, then replace
+    with the
     read resourceVersion and UID (optimistic concurrency; a replaced or concurrently edited object is refused), and
     require_cluster before every create/replace/delete. Secrets are never read.
   * Reviewed plans: `plan` writes the plan once (evidence/<helper>/<name>-<digest12>.json) and prints its digest; a
@@ -25,7 +27,9 @@ legacy_allowlist names the legacy API group. This module only adds what part 2 n
     create, replace and delete goes through mutation_step (intent-<n> with the validated pre-state BEFORE the call, step-<n>
     after); an unknown outcome keeps the lock; recover() takes recovery_guard (owner proven terminated), writes
     reconciled-<n> for what it can decide from the live objects, and releases the stale lock only when nothing stays
-    unresolved. What a helper owns is derived from this journal.
+    unresolved. What a helper owns is derived from this journal. A journal whose last line is a torn append (the
+    executor was killed inside the write) refuses every mutating command (mutating() checks before it takes the
+    lock); recover_plan lists it and recover, under the guard, sets the torn bytes aside first.
   * Helper-defined steps: Kube.step journals an operation the helper composes itself (session.py's restore: a
     Kube.scale write through /scale with the read resourceVersion and UID, then the wait for convergence); any failure
     inside it stays unresolved, and recover decides it with the reconciler the helper registered in RECONCILERS. An op
@@ -188,6 +192,7 @@ LOCK_SCOPE = "evaluation"                 # ONE lock (common_records.exclusive_l
 INTENT_ANNOTATION = "c28.devkuban.com/intent"
 DEFINITIVE = (400, 401, 403, 404, 409, 422, 429)   # the API refused: nothing was applied
 PART2_HELPERS = ("reserve", "prepare", "session", "calibrate")   # journals under the shared evaluation lock
+JOURNALS = PART2_HELPERS + ("recover",)   # every log written under that lock or its recovery guard (torn-tail scan)
 
 
 def lock_file(record: "Record") -> str:
@@ -328,29 +333,38 @@ def reconcile(kube: "Kube", d: Dict, record: Optional["Record"] = None) -> Dict:
 
 
 def recover_plan(record: "Record", kube: "Kube") -> Dict:
-    """Read-only: the held lock (with its sha256, which recovery must be given) and every unresolved intent of the
-    part-2 helpers, observed against the live state."""
-    actions = []
-    for helper in PART2_HELPERS:
-        for it in open_intents(receipts(record, helper)):
+    """Read-only: the held lock (with its sha256, which recovery must be given), every unresolved intent of the
+    part-2 helpers, observed against the live state, and every journal whose last line is a torn append (torn_tails;
+    read past here, set aside by recover). A step whose outcome receipt was torn has no recorded outcome, so it is one
+    of the unresolved intents and is reconciled like any other."""
+    actions, torn = [], []
+    for helper in JOURNALS:
+        entries, tail = receipts_scan(record, helper)
+        if tail is not None:
+            torn.append({"helper": helper, **tail})
+        for it in open_intents(entries) if helper in PART2_HELPERS else []:
             d = it["data"]
             actions.append({"helper": helper, "step": it["step"], "op": d["op"], "kind": d["kind"],
                             "namespace": d["namespace"], "name": d["name"], "context": d.get("context", {}),
                             **reconcile(kube, d, record)})
     path_ = lock_file(record)
     sha = C.sha256_file(path_) if os.path.exists(path_) else ""
-    return new_plan("recover", record, actions, lock=path_, lock_sha256=sha,
+    return new_plan("recover", record, actions, lock=path_, lock_sha256=sha, torn_tails=torn,
                     unresolved=[a for a in actions if a["observed"] == "unresolved"])
 
 
 def recover(record: "Record", kube: "Kube", reviewed: Dict, reviewed_digest: str,
             follow_up: Optional[Callable[[List[Dict]], None]] = None) -> Dict:
-    """common_records.recovery_guard (one recoverer, the lock's executor proven terminated), then reconciled-<n> for
-    every decided outcome; the stale lock is released only when nothing stays unresolved."""
+    """common_records.recovery_guard (one recoverer, the lock's executor proven terminated), then the reviewed torn
+    journal tails set aside (C.set_aside_torn_tail: the torn bytes copied into the evidence before the log is cut; only
+    here, never while its writer may live), then reconciled-<n> for every decided outcome; the stale lock is released
+    only when nothing stays unresolved."""
     live = recover_plan(record, kube)
     require_live(reviewed, reviewed_digest, "recover", record, live)
     with C.recovery_guard(record.doc, LOCK_SCOPE, live["lock_sha256"]) as guard:
         C.require_cluster(kube.api, record.cluster_uid)
+        for t in live["torn_tails"]:
+            C.set_aside_torn_tail(record.doc, t["helper"], t)
         for a in live["actions"]:
             if a["observed"] != "unresolved":
                 C.append_receipt(record.doc, a["helper"], f"reconciled-{a['step']}",
@@ -370,9 +384,16 @@ def recover(record: "Record", kube: "Kube", reviewed: Dict, reviewed_digest: str
 
 # --- typed API access -----------------------------------------------------------------------------------------------
 
+class ReadFailed(C.ApiError):
+    """A Kubernetes READ failed (a get, a list, discovery, or the cluster-identity check that precedes a write): the
+    API gave no answer after KubectlApi's retries, and nothing was written. An ApiError like any other for existing
+    handlers; a caller that must tell a failed observation from a failed mutation catches this class."""
+
+
 class Kube:
     """Typed access over a common_records API (KubectlApi or a fake with the same methods). Every mutation goes through
-    a Journal (intent before, outcome after) and checks the cluster identity first; without a journal it refuses."""
+    a Journal (intent before, outcome after) and checks the cluster identity first; without a journal it refuses.
+    Every read's failure is raised as ReadFailed."""
 
     def __init__(self, api, cluster_uid: str):
         self.api, self.cluster_uid = api, cluster_uid
@@ -385,12 +406,23 @@ class Kube:
             raise StagingError("a mutation needs the shared lock and an intent journal")
         return self.journal
 
+    def _read(self, fn: Callable, *args):
+        try:
+            return fn(*args)
+        except ReadFailed:
+            raise
+        except C.ApiError as e:
+            raise ReadFailed(str(e), getattr(e, "status", None)) from e
+
+    def _require_cluster(self) -> None:
+        self._read(C.require_cluster, self.api, self.cluster_uid)
+
     def identity(self) -> str:
-        return C.cluster_uid(self.api)
+        return self._read(C.cluster_uid, self.api)
 
     def served(self, kind: str) -> bool:
         if self._groups is None:
-            self._groups = C.discover_groups(self.api)
+            self._groups = self._read(C.discover_groups, self.api)
         return group_of(kind) in self._groups
 
     def discover_fresh(self) -> Dict[str, List[str]]:
@@ -398,27 +430,41 @@ class Kube:
         answer is returned; the RAW document is validated before anything is normalized (validate_discovery). A failed
         request (auth, timeout, not found) or a malformed document raises ApiError, so an absent group in the result
         is proven absent by discovery, never inferred from a failure."""
-        return validate_discovery(self.api.get("/apis"))
+        return self._read(lambda: validate_discovery(self.api.get("/apis")))
 
     def get(self, kind: str, name: str, namespace: Optional[str] = None) -> Optional[Dict]:
-        o = self.api.get(path(kind, namespace, name))
+        o = self._read(self.api.get, path(kind, namespace, name))
         if o is not None:
             o.setdefault("kind", kind)
         return o
 
+    def _list_doc(self, kind: str, namespace: Optional[str]) -> Dict:
+        """The list document of a collection, or ApiError. A collection endpoint never legitimately answers "not
+        found" (KubectlApi.get returns None for a 404): that is a proxy's not-found for the whole cluster, or a
+        resource type that is not served, so it is tried again like any failed read (the API client's own read
+        policy, when it has one) and then raised, as is an answer without an items array."""
+        retry = getattr(self.api, "retry", C.NO_RETRY)
+        for attempt in range(1, retry.attempts + 1):
+            doc = self.api.get(path(kind, namespace))
+            if isinstance(doc, dict) and isinstance(doc.get("items"), list):
+                return doc
+            if isinstance(getattr(self.api, "read_failures", None), list):
+                C._note_failure(self.api.read_failures, {"path": path(kind, namespace), "attempt": attempt,
+                                                         "category": "not a list"})
+            if attempt < retry.attempts:
+                self.api.sleep(retry.delays[attempt - 1])
+        raise C.ApiError(f"list {kind}: no list response from a served API (missing endpoint or malformed answer)")
+
     def list(self, kind: str, namespace: Optional[str] = None, labels: Optional[Dict[str, str]] = None,
-             node_name: str = "", strict: bool = False) -> List[Dict]:
-        """Client-side filtered list. strict: the API must answer with a real list (a JSON object carrying an items
-        array); a missing answer (KubectlApi returns None for 404) or a malformed one raises instead of reading as an
-        empty list. The writer censuses use strict; other callers keep the lenient default."""
-        doc = self.api.get(path(kind, namespace))
-        if strict and not (isinstance(doc, dict) and isinstance(doc.get("items"), list)):
-            raise C.ApiError(f"list {kind}: no list response from a served API (missing endpoint or malformed answer)")
-        items = (doc or {}).get("items", [])
-        if not isinstance(items, list):
-            raise C.ApiError(f"list {kind}: not a list")
+             node_name: str = "") -> List[Dict]:
+        """Client-side filtered list, ALWAYS strict: the API must answer with a real list (a JSON object carrying an
+        items array). "The collection exists and is empty" is {"items": []}; a missing answer (not found, an
+        unserved resource type) or a malformed one raises ReadFailed (_list_doc) and is never read as "no objects":
+        every listing here gates a safety decision (occupants, generators, a session's pods, the writer census). A
+        caller that lists an OPTIONAL API asks served() or fresh discovery first."""
+        doc = self._read(self._list_doc, kind, namespace)
         out = []
-        for o in items:
+        for o in doc["items"]:
             o.setdefault("kind", kind)
             ls = (o.get("metadata") or {}).get("labels") or {}
             if labels and any(ls.get(k) != v for k, v in labels.items()):
@@ -434,7 +480,7 @@ class Kube:
         and recover finds the object absent (not applied)."""
         j = self._journal()
         m = obj["metadata"]
-        C.require_cluster(self.api, self.cluster_uid)
+        self._require_cluster()
         result: Dict = {}
 
         def do(mark):
@@ -468,7 +514,7 @@ class Kube:
             mutate(body)
             body["metadata"]["uid"] = uid
             body["metadata"]["resourceVersion"] = cur["metadata"]["resourceVersion"]
-            C.require_cluster(self.api, self.cluster_uid)
+            self._require_cluster()
             pre = {"resourceVersion": cur["metadata"]["resourceVersion"],
                    "fields": {f: pointer_get(cur, f) for f in pre_fields}}
             try:
@@ -500,7 +546,7 @@ class Kube:
         j = self._journal()
         if not (isinstance(uid, str) and _UUID.match(uid)):
             raise StagingError(f"{kind}/{name}: a {op} step needs the bound UID")
-        C.require_cluster(self.api, self.cluster_uid)
+        self._require_cluster()
         result: Dict = {}
 
         def do(mark):
@@ -520,7 +566,7 @@ class Kube:
         self._journal()
         if not (isinstance(uid, str) and _UUID.match(uid)) or not resource_version:
             raise StagingError(f"{kind}/{name}: a scale needs the bound UID and the read resourceVersion")
-        C.require_cluster(self.api, self.cluster_uid)
+        self._require_cluster()
         resp = self.api.replace(path(kind, namespace, name) + "/scale", {
             "apiVersion": "autoscaling/v1", "kind": "Scale",
             "metadata": {"name": name, "namespace": namespace, "uid": uid, "resourceVersion": resource_version},
@@ -531,7 +577,7 @@ class Kube:
         j = self._journal()
         if not (isinstance(uid, str) and _UUID.match(uid)):
             raise StagingError(f"{kind}/{name}: a delete needs the bound UID")
-        C.require_cluster(self.api, self.cluster_uid)
+        self._require_cluster()
         j.run("delete", kind, namespace, name, lambda mark: self.api.delete(path(kind, namespace, name), uid), uid=uid)
         self.mutations.append({"op": "delete", "kind": kind, "namespace": namespace, "name": name, "uid": uid})
 
@@ -546,6 +592,8 @@ class mutating:
         self.lock = C.exclusive_lock(record.doc, LOCK_SCOPE, holder=helper)
 
     def __enter__(self):
+        for h in JOURNALS:                     # a torn or corrupt journal refuses BEFORE the lock is taken
+            receipts(self.record, h)
         self.lock.__enter__()
         self.kube.journal = Journal(self.record, self.helper, self.lock, self.context)
         return self.lock
@@ -626,6 +674,12 @@ def receipt(record: Record, helper: str, event: str, data: Dict, clock=None) -> 
 
 def receipts(record: Record, helper: str) -> List[Dict]:
     return C.read_receipts(C.receipts_path(record.doc, helper))
+
+
+def receipts_scan(record: Record, helper: str):
+    """(receipts, torn tail or None) for READ-ONLY reporting (C.scan_receipts): a torn last line is reported, never
+    raised. Anything that mutates reads with receipts()."""
+    return C.scan_receipts(C.receipts_path(record.doc, helper))
 
 
 def last(entries: List[Dict], event: str, **match) -> Optional[Dict]:
@@ -756,14 +810,14 @@ def writer_inventory(kube: Kube, namespace: str, names: Iterable[str], groups: O
     served = (lambda kind: group_of(kind) in groups) if groups is not None else kube.served
     if served("ScaledObject"):
         scaled = {(o["metadata"].get("namespace"), o["metadata"]["name"]): o["metadata"].get("uid")
-                  for o in kube.list("ScaledObject", None, strict=True)}
+                  for o in kube.list("ScaledObject")}
     for kind in WRITER_KINDS:
         if not served(kind):
             if kind in OPTIONAL_WRITERS or absent_ok:
                 continue
             raise StagingError(f"the {group_of(kind)} API is not served: the writer inventory cannot be complete")
         cross = kind in ("PredictiveAutoscaler", "LegacyPredictiveAutoscaler")
-        for o in kube.list(kind, None, strict=True):         # a served writer API must answer with a real list
+        for o in kube.list(kind):                            # a served writer API must answer with a real list
             as_writer = dict(o, kind="PredictiveAutoscaler" if cross else kind)
             targets = _cronhpa_targets(o) if kind == "CronHorizontalPodAutoscaler" else \
                 c28.render._writer_targets(as_writer)
@@ -804,7 +858,7 @@ def resource_writer_inventory(kube: Kube, namespace: str, names: Iterable[str],
     served = (lambda kind: group_of(kind) in groups) if groups is not None else kube.served
     if not served("VerticalPodAutoscaler"):
         return found
-    for o in kube.list("VerticalPodAutoscaler", None, strict=True):
+    for o in kube.list("VerticalPodAutoscaler"):
         spec, m = o.get("spec") or {}, o.get("metadata") or {}
         ref = spec.get("targetRef") or {}
         if m.get("namespace") != namespace or (ref.get("kind") or "") != "Deployment" or ref.get("name") not in names:

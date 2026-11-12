@@ -575,7 +575,7 @@ calibrate.py reduce --bundle evidence/calibrate/<id>      # offline: recompute c
 ```
 
 Manifest section 3's capacity calibration at fixed replicas with no autoscaler, never against a confirmation target.
-The record's `calibrate` section names a **calibration contract** (`c28-calibration-contract/v3`; v1 contracts, which predate the endpoints-rr ingress and its discovery gate, are refused, while recorded v1 bundles still reduce; v2 contracts, whose dispatch identity omits the ingress's no-ready rejections, are read-only: status, verify, stop and recover of their own calibration and the reduction of their bundles are unchanged, while plan and apply refuse them), frozen independently of
+The record's `calibrate` section names a **calibration contract** (`c28-calibration-contract/v4`; v1 contracts, which predate the endpoints-rr ingress and its discovery gate, are refused, while recorded v1 bundles still reduce; v2 contracts, whose dispatch identity omits the ingress's no-ready rejections, and v3 contracts, whose quiet readings end at the query time and do not rest on distinct raw observations, are read-only: status, verify, stop and recover of their own calibration and the reduction of their bundles are unchanged, while plan and apply refuse them), frozen independently of
 the unfinished params (only their reservation stage is read): cluster and node UIDs, namespace, source commit and the
 hash of `load/c28-calibrate.js`, the S1 `images.json` with its fixture and generator digests (taken from the record,
 never hardcoded), the candidate (CPU/memory requests and limits, max_inflight, max_queue, queue timeout, GOMAXPROCS,
@@ -647,6 +647,22 @@ stray-endpoint check is waived. Dispatched, received and answered arrivals recon
 with tolerance 0/0. The idle CPU baseline is averaged only after a washout of the 60 s rate window plus one CPU scrape
 interval.
 
+Readings in time (contract v4). The query API may answer the points newer than now minus its latency offset with
+older samples (VictoriaMetrics `-search.latencyOffset`; in the recorded evidence the last two 15 s points of a query
+that ended at the query time repeat the third-last). The contract declares that offset
+(`observer.latency_offset_s`, at least 30) and the executor keeps two kinds of reading apart. Completeness readings
+(the ingress counters before and after a trial, the per-endpoint dispatch, the selection's idle proof, the window
+queries) are read as history, their range ending at least `latency_offset_s + 2 x step_s` before the query; the
+after-reading is still at least `completion_grace_s` after the Job completed (asserted), and a quiet counter needs
+three distinct raw observations (the reading's raw scrape timestamps), never three equal values of repeated points.
+Live gates (pods up, freshness, discovery membership) query up to now and judge the newest raw sample in the answer,
+which must be within `latency_offset_s + max_staleness_s` of now; each trial's `gates.json` and `verify` say what
+instant every gate judged. The validator requires `completion_grace_s >= 2 + latency_offset_s + 2 x step_s` and
+`max_staleness_s >= 2 x` the slowest declared scrape interval. A dispatch series that vanishes between the two
+readings counts 0 only when its endpoint is proven retired from the trial's dispatch span (not one of the trial's
+pods, never in the endpoint set during the trial, its counter never moved); anything else stays incomplete. Equal
+per-endpoint totals do not prove a constant endpoint set.
+
 The writer census uses fresh discovery every time: a writer API group that a successful discovery does not serve (on
 prod today, the new PredictiveAutoscaler group) is recorded as "API discovery-proven absent" in the reviewed plan and
 the receipts, a failed or malformed discovery refuses, and any change of that availability during the calibration
@@ -666,7 +682,36 @@ rollouts), no writer of the fixture or ingress, the owned objects at their UIDs,
 injected sidecar, a fresh observer, no stop request and the total deadline. A violation stops the trial: the Job is
 deleted and its pods proven gone before anything else is touched. Mutations hold the shared evaluation lock with
 intents and outcomes; an unknown outcome or an unproven cleanup keeps the lock until `recover`. An interrupted
-measurement is recorded as interrupted and never resumed.
+measurement is recorded as interrupted and never resumed. A journal whose last line is a torn append (the executor
+killed inside a receipt's write) is refused by every mutating command of the part-2 helpers before a lock is taken;
+`status` and `request-stop` read past it and `status` reports it (`journal.torn_tail`); `recover-plan` lists it and
+`recover`, once the owning executor is proven ended, copies the torn bytes into the evidence
+(`receipts/<helper>.jsonl.torn-<offset>-<sha12>`), cuts them off the log, records `journal-tail-repaired` and
+reconciles the half-recorded step like any unresolved intent. A live journal is never cut or rewritten.
+
+Reads are retried, writes never: every kubectl read (`KubectlApi.get`, for every staging helper) and every calibration
+observer query makes up to three attempts over 20 s (`common_records.READ_RETRY`; a refusal such as 403 or an HTTP 4xx
+is an answer and is not retried). Each failed attempt is kept as a fixed category (`timeout`, `connection`, ...; never
+the error text) and the calibration journals them (`read-retried`; a retried evidence query also carries
+`failed_attempts`). An observer query that still fails stays a missing observation; a Kubernetes read that still
+fails inside a trial stops that trial as incomplete evidence (`trial-stopped` / `trial-not-started`, halt
+`incomplete`) through the usual arrivals-first path, never as an executor error. A failed mutation keeps its unknown
+outcome and the lock. The session watchdog's query reads use the same policy, so one failed read no longer stops a
+block; a read that stays failed still does.
+
+Lists are strict everywhere (`execlib.Kube.list`): "the collection exists and is empty" is an `items: []` answer;
+"not found" or any other non-list answer for a collection is a failed read (retried, then `ReadFailed`) and is never
+read as "no objects", because every such listing gates a safety decision (occupants of W and S, generators of the
+run, a session's pods, the pods of a calibration, the writer census). A caller that lists an optional API asks
+discovery first. A single object's GET is "absent" only on the API server's own `NotFound` answer, never on the words
+"not found" in a client-side failure. (`common_records.list_items`, used by the already-executed part-1 helpers
+`legacy.py` and `inventory.py`, is unchanged.)
+
+The plan, the `calibration-begin` receipt and the certificate record the environment that was measured on: for W and S
+the node name and UID and, from `status.nodeInfo`, the kernel, OS image, container runtime and kubelet versions, the
+boot ID and the machine ID. It binds a capacity to the environment that produced it and is never a gate, except that
+`apply` refuses when it differs from the reviewed plan's (said field by field). `status` prints the recorded one,
+`verify` the recorded and the live one with their differences.
 
 The evidence bundle (`evidence/calibrate/<id>/`) holds the contract, the rendered objects, per trial the Job, pod
 snapshots with their image identities, the raw observer responses and the derived result, then the manifest of hashes,

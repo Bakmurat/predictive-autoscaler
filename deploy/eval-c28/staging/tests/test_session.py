@@ -398,6 +398,50 @@ def test_stop_waits_for_generator_pods_and_reports_unresolved(world):
     assert "still open or unresolved" not in problems(world, other)
 
 
+def test_an_unanswered_list_is_never_read_as_no_generators_or_no_pods(world):
+    """Review 2026-11-10 R2-16: with one LIST answered "not found" (a proxy hiccup), quiesce saw no generator pods and
+    closed the session while its generator was still sending, and _active_generators let a second session start. A
+    list without a list answer is a failed read everywhere: nothing is concluded from it."""
+    record = session_record(world)
+    api = world["api"]
+    c, digest, started = start_session(world, record)
+    api.put(F.pod("c28-gen-s-0001-abc", "demo", "worker-s", labels={X.SESSION_LABEL: "s-0001", X.RUN_LABEL: "c28-r1"}))
+    real = api.get
+    api.get = lambda path: None if path.endswith(("/pods", "/jobs")) else real(path)
+    with pytest.raises(X.ReadFailed, match="no list response"):
+        S._active_generators(c)
+    other = session_record(world, id="s-0002", arm="H-RPS",
+                           plan=write_plan(world, "ordinary", 102, "c28-h-rps-s20", name="p2.json"))
+    with pytest.raises(X.ReadFailed):                                    # never "no generator of the run is active"
+        S.plan_start(ctx(world, other))
+    with pytest.raises(X.ReadFailed):                                    # never "its generator pods are gone"
+        stop_session(c)
+    assert "session-stopped" not in events(record)
+    out = S.watch(c, digest, fetch=steal(c.clock), max_checks=1)
+    assert out["ended"] == "unresolved" and "ReadFailed" in out["stops"][0]
+    api.get = real
+    out = stop_session(c)                                                # the pod is seen again: still present
+    assert out["data"]["resolved"] is False and "generator pods still present" in out["data"]["unresolved"][0]
+
+
+def test_watchdog_retries_a_failed_query_before_it_stops(world):
+    """Review 2026-11-10 R2-17: one failed steal query ended a 24-hour block. The watchdog's query reads are retried
+    (three attempts over 20 s); a query that stays failed is still the missing observation that stops the session."""
+    record = session_record(world)
+    c, digest, started = start_session(world, record)
+    good, calls = steal(c.clock), []
+
+    def flaky(url):
+        calls.append(url)
+        if len(calls) in (1, 2):
+            raise OSError("connection refused")
+        return good(url)
+    t0 = c.clock.now()
+    out = S.watch(c, digest, fetch=flaky, max_checks=1)
+    assert out["ended"] == "check budget exhausted" and len(calls) == 3 and c.clock.now() - t0 >= 20
+    assert "session-stopped" not in events(record)
+
+
 def test_replaced_objects_are_unresolved_not_success(world):
     record = session_record(world)
     api = world["api"]

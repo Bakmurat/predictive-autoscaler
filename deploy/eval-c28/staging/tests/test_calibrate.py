@@ -423,6 +423,190 @@ def test_crash_mid_trial_is_recorded_interrupted_and_never_resumed(cal, api):
     assert K.reduce_bundle(ctx.dir)["reproduced"]
 
 
+def test_torn_journal_line_after_a_kill_is_reported_refused_and_recovered(cal, api, capsys):
+    """Review 2026-11-10 F5: killed inside a receipt's write, the executor left a torn last journal line and every
+    command (status, recover, stop) died with a JSONDecodeError traceback. status reads past it and reports it;
+    request-stop still works; every other command refuses with a StagingError; recover (owner proven ended) keeps the
+    torn bytes in the evidence and repairs the log; stop then closes the calibration and the bundle reduces."""
+    ctx = cal()
+    real_sleep = ctx.clock.sleep
+
+    def sleep(s):
+        if any(k == "jobs" and n.endswith("t003") for (k, _, n) in api.objects):
+            raise Crash()
+        real_sleep(s)
+    ctx.sleep = sleep
+    with pytest.raises(Crash):
+        run(ctx)
+    ctx.sleep = real_sleep
+    path = C.receipts_path(ctx.record.doc, K.HELPER)
+    whole = open(path, "rb").read()
+    torn = b'{"at": "2026-11-30T00:00:00Z", "data": {"calibration": "' + ctx.cal.encode() + b'", "guard": {"own'
+    open(path, "ab").write(torn)
+    _write_lock(ctx)
+    PF.crash_owner(ctx.record)                                # the lock a killed executor leaves behind
+    st = K.status(ctx)
+    assert st["state"] == "open" and [t["id"] for t in st["interrupted"]] == ["t003"]
+    assert st["journal"]["torn_tail"]["state"] == "partial" and "ignored" in st["journal"]["torn_tail"]["note"]
+    assert st["journal"]["torn_tail"]["byte_offset"] == len(whole) and \
+        st["journal"]["receipts"] == len(whole.splitlines())
+    for refused in (K.plan, K.plan_stop, K.verify):
+        with pytest.raises(C.TornReceipt, match="torn append"):
+            refused(ctx)
+    args = dict(api=api, fetch=ctx.world.fetch, now=ctx.clock.now, sleep=ctx.clock.sleep)
+    assert K.main(["--record", ctx.record.path, "stop-plan"], **args) == 1          # refused, not a traceback
+    assert "refused" in capsys.readouterr().err and open(path, "rb").read() == whole + torn
+    assert K.main(["--record", ctx.record.path, "status"], **args) == 0
+    assert K.request_stop(ctx, "operator")["stop_request"]["path"] == "stop-request.json"
+    rp = X.recover_plan(ctx.record, ctx.kube)
+    assert [(t["helper"], t["state"]) for t in rp["torn_tails"]] == [(K.HELPER, "partial")]
+    assert PF.recover(ctx.record, ctx.kube)["event"] == "lock-recovered" and not lock_held(ctx)
+    kept = [f for f in os.listdir(os.path.dirname(path)) if ".torn-" in f]
+    assert len(kept) == 1 and open(os.path.join(os.path.dirname(path), kept[0]), "rb").read() == torn
+    assert open(path, "rb").read().startswith(whole) and "journal-tail-repaired" in events(ctx)
+    assert K.status(ctx)["journal"]["torn_tail"] is None
+    plan, digest = CW.reviewed(ctx, K.plan_stop, K.STOP, "stop-plan")
+    out = K.stop(ctx, plan, digest, "after a torn journal line")
+    assert out["outcome"] == "STOPPED" and live_calibration_objects(api, ctx.cal) == []
+    assert K.reduce_bundle(ctx.dir)["reproduced"]
+
+
+def _stop_after(ctx, trial):
+    """Ask the executor to stop once `trial` has its result (keeps a simulated run short)."""
+    def hook(world, api_):
+        if os.path.exists(os.path.join(ctx.dir, "trials", trial, "result.json")) and \
+                not os.path.exists(os.path.join(ctx.dir, "stop-request.json")):
+            K.request_stop(ctx, "test: enough")
+    ctx.world.hooks.append(hook)
+
+
+def _in_trial(ctx, trial):
+    return os.path.exists(os.path.join(ctx.dir, "trials", trial, "job.json")) and \
+        not os.path.exists(os.path.join(ctx.dir, "trials", trial, "result.json"))
+
+
+@pytest.mark.parametrize("phase", ["poll", "before-begin"])
+def test_a_failed_kubernetes_read_inside_a_trial_is_incomplete_evidence_not_an_executor_error(cal, api, monkeypatch,
+                                                                                               phase):
+    """Review 2026-11-10 F4: one failed kubectl read at one poll left run_trial as an ApiError, so apply recorded
+    apply-error and closed the calibration STOPPED. A read that still fails after its retries stops THAT trial as
+    incomplete evidence through the usual path (arrivals first, journalled), and the search halts "incomplete"."""
+    ctx = cal()
+    state = {"failed": 0, "armed": False}
+    real_get, real_await = api.get, K.await_observer
+
+    def get(path):
+        if not state["failed"] and path.endswith("/pods") and \
+                (state["armed"] if phase == "before-begin" else _in_trial(ctx, "t005") and state["polls"] >= 2):
+            state["failed"] += 1
+            raise C.ApiError(f"get {path}: failed (timeout, exit 1)", 504)      # what KubectlApi raises at the end
+        return real_get(path)
+
+    def await_observer(ctx_, meta, fstate, guard):
+        state["armed"] = meta["id"] == "t005"
+        return real_await(ctx_, meta, fstate, guard)
+    state["polls"] = 0
+    real_sleep = ctx.clock.sleep
+
+    def sleep(s):
+        state["polls"] += s == ctx.con["search"]["poll_s"] and _in_trial(ctx, "t005")
+        real_sleep(s)
+    api.get, ctx.sleep = get, sleep
+    monkeypatch.setattr(K, "await_observer", await_observer)
+    out = run(ctx)
+    ev, c = events(ctx), cert(ctx)
+    assert state["failed"] == 1 and "apply-error" not in ev and "trial-interrupted" not in ev
+    assert c["outcome"] == "HALTED" and out["verdict"] == "NOT READY" and c["halted"]["category"] == "incomplete"
+    [halt] = [e["data"] for e in ctx.entries() if e["event"] == "search-halted"]
+    assert halt["category"] == "incomplete" and "a Kubernetes read failed after its retries" in halt["reason"]
+    if phase == "poll":
+        [stopped] = [e["data"] for e in ctx.entries() if e["event"] == "trial-stopped"]
+        assert stopped["trial"]["id"] == "t005" and stopped["category"] == "incomplete"
+        assert ev.index("trial-stopping") < ev.index("trial-stopped")
+    else:
+        [not_started] = [e["data"] for e in ctx.entries() if e["event"] == "trial-not-started"]
+        assert not_started["trial"]["id"] == "t005" and "trial-stopped" not in ev
+    assert live_calibration_objects(api, ctx.cal) == [] and not lock_held(ctx)
+    assert K.reduce_bundle(ctx.dir)["reproduced"]
+
+
+def test_a_failed_mutation_inside_a_trial_is_never_read_as_a_failed_read(cal, api):
+    ctx = cal()
+    real = api.create
+
+    def create(path, body):
+        if body["kind"] == "Job":
+            raise C.ApiError("create: failed (timeout)", 504)          # unknown outcome
+        return real(path, body)
+    api.create = create
+    with pytest.raises(X.StagingError):
+        run(ctx)
+    assert lock_held(ctx) and X.open_intents(ctx.entries()) and "trial-stopped" not in events(ctx)
+
+
+def _refuse(ctx, when, times):
+    """The query API refuses `times` connections for the queries `when(url)` selects (below the retry layer)."""
+    import urllib.error
+    seen = {"refused": 0}
+    world_fetch = ctx.world.fetch
+
+    def fetch(url):
+        if seen["refused"] < times and when(urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)):
+            seen["refused"] += 1
+            raise urllib.error.URLError("connection refused")
+        return world_fetch(url)
+    ctx.fetch = fetch
+    return seen
+
+
+def test_one_refused_observer_query_is_retried_and_the_retry_is_in_the_evidence(cal):
+    """Review 2026-11-10 F4 (observer half): one refused query at one poll (the port-forward restarting) stopped the
+    trial and with it the calibration. The read is retried; the journal's read-retried receipt and the evidence
+    query's own failed_attempts show that it was."""
+    ctx = cal()
+    live = _refuse(ctx, lambda q: _in_trial(ctx, "t005") and "node_cpu_seconds_total" in q["query"][0], 1)
+    _stop_after(ctx, "t005")
+    run(ctx)
+    r = json.load(open(os.path.join(ctx.dir, "trials", "t005", "result.json")))
+    assert live["refused"] == 1 and r["verdict"] in ("PASS", "FAIL") and "trial-stopped" not in events(ctx)
+    [retried] = [e["data"] for e in ctx.entries() if e["event"] == "read-retried"]
+    assert retried["observer"] == {"failed_attempts": 1, "by_category": {"connection": 1}}
+    assert retried["kubernetes"]["failed_attempts"] == 0
+    # an evidence query (the measurement window's queue series) that needed a second attempt says so itself
+    ctx = cal({"attempt": 2})
+    window = _refuse(ctx, lambda q: "c28_queue" in q["query"][0] and "timestamp(" not in q["query"][0]
+                     and int(q["end"][0]) - int(q["start"][0]) == 900, 2)
+    _stop_after(ctx, "t003")
+    run(ctx)
+    obs = json.load(open(os.path.join(ctx.dir, "trials", "t003", "observations.json")))
+    assert window["refused"] == 2 and obs["fixture_queue"]["failed_attempts"] == ["connection", "connection"]
+    assert "response" in obs["fixture_queue"] and "failed_attempts" not in obs["fixture_cpu_cores"]
+    assert json.load(open(os.path.join(ctx.dir, "trials", "t003", "result.json")))["incomplete"] == []
+    assert K.reduce_bundle(ctx.dir)["reproduced"]
+
+
+def test_an_observer_query_that_keeps_failing_is_still_a_missing_observation(cal):
+    ctx = cal()
+    seen = _refuse(ctx, lambda q: _in_trial(ctx, "t005") and "node_cpu_seconds_total" in q["query"][0], 10 ** 6)
+    out = run(ctx)
+    [stopped] = [e["data"] for e in ctx.entries() if e["event"] == "trial-stopped"]
+    assert stopped["trial"]["id"] == "t005" and stopped["category"] in ("incomplete", "stopped")
+    assert "required observation missing: steal" in stopped["reason"] and "(URLError)" in stopped["reason"]
+    assert out["verdict"] == "NOT READY" and seen["refused"] >= ctx.retry.attempts
+    retried = [e["data"] for e in ctx.entries() if e["event"] == "read-retried"]
+    assert sum(r["observer"]["failed_attempts"] for r in retried) == seen["refused"]
+    # the policy is the context's: with none, the first refusal is final
+    single = K.Context(ctx.record, ctx.kube, fetch=ctx.world.fetch, now=ctx.clock.now, sleep=ctx.clock.sleep,
+                       retry=C.NO_RETRY)
+    calls = []
+
+    def refused(url):
+        calls.append(url)
+        raise OSError("refused")
+    single.fetch = refused
+    assert "error" in K.query_range(single.fetch, single.con, "up", 0, 60) and len(calls) == 1
+
+
 def _bundle_bytes(ctx):
     out = {}
     for root, _, fs in os.walk(ctx.dir):
@@ -730,8 +914,10 @@ def test_plan_reports_the_uncapped_bound_the_enforced_budget_and_an_estimate_apa
     se = p["search"]
     assert "worst_case" not in se
     con = ctx.con["search"]
-    per_trial = con["settle_s"] + con["measure_s"] + con["job_slack_s"] + con["completion_grace_s"]
-    overhead = (len(con["replica_counts"]) + 4) * con["converge_timeout_s"] + 2 * ctx.con["work_selection"]["idle_s"]
+    past = K.history_offset_s(ctx.con)      # each after-reading and each idle proof waits this long to be history
+    per_trial = con["settle_s"] + con["measure_s"] + con["job_slack_s"] + con["completion_grace_s"] + past
+    overhead = (len(con["replica_counts"]) + 4) * con["converge_timeout_s"] + \
+        2 * (ctx.con["work_selection"]["idle_s"] + past)
     # the uncapped bound: exactly the numbers the former worst_case reported (1d54538)
     plateaus = 0
     for n in con["replica_counts"]:
@@ -765,7 +951,8 @@ def test_search_budget_estimate_is_capped_at_max_trials():
                       "rate_min_rps_per_replica": 1, "rate_max_rps_per_replica": 100, "initial_rps_per_replica": 2,
                       "bracket_factor": 1.1, "resolution": 0.01, "max_trials": 10, "deadline_utc": "x",
                       "job_slack_s": 120, "completion_grace_s": 45, "converge_timeout_s": 300},
-           "work_selection": {"values": [600, 900], "idle_s": 240, "settle_s": 60, "measure_s": 300}}
+           "work_selection": {"values": [600, 900], "idle_s": 240, "settle_s": 60, "measure_s": 300},
+           "observer": {"step_s": 15, "latency_offset_s": 30}}
     b = K.search_budget(con)
     assert b["estimated_duration"]["trials"] == 10 and b["attempt_budget"]["uncapped_bound_exceeds_max_trials"]
     assert b["uncapped_search_bound"]["trials"] > 10
@@ -1908,9 +2095,10 @@ def test_w4_a_served_writer_api_must_answer_with_a_list(cal, api, kind, answer):
     probs = K.writer_problems(ctx)
     api.get = real
     assert any("listing a served writer API failed" in p and "no list response" in p for p in probs), probs
-    # other callers keep the lenient list
+    # every other caller's list is strict too (review 2026-11-10 R2-16): no list answer is never "no objects"
     api.get = lambda path: None if path == missing else real(path)
-    assert ctx.kube.list(kind, None) == []
+    with pytest.raises(X.ReadFailed, match="no list response"):
+        ctx.kube.list(kind, None)
     api.get = real
 
 
@@ -2190,6 +2378,120 @@ def test_a_dispatch_that_does_not_reconcile_is_incomplete(cal):
     assert any("does not reconcile" in w for w in r["incomplete"])
 
 
+# The live rev-4 contract's timings: the retired selection pod's series is pruned in the middle of t003.
+LIVE_TIMING = {"work_selection.idle_s": 240, "work_selection.settle_s": 120, "work_selection.measure_s": 600,
+               "search.completion_grace_s": 75, "search.job_slack_s": 180, "search.poll_s": 60}
+
+
+def test_a_retired_endpoints_pruned_dispatch_series_is_not_a_counter_reset(cal):
+    """Review 2026-11-10 F1: with w1 selected, w1's selection pod leaves at the scale to 0, a new w1 pod serves t003,
+    and the ingress prunes the old pod's dispatch series 15 minutes after it left, inside t003. The reducer read
+    "present before, absent after" as a counter reset: t003 INCOMPLETE, the calibration halted, every time. The
+    endpoint is proven retired from the trial's dispatch span, contributes 0 and is listed as pruned."""
+    ctx = cal(dict(LIVE_TIMING))
+    ctx.world.cost_ms = {600: 2.2, 900: 2.73}              # w0 outside [2.5, 3.0]: w1 is selected
+    ctx.world.prune_retired_s = 900                        # fixture/endpoints.go retiredSeriesKeep
+    _stop_after(ctx, "t003")
+    run(ctx)
+    c, r = cert(ctx), _result(ctx, "t003")
+    assert c["work_selection"]["selected"] == "w1" and r["variant"] == "w1"
+    assert r["verdict"] in ("PASS", "FAIL") and r["incomplete"] == [], r["incomplete"]
+    obs = json.load(open(os.path.join(ctx.dir, "trials", "t003", "observations.json")))
+    old = sorted(p["metadata"]["name"] for p in json.load(open(os.path.join(
+        ctx.dir, "trials", "t002", "pods-begin.json")))["w1"])
+    new = sorted(p["metadata"]["name"] for p in json.load(open(os.path.join(
+        ctx.dir, "trials", "t003", "pods-begin.json")))["w1"])
+    series = lambda o: sorted(x["metric"]["endpoint_pod"] for x in o["response"]["data"]["result"])  # noqa: E731
+    assert old != new and series(obs["ingress_before"]["dispatched"]) == old       # still exported before the trial
+    assert series(obs["ingress_after"]["dispatched"]) == new                       # pruned during it
+    d = r["criteria"]["dispatch"]
+    assert sorted(d["pruned"]) == old and sorted(d["by_endpoint"]) == new
+    assert d["pruned"][old[0]]["before"] > 0 and d["total"] == r["criteria"]["ingress"]["received"]
+    assert set(obs["dispatch_span"]) == set(K.DISPATCH_SPAN)
+    assert all(q["start"] == obs["ingress_before"]["at"] and q["end"] == obs["ingress_after"]["at"]
+               for q in obs["dispatch_span"].values())
+    assert K.reduce_bundle(ctx.dir)["reproduced"]
+    # the same evidence without its dispatch span (every bundle recorded before this rule) keeps the old verdict
+    raw = _raw(ctx, "t003")
+    del raw["observations"]["dispatch_span"]
+    again = K.evaluate_trial(ctx.con, raw, K.trial_history(ctx.entries(), ctx.cal, ctx.dir, "t003"))
+    assert again["verdict"] == "INCOMPLETE" and "pruned" not in again["criteria"]["dispatch"]
+    assert again["incomplete"][0] == "a per-endpoint dispatch counter went backwards (an ingress restart or reset)"
+    assert again["criteria"]["dispatch"]["by_endpoint"][old[0]] < 0
+
+
+def _span(start, end, dispatched, members, scrape_gap=None, step=15):
+    """A dispatch span from `start` to `end`: per endpoint its dispatch samples {pod: fn(t) -> value | None}, the
+    membership series of `members` {pod: fn(t) -> bool} and the one ingress pod's scrape timestamps."""
+    grid = [t for t in range(start, end + 1, step)]
+
+    def doc(result):
+        return {"start": start, "end": end, "step": step, "response": {"status": "success", "data": {
+            "resultType": "matrix", "result": [r for r in result if r["values"]]}}}
+    scr = [[t, str(t - 5)] for t in grid if not (scrape_gap and scrape_gap[0] <= t <= scrape_gap[1])]
+    return {"dispatched": doc([{"metric": {"endpoint_pod": k}, "values": [[t, str(f(t))] for t in grid
+                                                                           if f(t) is not None]}
+                               for k, f in sorted(dispatched.items())]),
+            "endpoints": doc([{"metric": {"endpoint_pod": k}, "values": [[t, str(t - 5)] for t in grid if f(t)]}
+                              for k, f in sorted(members.items())]),
+            "scrape_timestamp": doc([{"metric": {"pod": "ing-1"}, "values": scr}])}
+
+
+def test_a_vanished_dispatch_series_counts_zero_only_when_its_endpoint_is_proven_retired():
+    """Codex on F1: not every vanished foreign series is a zero contribution. The endpoint must be outside the trial's
+    pods, never in the discovered endpoint set during the trial, and its counter must not have moved after the
+    before-reading; the aggregate identity stays required; anything unproven stays INCOMPLETE."""
+    con = CW.contract("/nonexistent")
+    t0, t1, gone = 10_005, 11_505, 10_605                   # the old pod's series is pruned 10 minutes into the trial
+    before = _reading(t0, {"old": 5762}, None)
+    after = _reading(t1, {"new": 19201}, None)
+    flat = lambda t: 5762 if t < gone else None             # noqa: E731
+    cur = {"new": lambda t: 19201}
+    is_new = {"new": lambda t: True}
+
+    def judge(span, expected=("new",), received=19201.0, ingress="ing-1"):
+        obs = {"ingress_before": before, "ingress_after": after}
+        if span is not None:
+            obs["dispatch_span"] = span
+        return K.dispatch_counts(con, obs, list(expected), received, None, ingress)
+    why, d = judge(_span(t0, t1, dict(cur, old=flat), is_new))
+    assert why == [] and d["by_endpoint"] == {"new": 19201.0} and d["total"] == 19201
+    assert d["pruned"] == {"old": {"before": 5762.0, "samples": 40, "last_sample": 10_590}}
+    # proven retired, but the aggregate identity is still required
+    why, _ = judge(_span(t0, t1, dict(cur, old=flat), is_new), received=19202.0)
+    assert len(why) == 1 and "does not reconcile" in why[0]
+    for name, span, expected, reason in (
+            ("no span (an older bundle)", None, ("new",), None),
+            ("its counter moved after the before-reading",
+             _span(t0, t1, dict(cur, old=lambda t: (5762 if t < t0 + 60 else 5770) if t < gone else None), is_new),
+             ("new",), "its dispatch counter moved after the before-reading"),
+            ("it was an endpoint during the trial",
+             _span(t0, t1, dict(cur, old=flat), dict(is_new, old=lambda t: t0 + 300 <= t <= t0 + 330)), ("new",),
+             "it was in the ingress's endpoint set during the trial"),
+            ("it is one of the trial's pods", _span(t0, t1, dict(cur, old=flat), is_new), ("new", "old"),
+             "it is one of the trial's fixture pods"),
+            ("the ingress's scrapes do not cover the span",
+             _span(t0, t1, dict(cur, old=flat), is_new, scrape_gap=(t0 + 600, t0 + 660)), ("new",),
+             "the ingress's scrapes do not cover the span"),
+            ("its samples start late",
+             _span(t0, t1, dict(cur, old=lambda t: flat(t) if t >= t0 + 60 else None), is_new), ("new",),
+             "not recorded without a gap from the before-reading on"),
+            ("the span is another interval", _span(t0 + 15, t1, dict(cur, old=flat), is_new), ("new",),
+             "no dispatch span is recorded from the before-reading to the after-reading")):
+        why, d = judge(span, expected)
+        assert "pruned" not in d and d["by_endpoint"]["old"] == -5762, name
+        assert why[0] == "a per-endpoint dispatch counter went backwards (an ingress restart or reset)", name
+        assert any("does not reconcile" in w for w in why), name
+        if reason is None:
+            assert len(why) == 2, why                       # exactly the reasons recorded before this rule
+        else:
+            assert any("is not proven retired" in w and reason in w for w in why), (name, why)
+    # a series of the trial's own pod that decreases while present on both sides is still a reset
+    why, _ = K.dispatch_counts(con, {"ingress_before": _reading(t0, {"new": 50}, None),
+                                     "ingress_after": _reading(t1, {"new": 20}, None)}, ["new"], -30.0, None, "ing-1")
+    assert "a per-endpoint dispatch counter went backwards (an ingress restart or reset)" in why
+
+
 def test_discovery_verdict_is_pure_and_judges_every_evaluation():
     con = CW.contract("/nonexistent")
     step = con["observer"]["step_s"]
@@ -2243,9 +2545,17 @@ def _no_ready_values(raw, side):
 
 def _con_v2(con):
     """The same contract as v2 (observer.discovery without no_ready): the pre-v3 dispatch identity."""
-    old = copy.deepcopy(con)
+    old = _con_v3(con)
     old["schema"] = CW.V2
     old["observer"]["discovery"].pop("no_ready")
+    return old
+
+
+def _con_v3(con):
+    """The same contract as v3 (no observer.latency_offset_s): quiet readings by equal values, as before v4."""
+    old = copy.deepcopy(con)
+    old["schema"] = CW.V3
+    old["observer"].pop("latency_offset_s", None)
     return old
 
 
@@ -2299,6 +2609,7 @@ def _reading(at, dispatched, no_ready, step=15):
         return {"start": grid[0], "end": at, "step": step, "response": {"status": "success", "data": {
             "resultType": "matrix", "result": result}}}
     return {"at": at,
+            "raw": doc([{"metric": {"pod": "ing-1"}, "values": [[t, str(t - 5)] for t in grid]}]),
             "up": doc([{"metric": {"pod": "ing-1"}, "values": [[t, "1"] for t in grid]}]),
             "dispatched": doc([{"metric": {"endpoint_pod": k}, "values": [[t, str(v)] for t in grid]}
                                for k, v in sorted(dispatched.items())]),
@@ -2431,7 +2742,7 @@ def test_v3_validation_requires_the_no_ready_query(cal):
     ctx = cal()
     path = K.record_contract_path(ctx.record)
     con = json.load(open(path))
-    assert con["schema"] == K.CONTRACT_SCHEMA == "c28-calibration-contract/v3"
+    assert con["schema"] == K.CONTRACT_SCHEMA == "c28-calibration-contract/v4"
     cases = [(lambda c: c["observer"]["discovery"].pop("no_ready"), "observer.discovery must be exactly"),
              (lambda c: c["observer"]["discovery"].update(
                  no_ready='sum(c28_ingress_no_ready_endpoints_total{namespace="__NAMESPACE__"})'), "using __TARGET__"),
@@ -2441,8 +2752,9 @@ def test_v3_validation_requires_the_no_ready_query(cal):
              (lambda c: c["observer"]["discovery"].update(
                  no_ready='sum by (pod) (c28_ingress_no_ready_endpoints_total{target="__TARGET__"})'),
               "one series per target"),
-             # a v2 contract carries exactly the v2 discovery queries
-             (lambda c: c.update(schema=CW.V2), "observer.discovery must be exactly")]
+             # a v2 contract carries exactly the v2 discovery queries (and no latency offset)
+             (lambda c: (c.update(schema=CW.V2), c["observer"].pop("latency_offset_s")),
+              "observer.discovery must be exactly")]
     for mutate, msg in cases:
         bad = copy.deepcopy(con)
         mutate(bad)
@@ -2526,3 +2838,308 @@ def test_executor_liveness_is_unknown_when_its_process_cannot_be_inspected(cal, 
     finally:
         os.unlink(path)
     assert live["alive"] is None and "cannot be inspected" in live["why"]
+
+
+# --- review 2026-11-10 F3: readings in time (contract v4) -------------------------------------------------------------
+
+def test_the_world_can_substitute_the_tail_of_a_query_as_victoriametrics_does():
+    """The mode the F3 tests run in: at a 15 s step the last two points of a query that ends "now" repeat the
+    third-last (every point newer than now - 30 s takes the last value at or before it)."""
+    now = 1_794_300_000
+    grid = list(range(now - 60, now + 1, 15))
+    assert [v for _, v in CW.tail_copied([[t, t - now] for t in grid], now, 30)] == [-60, -45, -30, -30, -30]
+    assert CW.tail_copied([[now - 15, 1], [now, 2]], now, 30) == []           # nothing real to repeat
+    assert CW.tail_copied([[t, 7] for t in grid], now + 300, 30) == [[t, 7] for t in grid]     # history is untouched
+
+
+def _counter_doc(at, values, step=15):
+    grid = list(range(at - 4 * step, at + 1, step))
+    return {"start": grid[0], "end": at, "step": step, "response": {"status": "success", "data": {
+        "resultType": "matrix", "result": [{"metric": {"pod": "ing-1"}, "values": [[t, str(v)] for t, v in zip(
+            grid, values)]}] if values is not None else []}}}
+
+
+def test_a_quiet_counter_needs_three_distinct_raw_observations_not_three_equal_points():
+    """Review 2026-11-10 F3, consequence 1: "three or more fresh, equal samples" compared one real sample with two
+    substituted copies of itself, so a counter that was still moving read as quiet. Under contract v4 the proof is
+    three DISTINCT raw observations (the reading's raw scrape timestamps) with the counter equal across them."""
+    con = CW.contract("/nonexistent")
+    at = 1_794_300_000
+    grid = list(range(at - 60, at + 1, 15))
+    up = _counter_doc(at, [1] * 5)
+    moving = [19000, 19045, 19090, 19135, 19180]                       # 45 arrivals every 15 s: NOT quiet
+    as_answered = [float(v) for _, v in CW.tail_copied(list(zip(grid, moving)), at, 30)]
+    assert as_answered == [19000, 19045, 19090, 19090, 19090]          # what the query API answers at `at`
+    raw_true = _counter_doc(at, [t - 5 for t in grid])
+    raw_answered = _counter_doc(at, [v for _, v in CW.tail_copied([[t, t - 5] for t in grid], at, 30)])
+    # the v3 rule (no raw observations) is fooled by the substituted tail, exactly as the review showed
+    assert K.quiet_value(_counter_doc(at, as_answered), at, _con_v3(con), up, strict=True) == (19090.0, "")
+    # v4: the same answer is three distinct observations (the copies add none) over which the counter moves
+    v, why = K.quiet_value(_counter_doc(at, as_answered), at, con, up, strict=True, raw=raw_answered)
+    assert v is None and why == "the counter is still moving (not quiet)"
+    assert K.quiet_value(_counter_doc(at, moving), at, con, up, strict=True, raw=raw_true)[1] == \
+        "the counter is still moving (not quiet)"
+    # a counter that is really quiet passes, also when one evaluation repeats a sample (a late scrape)
+    quiet = _counter_doc(at, [19180] * 5)
+    assert K.quiet_value(quiet, at, con, up, strict=True, raw=raw_true) == (19180.0, "")
+    late = _counter_doc(at, [grid[0] - 5, grid[1] - 5, grid[1] - 5, grid[3] - 5, grid[4] - 5])
+    assert K.quiet_value(quiet, at, con, up, strict=True, raw=late) == (19180.0, "")
+    # it moved before the three newest observations only: quiet now
+    settled = _counter_doc(at, [19000, 19180, 19180, 19180, 19180])
+    assert K.quiet_value(settled, at, con, up, strict=True, raw=raw_true) == (19180.0, "")
+    # equal values of fewer than three distinct observations prove nothing; nor does a reading without raw timestamps
+    copies = _counter_doc(at, [grid[0] - 5] * 3 + [grid[3] - 5] * 2)
+    v, why = K.quiet_value(quiet, at, con, up, strict=True, raw=copies)
+    assert v is None and "fewer than three distinct raw observations" in why
+    for raw, msg in (({}, "raw sample timestamps: the query failed"), (_counter_doc(at, None), "0 series"),
+                     (_counter_doc(at, [t + 60 for t in grid]), "timestamped in the future"),
+                     (_counter_doc(at, [t - 200 for t in grid]), "the newest raw observation is stale")):
+        v, why = K.quiet_value(quiet, at, con, up, strict=True, raw=raw)
+        assert v is None and msg in why, (msg, why)
+    # an absent counter reads 0 only with the same three observations of the ingress
+    assert K.quiet_value(_counter_doc(at, None), at, con, up, strict=True, raw=raw_true) == (0.0, "")
+    assert K.quiet_value(_counter_doc(at, None), at, con, up, strict=True, raw=copies)[0] is None
+    assert K.raw_observations(raw_true, at, con)[0]["used"] == [grid[2] - 5, grid[3] - 5, grid[4] - 5]
+    assert K.reading_raw(_con_v3(con), {"raw": raw_true}) is None and K.reading_raw(con, {}) == {}
+
+
+def test_a_live_gate_judges_the_newest_raw_sample_and_says_which():
+    """Review 2026-11-10 F3, consequence 2: the live freshness gates saw every raw sample one latency offset older
+    than it was, so the effective tolerance was max_staleness_s - 30: no missed scrape at all for a 30 s source. A
+    live gate takes the newest raw sample in the answer as the instant it judges and allows latency_offset_s +
+    max_staleness_s to the query time."""
+    con = CW.contract("/nonexistent")
+    at = 1_794_300_000
+    grid = list(range(at - 60, at + 1, 15))
+
+    def answered(scrapes):
+        """A timestamp() query at `at` over a source scraped at `scrapes`, with the substituted tail."""
+        pts = [[t, max(s for s in scrapes if s <= t)] for t in grid]
+        return {"response": {"data": {"result": [{"metric": {"pod": "p"}, "values": [
+            [t, str(v)] for t, v in CW.tail_copied(pts, at, 30)]}]}}}
+    healthy = [at - 300 + 30 * i - 3.5 for i in range(12)]              # a 30 s cAdvisor cadence, newest 3.5 s old
+    why, d = K.live_freshness(con, answered(healthy), ["p"], "pod", at)
+    assert why == "" and d == {"p": {"judged_at": at - 33.5, "age_s": 33.5}}      # the instant it could judge
+    missed = [s for i, s in enumerate(healthy) if i != 9]               # ONE missed scrape: still a healthy source
+    why, d = K.live_freshness(con, answered(missed), ["p"], "pod", at)
+    assert why == "" and d["p"]["age_s"] == 63.5
+    # the rule the live gates used before stopped the trial here ("a raw sample 64 s old"), with a scrape 3.5 s ago
+    assert "64 s old" in K.raw_freshness(con, answered(missed), ["p"], "pod", at - 60, at)[0]
+    dead = [s for s in healthy if s < at - 120]                         # the scrapes stopped two minutes ago
+    why, d = K.live_freshness(con, answered(dead), ["p"], "pod", at)
+    assert "the newest raw sample (" in why and "is 124 s old at the gate" in why and "allowed 90 s" in why
+    assert d["p"]["judged_at"] == at - 123.5
+    assert "no raw samples for ['q']" in K.live_freshness(con, answered(healthy), ["p", "q"], "pod", at)[0]
+    assert "unexpected sources ['p']" in K.live_freshness(con, answered(healthy), [], "pod", at)[0] or \
+        K.live_freshness(con, answered(healthy), [], "pod", at)[0] == "no expected source to check"
+    future = {"response": {"data": {"result": [{"metric": {"pod": "p"}, "values": [[at, str(at + 60)]]}]}}}
+    assert "in the future" in K.live_freshness(con, future, ["p"], "pod", at)[0]
+
+
+def test_f3_contract_v4_declares_the_latency_offset_and_bounds_grace_and_staleness(cal):
+    ctx = cal()
+    path = K.record_contract_path(ctx.record)
+    con = json.load(open(path))
+    assert con["schema"] == K.CONTRACT_SCHEMA and con["observer"]["latency_offset_s"] == 30
+    assert (K.latency_offset_s(con), K.history_offset_s(con)) == (30, 60)
+    cases = [(lambda c: c["observer"].pop("latency_offset_s"), "observer must be exactly"),
+             (lambda c: c["observer"].update(latency_offset_s=29), "never below the documented default 30 s"),
+             (lambda c: c["observer"].update(latency_offset_s=True), "observer.latency_offset_s must be"),
+             (lambda c: c["observer"].update(latency_offset_s=301), "observer.latency_offset_s must be"),
+             # the grace must cover the request timeout, the latency offset and two more scrapes: 2 + 30 + 30
+             (lambda c: c["search"].update(completion_grace_s=61), "search.completion_grace_s must be at least 62 s"),
+             (lambda c: (c["observer"].update(latency_offset_s=60), c["search"].update(completion_grace_s=91)),
+              "search.completion_grace_s must be at least 92 s"),
+             # one missed scrape of the slowest declared source must not be a stale source: 2 x 30 s
+             (lambda c: c["observer"].update(max_staleness_s=59), "observer.max_staleness_s must be at least 60 s"),
+             (lambda c: c["observer"].update(cpu_scrape_interval_s=60),
+              "observer.max_staleness_s must be at least 120"),
+             # a v3 contract has no latency offset; a v4 contract is not a v3 one
+             (lambda c: c.update(schema=CW.V3), "observer must be exactly")]
+    for mutate, msg in cases:
+        bad = copy.deepcopy(con)
+        mutate(bad)
+        open(path, "w").write(json.dumps(bad))
+        with pytest.raises(X.StagingError, match=msg):
+            K.load_contract(ctx.record, ctx.params)
+    for ok in (lambda c: c["search"].update(completion_grace_s=62),
+               lambda c: c["observer"].update(cpu_scrape_interval_s=15, max_staleness_s=30),
+               lambda c: (c["observer"].update(latency_offset_s=60), c["search"].update(completion_grace_s=92))):
+        good = copy.deepcopy(con)
+        ok(good)
+        open(path, "w").write(json.dumps(good))
+        K.load_contract(ctx.record, ctx.params)
+    # a v3 contract keeps its own validation (a grace of 45 s was valid) and stays loadable for status and verify
+    old = _con_v3(con)
+    old["search"]["completion_grace_s"] = 45
+    open(path, "w").write(json.dumps(old))
+    assert K.load_contract(ctx.record, ctx.params)[0]["schema"] == CW.V3
+
+
+def _all_trials(ctx):
+    return sorted(os.listdir(os.path.join(ctx.dir, "trials")))
+
+
+def test_with_a_substituted_tail_every_completeness_reading_is_history_and_the_gates_say_what_they_judged(cal):
+    """Review 2026-11-10 F3 end to end, on a query API that substitutes its tail as VictoriaMetrics does: the
+    calibration is READY; every completeness reading ended at least latency_offset_s + 2 steps before it was asked
+    and rests on three distinct raw observations; the after-reading is still at least the completion grace after the
+    Job completed; and each trial records what instant every live gate judged."""
+    ctx = cal()
+    ctx.world.tail_copy_s = 30
+    asked = []
+    world_fetch = ctx.world.fetch
+
+    def fetch(url):
+        q = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+        asked.append(((q["query"][0], int(q["start"][0]), int(q["end"][0])), ctx.clock.now()))
+        return world_fetch(url)
+    ctx.fetch = fetch
+    out = run(ctx)
+    assert out["verdict"] == "READY", cert(ctx)["reasons"]
+    past, grace = K.history_offset_s(ctx.con), ctx.con["search"]["completion_grace_s"]
+    when = dict(asked)                                   # the LAST time each exact query was asked: the recorded one
+
+    def age(q):
+        """How long after its own end a recorded evidence query was asked."""
+        return when[(q["query"], q["start"], q["end"])] - q["end"]
+    for t in _all_trials(ctx):
+        base = os.path.join(ctx.dir, "trials", t)
+        obs, r = json.load(open(os.path.join(base, "observations.json"))), _result(ctx, t)
+        pod = json.load(open(os.path.join(base, "generator-pod.json")))
+        finished = K._utc(pod["status"]["containerStatuses"][0]["state"]["terminated"]["finishedAt"])
+        assert obs["ingress_after"]["at"] >= finished + grace, t
+        readings = ["ingress_before", "ingress_after"] + (["ingress_idle_start"] if r["kind"] == "selection" else [])
+        recorded = [q for name in readings for q in obs[name].values() if isinstance(q, dict)] + \
+            list(obs["dispatch_span"].values()) + list(obs["discovery_window"].values()) + \
+            [q for name, q in obs.items() if isinstance(q, dict) and "query" in q]
+        assert len(recorded) > 25 and all(age(q) >= past for q in recorded), (t, sorted(age(q) for q in recorded)[:3])
+        assert all(obs[name]["raw"]["end"] == obs[name]["at"] for name in readings)
+        for side in ("before", "after"):
+            used = r["criteria"]["ingress_readings"][side]
+            assert used["at"] == obs[f"ingress_{side}"]["at"] and len(set(used["raw_timestamps"])) == 3
+            assert all(ts <= used["at"] for ts in used["raw_timestamps"])
+        gates = json.load(open(os.path.join(base, "gates.json")))
+        assert [g["phase"] for g in gates][0] == "before" and gates[-1]["phase"] == "final"
+        assert {"poll", "final"} <= {g["phase"] for g in gates}
+        for g in gates:
+            assert {"steal", "ingress_metrics", "ingress_cpu", "fixture_metrics", "fixture_cpu", "discovery"} <= \
+                set(g["judged"]), (t, g)
+            for source, judged in g["judged"].items():
+                assert judged and all(0 <= j["age_s"] <= 90 and j["judged_at"] <= g["at"] for j in judged.values())
+        assert any("generator_cpu" in g["judged"] for g in gates), t
+    assert any(now - key[2] < 30 for key, now in asked)         # the live gates did query up to the present
+    assert K.reduce_bundle(ctx.dir)["reproduced"]
+    v = K.verify(ctx)
+    assert v["state"] == "closed"
+
+
+def test_a_counter_still_moving_after_the_job_is_not_quiet_even_on_a_substituted_tail(cal):
+    ctx = cal()
+    ctx.world.tail_copy_s = 30
+
+    def drift(world, api_):
+        job = api_.objects.get(("jobs", "demo", K.job_name(ctx.cal, 3)))
+        if job and (job.get("status") or {}).get("succeeded") and ctx.nm["variants"][0] not in world.drift:
+            world.drift[ctx.nm["variants"][0]] = (ctx.clock.now(), 3)     # 45 stray arrivals per 15 s from now on
+    ctx.world.hooks.append(drift)
+    out = run(ctx)
+    r = _result(ctx, "t003")
+    assert out["verdict"] == "NOT READY" and r["verdict"] == "INCOMPLETE"
+    assert "ingress requests after the trial: the counter is still moving (not quiet)" in r["incomplete"]
+    assert r["criteria"]["ingress"] == {}                            # nothing was read from a moving counter
+
+
+def test_v3_evidence_keeps_its_own_quiet_rule_and_a_v3_contract_is_read_only(cal, api, monkeypatch):
+    """A v3 contract (the calibration running when v4 was written) loads for status, verify, stop and recover; plan
+    and apply refuse it; a bundle recorded under v3 (readings without raw timestamps) reduces under the v3 rule."""
+    v3 = cal(contract_over={"schema": CW.V3, "search.completion_grace_s": 45})
+    assert v3.con["schema"] == CW.V3 and not K.v4(v3.con) and K.latency_offset_s(v3.con) == 30
+    p = K.plan(v3)
+    assert any("is read-only" in x and "distinct raw observations" in x for x in p["problems"]), p["problems"]
+    plan, digest = CW.reviewed(v3)
+    with pytest.raises(X.StagingError, match="is read-only"):
+        K.apply(v3, plan, digest)
+    assert live_calibration_objects(api, v3.cal) == []
+    monkeypatch.setattr(K, "CONTRACT_SCHEMA", CW.V3)             # an executor for which v3 is the current schema
+    _stop_after(v3, "t004")
+    run(v3)
+    monkeypatch.undo()
+    obs = json.load(open(os.path.join(v3.dir, "trials", "t003", "observations.json")))
+    r = _result(v3, "t003")
+    assert "raw" not in obs["ingress_after"] and "ingress_readings" not in r["criteria"]
+    assert r["verdict"] in ("PASS", "FAIL") and r["incomplete"] == []
+    again = CW.context(v3.record, api)                           # today's executor reads the v3 record
+    v = K.verify(again)
+    assert v["state"] == "closed" and v["bundle"]["reproduced"] and K.status(again)["state"] == "closed"
+    # the same raw evidence judged as v4 lacks its raw observations: never silently accepted
+    v4_con = copy.deepcopy(v3.con)
+    v4_con["observer"]["latency_offset_s"] = 30
+    assert any("raw sample timestamps" in w for w in K.evaluate_trial(v4_con, _raw(v3, "t003"))["incomplete"])
+
+
+# --- the environment record -------------------------------------------------------------------------------------------
+
+def _node_info(api, name, **over):
+    info = {"kernelVersion": "6.8.0-45-generic", "osImage": "Ubuntu 24.04.1 LTS",
+            "containerRuntimeVersion": "containerd://2.0.0", "kubeletVersion": "v1.35.5+rke2r1",
+            "bootID": f"boot-{name}", "machineID": f"machine-{name}", "architecture": "amd64"}
+    info.update(over)
+    api.obj("Node", name)["status"]["nodeInfo"] = info
+    return {k: info[k] for k in K.ENVIRONMENT_FIELDS}
+
+
+def test_the_environment_is_recorded_in_plan_begin_and_certificate_and_never_gated(cal, api):
+    """A calibration is bound to the environment it measured: per reserved node its name, UID, kernel, OS image,
+    container runtime, kubelet, boot ID and machine ID, in the reviewed plan, at apply's start and in the
+    certificate; status and verify print it. It is not a gate, except that a change between review and apply
+    refuses, field by field."""
+    ctx = cal()
+    w, s = _node_info(api, "worker-w"), _node_info(api, "worker-s", kernelVersion="6.8.0-48-generic")
+    want = {"workload": {"name": "worker-w", "uid": W_UID, **w}, "support": {"name": "worker-s", "uid": PF.S_UID, **s}}
+    plan, digest = CW.reviewed(ctx)
+    assert plan["environment"] == want and plan["problems"] == []
+    assert K.status(ctx)["environment"] is None                         # nothing begun yet
+    # the support node reboots between the review and apply: said by name, nothing is created
+    api.obj("Node", "worker-s")["status"]["nodeInfo"]["bootID"] = "boot-after-reboot"
+    with pytest.raises(X.StagingError, match="the environment changed after review") as e:
+        K.apply(ctx, plan, digest)
+    assert "support node bootID: 'boot-worker-s' -> 'boot-after-reboot'" in str(e.value)
+    assert live_calibration_objects(api, ctx.cal) == [] and "calibration-begin" not in events(ctx)
+    api.obj("Node", "worker-s")["status"]["nodeInfo"]["bootID"] = "boot-worker-s"
+    real_sleep = ctx.clock.sleep
+
+    def sleep(sec):
+        if any(k == "jobs" and n.endswith("t002") for (k, _, n) in api.objects):
+            raise Crash()
+        real_sleep(sec)
+    ctx.sleep = sleep
+    with pytest.raises(Crash):
+        K.apply(ctx, plan, digest)
+    ctx.sleep = real_sleep
+    begin = [e["data"] for e in ctx.entries() if e["event"] == "calibration-begin"][0]
+    assert begin["environment"] == want and K.status(ctx)["environment"] == want
+    # an open calibration: verify reports the recorded and the live environment; a difference is not a stop
+    api.obj("Node", "worker-w")["status"]["nodeInfo"]["kubeletVersion"] = "v1.35.6+rke2r1"
+    v = K.verify(ctx)
+    assert v["result"] == "OK", v["stops"]
+    assert v["environment"]["recorded"] == want and v["environment"]["live"]["workload"]["kubeletVersion"] == \
+        "v1.35.6+rke2r1"
+    assert v["environment"]["changed"] == ["workload node kubeletVersion: 'v1.35.5+rke2r1' -> 'v1.35.6+rke2r1'"]
+    sp, sd = CW.reviewed(ctx, K.plan_stop, K.STOP, "stop-plan")
+    K.stop(ctx, sp, sd)
+    c = cert(ctx)
+    assert c["environment"] == want                                     # as recorded at apply's start
+    out = K.reduce_bundle(ctx.dir)
+    assert out["reproduced"] and out["environment"] == want and K.verify(ctx)["environment"] == want
+    # the certificate's environment is bound to the journal: a different one does not reduce
+    c["environment"]["workload"]["kernelVersion"] = "other"
+    assert K.environment_changes(want, c["environment"]) == [
+        "workload node kernelVersion: '6.8.0-45-generic' -> 'other'"]
+
+
+def test_a_node_without_node_info_is_recorded_with_empty_fields(cal, api):
+    ctx = cal()
+    env = K.plan(ctx)["environment"]
+    assert env["workload"] == {"name": "worker-w", "uid": W_UID, **{k: None for k in K.ENVIRONMENT_FIELDS}}
+    assert K.environment_changes(env, env) == [] and K.environment_changes(None, env)

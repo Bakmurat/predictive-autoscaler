@@ -8,11 +8,16 @@ Every helper (inventory, archive, sanitize-render, legacy; reserve, prepare, fre
   * the API: an explicit, injectable Kubernetes client. KubectlApi runs `kubectl --kubeconfig <path> --context <ctx>
     get|replace|create|delete --raw` (never a default kubeconfig, a 30 s request timeout, errors fail closed); tests
     use a fake with the same five methods. require_cluster() re-reads the kube-system namespace UID before every
-    mutation.
+    mutation. A failed READ (get) is retried a bounded number of times (READ_RETRY: three attempts over 20 s), every
+    failed attempt kept as a fixed category for the caller's journal; a mutation is NEVER retried. RetryingFetch
+    gives a helper's query-API reads the same policy.
   * PLANS and RECEIPTS: a plan is a canonical JSON document whose sha256 (plan_digest) the reviewer approves; a
     mutation runs only with `--plan-digest <that digest>` and only while the plan file still has it
     (require_reviewed). Evidence files are written once (write_once refuses to overwrite); receipts are appended to a
-    hash-chained JSON-lines log (append_receipt), never rewritten.
+    hash-chained JSON-lines log (append_receipt), never rewritten. A log whose LAST line is a torn append (its writer
+    was killed inside the write) is refused by every mutating reader (read_receipts raises TornReceipt) until a
+    recovery that has proven the owner ended sets the torn bytes aside (set_aside_torn_tail: copied into the
+    evidence, never deleted); a read-only status may read past it (scan_receipts) and must report it.
   * LOCKS and INTENTS (stable interface, shared with part 2): exclusive_lock(rec, scope) is the ONE mutation lock
     of a cluster and resource scope in the mandatory shared lock_dir, recording host, boot, PID and process start;
     mutation_step() writes intent-<n> before and step-<n> after each mutation; a recovery uses recovery_guard(rec,
@@ -37,6 +42,8 @@ import json
 import os
 import re
 import subprocess
+import time
+import urllib.error
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
 RECORD_SCHEMA = "c28-preparation/v1"
@@ -185,13 +192,48 @@ def _classify(stderr: str) -> Optional[int]:
     return None
 
 
-class KubectlApi:
-    """Raw API access through kubectl with an explicit kubeconfig and context. get() returns None for 404."""
+# What kubectl prints for an HTTP 404 from the API server. Only this makes a read "absent": the words "not found"
+# also occur in client-side failures (a missing host, context, binary or file), which are failed reads.
+_SERVER_NOT_FOUND = re.compile(r"Error from server \(NotFound\)")
 
-    def __init__(self, kubeconfig: Mapping, run: Callable = subprocess.run, timeout: str = "30s"):
+
+class RetryPolicy:
+    """How an idempotent READ is retried: `delays` are the waits, in seconds, before the second, third, ... attempt
+    (so attempts = len(delays) + 1). Writes have no policy: a mutation is attempted once."""
+
+    def __init__(self, delays: Sequence[float]):
+        self.delays = tuple(delays)
+
+    attempts = property(lambda self: len(self.delays) + 1)
+
+
+# Three attempts spread over 20 s: long enough to outlast a port-forward or proxy restart (seconds), short against
+# a poll interval. One failed kubectl read or observer query no longer decides anything on its own.
+READ_RETRY = RetryPolicy((5, 15))
+NO_RETRY = RetryPolicy(())
+RETRIED_STATUS = (None, 429, 500, 504)      # worth another attempt; a refusal (400/401/403/409/422) is an answer
+FAILURES_KEPT = 500                         # failed attempts remembered until the caller journals them
+
+
+def _note_failure(log: List[Dict], entry: Dict) -> None:
+    log.append(entry)
+    del log[:-FAILURES_KEPT]
+
+
+class KubectlApi:
+    """Raw API access through kubectl with an explicit kubeconfig and context. get() returns None for 404 (only the
+    API server's own NotFound answer; whether a None for a COLLECTION path is believable is the caller's decision, and
+    execlib.Kube.list never believes it) and retries
+    a failed read per `retry` (timeout, throttling, server or unclassified error, an unparsable answer; never a
+    refusal); read_failures keeps every failed attempt as {path, attempt, category} (a fixed category, never kubectl's
+    text) until the caller journals and clears it. replace, create and delete are attempted exactly once."""
+
+    def __init__(self, kubeconfig: Mapping, run: Callable = subprocess.run, timeout: str = "30s",
+                 retry: RetryPolicy = READ_RETRY, sleep: Callable[[float], None] = time.sleep):
         self.base = ["kubectl", "--kubeconfig", kubeconfig["path"], "--context", kubeconfig["context"],
                      f"--request-timeout={timeout}"]
-        self.run = run
+        self.run, self.retry, self.sleep = run, retry, sleep
+        self.read_failures: List[Dict] = []
 
     def _call(self, verb: str, path: str, body: Optional[Mapping] = None) -> Optional[Dict]:
         args = self.base + [verb, "--raw", path]
@@ -203,6 +245,8 @@ class KubectlApi:
         if p.returncode != 0:
             # Never echo kubectl's stderr (it can quote a request body or a credential): classify it.
             status = _classify(p.stderr or "")
+            if status == 404 and verb == "get" and not _SERVER_NOT_FOUND.search(p.stderr or ""):
+                status = None                    # "not found" without the server's NotFound: no answer, not absence
             if status == 404:
                 if verb == "get":
                     return None
@@ -212,7 +256,17 @@ class KubectlApi:
         return json.loads(out) if out else {}
 
     def get(self, path: str) -> Optional[Dict]:
-        return self._call("get", path)
+        for attempt in range(1, self.retry.attempts + 1):
+            try:
+                return self._call("get", path)
+            except ApiError as e:
+                err, category = e, _STATUS.get(e.status, "error")
+            except ValueError:                   # a cut or garbled answer: no object was read
+                err, category = ApiError(f"get {path}: failed (malformed answer)"), "malformed"
+            _note_failure(self.read_failures, {"path": path, "attempt": attempt, "category": category})
+            if err.status not in RETRIED_STATUS or attempt == self.retry.attempts:
+                raise err
+            self.sleep(self.retry.delays[attempt - 1])
 
     def replace(self, path: str, body: Mapping) -> Dict:
         """PUT: the body carries metadata.resourceVersion, so a concurrent change is refused (409)."""
@@ -227,6 +281,43 @@ class KubectlApi:
             pre["resourceVersion"] = resource_version
         return self._call("delete", path, {"kind": "DeleteOptions", "apiVersion": "v1", "preconditions": pre,
                                            "propagationPolicy": "Background"})
+
+
+def fetch_category(e: BaseException) -> str:
+    """The fixed category of a failed query-API read (never the exception's text, which can carry a URL)."""
+    if isinstance(e, urllib.error.HTTPError):
+        return f"http-{int(e.code)}"
+    if isinstance(e, TimeoutError):
+        return "timeout"
+    if isinstance(e, OSError):                   # URLError, a refused or reset connection
+        return "connection"
+    return "malformed" if isinstance(e, ValueError) else "error"
+
+
+class RetryingFetch:
+    """fetch(url) -> JSON document, with a RetryPolicy: a failed read (connection, timeout, HTTP 5xx/408/429, an
+    unparsable body) is tried again after the policy's delay; an HTTP 4xx is the API's answer and is not. The last
+    failure is raised unchanged. `last` holds the failed attempts of the newest call as fixed categories (the caller
+    records them beside the query), and every failed attempt is also appended to `failures` for the journal."""
+
+    def __init__(self, fetch: Callable[[str], Dict], retry: RetryPolicy = READ_RETRY,
+                 sleep: Callable[[float], None] = time.sleep, failures: Optional[List[Dict]] = None):
+        self.fetch, self.retry, self.sleep = fetch, retry, sleep
+        self.failures = failures if failures is not None else []
+        self.last: List[str] = []
+
+    def __call__(self, url: str) -> Dict:
+        self.last = []
+        for attempt in range(1, self.retry.attempts + 1):
+            try:
+                return self.fetch(url)
+            except Exception as e:      # noqa: BLE001 - classified, recorded, then retried or raised
+                self.last.append(fetch_category(e))
+                _note_failure(self.failures, {"attempt": attempt, "category": self.last[-1]})
+                refused = isinstance(e, urllib.error.HTTPError) and 400 <= e.code < 500 and e.code not in (408, 429)
+                if refused or attempt == self.retry.attempts:
+                    raise
+            self.sleep(self.retry.delays[attempt - 1])
 
 
 # Resource kinds the helpers read: name -> (API prefix, plural, namespaced).
@@ -359,20 +450,107 @@ def receipts_path(rec: Mapping, helper: str) -> str:
     return os.path.join(rec["evidence_dir"], "receipts", f"{helper}.jsonl")
 
 
-def read_receipts(path: str) -> List[Dict]:
-    """The receipts of a log, verifying its hash chain."""
+class TornReceipt(StagingError):
+    """The LAST line of a receipt log is not a finished append (its writer was killed inside the write, or is writing
+    it right now): `tail` says where (scan_receipts). Mutating commands refuse it; the helper's recover sets it
+    aside."""
+
+    def __init__(self, message: str, tail: Dict):
+        super().__init__(message)
+        self.tail = tail
+
+
+def scan_receipts(path: str) -> (List[Dict], Optional[Dict]):
+    """(the receipts of a log with its hash chain verified, its torn tail or None). append_receipt writes one line per
+    receipt, newline last, fsynced before its caller acts on it, so only the LAST line can be an unfinished append:
+      * partial: not a JSON object (cut inside the write, whatever follows it). It is not in the list;
+        {"state": "partial", "line", "byte_offset", "bytes", "sha256"} locates its bytes;
+      * unterminated: a complete receipt that continues the chain but lacks its newline (cut before the last byte). It
+        IS in the list (a complete receipt is never dropped); the tail says so, because an append would run into it.
+    Its writer never returned from that append, so nothing acted on the receipt. A line that is not a JSON object and
+    is NOT the last one is corruption, never a torn append: StagingError, like a broken chain."""
     out, prev = [], "0" * 64
     if not os.path.exists(path):
-        return out
-    with open(path) as fh:
-        for n, line in enumerate(fh, 1):
-            r = json.loads(line)
-            body = {k: v for k, v in r.items() if k != "sha256"}
-            if r.get("prev") != prev or digest(body) != r.get("sha256"):
-                raise StagingError(f"{path}: receipt {n} breaks the hash chain")
-            out.append(r)
-            prev = r["sha256"]
+        return out, None
+    with open(path, "rb") as fh:
+        data = fh.read()
+    lines = data.split(b"\n")
+    terminated = lines[-1] == b""
+    if terminated:
+        lines.pop()
+    offset = 0
+    for n, raw in enumerate(lines, 1):
+        last = n == len(lines)
+        try:
+            r = json.loads(raw.decode())
+        except ValueError:
+            r = None
+        if not isinstance(r, dict):
+            if not last:
+                raise StagingError(f"{path}: line {n} (byte {offset}) is not a receipt and is not the last line: the "
+                                   "log is corrupt (not a torn append)")
+            return out, {"state": "partial", "line": n, "byte_offset": offset, "bytes": len(data) - offset,
+                         "sha256": hashlib.sha256(data[offset:]).hexdigest()}
+        body = {k: v for k, v in r.items() if k != "sha256"}
+        if r.get("prev") != prev or digest(body) != r.get("sha256"):
+            raise StagingError(f"{path}: receipt {n} breaks the hash chain")
+        out.append(r)
+        prev = r["sha256"]
+        if last and not terminated:
+            return out, {"state": "unterminated", "line": n, "byte_offset": offset, "bytes": len(raw),
+                         "sha256": hashlib.sha256(raw).hexdigest()}
+        offset += len(raw) + 1
+    return out, None
+
+
+def read_receipts(path: str) -> List[Dict]:
+    """The receipts of a log, verifying its hash chain. A torn last line (scan_receipts) raises TornReceipt: nothing
+    may be appended after it and no mutation may build on a log whose end is unknown."""
+    out, tail = scan_receipts(path)
+    if tail is not None:
+        what = "is a torn append (not a complete receipt)" if tail["state"] == "partial" else \
+            "is a complete receipt without its line end (the append was cut before its last byte)"
+        raise TornReceipt(f"{path}: the last line ({tail['line']}, {tail['bytes']} bytes from byte "
+                          f"{tail['byte_offset']}) {what}: its writer was killed inside the write or is writing it "
+                          f"now. The {tail['line'] - 1} receipts before it verify and nothing acted on this one. "
+                          "Refusing: once the owning executor is proven ended, the helper's recover-plan / recover "
+                          "sets the torn bytes aside (status reads past them)", tail)
     return out
+
+
+def set_aside_torn_tail(rec: Mapping, helper: str, tail: Mapping, clock=None) -> Dict:
+    """Repair the torn end of a helper's log (scan_receipts) so it can be appended to again. ONLY for a recovery that
+    holds recovery_guard (the owning executor proven ended): a live journal is never touched. The tail must still be
+    exactly the reviewed one (state, offset, length, sha256) and the chain before it must verify (the scan). A partial
+    line's bytes are first copied, fsynced, to receipts/<helper>.jsonl.torn-<offset>-<sha12> (written once, never
+    deleted) and only then cut off the log; an unterminated receipt is kept and gets its missing newline. Either way a
+    journal-tail-repaired receipt records what was done. Returns that receipt."""
+    path = receipts_path(rec, helper)
+    _, now = scan_receipts(path)
+    if now is None or any(now.get(k) != tail.get(k) for k in ("state", "line", "byte_offset", "bytes", "sha256")):
+        raise StagingError(f"{path}: its end is no longer the reviewed torn tail; plan the recovery again")
+    saved = None
+    if now["state"] == "partial":
+        with open(path, "rb") as fh:
+            fh.seek(now["byte_offset"])
+            torn = fh.read()
+        saved = f"{path}.torn-{now['byte_offset']}-{now['sha256'][:12]}"
+        if not (os.path.exists(saved) and sha256_file(saved) == now["sha256"]):     # a repeated recovery reuses it
+            write_once(saved, torn)
+        with open(saved, "rb") as fh:
+            os.fsync(fh.fileno())
+        with open(path, "r+b") as fh:
+            fh.truncate(now["byte_offset"])
+            fh.flush()
+            os.fsync(fh.fileno())
+    else:
+        with open(path, "ab") as fh:
+            fh.write(b"\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+    return append_receipt(rec, helper, "journal-tail-repaired",
+                          {**{k: now[k] for k in ("state", "line", "byte_offset", "bytes", "sha256")},
+                           "saved": os.path.basename(saved) if saved else None}, clock)
 
 
 def append_receipt(rec: Mapping, helper: str, event: str, data: Mapping, clock=None,
@@ -689,7 +867,8 @@ def api_for(rec: Mapping, run: Callable = subprocess.run) -> KubectlApi:
     return KubectlApi(rec["kubeconfig"], run=run)
 
 
-__all__ = ["exclusive_lock", "lock_path", "mutation_step", "unresolved_intents", "owner_terminated", "process_start",
+__all__ = ["RetryPolicy", "READ_RETRY", "NO_RETRY", "RetryingFetch", "fetch_category",
+           "exclusive_lock", "lock_path", "mutation_step", "unresolved_intents", "owner_terminated", "process_start",
            "recovery_guard",
            "ApiError", "KINDS", "KubectlApi", "NotFound", "StagingError",
            "add_common_args",
@@ -697,4 +876,5 @@ __all__ = ["exclusive_lock", "lock_path", "mutation_step", "unresolved_intents",
            "append_receipt", "assert_clean", "canonical", "cluster_uid", "digest", "discover_groups", "kind_group",
            "list_items", "load_plan", "load_record", "make_plan", "path_of", "plan_digest", "read_receipts",
            "receipts_path", "record_problems", "require_cluster", "require_reviewed", "sanitize_metadata",
+           "scan_receipts", "set_aside_torn_tail", "TornReceipt",
            "sanitize_object", "sha256_file", "summary", "utc_now", "write_json_once", "write_once"]
