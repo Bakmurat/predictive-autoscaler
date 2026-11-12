@@ -544,6 +544,10 @@ into an in-cluster VictoriaMetrics.
   (`REMOVE_HOLD_MS` 3,000), and the generator sends one clock probe per minute, a GET of the ingress's own /healthz,
   recorded apart as the minute line's `probe_clock` and intersected by the reducer with the workload's clock sample;
   probes are never dispatches, arrivals or outcomes.
+  Amendment 2 (after run 2, which stays FAIL): each judged minute must show equal scheduled load with accounted
+  boundary carries (due == the constant peak and dispatched + carried_out - carried_in == due, each carry matched by
+  the adjacent minute and at most the last second's arrivals plus one), with no drop and no unresolved outcome; the
+  reducer now reports each minute's carried_in and carried_out.
 - *Not shown.* A pod that needs its whole grace period to stop, a node failure, the `--k6-local` mode and the
   default full mode of this script, 24-hour segments, the operator and the forecaster (not installed), and any rate
   above the one used.

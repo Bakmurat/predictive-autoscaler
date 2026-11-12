@@ -542,6 +542,10 @@ def _generator_minute(cfg: Dict, streams: List[_Stream], m: int) -> Dict:
     for key in ("due", "dispatched", "ok", "failed", "unresolved"):
         out[key] = sum(r[key] for _, r in lines)
     out["dropped"] = {k: sum(r["dropped"][k] for _, r in lines) for k in DROPS}
+    # The minute's boundary carries (arrivals due in the previous minute dispatched in this one, and due here but
+    # dispatched in the next), from the validated lines; their matching across lines is checked above (carry_unmatched).
+    out["carried_in"] = sum(int(r["carried"][0]) for _, r in lines)
+    out["carried_out"] = sum(int(r["carried"][1]) for _, r in lines)
     out["no_response"] = sum(int((r.get("failed_by") or {}).get("0", 0)) for _, r in lines)
     out["active_ms"] = sum(b - a for a, b in spans)
     out["late_max_ms"] = max([r.get("late_max_ms", 0) for _, r in lines] or [0])

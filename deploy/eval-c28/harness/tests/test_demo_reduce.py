@@ -1164,3 +1164,13 @@ def test_a_probe_sample_only_narrows_the_clock_bounds():
     out = DR._clock({"a": [s]})
     assert out["i"][5] == (max(100_500 - 2_000 - 100_000 - 1_000, 100_400 - 10 - 100_000 - 1_000), min(500, 400))
     assert 6 not in out["i"]
+
+
+def test_a_minutes_boundary_carries_are_in_the_reduction(tmp_path):
+    cfg, out = sim(tmp_path, [{"pod_uid": "pod-a", "start_ms": PEAK - 3 * MIN}])
+    got = rows(reduced(cfg, out))
+    for row in got.values():
+        g = row["generator"]
+        assert isinstance(g["carried_in"], int) and isinstance(g["carried_out"], int)
+        if row["state"] == "observed":
+            assert g["dispatched"] + g["carried_out"] - g["carried_in"] == g["due"]

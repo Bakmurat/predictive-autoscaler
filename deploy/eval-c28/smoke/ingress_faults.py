@@ -59,6 +59,11 @@ REMOVE_WITHIN_MS = 60_000          # and its removal completes within the recove
 # that no request dispatched inside the fault can still complete after the removal (run 1: about 300 requests of the
 # fault's last 2 s completed after it; the transport mechanism is inferred).
 REMOVE_HOLD_MS = 3_000
+# Amendment 2 (2026-11-12, after run 2): equal scheduled load with accounted boundary carries. Per minute the due
+# arrivals equal the constant peak, and dispatched + carried_out - carried_in == due (the generator's conservation);
+# each carry must be matched by the neighbouring minute's counterpart, and a carry can only come from arrivals due in
+# the last max_late_ms (1,000 ms) of a minute, so it is at most that share of the peak plus one.
+MAX_LATE_MS = 1_000
 EDGE_MS, MAX_GAP_MS = 5_000, 15_000
 MIN_RUNTIME_S = 600
 MAX_FIRST_SEND_MS = 10_000
@@ -149,6 +154,11 @@ def traffic(red: Dict, phases: Dict, cfg: Dict, targets: List[str], peak: int, v
     """Every judged minute of every phase, per target, from the reducer's rows."""
     origin, m = cfg["origin_ms"], cfg["minute_ms"]
     detail = {}
+    # Every row of the reduction by target and minute, for a carry's counterpart outside the phase.
+    rows_all: Dict[str, Dict[int, List[Dict]]] = {}
+    for t in targets:
+        for x in ((red.get("targets") or {}).get(t) or {}).get("rows", []):
+            rows_all.setdefault(t, {}).setdefault(x["minute"], []).append(x)
     for name in PHASES:
         a, b = phases[name]
         minutes = list(range((a - origin) // m, (b - origin) // m))
@@ -169,12 +179,29 @@ def traffic(red: Dict, phases: Dict, cfg: Dict, targets: List[str], peak: int, v
                 if r["state"] != "observed":
                     v.add("unproven", f"{name} {t} minute {mm}: state {r['state']} {r.get('reasons')}")
                     continue
+                if not all(isinstance(g.get(k), int) for k in ("due", "carried_in", "carried_out", "unresolved")):
+                    v.add("unproven", f"{name} {t} minute {mm}: the reduction has no due, carry or unresolved counts")
+                    continue
                 drops = sum(g["dropped"].get(k, 0) for k in ("late", "inflight", "segment_end"))
-                if r["intended"] != peak or g["dispatched"] != peak or drops or \
-                        g["ok"] + g["failed"] != g["dispatched"]:
-                    bad.append(f"minute {mm}: intended {r['intended']}, dispatched {g['dispatched']}, dropped {drops}, "
-                               f"{g['ok']} ok + {g['failed']} failed (the constant peak is {peak}, every request "
-                               "resolved)")
+                adjusted = g["dispatched"] + g["carried_out"] - g["carried_in"]
+                max_carry = -(-peak * MAX_LATE_MS // cfg["minute_ms"]) + 1
+                nxt = [x for x in by.get(mm + 1, [])] or [x for x in rows_all.get(t, {}).get(mm + 1, [])]
+                prv = [x for x in by.get(mm - 1, [])] or [x for x in rows_all.get(t, {}).get(mm - 1, [])]
+                carry_ok = (g["carried_out"] == 0 or (len(nxt) == 1 and nxt[0]["generator"].get("carried_in") ==
+                                                      g["carried_out"])) and \
+                           (g["carried_in"] == 0 or (len(prv) == 1 and prv[0]["generator"].get("carried_out") ==
+                                                     g["carried_in"]))
+                detail.setdefault("minutes", []).append(
+                    {"phase": name, "target": t, "minute": mm, "dispatched": g["dispatched"], "carried_in": g["carried_in"],
+                     "carried_out": g["carried_out"], "dispatched_plus_out_minus_in": adjusted, "due": g["due"]})
+                if r["intended"] != peak or g["due"] != peak or adjusted != g["due"] or drops or g["unresolved"] or \
+                        g["ok"] + g["failed"] != g["dispatched"] or not carry_ok or \
+                        not (0 <= g["carried_in"] <= max_carry and 0 <= g["carried_out"] <= max_carry):
+                    bad.append(f"minute {mm}: intended {r['intended']}, due {g['due']}, dispatched {g['dispatched']} "
+                               f"(carried in {g['carried_in']}, out {g['carried_out']}, matched {carry_ok}; at most "
+                               f"{max_carry}), dropped {drops}, unresolved {g['unresolved']}, {g['ok']} ok + "
+                               f"{g['failed']} failed (equal scheduled load {peak} with accounted boundary carries, "
+                               "every request resolved)")
                 elif mm in mixed:
                     continue                                   # a transition minute: any split of ok and failed
                 elif t in down and (g["ok"] != 0 or g["failed"] != g["dispatched"]):
@@ -380,7 +407,8 @@ def selftest() -> int:
             t0 = mm * M
             for t in (A, B):
                 down = any(t in FAULTS[f] and phases[f][0] <= t0 < phases[f][1] for f in FAULTS)
-                g = {"dispatched": PEAK, "ok": 0 if down else PEAK, "failed": PEAK if down else 0,
+                g = {"dispatched": PEAK, "ok": 0 if down else PEAK, "failed": PEAK if down else 0, "due": PEAK,
+                     "carried_in": 0, "carried_out": 0, "unresolved": 0,
                      "dropped": {"late": 0, "inflight": 0, "segment_end": 0}}
                 rows[t].append({"minute": mm, "state": "observed", "reasons": [], "intended": PEAK, "generator": g})
         red = {"targets": {t: {"rows": r} for t, r in rows.items()},
@@ -473,8 +501,36 @@ def selftest() -> int:
                   remove_done_ms=phases["fault1"][1] + 59_500), phases=dict(phases, recovery1=(9 * M, 14 * M))),
          "FAIL", "recovery1: 240 s after the removal")
     must(r(ph=dict(ph, actions={})), "FAIL", "observed installation and removal times are missing")
+    # Amendment 2: a boundary carry is accounted, not a failure; anything else about carries is.
+    def carry(red, k, n, t=B, into=None):
+        rows_of(red, t)[k]["generator"].update(dispatched=PEAK - n, failed=rows_of(red, t)[k]["generator"]["failed"] - n
+                                                if rows_of(red, t)[k]["generator"]["failed"] else 0,
+                                                ok=rows_of(red, t)[k]["generator"]["ok"] - n
+                                                if rows_of(red, t)[k]["generator"]["ok"] else 0, carried_out=n)
+        nxt = rows_of(red, t)[k + 1]["generator"]
+        bump = n if into is None else into
+        nxt.update(dispatched=PEAK + bump, carried_in=bump,
+                   ok=nxt["ok"] + bump if nxt["ok"] else 0, failed=nxt["failed"] + bump if nxt["failed"] else 0)
+    out = r(red=red_for(lambda red: carry(red, 8, 1)))                  # run 2's case: fault1's last minute -> recovery1
+    assert out["result"] == "PASS", out
+    out = r(red=red_for(lambda red: carry(red, 12, 150, t=A)))          # a full second's worth: still accounted
+    assert out["result"] == "PASS", out
+    must(r(red=red_for(lambda red: carry(red, 12, 200, t=A))), "FAIL", "at most 151")   # beyond the lateness bound
+    must(r(red=red_for(lambda red: carry(red, 12, 3, t=A, into=2))), "FAIL", "matched False")   # unmatched
+    def wrong_sign(red):
+        rows_of(red, A)[12]["generator"].update(carried_in=2, dispatched=PEAK + 2, ok=PEAK + 2)
+    must(r(red=red_for(wrong_sign)), "FAIL", "matched False")          # an in-carry with no out-carry before it
+    def lost_counterpart(red):
+        carry(red, 13, 2, t=A)
+        rows_of(red, A).pop(14)
+    out = r(red=red_for(lost_counterpart))
+    assert out["result"] in ("FAIL", "UNPROVEN") and any("minute 14" in p for p in out["unproven"]) and \
+        any("matched False" in p for p in out["fail"]), out
+    must(r(red=red_for(lambda red: rows_of(red, A)[12]["generator"].update(unresolved=1))), "FAIL", "unresolved 1")
+    must(r(red=red_for(lambda red: rows_of(red, A)[12]["generator"]["dropped"].update(late=1))), "FAIL", "dropped 1")
+    must(r(red=red_for(lambda red: rows_of(red, A)[12]["generator"].update(due=PEAK - 1))), "FAIL", f"due {PEAK - 1}")
     print("ingress_faults selftest: setup and observed blackhole times, every minute's accounting from the reducer "
-          "(transition minutes included), memory coverage, plateau and peak, identity classes, and the generator's "
+          "(transition minutes and boundary carries included), memory coverage, plateau and peak, identity classes, and the generator's "
           "restart budget from terminations and validated first sends: OK")
     return 0
 
