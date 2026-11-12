@@ -212,6 +212,9 @@ def main(argv=None) -> int:
         sp.add_argument("--smoke-origin-utc", default=None,
                         help="kind smoke only, with --smoke-segment-minutes: the schedule origin on any whole "
                              "minute (YYYY-MM-DDTHH:MM:00Z) instead of the params' UTC midnight")
+        sp.add_argument("--smoke-constant-peak", action="store_true",
+                        help="kind smoke only, with --smoke-segment-minutes: every minute holds the schedule's largest "
+                             "minute count (program.kind constant-peak), for the ingress fault test")
     ds = sub.add_parser("demo-sizing"); ds.add_argument("--params", required=True)
     dr = sub.add_parser("demo-reduce"); dr.add_argument("--config", required=True)
     dr.add_argument("--log", action="append", required=True, help="a pod log file, repeatable")
@@ -254,10 +257,12 @@ def main(argv=None) -> int:
     elif args.cmd in ("render", "release-values", "residency") and args.stage == demo.STAGE:
         params = _load(args.params)
         if args.cmd == "render":
-            if (args.smoke_segment_minutes is not None or args.smoke_origin_utc is not None) and \
-                    args.part != "generator":
-                raise render.ParamsError("--smoke-segment-minutes and --smoke-origin-utc render only --part generator")
-            objs = demo.render(params, args.smoke_segment_minutes, _smoke_origin(args))[args.part] if args.part \
+            if (args.smoke_segment_minutes is not None or args.smoke_origin_utc is not None
+                    or args.smoke_constant_peak) and args.part != "generator":
+                raise render.ParamsError("--smoke-segment-minutes, --smoke-origin-utc and --smoke-constant-peak "
+                                         "render only --part generator")
+            objs = demo.render(params, args.smoke_segment_minutes, _smoke_origin(args),
+                               args.smoke_constant_peak)[args.part] if args.part \
                 else demo.render_all(params)
             _write(yaml.safe_dump_all(objs, sort_keys=True), args.out)
         elif args.cmd == "release-values":
@@ -267,7 +272,8 @@ def main(argv=None) -> int:
             _write(_json(out), args.out)
             return 1 if out["problems"] else 0
     elif args.cmd == "demo-plan":
-        _write(_json(demo.generator_config(_load(args.params), args.smoke_segment_minutes, _smoke_origin(args))),
+        _write(_json(demo.generator_config(_load(args.params), args.smoke_segment_minutes, _smoke_origin(args),
+                                           args.smoke_constant_peak)),
                args.out)
     elif args.cmd == "demo-sizing":
         params = _load(args.params)

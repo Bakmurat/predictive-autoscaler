@@ -7,7 +7,7 @@ import json
 
 import pytest
 
-from c28 import demo
+from c28 import demo, render, schedule
 from demo_helpers import DAY, MIN, changed, config, edited, intended, params, scaled_day, simulate
 
 ORIGIN = 1793491200000                     # 2026-11-01T00:00:00Z, the kind params' schedule origin
@@ -551,8 +551,11 @@ def test_the_schedule_ends_inside_an_incarnation_and_nothing_wraps(tmp_path):
     assert len(fin) == 1 and fin[0]["ended_ms"] == seg_end and fin[0]["exhausted"] is True   # it idled to its segment end
     assert fin[0]["reason"] == "segment-end" and fin[0]["inflight"] == 0
     assert fin[0]["cum"]["dispatched"] == sum(l["dispatched"] for l in lines)
-    ns = [l["n"] for l in out["lines"] if l["target"] == N]
+    ns = [l["n"] for l in out["lines"] if l["target"] == N and l.get("event") != "first_send"]
     assert ns == list(range(len(ns)))                                      # start, 3 lines, exhausted, end: no gap
+    first = [l for l in out["lines"] if l["target"] == N and l.get("event") == "first_send"]
+    assert len(first) == 1 and first[0]["n"] is None                       # one unnumbered first-send record
+    assert first[0]["sent_ms"] >= next(l for l in out["lines"] if l["target"] == N and l.get("event") == "start")["started_ms"]
 
 
 def test_an_incarnation_started_after_the_end_writes_the_record_sends_nothing_and_idles_to_its_segment_end(tmp_path):
@@ -848,3 +851,24 @@ def test_a_short_stall_inside_the_span_still_carries_into_the_next_minute_and_is
         assert lines[1]["carried"][1] > 0
         assert all(l["dropped"] == {"late": 0, "inflight": 0, "segment_end": 0} for l in lines)
         assert out["sends"][t] == sum(l["dispatched"] for l in lines) == sum(l["intended"] for l in lines)
+
+
+def test_a_constant_peak_smoke_schedule_holds_the_peak_and_is_never_a_demonstration():
+    p = params()
+    normal = demo.generator_config(p, smoke_segment_minutes=15)
+    flat = demo.generator_config(p, smoke_segment_minutes=15, smoke_constant_peak=True)
+    peak = max(max(row) for row in normal["per_minute_days"])
+    assert flat["label"] == "smoke" and flat["program"]["kind"] == demo.CONSTANT_PEAK
+    assert all(row == [peak] * 1440 for row in flat["per_minute_days"]) and len(flat["per_minute_days"]) == normal["days"]
+    assert flat["digest"] != normal["digest"] and demo.config_problems(flat) == []
+    with pytest.raises(render.ParamsError):
+        demo.generator_config(p, smoke_constant_peak=True)                   # smoke only
+    forged = dict(flat, per_minute_days=normal["per_minute_days"])            # the kind without the flat table
+    forged["digest"] = schedule.digest(forged)
+    assert any("constant-peak" in x for x in demo.config_problems(forged))
+    relabelled = dict(flat, label="demonstration")
+    relabelled["digest"] = schedule.digest(relabelled)
+    assert any("constant-peak" in x for x in demo.config_problems(relabelled))
+    objs = demo.render(p, 15, None, True)["generator"]
+    cm = next(o for o in objs if o["kind"] == "ConfigMap")
+    assert json.loads(cm["data"][demo.GENERATOR_CONFIG])["program"]["kind"] == demo.CONSTANT_PEAK
