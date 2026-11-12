@@ -1131,3 +1131,36 @@ def test_a_first_send_under_an_invalid_start_record_is_invalid():
     finally:
         DRM.start_problems = real
     assert any("start record is invalid" in p for p in s.first_send_problems), s.first_send_problems
+
+
+
+def test_a_minute_where_no_target_answers_has_its_clock_from_the_probe(tmp_path):
+    """Both targets unreachable: no workload response carries a Date header. The once-a-minute /healthz probe of the
+    same incarnation bounds the clock instead; it is never counted as a dispatch, an arrival or an outcome."""
+    fault = [{"target": t, "from_ms": PEAK - MIN, "to_ms": PEAK + 20 * MIN, "mode": "unreachable"} for t in (N, R)]
+    cfg, without = sim(tmp_path, [{"pod_uid": "pod-a", "start_ms": PEAK - 3 * MIN}], faults=fault, minutes_after=16)
+    cfg, out = sim(tmp_path, [{"pod_uid": "pod-a", "start_ms": PEAK - 3 * MIN}], faults=fault, clock_probe=True,
+                   minutes_after=16)
+    # Minutes deep inside the fault: no neighbour within CLOCK_NEIGHBOUR_MINUTES has a workload Date either.
+    lo, hi = PEAK + (DR.CLOCK_NEIGHBOUR_MINUTES + 1) * MIN, PEAK + 14 * MIN
+    blind, seen = rows(reduced(cfg, without, start=lo, end=hi)), rows(reduced(cfg, out, start=lo, end=hi))
+    assert sorted(blind) == sorted(seen) and len(blind) >= 4
+    for k in sorted(blind):
+        assert blind[k]["state"] == "unknown" and "clock_unverified" in blind[k]["reasons"], blind[k]
+        assert seen[k]["state"] == "observed", seen[k]
+        assert seen[k]["generator"]["ok"] == 0 and seen[k]["generator"]["failed"] == seen[k]["generator"]["dispatched"]
+        assert seen[k]["generator"]["dispatched"] == blind[k]["generator"]["dispatched"]   # probes are not workload
+    assert out["sends"] == without["sends"] and all(n > 0 for n in out["probes"].values())
+    lines = [l for l in out["lines"] if "minute" in l and "event" not in l]
+    assert all(l["probe_clock"] is None or l["probe_clock"]["rt_ms"] >= 0 for l in lines)
+    assert sum(1 for l in lines if l["probe_clock"]) >= len({(l["target"], l["minute"]) for l in lines}) - 4
+
+
+def test_a_probe_sample_only_narrows_the_clock_bounds():
+    s = DR._Stream("i", "a")
+    s.minutes[5] = {"clock": {"date_s": 100, "recv_ms": 100_500, "rt_ms": 2_000},
+                    "probe_clock": {"date_s": 100, "recv_ms": 100_400, "rt_ms": 10}}
+    s.minutes[6] = {"clock": None, "probe_clock": {"date_s": 160, "recv_ms": 160_300, "rt_ms": -5}}   # invalid
+    out = DR._clock({"a": [s]})
+    assert out["i"][5] == (max(100_500 - 2_000 - 100_000 - 1_000, 100_400 - 10 - 100_000 - 1_000), min(500, 400))
+    assert 6 not in out["i"]

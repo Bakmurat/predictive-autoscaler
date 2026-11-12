@@ -595,18 +595,21 @@ def _latency(cfg: Dict, lines: List[Dict]) -> Optional[Dict]:
 def _clock(streams_by_target: Dict[str, List[_Stream]]) -> Dict[str, Dict[int, Tuple[float, float]]]:
     """{incarnation: {minute: (lo, hi)}}: bounds in ms of (generator clock - ingress clock) from each minute's sample
     (any target: the clock is the pod's). The ingress wrote its Date header (whole seconds) between the request's
-    dispatch and its receipt, so the offset lies in [recv - rt - date - 1000, recv - date]."""
+    dispatch and its receipt, so the offset lies in [recv - rt - date - 1000, recv - date]. A minute's probe_clock
+    (the generator's once-a-minute GET of the ingress's /healthz, outside the workload) is the same kind of sample and
+    is intersected with the workload's: both bound the same offset, so neither may widen the other."""
     out: Dict[str, Dict[int, Tuple[float, float]]] = {}
     for streams in streams_by_target.values():
         for s in streams:
             for m, r in s.minutes.items():
-                c = r.get("clock")
-                if not (isinstance(c, dict) and all(_int(c.get(k)) for k in ("date_s", "recv_ms", "rt_ms"))):
-                    continue
-                lo = c["recv_ms"] - c["rt_ms"] - c["date_s"] * 1000 - 1000
-                hi = c["recv_ms"] - c["date_s"] * 1000
-                cur = out.setdefault(s.inc, {}).get(m)
-                out[s.inc][m] = (lo, hi) if cur is None else (max(cur[0], lo), min(cur[1], hi))
+                for c in (r.get("clock"), r.get("probe_clock")):
+                    if not (isinstance(c, dict) and all(_int(c.get(k)) for k in ("date_s", "recv_ms", "rt_ms"))
+                            and c["rt_ms"] >= 0):
+                        continue
+                    lo = c["recv_ms"] - c["rt_ms"] - c["date_s"] * 1000 - 1000
+                    hi = c["recv_ms"] - c["date_s"] * 1000
+                    cur = out.setdefault(s.inc, {}).get(m)
+                    out[s.inc][m] = (lo, hi) if cur is None else (max(cur[0], lo), min(cur[1], hi))
     return out
 
 
