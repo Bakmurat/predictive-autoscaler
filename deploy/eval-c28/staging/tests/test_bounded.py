@@ -78,7 +78,12 @@ class JobApi(F.FakeApi2):
             self.put(pod)
         return out
 
+    fail_pod_list_at = None
+
     def get(self, path):
+        if self.fail_pod_list_at and path.endswith("/pods") and self.clock.ms >= self.fail_pod_list_at:
+            self.fail_pod_list_at = None
+            raise X.C.ApiError("list pods: failed (error, exit 1)", 500)
         o = super().get(path)
         if o and o.get("kind") == "Job" and self.clock.ms >= self.end_ms:
             o.setdefault("status", {})["conditions"] = [{"type": "Complete", "status": "True"}]
@@ -103,10 +108,14 @@ class JobApi(F.FakeApi2):
         return super().delete(path, uid, resource_version)
 
 
+INSTANCES = {"worker-w": "10.0.0.1:9100", "worker-s": "10.0.0.2:9100"}
+
+
 class FakeVM:
     """The observer, answering every query bounded.py sends from a SIMULATED run of the real load script (its ingress
     counter samples) and steady synthetic series (15 s scrapes) for everything else: steal 1 %, no alert, throttling
-    0.01, a queue of 1, equal per-pod request increases."""
+    0.01, a queue of 1, equal per-pod request increases. Every selector is VALIDATED: an unknown query raises (an
+    observer refusal), so a wrong label (e.g. nodename on node_cpu_seconds_total) never silently returns data."""
 
     def __init__(self, sim_ingress, pod_names, steal=1.0, alerts=()):
         self.ingress, self.pod_names, self.steal, self.alerts = sim_ingress, pod_names, steal, list(alerts)
@@ -117,6 +126,7 @@ class FakeVM:
                                                                                   int(hi) + 1, step)]}
 
     def __call__(self, url):
+        import re
         import urllib.parse as U
         u = U.urlparse(url)
         q = dict(U.parse_qsl(u.query))
@@ -125,21 +135,32 @@ class FakeVM:
         res = []
         if u.path.endswith("query_range"):
             lo, hi, step = float(q["start"]), float(q["end"]), int(q["step"][:-1])
-            if "steal" in expr:
+            if "mode=\"steal\"" in expr and "node_uname_info" in expr:
                 res = [self.series(lo, hi, step, self.steal)]
-            elif "throttled" in expr:
+            elif "container_cpu_cfs_throttled_periods_total" in expr:
                 res = [self.series(lo, hi, step, 0.01)]
-            elif "c28_queue" in expr:
+            elif expr.startswith("sum(c28_queue{"):
                 res = [self.series(lo, hi, step, 1.0)]
+            else:
+                raise ValueError(f"FakeVM: unknown range query {expr}")
         elif expr.startswith("ALERTS"):
             res = [{"metric": a, "value": [0, "1"]} for a in self.alerts]
+        elif expr.startswith("node_uname_info{"):
+            res = [{"metric": {"nodename": n, "instance": i}, "value": [0, "1"]} for n, i in INSTANCES.items()]
         elif expr.startswith("sum by (pod) (increase(c28_requests_total"):
             t = expr.split('target="')[1].split('"')[0]
             res = [{"metric": {"pod": n}, "value": [0, "1000"]} for n in self.pod_names[t]]
         else:                                               # a raw range-vector query: SELECTOR[Ns] at time
+            sel, rng = expr.rsplit("[", 1)
             hi = float(q["time"])
-            lo = hi - float(expr.rsplit("[", 1)[1].rstrip("s]"))
-            if expr.startswith("c28_ingress_requests_total"):
+            lo = hi - float(rng.rstrip("s]"))
+            known = (r'c28_(ingress_requests_total|queue|requests_total)\{namespace="demo",target="[a-z0-9-]+"\}$',
+                     r'container_cpu_cfs_(throttled_)?periods_total\{namespace="demo",pod=~"[^"]+",container!=""\}$',
+                     r'node_cpu_seconds_total\{job="node-exporter",mode="steal",instance="(%s)"\}$'
+                     % "|".join(re.escape(i) for i in INSTANCES.values()))
+            if not any(re.match(k, sel) for k in known):
+                raise ValueError(f"FakeVM: unknown raw selector {sel}")
+            if sel.startswith("c28_ingress_requests_total"):
                 t = expr.split('target="')[1].split('"')[0]
                 res = [{"metric": {}, "values": [[a, str(b)] for a, b in self.ingress[t] if lo < a <= hi]}]
             else:
@@ -147,7 +168,7 @@ class FakeVM:
         return {"status": "success", "data": {"result": res}}
 
 
-def simulated(params, label, origin_ms):
+def simulated(params, label, origin_ms, stalls=()):
     """The generator configuration and the REAL script's output for one bounded run (harness simulator)."""
     import sys
     import tempfile
@@ -159,7 +180,7 @@ def simulated(params, label, origin_ms):
     cfg = c28.demo.bounded_config(params, label, origin_ms)
     run_min = 40 if label == "admission" else 15
     out = simulate(pathlib.Path(tempfile.mkdtemp()), cfg, {
-        "incarnations": [{"pod_uid": "pod-gen", "start_ms": origin_ms - 2 * MIN}],
+        "incarnations": [{"pod_uid": "pod-gen", "start_ms": origin_ms - 2 * MIN, "stalls": list(stalls)}],
         "until_ms": origin_ms + (run_min + 5) * MIN, "ingress_initial": 100,
         "scrape": scrape(origin_ms - 5 * MIN, origin_ms + (run_min + 5) * MIN)})
     return cfg, [json.dumps(l) for l in out["lines"]], out["ingress"]
@@ -252,7 +273,11 @@ def _gen_pods(a):
 @pytest.mark.parametrize("kw, text", [({"steal": 9.0}, "steal above 5 %"),
                                       ({"alerts": [{"alertname": "KubeNodeNotReady", "node": "worker-s",
                                                     "severity": "warning"}]}, "alert KubeNodeNotReady"),
-                                      ({"alerts": [{"alertname": "C28DemoAlert", "node": "worker-s"}]}, None)])
+                                      ({"alerts": [{"alertname": "TargetDown", "instance": "10.0.0.2:10250",
+                                                    "severity": "warning"}]}, "alert TargetDown"),
+                                      ({"alerts": [{"alertname": "C28Anything", "node": "worker-s"}]}, "alert C28Anything"),
+                                      ({"alerts": [{"alertname": "NodeFilesystemAlmostFull", "node": "worker-x",
+                                                    "severity": "warning"}]}, None)])
 def test_live_stops_end_the_load_before_any_evidence_is_collected(world, kw, text):  # noqa: F811
     record, kube, a, clock, c, p, d, logs, vm = _run(world, **kw)
     seen = []
@@ -264,7 +289,7 @@ def test_live_stops_end_the_load_before_any_evidence_is_collected(world, kw, tex
                 seen.append(len(_gen_pods(a)))
             return inner(url)
     out = B.run_admission(c, p, d, Probe(), "http://vm", logs=logs)
-    if text is None:                                                  # the demonstration's own alerts never stop it
+    if text is None:                                                  # another node's alert does not stop it
         assert out["data"]["verdict"] == "PASS" and not out["data"]["stopped"]
         return
     assert text in out["data"]["stopped"] and out["data"]["verdict"] == "STOPPED"
@@ -384,7 +409,7 @@ class StartupApi(JobApi):
         return out
 
 
-def _startup(world, admission=True, **kw):  # noqa: F811
+def _startup(world, admission=True, stalls=(), **kw):  # noqa: F811
     """A world whose admission really PASSED (a full simulated run), then a startup plan 3 minutes ahead."""
     record, kube, base = ready_world(world)
     clock = Clock(O_MS - 180_000)
@@ -401,7 +426,8 @@ def _startup(world, admission=True, **kw):  # noqa: F811
     c = B.Ctx(record, kube, now=clock.now, sleep=clock.sleep)
     p = B.plan_startup(c, _ts(o2))
     saved = X.save_plan(record, B.HELPER, p, "plan-startup")
-    _, lines, ingress = simulated(c.params, "startup", o2)
+    _, lines, ingress = simulated(c.params, "startup", o2,
+                                  stalls=[{"at_ms": o2 + x[0], "for_ms": x[1]} for x in stalls])
     vm = FakeVM(ingress, {R: []})
     return record, kube, a, clock, c, X.load_plan(saved["plan"]), saved["plan_digest"], vm, lines
 
@@ -494,3 +520,81 @@ def test_after_a_failed_restore_recover_then_restore_meets_the_obligation(world)
     saved = X.save_plan(record, B.HELPER, rp, "plan-restore")
     B.restore(c, X.load_plan(saved["plan"]), saved["plan_digest"])
     assert not B.open_obligations(record) and a.obj("Deployment", R, "demo")["spec"]["replicas"] == 12
+
+
+
+# --- the second review's reproductions ----------------------------------------------------------------------------------
+
+def test_an_interruption_between_create_and_its_receipt_still_stops_the_load(world, monkeypatch):  # noqa: F811
+    record, kube, a, clock, c, p, d, logs, vm = _run(world)
+    real = B.own
+
+    def flaky(c_, run, obj):
+        if obj.get("kind") == "Job":
+            raise RuntimeError("interrupted before the owned receipt")
+        return real(c_, run, obj)
+    monkeypatch.setattr(B, "own", flaky)
+    with pytest.raises(RuntimeError):
+        B.run_admission(c, p, d, vm, "http://vm", logs=logs)
+    assert a.obj("Job", "c28-demo-admission", "demo") is None and not _gen_pods(a)   # found through the journal
+    assert not X.open_intents(X.receipts(record, B.HELPER))
+
+
+def test_a_failed_pod_poll_stops_the_run(world):  # noqa: F811
+    record, kube, a, clock, c, p, d, logs, vm = _run(world)
+    a.fail_pod_list_at = O_MS + 10 * 60_000
+    out = B.run_admission(c, p, d, vm, "http://vm", logs=logs)
+    assert out["data"]["verdict"] == "STOPPED" and "observation failed" in out["data"]["stopped"]
+
+
+def test_an_evidence_failure_never_blocks_the_restore(world, monkeypatch):  # noqa: F811
+    record, kube, a, clock, c, p, d, vm, lines = _startup(world)
+    real = B._write
+
+    def broken(path, doc):
+        if "startup-" in path:
+            raise OSError("disk full")
+        return real(path, doc)
+    monkeypatch.setattr(B, "_write", broken)
+    data = run_s(c, p, d, vm, lines)["data"]
+    assert data["measured"] is False and data["evidence_sha256"] is None
+    assert a.obj("Deployment", R, "demo")["spec"]["replicas"] == 12 and not B.open_obligations(record)
+
+
+def test_a_recovered_readiness_loss_is_seen_and_the_first_ready_kept(world):  # noqa: F811
+    record, kube, a, clock, c, p, d, vm, lines = _startup(world)
+    real = a.get
+
+    def get(path):
+        o = real(path)
+        if path.endswith("/pods") and clock.ms > _ms_of(p["origin_utc"]) + 6 * 60_000:
+            for x in (o or {}).get("items", []):
+                if x["metadata"]["name"] == f"{R}-n06":
+                    for cond in x["status"]["conditions"]:
+                        if cond["type"] == "Ready":
+                            cond["lastTransitionTime"] = _ts(clock.ms)   # flapped and came back: still True
+        return o
+    a.get = get
+    data = run_s(c, p, d, vm, lines)["data"]
+    ev = json.load(open(os.path.join(data["dir"], "evidence.json")))
+    assert data["measured"] is False and ev["summary"]["readiness_lost"]
+    assert data["creation_to_ready_s"] == [20.0] * 6                    # the FIRST Ready, not the recovery
+
+
+def _ms_of(text):
+    return int(datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+
+def test_an_admission_pass_is_void_for_a_changed_live_workload(world):  # noqa: F811
+    record, kube, a, clock, c, p, d, vm, lines = _startup(world)
+    assert p["problems"] == []
+    tpl = a.obj("Deployment", N, "demo")["spec"]["template"]["spec"]["containers"][0]
+    tpl.setdefault("resources", {}).setdefault("limits", {})["memory"] = "16Mi"
+    assert any("other images, configuration" in x for x in B.plan_startup(c, p["origin_utc"])["problems"])
+
+
+def test_a_stalled_generator_is_not_the_scheduled_load(world):  # noqa: F811
+    record, kube, a, clock, c, p, d, vm, lines = _startup(world, stalls=[(3 * 60_000, 20_000)])
+    data = run_s(c, p, d, vm, lines)["data"]
+    assert data["measured"] is False
+    assert any("zero generator drops" in x for x in data["load_problems"]), data["load_problems"]

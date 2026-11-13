@@ -188,6 +188,7 @@ class Observer:
         self.watch: List[Dict] = []
         self.endpoints: List[Dict] = []
         self.stops: List[Dict] = []
+        self.failures: List[Dict] = []
 
     def _pods(self) -> List[Dict]:
         names = set(self.c.c28.demo.target_names(self.c.params)) | {"c28-ingress"}
@@ -198,8 +199,9 @@ class Observer:
     def poll_pods(self, t_s: float) -> None:
         try:
             pods = self._pods()
-        except (C.ApiError, X.StagingError):
-            return                                      # a failed poll is a gap in the watch (recorded by absence)
+        except (C.ApiError, X.StagingError) as e:
+            self.failures.append({"t_s": t_s, "what": f"pod poll: {type(e).__name__}"})   # a live stop, never silent
+            return
         with open(os.path.join(self.dir, "pod-polls.jsonl"), "a") as fh:        # the raw observations, kept
             fh.write(json.dumps({"t_s": t_s, "pods": [{"uid": p["metadata"]["uid"], "name": p["metadata"]["name"],
                                                          "status": p.get("status"), "deleting":
@@ -251,7 +253,8 @@ class Observer:
             try:
                 slices = self.c.kube.list("EndpointSlice", self.c.ns, labels={"kubernetes.io/service-name": t},
                                           strict=True)
-            except (C.ApiError, X.StagingError):
+            except (C.ApiError, X.StagingError) as e:
+                self.failures.append({"t_s": t_s, "what": f"endpoint sample {t}: {type(e).__name__}"})
                 continue
             ready = sorted({(e.get("targetRef") or {}).get("uid") for s in slices for e in s.get("endpoints") or []
                             if (e.get("conditions") or {}).get("ready") and (e.get("targetRef") or {}).get("uid")})
@@ -353,12 +356,32 @@ def collect_vm(c: Ctx, fetch: Fetch, api: str, origin_s: float, gen_pod: str, po
             out["freshness"][f"{key}/{who}"] = guard(f"{key}/{who}", lambda: _worst(_raw(
                 fetch, api, f"{metric}{sel}", m_lo, hi), m_lo, hi))
     nodes = {"w": c.params["nodes"]["workload"], "s": c.params["nodes"]["support"]}
+    inst = guard("node instances", lambda: node_instances(c, fetch, api), {})
     for role, node in nodes.items():
         out["steal"][role] = guard(f"steal/{role}", lambda: _range(fetch, api, steal_expr([node]), lo, hi, 60), [])
-        out["freshness"][f"steal_raw/{role}"] = guard(f"steal-raw/{role}", lambda: _worst(_raw(
-            fetch, api, f'node_cpu_seconds_total{{job="node-exporter",mode="steal",nodename="{node}"}}', lo, hi),
-            lo, hi))
+        if role in inst:
+            out["freshness"][f"steal_raw/{role}"] = guard(f"steal-raw/{role}", lambda: _worst(_raw(
+                fetch, api, f'node_cpu_seconds_total{{job="node-exporter",mode="steal",instance="{inst[role]}"}}',
+                lo, hi), lo, hi))
     out["freshness"] = {k: v for k, v in out["freshness"].items() if v is not None}
+    return out
+
+
+def node_instances(c: Ctx, fetch: Fetch, api: str) -> Dict[str, str]:
+    """W's and S's node-exporter instance, resolved through node_uname_info (node_cpu_seconds_total carries no node
+    name: evidence/calibration-observer-20261108T233404Z.md). A missing or ambiguous mapping raises."""
+    nodes = {c.params["nodes"]["workload"]: "w", c.params["nodes"]["support"]: "s"}
+    sel = "|".join(nodes)
+    res = _q(fetch, api, "query", query=f'node_uname_info{{job="node-exporter",nodename=~"{sel}"}}')
+    out: Dict[str, str] = {}
+    for r in res:
+        n, inst = r["metric"].get("nodename"), r["metric"].get("instance")
+        if n in nodes and inst:
+            if nodes[n] in out and out[nodes[n]] != inst:
+                raise X.StagingError(f"node {n} maps to two node-exporter instances")
+            out[nodes[n]] = inst
+    if set(out) != {"w", "s"}:
+        raise X.StagingError(f"node_uname_info does not map both W and S to an instance: {sorted(out)}")
     return out
 
 
@@ -432,11 +455,30 @@ def own(c: Ctx, run: str, obj: Dict) -> Dict:
 
 
 def owned(record: X.Record, run: str) -> Dict[str, List[Dict]]:
+    """What the run owns: its "owned" receipts AND every create of this helper's journal under the run (applied, or
+    reconciled as done by recover), so an interruption between a create and its receipt still leaves the object
+    known by its UID."""
     out: Dict[str, List[Dict]] = {}
-    for e in X.receipts(record, HELPER):
+    seen = set()
+
+    def add(kind, name, uid):
+        if uid and uid not in seen:
+            seen.add(uid)
+            out.setdefault(kind, []).append({"run": run, "kind": kind, "name": name, "uid": uid})
+    es = X.receipts(record, HELPER)
+    for e in es:
         if e["event"] == "owned" and e["data"]["run"] == run:
-            out.setdefault(e["data"]["kind"], []).append(e["data"])
+            add(e["data"]["kind"], e["data"]["name"], e["data"]["uid"])
+    for it in X.applied_intents(es):
+        d = it["data"]
+        if d["op"] == "create" and (d.get("context") or {}).get("run") == run:
+            add(d["kind"], d["name"], d.get("result_uid"))
     return out
+
+
+def unresolved_creates(record: X.Record, run: str) -> List[Dict]:
+    return [it["data"] for it in X.open_intents(X.receipts(record, HELPER))
+            if it["data"]["op"] == "create" and (it["data"].get("context") or {}).get("run") == run]
 
 
 def stop_load(c: Ctx, run: str) -> None:
@@ -444,6 +486,10 @@ def stop_load(c: Ctx, run: str) -> None:
     object holding the name is a replacement and is refused, never deleted), then every pod recorded or owned by a
     recorded Job's UID, found WITHOUT the Job (a raw-API Job delete orphans its pod), each deleted by UID and proven
     gone as a journalled step. Idempotent."""
+    pending = unresolved_creates(c.record, run)
+    if pending:
+        raise X.StagingError(f"{[d['kind'] + '/' + d['name'] for d in pending]}: a create of this run has an unknown "
+                             "outcome; recover first (the load cannot be declared stopped, the fence stays)")
     o = owned(c.record, run)
     job_uids = {j["uid"] for j in o.get("Job", [])}
     for j in o.get("Job", []):
@@ -478,21 +524,27 @@ def _write(path: str, doc) -> str:
 
 # --- live stop conditions -------------------------------------------------------------------------------------------------
 
-ALERT_EXCLUDED_PREFIXES = ("C28", "PredictiveAutoscaler")   # the demonstration's own alerts are evidence, not neighbours
+# Expected alerts reviewed as NOT a reason to stop (by exact name, with the reason); none are reviewed yet, so every
+# alert the selection below matches stops the run.
+REVIEWED_EXPECTED_ALERTS: Dict[str, str] = {}
 
 
 def neighbour_alerts(c: Ctx, fetch: Fetch, api: str) -> List[str]:
-    """Firing alerts that name W or S (any label value equal to the node's name) or the control namespace, any
-    severity, and critical alerts of the watched namespace, except the demonstration's own alert names. An observer
-    failure raises (the caller stops: a missing observation is a stop)."""
-    nodes = {c.params["nodes"]["workload"], c.params["nodes"]["support"]}
+    """Firing alerts that concern W, S or the demonstration, by an explicit mapping: a node, nodename or kubernetes_node
+    label equal to W's or S's name, or an instance whose host is W's or S's node-exporter host (any port); any alert
+    of the control namespace; a critical alert of the watched namespace. Only REVIEWED_EXPECTED_ALERTS are exempt.
+    An observer failure raises (the caller stops: a missing observation is a stop)."""
+    names = {c.params["nodes"]["workload"], c.params["nodes"]["support"]}
+    hosts = {i.rsplit(":", 1)[0] for i in node_instances(c, fetch, api).values()}
     out = []
     for r in _q(fetch, api, "query", query='ALERTS{alertstate="firing"}'):
         m = r["metric"]
         name = m.get("alertname", "")
-        if name.startswith(ALERT_EXCLUDED_PREFIXES):
+        if name in REVIEWED_EXPECTED_ALERTS:
             continue
-        if nodes & set(m.values()) or m.get("namespace") == c.params["control_namespace"] or \
+        on_node = any(m.get(k) in names for k in ("node", "nodename", "kubernetes_node")) or \
+            (m.get("instance") or "").rsplit(":", 1)[0] in hosts
+        if on_node or m.get("namespace") == c.params["control_namespace"] or \
                 (m.get("namespace") == c.ns and m.get("severity") == "critical"):
             out.append(f"alert {name} firing ({m.get('severity', '?')})")
     return out
@@ -537,7 +589,8 @@ def live_stops(c: Ctx, obs: "Observer", fetch: Fetch, api: str, baseline_s: floa
                cfg: Dict, lines: List[str], label: str) -> List[str]:
     """Every live stop condition; an observer failure is itself a stop."""
     t = c.now() / 1000
-    stops = obs.node_stops()
+    stops = [f"observation failed: {f['what']}" for f in obs.failures]
+    stops += obs.node_stops()
     stops += [f"{x['what']} of pod {x['pod_uid']}" for x in obs.transitions
               if x["what"] in ("oom", "restart", "deleted", "container-changed") and x["t_s"] >= baseline_s]
     if _terminal(job) == "Failed":
@@ -557,13 +610,28 @@ def live_stops(c: Ctx, obs: "Observer", fetch: Fetch, api: str, baseline_s: floa
 
 def binding(c: Ctx, targets: Dict) -> Dict:
     """What an admission PASS is bound to: the params file's bytes, the target and PA identities, the generator,
-    fixture and release images, the bounded configuration's peak and per-target capacity."""
+    fixture and release images, the peak, the LIVE pod templates of both targets and the ingress (resources, images,
+    args, env: a changed limit voids the PASS), the live PA specs, and the node environment of W and S (UID, kernel,
+    kubelet, runtime, OS image, allocatable)."""
     s = c.s["release"]
+    live = {}
+    for name in list(targets) + ["c28-ingress"]:
+        dep = c.kube.get("Deployment", name, c.ns)
+        live[name] = X.json_digest((dep or {}).get("spec", {}).get("template", {}).get("spec"))
+    pas = {t: X.json_digest((c.kube.get("PredictiveAutoscaler", t, c.ns) or {}).get("spec")) for t in targets}
+    env = {}
+    for role in ("workload", "support"):
+        n = c.kube.get("Node", c.params["nodes"][role]) or {}
+        info = (n.get("status") or {}).get("nodeInfo") or {}
+        env[role] = {"uid": (n.get("metadata") or {}).get("uid"), "allocatable": (n.get("status") or {}).get(
+            "allocatable"), **{k: info.get(k) for k in ("kernelVersion", "kubeletVersion", "containerRuntimeVersion",
+                                                          "osImage")}}
     return {"params_sha256": C.sha256_file(c.record.resolve(c.record.doc["params"])),
             "targets": {t: {"deployment_uid": v["deployment_uid"], "pa_uid": v["pa_uid"]} for t, v in targets.items()},
             "generator_image": c.params["demonstration"]["generator"]["image"], "fixture_image": c.params["image"],
             "release_images": [s["operator_image"], s["statistical_image"]],
-            "peak_per_minute": max(max(r) for r in c.c28.demo.day_table(c.params))}
+            "peak_per_minute": max(max(r) for r in c.c28.demo.day_table(c.params)),
+            "pod_templates": live, "pa_specs": pas, "nodes": env}
 
 
 def _sha(path: str) -> Optional[str]:
@@ -713,12 +781,14 @@ def run_admission(c: Ctx, reviewed: Dict, reviewed_digest: str, fetch: Fetch, ap
                           "created_s": st["created_ms"] / 1000 if st["created_ms"] else None},
                   "stops": obs.stops, "limits": c.verdicts.FROZEN,
                   "collection_problems": vm["problems"] + st["problems"]}
-            ev_sha = _write(os.path.join(out_dir, "evidence.json"), ev)
-            with open(os.path.join(out_dir, "evidence.json")) as fh:
-                verdict = c.verdicts.verdict(json.load(fh))       # from the WRITTEN file
-            v_sha = _write(os.path.join(out_dir, "verdict.json"), verdict)
-            if stopped_ok:
-                remove_config(c, rid)
+            try:
+                ev_sha = _write(os.path.join(out_dir, "evidence.json"), ev)
+                with open(os.path.join(out_dir, "evidence.json")) as fh:
+                    verdict = c.verdicts.verdict(json.load(fh))   # from the WRITTEN file
+                v_sha = _write(os.path.join(out_dir, "verdict.json"), verdict)
+            finally:
+                if stopped_ok:
+                    remove_config(c, rid)
         return X.receipt(c.record, HELPER, "run-complete", {
             "run": rid, "label": "admission", "plan_sha256": reviewed_digest, "verdict": verdict["verdict"],
             "evidence_sha256": ev_sha, "verdict_sha256": v_sha, "dir": out_dir, "stopped": st["stop"] or None,
@@ -846,17 +916,25 @@ def restore_to_twelve(c: Ctx, ob: Dict) -> None:
 
 
 class PodTimeline:
-    """Every poll's view of the target's pods created after a time: their conditions, container state and restarts
-    (kept raw), so readiness gained and LOST between the scale write and the end are both seen."""
+    """Every poll's view of the target's pods created after a time (kept raw): conditions, container state, restarts.
+    A failed poll is recorded (a live stop and a coverage gap). Each pod's creation-to-Ready uses its FIRST observed
+    Ready; any later Ready=False, or a newer Ready transition time, is a readiness loss."""
+
+    MAX_GAP_MS = 30_000
 
     def __init__(self, c: Ctx, name: str):
-        self.c, self.name, self.since_ms, self.polls = c, name, None, []
+        self.c, self.name, self.since_ms, self.polls, self.failures = c, name, None, [], []
 
     def poll(self) -> None:
         if self.since_ms is None:
             return
+        try:
+            pods = self.c.kube.list("Pod", self.c.ns, strict=True)
+        except (C.ApiError, X.StagingError) as e:
+            self.failures.append({"t_ms": self.c.now(), "what": f"startup pod poll: {type(e).__name__}"})
+            return
         snap = []
-        for p in self.c.kube.list("Pod", self.c.ns, strict=True):
+        for p in pods:
             if (p["metadata"].get("labels") or {}).get("c28.devkuban.com/target") != self.name:
                 continue
             ct = p["metadata"].get("creationTimestamp")
@@ -873,17 +951,25 @@ class PodTimeline:
         self.polls.append({"t_ms": self.c.now(), "pods": snap})
 
     def summary(self) -> Dict:
-        first, last, lost = {}, {}, []
+        first_ready, last, lost = {}, {}, []
         for poll in self.polls:
             for x in poll["pods"]:
-                first.setdefault(x["uid"], x)
-                prev = last.get(x["uid"])
-                if prev and prev["ready"] == "True" and x["ready"] != "True":
-                    lost.append({"uid": x["uid"], "t_ms": poll["t_ms"]})
-                last[x["uid"]] = x
-        new = [{**last[u], "creation_to_ready_s": (_ms(last[u]["ready_since"]) - _ms(last[u]["created"])) / 1000
-                if last[u]["ready"] == "True" and last[u]["ready_since"] else None} for u in sorted(last)]
-        return {"new_pods": new, "readiness_lost": lost, "polls": len(self.polls),
+                u = x["uid"]
+                if x["ready"] == "True" and u not in first_ready:
+                    first_ready[u] = x
+                elif u in first_ready and (x["ready"] != "True" or x["ready_since"] != first_ready[u]["ready_since"]):
+                    if not lost or lost[-1]["uid"] != u or lost[-1]["t_ms"] != poll["t_ms"]:
+                        lost.append({"uid": u, "t_ms": poll["t_ms"], "ready": x["ready"], "since": x["ready_since"]})
+                last[u] = x
+        new = []
+        for u in sorted(last):
+            fr = first_ready.get(u)
+            c2r = (_ms(fr["ready_since"]) - _ms(fr["created"])) / 1000 if fr and fr["ready_since"] else None
+            new.append({**last[u], "first_ready_since": (fr or {}).get("ready_since"), "creation_to_ready_s": c2r})
+        ts = [self.since_ms] + [p["t_ms"] for p in self.polls]
+        gaps = [[a, b] for a, b in zip(ts, ts[1:]) if b - a > self.MAX_GAP_MS] if self.polls else [[self.since_ms, None]]
+        return {"new_pods": new, "readiness_lost": lost, "polls": len(self.polls), "failures": self.failures,
+                "coverage_gaps": gaps + [[f["t_ms"], f["what"]] for f in self.failures],
                 "creation_to_ready_s": sorted(x["creation_to_ready_s"] for x in new
                                               if x["creation_to_ready_s"] is not None)}
 
@@ -904,10 +990,19 @@ def startup_load_problems(c: Ctx, cfg: Dict, lines: List[str]) -> List[str]:
     except ValueError as e:
         return out + [f"the load records cannot be reduced: {e}"]
     for t in cfg["targets"]:
-        bad = [row["minute"] for row in r["targets"][t]["rows"]
-               if row["generator_state"] != "complete" or not row["generator"].get("dispatched")]
+        bad = []
+        for row in r["targets"][t]["rows"]:
+            g = row["generator"]
+            why = [] if row["generator_state"] == "complete" else [f"state {row['generator_state']}"]
+            why += [f"due {g.get('due')} of {row['intended']} scheduled"] if g.get("due") != row["intended"] else []
+            why += ["dropped"] if sum((g.get("dropped") or {}).values()) else []
+            why += ["unresolved outcomes"] if g.get("unresolved") else []
+            why += ["nothing dispatched"] if not g.get("dispatched") else []
+            if why:
+                bad.append((row["minute"], why))
         if bad:
-            out.append(f"{t}: minutes without a complete record of dispatched load: {bad[:8]}")
+            out.append(f"{t}: minutes without the full scheduled load, conserved carries, zero generator drops and "
+                       f"complete outcomes: {bad[:6]}")
     return out
 
 
@@ -976,6 +1071,7 @@ def run_startup(c: Ctx, reviewed: Dict, reviewed_digest: str, fetch: Fetch, api:
                     pull()
                     stops = live_stops(c, obs, fetch, api, baseline_s,
                                        c.kube.get("Job", job["metadata"]["name"], c.ns), cfg, lines, "startup")
+                    stops += [f"observation failed: {f['what']}" for f in timeline.failures]
                     if stops:
                         raise X.StagingError("STOP: " + "; ".join(stops))
                 next_check = 0.0
@@ -1021,24 +1117,31 @@ def run_startup(c: Ctx, reviewed: Dict, reviewed_digest: str, fetch: Fetch, api:
             except Exception as e:
                 st["problems"].append(f"terminal state or final log: {type(e).__name__}: {str(e)[:160]}")
         finally:
-            stopped_ok = False
+            stopped_ok, summ, load, ev_sha = False, {"new_pods": [], "creation_to_ready_s": [], "readiness_lost": [],
+                                                     "coverage_gaps": [], "polls": 0}, ["not evaluated"], None
+            doc = {"job": {}}
             try:
                 stop_load(c, rid)
                 stopped_ok = True
             finally:
-                summ = timeline.summary()
-                load = startup_load_problems(c, cfg, lines) if lines else ["no load records"]
-                doc = {"schema": "c28-startup-evidence/v1", "run": rid, "target": target, "uid": uid,
-                       "origin_utc": p["origin_utc"], "write_ms": st["write_ms"], "late_s": st["late_s"],
-                       "timeline": timeline.polls, "summary": summ, "load_problems": load,
-                       "stopped": st["stop"] or None, "problems": st["problems"],
-                       "job": {"status": st["status"], "exit_code": st["code"]}, "k6_lines": lines}
-                ev_sha = _write(os.path.join(out_dir, "evidence.json"), doc)
-                if stopped_ok:
-                    restore_to_twelve(c, ob)                      # raises (obligation open, fence kept) if unmet
+                try:
+                    summ = timeline.summary()
+                    load = startup_load_problems(c, cfg, lines) if lines else ["no load records"]
+                    doc = {"schema": "c28-startup-evidence/v1", "run": rid, "target": target, "uid": uid,
+                           "origin_utc": p["origin_utc"], "write_ms": st["write_ms"], "late_s": st["late_s"],
+                           "timeline": timeline.polls, "summary": summ, "load_problems": load,
+                           "stopped": st["stop"] or None, "problems": st["problems"],
+                           "job": {"status": st["status"], "exit_code": st["code"]}, "k6_lines": lines}
+                    ev_sha = _write(os.path.join(out_dir, "evidence.json"), doc)
+                except Exception as e:                        # evidence never blocks the restore
+                    st["problems"].append(f"evidence: {type(e).__name__}: {str(e)[:160]}")
+                finally:
+                    if stopped_ok:
+                        restore_to_twelve(c, ob)              # raises (obligation open, fence kept) if unmet
         n_new = len(summ["new_pods"])
         ok = not st["stop"] and not load and not st["problems"] and n_new == REPLICAS - STARTUP_LOW \
             and len(summ["creation_to_ready_s"]) == n_new and not summ["readiness_lost"] \
+            and not summ["coverage_gaps"] and ev_sha is not None \
             and doc["job"] == {"status": "Complete", "exit_code": 0}
         return X.receipt(c.record, HELPER, "startup-complete", {
             "run": rid, "plan_sha256": reviewed_digest, "measured": ok, "stopped": st["stop"] or None,
