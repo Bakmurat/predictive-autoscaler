@@ -282,3 +282,70 @@ def test_a_read_is_refused_before_any_write(make_record, tmp_path):  # noqa: F81
     assert kube.mutations == []
     with pytest.raises(X.StagingError, match="max-bytes"):
         L.read(rec, kube, out, max_bytes=L.MAX_BYTES_LIMIT + 1, run=fake_exec(b""), sleep=lambda s: None)
+
+
+FRESH = r'''
+import json, sys
+sys.path[:0] = [sys.argv[1], sys.argv[1] + "/tests"]
+import execlib as X          # a fresh process of ANOTHER helper: ledger_read is never imported here
+import fake2 as F
+import prepare  # noqa: F401
+assert "ledger_read" not in sys.modules
+api = F.FakeApi2()
+for o in json.load(open(sys.argv[3])):
+    api.put(o)
+rec = X.load_record(sys.argv[2])
+plan = X.recover_plan(rec, rec.kube(api=api))
+print(json.dumps([[a["op"], a["observed"]] for a in plan["actions"]]))
+'''
+
+
+def _stuck(make_record, tmp_path):  # noqa: F811
+    rec, params, s = demo_record(make_record)
+    a = StickyApi()
+    operator_pod(a, s)
+    kube = rec.kube(api=a)
+    f = tmp_path / "src.jsonl"
+    f.write_bytes(lines(3))
+    with pytest.raises(X.StagingError, match="still present"):
+        L.read(rec, kube, str(tmp_path / "l.jsonl"), run=fake_exec(run_script(f)), sleep=lambda s: None)
+    return rec, a
+
+
+def _reader_pods(a):
+    return [k for k, v in a.objects.items() if v["metadata"]["name"].startswith("c28-ledger-reader-")
+            and "containers" in (v.get("spec") or {})]
+
+
+def test_a_fresh_process_of_another_helper_decides_the_gone_intent(make_record, tmp_path):  # noqa: F811
+    rec, a = _stuck(make_record, tmp_path)
+
+    def fresh():
+        objs = tmp_path / "objects.json"
+        objs.write_text(json.dumps([v for v in a.objects.values() if v.get("kind")]))
+        p = subprocess.run([sys.executable, "-I", "-c", FRESH, os.path.dirname(os.path.dirname(__file__)) or ".",
+                            rec.path, str(objs)], capture_output=True, text=True, timeout=120,
+                           env=dict(os.environ, KUBECONFIG="/dev/null"))
+        assert p.returncode == 0, p.stderr[-2000:]
+        return json.loads(p.stdout.strip().splitlines()[-1])
+    assert [L.GONE_OP, "unresolved"] in fresh()               # blocked while the reader pod exists
+    for k in _reader_pods(a):
+        del a.objects[k]
+    assert [L.GONE_OP, "done"] in fresh()                     # decided once it is gone
+
+
+def test_the_cli_recovers_the_lock_only_after_the_pod_is_gone(make_record, tmp_path, capsys):  # noqa: F811
+    rec, a = _stuck(make_record, tmp_path)
+    PF.crash_owner(rec)
+    assert L.main(["--record", rec.path, "recover-plan"], api=a) == 0
+    saved = json.loads(capsys.readouterr().out)
+    with pytest.raises(X.StagingError, match="unresolved"):
+        L.main(["--record", rec.path, "recover", "--plan", saved["plan"], "--plan-digest", saved["plan_digest"]], api=a)
+    assert os.path.exists(X.lock_file(rec))
+    for k in _reader_pods(a):
+        del a.objects[k]
+    assert L.main(["--record", rec.path, "recover-plan"], api=a) == 0
+    saved = json.loads(capsys.readouterr().out)
+    assert L.main(["--record", rec.path, "recover", "--plan", saved["plan"], "--plan-digest", saved["plan_digest"]],
+                  api=a) == 0
+    assert not os.path.exists(X.lock_file(rec)) and not X.open_intents(X.receipts(rec, L.HELPER))

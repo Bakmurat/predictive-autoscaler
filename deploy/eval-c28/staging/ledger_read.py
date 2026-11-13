@@ -210,13 +210,15 @@ def operator_node(kube: X.Kube, params: Dict, section: Dict) -> Tuple[str, List[
 
 
 def _wait(fn: Callable[[], bool], seconds: float, sleep: Callable[[float], None]) -> bool:
-    end = time.monotonic() + seconds
+    """Poll every 2 s; the budget counts the slept time (so a test's no-op sleep needs no wall clock)."""
+    waited = 0.0
     while True:
         if fn():
             return True
-        if time.monotonic() >= end:
+        if waited >= seconds:
             return False
         sleep(2)
+        waited += 2
 
 
 def _ready(kube: X.Kube, ns: str, name: str) -> bool:
@@ -320,7 +322,7 @@ def read(record: X.Record, kube: X.Kube, out: str, offset: int = 0, max_bytes: i
     return data
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: Optional[List[str]] = None, api=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--record", required=True)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -329,16 +331,25 @@ def main(argv: Optional[List[str]] = None) -> int:
     r.add_argument("--out", required=True)
     r.add_argument("--offset", type=int, default=0)
     r.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
+    sub.add_parser("recover-plan", help="read-only: the held lock and every open intent, decided against the live state")
+    rc = sub.add_parser("recover", help="apply the reviewed recover plan (the lock's executor proven terminated)")
+    rc.add_argument("--plan", required=True)
+    rc.add_argument("--plan-digest", required=True)
     a = ap.parse_args(argv)
-    record = X.load_record(a.record, ("prepare",))
+    record = X.load_record(a.record, () if a.cmd.startswith("recover") else ("prepare",))
     if a.cmd == "render":
         s = prepare._section(record)
         params = prepare.load_params(record, prepare.stage_of(s))
         X.emit({"objects": render(params, s, "c28-ledger-reader-render", params["nodes"]["support"]),
                 "residency_problems": residency_problems(params)})
         return 0
-    kube = record.kube()
-    X.emit(read(record, kube, a.out, a.offset, a.max_bytes))
+    kube = record.kube(api)
+    if a.cmd == "recover-plan":
+        X.emit(X.cli_plan(record, "recover", X.recover_plan(record, kube), "recover-plan"))
+    elif a.cmd == "recover":
+        X.emit(X.recover(record, kube, X.load_plan(a.plan), a.plan_digest))
+    else:
+        X.emit(read(record, kube, a.out, a.offset, a.max_bytes))
     return 0
 
 
