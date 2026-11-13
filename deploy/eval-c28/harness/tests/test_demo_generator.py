@@ -118,7 +118,7 @@ def test_segment_end(tmp_path, start, end, why):
     ({"max_late_ms": 60_000}, "max_late_ms must be below one minute"),
     ({"schema": "c28-k6-plan/v1"}, "schema must be c28-demo-generator/v2"),
     ({"schema": "c28-demo-generator/v1"}, "schema must be c28-demo-generator/v2"),
-    ({"label": "production"}, "label must be demonstration or smoke"),
+    ({"label": "production"}, "label must be demonstration, smoke, admission or startup"),
     ({"days": 0}, "days must be an integer in 1..28"),
     ({"days": 29}, "days must be an integer in 1..28"),
     ({"days": 27}, "a demonstration has exactly 28 days"),
@@ -872,3 +872,82 @@ def test_a_constant_peak_smoke_schedule_holds_the_peak_and_is_never_a_demonstrat
     objs = demo.render(p, 15, None, True)["generator"]
     cm = next(o for o in objs if o["kind"] == "ConfigMap")
     assert json.loads(cm["data"][demo.GENERATOR_CONFIG])["program"]["kind"] == demo.CONSTANT_PEAK
+
+
+# --- the bounded pre-history profiles (ADMISSION-DESIGN draft 2) -----------------------------------------------------
+
+ODD = ORIGIN + 17 * 3600_000 + 23 * MIN
+
+
+@pytest.mark.parametrize("label, seg, names", [("admission", 40, [N, R]), ("startup", 15, [R])])
+def test_a_bounded_profile_is_one_constant_peak_segment_on_its_targets(tmp_path, label, seg, names):
+    p = params()
+    cfg = demo.bounded_config(p, label, ODD)
+    peak = max(max(row) for row in demo.day_table(p))
+    assert cfg["per_minute_days"] == [[peak] * 1440] and cfg["days"] == 1 and cfg["segment_minutes"] == seg
+    assert cfg["targets"] == names and cfg["program"]["kind"] == demo.CONSTANT_PEAK and demo.config_problems(cfg) == []
+    assert demo.bounded_deadline_s(label) == 300 + seg * 60 + 180
+    other = "startup" if label == "admission" else "admission"
+    assert demo.config_problems(edited(cfg, label=other))                  # the other profile's shape is refused
+    assert demo.config_problems(edited(cfg, label="demonstration"))
+    _, out = run(tmp_path, [], ODD, cfg=cfg, probes=[
+        {"fn": "check", "override": {}},
+        {"fn": "check", "override": {"label": other}},
+        {"fn": "check", "override": {"segment_minutes": seg + 1}},
+        {"fn": "check", "override": {"program": dict(cfg["program"], kind="ordinary")}},
+        {"fn": "check", "cells": [[0, 700, peak - 1]]},
+        {"fn": "check", "override": {"label": "demonstration"}}])
+    ok, swapped, longer, ordinary, uneven, demonstration = out["functions"]
+    assert ok["ok"] is True
+    for bad in (swapped, longer, ordinary, uneven):
+        assert bad["ok"] is False and "constant-peak, one day" in bad["error"], bad
+    assert demonstration["ok"] is False and "UTC midnight" in demonstration["error"]
+    with pytest.raises(demo.R.ParamsError, match="whole minute"):
+        demo.bounded_config(p, label, ODD + 1_000)
+
+
+def test_an_admission_run_stops_at_its_segment_end_and_never_restarts(tmp_path):
+    cfg = demo.bounded_config(params(), "admission", ODD)
+    _, out = run(tmp_path, [{"pod_uid": "pod-a", "start_ms": ODD - 3 * MIN}], ODD + 60 * MIN, cfg=cfg)
+    for t in (N, R):
+        ls = minutes(out, t)
+        assert [l["minute"] for l in ls] == list(range(40)), t                 # exactly the 40 minutes, then nothing
+        for l in ls:
+            identity(l)
+            assert l["intended"] == cfg["per_minute_days"][0][0]
+    assert out["sends"][N] == out["sends"][R] == 40 * cfg["per_minute_days"][0][0]
+
+
+def test_lat_all_counts_every_outcome_and_a_timeout_lands_in_the_top_bucket(tmp_path):
+    fault = [{"target": N, "from_ms": PEAK + MIN, "to_ms": PEAK + 2 * MIN, "mode": "timeout"},
+             {"target": R, "from_ms": PEAK + MIN, "to_ms": PEAK + 2 * MIN, "mode": "status", "status": 503}]
+    _, out = run(tmp_path, [{"pod_uid": "pod-a", "start_ms": PEAK}], PEAK + 4 * MIN, faults=fault)
+    for t in (N, R):
+        for l in minutes(out, t):
+            identity(l)
+            assert sum(l["lat"]["all"]) == l["ok"] + l["failed"], l             # every resolved outcome, once
+    timed_out = minutes(out, N)[1]
+    above_500 = sum(timed_out["lat"]["all"][demo.LATENCY_BOUNDS_MS.index(500) + 1:])
+    assert timed_out["ok"] == 0 and above_500 == timed_out["failed"] > 0     # every timeout counts above 500 ms
+    refused = minutes(out, R)[1]
+    assert refused["ok"] == 0 and sum(refused["lat"]["all"]) == refused["failed"] > 0
+
+
+@pytest.mark.parametrize("label", ["admission", "startup"])
+def test_a_bounded_profile_renders_a_finite_job_never_a_statefulset(label):
+    p = params()
+    cm, job = demo.bounded_objects(p, label, ODD)
+    assert (cm["kind"], job["kind"]) == ("ConfigMap", "Job") and cm["metadata"]["name"] == job["metadata"]["name"]
+    spec, pod = job["spec"], job["spec"]["template"]["spec"]
+    assert spec["backoffLimit"] == 0 and "ttlSecondsAfterFinished" not in spec and pod["restartPolicy"] == "Never"
+    assert spec["activeDeadlineSeconds"] == demo.bounded_deadline_s(label)
+    assert pod["automountServiceAccountToken"] is False
+    sts = next(o for o in demo.generator_objects(p) if o["kind"] == "StatefulSet")["spec"]["template"]["spec"]
+    for k in ("affinity", "tolerations", "securityContext"):
+        assert pod.get(k) == sts.get(k), k                                   # the generator's placement and identity
+    assert pod["containers"][0]["image"] == sts["containers"][0]["image"]
+    assert pod["containers"][0]["resources"] == sts["containers"][0]["resources"]
+    cfg = json.loads(cm["data"][demo.GENERATOR_CONFIG])
+    assert cfg["label"] == label and demo.config_problems(cfg) == []
+    assert job["spec"]["template"]["metadata"]["annotations"]["c28.devkuban.com/generator-config"] == cfg["digest"]
+    assert job["metadata"]["labels"][demo.COMPONENT_LABEL] == label

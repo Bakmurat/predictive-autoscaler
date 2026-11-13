@@ -592,6 +592,20 @@ def generator_problems(record: X.Record, kube: X.Kube, params: Dict, parts: Dict
     if ing is None or live is None or live["metadata"]["uid"] != ing["uid"]:
         out.append(f"Deployment {ns}/c28-ingress was not created by this run or was replaced (phase common first)")
     mine = {(r["kind"], r["name"]) for r in ours}
+    # The bounded workloads' fence (bounded.py): never beside an admission or startup Job, its pod (Terminating
+    # included) or an unresolved bounded intent.
+    for lab in ("admission", "startup"):
+        name = c28.demo.bounded_name(lab)
+        for kind in ("Job", "Pod", "ConfigMap"):
+            for o in kube.list(kind, ns, labels={"app.kubernetes.io/name": name}, strict=True):
+                out.append(f"a bounded {lab} workload exists: {kind} {ns}/{o['metadata']['name']} (one generator-like "
+                           "workload at a time)")
+    if X.open_intents(X.receipts(record, "bounded")):
+        out.append("bounded.py has intents with unknown outcomes: recover first")
+    bes = X.receipts(record, "bounded")
+    closed = {e["data"]["run"] for e in bes if e["event"] == "restore-closed"}
+    if any(e["event"] == "restore-obligation" and e["data"]["run"] not in closed for e in bes):
+        out.append("a bounded startup restore obligation is open: bounded.py plan-restore / restore first")
     label = {"app.kubernetes.io/name": c28.demo.GENERATOR_NAME}
     for kind in ("Deployment", "StatefulSet", "Pod"):
         for o in kube.list(kind, ns, labels=label, strict=True):

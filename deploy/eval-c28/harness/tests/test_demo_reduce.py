@@ -819,6 +819,7 @@ def test_due_must_be_exactly_the_scheduled_arrivals_of_the_active_span(tmp_path,
         line["dispatched"] += delta
         line["ok"] += delta
         line["lat"]["counts"][2] += delta
+        line["lat"]["all"][2] += delta
         assert line["due"] == line["dispatched"] == line["ok"] == sum(line["lat"]["counts"])
         red = DR.reduce(cfg, recs, out["ingress"], PEAK - 3 * MIN, PEAK + 9 * MIN)
         row = {r["minute"] - BASE: r for r in red["targets"][N]["rows"]}[k]
@@ -1052,6 +1053,7 @@ def test_a_carry_must_be_matched_by_the_next_line_of_the_same_incarnation(tmp_pa
     nxt["dispatched"] -= 1
     nxt["ok"] -= 1
     nxt["lat"]["counts"][2] -= 1
+    nxt["lat"]["all"][2] -= 1
     assert DR._line_problems(cfg, nxt) == []
     got = rows(reduced(cfg, out, records=recs))
     for k in (1, 2):
@@ -1075,6 +1077,7 @@ def test_a_carry_must_be_matched_by_the_next_line_of_the_same_incarnation(tmp_pa
         l["dispatched"] += 3 if idx == 0 else -3
         l["ok"] += 3 if idx == 0 else -3
         l["lat"]["counts"][2] += 3 if idx == 0 else -3
+        l["lat"]["all"][2] += 3 if idx == 0 else -3
         assert DR._line_problems(cfg2, l) == []
         red = DR.reduce(cfg2, recs, out2["ingress"], PEAK, PEAK + 2 * MIN)
         row = red["targets"][N]["rows"][k]

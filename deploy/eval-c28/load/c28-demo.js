@@ -126,13 +126,15 @@ function checkConfig(cfg, sha256hex) {
   const fail = (why) => { throw new Error(`c28-demo config: ${why}`); };
   const int = (v, lo, hi) => Number.isInteger(v) && v >= lo && v <= hi;
   if (!cfg || cfg.schema !== 'c28-demo-generator/v2') fail('schema must be c28-demo-generator/v2');
-  if (cfg.label !== 'demonstration' && cfg.label !== 'smoke') fail('label must be demonstration or smoke');
+  if (!['demonstration', 'smoke', 'admission', 'startup'].includes(cfg.label)) {
+    fail('label must be demonstration, smoke, admission or startup');
+  }
   if (cfg.minute_ms !== 60000 || cfg.day_minutes !== 1440) fail('minute_ms must be 60000 and day_minutes 1440');
-  // The origin is a UTC midnight. SMOKE ONLY: a configuration labelled "smoke" may start on any whole minute, so a
-  // smoke can put a day boundary of the table a few minutes ahead; a "demonstration" can never use that.
+  // The origin is a UTC midnight. A "smoke", "admission" or "startup" configuration may start on any whole minute;
+  // a "demonstration" never.
   if (!int(cfg.origin_ms, 0, 4102444800000) || cfg.origin_ms % cfg.minute_ms !== 0 ||
-      (cfg.origin_ms % 86400000 !== 0 && cfg.label !== 'smoke')) {
-    fail('origin_ms must be a UTC midnight (a whole minute only under the label smoke)');
+      (cfg.origin_ms % 86400000 !== 0 && cfg.label === 'demonstration')) {
+    fail('origin_ms must be a UTC midnight (a whole minute only under the labels smoke, admission and startup)');
   }
   if (!int(cfg.days, 1, 28)) fail('days must be an integer in 1..28');
   if (cfg.label === 'demonstration' && cfg.days !== 28) fail('a demonstration has exactly 28 days');
@@ -167,6 +169,21 @@ function checkConfig(cfg, sha256hex) {
   if (!Array.isArray(cfg.latency_bounds_ms) || cfg.latency_bounds_ms.length < 1 || cfg.latency_bounds_ms.length > 32 ||
       !cfg.latency_bounds_ms.every((b, i, a) => int(b, 1, 600000) && (i === 0 || b > a[i - 1]))) {
     fail('latency_bounds_ms must be increasing');
+  }
+  // The two bounded pre-history profiles (ADMISSION-DESIGN draft 2): one day row held at one count (constant-peak), a
+  // single segment of fixed length, and a fixed target count: admission = both targets for 40 minutes, startup = one
+  // target for 15 minutes. Neither label accepts the other's shape.
+  const PROFILES = { admission: { segment: 40, targets: 2 }, startup: { segment: 15, targets: 1 } };
+  if (cfg.label in PROFILES) {
+    const pr = PROFILES[cfg.label];
+    const row = cfg.per_minute_days[0];
+    if (!cfg.program || cfg.program.kind !== 'constant-peak' || cfg.days !== 1 || !row.every((n) => n === row[0]) ||
+        row[0] < 1 || cfg.segment_minutes !== pr.segment || cfg.targets.length !== pr.targets) {
+      fail(`a ${cfg.label} configuration is constant-peak, one day, a ${pr.segment}-minute segment and ` +
+        `${pr.targets} target(s)`);
+    }
+  } else if (cfg.program && cfg.program.kind === 'constant-peak' && cfg.label !== 'smoke') {
+    fail('constant-peak is a smoke, admission or startup schedule');
   }
   if (typeof cfg.run_id !== 'string' || typeof cfg.digest !== 'string') fail('run_id and digest are required');
   if (typeof sha256hex !== 'function') fail('no SHA-256 function: the configuration cannot be verified');
@@ -270,7 +287,8 @@ function createGenerator(cfg, index, shared, deps) {
     let r = minutes.get(m);
     if (!r) {
       r = { due: 0, dispatched: 0, in: 0, out: 0, late: 0, inflight: 0, end: 0, ok: 0, failed: 0, failed_by: {},
-        lat: new Array(B + 1).fill(0), lat_max: 0, late_max: 0, clock: null, probe_clock: null };
+        lat: new Array(B + 1).fill(0), lat_all: new Array(B + 1).fill(0), lat_max: 0, late_max: 0, clock: null,
+        probe_clock: null };
       minutes.set(m, r);
     }
     return r;
@@ -299,10 +317,13 @@ function createGenerator(cfg, index, shared, deps) {
     if (ok) cum.ok += 1; else cum.failed += 1;
     const r = minutes.get(mDispatch);
     if (!r) { cum.late_completions += 1; return; }    // its minute's line is already written
+    // Every workload outcome (a failure or a timeout too; never a clock probe) in lat_all: the admission criteria are
+    // fractions of ALL outcomes above 200 and 500 ms. lat (successes only) is kept as before.
+    let b = 0;
+    while (b < B && durationMs > cfg.latency_bounds_ms[b]) b += 1;
+    r.lat_all[b] += 1;
     if (ok) {
       r.ok += 1;
-      let b = 0;
-      while (b < B && durationMs > cfg.latency_bounds_ms[b]) b += 1;
       r.lat[b] += 1;
       if (durationMs > r.lat_max) r.lat_max = durationMs;
     } else {
@@ -373,7 +394,7 @@ function createGenerator(cfg, index, shared, deps) {
       due: r.due, dispatched: r.dispatched, carried: [r.in, r.out],
       dropped: { late: r.late, inflight: r.inflight, segment_end: r.end },
       ok: r.ok, failed: r.failed, failed_by: r.failed_by, unresolved: r.dispatched - r.ok - r.failed,
-      lat: { counts: r.lat, max_ms: Math.round(r.lat_max) }, late_max_ms: Math.round(r.late_max), clock: r.clock,
+      lat: { counts: r.lat, all: r.lat_all, max_ms: Math.round(r.lat_max) }, late_max_ms: Math.round(r.late_max), clock: r.clock,
       probe_clock: r.probe_clock,
       cum: cumNow() });
     seq += 1;
@@ -534,8 +555,12 @@ export function run(shared) {
     count: (name, tags, n) => counters[name].add(n === undefined ? 1 : n, tags),
     send: (url, _timeoutMs, done) => {
       const t0 = Date.now();
+      // A request without a response (status 0: a timeout, a reset) has no meaningful timings.duration: its latency is
+      // the wall time it took, so a timeout lands in the top bucket of lat_all, never the lowest.
       http.asyncRequest('GET', url, null, { timeout, tags: { name: 'work', c28_target: cfg.targets[index] } }).then(
-        (res) => done(res.status || 0, res.timings ? res.timings.duration : Date.now() - t0,
+        (res) => done(res.status || 0,
+          (res.status && res.timings) ? res.timings.duration : Math.max(res.timings ? res.timings.duration : 0,
+            Date.now() - t0),
           res.headers ? res.headers.Date : undefined),
         () => done(0, Date.now() - t0, undefined),
       );
