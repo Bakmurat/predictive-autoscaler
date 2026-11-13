@@ -626,6 +626,7 @@ PY
 shadow_self_test() {
   local dir bad=0 f want rc kind write="$RELEASE_FULLNAME-operator-write"
   dir="$(mktemp -d)"
+  "$PY" "$ROOT/deploy/eval-c28/smoke/shadow_checks.py" selftest | sed 's/^/render-only: /' || bad=1   # S6 + S7 (pipefail)
   c28 release-values --params "$PARAMS" --out "$dir/release-values.yaml" || bad=1
   for kind in default shadow; do
     smoke_values "{repository: smoke.invalid/operator, tag: self-test}" "{repository: smoke.invalid/forecaster, tag: self-test}" \
@@ -1636,7 +1637,9 @@ print(urllib.request.urlopen(sys.argv[1], timeout=5, context=ctx).read().decode(
   }
   # S6. One Recommend autoscaler at the demonstration's validated profile, rendered by the stage itself (explicit 60/60,
   # minimum lead 600 s, [seasonalNaive], default trust and calibration), on a target of its own. Within a smoke it has
-  # no history: a reason of insufficient history or data is expected; a configuration refusal is not.
+  # no history: the service's own answer for it with a reason of insufficient history or data is expected
+  # (shadow_checks.py: an issued, untrusted forecast or the service's 503 body); a transport or TLS failure, a refused
+  # request, the registration limit or a configuration refusal is not (Codex, review of 9ade750).
   VALID=c28-validated
   k -n "$NS" get deploy c28-pa-n-s20 -o json | "$PY" -c '
 import json, sys
@@ -1666,40 +1669,24 @@ print(json.dumps(pa))' "$NS" "$VALID" "$RUN_LABEL_VALUE" > "$WORK/validated-pa.j
   k apply -f "$WORK/validated-pa.json" >/dev/null || die "S6. applying the validated-profile autoscaler"
   validated_seen() {
     k -n "$NS" get pa "$VALID" -o json > "$WORK/validated-pa-live.json" 2>/dev/null || return 1
-    "$PY" - "$WORK/validated-pa-live.json" "$ROOT/ml-engine" <<'PY'
-import json, sys
-sys.path.insert(0, sys.argv[2])
-from forecasting import contracts as c
-pa = json.load(open(sys.argv[1]))
-st = pa.get("status") or {}
-ready = next((x for x in st.get("conditions", []) if x["type"] == "PredictionReady"), None)
-lead = ((st.get("prediction") or {}).get("lead") or {})
-if ready is None or not lead:
-    sys.exit(1)                                            # not decided yet
-settings = c.resolve_settings(pa)
-sel, why = c.resolve_lead(pa, settings, pa["metadata"]["generation"])
-bad = []
-if sel is None or sel.lead_seconds != 600:
-    bad.append(f"resolved lead {None if sel is None else sel.lead_seconds} ({why})")
-if c.validated_profile(settings, 600) is None:
-    bad.append("the live object is not the validated profile")
-if ready["reason"] in ("ConfigurationNotValidated", "SettingsInvalid", "LeadInsufficient"):
-    bad.append(f"PredictionReady {ready['status']}/{ready['reason']}: {ready.get('message')}")
-json.dump({"reason": ready["reason"], "status": ready["status"], "lead": lead, "problems": bad},
-          open(sys.argv[1] + ".verdict.json", "w"), indent=1)
-sys.exit(2 if bad else 0)
-PY
+    "$PY" "$ROOT/deploy/eval-c28/smoke/shadow_checks.py" validated "$WORK/validated-pa-live.json" "$ROOT/ml-engine" \
+      "$WORK/validated-pa-live.json.verdict.json"
   }
   rc=1; for _ in $(seq 1 30); do rc=0; validated_seen || rc=$?; [ "$rc" = 1 ] || break; sleep 10; done
   [ "$rc" = 0 ] || die "S6. the validated-profile autoscaler: $(cat "$WORK/validated-pa-live.json.verdict.json" 2>/dev/null || echo 'no decision within 300 s')"
-  pass "S6. a Recommend autoscaler at the demonstration's validated profile resolves to it (lead 600 s) and is not refused for its configuration: PredictionReady $(cut -c1-200 "$WORK/validated-pa-live.json.verdict.json" | tr -d '\n ')"
+  pass "S6. a Recommend autoscaler at the demonstration's validated profile resolves to it (lead 600 s) and the forecast service answered for it with a history or data reason: $(cut -c1-200 "$WORK/validated-pa-live.json.verdict.json" | tr -d '\n ')"
 
   # S7. Health and writes: the operator and the forecaster Ready without restarts; the forecaster's journal healthy;
   # no confirmed scale write; the operator's calculated count for the shadow arm is the ledger's last decision.
+  # Every pod of each component (the count its Deployment asks for) and every container of each pod; the pod JSON is
+  # kept as evidence.
   for comp in operator forecaster; do
-    read -r ready restarts <<<"$(k -n "$CTRL" get pods -l "app.kubernetes.io/instance=pa-eval,app.kubernetes.io/component=$comp" \
-      -o jsonpath='{range .items[*]}{.status.containerStatuses[0].ready} {.status.containerStatuses[0].restartCount}{"\n"}{end}' | head -1)"
-    [ "$ready" = true ] && [ "$restarts" = 0 ] || die "S7. $comp ready '$ready', restarts '$restarts'"
+    want="$(k -n "$CTRL" get deploy "$RELEASE_FULLNAME-$comp" -o jsonpath='{.spec.replicas}')" || die "S7. reading $comp's Deployment"
+    [ -n "$want" ] && [ "$want" -ge 1 ] || die "S7. $comp's Deployment asks for '$want' replicas"
+    k -n "$CTRL" get pods -l "app.kubernetes.io/instance=pa-eval,app.kubernetes.io/component=$comp" -o json \
+      > "$WORK/s7-$comp-pods.json" || die "S7. reading $comp's pods"
+    found="$("$PY" "$ROOT/deploy/eval-c28/smoke/shadow_checks.py" pods "$WORK/s7-$comp-pods.json" "$want" "$comp")" \
+      || die "S7. $comp: $found"
   done
   fetch_text "$CTRL" "deploy/$RELEASE_FULLNAME-operator" 19271 8080 /metrics > "$WORK/operator-metrics.txt"
   fetch_text "$CTRL" "deploy/$RELEASE_FULLNAME-forecaster" 19272 8443 /metrics https > "$WORK/forecaster-metrics.txt"
@@ -1737,7 +1724,7 @@ print(json.dumps({"applied_writes": applied, "calculated": calc,
                   "problems": bad}))
 sys.exit(1 if bad else 0)
 PY
-  pass "S7. operator and forecaster Ready with 0 restarts, journal healthy, 0 confirmed scale writes, and $SHADOW_ARM's calculated_replicas equals the ledger's last decision: $(cut -c1-240 "$WORK/shadow-health.json")"
+  pass "S7. every operator and forecaster pod and container Ready with 0 restarts, journal healthy, 0 confirmed scale writes, and $SHADOW_ARM's calculated_replicas equals the ledger's last decision: $(cut -c1-240 "$WORK/shadow-health.json")"
 
   # S8. After the metrics outage (check 5) telemetry and recommendations resumed: the shadow arm's ledger has measured
   # decisions after the outage's end, and its TelemetryAvailable condition is True now.
