@@ -237,3 +237,110 @@ def test_a_fresh_process_of_another_helper_decides_the_bounded_gone_step(world, 
               and v.get("kind") == "Pod"]:
         del a.objects[k]
     assert [B.GONE_OP, "done"] in fresh()
+
+
+# --- the startup step ---------------------------------------------------------------------------------------------------
+
+def _ts(ms):
+    return datetime.fromtimestamp(ms / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class StartupApi(JobApi):
+    """A /scale write makes the target's labelled pods match the count at once: removed ones vanish, new ones are
+    created now and become Ready 20 s later (the Ready condition's lastTransitionTime)."""
+
+    fail_restore = False
+
+    def _scale(self, o, body):
+        want, name = body["spec"]["replicas"], o["metadata"]["name"]
+        if self.fail_restore and want == 12:
+            raise X.C.ApiError("scale refused", 403) if hasattr(X, "C") else Exception("scale refused")
+        out = super()._scale(o, body)
+        mine = sorted(k for k, v in self.objects.items() if k[0] == "pods"
+                      and (v["metadata"].get("labels") or {}).get("c28.devkuban.com/target") == name)
+        for k in mine[want:]:
+            del self.objects[k]
+        for i in range(len(mine), want):
+            p = F.pod(f"{name}-n{i:02d}", "demo", "worker-w", labels={"c28.devkuban.com/target": name, X.RUN_LABEL: DEMO})
+            p["metadata"]["creationTimestamp"] = _ts(self.clock.ms)
+            p["status"]["conditions"] = [{"type": "PodScheduled", "status": "True", "lastTransitionTime": _ts(self.clock.ms)},
+                                         {"type": "Ready", "status": "True",
+                                          "lastTransitionTime": _ts(self.clock.ms + 20_000)}]
+            p["status"]["containerStatuses"] = [{"name": "fixture", "restartCount": 0,
+                                                 "state": {"running": {"startedAt": _ts(self.clock.ms + 5_000)}}}]
+            self.put(p)
+        return out
+
+
+def _startup(world, passed=True, **kw):  # noqa: F811
+    record, kube, base = ready_world(world)
+    clock = Clock(O_MS - 180_000)
+    a = StartupApi(base, clock, O_MS + 15 * 60_000 + 40_000, **kw)
+    kube = record.kube(api=a)
+    if passed:
+        X.receipt(record, B.HELPER, "run-complete", {"run": "a-x", "verdict": "PASS"})
+    c = B.Ctx(record, kube, now=clock.now, sleep=clock.sleep)
+    p = B.plan_startup(c, ORIGIN)
+    saved = X.save_plan(record, B.HELPER, p, "plan-startup")
+    return record, kube, a, clock, c, X.load_plan(saved["plan"]), saved["plan_digest"]
+
+
+def test_startup_requires_the_admission_pass(world):  # noqa: F811
+    *_, p, d = _startup(world, passed=False)
+    assert any("requires the admission exercise's PASS" in x for x in p["problems"])
+
+
+def test_a_startup_step_scales_down_idle_measures_the_scale_up_and_meets_its_obligation(world):  # noqa: F811
+    record, kube, a, clock, c, p, d = _startup(world)
+    assert p["problems"] == [], p["problems"] and p["target"] == R
+    out = B.run_startup(c, p, d, logs=lambda c_, pod: [])
+    data = out["data"]
+    assert data["measured"] is True and data["stopped"] is None, data
+    assert data["creation_to_ready_s"] == [20.0] * 6
+    es = [e["event"] for e in X.receipts(record, B.HELPER)]
+    assert es.index("restore-obligation") < es.index("scale-write") and "restore-closed" in es
+    assert a.obj("Deployment", R, "demo")["spec"]["replicas"] == 12
+    assert not B.open_obligations(record) and not os.path.exists(X.lock_file(record))
+    ops = [(m["op"], m["kind"]) for m in kube.mutations]
+    assert ops[0] == (B.SCALE_OP, "Deployment") and ops[1:3] == [("create", "ConfigMap"), ("create", "Job")]
+    assert ops.count((B.SCALE_OP, "Deployment")) == 2
+
+
+def test_a_void_startup_still_stops_the_load_and_restores_twelve(world):  # noqa: F811
+    record, kube, a, clock, c, p, d = _startup(world, never_running=True)
+    out = B.run_startup(c, p, d, logs=lambda c_, pod: [])
+    assert "VOID" in out["data"]["stopped"] and out["data"]["measured"] is False
+    assert a.obj("Deployment", R, "demo")["spec"]["replicas"] == 12 and not B.open_obligations(record)
+    assert not [k for k in a.objects if k[0] in ("jobs", "configmaps") and "startup" in k[2]]
+
+
+def test_an_unmet_obligation_keeps_every_fence_until_restore(world):  # noqa: F811
+    record, kube, a, clock, c, p, d = _startup(world, never_running=True)
+    a.fail_restore = True
+    with pytest.raises(Exception):
+        B.run_startup(c, p, d, logs=lambda c_, pod: [])
+    assert B.open_obligations(record) and a.obj("Deployment", R, "demo")["spec"]["replicas"] == 6
+    assert any("restore obligation is open" in x for x in B.fence_problems(c))
+    assert any("restore obligation is open" in x
+               for x in prepare.plan(record, kube, "generator", now=lambda: "2026-11-11T00:00:00Z")["problems"])
+
+
+def test_after_a_failed_restore_recover_then_restore_meets_the_obligation(world):  # noqa: F811
+    import part2_fixtures as PF
+    record, kube, a, clock, c, p, d = _startup(world, never_running=True)
+    a.fail_restore = True
+    with pytest.raises(Exception):
+        B.run_startup(c, p, d, logs=lambda c_, pod: [])
+    a.fail_restore = False
+    if os.path.exists(X.lock_file(record)):
+        PF.crash_owner(record)
+        rp = X.recover_plan(record, kube)
+        saved = X.save_plan(record, "recover", rp, "recover-plan")
+        X.recover(record, kube, X.load_plan(saved["plan"]), saved["plan_digest"])
+    assert B.open_obligations(record)                                  # recover decides intents, never mutates
+    rp = B.plan_restore(c)
+    assert rp["problems"] == [] and rp["obligations"][0]["replicas"] == 6
+    saved = X.save_plan(record, B.HELPER, rp, "plan-restore")
+    B.restore(c, X.load_plan(saved["plan"]), saved["plan_digest"])
+    assert not B.open_obligations(record) and a.obj("Deployment", R, "demo")["spec"]["replicas"] == 12
+    assert not B.fence_problems(c) or all("restore obligation" not in x for x in B.fence_problems(c))

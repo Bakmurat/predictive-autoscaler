@@ -300,7 +300,8 @@ def _expect_holds(obj: Dict, expect: List) -> bool:
 RECONCILERS: Dict[str, Callable[["Kube", Dict, Optional["Record"]], Dict]] = {}
 # Helper-defined ops whose reconciler lives in a module another helper's process may not have loaded: recover (from any
 # helper's CLI) imports it on demand, so an open intent of that op is never left "no reconciler loaded".
-RECONCILER_MODULES: Dict[str, str] = {"ledger-reader-gone": "ledger_read", "bounded-pod-gone": "bounded"}
+RECONCILER_MODULES: Dict[str, str] = {"ledger-reader-gone": "ledger_read", "bounded-pod-gone": "bounded",
+                                       "startup-scale": "bounded"}
 
 
 def reconcile(kube: "Kube", d: Dict, record: Optional["Record"] = None) -> Dict:

@@ -5,7 +5,17 @@
   bounded.py --record R run-admission --plan F --plan-digest D           create, observe, collect, judge, clean up
   bounded.py --record R recover-plan | recover --plan F --plan-digest D
 
-(The startup step is added by the next slice; its label is already fenced here.)
+  bounded.py --record R plan-startup --origin <UTC whole minute>        read-only (requires the admission PASS)
+  bounded.py --record R run-startup --plan F --plan-digest D             12 -> 6 idle, peak load, 6 -> 12, measure
+
+The startup step (section 4, Review 1 item 6): the restore obligation (the reactive target's UID back to 12) is a
+receipt written BEFORE the first write; 12 -> 6 while idle (journalled /scale with the resourceVersion read just
+before, then 6 Ready); the startup Job (one target, 15 minutes, constant peak); at origin + 60 s (at most 15 s late)
+6 -> 12; each new pod's created / scheduled / started / Ready; then cleanup, and the obligation met (same UID at 12
+Ready) before it closes. restore meets every open obligation (stop the load, prove it gone, restore 12); it never starts a
+workload. An unmet obligation or an unproven disappearance keeps the fence.
+After an interruption: recover-plan / recover decide the open intents, then plan-restore / restore meet every open
+obligation (as session.py's restore); until then every bounded plan and prepare's generator phase refuse.
 
 The admission exercise is ONE Job (demo.bounded_objects, label admission): both targets at the 28-day table's maximum
 for 40 minutes (10 settling, 30 measured), restartPolicy Never, backoffLimit 0, a deadline of 5 min before the origin
@@ -94,7 +104,7 @@ class Ctx:
 
 # --- the shared fence -------------------------------------------------------------------------------------------------
 
-def fence_problems(c: Ctx) -> List[str]:
+def fence_problems(c: Ctx, own_run: Optional[str] = None) -> List[str]:
     """Any generator-like workload in the namespace, by name label or component, a Terminating pod included, or any
     unresolved intent of this helper or prepare's: refuse. Listings are strict (a failed list is never "none")."""
     out = []
@@ -108,6 +118,8 @@ def fence_problems(c: Ctx) -> List[str]:
     for h in (HELPER, "prepare"):
         if X.open_intents(X.receipts(c.record, h)):
             out.append(f"{h} has intents with unknown outcomes: recover first")
+    if [o for o in open_obligations(c.record) if o["run"] != own_run]:      # the caller's own obligation excepted
+        out.append("a startup restore obligation is open: bounded.py plan-restore / restore first")
     return out
 
 
@@ -512,6 +524,262 @@ def run_admission(c: Ctx, reviewed: Dict, reviewed_digest: str, fetch: Fetch, ap
                                                              "stopped": stop_reason or None})
 
 
+# --- the startup step (ADMISSION-DESIGN section 4 + Review 1 item 6) ---------------------------------------------------
+
+SCALE_OP = "startup-scale"
+STARTUP_WRITE_AT_S, STARTUP_LATE_S, STARTUP_LOW = 60, 15, 6
+
+
+def admission_passed(c: Ctx) -> Optional[Dict]:
+    done = [e["data"] for e in X.receipts(c.record, HELPER) if e["event"] == "run-complete"
+            and (e["data"].get("label") or "admission") == "admission"]
+    return done[-1] if done and done[-1]["verdict"] == "PASS" else None
+
+
+def open_obligations(c_or_record) -> List[Dict]:
+    record = getattr(c_or_record, "record", c_or_record)
+    es = X.receipts(record, HELPER)
+    closed = {e["data"]["run"] for e in es if e["event"] == "restore-closed"}
+    return [e["data"] for e in es if e["event"] == "restore-obligation" and e["data"]["run"] not in closed]
+
+
+def plan_startup(c: Ctx, origin_utc: str) -> Dict:
+    origin = _ms(origin_utc)
+    objs = c.c28.demo.bounded_objects(c.params, "startup", origin)
+    cfg = json.loads(objs[0]["data"][c.c28.demo.GENERATOR_CONFIG])
+    parts = c.parts_with(objs)
+    problems = prepare.admission_problems(c.record, c.params, c.s, parts)
+    gate, gp = prepare.demonstration_gate(c.record, c.kube, c.params, c.s, parts)
+    problems += gp + fence_problems(c)
+    targets, tp = _targets_state(c)
+    problems += tp
+    passed = admission_passed(c)
+    if passed is None:
+        problems.append("the startup step requires the admission exercise's PASS (the last run-complete)")
+    if open_obligations(c):
+        problems.append("an earlier startup's restore obligation is open: recover first")
+    lead = (origin - c.now()) / 1000
+    if not ORIGIN_MIN_S <= lead <= ORIGIN_MAX_S + 600:
+        problems.append(f"the origin is {lead:.0f} s ahead; it must be {ORIGIN_MIN_S}..{ORIGIN_MAX_S} s ahead at apply")
+    target = cfg["targets"][0]
+    actions = [{"create": o["kind"], "namespace": c.ns, "name": o["metadata"]["name"], "sha256": X.json_digest(o)}
+               for o in objs]
+    actions += [{"scale": target, "from": REPLICAS, "to": STARTUP_LOW, "when": "before the origin, idle"},
+                {"scale": target, "from": STARTUP_LOW, "to": REPLICAS, "when": f"origin + {STARTUP_WRITE_AT_S} s"}]
+    return X.new_plan(HELPER, c.record, actions, problems=problems, label="startup", origin_utc=origin_utc,
+                      config_digest=cfg["digest"], target=target, targets=targets, reservation_gate=gate,
+                      admission=(passed or {}).get("run"), deadline_s=c.c28.demo.bounded_deadline_s("startup"))
+
+
+def _converged(c: Ctx, name: str, uid: str, n: int) -> bool:
+    dep = c.kube.get("Deployment", name, c.ns)
+    if dep is None or dep["metadata"]["uid"] != uid:
+        raise X.StagingError(f"{name} is gone or replaced")
+    if int(dep["spec"].get("replicas") or 0) != n:
+        raise X.StagingError(f"{name}'s desired count changed to {dep['spec'].get('replicas')}: another writer")
+    pods = [p for p in c.kube.list("Pod", c.ns, strict=True)
+            if (p["metadata"].get("labels") or {}).get("c28.devkuban.com/target") == name]
+    ready = [p for p in pods if not p["metadata"].get("deletionTimestamp") and any(
+        x.get("type") == "Ready" and x.get("status") == "True" for x in (p.get("status") or {}).get("conditions") or [])]
+    return len(pods) == n and len(ready) == n
+
+
+def _scale_step(c: Ctx, run: str, name: str, uid: str, frm: int, to: int, wait_s: float) -> Dict:
+    """One journalled /scale write (UID and the resourceVersion read immediately before), then the wait until exactly
+    `to` pods exist and are Ready. Receipts: scale-write submitting (durable before the request), then applied with the
+    write time. Any failure leaves the step for recover (reconcile_scale)."""
+    dep = c.kube.get("Deployment", name, c.ns)
+    if dep is None or dep["metadata"]["uid"] != uid or int(dep["spec"].get("replicas") or 0) != frm:
+        raise X.StagingError(f"{name} is not the reviewed object at {frm} replicas; refusing")
+
+    def fn(mark):
+        X.receipt(c.record, HELPER, "scale-write", {"run": run, "mark": mark, "result": "submitting", "to": to})
+        out = c.kube.scale("Deployment", name, c.ns, uid, dep["metadata"]["resourceVersion"], to)
+        at = c.now()
+        X.receipt(c.record, HELPER, "scale-write", {"run": run, "mark": mark, "result": "applied", "to": to,
+                                                    "at_ms": at})
+        end = at + wait_s * 1000
+        while not _converged(c, name, uid, to):
+            if c.now() >= end:
+                raise X.StagingError(f"{name} did not reach {to} Ready within {wait_s:.0f} s")
+            c.sleep(2)
+        return {"metadata": {"uid": uid, "generation": (dep["metadata"].get("generation") or 0) + 1}, "at_ms": at}
+    return c.kube.step(SCALE_OP, "Deployment", c.ns, name, uid, fn,
+                       pre={"generation": dep["metadata"].get("generation"), "replicas": frm},
+                       expect=[["/spec/replicas", to]])
+
+
+def reconcile_scale(kube: X.Kube, d: Dict, record) -> Dict:
+    """done: the Deployment (same UID) desires the step's target count; not-done: still at the planned count with its
+    planned generation; else unresolved. Convergence is the restore's business (recover's follow-up)."""
+    live = kube.get("Deployment", d["name"], d["namespace"])
+    if live is None or live["metadata"].get("uid") != d["uid"]:
+        return {"observed": "unresolved", "why": "the Deployment is gone or replaced"}
+    cur, gen = int(live["spec"].get("replicas") or 0), live["metadata"].get("generation")
+    if cur == d["expect"][0][1]:
+        return {"observed": "done", "uid": d["uid"]}
+    if cur == d["pre"].get("replicas") and gen == d["pre"].get("generation"):
+        return {"observed": "not-done", "state": "not-applied", "uid": d["uid"]}
+    return {"observed": "unresolved", "why": f"at {cur} replicas, generation {gen}: not explained by the step"}
+
+
+X.RECONCILERS[SCALE_OP] = reconcile_scale
+
+
+def restore_to_twelve(c: Ctx, ob: Dict) -> None:
+    """The obligation: stop any startup load (Job and pod by UID, the pod proven gone), then the SAME target UID back
+    to 12 Ready; the obligation closes only then. Never starts a workload."""
+    name = c.c28.demo.bounded_name("startup")
+    job = c.kube.get("Job", name, c.ns)
+    if job is not None:
+        c.kube.delete("Job", name, c.ns, job["metadata"]["uid"])
+        for p in [p for p in c.kube.list("Pod", c.ns, strict=True)
+                  if any(r.get("uid") == job["metadata"]["uid"] for r in p["metadata"].get("ownerReferences") or [])]:
+            c.kube.delete("Pod", p["metadata"]["name"], c.ns, p["metadata"]["uid"])
+            c.kube.step(GONE_OP, "Pod", c.ns, p["metadata"]["name"], p["metadata"]["uid"],
+                        lambda mark, p=p: _prove_gone(c, "Pod", p["metadata"]["name"], p["metadata"]["uid"], 180))
+    dep = c.kube.get("Deployment", ob["target"], c.ns)
+    if dep is None or dep["metadata"]["uid"] != ob["uid"]:
+        raise X.StagingError(f"{ob['target']} is gone or replaced: the obligation cannot be met; the fence stays")
+    cur = int(dep["spec"].get("replicas") or 0)
+    if cur != REPLICAS:
+        _scale_step(c, ob["run"], ob["target"], ob["uid"], cur, REPLICAS, 300)
+    elif not _converged(c, ob["target"], ob["uid"], REPLICAS):
+        end = c.now() + 300_000
+        while not _converged(c, ob["target"], ob["uid"], REPLICAS):
+            if c.now() >= end:
+                raise X.StagingError(f"{ob['target']} is not at {REPLICAS} Ready: the obligation stays open")
+            c.sleep(2)
+    X.receipt(c.record, HELPER, "restore-closed", {"run": ob["run"], "target": ob["target"], "uid": ob["uid"]})
+
+
+def _startup_pods(c: Ctx, name: str, since_ms: float) -> List[Dict]:
+    out = []
+    for p in c.kube.list("Pod", c.ns, strict=True):
+        if (p["metadata"].get("labels") or {}).get("c28.devkuban.com/target") != name:
+            continue
+        created = _ms(p["metadata"]["creationTimestamp"]) if p["metadata"].get("creationTimestamp") else None
+        if created is None or created < since_ms:
+            continue
+        conds = {x["type"]: x for x in (p.get("status") or {}).get("conditions") or []}
+        cs = ((p.get("status") or {}).get("containerStatuses") or [{}])[0]
+        ready = conds.get("Ready", {})
+        out.append({"uid": p["metadata"]["uid"], "name": p["metadata"]["name"], "created": p["metadata"]["creationTimestamp"],
+                    "scheduled": conds.get("PodScheduled", {}).get("lastTransitionTime"),
+                    "started": ((cs.get("state") or {}).get("running") or {}).get("startedAt"),
+                    "ready": ready.get("lastTransitionTime") if ready.get("status") == "True" else None,
+                    "restarts": cs.get("restartCount", 0)})
+    return out
+
+
+def run_startup(c: Ctx, reviewed: Dict, reviewed_digest: str, logs: Callable[[Ctx, str], List[str]] = _logs) -> Dict:
+    rid = f"s-{reviewed_digest[:12]}"
+    out_dir = os.path.join(c.record.evidence_dir, f"startup-{rid}")
+    with X.mutating(c.record, c.kube, HELPER, {"run": rid, "label": "startup"}):
+        p = plan_startup(c, reviewed["origin_utc"])
+        X.require_live(reviewed, reviewed_digest, HELPER, c.record, p)
+        if p["problems"]:
+            raise X.StagingError("the plan has problems: " + "; ".join(p["problems"]))
+        origin = _ms(p["origin_utc"])
+        if not ORIGIN_MIN_S <= (origin - c.now()) / 1000 <= ORIGIN_MAX_S:
+            raise X.StagingError("the origin is not 120..300 s ahead at apply")
+        os.makedirs(out_dir)
+        target, uid = p["target"], p["targets"][p["target"]]["deployment_uid"]
+        objs = {o["kind"]: o for o in c.c28.demo.bounded_objects(c.params, "startup", origin)}
+        for a in p["actions"]:
+            if "create" in a and X.json_digest(objs[a["create"]]) != a["sha256"]:
+                raise X.StagingError(f"{a['create']} rendered differently from the reviewed plan; refusing")
+        ob = {"run": rid, "target": target, "uid": uid, "to": REPLICAS}
+        X.receipt(c.record, HELPER, "restore-obligation", ob)          # BEFORE the first write
+        made: Dict[str, Dict] = {}
+        pod, result, why = None, {}, ""
+        try:
+            _scale_step(c, rid, target, uid, REPLICAS, STARTUP_LOW, 180)
+            fence = fence_problems(c, own_run=rid)
+            if fence:
+                raise X.StagingError("fence: " + "; ".join(fence))
+            for kind in ("ConfigMap", "Job"):
+                made[kind] = X.object_ref(c.kube.create(objs[kind]))
+            while True:
+                pod = _job_pod(c, made["Job"]["name"], made["Job"]["uid"])
+                if pod is not None and (pod.get("status") or {}).get("phase") == "Running":
+                    break
+                if c.now() >= origin:
+                    raise X.StagingError("VOID: the startup pod was not Running before the origin")
+                c.sleep(2)
+            while c.now() < origin + STARTUP_WRITE_AT_S * 1000:
+                c.sleep(1)
+            late = (c.now() - origin) / 1000 - STARTUP_WRITE_AT_S
+            if late > STARTUP_LATE_S:
+                raise X.StagingError(f"the 6 -> 12 write would be {late:.0f} s late (allowed {STARTUP_LATE_S} s)")
+            write_ms = c.now()
+            step = _scale_step(c, rid, target, uid, STARTUP_LOW, REPLICAS, 15 * 60 - STARTUP_WRITE_AT_S)
+            new = _startup_pods(c, target, write_ms - 5_000)
+            result = {"write_ms": step.get("at_ms", write_ms), "late_s": late, "new_pods": new,
+                      "creation_to_ready_s": sorted((_ms(x["ready"]) - _ms(x["created"])) / 1000 for x in new
+                                                    if x["ready"] and x["created"])}
+            end = origin + 15 * 60_000 + 30_000
+            while c.now() < end and _terminal(c.kube.get("Job", made["Job"]["name"], c.ns)) is None:
+                c.sleep(POLL_S)
+            deadline = c.now() + 180_000
+            while _terminal(c.kube.get("Job", made["Job"]["name"], c.ns)) is None and c.now() < deadline:
+                c.sleep(POLL_S)
+        except X.StagingError as e:
+            why = str(e)
+        finally:
+            lines = logs(c, pod["metadata"]["name"]) if pod is not None else []
+            job = c.kube.get("Job", made["Job"]["name"], c.ns) if "Job" in made else None
+            pod_now = c.kube.get("Pod", pod["metadata"]["name"], c.ns) if pod is not None else None
+            doc = {"schema": "c28-startup-evidence/v1", "run": rid, "target": target, "uid": uid,
+                   "origin_utc": p["origin_utc"], "result": result, "stopped": why or None,
+                   "job": {"status": _terminal(job), "exit_code": _exit_code(pod_now)}, "k6_lines": lines}
+            ev_sha = _write(os.path.join(out_dir, "evidence.json"), doc)
+            if made or pod is not None:
+                cleanup(c, made, pod)
+            restore_to_twelve(c, ob)                                  # raises (fence kept) if it cannot be met
+        n_new = len(result.get("new_pods") or [])
+        ok = not why and n_new == REPLICAS - STARTUP_LOW and len(result.get("creation_to_ready_s") or []) == n_new \
+            and doc["job"] == {"status": "Complete", "exit_code": 0}
+        return X.receipt(c.record, HELPER, "startup-complete", {"run": rid, "plan_sha256": reviewed_digest,
+                                                                 "measured": ok, "stopped": why or None,
+                                                                 "creation_to_ready_s": result.get("creation_to_ready_s"),
+                                                                 "evidence_sha256": ev_sha, "dir": out_dir})
+
+
+def plan_restore(c: Ctx) -> Dict:
+    """Read-only: every open restore obligation with the live state of its target (after recover, if needed)."""
+    obs = open_obligations(c)
+    problems = []
+    if not obs:
+        problems.append("no open restore obligation")
+    for h in (HELPER, "prepare"):
+        if X.open_intents(X.receipts(c.record, h)):
+            problems.append(f"{h} has intents with unknown outcomes: recover first")
+    live = []
+    for ob in obs:
+        dep = c.kube.get("Deployment", ob["target"], c.ns)
+        if dep is None or dep["metadata"]["uid"] != ob["uid"]:
+            problems.append(f"{ob['target']} is gone or replaced: the obligation cannot be met by this tool")
+        live.append({"run": ob["run"], "target": ob["target"], "uid": ob["uid"],
+                     "replicas": None if dep is None else dep["spec"].get("replicas")})
+    return X.new_plan(HELPER, c.record, [{"restore": o["target"], "uid": o["uid"], "to": REPLICAS} for o in obs],
+                      problems=problems, obligations=live)
+
+
+def restore(c: Ctx, reviewed: Dict, reviewed_digest: str) -> Dict:
+    """Meet every open obligation: stop the startup load (Job and pod by UID, the pod proven gone) and bring the SAME
+    target UID back to 12 Ready. Never starts a workload. Anything unmet raises with the fence kept."""
+    with X.mutating(c.record, c.kube, HELPER, {"restore": reviewed_digest[:12]}):
+        p = plan_restore(c)
+        X.require_live(reviewed, reviewed_digest, HELPER, c.record, p)
+        if p["problems"]:
+            raise X.StagingError("the restore plan has problems: " + "; ".join(p["problems"]))
+        for ob in open_obligations(c):
+            restore_to_twelve(c, ob)
+        return X.receipt(c.record, HELPER, "restore-complete", {"plan_sha256": reviewed_digest,
+                                                                 "met": [o["run"] for o in p["obligations"]]})
+
+
 def main(argv: Optional[List[str]] = None, api=None, fetch: Fetch = http_json) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--record", required=True)
@@ -522,6 +790,15 @@ def main(argv: Optional[List[str]] = None, api=None, fetch: Fetch = http_json) -
     ra.add_argument("--plan", required=True)
     ra.add_argument("--plan-digest", required=True)
     ra.add_argument("--query-api", required=True, help="the observer's Prometheus API base (a local forward)")
+    ps = sub.add_parser("plan-startup")
+    ps.add_argument("--origin", required=True)
+    rs = sub.add_parser("run-startup")
+    rs.add_argument("--plan", required=True)
+    rs.add_argument("--plan-digest", required=True)
+    sub.add_parser("plan-restore")
+    rr = sub.add_parser("restore")
+    rr.add_argument("--plan", required=True)
+    rr.add_argument("--plan-digest", required=True)
     sub.add_parser("recover-plan")
     rc = sub.add_parser("recover")
     rc.add_argument("--plan", required=True)
@@ -533,6 +810,14 @@ def main(argv: Optional[List[str]] = None, api=None, fetch: Fetch = http_json) -
         X.emit(X.cli_plan(record, "recover", X.recover_plan(record, kube), "recover-plan"))
     elif a.cmd == "recover":
         X.emit(X.recover(record, kube, X.load_plan(a.plan), a.plan_digest))
+    elif a.cmd == "plan-restore":
+        X.emit(X.cli_plan(record, HELPER, plan_restore(Ctx(record, kube)), "plan-restore"))
+    elif a.cmd == "restore":
+        X.emit(restore(Ctx(record, kube), X.load_plan(a.plan), a.plan_digest))
+    elif a.cmd == "plan-startup":
+        X.emit(X.cli_plan(record, HELPER, plan_startup(Ctx(record, kube), a.origin), "plan-startup"))
+    elif a.cmd == "run-startup":
+        X.emit(run_startup(Ctx(record, kube), X.load_plan(a.plan), a.plan_digest))
     elif a.cmd == "plan-admission":
         X.emit(X.cli_plan(record, HELPER, plan_admission(Ctx(record, kube), a.origin), "plan-admission"))
     else:

@@ -602,6 +602,10 @@ def generator_problems(record: X.Record, kube: X.Kube, params: Dict, parts: Dict
                            "workload at a time)")
     if X.open_intents(X.receipts(record, "bounded")):
         out.append("bounded.py has intents with unknown outcomes: recover first")
+    bes = X.receipts(record, "bounded")
+    closed = {e["data"]["run"] for e in bes if e["event"] == "restore-closed"}
+    if any(e["event"] == "restore-obligation" and e["data"]["run"] not in closed for e in bes):
+        out.append("a bounded startup restore obligation is open: bounded.py plan-restore / restore first")
     label = {"app.kubernetes.io/name": c28.demo.GENERATOR_NAME}
     for kind in ("Deployment", "StatefulSet", "Pod"):
         for o in kube.list(kind, ns, labels=label, strict=True):
