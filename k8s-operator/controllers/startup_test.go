@@ -519,6 +519,10 @@ func TestStartupWithoutACertainReplicaSetAttributesNothing(t *testing.T) {
 // ScaleOutBlocked through Reconcile: a Warning when a scale-out cannot complete, a Normal event when it clears.
 func TestScaleOutBlockedConditionAndEvents(t *testing.T) {
 	r, req, path, rec := recommendHarness(t, autoscalerv1alpha1.ModeActive, "3000")
+	// The pods below are created relative to the fixed startupNow; the reconcile must judge them at that time too.
+	// On the wall clock they would leave the 7-day startup window a week after startupNow and the test would fail
+	// from then on (it did on 2026-11-13).
+	r.Clock = func() time.Time { return startupNow }
 	var dep appsv1.Deployment
 	if err := r.Get(context.Background(), req.NamespacedName, &dep); err != nil {
 		t.Fatal(err)

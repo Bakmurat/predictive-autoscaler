@@ -1621,5 +1621,147 @@ json.dump(summary, open(os.path.join(work, "shadow-summary.json"), "w"), indent=
 print("shadow-summary " + json.dumps(summary))
 PY
   pass "S5. shadow: at the end $SHADOW_ARM still has 2 replicas at generation $SHADOW_GEN, and all $ARMS_FINAL PredictiveAutoscalers are in Recommend with no write recorded ($WORK/shadow-summary.json)"
+
+  # --- S6..S8: the r3 product images (Codex, 2026-11-12) ---------------------------------------------------------------
+  # fetch_text <ns> <resource> <local port> <remote port> <path> <scheme>: the body, or nothing (TLS not verified: a
+  # read of the smoke's own self-signed forecaster through a port-forward).
+  fetch_text() {
+    local ns=$1 res=$2 lport=$3 rport=$4 path=$5 scheme=${6:-http} pf
+    k -n "$ns" port-forward "$res" "$lport:$rport" >/dev/null 2>&1 & pf=$!
+    sleep 2
+    "$PY" -c 'import ssl, sys, urllib.request
+ctx = ssl._create_unverified_context()
+print(urllib.request.urlopen(sys.argv[1], timeout=5, context=ctx).read().decode())' "$scheme://127.0.0.1:$lport$path" 2>/dev/null || true
+    kill "$pf" 2>/dev/null || true
+  }
+  # S6. One Recommend autoscaler at the demonstration's validated profile, rendered by the stage itself (explicit 60/60,
+  # minimum lead 600 s, [seasonalNaive], default trust and calibration), on a target of its own. Within a smoke it has
+  # no history: a reason of insufficient history or data is expected; a configuration refusal is not.
+  VALID=c28-validated
+  k -n "$NS" get deploy c28-pa-n-s20 -o json | "$PY" -c '
+import json, sys
+d = json.load(sys.stdin)
+for k in ("uid", "resourceVersion", "creationTimestamp", "generation", "managedFields", "annotations"):
+    d["metadata"].pop(k, None)
+d.pop("status", None)
+name = sys.argv[1]
+d["metadata"]["name"] = name
+d["metadata"]["labels"]["c28.devkuban.com/target"] = name
+d["spec"]["replicas"] = 1
+d["spec"]["selector"]["matchLabels"]["c28.devkuban.com/target"] = name
+d["spec"]["template"]["metadata"]["labels"]["c28.devkuban.com/target"] = name
+print(json.dumps(d))' "$VALID" > "$WORK/validated-deploy.json" || die "S6. rendering the extra target"
+  RUN_LABEL_VALUE="$("$PY" -c 'import json, sys; print(json.load(open(sys.argv[1]))["run_id"])' "$jq_params")"
+  ( cd "$HARNESS" && "$PY" -m c28 render --params "$ROOT/deploy/eval-c28/params/kind-demo.json" --stage demonstration --part pas ) \
+    | "$PY" -c '
+import json, sys, yaml
+docs = [d for d in yaml.safe_load_all(sys.stdin) if d]
+pa = next(d for d in docs if d["metadata"]["labels"].get("c28.devkuban.com/demo-role") == "forecast")
+ns, name, run = sys.argv[1], sys.argv[2], sys.argv[3]
+pa["metadata"] = {"name": name, "namespace": ns,
+                  "labels": {**pa["metadata"]["labels"], "c28.devkuban.com/target": name, "c28.devkuban.com/run": run}}
+pa["spec"]["targetDeployment"] = {"name": name, "namespace": ns}
+print(json.dumps(pa))' "$NS" "$VALID" "$RUN_LABEL_VALUE" > "$WORK/validated-pa.json" || die "S6. rendering the validated-profile autoscaler"
+  k apply -f "$WORK/validated-deploy.json" >/dev/null || die "S6. applying the extra target"
+  k apply -f "$WORK/validated-pa.json" >/dev/null || die "S6. applying the validated-profile autoscaler"
+  validated_seen() {
+    k -n "$NS" get pa "$VALID" -o json > "$WORK/validated-pa-live.json" 2>/dev/null || return 1
+    "$PY" - "$WORK/validated-pa-live.json" "$ROOT/ml-engine" <<'PY'
+import json, sys
+sys.path.insert(0, sys.argv[2])
+from forecasting import contracts as c
+pa = json.load(open(sys.argv[1]))
+st = pa.get("status") or {}
+ready = next((x for x in st.get("conditions", []) if x["type"] == "PredictionReady"), None)
+lead = ((st.get("prediction") or {}).get("lead") or {})
+if ready is None or not lead:
+    sys.exit(1)                                            # not decided yet
+settings = c.resolve_settings(pa)
+sel, why = c.resolve_lead(pa, settings, pa["metadata"]["generation"])
+bad = []
+if sel is None or sel.lead_seconds != 600:
+    bad.append(f"resolved lead {None if sel is None else sel.lead_seconds} ({why})")
+if c.validated_profile(settings, 600) is None:
+    bad.append("the live object is not the validated profile")
+if ready["reason"] in ("ConfigurationNotValidated", "SettingsInvalid", "LeadInsufficient"):
+    bad.append(f"PredictionReady {ready['status']}/{ready['reason']}: {ready.get('message')}")
+json.dump({"reason": ready["reason"], "status": ready["status"], "lead": lead, "problems": bad},
+          open(sys.argv[1] + ".verdict.json", "w"), indent=1)
+sys.exit(2 if bad else 0)
+PY
+  }
+  rc=1; for _ in $(seq 1 30); do rc=0; validated_seen || rc=$?; [ "$rc" = 1 ] || break; sleep 10; done
+  [ "$rc" = 0 ] || die "S6. the validated-profile autoscaler: $(cat "$WORK/validated-pa-live.json.verdict.json" 2>/dev/null || echo 'no decision within 300 s')"
+  pass "S6. a Recommend autoscaler at the demonstration's validated profile resolves to it (lead 600 s) and is not refused for its configuration: PredictionReady $(cut -c1-200 "$WORK/validated-pa-live.json.verdict.json" | tr -d '\n ')"
+
+  # S7. Health and writes: the operator and the forecaster Ready without restarts; the forecaster's journal healthy;
+  # no confirmed scale write; the operator's calculated count for the shadow arm is the ledger's last decision.
+  for comp in operator forecaster; do
+    read -r ready restarts <<<"$(k -n "$CTRL" get pods -l "app.kubernetes.io/instance=pa-eval,app.kubernetes.io/component=$comp" \
+      -o jsonpath='{range .items[*]}{.status.containerStatuses[0].ready} {.status.containerStatuses[0].restartCount}{"\n"}{end}' | head -1)"
+    [ "$ready" = true ] && [ "$restarts" = 0 ] || die "S7. $comp ready '$ready', restarts '$restarts'"
+  done
+  fetch_text "$CTRL" "deploy/$RELEASE_FULLNAME-operator" 19271 8080 /metrics > "$WORK/operator-metrics.txt"
+  fetch_text "$CTRL" "deploy/$RELEASE_FULLNAME-forecaster" 19272 8443 /metrics https > "$WORK/forecaster-metrics.txt"
+  shadow_ledger_read "$WORK/forecast-ledger-end.jsonl" || die "S7. reading the operator's ledger"
+  "$PY" - "$WORK/operator-metrics.txt" "$WORK/forecaster-metrics.txt" "$WORK/forecast-ledger-end.jsonl" "$SHADOW_ARM" "$NS" \
+    > "$WORK/shadow-health.json" <<'PY' || die "S7. $(cat "$WORK/shadow-health.json")"
+import json, re, sys
+op, fc, ledger, arm, ns = open(sys.argv[1]).read(), open(sys.argv[2]).read(), sys.argv[3], sys.argv[4], sys.argv[5]
+def samples(text, name):
+    return [(m.group(1), float(m.group(2))) for m in re.finditer(r"^" + name + r"(\{[^}]*\})? ([-0-9.e+]+)$", text, re.M)]
+bad = []
+if not op.strip() or not fc.strip():
+    bad.append("a metrics endpoint could not be read")
+applied = [v for lab, v in samples(op, "predictive_autoscaler_scale_writes_total") if 'result="applied"' in (lab or "")]
+if not applied or any(v != 0 for v in applied):
+    bad.append(f"confirmed scale writes: {applied}")
+if samples(fc, "predictive_autoscaler_forecaster_journal_unhealthy_since_seconds"):
+    bad.append("the forecaster's journal is unhealthy")
+if [v for _, v in samples(fc, "predictive_autoscaler_forecaster_journal_permanent_failure")] != [0.0]:
+    bad.append("the forecaster's journal permanent-failure gauge is not exactly one 0")
+calc = [v for lab, v in samples(op, "predictive_autoscaler_calculated_replicas")
+        if f'autoscaler="{arm}"' in (lab or "") and f'namespace="{ns}"' in (lab or "")]
+last = None
+for line in open(ledger):
+    try:
+        d = json.loads(line)
+    except ValueError:
+        continue
+    if d.get("event") == "decision" and d.get("application") == arm and d.get("namespace") == ns:
+        last = d
+if last is None or len(calc) != 1 or calc[0] != last.get("desired_replicas"):
+    bad.append(f"calculated_replicas {calc} vs the ledger's last decision {None if last is None else last.get('desired_replicas')}")
+print(json.dumps({"applied_writes": applied, "calculated": calc,
+                  "ledger_last": None if last is None else {k: last.get(k) for k in ("at", "desired_replicas", "action", "telemetry_status")},
+                  "problems": bad}))
+sys.exit(1 if bad else 0)
+PY
+  pass "S7. operator and forecaster Ready with 0 restarts, journal healthy, 0 confirmed scale writes, and $SHADOW_ARM's calculated_replicas equals the ledger's last decision: $(cut -c1-240 "$WORK/shadow-health.json")"
+
+  # S8. After the metrics outage (check 5) telemetry and recommendations resumed: the shadow arm's ledger has measured
+  # decisions after the outage's end, and its TelemetryAvailable condition is True now.
+  "$PY" - "$WORK/forecast-ledger-end.jsonl" "$SHADOW_ARM" "$NS" "$end" > "$WORK/shadow-resume.json" <<'PY' || die "S8. $(cat "$WORK/shadow-resume.json")"
+import json, sys
+from datetime import datetime
+ledger, arm, ns, end = sys.argv[1:5]
+end_t = datetime.strptime(end, "%Y-%m-%dT%H:%M:%SZ")
+after = []
+for line in open(ledger):
+    try:
+        d = json.loads(line)
+    except ValueError:
+        continue
+    if d.get("event") == "decision" and d.get("application") == arm and d.get("namespace") == ns:
+        t = datetime.strptime(d["at"][:19], "%Y-%m-%dT%H:%M:%S")
+        if t > end_t:
+            after.append(d)
+measured = [d for d in after if d.get("telemetry_status") == "measured" and d.get("action") == "recommend"]
+print(json.dumps({"decisions_after_outage": len(after), "measured_recommendations": len(measured)}))
+sys.exit(0 if measured else 1)
+PY
+  [ "$(k -n "$NS" get pa "$SHADOW_ARM" -o jsonpath='{.status.conditions[?(@.type=="TelemetryAvailable")].status}')" = True ] \
+    || die "S8. $SHADOW_ARM's TelemetryAvailable is not True after the outage"
+  pass "S8. after the metrics outage $SHADOW_ARM measures and recommends again: $(cat "$WORK/shadow-resume.json")"
 fi
 log "smoke complete (accelerated, engineering only: no C2.8 evidence)"
