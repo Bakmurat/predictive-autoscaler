@@ -285,6 +285,10 @@ def _line_problems(cfg: Dict, r: Dict) -> List[str]:
     elif r["due"] != r["dispatched"] - r["carried"][0] + r["carried"][1] + sum(r["dropped"][k] for k in DROPS) \
             or r["dispatched"] != r["ok"] + r["failed"] + r["unresolved"] or sum(counts) != r["ok"]:
         out.append("inconsistent_line")
+    elif "all" in r["lat"] and not (isinstance(r["lat"]["all"], list) and len(r["lat"]["all"]) == len(counts)
+                                    and all(_int(c) and c >= 0 for c in r["lat"]["all"])
+                                    and sum(r["lat"]["all"]) == r["ok"] + r["failed"]):
+        out.append("inconsistent_line")      # lat.all: every resolved outcome once, in the same buckets
     elif "plan_mismatch" not in out:
         # Every arrival the schedule places in the active span is owed: due must be exactly that number (and the
         # identity above then accounts for each one as dispatched, carried or dropped).
@@ -550,6 +554,9 @@ def _generator_minute(cfg: Dict, streams: List[_Stream], m: int) -> Dict:
     out["active_ms"] = sum(b - a for a, b in spans)
     out["late_max_ms"] = max([r.get("late_max_ms", 0) for _, r in lines] or [0])
     out["latency"] = _latency(cfg, [r for _, r in lines])
+    # Bucket counts of EVERY resolved outcome (lat.all), summed; None when a line lacks them (an older script).
+    alls = [r["lat"].get("all") for _, r in lines]
+    out["lat_all"] = [sum(c) for c in zip(*alls)] if alls and all(isinstance(a, list) for a in alls) else None
     if any(x in blocking or x == "duplicate_generators" for x in reasons):
         return out
     if not inside:
