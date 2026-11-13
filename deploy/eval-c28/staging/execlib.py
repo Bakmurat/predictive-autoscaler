@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -187,7 +188,7 @@ def load_record(path_: str, sections: Iterable[str] = ()) -> Record:
 LOCK_SCOPE = "evaluation"                 # ONE lock (common_records.exclusive_lock) for every part-2 helper's mutations
 INTENT_ANNOTATION = "c28.devkuban.com/intent"
 DEFINITIVE = (400, 401, 403, 404, 409, 422, 429)   # the API refused: nothing was applied
-PART2_HELPERS = ("reserve", "prepare", "session", "calibrate")   # journals under the shared evaluation lock
+PART2_HELPERS = ("reserve", "prepare", "session", "calibrate", "ledger_read")   # journals under the shared evaluation lock
 
 
 def lock_file(record: "Record") -> str:
@@ -295,11 +296,16 @@ def _expect_holds(obj: Dict, expect: List) -> bool:
 # Reconcilers of the journalled ops a helper defines itself (op -> fn(kube, intent data) -> observation); a helper
 # registers its own at import (session.py: "restore"). An op without a loaded reconciler is never guessed: unresolved.
 RECONCILERS: Dict[str, Callable[["Kube", Dict, Optional["Record"]], Dict]] = {}
+# Helper-defined ops whose reconciler lives in a module another helper's process may not have loaded: recover (from any
+# helper's CLI) imports it on demand, so an open intent of that op is never left "no reconciler loaded".
+RECONCILER_MODULES: Dict[str, str] = {"ledger-reader-gone": "ledger_read"}
 
 
 def reconcile(kube: "Kube", d: Dict, record: Optional["Record"] = None) -> Dict:
     """What an unresolved intent actually did, read live: {"observed": done | not-done | unresolved, ...}. A helper's
     reconciler also gets the record (its journal holds what the step persisted before the outcome was lost)."""
+    if d["op"] not in RECONCILERS and d["op"] in RECONCILER_MODULES:     # a fresh process of another helper
+        importlib.import_module(RECONCILER_MODULES[d["op"]])           # registers it on import
     if d["op"] in RECONCILERS:
         if record is None:
             return {"observed": "unresolved", "why": f"the {d['op']!r} reconciler needs the record"}
