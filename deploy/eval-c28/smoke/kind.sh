@@ -1672,8 +1672,12 @@ print(json.dumps(pa))' "$NS" "$VALID" "$RUN_LABEL_VALUE" > "$WORK/validated-pa.j
     "$PY" "$ROOT/deploy/eval-c28/smoke/shadow_checks.py" validated "$WORK/validated-pa-live.json" "$ROOT/ml-engine" \
       "$WORK/validated-pa-live.json.verdict.json"
   }
-  rc=1; for _ in $(seq 1 30); do rc=0; validated_seen || rc=$?; [ "$rc" = 1 ] || break; sleep 10; done
-  [ "$rc" = 0 ] || die "S6. the validated-profile autoscaler: $(cat "$WORK/validated-pa-live.json.verdict.json" 2>/dev/null || echo 'no decision within 300 s')"
+  # Not before check 5's metrics outage has ended (the run of 2026-11-13 created it inside the outage: the service
+  # answered "history unavailable", refused correctly, but as final); a transient answer is asked again (exit 3) for up
+  # to 300 s; a configuration refusal or a live object outside the profile fails at once (exit 2).
+  until [ "$(date -u +%s)" -ge $(( $(date -u -d "$end" +%s) + 15 )) ]; do sleep 5; done
+  rc=1; for _ in $(seq 1 30); do rc=0; validated_seen || rc=$?; case "$rc" in 1|3) sleep 10 ;; *) break ;; esac; done
+  [ "$rc" = 0 ] || die "S6. the validated-profile autoscaler (exit $rc): $(cat "$WORK/validated-pa-live.json.verdict.json" 2>/dev/null || echo 'no decision within 300 s')"
   pass "S6. a Recommend autoscaler at the demonstration's validated profile resolves to it (lead 600 s) and the forecast service answered for it with a history or data reason: $(cut -c1-200 "$WORK/validated-pa-live.json.verdict.json" | tr -d '\n ')"
 
   # S7. Health and writes: the operator and the forecaster Ready without restarts; the forecaster's journal healthy;

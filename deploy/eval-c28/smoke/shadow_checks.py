@@ -1,6 +1,7 @@
 """Shadow smoke checks S6 and S7 for the r3 product images (kind.sh --shadow), with an offline selftest.
 
-  shadow_checks.py validated <live PA json> <ml-engine dir> <verdict out>   exit 0 pass, 1 not decided yet, 2 fail
+  shadow_checks.py validated <live PA json> <ml-engine dir> <verdict out>   exit 0 pass, 1 not decided yet,
+                                                                             2 fail, 3 not accepted yet (ask again)
   shadow_checks.py pods <pods json> <expected count> <component>           exit 0 pass, 2 fail (problems on stdout)
   shadow_checks.py selftest
 
@@ -12,6 +13,9 @@ calibration or shadow reason, or PredictionReady DataUnavailable whose message i
 (mlapi_client.go: "ML API returned status 503: <body>") with error HistoryInsufficient, or DataUnavailable for data
 that is too old (not "history unavailable": that is the service failing to read its metrics backend). A transport or
 TLS failure, a refused request, the registration limit, or a configuration, settings or lead refusal is a failure.
+A configuration, settings or lead refusal, or a live object outside the profile, fails at once (exit 2); any other
+answer that is not accepted may be transient (a metrics outage, a forecaster restart) and is asked again until the
+caller's deadline, which then fails with the last verdict (exit 3).
 
 S7 (pods): exactly the expected number of the component's pods, every one Running with every container ready and
 never restarted.
@@ -25,6 +29,7 @@ import sys
 
 SERVICE_TRUST_REASONS = ("HistoryInsufficient", "CalibrationInsufficient", "ShadowInsufficient")
 SERVICE_503_REASONS = ("HistoryInsufficient", "DataUnavailable")
+PERMANENT = ("ConfigurationNotValidated", "SettingsInvalid", "LeadInsufficient")
 REFUSED = ("ConfigurationNotValidated", "SettingsInvalid", "LeadInsufficient", "RequestRefused",
            "AutoscalerLimitReached", "ForecastRejected", "IdentityMismatch", "StateUnavailable")
 _BODY = re.compile(r"ML API returned status 503: (\{.*\})\s*$", re.S)
@@ -57,7 +62,7 @@ def service_answer(ready: dict, prediction: dict) -> tuple:
 
 
 def validated(pa: dict, contracts) -> tuple:
-    """(code, verdict): 0 pass, 1 not decided yet, 2 fail."""
+    """(code, verdict): 0 pass, 1 not decided yet, 2 fail, 3 not accepted yet."""
     st = pa.get("status") or {}
     ready = next((x for x in st.get("conditions", []) if x.get("type") == "PredictionReady"), None)
     lead = (st.get("prediction") or {}).get("lead")
@@ -70,10 +75,12 @@ def validated(pa: dict, contracts) -> tuple:
         problems.append(f"selected lead {None if sel is None else sel.lead_seconds} ({why})")
     if contracts.validated_profile(settings, 600) is None:
         problems.append("the live object is not the validated profile")
+    permanent = bool(problems) or ready.get("reason") in PERMANENT
     answered, how = service_answer(ready, st.get("prediction") or {})
     if not answered:
         problems.append(how)
-    return (2 if problems else 0), {"reason": ready.get("reason"), "service": how, "lead": lead, "problems": problems}
+    code = 0 if not problems else 2 if permanent else 3
+    return code, {"reason": ready.get("reason"), "service": how, "lead": lead, "problems": problems}
 
 
 def pods_problems(doc: dict, expected: int, component: str) -> list:
@@ -137,7 +144,8 @@ def selftest() -> int:
         assert code == 0, (p, v)
     for p in bad:
         code, v = validated(p, Contracts)
-        assert code == 2, (p, v)
+        want = 2 if p["status"]["conditions"][0]["reason"] in PERMANENT else 3
+        assert code == want, (p, v, want)
     assert validated({"status": {}}, Contracts)[0] == 1
     Contracts.lead = 900
     assert validated(ok[0], Contracts)[0] == 2
