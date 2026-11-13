@@ -21,6 +21,15 @@ from part2_fixtures import api, make_record  # noqa: F401
 from test_prepare_demo import DEMO, OWNER, demo_params
 
 
+def fast():
+    """A simulated clock that the no-op sleep advances: waits end by their budget without wall time."""
+    now = [0.0]
+
+    def sleep(s):
+        now[0] += s
+    return {"sleep": sleep, "clock": lambda: now[0]}
+
+
 def run_script(path, offset=0, cap=L.DEFAULT_MAX_BYTES):
     p = subprocess.run([sys.executable, "-I", "-c", L.READER_SCRIPT, str(path), str(offset), str(cap)],
                        capture_output=True, timeout=60)
@@ -168,7 +177,7 @@ def test_a_read_creates_uses_and_deletes_the_reader_under_the_journal(make_recor
     f.write_bytes(lines(7) + b'{"x"')
     seen = []
     out = tmp_path / "ledger.jsonl"
-    data = L.read(rec, kube, str(out), run=fake_exec(run_script(f), seen=seen), sleep=lambda s: None)
+    data = L.read(rec, kube, str(out), run=fake_exec(run_script(f), seen=seen), **fast())
     assert out.read_bytes() == lines(7) and data["lines"] == 7 and data["partial_tail_bytes"] == 4
     assert seen[0][seen[0].index("exec") + 1].startswith("c28-ledger-reader-") and seen[0][-3] == "/ledger/forecasts.jsonl"
     ops = [(m["op"], m["kind"]) for m in kube.mutations]
@@ -192,7 +201,7 @@ def test_a_failed_exec_or_transfer_still_deletes_the_reader_and_keeps_the_raw_by
     out = tmp_path / "ledger.jsonl"
     raw = run_script(f)
     with pytest.raises(L.TransferRefused):
-        L.read(rec, kube, str(out), run=fake_exec(raw[:len(raw) // 2]), sleep=lambda s: None)
+        L.read(rec, kube, str(out), run=fake_exec(raw[:len(raw) // 2]), **fast())
     assert not out.exists()
     kept = [p for p in os.listdir(tmp_path) if p.startswith("ledger.jsonl.failed-")]
     assert len(kept) == 1 and (tmp_path / kept[0]).read_bytes() == raw[:len(raw) // 2]
@@ -200,7 +209,7 @@ def test_a_failed_exec_or_transfer_still_deletes_the_reader_and_keeps_the_raw_by
     kube.mutations.clear()
     out2 = tmp_path / "ledger2.jsonl"
     with pytest.raises(L.TransferRefused) as e:
-        L.read(rec, kube, str(out2), run=fake_exec(raw, code=1), sleep=lambda s: None)
+        L.read(rec, kube, str(out2), run=fake_exec(raw, code=1), **fast())
     assert "secret-ish" not in str(e.value) and [m["op"] for m in kube.mutations][-3:] == ["delete", L.GONE_OP, "delete"]
 
 
@@ -213,7 +222,7 @@ def test_a_timed_out_transfer_keeps_what_was_received(make_record, tmp_path):  #
     def run(argv, **kw):
         raise subprocess.TimeoutExpired(argv, 600, output=b"partial-transfer")
     with pytest.raises(L.TransferRefused, match="timed out"):
-        L.read(rec, kube, str(tmp_path / "l.jsonl"), run=run, sleep=lambda s: None)
+        L.read(rec, kube, str(tmp_path / "l.jsonl"), run=run, **fast())
     kept = [p for p in os.listdir(tmp_path) if p.startswith("l.jsonl.failed-")]
     assert len(kept) == 1 and (tmp_path / kept[0]).read_bytes() == b"partial-transfer"
     assert X.last(X.receipts(rec, L.HELPER), "read-refused")["data"]["raw_bytes"] == len(b"partial-transfer")
@@ -237,7 +246,7 @@ def test_an_unproven_pod_deletion_keeps_the_lock_and_the_policy(make_record, tmp
     f = tmp_path / "src.jsonl"
     f.write_bytes(lines(3))
     with pytest.raises(X.StagingError, match="still present"):
-        L.read(rec, kube, str(tmp_path / "l.jsonl"), run=fake_exec(run_script(f)), sleep=lambda s: None)
+        L.read(rec, kube, str(tmp_path / "l.jsonl"), run=fake_exec(run_script(f)), **fast())
     assert [m["op"] for m in kube.mutations] == ["create", "create", "delete"]     # no policy delete, no gone step
     assert os.path.exists(X.lock_file(rec))                                         # the fence stays
     assert [it["data"]["op"] for it in X.open_intents(X.receipts(rec, L.HELPER))] == [L.GONE_OP]
@@ -272,16 +281,16 @@ def test_a_read_is_refused_before_any_write(make_record, tmp_path):  # noqa: F81
     kube = rec.kube(api=a)
     out = str(tmp_path / "x.jsonl")
     with pytest.raises(X.StagingError, match="exactly one running operator pod"):
-        L.read(rec, kube, out, run=fake_exec(b""), sleep=lambda s: None)
+        L.read(rec, kube, out, run=fake_exec(b""), **fast())
     operator_pod(a, s, node="worker-w")
     with pytest.raises(X.StagingError, match="not on S"):
-        L.read(rec, kube, out, run=fake_exec(b""), sleep=lambda s: None)
+        L.read(rec, kube, out, run=fake_exec(b""), **fast())
     rec2, _, s2 = demo_record(make_record, extra_reader=False)
     with pytest.raises(X.StagingError, match="support_extra must count the ledger reader"):
-        L.read(rec2, rec2.kube(api=a), out, run=fake_exec(b""), sleep=lambda s: None)
+        L.read(rec2, rec2.kube(api=a), out, run=fake_exec(b""), **fast())
     assert kube.mutations == []
     with pytest.raises(X.StagingError, match="max-bytes"):
-        L.read(rec, kube, out, max_bytes=L.MAX_BYTES_LIMIT + 1, run=fake_exec(b""), sleep=lambda s: None)
+        L.read(rec, kube, out, max_bytes=L.MAX_BYTES_LIMIT + 1, run=fake_exec(b""), **fast())
 
 
 FRESH = r'''
@@ -308,7 +317,7 @@ def _stuck(make_record, tmp_path):  # noqa: F811
     f = tmp_path / "src.jsonl"
     f.write_bytes(lines(3))
     with pytest.raises(X.StagingError, match="still present"):
-        L.read(rec, kube, str(tmp_path / "l.jsonl"), run=fake_exec(run_script(f)), sleep=lambda s: None)
+        L.read(rec, kube, str(tmp_path / "l.jsonl"), run=fake_exec(run_script(f)), **fast())
     return rec, a
 
 
@@ -349,3 +358,17 @@ def test_the_cli_recovers_the_lock_only_after_the_pod_is_gone(make_record, tmp_p
     assert L.main(["--record", rec.path, "recover", "--plan", saved["plan"], "--plan-digest", saved["plan_digest"]],
                   api=a) == 0
     assert not os.path.exists(X.lock_file(rec)) and not X.open_intents(X.receipts(rec, L.HELPER))
+
+
+def test_a_slow_poll_counts_against_the_wait_budget():
+    now, polls = [0.0], []
+
+    def slow_poll():                       # every poll (an API read) takes 30 s
+        polls.append(now[0])
+        now[0] += 30
+        return False
+
+    def sleep(s):
+        now[0] += s
+    assert L._wait(slow_poll, 120, sleep, lambda: now[0]) is False
+    assert len(polls) <= 5 and now[0] <= 120 + 30 + 2, (len(polls), now[0])

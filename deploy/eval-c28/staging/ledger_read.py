@@ -209,16 +209,16 @@ def operator_node(kube: X.Kube, params: Dict, section: Dict) -> Tuple[str, List[
     return node, []
 
 
-def _wait(fn: Callable[[], bool], seconds: float, sleep: Callable[[float], None]) -> bool:
-    """Poll every 2 s; the budget counts the slept time (so a test's no-op sleep needs no wall clock)."""
-    waited = 0.0
+def _wait(fn: Callable[[], bool], seconds: float, sleep: Callable[[float], None],
+          clock: Callable[[], float] = time.monotonic) -> bool:
+    """Poll every 2 s until fn() or the elapsed-time budget (monotonic: slow polls count too) is exhausted."""
+    end = clock() + seconds
     while True:
         if fn():
             return True
-        if waited >= seconds:
+        if clock() >= end:
             return False
         sleep(2)
-        waited += 2
 
 
 def _ready(kube: X.Kube, ns: str, name: str) -> bool:
@@ -232,11 +232,12 @@ def _ready(kube: X.Kube, ns: str, name: str) -> bool:
 GONE_OP = "ledger-reader-gone"
 
 
-def _prove_gone(kube: X.Kube, ns: str, name: str, uid: str, sleep: Callable[[float], None]) -> Dict:
+def _prove_gone(kube: X.Kube, ns: str, name: str, uid: str, sleep: Callable[[float], None],
+                clock: Callable[[], float] = time.monotonic) -> Dict:
     def gone() -> bool:
         o = kube.get("Pod", name, ns)
         return o is None or o["metadata"].get("uid") != uid
-    if not _wait(gone, 120, sleep):
+    if not _wait(gone, 120, sleep, clock):
         raise X.StagingError(f"the reader pod {name} is still present 120 s after its delete")
     return {"metadata": {"uid": uid}}
 
@@ -260,7 +261,7 @@ def exec_argv(record: X.Record, ns: str, name: str, offset: int, max_bytes: int)
 
 def read(record: X.Record, kube: X.Kube, out: str, offset: int = 0, max_bytes: int = DEFAULT_MAX_BYTES,
          run: Callable = subprocess.run, sleep: Callable[[float], None] = time.sleep,
-         now: Callable[[], str] = X.utcnow) -> Dict:
+         now: Callable[[], str] = X.utcnow, clock: Callable[[], float] = time.monotonic) -> Dict:
     if os.path.exists(out):
         raise X.StagingError(f"{out} exists; refusing to overwrite")
     if not (0 < max_bytes <= MAX_BYTES_LIMIT) or offset < 0:
@@ -286,7 +287,7 @@ def read(record: X.Record, kube: X.Kube, out: str, offset: int = 0, max_bytes: i
         made = [kube.create(np_)]
         try:
             made.append(kube.create(pod))
-            if not _wait(lambda: _ready(kube, ns, name), 180, sleep):
+            if not _wait(lambda: _ready(kube, ns, name), 180, sleep, clock):
                 raise X.StagingError(f"the reader pod {name} did not become Ready within 180 s")
             try:
                 p = run(exec_argv(record, ns, name, offset, max_bytes), capture_output=True, timeout=600)
@@ -302,7 +303,7 @@ def read(record: X.Record, kube: X.Kube, out: str, offset: int = 0, max_bytes: i
             if len(made) > 1:                       # the pod: deleted, then its disappearance proven as a journalled
                 pod_uid = made[1]["metadata"]["uid"]   # step (an unproven one keeps the lock: no other reader starts)
                 kube.delete("Pod", name, ns, pod_uid)
-                kube.step(GONE_OP, "Pod", ns, name, pod_uid, lambda mark: _prove_gone(kube, ns, name, pod_uid, sleep))
+                kube.step(GONE_OP, "Pod", ns, name, pod_uid, lambda mark: _prove_gone(kube, ns, name, pod_uid, sleep, clock))
             kube.delete("NetworkPolicy", name, ns, made[0]["metadata"]["uid"])
     try:
         if failure:
