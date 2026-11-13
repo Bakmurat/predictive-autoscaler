@@ -171,9 +171,10 @@ def test_a_read_creates_uses_and_deletes_the_reader_under_the_journal(make_recor
     data = L.read(rec, kube, str(out), run=fake_exec(run_script(f), seen=seen), sleep=lambda s: None)
     assert out.read_bytes() == lines(7) and data["lines"] == 7 and data["partial_tail_bytes"] == 4
     assert seen[0][seen[0].index("exec") + 1].startswith("c28-ledger-reader-") and seen[0][-3] == "/ledger/forecasts.jsonl"
-    ops = [m["op"] for m in kube.mutations]
-    assert ops == ["create", "create", "delete", "delete"]
-    assert [m["kind"] for m in kube.mutations] == ["NetworkPolicy", "Pod", "Pod", "NetworkPolicy"]
+    ops = [(m["op"], m["kind"]) for m in kube.mutations]
+    assert ops == [("create", "NetworkPolicy"), ("create", "Pod"), ("delete", "Pod"), (L.GONE_OP, "Pod"),
+                   ("delete", "NetworkPolicy")]                        # the pod proven gone before its policy goes
+    assert not [p for p in os.listdir(tmp_path) if ".failed-" in p]  # the kept transfer is removed once verified
 
 
     assert not X.open_intents(X.receipts(rec, L.HELPER))
@@ -195,12 +196,74 @@ def test_a_failed_exec_or_transfer_still_deletes_the_reader_and_keeps_the_raw_by
     assert not out.exists()
     kept = [p for p in os.listdir(tmp_path) if p.startswith("ledger.jsonl.failed-")]
     assert len(kept) == 1 and (tmp_path / kept[0]).read_bytes() == raw[:len(raw) // 2]
-    assert [m["op"] for m in kube.mutations] == ["create", "create", "delete", "delete"]
+    assert [m["op"] for m in kube.mutations] == ["create", "create", "delete", L.GONE_OP, "delete"]
     kube.mutations.clear()
     out2 = tmp_path / "ledger2.jsonl"
     with pytest.raises(L.TransferRefused) as e:
         L.read(rec, kube, str(out2), run=fake_exec(raw, code=1), sleep=lambda s: None)
-    assert "secret-ish" not in str(e.value) and [m["op"] for m in kube.mutations][-2:] == ["delete", "delete"]
+    assert "secret-ish" not in str(e.value) and [m["op"] for m in kube.mutations][-3:] == ["delete", L.GONE_OP, "delete"]
+
+
+def test_a_timed_out_transfer_keeps_what_was_received(make_record, tmp_path):  # noqa: F811
+    rec, params, s = demo_record(make_record)
+    a = ReadyApi()
+    operator_pod(a, s)
+    kube = rec.kube(api=a)
+
+    def run(argv, **kw):
+        raise subprocess.TimeoutExpired(argv, 600, output=b"partial-transfer")
+    with pytest.raises(L.TransferRefused, match="timed out"):
+        L.read(rec, kube, str(tmp_path / "l.jsonl"), run=run, sleep=lambda s: None)
+    kept = [p for p in os.listdir(tmp_path) if p.startswith("l.jsonl.failed-")]
+    assert len(kept) == 1 and (tmp_path / kept[0]).read_bytes() == b"partial-transfer"
+    assert X.last(X.receipts(rec, L.HELPER), "read-refused")["data"]["raw_bytes"] == len(b"partial-transfer")
+
+
+class StickyApi(ReadyApi):
+    """A DELETE of a reader pod is accepted but the pod never goes away (a stuck kubelet, a finalizer)."""
+
+    def delete(self, path, uid, resource_version=None):
+        if "/pods/" in path:
+            self.calls.append(("delete", path))
+            return {}
+        return super().delete(path, uid, resource_version)
+
+
+def test_an_unproven_pod_deletion_keeps_the_lock_and_the_policy(make_record, tmp_path):  # noqa: F811
+    rec, params, s = demo_record(make_record)
+    a = StickyApi()
+    operator_pod(a, s)
+    kube = rec.kube(api=a)
+    f = tmp_path / "src.jsonl"
+    f.write_bytes(lines(3))
+    with pytest.raises(X.StagingError, match="still present"):
+        L.read(rec, kube, str(tmp_path / "l.jsonl"), run=fake_exec(run_script(f)), sleep=lambda s: None)
+    assert [m["op"] for m in kube.mutations] == ["create", "create", "delete"]     # no policy delete, no gone step
+    assert os.path.exists(X.lock_file(rec))                                         # the fence stays
+    assert [it["data"]["op"] for it in X.open_intents(X.receipts(rec, L.HELPER))] == [L.GONE_OP]
+    assert [p for p in os.listdir(tmp_path) if p.startswith("l.jsonl.failed-")]    # the transfer is kept
+    pod = [o for o in a.objects.values() if o["metadata"]["name"].startswith("c28-ledger-reader-")
+           and o.get("kind", "Pod") == "Pod" and "containers" in (o.get("spec") or {})]
+    assert X.reconcile(kube, X.open_intents(X.receipts(rec, L.HELPER))[0]["data"], rec)["observed"] == "unresolved"
+    a.objects = {k: v for k, v in a.objects.items() if not (v["metadata"]["name"].startswith("c28-ledger-reader-")
+                                                              and "containers" in (v.get("spec") or {}))}
+    assert X.reconcile(kube, X.open_intents(X.receipts(rec, L.HELPER))[0]["data"], rec)["observed"] == "done"
+
+
+def test_a_maximum_read_stays_within_the_reader_memory_limit(tmp_path):
+    f = tmp_path / "forecasts.jsonl"
+    line = json.dumps({"at": 0, "action": "recommend", "pad": "x" * 400}).encode() + b"\n"
+    with open(f, "wb") as fh:
+        for _ in range(L.MAX_BYTES_LIMIT // (len(line) * 1000) + 1):
+            fh.write(line * 1000)
+    probe = ("import resource, subprocess, sys; "
+             "subprocess.run([sys.executable, '-I', '-c', sys.argv[1], sys.argv[2], '0', sys.argv[3]], "
+             "stdout=subprocess.DEVNULL, check=True); "
+             "print(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)")
+    p = subprocess.run([sys.executable, "-I", "-c", probe, L.READER_SCRIPT, str(f), str(L.MAX_BYTES_LIMIT)],
+                       capture_output=True, timeout=300, check=True)
+    kib = int(p.stdout)
+    assert kib < 64 * 1024, f"{kib} KiB for a {L.MAX_BYTES_LIMIT}-byte read"     # far below the 256Mi limit
 
 
 def test_a_read_is_refused_before_any_write(make_record, tmp_path):  # noqa: F811

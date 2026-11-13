@@ -10,15 +10,19 @@ reservation owner's taint, carries the demonstration's run label (an authorized 
 params.residency.support_extra), runs the reviewed statistical image (digest-pinned, python, non-root uid 10001) with no
 service-account token, no service links, a read-only root filesystem, every capability dropped and NO fsGroup (the claim's
 ownership is never changed), mounts the claim readOnly, and a deny-all NetworkPolicy selects it. It is created, used
-and deleted under the shared evaluation lock; every create and delete is journalled (intent before, outcome after), and
-its deletion is proven before the lock is released.
+and deleted under the shared evaluation lock; every create and delete is journalled (intent before, outcome after). The
+pod is deleted first and its disappearance is proven as a journalled step (ledger-reader-gone, with a reconciler); only
+then is its NetworkPolicy deleted. An unproven disappearance leaves that step unresolved, so the lock stays and no other
+reader (or other helper) starts until recover finds the pod gone.
 
 Inside the pod a fixed script opens forecasts.jsonl, takes its size at open (fstat), reads at most --max-bytes from
---offset up to that size, and keeps the COMPLETE-LINE prefix: an incomplete trailing line (an append in progress) is
+--offset up to that size in two streaming passes (memory: one 1 MiB chunk plus the longest line; the file only grows
+by appends), and keeps the COMPLETE-LINE prefix: an incomplete trailing line (an append in progress) is
 reported as partial_tail_bytes and never captured. It prints a receipt (size at open, offset, captured bytes, lines,
 malformed lines, partial tail, cap hit, sha256 of the captured bytes, its uid and the file mode), the captured bytes,
 and a trailer (bytes, sha256). The local side accepts the transfer only when the receipt, the bytes and the trailer
-agree; anything else (an interrupted or altered transfer) is kept as <out>.failed-<UTC> and refused.
+agree. The received bytes are written to <out>.failed-<UTC> as soon as the exec returns or times out, before any
+cleanup; that file is removed only after a verified transfer, so an interrupted or altered one stays kept and refused.
 """
 
 from __future__ import annotations
@@ -48,6 +52,7 @@ LIFETIME_S = 840                        # the container sleeps this long; active
 READER_SCRIPT = r'''
 import hashlib, json, os, sys
 p, off, cap = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+CH = 1 << 20
 out = sys.stdout.buffer
 fd = os.open(p, os.O_RDONLY)
 st = os.fstat(fd)
@@ -55,31 +60,42 @@ size = st.st_size
 if off > size:
     raise SystemExit("offset beyond the file's size at open (replaced or truncated)")
 want = min(size - off, cap)
-chunks, got = [], 0
-while got < want:
-    b = os.pread(fd, min(1 << 20, want - got), off + got)
+# Pass 1, streaming (memory: one chunk plus the longest line): the complete-line cut, the hash, the line counts.
+h, pos, cut, lines, bad, carry = hashlib.sha256(), 0, 0, 0, 0, b""
+while pos < want:
+    b = os.pread(fd, min(CH, want - pos), off + pos)
     if not b:
         break
-    chunks.append(b)
-    got += len(b)
-os.close(fd)
-data = b"".join(chunks)
-cut = data.rfind(b"\n") + 1
-complete = data[:cut]
-bad = 0
-for line in complete.splitlines():
-    try:
-        json.loads(line)
-    except ValueError:
-        bad += 1
-h = hashlib.sha256(complete).hexdigest()
+    pos += len(b)
+    buf = carry + b
+    k = buf.rfind(b"\n") + 1
+    for line in buf[:k].split(b"\n")[:-1]:
+        lines += 1
+        try:
+            json.loads(line)
+        except ValueError:
+            bad += 1
+    h.update(buf[:k])
+    cut += k
+    carry = buf[k:]
+    del buf, b
+digest = h.hexdigest()
 rec = {"schema": "c28-ledger-read/v1", "path": p, "inode": st.st_ino, "size_at_open": size, "offset": off,
-       "read_bytes": len(data), "captured_bytes": len(complete), "partial_tail_bytes": len(data) - len(complete),
-       "cap_hit": size - off > cap, "lines": complete.count(b"\n"), "malformed": bad, "sha256": h,
-       "uid": os.getuid(), "mode": oct(st.st_mode & 0o777)}
+       "read_bytes": pos, "captured_bytes": cut, "partial_tail_bytes": pos - cut, "cap_hit": size - off > cap,
+       "lines": lines, "malformed": bad, "sha256": digest, "uid": os.getuid(), "mode": oct(st.st_mode & 0o777)}
 out.write(json.dumps(rec, sort_keys=True).encode() + b"\n")
-out.write(complete)
-out.write(json.dumps({"trailer": {"bytes": len(complete), "sha256": h}}, sort_keys=True).encode() + b"\n")
+# Pass 2: stream exactly the captured bytes again (the file only grows by appends) and re-hash what was sent.
+h2, sent = hashlib.sha256(), 0
+while sent < cut:
+    b = os.pread(fd, min(CH, cut - sent), off + sent)
+    if not b:
+        break
+    h2.update(b)
+    out.write(b)
+    sent += len(b)
+os.close(fd)
+tr = {"bytes": sent, "sha256": h2.hexdigest()}
+out.write(json.dumps({"trailer": tr}, sort_keys=True).encode() + b"\n")
 out.flush()
 '''
 
@@ -210,6 +226,30 @@ def _ready(kube: X.Kube, ns: str, name: str) -> bool:
                                                 for c in st.get("conditions") or [])
 
 
+
+GONE_OP = "ledger-reader-gone"
+
+
+def _prove_gone(kube: X.Kube, ns: str, name: str, uid: str, sleep: Callable[[float], None]) -> Dict:
+    def gone() -> bool:
+        o = kube.get("Pod", name, ns)
+        return o is None or o["metadata"].get("uid") != uid
+    if not _wait(gone, 120, sleep):
+        raise X.StagingError(f"the reader pod {name} is still present 120 s after its delete")
+    return {"metadata": {"uid": uid}}
+
+
+def _reconcile_gone(kube: X.Kube, d: Dict, record) -> Dict:
+    """recover: the reader pod of this intent is gone (absent, or the name holds another object): done; else unresolved
+    (the lock stays until it is gone)."""
+    o = kube.get("Pod", d["name"], d["namespace"])
+    if o is None or o["metadata"].get("uid") != d["uid"]:
+        return {"observed": "done", "uid": d["uid"]}
+    return {"observed": "unresolved", "why": "the reader pod still exists"}
+
+
+X.RECONCILERS[GONE_OP] = _reconcile_gone
+
 def exec_argv(record: X.Record, ns: str, name: str, offset: int, max_bytes: int) -> List[str]:
     k = record.doc["kubeconfig"]
     return ["kubectl", "--kubeconfig", k["path"], "--context", k["context"], "-n", ns, "exec", name, "-c", "reader",
@@ -239,38 +279,42 @@ def read(record: X.Record, kube: X.Kube, out: str, offset: int = 0, max_bytes: i
         if kube.get(o["kind"], name, ns) is not None:
             raise X.StagingError(f"{o['kind']}/{name} exists; refusing")
     raw, failure = b"", None
+    kept = f"{out}.failed-{stamp}"                  # the transfer as received, written before any cleanup
     with X.mutating(record, kube, HELPER, {"read": name}):
         made = [kube.create(np_)]
         try:
             made.append(kube.create(pod))
             if not _wait(lambda: _ready(kube, ns, name), 180, sleep):
                 raise X.StagingError(f"the reader pod {name} did not become Ready within 180 s")
-            p = run(exec_argv(record, ns, name, offset, max_bytes), capture_output=True, timeout=600)
-            raw = p.stdout or b""
-            if p.returncode != 0:
-                failure = f"kubectl exec exit {p.returncode}"      # stderr is never echoed (it may quote anything)
+            try:
+                p = run(exec_argv(record, ns, name, offset, max_bytes), capture_output=True, timeout=600)
+                raw = p.stdout or b""
+                if p.returncode != 0:
+                    failure = f"kubectl exec exit {p.returncode}"  # stderr is never echoed (it may quote anything)
+            except subprocess.TimeoutExpired as e:
+                raw, failure = (e.output or b""), "kubectl exec timed out after 600 s"
+            finally:
+                with open(kept, "xb") as fh:
+                    fh.write(raw)
         finally:
-            for o in reversed(made):                               # pod first, then its NetworkPolicy
-                kube.delete(o["kind"], name, ns, o["metadata"]["uid"])
-            pod_uid = made[-1]["metadata"]["uid"] if len(made) > 1 else ""
-            if pod_uid and not _wait(lambda: (kube.get("Pod", name, ns) or {}).get("metadata", {}).get("uid")
-                                     != pod_uid, 120, sleep):
-                raise X.StagingError(f"the reader pod {name} is still present 120 s after its delete")
+            if len(made) > 1:                       # the pod: deleted, then its disappearance proven as a journalled
+                pod_uid = made[1]["metadata"]["uid"]   # step (an unproven one keeps the lock: no other reader starts)
+                kube.delete("Pod", name, ns, pod_uid)
+                kube.step(GONE_OP, "Pod", ns, name, pod_uid, lambda mark: _prove_gone(kube, ns, name, pod_uid, sleep))
+            kube.delete("NetworkPolicy", name, ns, made[0]["metadata"]["uid"])
     try:
         if failure:
             raise TransferRefused(failure)
         rec, body = parse_stream(raw)
     except TransferRefused as e:
-        bad = f"{out}.failed-{stamp}"
-        with open(bad, "xb") as fh:                            # the raw transfer, kept as received
-            fh.write(raw)
-        X.receipt(record, HELPER, "read-refused", {"pod": name, "why": str(e), "kept": bad,
+        X.receipt(record, HELPER, "read-refused", {"pod": name, "why": str(e), "kept": kept,
                                                    "raw_bytes": len(raw), "raw_sha256": X.sha256_bytes(raw)})
         raise
     tmp = f"{out}.partial-{stamp}"
     with open(tmp, "xb") as fh:
         fh.write(body)
     os.replace(tmp, out)
+    os.unlink(kept)
     data = {"pod": name, "node": node, "out": out, **rec}
     X.receipt(record, HELPER, "read", data)
     return data
