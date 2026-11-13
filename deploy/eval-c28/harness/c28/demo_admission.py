@@ -35,12 +35,16 @@ Aggregation, per target, over the measured window M = [origin + 10 min, origin +
   distribution   each expected pod's request increase over M within 0.5x..1.5x of the target's total / 12 -> FAIL
   pods           no ready-lost, restart, container-changed, deleted or oom transition from the baseline through
                  completion; the watch covers [baseline, completion] without a gap > 30 s             -> FAIL
-  freshness      every series' worst staleness <= 60 s                                                -> INCOMPLETE
+  freshness      exactly the inventory of freshness_inventory(targets), each finite and <= 60 s, from RAW samples
+                                                                                                     -> INCOMPLETE
+  throttling     each of generator, ingress, fixture: every 60 s bin of M has a finite sample, gaps <= 2 steps of 15 s
+  collection     collection_problems empty (the executor's own collection errors)                    -> INCOMPLETE
   job            Complete with exit code 0                                                            -> INCOMPLETE
 Precedence: STOPPED > INCOMPLETE > LIMIT > FAIL > PASS."""
 
 from __future__ import annotations
 
+import math
 from typing import Dict, List, Tuple
 
 from . import demo, demo_reduce
@@ -55,7 +59,17 @@ FROZEN = {"max_failure_fraction": 0.001, "max_share_above_200ms": 0.05, "max_sha
           "distribution": [0.5, 1.5], "watch_max_gap_s": 30, "max_staleness_s": 60}
 ORDER = ("STOPPED", "INCOMPLETE", "LIMIT", "FAIL", "PASS")
 REQUIRED = ("schema", "config", "lines", "ingress", "queue", "throttled", "steal", "endpoints", "pod_requests", "pods",
-            "freshness", "job", "stops", "limits")
+            "freshness", "job", "stops", "limits", "collection_problems")
+THROTTLED = ("generator", "ingress", "fixture")
+
+
+def freshness_inventory(targets: List[str]) -> List[str]:
+    """The RAW-sample sources whose staleness the evidence must state, every one: the ingress counter, the waiting
+    queue and the per-pod request counters of each target; both cAdvisor counters (periods and throttled periods) of
+    each throttling series; the steal source (node_cpu_seconds_total, mode steal) of W and S."""
+    out = [f"{k}/{t}" for t in targets for k in ("ingress", "queue", "requests")]
+    out += [f"{k}/{w}" for w in THROTTLED for k in ("cfs_periods", "cfs_throttled")]
+    return sorted(out + ["steal_raw/w", "steal_raw/s"])
 
 
 def _crit(out: Dict, name: str, ok, failing: str, **data) -> None:
@@ -161,11 +175,18 @@ def verdict(ev: Dict) -> Dict:
             lo, hi = FROZEN["distribution"]
             out = {u: v for u, v in reqs.items() if not lo * total / REPLICAS <= v <= hi * total / REPLICAS}
             _crit(crit, f"{t}/distribution", bool(total) and not out, "FAIL", total=total, outside=out)
-    for who in ("generator", "ingress"):
-        m = _mean_over(ev["throttled"].get(who), m_lo, m_hi)
-        _crit(crit, f"throttled/{who}", None if m is None else m <= FROZEN["max_throttled_fraction"], "LIMIT", mean=m)
-    fx = _mean_over(ev["throttled"].get("fixture"), m_lo, m_hi)
-    crit["throttled/fixture"] = {"result": "DIAGNOSTIC", "mean": fx}
+    q = FROZEN["queue"]
+    for who in THROTTLED:
+        series = ev["throttled"].get(who) or []
+        _, probs = _bins(series, m_lo, RUN_MIN - SETTLE_MIN, q["step_s"], q["max_gap_steps"])
+        finite = all(isinstance(v, (int, float)) and math.isfinite(v) for t, v in series if m_lo <= t < m_hi)
+        m = _mean_over(series, m_lo, m_hi) if not probs and finite else None
+        if who == "fixture":
+            crit["throttled/fixture"] = {"result": "DIAGNOSTIC" if m is not None else "INCOMPLETE", "mean": m,
+                                         "problems": probs[:3]}
+            continue
+        _crit(crit, f"throttled/{who}", None if m is None else m <= FROZEN["max_throttled_fraction"], "LIMIT",
+              mean=m, problems=probs[:3])
     run_lo, run_hi = origin_s, m_hi
     for node, samples in sorted(ev["steal"].items()):
         means, probs = _bins(samples, run_lo, RUN_MIN, 60, 1)        # one-minute steps, one missing step at most
@@ -194,8 +215,14 @@ def verdict(ev: Dict) -> Dict:
     covered = bool(covered) and cur is not None and done is not None and cur >= done
     bad = [x for x in pods.get("transitions") or [] if base is not None and x["t_s"] >= base]
     _crit(crit, "pods", None if not covered else not bad, "FAIL", transitions=bad[:10])
-    stale = {k: v for k, v in ev["freshness"].items() if v is None or v > FROZEN["max_staleness_s"]}
-    _crit(crit, "freshness", True if ev["freshness"] and not stale else None, "INCOMPLETE", stale=stale)
+    want = freshness_inventory(cfg["targets"])
+    fr = ev["freshness"]
+    missing = sorted(set(want) - set(fr))
+    stale = {k: fr[k] for k in want if k in fr and not (isinstance(fr[k], (int, float)) and math.isfinite(fr[k])
+                                                        and fr[k] <= FROZEN["max_staleness_s"])}
+    _crit(crit, "freshness", True if not missing and not stale else None, "INCOMPLETE", missing=missing, stale=stale)
+    _crit(crit, "collection", True if not ev["collection_problems"] else None, "INCOMPLETE",
+          problems=list(ev["collection_problems"])[:10])
     job = ev["job"]
     _crit(crit, "job", True if job.get("status") == "Complete" and job.get("exit_code") == 0 else None, "INCOMPLETE",
           status=job.get("status"), exit_code=job.get("exit_code"))

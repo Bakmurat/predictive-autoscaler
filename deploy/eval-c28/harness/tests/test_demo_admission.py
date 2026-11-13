@@ -30,7 +30,7 @@ def base(tmp_path_factory):
           "pod_requests": {t: {u: 1000 for u in pods[t]} for t in (N, R)},
           "pods": {"expected": pods, "baseline_s": o - 120, "completion_s": o + 40 * 60 + 20,
                    "watch": [{"from_s": o - 200, "to_s": o + 41 * 60}], "transitions": []},
-          "freshness": {"ingress": 20, "queue": 20, "throttled": 25, "steal": 50},
+          "freshness": {k: 20 for k in A.freshness_inventory([N, R])}, "collection_problems": [],
           "job": {"status": "Complete", "exit_code": 0, "created_s": o - 180, "pod_started_s": o - 170},
           "stops": [], "limits": copy.deepcopy(A.FROZEN)}
     return ev
@@ -76,7 +76,13 @@ def missing_line(ev):
      "STOPPED", "steal/w"),
     (missing_line, "INCOMPLETE", f"{R}/rows"),
     (lambda ev: ev["job"].update(exit_code=1, status="Failed"), "INCOMPLETE", "job"),
-    (lambda ev: ev["freshness"].update(queue=95), "INCOMPLETE", "freshness"),
+    (lambda ev: ev["freshness"].update({f"queue/{N}": 95}), "INCOMPLETE", "freshness"),
+    (lambda ev: ev["freshness"].pop(f"requests/{R}"), "INCOMPLETE", "freshness"),
+    (lambda ev: ev["freshness"].update({"steal_raw/w": float("nan")}), "INCOMPLETE", "freshness"),
+    (lambda ev: ev["collection_problems"].append("ingress x: 2 raw series"), "INCOMPLETE", "collection"),
+    (lambda ev: ev["throttled"].__setitem__("ingress", ev["throttled"]["ingress"][:1]), "INCOMPLETE",
+     "throttled/ingress"),
+    (lambda ev: ev["throttled"].__setitem__("fixture", []), "INCOMPLETE", "throttled/fixture"),
     (lambda ev: ev["queue"][N].__delitem__(slice(80, 90)), "INCOMPLETE", f"{N}/queue"),
     (lambda ev: ev["pods"]["watch"].__setitem__(0, {"from_s": ev["pods"]["baseline_s"] + 5, "to_s": 9e12}),
      "INCOMPLETE", "pods"),
@@ -103,7 +109,7 @@ def test_precedence_stopped_over_incomplete_over_limit_over_fail(base):
     def all_of(ev):
         slow(ev)
         ev["throttled"]["ingress"] = [[t, 0.5] for t, _ in ev["throttled"]["ingress"]]
-        ev["freshness"]["queue"] = 999
+        ev["freshness"][f"queue/{N}"] = 999
     assert run(base, all_of)["verdict"] == "INCOMPLETE"
     assert run(base, lambda ev: (all_of(ev), ev["stops"].append({"t_s": 1, "why": "x"})))["verdict"] == "STOPPED"
 

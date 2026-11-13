@@ -5,6 +5,7 @@ The verdict's criteria are tested in the harness (test_demo_admission)."""
 
 import json
 import os
+import subprocess
 from datetime import datetime, timezone
 
 import pytest
@@ -102,8 +103,66 @@ class JobApi(F.FakeApi2):
         return super().delete(path, uid, resource_version)
 
 
-def fetch(url):
-    return {"status": "success", "data": {"resultType": "matrix", "result": []}}
+class FakeVM:
+    """The observer, answering every query bounded.py sends from a SIMULATED run of the real load script (its ingress
+    counter samples) and steady synthetic series (15 s scrapes) for everything else: steal 1 %, no alert, throttling
+    0.01, a queue of 1, equal per-pod request increases."""
+
+    def __init__(self, sim_ingress, pod_names, steal=1.0, alerts=()):
+        self.ingress, self.pod_names, self.steal, self.alerts = sim_ingress, pod_names, steal, list(alerts)
+        self.queries = []
+
+    def series(self, lo, hi, step, value, metric=None):
+        return {"metric": metric or {}, "values": [[t, str(value)] for t in range(int(-(-lo // step) * step),
+                                                                                  int(hi) + 1, step)]}
+
+    def __call__(self, url):
+        import urllib.parse as U
+        u = U.urlparse(url)
+        q = dict(U.parse_qsl(u.query))
+        expr = q["query"]
+        self.queries.append(expr)
+        res = []
+        if u.path.endswith("query_range"):
+            lo, hi, step = float(q["start"]), float(q["end"]), int(q["step"][:-1])
+            if "steal" in expr:
+                res = [self.series(lo, hi, step, self.steal)]
+            elif "throttled" in expr:
+                res = [self.series(lo, hi, step, 0.01)]
+            elif "c28_queue" in expr:
+                res = [self.series(lo, hi, step, 1.0)]
+        elif expr.startswith("ALERTS"):
+            res = [{"metric": a, "value": [0, "1"]} for a in self.alerts]
+        elif expr.startswith("sum by (pod) (increase(c28_requests_total"):
+            t = expr.split('target="')[1].split('"')[0]
+            res = [{"metric": {"pod": n}, "value": [0, "1000"]} for n in self.pod_names[t]]
+        else:                                               # a raw range-vector query: SELECTOR[Ns] at time
+            hi = float(q["time"])
+            lo = hi - float(expr.rsplit("[", 1)[1].rstrip("s]"))
+            if expr.startswith("c28_ingress_requests_total"):
+                t = expr.split('target="')[1].split('"')[0]
+                res = [{"metric": {}, "values": [[a, str(b)] for a, b in self.ingress[t] if lo < a <= hi]}]
+            else:
+                res = [self.series(lo, hi, 15, 1.0)]
+        return {"status": "success", "data": {"result": res}}
+
+
+def simulated(params, label, origin_ms):
+    """The generator configuration and the REAL script's output for one bounded run (harness simulator)."""
+    import sys
+    import tempfile
+    import pathlib
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                                    "harness", "tests"))
+    from demo_helpers import MIN, scrape, simulate
+    c28 = X.import_harness()
+    cfg = c28.demo.bounded_config(params, label, origin_ms)
+    run_min = 40 if label == "admission" else 15
+    out = simulate(pathlib.Path(tempfile.mkdtemp()), cfg, {
+        "incarnations": [{"pod_uid": "pod-gen", "start_ms": origin_ms - 2 * MIN}],
+        "until_ms": origin_ms + (run_min + 5) * MIN, "ingress_initial": 100,
+        "scrape": scrape(origin_ms - 5 * MIN, origin_ms + (run_min + 5) * MIN)})
+    return cfg, [json.dumps(l) for l in out["lines"]], out["ingress"]
 
 
 def plan_now(record, kube, clock):
@@ -155,21 +214,26 @@ def test_prepares_generator_phase_refuses_while_a_bounded_workload_exists(world)
     assert any("a bounded admission workload exists" in x for x in probs)
 
 
-def _run(world, **kw):  # noqa: F811
+def _run(world, steal=1.0, alerts=(), **kw):  # noqa: F811
     record, kube, base = ready_world(world)
     clock = Clock(O_MS - 180_000)
     a = JobApi(base, clock, O_MS + 40 * 60_000 + 60_000, **kw)
     kube = record.kube(api=a)
     c, p, d = plan_now(record, kube, clock)
     assert p["problems"] == [], p["problems"]
-    logs = lambda c_, pod: ['{"schema": "x"}']
-    return record, kube, a, clock, c, p, d, logs
+    _, lines, ingress = simulated(c.params, "admission", O_MS)
+    names = {t: [f"{t}-{i:02d}" for i in range(12)] for t in (N, R)}
+    vm = FakeVM(ingress, names, steal=steal, alerts=alerts)
+    logs = lambda c_, pod: lines
+    return record, kube, a, clock, c, p, d, logs, vm
 
 
 def test_a_complete_run_writes_evidence_before_cleanup_and_proves_the_pod_gone(world):  # noqa: F811
-    record, kube, a, clock, c, p, d, logs = _run(world)
-    out = B.run_admission(c, p, d, fetch, "http://vm", logs=logs)
-    assert out["data"]["verdict"] in ("PASS", "INCOMPLETE", "FAIL", "LIMIT", "STOPPED") and not out["data"]["stopped"]
+    record, kube, a, clock, c, p, d, logs, vm = _run(world)
+    out = B.run_admission(c, p, d, vm, "http://vm", logs=logs)
+    v = json.load(open(os.path.join(out["data"]["dir"], "verdict.json")))
+    assert out["data"]["verdict"] == "PASS", (v["reasons"], {k: v["criteria"][k] for k in v["reasons"]})
+    assert not out["data"]["stopped"]
     ops = [(m["op"], m["kind"]) for m in kube.mutations]
     assert ops == [("create", "ConfigMap"), ("create", "Job"), ("delete", "Job"), ("delete", "Pod"),
                    (B.GONE_OP, "Pod"), ("delete", "ConfigMap")]
@@ -181,8 +245,54 @@ def test_a_complete_run_writes_evidence_before_cleanup_and_proves_the_pod_gone(w
     assert not os.path.exists(X.lock_file(record)) and not X.open_intents(X.receipts(record, B.HELPER))
 
 
+def _gen_pods(a):
+    return [v for k, v in a.objects.items() if k[0] == "pods" and v["metadata"]["name"].startswith("c28-demo-admission-")]
+
+
+@pytest.mark.parametrize("kw, text", [({"steal": 9.0}, "steal above 5 %"),
+                                      ({"alerts": [{"alertname": "KubeNodeNotReady", "node": "worker-s",
+                                                    "severity": "warning"}]}, "alert KubeNodeNotReady"),
+                                      ({"alerts": [{"alertname": "C28DemoAlert", "node": "worker-s"}]}, None)])
+def test_live_stops_end_the_load_before_any_evidence_is_collected(world, kw, text):  # noqa: F811
+    record, kube, a, clock, c, p, d, logs, vm = _run(world, **kw)
+    seen = []
+    inner = vm.__call__
+
+    class Probe:
+        def __call__(self, url):
+            if "c28_ingress_requests_total" in url:                   # the collection's first query
+                seen.append(len(_gen_pods(a)))
+            return inner(url)
+    out = B.run_admission(c, p, d, Probe(), "http://vm", logs=logs)
+    if text is None:                                                  # the demonstration's own alerts never stop it
+        assert out["data"]["verdict"] == "PASS" and not out["data"]["stopped"]
+        return
+    assert text in out["data"]["stopped"] and out["data"]["verdict"] == "STOPPED"
+    assert seen and all(n == 0 for n in seen)                         # the generator pod was gone before collection
+
+
+def test_stop_load_acts_on_recorded_identities_only(world):  # noqa: F811
+    record, kube, base = ready_world(world)
+    c = B.Ctx(record, kube)
+    job_uid = "11111111-0000-4000-8000-000000000001"
+    orphan = F.pod("c28-demo-startup-zzzzz", "demo", "worker-s", labels={"app.kubernetes.io/name": "c28-demo-startup"})
+    orphan["metadata"]["ownerReferences"] = [{"kind": "Job", "uid": job_uid, "controller": True}]
+    base.put(orphan)
+    with X.mutating(record, kube, B.HELPER, {"test": "stop"}):
+        X.receipt(record, B.HELPER, "owned", {"run": "s-1", "kind": "Job", "name": "c28-demo-startup", "uid": job_uid})
+        B.stop_load(c, "s-1")                                         # the Job is gone; its orphan is still found
+    assert not _gen_pods(base) and not [v for v in base.objects.values()
+                                        if v["metadata"]["name"] == "c28-demo-startup-zzzzz"]
+    base.put({"apiVersion": "batch/v1", "kind": "Job", "metadata": {"name": "c28-demo-startup", "namespace": "demo"},
+              "spec": {}})                                            # a REPLACEMENT under the recorded name
+    with pytest.raises(X.StagingError, match="replacement"):
+        with X.mutating(record, kube, B.HELPER, {"test": "stop2"}):
+            B.stop_load(c, "s-1")
+    assert base.obj("Job", "c28-demo-startup", "demo") is not None   # never deleted
+
+
 def test_node_pressure_stops_the_run_and_keeps_the_partial_evidence(world):  # noqa: F811
-    record, kube, a, clock, c, p, d, logs = _run(world)
+    record, kube, a, clock, c, p, d, logs, vm = _run(world)
     real_sleep = clock.sleep
 
     def sleep(s):
@@ -191,25 +301,27 @@ def test_node_pressure_stops_the_run_and_keeps_the_partial_evidence(world):  # n
             n = a.obj("Node", "worker-s")
             next(x for x in n["status"]["conditions"] if x["type"] == "MemoryPressure")["status"] = "True"
     c.sleep = sleep
-    out = B.run_admission(c, p, d, fetch, "http://vm", logs=logs)
+    out = B.run_admission(c, p, d, vm, "http://vm", logs=logs)
     assert out["data"]["verdict"] == "STOPPED" and "MemoryPressure" in out["data"]["stopped"]
     assert os.path.exists(os.path.join(out["data"]["dir"], "evidence.json"))
     assert ("delete", "Job") in [(m["op"], m["kind"]) for m in kube.mutations]
 
 
-def test_a_pod_not_running_before_the_origin_is_void_and_cleaned_up(world):  # noqa: F811
-    record, kube, a, clock, c, p, d, logs = _run(world, never_running=True)
-    with pytest.raises(X.StagingError, match="VOID"):
-        B.run_admission(c, p, d, fetch, "http://vm", logs=logs)
+def test_a_pod_not_running_before_the_origin_is_void_stopped_and_cleaned_up(world):  # noqa: F811
+    record, kube, a, clock, c, p, d, logs, vm = _run(world, never_running=True)
+    out = B.run_admission(c, p, d, vm, "http://vm", logs=logs)
+    assert "VOID" in out["data"]["stopped"] and out["data"]["verdict"] != "PASS"
+    assert os.path.exists(os.path.join(out["data"]["dir"], "evidence.json"))     # partial evidence kept
     ops = [(m["op"], m["kind"]) for m in kube.mutations]
     assert ops[:2] == [("create", "ConfigMap"), ("create", "Job")] and ("delete", "ConfigMap") == ops[-1]
+    assert (B.GONE_OP, "Pod") in ops                                             # the pending pod proven gone too
     assert not os.path.exists(X.lock_file(record))
 
 
 def test_an_unproven_pod_disappearance_keeps_the_lock(world):  # noqa: F811
-    record, kube, a, clock, c, p, d, logs = _run(world, sticky=True)
+    record, kube, a, clock, c, p, d, logs, vm = _run(world, sticky=True)
     with pytest.raises(X.StagingError, match="still present"):
-        B.run_admission(c, p, d, fetch, "http://vm", logs=logs)
+        B.run_admission(c, p, d, vm, "http://vm", logs=logs)
     assert os.path.exists(X.lock_file(record))
     assert [it["data"]["op"] for it in X.open_intents(X.receipts(record, B.HELPER))] == [B.GONE_OP]
     assert ("delete", "ConfigMap") not in [(m["op"], m["kind"]) for m in kube.mutations]
@@ -219,9 +331,9 @@ def test_a_fresh_process_of_another_helper_decides_the_bounded_gone_step(world, 
     import subprocess
     import sys
     from test_ledger_read import FRESH
-    record, kube, a, clock, c, p, d, logs = _run(world, sticky=True)
+    record, kube, a, clock, c, p, d, logs, vm = _run(world, sticky=True)
     with pytest.raises(X.StagingError, match="still present"):
-        B.run_admission(c, p, d, fetch, "http://vm", logs=logs)
+        B.run_admission(c, p, d, vm, "http://vm", logs=logs)
 
     def fresh():
         objs = tmp_path / "objects.json"
@@ -272,53 +384,92 @@ class StartupApi(JobApi):
         return out
 
 
-def _startup(world, passed=True, **kw):  # noqa: F811
+def _startup(world, admission=True, **kw):  # noqa: F811
+    """A world whose admission really PASSED (a full simulated run), then a startup plan 3 minutes ahead."""
     record, kube, base = ready_world(world)
     clock = Clock(O_MS - 180_000)
-    a = StartupApi(base, clock, O_MS + 15 * 60_000 + 40_000, **kw)
+    if admission:
+        a1 = JobApi(base, clock, O_MS + 40 * 60_000 + 60_000)
+        k1 = record.kube(api=a1)
+        c1, p1, d1 = plan_now(record, k1, clock)
+        _, lines, ingress = simulated(c1.params, "admission", O_MS)
+        vm1 = FakeVM(ingress, {t: [f"{t}-{i:02d}" for i in range(12)] for t in (N, R)})
+        assert B.run_admission(c1, p1, d1, vm1, "http://vm", logs=lambda c_, pod: lines)["data"]["verdict"] == "PASS"
+    o2 = (clock.ms // 60_000 + 4) * 60_000
+    a = StartupApi(base, clock, o2 + 15 * 60_000 + 40_000, **kw)
     kube = record.kube(api=a)
-    if passed:
-        X.receipt(record, B.HELPER, "run-complete", {"run": "a-x", "verdict": "PASS"})
     c = B.Ctx(record, kube, now=clock.now, sleep=clock.sleep)
-    p = B.plan_startup(c, ORIGIN)
+    p = B.plan_startup(c, _ts(o2))
     saved = X.save_plan(record, B.HELPER, p, "plan-startup")
-    return record, kube, a, clock, c, X.load_plan(saved["plan"]), saved["plan_digest"]
+    _, lines, ingress = simulated(c.params, "startup", o2)
+    vm = FakeVM(ingress, {R: []})
+    return record, kube, a, clock, c, X.load_plan(saved["plan"]), saved["plan_digest"], vm, lines
 
 
-def test_startup_requires_the_admission_pass(world):  # noqa: F811
-    *_, p, d = _startup(world, passed=False)
-    assert any("requires the admission exercise's PASS" in x for x in p["problems"])
+def run_s(c, p, d, vm, lines):
+    return B.run_startup(c, p, d, vm, "http://vm", logs=lambda c_, pod: lines)
 
 
-def test_a_startup_step_scales_down_idle_measures_the_scale_up_and_meets_its_obligation(world):  # noqa: F811
-    record, kube, a, clock, c, p, d = _startup(world)
-    assert p["problems"] == [], p["problems"] and p["target"] == R
-    out = B.run_startup(c, p, d, logs=lambda c_, pod: [])
-    data = out["data"]
-    assert data["measured"] is True and data["stopped"] is None, data
-    assert data["creation_to_ready_s"] == [20.0] * 6
+def test_startup_requires_a_bound_admission_pass(world):  # noqa: F811
+    *_, p, d, vm, lines = _startup(world, admission=False)
+    assert any("requires a bound admission PASS" in x for x in p["problems"])
+
+
+def test_an_admission_pass_for_another_configuration_does_not_count(world):  # noqa: F811
+    record, kube, a, clock, c, p, d, vm, lines = _startup(world)
+    assert p["problems"] == [], p["problems"]
+    r = X.last(X.receipts(record, B.HELPER), "run-complete")["data"]
+    with open(os.path.join(r["dir"], "verdict.json"), "a") as fh:      # the verdict file altered after the run
+        fh.write(" ")
+    assert any("no longer hashes" in x for x in B.plan_startup(c, p["origin_utc"])["problems"])
+
+
+def test_a_startup_step_measures_six_starts_under_proven_load_and_meets_its_obligation(world):  # noqa: F811
+    record, kube, a, clock, c, p, d, vm, lines = _startup(world)
+    assert p["problems"] == [], p["problems"]
+    data = run_s(c, p, d, vm, lines)["data"]
+    assert data["measured"] is True, data
+    assert data["creation_to_ready_s"] == [20.0] * 6 and data["load_problems"] == []
     es = [e["event"] for e in X.receipts(record, B.HELPER)]
-    assert es.index("restore-obligation") < es.index("scale-write") and "restore-closed" in es
+    assert es.index("restore-obligation") < max(i for i, e in enumerate(es) if e == "scale-write") \
+        and "restore-closed" in es
     assert a.obj("Deployment", R, "demo")["spec"]["replicas"] == 12
     assert not B.open_obligations(record) and not os.path.exists(X.lock_file(record))
-    ops = [(m["op"], m["kind"]) for m in kube.mutations]
-    assert ops[0] == (B.SCALE_OP, "Deployment") and ops[1:3] == [("create", "ConfigMap"), ("create", "Job")]
-    assert ops.count((B.SCALE_OP, "Deployment")) == 2
+    ev = json.load(open(os.path.join(data["dir"], "evidence.json")))
+    assert ev["summary"]["polls"] > 10 and not ev["summary"]["readiness_lost"]   # observed throughout
+
+
+def test_a_startup_without_load_records_is_never_a_measurement(world):  # noqa: F811
+    record, kube, a, clock, c, p, d, vm, lines = _startup(world)
+    data = run_s(c, p, d, vm, [])["data"]
+    assert data["measured"] is False and data["load_problems"]
+    assert a.obj("Deployment", R, "demo")["spec"]["replicas"] == 12 and not B.open_obligations(record)
 
 
 def test_a_void_startup_still_stops_the_load_and_restores_twelve(world):  # noqa: F811
-    record, kube, a, clock, c, p, d = _startup(world, never_running=True)
-    out = B.run_startup(c, p, d, logs=lambda c_, pod: [])
-    assert "VOID" in out["data"]["stopped"] and out["data"]["measured"] is False
+    record, kube, a, clock, c, p, d, vm, lines = _startup(world, never_running=True)
+    data = run_s(c, p, d, vm, lines)["data"]
+    assert "VOID" in data["stopped"] and data["measured"] is False
     assert a.obj("Deployment", R, "demo")["spec"]["replicas"] == 12 and not B.open_obligations(record)
-    assert not [k for k in a.objects if k[0] in ("jobs", "configmaps") and "startup" in k[2]]
+    assert not [k for k in a.objects if k[0] in ("jobs", "configmaps", "pods") and "startup" in k[2]]
+
+
+def test_a_log_failure_still_stops_the_load_and_restores(world):  # noqa: F811
+    record, kube, a, clock, c, p, d, vm, lines = _startup(world)
+
+    def broken(c_, pod):
+        raise subprocess.TimeoutExpired("kubectl logs", 120)
+    data = B.run_startup(c, p, d, vm, "http://vm", logs=broken)["data"]
+    assert data["measured"] is False
+    assert a.obj("Deployment", R, "demo")["spec"]["replicas"] == 12 and not B.open_obligations(record)
+    assert not [k for k in a.objects if k[0] in ("jobs", "configmaps", "pods") and "startup" in k[2]]
 
 
 def test_an_unmet_obligation_keeps_every_fence_until_restore(world):  # noqa: F811
-    record, kube, a, clock, c, p, d = _startup(world, never_running=True)
+    record, kube, a, clock, c, p, d, vm, lines = _startup(world, never_running=True)
     a.fail_restore = True
     with pytest.raises(Exception):
-        B.run_startup(c, p, d, logs=lambda c_, pod: [])
+        run_s(c, p, d, vm, lines)
     assert B.open_obligations(record) and a.obj("Deployment", R, "demo")["spec"]["replicas"] == 6
     assert any("restore obligation is open" in x for x in B.fence_problems(c))
     assert any("restore obligation is open" in x
@@ -327,10 +478,10 @@ def test_an_unmet_obligation_keeps_every_fence_until_restore(world):  # noqa: F8
 
 def test_after_a_failed_restore_recover_then_restore_meets_the_obligation(world):  # noqa: F811
     import part2_fixtures as PF
-    record, kube, a, clock, c, p, d = _startup(world, never_running=True)
+    record, kube, a, clock, c, p, d, vm, lines = _startup(world, never_running=True)
     a.fail_restore = True
     with pytest.raises(Exception):
-        B.run_startup(c, p, d, logs=lambda c_, pod: [])
+        run_s(c, p, d, vm, lines)
     a.fail_restore = False
     if os.path.exists(X.lock_file(record)):
         PF.crash_owner(record)
@@ -343,4 +494,3 @@ def test_after_a_failed_restore_recover_then_restore_meets_the_obligation(world)
     saved = X.save_plan(record, B.HELPER, rp, "plan-restore")
     B.restore(c, X.load_plan(saved["plan"]), saved["plan_digest"])
     assert not B.open_obligations(record) and a.obj("Deployment", R, "demo")["spec"]["replicas"] == 12
-    assert not B.fence_problems(c) or all("restore obligation" not in x for x in B.fence_problems(c))
