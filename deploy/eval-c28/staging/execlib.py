@@ -187,7 +187,7 @@ def load_record(path_: str, sections: Iterable[str] = ()) -> Record:
 LOCK_SCOPE = "evaluation"                 # ONE lock (common_records.exclusive_lock) for every part-2 helper's mutations
 INTENT_ANNOTATION = "c28.devkuban.com/intent"
 DEFINITIVE = (400, 401, 403, 404, 409, 422, 429)   # the API refused: nothing was applied
-PART2_HELPERS = ("reserve", "prepare", "session", "calibrate")   # journals under the shared evaluation lock
+PART2_HELPERS = ("reserve", "prepare", "session", "calibrate", "ledger_read")   # journals under the shared evaluation lock
 
 
 def lock_file(record: "Record") -> str:
