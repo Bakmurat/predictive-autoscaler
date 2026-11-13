@@ -63,6 +63,7 @@ EXTRA_KINDS = {
     "priorityclasses": ("/apis/scheduling.k8s.io/v1", "priorityclasses", False),
     "storageclasses": ("/apis/storage.k8s.io/v1", "storageclasses", False),
     "networkpolicies": ("/apis/networking.k8s.io/v1", "networkpolicies", True),
+    "endpointslices": ("/apis/discovery.k8s.io/v1", "endpointslices", True),
     "podmonitors": ("/apis/monitoring.coreos.com/v1", "podmonitors", True),
     "vmpodscrapes": ("/apis/operator.victoriametrics.com/v1beta1", "vmpodscrapes", True),
     "volumeattachments": ("/apis/storage.k8s.io/v1", "volumeattachments", False),
@@ -87,6 +88,7 @@ KIND_KEY = {
     "PodMonitor": "podmonitors", "VMPodScrape": "vmpodscrapes", "VolumeAttachment": "volumeattachments",
     "CronHorizontalPodAutoscaler": "cronhpas", "VerticalPodAutoscaler": "vpas",
     "ServiceAccount": "serviceaccounts", "Role": "roles", "RoleBinding": "rolebindings",
+    "EndpointSlice": "endpointslices",
 }
 if C.KINDS["pa-legacy"][0] != f"/apis/{legacy_allowlist.LEGACY_GROUP}/v1alpha1":     # pragma: no cover
     raise ImportError("common_records and legacy_allowlist disagree on the legacy API group")
@@ -188,7 +190,7 @@ def load_record(path_: str, sections: Iterable[str] = ()) -> Record:
 LOCK_SCOPE = "evaluation"                 # ONE lock (common_records.exclusive_lock) for every part-2 helper's mutations
 INTENT_ANNOTATION = "c28.devkuban.com/intent"
 DEFINITIVE = (400, 401, 403, 404, 409, 422, 429)   # the API refused: nothing was applied
-PART2_HELPERS = ("reserve", "prepare", "session", "calibrate", "ledger_read")   # journals under the shared evaluation lock
+PART2_HELPERS = ("reserve", "prepare", "session", "calibrate", "ledger_read", "bounded")   # journals under the shared evaluation lock
 
 
 def lock_file(record: "Record") -> str:
@@ -298,7 +300,7 @@ def _expect_holds(obj: Dict, expect: List) -> bool:
 RECONCILERS: Dict[str, Callable[["Kube", Dict, Optional["Record"]], Dict]] = {}
 # Helper-defined ops whose reconciler lives in a module another helper's process may not have loaded: recover (from any
 # helper's CLI) imports it on demand, so an open intent of that op is never left "no reconciler loaded".
-RECONCILER_MODULES: Dict[str, str] = {"ledger-reader-gone": "ledger_read"}
+RECONCILER_MODULES: Dict[str, str] = {"ledger-reader-gone": "ledger_read", "bounded-pod-gone": "bounded"}
 
 
 def reconcile(kube: "Kube", d: Dict, record: Optional["Record"] = None) -> Dict:
