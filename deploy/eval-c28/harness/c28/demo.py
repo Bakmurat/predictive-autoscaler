@@ -511,6 +511,51 @@ def generator_config(p: Dict, smoke_segment_minutes: Optional[int] = None,
     return cfg
 
 
+# The two bounded pre-history profiles (ADMISSION-DESIGN draft 2), each one ConfigMap + Job, never the continuous
+# generator: label -> (segment minutes, which targets). The deadline is the maximum pre-origin delay + the run + drain.
+BOUNDED = {"admission": (40, "both"), "startup": (15, "reactive")}
+BOUNDED_MAX_PRE_ORIGIN_S = 300
+BOUNDED_DRAIN_S = 180
+
+
+def bounded_deadline_s(label: str) -> int:
+    return BOUNDED_MAX_PRE_ORIGIN_S + BOUNDED[label][0] * 60 + BOUNDED_DRAIN_S
+
+
+def bounded_config(p: Dict, label: str, origin_ms: int) -> Dict:
+    """The configuration of a bounded profile: ONE day row held at the full 28-day table's maximum (constant-peak),
+    origin on a whole minute, one segment of the profile's length, the profile's targets (admission: both; startup:
+    the reactive target only). The script refuses any other shape under these labels."""
+    validate(p)
+    if label not in BOUNDED:
+        raise R.ParamsError(f"label must be one of {sorted(BOUNDED)}")
+    if not _int(origin_ms, 0, 4_102_444_800_000) or origin_ms % 60_000:
+        raise R.ParamsError("origin_ms must be a whole minute in epoch milliseconds")
+    seg, which = BOUNDED[label]
+    d = p["demonstration"]
+    peak = max(max(row) for row in day_table(p))
+    names = target_names(p) if which == "both" else \
+        [t["name"] for t in d["targets"] if t["role"] == "reactive"]
+    cfg = {"schema": GENERATOR_CONFIG_SCHEMA, "label": label, "run_id": p["run_id"],
+           "origin_utc": datetime.fromtimestamp(origin_ms // 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+           "origin_ms": origin_ms, "minute_ms": 60_000, "day_minutes": schedule.MINUTES, "days": 1,
+           "schedule_minutes": schedule.MINUTES, "schedule_end_ms": origin_ms + schedule.MINUTES * 60_000,
+           "segment_minutes": seg, "min_segment_ms": 30_000, "pre_origin_max_ms": BOUNDED_MAX_PRE_ORIGIN_S * 1000,
+           "base_url": f"http://c28-ingress.{p['namespace']}.svc", "targets": names,
+           "timeout_ms": F.REQUEST_TIMEOUT_S * 1000, "max_late_ms": MAX_LATE_MS, "flush_grace_ms": FLUSH_GRACE_MS,
+           "max_inflight": generator_sizing(p)["max_inflight_per_target"],
+           "latency_bounds_ms": list(LATENCY_BOUNDS_MS),
+           "program": {"kind": CONSTANT_PEAK, "seed": d["program"]["seed"], "days": 1,
+                       "capacity_per_replica_rps": capacity(p), "capacity_label": d["capacity_label"],
+                       "capacity_source_calibration": d["capacity_source_calibration"]},
+           "seeds": [d["program"]["seed"]], "per_minute_days": [[peak] * schedule.MINUTES]}
+    why = canonical_problems(cfg)
+    if why:
+        raise R.ParamsError("the bounded configuration cannot be digested identically by the script: " + "; ".join(why))
+    cfg["digest"] = schedule.digest(cfg)
+    return cfg
+
+
 def canonical_problems(obj, where: str = "config") -> List[str]:
     """Why a value could be written differently by Python's json.dumps and by the script's canonical form (so the
     digest the script recomputes at start would differ): the configuration holds only objects with string keys,
@@ -559,17 +604,27 @@ def config_problems(cfg) -> List[str]:
         out.append("seeds must be one seed per day, consecutive")
     elif (cfg.get("program") or {}).get("seed") != seeds[0] or (cfg.get("program") or {}).get("days") != days:
         out.append("program.seed and program.days must be the base seed and the day count")
-    if cfg.get("label") not in ("demonstration", "smoke"):
-        out.append("label must be demonstration or smoke")
+    label = cfg.get("label")
+    if label not in ("demonstration", "smoke") + tuple(BOUNDED):
+        out.append("label must be demonstration, smoke, admission or startup")
     o = cfg.get("origin_ms")
-    if not _int(o, 0, 4_102_444_800_000) or o % 60_000 or (o % 86_400_000 and cfg.get("label") != "smoke"):
-        out.append("origin_ms must be a UTC midnight (a whole minute only under the label smoke)")
+    if not _int(o, 0, 4_102_444_800_000) or o % 60_000 or (o % 86_400_000 and label == "demonstration"):
+        out.append("origin_ms must be a UTC midnight (a whole minute only under the labels smoke, admission and "
+                   "startup)")
     elif cfg.get("schedule_minutes") != days * schedule.MINUTES or \
             cfg.get("schedule_end_ms") != o + days * schedule.MINUTES * 60_000:
         out.append("schedule_minutes and schedule_end_ms must be days x 1440 minutes from the origin")
     if cfg.get("label") == "demonstration" and days != DEMONSTRATION_DAYS:
         out.append(f"a demonstration's schedule has exactly {DEMONSTRATION_DAYS} days")
-    if (cfg.get("program") or {}).get("kind") == CONSTANT_PEAK and (cfg.get("label") != "smoke" or not (
+    if label in BOUNDED:
+        seg, which = BOUNDED[label]
+        if (cfg.get("program") or {}).get("kind") != CONSTANT_PEAK or days != 1 or cfg.get("segment_minutes") != seg \
+                or len(cfg.get("targets") or []) != (2 if which == "both" else 1) or not (
+                    isinstance(table, list) and table and isinstance(table[0], list) and len(set(table[0])) == 1
+                    and table[0][0] >= 1):
+            out.append(f"a {label} configuration is constant-peak, one day, a {seg}-minute segment and "
+                       f"{2 if which == 'both' else 1} target(s)")
+    elif (cfg.get("program") or {}).get("kind") == CONSTANT_PEAK and (label != "smoke" or not (
             isinstance(table, list) and table and all(isinstance(r, list) and r and len(set(r)) == 1 for r in table)
             and len({r[0] for r in table}) == 1)):
         out.append("a constant-peak schedule is a smoke schedule with one count for every minute of every day")
@@ -646,6 +701,51 @@ def generator_objects(p: Dict, smoke_segment_minutes: Optional[int] = None,
                     "revisionHistoryLimit": 2, "updateStrategy": {"type": "RollingUpdate"},
                     "selector": {"matchLabels": selector}, "template": pod}}
     return [cm, svc, sts]
+
+
+def bounded_name(label: str) -> str:
+    return f"c28-demo-{label}"
+
+
+def bounded_objects(p: Dict, label: str, origin_ms: int) -> List[Dict]:
+    """A bounded profile's ConfigMap and Job (never the continuous generator's StatefulSet): the generator's image,
+    resources, placement on S, identity and security; restartPolicy Never, backoffLimit 0 (no retry, no repeat),
+    activeDeadlineSeconds = bounded_deadline_s (max pre-origin delay + run + drain; the executor checks the Job's
+    creation time against it), no ttlSecondsAfterFinished (the pod stays for evidence until the journalled cleanup).
+    k6 itself ends at the segment's end."""
+    cfg = bounded_config(p, label, origin_ms)
+    g = p["demonstration"]["generator"]
+    name, ns = bounded_name(label), p["namespace"]
+    labels = {**R._labels(p), "app.kubernetes.io/name": name, COMPONENT_LABEL: label}
+    script = script_text()
+    cm = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": name, "namespace": ns, "labels": labels},
+          "data": {GENERATOR_SCRIPT: script, GENERATOR_CONFIG: json.dumps(cfg, sort_keys=True, separators=(",", ":"))}}
+    args = ["run", "--quiet", "--no-color", "--no-usage-report", "--no-summary", "--no-thresholds",
+            "--log-format", "raw", "--out", K6_OUTPUT, "--tag", f"c28_run={p['run_id']}", "--tag", f"c28_phase={label}",
+            "-e", f"C28D_CONFIG=/plan/{GENERATOR_CONFIG}", f"/plan/{GENERATOR_SCRIPT}"]
+    env = [{"name": "POD_UID", "valueFrom": {"fieldRef": {"apiVersion": "v1", "fieldPath": "metadata.uid"}}},
+           {"name": "POD_NAME", "valueFrom": {"fieldRef": {"apiVersion": "v1", "fieldPath": "metadata.name"}}},
+           {"name": "K6_PROMETHEUS_RW_SERVER_URL", "value": g["remote_write_url"]},
+           {"name": "K6_PROMETHEUS_RW_PUSH_INTERVAL", "value": "5s"}]
+    pod = {"metadata": {"labels": {**labels, **R.SIDECAR_FREE},
+                        "annotations": {**R.SIDECAR_FREE, "c28.devkuban.com/generator-config": cfg["digest"],
+                                        "c28.devkuban.com/generator-script":
+                                            hashlib.sha256(script.encode()).hexdigest()}},
+           "spec": {"automountServiceAccountToken": False, "terminationGracePeriodSeconds": 15,
+                    "restartPolicy": "Never",
+                    "securityContext": {"runAsNonRoot": True, "runAsUser": GENERATOR_USER,
+                                        "seccompProfile": {"type": "RuntimeDefault"}},
+                    **R._placement(p, "support"),
+                    "containers": [{"name": "k6", "image": g["image"], "args": args, "env": env,
+                                    "resources": R._resources(g["resources"]),
+                                    "securityContext": {"allowPrivilegeEscalation": False,
+                                                        "capabilities": {"drop": ["ALL"]}},
+                                    "volumeMounts": [{"name": "plan", "mountPath": "/plan", "readOnly": True}]}],
+                    "volumes": [{"name": "plan", "configMap": {"name": name}}]}}
+    job = {"apiVersion": "batch/v1", "kind": "Job", "metadata": {"name": name, "namespace": ns, "labels": labels},
+           "spec": {"backoffLimit": 0, "completions": 1, "parallelism": 1,
+                    "activeDeadlineSeconds": bounded_deadline_s(label), "template": pod}}
+    return [cm, job]
 
 
 def generator_pod_name() -> str:
