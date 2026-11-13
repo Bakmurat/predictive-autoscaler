@@ -678,7 +678,9 @@ def run_admission(c: Ctx, reviewed: Dict, reviewed_digest: str, fetch: Fetch, ap
             if X.json_digest(objs[a["create"]]) != a["sha256"]:
                 raise X.StagingError(f"{a['create']} rendered differently from the reviewed plan; refusing")
         cfg = json.loads(objs["ConfigMap"]["data"][c.c28.demo.GENERATOR_CONFIG])
+        bound = binding(c, p["targets"])                          # FROZEN before anything runs
         X.receipt(c.record, HELPER, "run-begin", {"run": rid, "plan_sha256": reviewed_digest, "label": "admission",
+                                                   "binding": bound,
                                                    "origin_utc": p["origin_utc"], "dir": out_dir})
         expected: Dict[str, List[str]] = {t: [] for t in c.c28.demo.target_names(c.params)}
         obs = Observer(c, out_dir, expected)
@@ -781,6 +783,13 @@ def run_admission(c: Ctx, reviewed: Dict, reviewed_digest: str, fetch: Fetch, ap
                           "created_s": st["created_ms"] / 1000 if st["created_ms"] else None},
                   "stops": obs.stops, "limits": c.verdicts.FROZEN,
                   "collection_problems": vm["problems"] + st["problems"]}
+            try:                                                  # the tested configuration, still the same?
+                if binding(c, p["targets"]) != bound:
+                    ev["collection_problems"].append("the bound configuration changed during the run (images, pod "
+                                                     "templates, PA specs, node environment or params)")
+            except Exception as e:
+                ev["collection_problems"].append(f"binding re-check: {type(e).__name__}")
+            ev["binding"] = bound
             try:
                 ev_sha = _write(os.path.join(out_dir, "evidence.json"), ev)
                 with open(os.path.join(out_dir, "evidence.json")) as fh:
@@ -792,7 +801,7 @@ def run_admission(c: Ctx, reviewed: Dict, reviewed_digest: str, fetch: Fetch, ap
         return X.receipt(c.record, HELPER, "run-complete", {
             "run": rid, "label": "admission", "plan_sha256": reviewed_digest, "verdict": verdict["verdict"],
             "evidence_sha256": ev_sha, "verdict_sha256": v_sha, "dir": out_dir, "stopped": st["stop"] or None,
-            "binding": binding(c, p["targets"])})
+            "binding": bound})
 
 
 # --- the startup step (ADMISSION-DESIGN section 4 + Review 1 item 6) ---------------------------------------------------
@@ -896,10 +905,14 @@ X.RECONCILERS[SCALE_OP] = reconcile_scale
 
 def restore_to_twelve(c: Ctx, ob: Dict) -> None:
     """The obligation: stop the run's load (stop_load: recorded identities only, orphans found without the Job, every
-    pod proven gone), remove its ConfigMap, then the SAME target UID back to 12 Ready; only then the obligation
-    closes. Never starts a workload."""
+    pod proven gone); then, independently of the ConfigMap's removal, the SAME target UID back to 12 Ready; the
+    obligation closes only when both are done. Never starts a workload."""
     stop_load(c, ob["run"])
-    remove_config(c, ob["run"])
+    cleanup_error = None
+    try:
+        remove_config(c, ob["run"])
+    except Exception as e:                                        # never blocks the same-UID restore
+        cleanup_error = e
     dep = c.kube.get("Deployment", ob["target"], c.ns)
     if dep is None or dep["metadata"]["uid"] != ob["uid"]:
         raise X.StagingError(f"{ob['target']} is gone or replaced: the obligation cannot be met; the fence stays")
@@ -912,6 +925,9 @@ def restore_to_twelve(c: Ctx, ob: Dict) -> None:
             if c.now() >= end:
                 raise X.StagingError(f"{ob['target']} is not at {REPLICAS} Ready: the obligation stays open")
             c.sleep(2)
+    if cleanup_error is not None:
+        raise X.StagingError(f"{ob['target']} is back at {REPLICAS}, but the run's ConfigMap could not be removed "
+                             f"({type(cleanup_error).__name__}): the obligation stays open until restore succeeds")
     X.receipt(c.record, HELPER, "restore-closed", {"run": ob["run"], "target": ob["target"], "uid": ob["uid"]})
 
 
@@ -950,7 +966,9 @@ class PodTimeline:
                          "restarts": cs.get("restartCount", 0)})
         self.polls.append({"t_ms": self.c.now(), "pods": snap})
 
-    def summary(self) -> Dict:
+    def summary(self, end_ms: Optional[float] = None) -> Dict:
+        """end_ms: the coverage endpoint (the run's completion); a gap from the last poll to it counts too, and no
+        endpoint at all is itself a gap."""
         first_ready, last, lost = {}, {}, []
         for poll in self.polls:
             for x in poll["pods"]:
@@ -966,8 +984,15 @@ class PodTimeline:
             fr = first_ready.get(u)
             c2r = (_ms(fr["ready_since"]) - _ms(fr["created"])) / 1000 if fr and fr["ready_since"] else None
             new.append({**last[u], "first_ready_since": (fr or {}).get("ready_since"), "creation_to_ready_s": c2r})
-        ts = [self.since_ms] + [p["t_ms"] for p in self.polls]
-        gaps = [[a, b] for a, b in zip(ts, ts[1:]) if b - a > self.MAX_GAP_MS] if self.polls else [[self.since_ms, None]]
+        if self.since_ms is None:
+            gaps = [[None, "the observation never started"]]
+        else:
+            ts = [self.since_ms] + [p["t_ms"] for p in self.polls] + ([end_ms] if end_ms is not None else [])
+            gaps = [[a, b] for a, b in zip(ts, ts[1:]) if b - a > self.MAX_GAP_MS]
+            if end_ms is None:
+                gaps.append([ts[-1], "no completion endpoint"])
+            elif not self.polls or self.polls[-1]["t_ms"] < end_ms - self.MAX_GAP_MS:
+                gaps.append([ts[-2] if len(ts) > 1 else None, "no final observation"])
         return {"new_pods": new, "readiness_lost": lost, "polls": len(self.polls), "failures": self.failures,
                 "coverage_gaps": gaps + [[f["t_ms"], f["what"]] for f in self.failures],
                 "creation_to_ready_s": sorted(x["creation_to_ready_s"] for x in new
@@ -1103,10 +1128,13 @@ def run_startup(c: Ctx, reviewed: Dict, reviewed_digest: str, fetch: Fetch, api:
                     c.sleep(POLL_S)
                 deadline = c.now() + 180_000
                 while _terminal(c.kube.get("Job", job["metadata"]["name"], c.ns)) is None and c.now() < deadline:
+                    timeline.poll()
                     c.sleep(POLL_S)
             except X.StagingError as e:
                 st["stop"] = str(e)
                 X.receipt(c.record, HELPER, "run-stopped", {"run": rid, "why": st["stop"][:300]})
+            timeline.poll()                                       # the final observation
+            st["completion_ms"] = c.now()
             try:                                                  # terminal state and the final log BEFORE the stop
                 ref = (owned(c.record, rid).get("Job") or [None])[0]
                 job_now = c.kube.get("Job", ref["name"], c.ns) if ref else None
@@ -1125,7 +1153,7 @@ def run_startup(c: Ctx, reviewed: Dict, reviewed_digest: str, fetch: Fetch, api:
                 stopped_ok = True
             finally:
                 try:
-                    summ = timeline.summary()
+                    summ = timeline.summary(st.get("completion_ms"))
                     load = startup_load_problems(c, cfg, lines) if lines else ["no load records"]
                     doc = {"schema": "c28-startup-evidence/v1", "run": rid, "target": target, "uid": uid,
                            "origin_utc": p["origin_utc"], "write_ms": st["write_ms"], "late_s": st["late_s"],

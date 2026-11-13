@@ -598,3 +598,50 @@ def test_a_stalled_generator_is_not_the_scheduled_load(world):  # noqa: F811
     data = run_s(c, p, d, vm, lines)["data"]
     assert data["measured"] is False
     assert any("zero generator drops" in x for x in data["load_problems"]), data["load_problems"]
+
+
+# --- the third review's reproductions -----------------------------------------------------------------------------------
+
+def test_a_configuration_changed_during_the_run_is_never_a_pass(world):  # noqa: F811
+    record, kube, a, clock, c, p, d, logs, vm = _run(world)
+    inner = vm.__call__
+
+    class Probe:
+        def __call__(self, url):
+            if "c28_ingress_requests_total" in url:                   # during the collection
+                tpl = a.obj("Deployment", N, "demo")["spec"]["template"]["spec"]["containers"][0]
+                tpl.setdefault("resources", {}).setdefault("limits", {})["memory"] = "16Mi"
+            return inner(url)
+    out = B.run_admission(c, p, d, Probe(), "http://vm", logs=logs)
+    assert out["data"]["verdict"] == "INCOMPLETE"
+    begin = X.last(X.receipts(record, B.HELPER), "run-begin")["data"]["binding"]
+    assert out["data"]["binding"] == begin                            # the ORIGINAL binding is the one kept
+
+
+def test_an_unobserved_tail_invalidates_the_startup_measurement(world, monkeypatch):  # noqa: F811
+    record, kube, a, clock, c, p, d, vm, lines = _startup(world)
+    origin = _ms_of(p["origin_utc"])
+    real = B.PodTimeline.poll
+
+    def paused(self):
+        if clock.ms < origin + 3 * 60_000:
+            return real(self)                                         # observation stops after minute two
+    monkeypatch.setattr(B.PodTimeline, "poll", paused)
+    data = run_s(c, p, d, vm, lines)["data"]
+    ev = json.load(open(os.path.join(data["dir"], "evidence.json")))
+    assert data["measured"] is False and ev["summary"]["coverage_gaps"]
+
+
+def test_a_configmap_delete_error_never_blocks_the_restore(world):  # noqa: F811
+    record, kube, a, clock, c, p, d, vm, lines = _startup(world)
+    real = a.delete
+
+    def delete(path, uid, resource_version=None):
+        if "/configmaps/" in path:
+            raise X.C.ApiError("delete configmap: failed (error, exit 1)", 500)
+        return real(path, uid, resource_version)
+    a.delete = delete
+    with pytest.raises(X.StagingError, match="ConfigMap could not be removed"):
+        run_s(c, p, d, vm, lines)
+    assert a.obj("Deployment", R, "demo")["spec"]["replicas"] == 12      # restored anyway
+    assert B.open_obligations(record)                                     # but the obligation stays open
