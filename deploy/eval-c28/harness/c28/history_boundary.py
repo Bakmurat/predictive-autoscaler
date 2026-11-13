@@ -4,11 +4,13 @@ Isolation is of the RAW SERIES, not a time filter (VictoriaMetrics' rate() reads
 
   * per boundary attempt k a NEW scrape object c28-demo-history-<k>, created only after the origin O, scraping the
     ingress like the common scrape object, keeping only c28_ingress_requests_total, renaming it to
-    c28_demo_history_requests_total and adding the label c28_history_epoch="<k>". Every raw sample of those series is
+    c28_demo_history_requests_total and adding the label c28_history_epoch="<run id>-h<k>" (run-scoped: another
+    run's attempt k never matches; every query also names the namespace). Every raw sample of those series is
     therefore younger than the object, hence than O. The common scrape object and every accounting query are unchanged
     (the renamed metric never matches them).
   * the PA query of attempt k (the operator compiles {{ .Name }}):
-      sum(rate(c28_demo_history_requests_total{target="{{ .Name }}",c28_history_epoch="<k>"}[60s]))
+      sum(rate(c28_demo_history_requests_total{namespace="<ns>",target="{{ .Name }}",
+                                              c28_history_epoch="<run id>-h<k>"}[60s]))
         and on() (vector(time()) >= G)
     with G = O + 300 fixed before the contract. The guard only avoids a first partial window; it is not the isolation.
   * the acceptance proof (acceptance()) from RAW samples, per target: exactly one series with the verified labels, no
@@ -35,6 +37,13 @@ SCRAPE_S = F.SCRAPE_INTERVAL_S    # the ingress scrape object's own interval (bo
 MAX_GAP_S = 2 * SCRAPE_S
 
 
+def epoch_id(run_id: str, attempt: int) -> str:
+    """The run-scoped epoch identifier: another run's attempt k (or another namespace's) never matches."""
+    if not isinstance(run_id, str) or not run_id:
+        raise R.ParamsError("the epoch needs the run id")
+    return f"{run_id}-h{_attempt(attempt)}"
+
+
 def scrape_name(attempt: int) -> str:
     return f"c28-demo-history-{attempt}"
 
@@ -55,13 +64,14 @@ def history_scrape(p: Dict, attempt: int) -> Dict:
                   and o["metadata"]["name"] == "c28-ingress")
     obj = {"apiVersion": common["apiVersion"], "kind": "VMPodScrape",
            "metadata": {"name": scrape_name(attempt), "namespace": p["namespace"],
-                        "labels": {**common["metadata"]["labels"], EPOCH_LABEL: str(attempt)}},
+                        "labels": {**common["metadata"]["labels"], EPOCH_LABEL: epoch_id(p["run_id"], attempt)}},
            "spec": {"selector": common["spec"]["selector"],
                     "podMetricsEndpoints": [dict(common["spec"]["podMetricsEndpoints"][0], metricRelabelConfigs=[
                         {"action": "keep", "sourceLabels": ["__name__"], "regex": SOURCE_METRIC},
                         {"action": "replace", "sourceLabels": ["__name__"], "targetLabel": "__name__",
                          "regex": SOURCE_METRIC, "replacement": HISTORY_METRIC},
-                        {"action": "replace", "targetLabel": EPOCH_LABEL, "replacement": str(attempt)}])]}}
+                        {"action": "replace", "targetLabel": EPOCH_LABEL,
+                         "replacement": epoch_id(p["run_id"], attempt)}])]}}
     return obj
 
 
@@ -69,28 +79,28 @@ def guard_s(origin_s: int) -> int:
     return origin_s + GUARD_AFTER_ORIGIN_S
 
 
-def guarded_query(attempt: int, guard: int) -> str:
-    """The PA's query template of the attempt ({{ .Name }} is the operator's substitution)."""
-    attempt = _attempt(attempt)
-    return (f'sum(rate({HISTORY_METRIC}{{target="{{{{ .Name }}}}",{EPOCH_LABEL}="{attempt}"}}[{RATE_RANGE_S}s]))'
-            f' and on() (vector(time()) >= {int(guard)})')
+def guarded_query(namespace: str, epoch: str, guard: int) -> str:
+    """The PA's query template of the attempt ({{ .Name }} is the operator's substitution), scoped by namespace and
+    the run-scoped epoch."""
+    return (f'sum(rate({HISTORY_METRIC}{{namespace="{namespace}",target="{{{{ .Name }}}}",{EPOCH_LABEL}="{epoch}"}}'
+            f'[{RATE_RANGE_S}s])) and on() (vector(time()) >= {int(guard)})')
 
 
-def compiled_query(attempt: int, guard: int, target: str) -> str:
+def compiled_query(namespace: str, epoch: str, guard: int, target: str) -> str:
     """The exact string the operator compiles for `target` (what the forecaster reads and hashes)."""
-    return guarded_query(attempt, guard).replace("{{ .Name }}", target)
+    return guarded_query(namespace, epoch, guard).replace("{{ .Name }}", target)
 
 
-def raw_selector(attempt: int, target: str) -> str:
-    return f'{HISTORY_METRIC}{{target="{target}",{EPOCH_LABEL}="{_attempt(attempt)}"}}'
+def raw_selector(namespace: str, epoch: str, target: str) -> str:
+    return f'{HISTORY_METRIC}{{namespace="{namespace}",target="{target}",{EPOCH_LABEL}="{epoch}"}}'
 
 
-def acceptance(series_by_target: Dict[str, List[Dict]], targets: List[str], attempt: int, origin_s: float,
-               guard: float) -> Dict:
+def acceptance(series_by_target: Dict[str, List[Dict]], targets: List[str], namespace: str, epoch: str,
+               origin_s: float, guard: float) -> Dict:
     """The acceptance proof from RAW samples (a range-vector query's result per target: [{"metric": {...},
     "values": [[t, v], ...]}]). Accepted only when every target passes every check."""
-    attempt = _attempt(attempt)
-    out = {"accepted": False, "attempt": attempt, "origin_s": origin_s, "guard_s": guard, "targets": {},
+    out = {"accepted": False, "epoch": epoch, "namespace": namespace, "origin_s": origin_s, "guard_s": guard,
+           "targets": {},
            "problems": []}
     w_lo = guard - RATE_RANGE_S
     for t in targets:
@@ -104,7 +114,7 @@ def acceptance(series_by_target: Dict[str, List[Dict]], targets: List[str], atte
             probs.append(f"{len(series)} series (exactly one expected)")
         s = series[0]
         m = s.get("metric") or {}
-        want = {"__name__": HISTORY_METRIC, "target": t, EPOCH_LABEL: str(attempt)}
+        want = {"__name__": HISTORY_METRIC, "namespace": namespace, "target": t, EPOCH_LABEL: epoch}
         wrong = {k: m.get(k) for k, v in want.items() if m.get(k) != v}
         if wrong:
             probs.append(f"labels not as relabelled: {wrong}")

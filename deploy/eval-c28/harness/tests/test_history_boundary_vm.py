@@ -59,8 +59,8 @@ def vm(tmp_path):
             assert doc["status"] == "success", doc
             return doc["data"]["result"]
 
-        def raw(self, attempt, target, lo, hi):
-            return self.get("query", query=f"{H.raw_selector(attempt, target)}[{int(hi - lo)}s]", time=f"{hi}")
+        def raw(self, epoch, target, lo, hi, ns="demo"):
+            return self.get("query", query=f"{H.raw_selector(ns, epoch, target)}[{int(hi - lo)}s]", time=f"{hi}")
 
         def range(self, query, lo, hi, step=STEP):
             res = self.get("query_range", query=query, start=lo, end=hi, step=f"{step}s")
@@ -84,7 +84,15 @@ def counter(t0, t1, start, per_min, step=STEP, skip=()):
     return out
 
 
-def world(vm, attempt=1, origin=None, created_after=30, pre_rate=6000.0, post_rate=600.0, skip=(), inherited=5e6):
+RUN = "c28-demo-1"
+
+
+def ep(k, run=RUN):
+    return H.epoch_id(run, k)
+
+
+def world(vm, attempt=1, origin=None, created_after=30, pre_rate=6000.0, post_rate=600.0, skip=(), inherited=5e6,
+          run=RUN, ns="demo"):
     """The ingress counter of both targets before and after the origin O (contrasting slopes), plus the attempt's
     history copy that starts `created_after` seconds after O, carrying the counter's (large, inherited) value."""
     now = int(time.time()) // 60 * 60
@@ -93,21 +101,21 @@ def world(vm, attempt=1, origin=None, created_after=30, pre_rate=6000.0, post_ra
     for t in (N, R):
         pre = counter(o - 1800, o, inherited - pre_rate * 30, pre_rate)
         post = counter(o + STEP, o + 1800, pre[-1][1] + post_rate * STEP / 60, post_rate)
-        vm.put({"__name__": H.SOURCE_METRIC, "target": t, "job": "demo/c28-ingress"}, pre + post)
+        vm.put({"__name__": H.SOURCE_METRIC, "namespace": ns, "target": t, "job": f"{ns}/c28-ingress"}, pre + post)
         hist = [(ts, v) for ts, v in pre + post if ts >= o + created_after and ts not in skip]
-        vm.put({"__name__": H.HISTORY_METRIC, "target": t, H.EPOCH_LABEL: str(attempt),
-                "job": f"demo/{H.scrape_name(attempt)}"}, hist)
+        vm.put({"__name__": H.HISTORY_METRIC, "namespace": ns, "target": t, H.EPOCH_LABEL: ep(attempt, run),
+                "job": f"{ns}/{H.scrape_name(attempt)}"}, hist)
     return o, g
 
 
 def accept(vm, attempt, o, g):
-    return H.acceptance({t: vm.raw(attempt, t, o - 1800, g) for t in (N, R)}, [N, R], attempt, o, g)
+    return H.acceptance({t: vm.raw(ep(attempt), t, o - 1800, g) for t in (N, R)}, [N, R], "demo", ep(attempt), o, g)
 
 
 def test_isolation_excluded_steps_absent_and_only_the_post_origin_slope(vm):
     o, g = world(vm)
     assert accept(vm, 1, o, g)["accepted"]
-    got = vm.range(H.compiled_query(1, g, N), o - 1800, g + 900)
+    got = vm.range(H.compiled_query("demo", ep(1), g, N), o - 1800, g + 900)
     assert got and min(got) >= g                              # every step before G is ABSENT, never zero
     assert all(abs(v - 600 / 60) < 1e-6 for v in got.values())   # only the post-origin slope (10 rps), never 100 rps
     acct = vm.range(f'sum(rate({H.SOURCE_METRIC}{{target="{N}"}}[60s]))', o - 600, o - 60)
@@ -116,7 +124,7 @@ def test_isolation_excluded_steps_absent_and_only_the_post_origin_slope(vm):
 
 def test_an_inherited_nonzero_counter_never_appears_as_a_burst(vm):
     o, g = world(vm, inherited=9e7)
-    got = vm.range(H.compiled_query(1, g, N), g, g + 600)
+    got = vm.range(H.compiled_query("demo", ep(1), g, N), g, g + 600)
     assert got and max(got.values()) < 11                      # the first accepted window has a post-O predecessor
 
 
@@ -124,20 +132,20 @@ def test_accounting_queries_are_identical_with_and_without_the_history_series(vm
     now = int(time.time()) // 60 * 60
     o = now - 3600
     for t in (N,):
-        vm.put({"__name__": H.SOURCE_METRIC, "target": t, "job": "demo/c28-ingress"},
+        vm.put({"__name__": H.SOURCE_METRIC, "namespace": "demo", "target": t, "job": "demo/c28-ingress"},
                counter(o - 1800, o + 1800, 1000, 600))
     q = f'sum(rate({H.SOURCE_METRIC}{{target="{N}"}}[60s]))'
     before = vm.range(q, o - 1200, o + 1200)
-    vm.put({"__name__": H.HISTORY_METRIC, "target": N, H.EPOCH_LABEL: "1", "job": "demo/c28-demo-history-1"},
-           counter(o + 30, o + 1800, 1000, 600))
+    vm.put({"__name__": H.HISTORY_METRIC, "namespace": "demo", "target": N, H.EPOCH_LABEL: ep(1),
+            "job": "demo/c28-demo-history-1"}, counter(o + 30, o + 1800, 1000, 600))
     assert vm.range(q, o - 1200, o + 1200) == before
 
 
 def test_altered_pre_origin_samples_never_change_accepted_history(vm):
     o, g = world(vm)
-    q = H.compiled_query(1, g, N)
+    q = H.compiled_query("demo", ep(1), g, N)
     before = vm.range(q, g, g + 900)
-    vm.put({"__name__": H.SOURCE_METRIC, "target": N, "job": "demo/c28-ingress"},
+    vm.put({"__name__": H.SOURCE_METRIC, "namespace": "demo", "target": N, "job": "demo/c28-ingress"},
            [(o - 7, 1.0), (o - 3, 9e9)])                       # pre-origin samples altered (a counter jump)
     assert vm.range(q, g, g + 900) == before
 
@@ -163,7 +171,7 @@ def test_a_history_series_started_before_the_origin_fails_the_proof(vm):
 
 def test_an_empty_or_missing_target_fails(vm):
     o, g = world(vm)
-    r = H.acceptance({N: vm.raw(1, N, o - 1800, g)}, [N, R], 1, o, g)
+    r = H.acceptance({N: vm.raw(ep(1), N, o - 1800, g)}, [N, R], "demo", ep(1), o, g)
     assert not r["accepted"] and any(R in x and "no series" in x for x in r["problems"])
     assert not accept(vm, 7, o, g)["accepted"]                 # an attempt that never scraped
 
@@ -176,12 +184,12 @@ def test_a_failed_attempt_then_a_retry_never_mix(vm):
     o2 = now - 3600
     _, g2 = world(vm, attempt=2, origin=o2, post_rate=1200.0)
     assert accept(vm, 2, o2, g2)["accepted"]
-    got = vm.range(H.compiled_query(2, g2, N), o1, g2 + 600)
+    got = vm.range(H.compiled_query("demo", ep(2), g2, N), o1, g2 + 600)
     assert got and min(got) >= g2 and all(abs(v - 20) < 1e-6 for v in got.values())   # attempt 1 never leaks in
     before = dict(got)
-    vm.put({"__name__": H.HISTORY_METRIC, "target": N, H.EPOCH_LABEL: "1", "job": "demo/c28-demo-history-1"},
-           [(g2 + 100, 1.0)])                                  # the failed attempt's samples changed later
-    assert vm.range(H.compiled_query(2, g2, N), o1, g2 + 600) == before
+    vm.put({"__name__": H.HISTORY_METRIC, "namespace": "demo", "target": N, H.EPOCH_LABEL: ep(1),
+            "job": "demo/c28-demo-history-1"}, [(g2 + 100, 1.0)])                                  # the failed attempt's samples changed later
+    assert vm.range(H.compiled_query("demo", ep(2), g2, N), o1, g2 + 600) == before
 
 
 def _ml_engine():
@@ -205,7 +213,7 @@ def _signal(query):
 def test_the_forecasters_history_read_sees_no_step_before_the_guard(vm):
     _, _, contracts, history = _ml_engine()
     o, g = world(vm)
-    grid = history.read_rps_history(vm.base, _signal(H.compiled_query(1, g, N)), now=g + 900, interval_s=60,
+    grid = history.read_rps_history(vm.base, _signal(H.compiled_query("demo", ep(1), g, N)), now=g + 900, interval_s=60,
                                     history_seconds=3600, settlement_s=0)
     pts = {grid.start + i * 60: v for i, v in enumerate(grid.values)}
     assert all(v is None for t, v in pts.items() if t < g)              # absent before G: gaps, never zeros
@@ -224,7 +232,21 @@ def test_the_guarded_query_starts_a_new_evidence_key(vm):
     from tests import demonstration_helpers  # noqa: F401  (the ml-engine test helpers are importable)
     from tests.test_demonstration_tool import pa
     settings = contracts.resolve_settings(pa())
-    a = contracts.evidence_key(_signal(H.compiled_query(1, g, N)), settings, 600)
+    a = contracts.evidence_key(_signal(H.compiled_query("demo", ep(1), g, N)), settings, 600)
     b = contracts.evidence_key(_signal(f'sum(rate({H.SOURCE_METRIC}{{target="{N}"}}[60s]))'), settings, 600)
-    c = contracts.evidence_key(_signal(H.compiled_query(2, g + 86400, N)), settings, 600)
+    c = contracts.evidence_key(_signal(H.compiled_query("demo", ep(2), g + 86400, N)), settings, 600)
     assert len({a, b, c}) == 3                                            # each attempt is its own evidence epoch
+
+
+
+def test_another_run_or_namespace_never_matches_the_epoch(vm):
+    now = int(time.time()) // 60 * 60
+    o = now - 3600
+    _, g = world(vm, origin=o)
+    q = H.compiled_query("demo", ep(1), g, N)
+    before = vm.range(q, g, g + 900)
+    world(vm, origin=o, run="c28-other-run", post_rate=60000.0)          # another run's attempt 1, same namespace
+    world(vm, origin=o, ns="elsewhere", post_rate=60000.0)               # the same run id in another namespace
+    assert vm.range(q, g, g + 900) == before
+    assert accept(vm, 1, o, g)["accepted"]
+    assert len(vm.raw(ep(1), N, o - 1800, g)) == 1                       # exactly our one series
