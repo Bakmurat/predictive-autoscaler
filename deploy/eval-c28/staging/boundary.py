@@ -86,6 +86,18 @@ class Ctx:
         return BD.Ctx(self.record, self.kube, now=self.now, sleep=self.sleep)
 
 
+def attempts_used(record: X.Record) -> List[int]:
+    """Every attempt number this helper ever touched: receipts AND journalled intents (a crash before the summary
+    receipt still uses the number)."""
+    out = set()
+    for e in X.receipts(record, HELPER):
+        d = e.get("data") or {}
+        for v in (d.get("attempt"), (d.get("context") or {}).get("attempt")):
+            if isinstance(v, int):
+                out.add(v)
+    return sorted(out)
+
+
 def _events(c: Ctx, k: int, event: str) -> List[Dict]:
     return [e["data"] for e in X.receipts(c.record, HELPER) if e["event"] == event and e["data"].get("attempt") == k]
 
@@ -99,18 +111,48 @@ def fence(c: Ctx) -> List[str]:
     return out
 
 
-def startup_measured(c: Ctx) -> Tuple[Optional[Dict], str]:
-    """The last startup-complete must be measured and its evidence file must still hash to the receipt."""
+def startup_measured(c: Ctx, check_live: bool = True) -> Tuple[Optional[Dict], str]:
+    """The last startup-complete must be measured, its evidence must still hash to the receipt, it must name the
+    admission run it relied on, and (check_live) that admission's PASS must still be bound to the live identities and
+    configuration (bounded.admission_passed: images, pod templates, PA specs, node environment, params)."""
     done = [e["data"] for e in X.receipts(c.record, "bounded") if e["event"] == "startup-complete"]
     if not done:
         return None, "no startup step was run"
     r = done[-1]
     if not r.get("measured"):
         return None, "the last startup step was not a measurement"
-    path = os.path.join(r["dir"], "evidence.json")
+    path = os.path.join(r.get("dir") or "", "evidence.json")
     if not os.path.isfile(path) or C.sha256_file(path) != r.get("evidence_sha256"):
         return None, "the startup evidence no longer hashes to its receipt"
+    if check_live:
+        b = c.bctx()
+        targets, why = BD._targets_state(b)
+        passed, why2 = BD.admission_passed(b, targets)
+        if passed is None:
+            return None, f"the admission PASS the startup relied on no longer applies: {why2 or why}"
+        if r.get("admission") != passed.get("run"):
+            return None, "the startup step was not run under the current admission PASS"
     return r, ""
+
+
+def _live_except_pas(c: Ctx) -> Dict:
+    """The admission binding's live part that the boundary must not change: everything but the PA specs (the only
+    reviewed change is the PA query)."""
+    b = c.bctx()
+    targets, _ = BD._targets_state(b)
+    out = BD.binding(b, targets)
+    out.pop("pa_specs", None)
+    return out
+
+
+def _admission_binding(c: Ctx) -> Optional[Dict]:
+    done = [e["data"] for e in X.receipts(c.record, "bounded") if e["event"] == "run-complete"
+            and e["data"].get("label") == "admission" and e["data"].get("verdict") == "PASS"]
+    if not done:
+        return None
+    b = dict(done[-1]["binding"])
+    b.pop("pa_specs", None)
+    return b
 
 
 def _pas(c: Ctx) -> Tuple[Dict[str, Dict], List[str]]:
@@ -139,17 +181,14 @@ def plan_query(c: Ctx, k: int) -> Dict:
     problems = fence(c)
     _, why = startup_measured(c)
     if why:
-        problems.append(f"the startup step must be measured first: {why}")
+        problems.append(f"the startup step must be measured first, under a still-valid admission PASS: {why}")
     if c.origin_s % 86400:
         problems.append("schedule_origin_utc must be a UTC midnight")
     if c.now() / 1000 >= c.origin_s:
         problems.append("the origin is not in the future: the query update happens before O")
-    if any(_events(c, k, e) for e in ("query-planned-applied", "query-updated", "attempt-incomplete", "scrape-created",
-                                      "attempt-void", "boundary-accepted", "boundary-failed")):
-        problems.append(f"attempt {k} was used before: a retry takes a new attempt number")
-    later = [e["data"].get("attempt") for e in X.receipts(c.record, HELPER) if e["data"].get("attempt")]
-    if later and k <= max(later):
-        problems.append(f"attempt {k} is not above the last attempt {max(later)}")
+    used = attempts_used(c.record)
+    if used and k <= max(used):
+        problems.append(f"attempt {k} is not above the last attempt {max(used)} (receipts and journal)")
     pas, pp = _pas(c)
     problems += pp
     actions = [{"update": "PredictiveAutoscaler", "name": t, "uid": v["pa_uid"], "from_generation": v["pa_generation"],
@@ -208,35 +247,66 @@ def apply_query(c: Ctx, reviewed: Dict, reviewed_digest: str, wait_s: float = 30
                                                               "pas": done, "plan_sha256": reviewed_digest})
 
 
-def prove_hold(c: Ctx, k: int, fetch: Fetch, api: str, ledger_rows: List[Dict]) -> Dict:
-    """Read-only, between the query update and G: per PA the compiled query and its hash for the current generation,
-    TelemetryAvailable False, the ledger's decisions since the update all keep_current with nothing applied, and the
-    operator's applied-write counter unchanged since the update."""
+MODE_MAX_GAP_S = 120
+
+
+def ledger_rows(record: X.Record, path: str) -> List[Dict]:
+    """The decision records of a ledger file that ledger_read.py itself wrote and receipted (out path and captured
+    bytes' sha256); any other file is refused."""
+    reads = [e["data"] for e in X.receipts(record, "ledger_read") if e["event"] == "read"]
+    sha = C.sha256_file(path) if os.path.isfile(path) else None
+    if not any(r.get("out") == path and r.get("sha256") == sha for r in reads):
+        raise X.StagingError(f"{path} is not a verified ledger_read.py read (no receipt with its path and sha256)")
+    with open(path) as fh:
+        return [json.loads(ln) for ln in fh if ln.strip()]
+
+
+def prove_hold(c: Ctx, k: int, fetch: Fetch, api: str, rows: List[Dict]) -> Dict:
+    """Read-only, after the query update and BEFORE G, for the attempt's own identities: per PA the compiled query for
+    the recorded generation, TelemetryAvailable False, the ledger's decision records since the update (event decision,
+    application = the target, namespace) all keep_current with nothing applied, and counter evidence COVERING the
+    interval: the PA's predictive_autoscaler_mode series (Recommend = 1) sampled without gaps above 120 s from the
+    update to now, and the applied-write counter either absent (never incremented) or unchanged over the interval."""
     q = (_events(c, k, "query-updated") or [None])[-1]
-    probs = []
     if q is None:
-        return {"proven": False, "problems": ["the attempt's query update is not complete"]}
+        return {"proven": False, "problems": ["the attempt's query update is not complete"], "attempt": k}
+    now_s = c.now() / 1000
+    probs = []
+    if now_s >= c.guard_s:
+        probs.append("the hold is proven before G only")
     since_s = q["updated_s"]
     per = {}
-    for row in q["pas"]:
-        pa = c.kube.get("PredictiveAutoscaler", row["name"], c.ns) or {}
-        compiled = c.hb.compiled_query(c.ns, q["epoch"], q["guard_s"], row["name"])
+    for r in q["pas"]:
+        name = r["name"]
+        pa = c.kube.get("PredictiveAutoscaler", name, c.ns) or {"metadata": {}}
+        compiled = c.hb.compiled_query(c.ns, q["epoch"], q["guard_s"], name)
+        ident = pa["metadata"].get("uid") == r["uid"] and pa["metadata"].get("generation") == r["generation"]
         conds = {x["type"]: x for x in (pa.get("status") or {}).get("conditions") or []}
         tele = conds.get("TelemetryAvailable", {})
-        mine = [r for r in ledger_rows if r.get("autoscaler_name") == row["name"]
-                and _ms(str(r.get("at"))[:19] + "Z") / 1000 >= since_s]
-        bad = [r for r in mine if r.get("desired_source") != "keep_current"
-               or r.get("applied_replicas") != r.get("current_replicas")]
-        res = BD._q(fetch, api, "query", query=f'increase(predictive_autoscaler_scale_writes_total{{namespace="{c.ns}",'
-                    f'autoscaler="{row["name"]}",result="applied"}}[1h])', time=f"{c.now() / 1000:.3f}")
-        applied = sum(float(r["value"][1]) for r in res)
-        ok = _status_ok(pa, compiled) and tele.get("status") == "False" and mine and not bad and applied == 0
-        per[row["name"]] = {"query_sha256": hashlib.sha256(compiled.encode()).hexdigest(),
-                            "telemetry": [tele.get("status"), tele.get("reason")], "decisions": len(mine),
-                            "not_keep_current": len(bad), "applied_writes_1h": applied, "ok": bool(ok)}
+        mine = [x for x in rows if x.get("event") == "decision" and x.get("application") == name
+                and x.get("namespace") == c.ns and _ms(str(x.get("at"))[:19] + "Z") / 1000 >= since_s]
+        bad = [x for x in mine if x.get("desired_source") != "keep_current"
+               or x.get("applied_replicas") != x.get("current_replicas")]
+        sel = f'namespace="{c.ns}",autoscaler="{name}"'
+        span = int(now_s - since_s) + 1
+        mode = BD._q(fetch, api, "query", query=f'predictive_autoscaler_mode{{{sel},mode="Recommend"}}[{span}s]',
+                     time=f"{now_s:.3f}")
+        mts = sorted(float(t) for s_ in mode for t, v in s_["values"] if float(v) == 1)
+        covered = bool(mts) and mts[0] - since_s <= MODE_MAX_GAP_S and now_s - mts[-1] <= MODE_MAX_GAP_S and all(
+            b - a <= MODE_MAX_GAP_S for a, b in zip(mts, mts[1:]))
+        writes = BD._q(fetch, api, "query", query=f'predictive_autoscaler_scale_writes_total{{{sel},result="applied"}}'
+                                                   f'[{span}s]', time=f"{now_s:.3f}")
+        changed = any(len({v for _, v in s_["values"]}) > 1 for s_ in writes)
+        ok = ident and _status_ok(pa, compiled) and tele.get("status") == "False" and bool(mine) and not bad \
+            and covered and not changed
+        per[name] = {"uid": r["uid"], "generation": r["generation"],
+                     "query_sha256": hashlib.sha256(compiled.encode()).hexdigest(),
+                     "telemetry": [tele.get("status"), tele.get("reason")], "decisions": len(mine),
+                     "not_keep_current": len(bad), "mode_samples": len(mts), "mode_covered": covered,
+                     "applied_counter_series": len(writes), "applied_changed": changed, "ok": bool(ok)}
         if not ok:
-            probs.append(f"{row['name']}: hold not proven {per[row['name']]}")
-    out = {"proven": not probs, "pas": per, "problems": probs, "attempt": k}
+            probs.append(f"{name}: hold not proven {per[name]}")
+    out = {"proven": not probs, "pas": per, "problems": probs, "attempt": k, "at_s": now_s}
     X.receipt(c.record, HELPER, "hold-proof", out)
     return out
 
@@ -289,67 +359,177 @@ def apply_scrape(c: Ctx, reviewed: Dict, reviewed_digest: str, logs: Callable[[s
         obj = c.hb.history_scrape(c.params, k)
         if X.json_digest(obj) != p["actions"][0]["sha256"]:
             raise X.StagingError("the scrape object rendered differently from the reviewed plan")
+        before_s = c.now() / 1000                                   # re-checked IMMEDIATELY before the create
+        if before_s <= c.origin_s or before_s > c.guard_s - SCRAPE_MARGIN_S:
+            X.receipt(c.record, HELPER, "attempt-void", {"attempt": k, "why": f"the cutoff passed while checking "
+                                                                            f"({before_s:.0f})"})
+            raise X.StagingError(f"VOID: the cutoff G - {SCRAPE_MARGIN_S} s passed before the create")
         made = c.kube.create(obj)
-        return X.receipt(c.record, HELPER, "scrape-created", {
-            "attempt": k, "epoch": c.epoch(k), "uid": made["metadata"]["uid"], "spec_sha256": X.json_digest(obj["spec"]),
-            "created_s": now_s, "generator_config_digest": digest, "plan_sha256": reviewed_digest})
+        created_s = c.now() / 1000                                  # the actual creation time, recorded
+        data = {"attempt": k, "epoch": c.epoch(k), "uid": made["metadata"]["uid"],
+                "spec_sha256": X.json_digest(obj["spec"]), "checked_s": now_s, "before_create_s": before_s,
+                "created_s": created_s, "generator_config_digest": digest, "plan_sha256": reviewed_digest}
+        if created_s > c.guard_s - SCRAPE_MARGIN_S:                 # the create itself overran: void, object kept
+            X.receipt(c.record, HELPER, "attempt-void", dict(data, why="the create completed after the cutoff"))
+            raise X.StagingError("VOID: the history scrape's create completed after the cutoff (object kept)")
+        return X.receipt(c.record, HELPER, "scrape-created", data)
+
+
+def _write_same(path: str, text: str) -> str:
+    """Write once; a rerun with identical content is accepted (idempotent), different content is refused."""
+    if os.path.exists(path):
+        with open(path) as fh:
+            if fh.read() != text:
+                raise X.StagingError(f"{path} exists with other content")
+        return C.sha256_file(path)
+    return X.write_new(path, text)
+
+
+def _live_attempt_problems(c: Ctx, k: int, qu: Dict, sc: Dict) -> List[str]:
+    """The attempt's live binding: both targets, the original PA and Deployment UIDs, the PA generations recorded by
+    the query update (nothing changed since), each PA's status reporting the compiled query and its hash, O/G and the
+    epoch the same across receipts, the generator configuration the scrape was created under, the scrape object
+    itself, and everything else of the admission binding unchanged (only the PA queries were the reviewed change)."""
+    out = []
+    epoch = c.epoch(k)
+    if (qu.get("origin_s"), qu.get("guard_s"), qu.get("epoch")) != (c.origin_s, c.guard_s, epoch) or \
+            sc.get("epoch") != epoch:
+        out.append("O, G or the epoch differ between the params and the attempt's receipts")
+    rec = {x["name"]: x for x in qu.get("pas") or []}
+    targets = c.c28.demo.target_names(c.params)
+    if set(rec) != set(targets):
+        out.append(f"the query update covered {sorted(rec)}, not both targets {targets}")
+    created = prepare.created_objects(c.record)
+    for t in targets:
+        pa = c.kube.get("PredictiveAutoscaler", t, c.ns)
+        dep = c.kube.get("Deployment", t, c.ns)
+        dref = created.get(("Deployment", c.ns, t))
+        r = rec.get(t) or {}
+        compiled = c.hb.compiled_query(c.ns, epoch, c.guard_s, t)
+        if pa is None or pa["metadata"]["uid"] != r.get("uid"):
+            out.append(f"PredictiveAutoscaler {t} is gone or replaced")
+            continue
+        if pa["metadata"].get("generation") != r.get("generation"):
+            out.append(f"PredictiveAutoscaler {t} changed after the query update (generation "
+                       f"{pa['metadata'].get('generation')}, recorded {r.get('generation')})")
+        if not _status_ok(pa, compiled) or r.get("compiled_sha256") != hashlib.sha256(compiled.encode()).hexdigest():
+            out.append(f"PredictiveAutoscaler {t} does not report the attempt's compiled query")
+        if dep is None or not dref or dep["metadata"]["uid"] != dref["uid"]:
+            out.append(f"Deployment {t} is gone or replaced")
+    live = c.kube.get("VMPodScrape", c.hb.scrape_name(k), c.ns)
+    if live is None or live["metadata"]["uid"] != sc.get("uid") or X.json_digest(live.get("spec")) != sc.get("spec_sha256"):
+        out.append("the history scrape object is not the one created for this attempt")
+    if sc.get("generator_config_digest") != c.c28.demo.generator_config(c.params)["digest"]:
+        out.append("the generator configuration differs from the one the scrape was created under")
+    adm = _admission_binding(c)
+    if adm is None or _live_except_pas(c) != adm:
+        out.append("the live configuration (images, pod templates, node environment, params) differs from the "
+                   "admission binding beyond the reviewed PA query change")
+    return out
 
 
 def accept(c: Ctx, k: int, fetch: Fetch, api: str) -> Dict:
-    """Read-only reads at G + 30 s or later; one receipt bound to everything the attempt consists of."""
-    if c.now() / 1000 < c.guard_s + ACCEPT_AFTER_G_S:
-        raise X.StagingError(f"acceptance reads start at G + {ACCEPT_AFTER_G_S} s")
-    sc = (_events(c, k, "scrape-created") or [None])[-1]
-    qu = (_events(c, k, "query-updated") or [None])[-1]
-    if sc is None or qu is None:
-        raise X.StagingError(f"attempt {k} has no query update or no scrape")
-    if _events(c, k, "boundary-accepted") or _events(c, k, "boundary-failed"):
-        raise X.StagingError(f"attempt {k} is already decided")
-    epoch = c.epoch(k)
-    targets = c.c28.demo.target_names(c.params)
-    raw = {t: BD._q(fetch, api, "query", query=f"{c.hb.raw_selector(c.ns, epoch, t)}[{c.guard_s - c.origin_s + 600}s]",
-                    time=f"{c.guard_s}") for t in targets}
-    proof = c.hb.acceptance(raw, targets, c.ns, epoch, c.origin_s, c.guard_s)
-    live = c.kube.get("VMPodScrape", c.hb.scrape_name(k), c.ns)
-    if live is None or live["metadata"]["uid"] != sc["uid"] or X.json_digest(live.get("spec")) != sc["spec_sha256"]:
-        proof["accepted"] = False
-        proof["problems"].append("the history scrape object is not the one created for this attempt")
-    pas, _ = _pas(c)
-    out_dir = os.path.join(c.record.evidence_dir, f"boundary-{epoch}")
-    os.makedirs(out_dir, exist_ok=True)
-    raw_sha = X.write_new(os.path.join(out_dir, "raw-samples.json"), json.dumps(raw, sort_keys=True, indent=1) + "\n")
-    binding = {"attempt": k, "epoch": epoch, "origin_s": c.origin_s, "guard_s": c.guard_s,
-               "scrape": {"uid": sc["uid"], "spec_sha256": sc["spec_sha256"]},
-               "pas": {t: {"pa_uid": v["pa_uid"], "pa_generation": v["pa_generation"],
-                           "deployment_uid": v["deployment_uid"],
-                           "compiled_sha256": hashlib.sha256(c.hb.compiled_query(c.ns, epoch, c.guard_s, t).encode())
-                           .hexdigest()} for t, v in pas.items()},
-               "generator_config_digest": sc["generator_config_digest"], "raw_sha256": raw_sha}
-    X.write_new(os.path.join(out_dir, "proof.json"), json.dumps({"proof": proof, "binding": binding}, indent=1,
-                                                                 sort_keys=True) + "\n")
-    return X.receipt(c.record, HELPER, "boundary-accepted" if proof["accepted"] else "boundary-failed",
-                     {"attempt": k, "binding": binding, "problems": proof["problems"][:20]})
+    """At G + 30 s or later, under the shared lock: raw reads, the acceptance proof, the live binding checks, the raw
+    evidence and proof written idempotently (a rerun after an interruption completes the decision), then ONE
+    receipt."""
+    with X.mutating(c.record, c.kube, HELPER, {"attempt": k, "step": "accept"}):
+        if c.now() / 1000 < c.guard_s + ACCEPT_AFTER_G_S:
+            raise X.StagingError(f"acceptance reads start at G + {ACCEPT_AFTER_G_S} s")
+        sc = (_events(c, k, "scrape-created") or [None])[-1]
+        qu = (_events(c, k, "query-updated") or [None])[-1]
+        if sc is None or qu is None:
+            raise X.StagingError(f"attempt {k} has no query update or no scrape")
+        if any(_events(c, k, e) for e in ("boundary-accepted", "boundary-failed", "attempt-void")):
+            raise X.StagingError(f"attempt {k} is already decided")
+        if k != max(attempts_used(c.record)):
+            raise X.StagingError(f"attempt {k} is not the latest attempt")
+        why = [x for x in fence(c) if "intents with unknown outcomes" in x or "obligation" in x]
+        if why:
+            raise X.StagingError("fence: " + "; ".join(why))
+        epoch = c.epoch(k)
+        targets = c.c28.demo.target_names(c.params)
+        raw = {t: BD._q(fetch, api, "query",
+                        query=f"{c.hb.raw_selector(c.ns, epoch, t)}[{c.guard_s - c.origin_s + 600}s]",
+                        time=f"{c.guard_s}") for t in targets}
+        proof = c.hb.acceptance(raw, targets, c.ns, epoch, c.origin_s, c.guard_s)
+        live = _live_attempt_problems(c, k, qu, sc)
+        if live:
+            proof["accepted"] = False
+            proof["problems"] += live
+        out_dir = os.path.join(c.record.evidence_dir, f"boundary-{epoch}")
+        os.makedirs(out_dir, exist_ok=True)
+        raw_path, proof_path = os.path.join(out_dir, "raw-samples.json"), os.path.join(out_dir, "proof.json")
+        raw_sha = _write_same(raw_path, json.dumps(raw, sort_keys=True, indent=1) + "\n")
+        pas = {x["name"]: x for x in qu.get("pas") or []}
+        binding = {"attempt": k, "epoch": epoch, "origin_s": c.origin_s, "guard_s": c.guard_s,
+                   "scrape": {"uid": sc["uid"], "spec_sha256": sc["spec_sha256"], "created_s": sc["created_s"]},
+                   "pas": {t: {"pa_uid": v["uid"], "pa_generation": v["generation"],
+                               "compiled_sha256": v["compiled_sha256"],
+                               "deployment_uid": (prepare.created_objects(c.record).get(("Deployment", c.ns, t))
+                                                  or {}).get("uid")} for t, v in pas.items()},
+                   "generator_config_digest": sc["generator_config_digest"], "raw_sha256": raw_sha}
+        proof_sha = _write_same(proof_path, json.dumps({"proof": proof, "binding": binding}, indent=1,
+                                                       sort_keys=True) + "\n")
+        return X.receipt(c.record, HELPER, "boundary-accepted" if proof["accepted"] else "boundary-failed",
+                         {"attempt": k, "binding": binding, "problems": proof["problems"][:20],
+                          "raw_path": raw_path, "proof_path": proof_path, "proof_sha256": proof_sha})
 
 
 def accepted_boundary(record: X.Record) -> Optional[Dict]:
-    """What activation requires: the last decided attempt, accepted (a failed one leaves the demonstration in
-    Recommend whatever the qualification says)."""
-    es = [e for e in X.receipts(record, HELPER) if e["event"] in ("boundary-accepted", "boundary-failed")]
-    return es[-1]["data"] if es and es[-1]["event"] == "boundary-accepted" else None
+    """What activation requires: the LATEST attempt (receipts and journal), decided as accepted, with its raw evidence
+    and proof still hashing to the receipt. A newer attempt in any state (pending, incomplete, void, failed)
+    invalidates an older acceptance; a failed boundary leaves the demonstration in Recommend whatever the
+    qualification says."""
+    used = attempts_used(record)
+    if not used:
+        return None
+    k = max(used)
+    es = [e for e in X.receipts(record, HELPER) if (e.get("data") or {}).get("attempt") == k]
+    dec = [e for e in es if e["event"] in ("boundary-accepted", "boundary-failed", "attempt-void", "attempt-incomplete")]
+    if not dec or dec[-1]["event"] != "boundary-accepted":
+        return None
+    d = dec[-1]["data"]
+    raw, proof = d.get("raw_path"), d.get("proof_path")
+    if not (raw and proof and os.path.isfile(raw) and os.path.isfile(proof)
+            and C.sha256_file(raw) == d["binding"]["raw_sha256"] and C.sha256_file(proof) == d.get("proof_sha256")):
+        return None
+    return d
 
 
 # --- a retry: retire the continuous generator ------------------------------------------------------------------------------
 
+ABSENT_OP = "boundary-absent"
+
+
+def _prove_absent(c: Ctx, kind: str, name: str, seconds: float) -> Dict:
+    """Gone means ABSENT: no object of that name at all (a replacement under the name is not success)."""
+    end = c.now() + seconds * 1000
+    while c.kube.get(kind, name, c.ns) is not None:
+        if c.now() >= end:
+            raise X.StagingError(f"{kind}/{name} still exists {seconds:.0f} s after its delete")
+        c.sleep(2)
+    return {"metadata": {"name": name}}
+
+
+def _reconcile_absent(kube: X.Kube, d: Dict, record) -> Dict:
+    o = kube.get(d["kind"], d["name"], d["namespace"])
+    return {"observed": "done", "uid": d["uid"]} if o is None else \
+        {"observed": "unresolved", "why": f"{d['kind']}/{d['name']} still exists"}
+
+
+X.RECONCILERS[ABSENT_OP] = _reconcile_absent
+
+
 def plan_retire(c: Ctx) -> Dict:
-    problems = BD.fence_problems(c.bctx())
-    problems = [x for x in problems if "c28-demo-generator" not in x]
-    decided = [e for e in X.receipts(c.record, HELPER)
-               if e["event"] in ("boundary-accepted", "boundary-failed", "attempt-void", "attempt-incomplete")]
-    if not decided or decided[-1]["event"] == "boundary-accepted":
-        problems.append("the generator is retired only for a retry (the last attempt failed, voided or incomplete)")
+    problems = [x for x in BD.fence_problems(c.bctx()) if "c28-demo-generator" not in x]
+    used = attempts_used(c.record)
+    last = [e for e in X.receipts(c.record, HELPER) if (e.get("data") or {}).get("attempt") == (max(used) if used else 0)
+            and e["event"] in ("boundary-accepted", "boundary-failed", "attempt-void", "attempt-incomplete")]
+    if not last or last[-1]["event"] == "boundary-accepted":
+        problems.append("the generator is retired only for a retry (the latest attempt failed, voided or incomplete)")
     created = prepare.created_objects(c.record)
     name = c.c28.demo.GENERATOR_NAME
-    refs = []
+    refs, pods = [], []
     for kind in ("StatefulSet", "Service", "ConfigMap"):
         ref = created.get((kind, c.ns, name))
         live = c.kube.get(kind, name, c.ns)
@@ -357,34 +537,52 @@ def plan_retire(c: Ctx) -> Dict:
             refs.append({"kind": kind, "name": name, "uid": ref["uid"]})
         elif live is not None:
             problems.append(f"{kind}/{name} is not the generator this run created: never touched")
-    return X.new_plan(HELPER, c.record, [{"delete": r["kind"], "name": r["name"], "uid": r["uid"]} for r in refs],
-                      problems=problems)
+    sts = next((r for r in refs if r["kind"] == "StatefulSet"), None)
+    for p_ in c.kube.list("Pod", c.ns, strict=True):
+        owners = {o.get("uid") for o in p_["metadata"].get("ownerReferences") or []}
+        if sts and sts["uid"] in owners:
+            pods.append({"name": p_["metadata"]["name"], "uid": p_["metadata"]["uid"]})
+        elif p_["metadata"]["name"] == c.c28.demo.generator_pod_name():
+            problems.append(f"Pod/{p_['metadata']['name']} is not owned by this run's generator: never touched")
+    actions = [{"delete": r["kind"], "name": r["name"], "uid": r["uid"]} for r in refs]
+    actions += [{"delete": "Pod", "name": x["name"], "uid": x["uid"], "owner": sts["uid"]} for x in pods]
+    return X.new_plan(HELPER, c.record, actions, problems=problems)
 
 
 def retire(c: Ctx, reviewed: Dict, reviewed_digest: str, logs: Callable[[str], List[str]]) -> Dict:
+    """The run's own generator only (the plan's UIDs; pods bound to the recorded StatefulSet UID): logs archived first
+    (a failed fetch refuses), the StatefulSet deleted and proven ABSENT, each of its pods deleted by UID, no pod of
+    the generator's name left at all, then the Service and ConfigMap."""
     with X.mutating(c.record, c.kube, HELPER, {"step": "retire-generator"}):
         p = plan_retire(c)
         X.require_live(reviewed, reviewed_digest, HELPER, c.record, p)
         if p["problems"]:
             raise X.StagingError("the plan has problems: " + "; ".join(p["problems"]))
-        pod_name = c.c28.demo.generator_pod_name()
-        pod = c.kube.get("Pod", pod_name, c.ns)
+        acts = {}
+        pods = []
+        for a in p["actions"]:
+            (pods.append(a) if a["delete"] == "Pod" else acts.__setitem__(a["delete"], a))
         out_dir = os.path.join(c.record.evidence_dir, f"generator-retired-{reviewed_digest[:12]}")
         os.makedirs(out_dir)
-        log_sha = X.write_new(os.path.join(out_dir, "generator.log"), "\n".join(logs(pod_name) if pod else []) + "\n")
-        acts = {a["delete"]: a for a in p["actions"]}
+        log_shas = {}
+        for x in pods:
+            text = logs(x["name"])                                  # raises on a failed fetch: nothing deleted yet
+            log_shas[x["name"]] = X.write_new(os.path.join(out_dir, f"{x['name']}.log"), "\n".join(text) + "\n")
         if "StatefulSet" in acts:
-            c.kube.delete("StatefulSet", acts["StatefulSet"]["name"], c.ns, acts["StatefulSet"]["uid"])
-        if pod is not None:
-            live = c.kube.get("Pod", pod_name, c.ns)
-            if live is not None and live["metadata"]["uid"] == pod["metadata"]["uid"]:
-                c.kube.delete("Pod", pod_name, c.ns, pod["metadata"]["uid"])
-            c.kube.step(BD.GONE_OP, "Pod", c.ns, pod_name, pod["metadata"]["uid"],
-                        lambda mark: BD._prove_gone(c.bctx(), "Pod", pod_name, pod["metadata"]["uid"], 180))
+            a = acts["StatefulSet"]
+            c.kube.delete("StatefulSet", a["name"], c.ns, a["uid"])
+            c.kube.step(ABSENT_OP, "StatefulSet", c.ns, a["name"], a["uid"],
+                        lambda mark: _prove_absent(c, "StatefulSet", a["name"], 180))
+        for x in pods:
+            live = c.kube.get("Pod", x["name"], c.ns)
+            if live is not None and live["metadata"]["uid"] == x["uid"]:
+                c.kube.delete("Pod", x["name"], c.ns, x["uid"])
+            c.kube.step(ABSENT_OP, "Pod", c.ns, x["name"], x["uid"],
+                        lambda mark, x=x: _prove_absent(c, "Pod", x["name"], 180))
         for kind in ("Service", "ConfigMap"):
             if kind in acts:
                 c.kube.delete(kind, acts[kind]["name"], c.ns, acts[kind]["uid"])
-        return X.receipt(c.record, HELPER, "generator-retired", {"plan_sha256": reviewed_digest, "log_sha256": log_sha,
+        return X.receipt(c.record, HELPER, "generator-retired", {"plan_sha256": reviewed_digest, "logs": log_shas,
                                                                   "deleted": p["actions"]})
 
 
@@ -393,7 +591,9 @@ def _logs(c: Ctx) -> Callable[[str], List[str]]:
         k = c.record.doc["kubeconfig"]
         r = subprocess.run(["kubectl", "--kubeconfig", k["path"], "--context", k["context"], "-n", c.ns, "logs", pod],
                            capture_output=True, text=True, timeout=120)
-        return r.stdout.splitlines() if r.returncode == 0 else []
+        if r.returncode != 0:
+            raise X.StagingError(f"kubectl logs {pod} failed (exit {r.returncode})")   # never an empty archive
+        return r.stdout.splitlines()
     return get
 
 
@@ -433,9 +633,7 @@ def main(argv: Optional[List[str]] = None, api=None, fetch: Fetch = BD.http_json
     elif a.cmd == "apply-query":
         X.emit(apply_query(c, X.load_plan(a.plan), a.plan_digest))
     elif a.cmd == "prove-hold":
-        with open(a.ledger) as fh:
-            rows = [json.loads(ln) for ln in fh if ln.strip()]
-        X.emit(prove_hold(c, a.attempt, fetch, a.query_api, rows))
+        X.emit(prove_hold(c, a.attempt, fetch, a.query_api, ledger_rows(record, os.path.abspath(a.ledger))))
     elif a.cmd == "plan-scrape":
         X.emit(X.cli_plan(record, HELPER, plan_scrape(c, a.attempt), f"plan-scrape-{a.attempt}"))
     elif a.cmd == "apply-scrape":

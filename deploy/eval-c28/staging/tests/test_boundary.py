@@ -63,13 +63,28 @@ def boundary_world(world, stuck=()):  # noqa: F811
     run_until(record, kube, "pas")
     a = OperatorApi(world.api, stuck)
     kube = record.kube(api=a)
+    clock = Clock(O - 6 * 3600)
+    c = BY.Ctx(record, kube, now=clock.now, sleep=clock.sleep)
+    admission_pass(record, c)
     ev = os.path.join(record.evidence_dir, "startup-x")
     os.makedirs(ev)
     sha = X.write_new(os.path.join(ev, "evidence.json"), "{}\n")
     X.receipt(record, "bounded", "startup-complete", {"run": "s-x", "measured": True, "dir": ev,
-                                                      "evidence_sha256": sha})
-    clock = Clock(O - 6 * 3600)
-    return record, kube, a, clock, BY.Ctx(record, kube, now=clock.now, sleep=clock.sleep)
+                                                      "evidence_sha256": sha, "admission": "a-x"})
+    return record, kube, a, clock, c
+
+
+def admission_pass(record, c):
+    """A bounded admission PASS bound to the world's LIVE configuration (as bounded.run_admission records it)."""
+    b = c.bctx()
+    targets, _ = BD._targets_state(b)
+    d = os.path.join(record.evidence_dir, "admission-a-x")
+    os.makedirs(d)
+    ev = X.write_new(os.path.join(d, "evidence.json"), "{}\n")
+    vd = X.write_new(os.path.join(d, "verdict.json"), json.dumps({"verdict": "PASS"}) + "\n")
+    X.receipt(record, "bounded", "run-complete", {"run": "a-x", "label": "admission", "verdict": "PASS", "dir": d,
+                                                  "evidence_sha256": ev, "verdict_sha256": vd,
+                                                  "binding": BD.binding(b, targets)})
 
 
 def saved(record, plan, name):
@@ -89,7 +104,7 @@ def test_plan_query_binds_both_pas_and_the_guarded_query(world):  # noqa: F811
     (lambda record, c, clock: clock.__setattr__("ms", (O + 1) * 1000), "not in the future"),
     (lambda record, c, clock: X.receipt(record, "bounded", "startup-complete", {"run": "s-y", "measured": False}),
      "must be measured first"),
-    (lambda record, c, clock: X.receipt(record, BY.HELPER, "boundary-failed", {"attempt": 1}), "used before"),
+    (lambda record, c, clock: X.receipt(record, BY.HELPER, "boundary-failed", {"attempt": 1}), "not above the last"),
 ])
 def test_plan_query_refuses(world, edit, text):  # noqa: F811
     record, kube, a, clock, c = boundary_world(world)
@@ -222,21 +237,55 @@ def test_a_replaced_history_scrape_object_fails_the_boundary(world):  # noqa: F8
     assert any("not the one created" in x for x in out["data"]["problems"])
 
 
-def test_the_hold_proof_needs_keep_current_decisions_and_no_applied_write(world):  # noqa: F811
-    record, kube, a, clock, c = _query_done(world)
-    clock.sleep(600)
-    at = datetime.fromtimestamp(clock.ms / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    rows = [{"autoscaler_name": t, "at": at, "desired_source": "keep_current", "applied_replicas": 12,
-             "current_replicas": 12} for t in (N, R)]
+def hold_vm(mode_from, mode_to, writes=None, step=30):
+    """The observer for the hold proof: the PA's mode series (Recommend = 1) sampled every `step` s over
+    [mode_from, mode_to] (None: absent), and the applied-write counter (None: absent; a list of values otherwise)."""
+    def fetch(url):
+        import urllib.parse as U
+        q = dict(U.parse_qsl(U.urlparse(url).query))["query"]
+        if q.startswith("predictive_autoscaler_mode"):
+            res = [] if mode_from is None else [{"metric": {}, "values": [[t, "1"] for t in range(int(mode_from),
+                                                                                                     int(mode_to) + 1, step)]}]
+        elif q.startswith("predictive_autoscaler_scale_writes_total"):
+            res = [] if writes is None else [{"metric": {}, "values": [[mode_from + i, str(v)] for i, v in enumerate(writes)]}]
+        else:
+            raise ValueError(q)
+        return {"status": "success", "data": {"result": res}}
+    return fetch
 
-    def vm(value):
-        return lambda url: {"status": "success", "data": {"result": [{"metric": {}, "value": [0, str(value)]}]}}
-    assert BY.prove_hold(c, 1, vm(0), "http://vm", rows)["proven"]
-    assert not BY.prove_hold(c, 1, vm(1), "http://vm", rows)["proven"]          # an applied write
-    bad = copy.deepcopy(rows)
-    bad[0]["desired_source"] = "reactive"
-    assert not BY.prove_hold(c, 1, vm(0), "http://vm", bad)["proven"]
-    assert not BY.prove_hold(c, 1, vm(0), "http://vm", [])["proven"]            # no decision seen at all
+
+def decisions(clock, **over):
+    at = datetime.fromtimestamp(clock.ms / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return [dict({"event": "decision", "application": t, "namespace": "demo", "at": at, "desired_source": "keep_current",
+                  "applied_replicas": 12, "current_replicas": 12}, **over) for t in (N, R)]
+
+
+def test_the_hold_proof_needs_real_decisions_mode_coverage_and_no_applied_write(world):  # noqa: F811
+    record, kube, a, clock, c = _query_done(world)
+    since = X.last(X.receipts(record, BY.HELPER), "query-updated")["data"]["updated_s"]
+    clock.sleep(600)
+    now = clock.ms / 1000
+    rows = decisions(clock)
+    assert BY.prove_hold(c, 1, hold_vm(since, now), "http://vm", rows)["proven"]
+    assert BY.prove_hold(c, 1, hold_vm(since, now, writes=[0, 0, 0]), "http://vm", rows)["proven"]
+    assert not BY.prove_hold(c, 1, hold_vm(since, now, writes=[0, 1]), "http://vm", rows)["proven"]   # a write
+    assert not BY.prove_hold(c, 1, hold_vm(None, None), "http://vm", rows)["proven"]          # no counter evidence
+    assert not BY.prove_hold(c, 1, hold_vm(since + 300, now), "http://vm", rows)["proven"]    # coverage gap
+    assert not BY.prove_hold(c, 1, hold_vm(since, now), "http://vm", decisions(clock, desired_source="reactive"))["proven"]
+    assert not BY.prove_hold(c, 1, hold_vm(since, now), "http://vm",
+                             [dict(r, application="other") for r in rows])["proven"]          # not these targets
+    clock.ms = (G + 1) * 1000
+    assert not BY.prove_hold(c, 1, hold_vm(since, G), "http://vm", decisions(clock))["proven"]   # only before G
+
+
+def test_a_ledger_file_must_be_a_receipted_read(world, tmp_path):  # noqa: F811
+    record, kube, a, clock, c = _query_done(world)
+    f = tmp_path / "ledger.jsonl"
+    f.write_text("{}\n")
+    with pytest.raises(X.StagingError, match="not a verified ledger_read"):
+        BY.ledger_rows(record, str(f))
+    X.receipt(record, "ledger_read", "read", {"out": str(f), "sha256": hashlib.sha256(b"{}\n").hexdigest()})
+    assert BY.ledger_rows(record, str(f)) == [{}]
 
 
 def test_the_generator_is_retired_only_for_a_retry_and_by_recorded_uid(world):  # noqa: F811
@@ -254,16 +303,122 @@ def test_a_retry_retires_the_generator_by_recorded_uid_and_proves_its_pod_gone(w
     c = BY.Ctx(record, record.kube(api=a))
     pod = F.pod(c.c28.demo.generator_pod_name(), "demo", "worker-s",
                 labels={"app.kubernetes.io/name": c.c28.demo.GENERATOR_NAME, X.RUN_LABEL: DEMO})
+    sts_uid = a.obj("StatefulSet", c.c28.demo.GENERATOR_NAME, "demo")["metadata"]["uid"]
+    pod["metadata"]["ownerReferences"] = [{"kind": "StatefulSet", "uid": sts_uid, "controller": True}]
     a.put(pod)
     X.receipt(record, BY.HELPER, "boundary-failed", {"attempt": 1})
     p = BY.plan_retire(c)
-    assert p["problems"] == [] and {x["delete"] for x in p["actions"]} == {"StatefulSet", "Service", "ConfigMap"}
+    assert p["problems"] == [] and {x["delete"] for x in p["actions"]} == {"StatefulSet", "Service", "ConfigMap", "Pod"}
     s = X.save_plan(record, BY.HELPER, p, "retire")
     out = BY.retire(c, X.load_plan(s["plan"]), s["plan_digest"], logs=lambda name: ['{"k6": "log"}'])
-    assert out["data"]["log_sha256"]
+    assert out["data"]["logs"] and all(out["data"]["logs"].values())
     for kind in ("StatefulSet", "Service", "ConfigMap", "Pod"):
         assert not [k for k, v in a.objects.items() if v.get("kind") == kind
                     and v["metadata"]["name"].startswith(c.c28.demo.GENERATOR_NAME)], kind
     ops = [(m["op"], m["kind"]) for m in c.kube.mutations]
-    assert ops.index(("delete", "StatefulSet")) < ops.index((BD.GONE_OP, "Pod")) < ops.index(("delete", "ConfigMap"))
+    assert ops.index(("delete", "StatefulSet")) < ops.index((BY.ABSENT_OP, "StatefulSet")) \
+        < ops.index((BY.ABSENT_OP, "Pod")) < ops.index(("delete", "ConfigMap"))
+    assert not os.path.exists(X.lock_file(record))
+
+
+
+# --- the review's reproductions, now refused -----------------------------------------------------------------------------
+
+def test_acceptance_refuses_changed_live_queries_or_a_replaced_pa(world):  # noqa: F811
+    record, kube, a, clock, c = _scrape_done(world)
+    for t in (N, R):
+        pa = a.obj("PredictiveAutoscaler", t, "demo")
+        pa["spec"]["metrics"]["requests"]["source"]["query"] = "sum(rate(old_counter[60s]))"
+        pa["metadata"]["generation"] += 1
+    out = BY.accept(c, 1, _vm_series(c, O + 75, G), "http://vm")
+    assert out["event"] == "boundary-failed" and any("changed after the query update" in x for x in out["data"]["problems"])
+
+
+def test_acceptance_refuses_a_replaced_pa(world):  # noqa: F811
+    record, kube, a, clock, c = _scrape_done(world)
+    a.obj("PredictiveAutoscaler", N, "demo")["metadata"]["uid"] = "11111111-0000-4000-8000-0000000000ff"
+    out = BY.accept(c, 1, _vm_series(c, O + 75, G), "http://vm")
+    assert out["event"] == "boundary-failed" and any("gone or replaced" in x for x in out["data"]["problems"])
+
+
+def test_a_newer_attempt_in_any_state_invalidates_an_older_acceptance(world):  # noqa: F811
+    record, kube, a, clock, c = _scrape_done(world)
+    BY.accept(c, 1, _vm_series(c, O + 75, G), "http://vm")
+    assert BY.accepted_boundary(record)["attempt"] == 1
+    X.receipt(record, BY.HELPER, "attempt-incomplete", {"attempt": 2, "done": []})
+    assert BY.accepted_boundary(record) is None
+
+
+def test_an_altered_acceptance_file_is_no_longer_accepted(world):  # noqa: F811
+    record, kube, a, clock, c = _scrape_done(world)
+    out = BY.accept(c, 1, _vm_series(c, O + 75, G), "http://vm")
+    with open(out["data"]["proof_path"], "a") as fh:
+        fh.write(" ")
+    assert BY.accepted_boundary(record) is None
+
+
+def test_an_unowned_generator_named_pod_is_never_retired(world):  # noqa: F811
+    record, kube, a, clock, c = _query_done(world)
+    pod = F.pod(c.c28.demo.generator_pod_name(), "demo", "worker-s", labels={})
+    a.put(pod)
+    X.receipt(record, BY.HELPER, "boundary-failed", {"attempt": 1})
+    assert any("not owned by this run's generator" in x for x in BY.plan_retire(c)["problems"])
+    assert c.kube.get("Pod", pod["metadata"]["name"], "demo") is not None
+
+
+def test_a_failed_log_fetch_refuses_the_retirement(world):  # noqa: F811
+    record, kube = world()
+    run_until(record, kube, "generator")
+    a = world.api
+    c = BY.Ctx(record, record.kube(api=a))
+    pod = F.pod(c.c28.demo.generator_pod_name(), "demo", "worker-s", labels={})
+    pod["metadata"]["ownerReferences"] = [{"kind": "StatefulSet", "controller": True,
+                                           "uid": a.obj("StatefulSet", c.c28.demo.GENERATOR_NAME, "demo")["metadata"]["uid"]}]
+    a.put(pod)
+    X.receipt(record, BY.HELPER, "boundary-failed", {"attempt": 1})
+    s_ = X.save_plan(record, BY.HELPER, BY.plan_retire(c), "retire")
+
+    def broken(name):
+        raise X.StagingError("kubectl logs failed (exit 1)")
+    with pytest.raises(X.StagingError, match="logs"):
+        BY.retire(c, X.load_plan(s_["plan"]), s_["plan_digest"], logs=broken)
+    assert a.obj("StatefulSet", c.c28.demo.GENERATOR_NAME, "demo") is not None   # nothing deleted
+
+
+def test_a_slow_check_cannot_create_the_scrape_after_the_cutoff(world):  # noqa: F811
+    record, kube, a, clock, c = _query_done(world)
+    p, d = saved(record, BY.plan_scrape(c, 1), "s1")
+    lines = _generator(a, c, O * 1000)
+    clock.ms = (G - 121) * 1000
+
+    def slow(pod):
+        clock.sleep(120)
+        return lines
+    with pytest.raises(X.StagingError, match="VOID"):
+        BY.apply_scrape(c, p, d, logs=slow)
+    assert not [k for k in a.objects if k[0] == "vmpodscrapes" and "history" in k[2]]
+    assert X.last(X.receipts(record, BY.HELPER), "attempt-void")
+
+
+def test_a_changed_live_target_template_voids_the_startup_basis(world):  # noqa: F811
+    record, kube, a, clock, c = boundary_world(world)
+    dep = a.obj("Deployment", R, "demo")
+    dep["spec"]["template"]["spec"]["containers"][0].setdefault("resources", {}).setdefault("limits", {})["memory"] = "16Mi"
+    assert any("no longer applies" in x for x in BY.plan_query(c, 1)["problems"])
+
+
+def test_an_interrupted_acceptance_is_completed_by_a_rerun(world, monkeypatch):  # noqa: F811
+    record, kube, a, clock, c = _scrape_done(world)
+    real = X.write_new
+
+    def broken(path, *args, **kw):
+        if path.endswith("/proof.json"):
+            raise OSError("simulated disk failure")
+        return real(path, *args, **kw)
+    with monkeypatch.context() as m:
+        m.setattr(X, "write_new", broken)
+        with pytest.raises(OSError):
+            BY.accept(c, 1, _vm_series(c, O + 75, G), "http://vm")
+    out = BY.accept(c, 1, _vm_series(c, O + 75, G), "http://vm")       # the same raw samples: completes
+    assert out["event"] == "boundary-accepted" and BY.accepted_boundary(record)["attempt"] == 1
     assert not os.path.exists(X.lock_file(record))

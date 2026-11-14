@@ -1173,6 +1173,7 @@ def run_startup(c: Ctx, reviewed: Dict, reviewed_digest: str, fetch: Fetch, api:
             and doc["job"] == {"status": "Complete", "exit_code": 0}
         return X.receipt(c.record, HELPER, "startup-complete", {
             "run": rid, "plan_sha256": reviewed_digest, "measured": ok, "stopped": st["stop"] or None,
+            "admission": p.get("admission"),
             "load_problems": load, "creation_to_ready_s": summ["creation_to_ready_s"], "evidence_sha256": ev_sha,
             "dir": out_dir})
 
