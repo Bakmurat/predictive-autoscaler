@@ -22,6 +22,7 @@ Isolation is of the RAW SERIES, not a time filter (VictoriaMetrics' rate() reads
 
 from __future__ import annotations
 
+import math
 from typing import Dict, List
 
 from . import demo as D
@@ -103,6 +104,17 @@ def acceptance(series_by_target: Dict[str, List[Dict]], targets: List[str], name
            "targets": {},
            "problems": []}
     w_lo = guard - RATE_RANGE_S
+    bad_inputs = []
+    if not isinstance(targets, list) or not targets or len(set(targets)) != len(targets) \
+            or not all(isinstance(t, str) and t for t in targets):
+        bad_inputs.append("the targets must be a non-empty list of distinct names")
+    if not all(isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) for x in (origin_s, guard)):
+        bad_inputs.append("the origin and the guard must be finite times")
+    elif guard != origin_s + GUARD_AFTER_ORIGIN_S:
+        bad_inputs.append(f"the guard must be exactly the origin + {GUARD_AFTER_ORIGIN_S} s")
+    if bad_inputs:
+        out["problems"] = bad_inputs
+        return out
     for t in targets:
         probs: List[str] = []
         series = series_by_target.get(t)
@@ -118,7 +130,22 @@ def acceptance(series_by_target: Dict[str, List[Dict]], targets: List[str], name
         wrong = {k: m.get(k) for k, v in want.items() if m.get(k) != v}
         if wrong:
             probs.append(f"labels not as relabelled: {wrong}")
-        ts = sorted(float(x[0]) for x in s.get("values") or [])
+        ts, malformed, by_time = [], 0, {}
+        for x in s.get("values") or []:
+            try:
+                tt, vv = float(x[0]), float(x[1])
+            except (TypeError, ValueError, IndexError):
+                malformed += 1
+                continue
+            if not (math.isfinite(tt) and math.isfinite(vv)):
+                malformed += 1
+                continue
+            if tt in by_time and by_time[tt] != vv:
+                probs.append(f"conflicting samples at {tt}")
+            by_time[tt] = vv
+        if malformed:
+            probs.append(f"{malformed} samples without a finite time and value")
+        ts = sorted(by_time)                       # distinct sample times only
         if not ts:
             probs.append("no raw sample")
         else:

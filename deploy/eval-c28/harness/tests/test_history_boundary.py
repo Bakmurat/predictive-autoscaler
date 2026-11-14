@@ -63,3 +63,40 @@ def test_the_acceptance_refuses_wrong_shapes(edit, text):
     edit(s)
     r = H.acceptance(s, [N, R_], "demo", EP, o, g)
     assert not r["accepted"] and any(text in x for x in r["problems"]), r["problems"]
+
+
+
+@pytest.mark.parametrize("targets, origin, guard, text", [
+    ([], 1_800_000_000, 1_800_000_300, "non-empty list of distinct"),
+    ([N, N], 1_800_000_000, 1_800_000_300, "non-empty list of distinct"),
+    ([N, R_], 1_800_000_000, 1_800_000_120, "exactly the origin + 300"),
+    ([N, R_], float("nan"), 1_800_000_300, "finite times"),
+])
+def test_the_proofs_inputs_are_validated(targets, origin, guard, text):
+    s = {t: series(t, 1_800_000_030, 1_800_000_300) for t in (N, R_)}
+    r = H.acceptance(s, targets, "demo", EP, origin, guard)
+    assert not r["accepted"] and any(text in x for x in r["problems"]), r["problems"]
+
+
+@pytest.mark.parametrize("value", ["NaN", "+Inf", "not-a-number", None])
+def test_samples_need_a_finite_value(value):
+    o = 1_800_000_000
+    g = H.guard_s(o)
+    s = {t: series(t, o + 30, g) for t in (N, R_)}
+    for v in s[R_][0]["values"]:
+        v[1] = value
+    r = H.acceptance(s, [N, R_], "demo", EP, o, g)
+    assert not r["accepted"] and any("finite" in x or "no raw sample" in x for x in r["problems"]), r["problems"]
+
+
+def test_duplicate_sample_times_count_once_and_conflicts_fail():
+    o = 1_800_000_000
+    g = H.guard_s(o)
+    s = {t: series(t, o + 30, g - 61) for t in (N, R_)}                  # nothing inside the window...
+    for t in (N, R_):
+        s[t][0]["values"] += [[g - 10, "5"], [g - 10, "5"]]               # ...but one time, twice
+    r = H.acceptance(s, [N, R_], "demo", EP, o, g)
+    assert not r["accepted"] and any("1 samples inside" in x for x in r["problems"]), r["problems"]
+    s[N][0]["values"] += [[g - 5, "1"], [g - 5, "2"]]                     # two values for one time
+    r = H.acceptance(s, [N, R_], "demo", EP, o, g)
+    assert any("conflicting samples" in x for x in r["problems"])
