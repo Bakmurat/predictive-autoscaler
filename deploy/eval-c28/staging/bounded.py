@@ -14,8 +14,10 @@ before, then 6 Ready); the startup Job (one target, 15 minutes, constant peak); 
 6 -> 12; each new pod's created / scheduled / started / Ready; then cleanup, and the obligation met (same UID at 12
 Ready) before it closes. restore meets every open obligation (stop the load, prove it gone, restore 12); it never starts a
 workload. An unmet obligation or an unproven disappearance keeps the fence.
-After an interruption: recover-plan / recover decide the open intents, then plan-restore / restore meet every open
-obligation (as session.py's restore); until then every bounded plan and prepare's generator phase refuse.
+After an interruption: recover-plan / recover decide the open intents (and release a dead executor's lock), then
+plan-restore / restore meet every open obligation (as session.py's restore); until then every bounded plan and
+prepare's generator phase refuse. A crashed or aborted ADMISSION run (no obligation) is cleaned up with
+plan-stop --run <run> / stop: its recorded Job, its pods (found without the Job) proven gone, its ConfigMap.
 
 The admission exercise is ONE Job (demo.bounded_objects, label admission): both targets at the 28-day table's maximum
 for 40 minutes (10 settling, 30 measured), restartPolicy Never, backoffLimit 0, a deadline of 5 min before the origin
@@ -1216,6 +1218,46 @@ def restore(c: Ctx, reviewed: Dict, reviewed_digest: str) -> Dict:
                                                                  "met": [o["run"] for o in p["obligations"]]})
 
 
+def plan_stop(c: Ctx, run: str) -> Dict:
+    """Read-only: the cleanup of a run whose executor died (or a run to abort): every object the run owns (receipts and
+    journalled creates, by UID) with its live state. A startup run with an open restore obligation is not stopped here:
+    plan-restore / restore stop its load AND restore 12. Recover first when the lock is held or intents are open."""
+    o = owned(c.record, run)
+    problems = []
+    if not o:
+        problems.append(f"run {run} owns no object (nothing to stop)")
+    if unresolved_creates(c.record, run):
+        problems.append("a create of the run has an unknown outcome: recover first")
+    if X.open_intents(X.receipts(c.record, HELPER)):
+        problems.append("bounded has intents with unknown outcomes: recover first")
+    if any(ob["run"] == run for ob in open_obligations(c)):
+        problems.append(f"run {run} has an open restore obligation: use plan-restore / restore")
+    live = []
+    for kind, refs in sorted(o.items()):
+        for r in refs:
+            cur = c.kube.get(kind, r["name"], c.ns)
+            live.append({"kind": kind, "name": r["name"], "uid": r["uid"],
+                         "live": None if cur is None else ("same" if cur["metadata"]["uid"] == r["uid"] else "replaced")})
+    return X.new_plan(HELPER, c.record, [{"stop": x["kind"], "name": x["name"], "uid": x["uid"]} for x in live],
+                      problems=problems, run=run, live=live)
+
+
+def stop(c: Ctx, reviewed: Dict, reviewed_digest: str) -> Dict:
+    """Under the shared lock: stop_load (the recorded Job by its UID, every pod recorded or owned by it, found without
+    the Job, each deleted by UID and proven gone; a replacement under a recorded name is refused) then the run's
+    ConfigMap. Nothing else is touched."""
+    run = reviewed["run"]
+    with X.mutating(c.record, c.kube, HELPER, {"run": run, "step": "stop"}):
+        p = plan_stop(c, run)
+        X.require_live(reviewed, reviewed_digest, HELPER, c.record, p)
+        if p["problems"]:
+            raise X.StagingError("the plan has problems: " + "; ".join(p["problems"]))
+        stop_load(c, run)
+        remove_config(c, run)
+        return X.receipt(c.record, HELPER, "run-stopped-by-operator", {"run": run, "plan_sha256": reviewed_digest,
+                                                                         "objects": p["live"]})
+
+
 def main(argv: Optional[List[str]] = None, api=None, fetch: Fetch = http_json) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--record", required=True)
@@ -1232,6 +1274,11 @@ def main(argv: Optional[List[str]] = None, api=None, fetch: Fetch = http_json) -
     rs.add_argument("--plan", required=True)
     rs.add_argument("--plan-digest", required=True)
     rs.add_argument("--query-api", required=True, help="the observer's Prometheus API base (a local forward)")
+    pst = sub.add_parser("plan-stop")
+    pst.add_argument("--run", required=True)
+    rst = sub.add_parser("stop")
+    rst.add_argument("--plan", required=True)
+    rst.add_argument("--plan-digest", required=True)
     sub.add_parser("plan-restore")
     rr = sub.add_parser("restore")
     rr.add_argument("--plan", required=True)
@@ -1247,6 +1294,10 @@ def main(argv: Optional[List[str]] = None, api=None, fetch: Fetch = http_json) -
         X.emit(X.cli_plan(record, "recover", X.recover_plan(record, kube), "recover-plan"))
     elif a.cmd == "recover":
         X.emit(X.recover(record, kube, X.load_plan(a.plan), a.plan_digest))
+    elif a.cmd == "plan-stop":
+        X.emit(X.cli_plan(record, HELPER, plan_stop(Ctx(record, kube), a.run), f"plan-stop-{a.run}"))
+    elif a.cmd == "stop":
+        X.emit(stop(Ctx(record, kube), X.load_plan(a.plan), a.plan_digest))
     elif a.cmd == "plan-restore":
         X.emit(X.cli_plan(record, HELPER, plan_restore(Ctx(record, kube)), "plan-restore"))
     elif a.cmd == "restore":

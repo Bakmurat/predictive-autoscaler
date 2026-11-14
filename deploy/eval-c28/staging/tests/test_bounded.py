@@ -645,3 +645,27 @@ def test_a_configmap_delete_error_never_blocks_the_restore(world):  # noqa: F811
         run_s(c, p, d, vm, lines)
     assert a.obj("Deployment", R, "demo")["spec"]["replicas"] == 12      # restored anyway
     assert B.open_obligations(record)                                     # but the obligation stays open
+
+
+def test_a_crashed_admission_is_cleaned_up_through_plan_stop_and_stop(world):  # noqa: F811
+    import part2_fixtures as PF
+    record, kube, a, clock, c, p, d, logs, vm = _run(world)
+    rid = "a-crashed"
+    objs = {o["kind"]: o for o in c.c28.demo.bounded_objects(c.params, "admission", O_MS)}
+    with X.mutating(record, kube, B.HELPER, {"run": rid, "label": "admission"}):
+        B.own(c, rid, kube.create(objs["ConfigMap"]))
+        kube.create(objs["Job"])                                         # the executor died before its receipt
+    assert _gen_pods(a)                                                 # its pod runs on
+    import common_records as C
+    C.exclusive_lock(record.doc, X.LOCK_SCOPE, holder=B.HELPER).__enter__()   # the dead executor's lock, never released
+    PF.crash_owner(record)
+    rp = X.recover_plan(record, kube)
+    s_ = X.save_plan(record, "recover", rp, "recover-plan")
+    X.recover(record, kube, X.load_plan(s_["plan"]), s_["plan_digest"])
+    plan = B.plan_stop(c, rid)
+    assert plan["problems"] == [] and {x["stop"] for x in plan["actions"]} == {"ConfigMap", "Job"}
+    s_ = X.save_plan(record, B.HELPER, plan, "plan-stop")
+    out = B.stop(c, X.load_plan(s_["plan"]), s_["plan_digest"])
+    assert out["event"] == "run-stopped-by-operator"
+    assert not _gen_pods(a) and a.obj("Job", "c28-demo-admission", "demo") is None
+    assert a.obj("ConfigMap", "c28-demo-admission", "demo") is None and not os.path.exists(X.lock_file(record))

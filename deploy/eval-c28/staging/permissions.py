@@ -12,8 +12,10 @@ Asked of the API server's authorizer under impersonation of the operator's Servi
     are the planned ones);
   * direct writes: update, patch and delete on deployments.apps, create and delete on pods: all must be no;
   * the scale write without a name in EVERY namespace of the cluster and cluster-wide (-A): no, never a sample.
-(Aggregated ClusterRoles are read with the rules the aggregation controller filled in, i.e. the rules in effect.
-Run it for the forecaster's and the trainer's ServiceAccounts too, with --sa.)
+(Aggregated ClusterRoles are read with the rules the aggregation controller filled in, i.e. the rules in effect.)
+--role: the operator's control is get on the scale subresource; the forecaster's and the trainer's (--role
+forecaster|trainer) is get on Deployments (their chart roles read Deployments only). An answer counts only as exit 0
+with "yes" or exit 1 with "no"; the answering cluster's kube-system UID must be the record's (in the evidence).
 And from the RBAC objects of the WHOLE cluster (ClusterRoles, Roles, ClusterRoleBindings, RoleBindings of every
 namespace; no other kind is read): every binding whose subject is the ServiceAccount, its username or one of its groups
 is resolved to its role, and any rule there that reaches the scale subresource, Deployments or pods with a write verb
@@ -34,6 +36,9 @@ import sys
 from typing import Callable, Dict, List, Tuple
 
 SCALE_VERBS = ("update", "patch", "get")
+# The control question each identity must answer yes (so a no proves the question reached the authorizer): the
+# operator reads the scale subresource; the forecaster and the trainer read Deployments only (their chart roles).
+ROLES = ("operator", "forecaster", "trainer")
 DIRECT = [("update", "deployments.apps"), ("patch", "deployments.apps"), ("delete", "deployments.apps"),
           ("create", "pods"), ("delete", "pods")]
 WRITES = {"update", "patch", "create", "delete", "deletecollection", "*"}
@@ -44,40 +49,53 @@ def groups_of(sa_ns: str) -> List[str]:
     return ["system:serviceaccounts", f"system:serviceaccounts:{sa_ns}", "system:authenticated"]
 
 
-def collect(kubectl: Callable[[List[str]], Tuple[int, str]], sa_ns: str, sa: str, ns: str, targets: List[str]) -> Dict:
+def _answer(rc, out) -> str:
+    """kubectl auth can-i: exit 0 with "yes" or exit 1 with "no"; any other combination (another exit code, an empty or
+    different word, a failed command) is "error", i.e. unproven."""
+    word = out.strip().splitlines()[-1].strip() if (out or "").strip() else ""
+    return word if (rc, word) in ((0, "yes"), (1, "no")) else "error"
+
+
+def collect(kubectl: Callable[[List[str]], Tuple[int, str]], sa_ns: str, sa: str, ns: str, targets: List[str],
+            role: str = "operator") -> Dict:
     """Read-only questions and lists. kubectl(args) -> (exit code, stdout); its stderr is never kept (it may quote a
     request). An error is recorded as the answer "error"."""
+    if role not in ROLES:
+        raise ValueError(f"role must be one of {ROLES}")
     imp = [f"--as=system:serviceaccount:{sa_ns}:{sa}"] + [f"--as-group={g}" for g in groups_of(sa_ns)]
     answers: Dict[str, Dict[str, str]] = {}
 
+    def call(args):
+        try:
+            return kubectl(args)
+        except Exception:                                   # a failed or timed-out command: unproven, never "no"
+            return None, ""
+
     def ask(key, verb, resource, extra):
-        rc, out = kubectl(["auth", "can-i", verb, resource, "-n", ns, *extra, *imp])
-        word = out.strip().splitlines()[-1].strip() if out.strip() else ""
-        # can-i exits 1 with "no" for a denied question: only the printed word counts, and only yes/no
-        answers.setdefault(key, {})[verb] = word if word in ("yes", "no") else "error"
+        rc, out = call(["auth", "can-i", verb, resource, "-n", ns, *extra, *imp])
+        answers.setdefault(key, {})[verb] = _answer(rc, out)
     for name in ["-"] + list(targets):
         for verb in SCALE_VERBS:
             ask(name, verb, "deployments.apps" + ("" if name == "-" else f"/{name}"), ["--subresource=scale"])
     for verb, res in DIRECT:
         ask(f"direct:{res}", verb, res, [])
+    ask("control:deployments", "get", "deployments.apps", [])
     # The scale write without a name in EVERY namespace of the cluster, and cluster-wide (-A): never a sample.
-    rc, out = kubectl(["get", "namespaces", "-o", "json"])
+    rc, out = call(["get", "namespaces", "-o", "json"])
     try:
         namespaces = sorted(i["metadata"]["name"] for i in json.loads(out)["items"]) if rc == 0 else None
     except (ValueError, KeyError, TypeError):
         namespaces = None
     for other in namespaces or []:
         for verb in ("update", "patch"):
-            rc_, out_ = kubectl(["auth", "can-i", verb, "deployments.apps", "--subresource=scale", "-n", other, *imp])
-            word = out_.strip().splitlines()[-1].strip() if out_.strip() else ""
-            answers.setdefault(f"ns:{other}", {})[verb] = word if word in ("yes", "no") else "error"
+            rc_, out_ = call(["auth", "can-i", verb, "deployments.apps", "--subresource=scale", "-n", other, *imp])
+            answers.setdefault(f"ns:{other}", {})[verb] = _answer(rc_, out_)
     for verb in ("update", "patch"):
-        rc_, out_ = kubectl(["auth", "can-i", verb, "deployments.apps", "--subresource=scale", "-A", *imp])
-        word = out_.strip().splitlines()[-1].strip() if out_.strip() else ""
-        answers.setdefault("cluster", {})[verb] = word if word in ("yes", "no") else "error"
+        rc_, out_ = call(["auth", "can-i", verb, "deployments.apps", "--subresource=scale", "-A", *imp])
+        answers.setdefault("cluster", {})[verb] = _answer(rc_, out_)
     rbac, list_errors = [], []
     for kind in RBAC_KINDS:
-        rc, out = kubectl(["get", kind, "-o", "json"] + (["-A"] if kind in ("roles", "rolebindings") else []))
+        rc, out = call(["get", kind, "-o", "json"] + (["-A"] if kind in ("roles", "rolebindings") else []))
         try:
             doc = json.loads(out) if rc == 0 else None
         except ValueError:
@@ -88,26 +106,40 @@ def collect(kubectl: Callable[[List[str]], Tuple[int, str]], sa_ns: str, sa: str
         rbac.extend(doc["items"])
     if namespaces is None:
         list_errors.append("namespaces")
-    return {"answers": answers, "rbac": rbac, "list_errors": list_errors, "namespaces": namespaces or []}
+    rc, out = call(["get", "namespace", "kube-system", "-o", "json"])
+    try:
+        cluster_uid = json.loads(out)["metadata"]["uid"] if rc == 0 else None
+    except (ValueError, KeyError, TypeError):
+        cluster_uid = None
+    return {"answers": answers, "rbac": rbac, "list_errors": list_errors, "namespaces": namespaces or [],
+            "role": role, "cluster_uid": cluster_uid}
 
 
 def _role_kind(o: Dict) -> str:
     return o.get("kind") or ""
 
 
-def verdict(collected: Dict, sa_ns: str, sa: str, targets: List[str]) -> Dict:
+def verdict(collected: Dict, sa_ns: str, sa: str, targets: List[str], cluster_uid: str = "") -> Dict:
     answers, refused, unproven = collected["answers"], [], []
+    role = collected.get("role", "operator")
     if not targets:
         unproven.append("no target to ask about")
+    if not cluster_uid or collected.get("cluster_uid") != cluster_uid:
+        unproven.append(f"the cluster answering (kube-system UID {collected.get('cluster_uid')}) is not the recorded "
+                        f"cluster {cluster_uid or '(none given)'}")
+    if role != "operator":
+        got = answers.get("control:deployments", {}).get("get")
+        if got != "yes":
+            unproven.append(f"get deployments answered {got}: the {role}'s control failed")
     for name in ["-"] + list(targets):
         label = "of any Deployment (no name)" if name == "-" else f"of Deployment {name}"
         for verb in SCALE_VERBS:
             got = answers.get(name, {}).get(verb)
-            if got not in ("yes", "no"):
+            if got not in ("yes", "no") and (verb != "get" or role == "operator"):
                 unproven.append(f"{verb} deployments/scale {label}: no clear answer ({got})")
             elif verb != "get" and got == "yes":
                 refused.append(f"the authorizer allows {verb} on deployments/scale {label}")
-            elif verb == "get" and got == "no":
+            elif verb == "get" and got == "no" and role == "operator":
                 unproven.append(f"get deployments/scale {label} answered no: the control failed")
     for verb, res in DIRECT:
         got = answers.get(f"direct:{res}", {}).get(verb)
@@ -170,7 +202,8 @@ def verdict(collected: Dict, sa_ns: str, sa: str, targets: List[str]) -> Dict:
                 refused.append(f'{bid} -> {rid} authorizes {gr["verbs"]} on {gr["resources"]} in {gr["where"]}'
                                + (f', resourceNames {gr["resourceNames"]}' if gr["resourceNames"] else ""))
     v = "refused" if refused else "unproven" if unproven else "pass"
-    return {"identity": user, "groups": sorted(groups), "targets": list(targets), "answers": answers,
+    return {"identity": user, "role": role, "cluster_uid": collected.get("cluster_uid"),
+            "recorded_cluster_uid": cluster_uid, "groups": sorted(groups), "targets": list(targets), "answers": answers,
             "bindings_of_the_identity": sorted(bindings, key=lambda x: x["binding"]), "write_grants": grants,
             "verdict": v, "refused": refused, "unproven": unproven}
 
@@ -184,21 +217,23 @@ def main(argv=None, kubectl_run=subprocess.run) -> int:
     ck.add_argument("--out", required=True)
     ck.add_argument("--sa", default="")
     ck.add_argument("--sa-namespace", default="")
+    ck.add_argument("--role", choices=ROLES, default="operator")
     a = ap.parse_args(argv)
     import execlib as X
     import prepare
     record = X.load_record(a.record, ("prepare",))
     params = prepare.load_params(record, prepare.stage_of(prepare._section(record)))
     sa_ns = a.sa_namespace or params["control_namespace"]
-    sa = a.sa or f"{params['release']}-predictive-autoscaler-operator"
+    sa = a.sa or f"{params['release']}-predictive-autoscaler-{a.role}"
     k = record.doc["kubeconfig"]
 
     def kubectl(args):
         p = kubectl_run(["kubectl", "--kubeconfig", k["path"], "--context", k["context"], "--request-timeout=30s",
                          *args], capture_output=True, text=True, timeout=120)
-        return p.returncode, p.stdout or ""
+        return p.returncode, p.stdout or ""            # collect() turns an exception (timeout) into "unproven"
     targets = [t for t in a.targets.split(",") if t]
-    v = verdict(collect(kubectl, sa_ns, sa, params["namespace"], targets), sa_ns, sa, targets)
+    v = verdict(collect(kubectl, sa_ns, sa, params["namespace"], targets, a.role), sa_ns, sa, targets,
+                record.cluster_uid)
     X.write_new(a.out, json.dumps(v, indent=1, sort_keys=True) + "\n")
     X.receipt(record, "permissions", "check", {"out": a.out, "verdict": v["verdict"], "targets": targets,
                                                "refused": v["refused"][:10], "unproven": v["unproven"][:10]})
