@@ -626,7 +626,11 @@ def binding(c: Ctx, targets: Dict) -> Dict:
         env[role] = {"uid": (n.get("metadata") or {}).get("uid"), "allocatable": (n.get("status") or {}).get(
             "allocatable"), **{k: info.get(k) for k in ("kernelVersion", "kubeletVersion", "containerRuntimeVersion",
                                                           "osImage")}}
+    with open(c.record.resolve(c.record.doc["params"])) as fh:
+        pdoc = json.load(fh)
+    pdoc.get("demonstration", {}).pop("schedule_origin_utc", None)
     return {"params_sha256": C.sha256_file(c.record.resolve(c.record.doc["params"])),
+            "params_except_origin_sha256": X.json_digest(pdoc),
             "targets": {t: {"deployment_uid": v["deployment_uid"], "pa_uid": v["pa_uid"]} for t, v in targets.items()},
             "generator_image": c.params["demonstration"]["generator"]["image"], "fixture_image": c.params["image"],
             "release_images": [s["operator_image"], s["statistical_image"]],

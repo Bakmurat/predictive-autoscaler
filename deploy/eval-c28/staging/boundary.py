@@ -39,9 +39,11 @@ logs pulled to evidence first; the history series and every receipt stay.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import importlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -111,10 +113,62 @@ def fence(c: Ctx) -> List[str]:
     return out
 
 
+def _admission(c: Ctx) -> Tuple[Optional[Dict], str]:
+    """The last admission run-complete: PASS, its evidence and verdict files still hashing to the receipt, and a
+    binding that carries params_except_origin_sha256 (the origin may change by the reviewed transformation only)."""
+    done = [e["data"] for e in X.receipts(c.record, "bounded") if e["event"] == "run-complete"
+            and e["data"].get("label") == "admission"]
+    if not done or done[-1].get("verdict") != "PASS":
+        return None, "no current admission PASS"
+    r = done[-1]
+    for f, key in (("evidence.json", "evidence_sha256"), ("verdict.json", "verdict_sha256")):
+        path = os.path.join(r.get("dir") or "", f)
+        if not os.path.isfile(path) or C.sha256_file(path) != r.get(key):
+            return None, f"the admission {f} no longer hashes to its receipt"
+    if "params_except_origin_sha256" not in (r.get("binding") or {}):
+        return None, "the admission binding predates the origin transformation (re-run the admission)"
+    return r, ""
+
+
+def expected_pa_spec(c: Ctx, t: str, adm: Dict) -> str:
+    """The reviewed chain of a PA's spec: the admission's digest, then each completed query update's recorded digest
+    (that update verified it changed only spec.metrics.requests.source); the latest one is what the PA must be."""
+    want = adm["binding"]["pa_specs"].get(t)
+    for e in X.receipts(c.record, HELPER):
+        if e["event"] == "query-updated":
+            for row in e["data"].get("pas") or []:
+                if row.get("name") == t and row.get("spec_sha256"):
+                    want = row["spec_sha256"]
+    return want
+
+
+def basis_problems(c: Ctx) -> List[str]:
+    """Everything the admission bound, re-checked LIVE through the only reviewed transformations: the params may
+    differ by the schedule origin alone (params_except_origin_sha256), each PA spec must be the end of its reviewed
+    chain (expected_pa_spec); images, pod templates, PA identities, node environment and the peak must be unchanged."""
+    adm, why = _admission(c)
+    if adm is None:
+        return [why]
+    b = c.bctx()
+    targets, _ = BD._targets_state(b)
+    live = BD.binding(b, targets)
+    want = dict(adm["binding"])
+    out = []
+    for k in sorted(set(want) | set(live)):
+        if k in ("params_sha256", "pa_specs"):
+            continue
+        if want.get(k) != live.get(k):
+            out.append(f"{k} differs from the admission binding")
+    for t in sorted(want.get("pa_specs") or {}):
+        if (live.get("pa_specs") or {}).get(t) != expected_pa_spec(c, t, adm):
+            out.append(f"PredictiveAutoscaler {t}'s spec is not the end of its reviewed chain (admission, then the "
+                       "recorded query updates)")
+    return out
+
+
 def startup_measured(c: Ctx, check_live: bool = True) -> Tuple[Optional[Dict], str]:
-    """The last startup-complete must be measured, its evidence must still hash to the receipt, it must name the
-    admission run it relied on, and (check_live) that admission's PASS must still be bound to the live identities and
-    configuration (bounded.admission_passed: images, pod templates, PA specs, node environment, params)."""
+    """The last startup-complete must be measured, its evidence must still hash to the receipt, and it must name the
+    current admission run; (check_live) the admission basis must still hold through the reviewed transformations."""
     done = [e["data"] for e in X.receipts(c.record, "bounded") if e["event"] == "startup-complete"]
     if not done:
         return None, "no startup step was run"
@@ -124,35 +178,14 @@ def startup_measured(c: Ctx, check_live: bool = True) -> Tuple[Optional[Dict], s
     path = os.path.join(r.get("dir") or "", "evidence.json")
     if not os.path.isfile(path) or C.sha256_file(path) != r.get("evidence_sha256"):
         return None, "the startup evidence no longer hashes to its receipt"
+    adm, why = _admission(c)
+    if adm is None or r.get("admission") != adm.get("run"):
+        return None, why or "the startup step was not run under the current admission PASS"
     if check_live:
-        b = c.bctx()
-        targets, why = BD._targets_state(b)
-        passed, why2 = BD.admission_passed(b, targets)
-        if passed is None:
-            return None, f"the admission PASS the startup relied on no longer applies: {why2 or why}"
-        if r.get("admission") != passed.get("run"):
-            return None, "the startup step was not run under the current admission PASS"
+        probs = basis_problems(c)
+        if probs:
+            return None, "; ".join(probs)
     return r, ""
-
-
-def _live_except_pas(c: Ctx) -> Dict:
-    """The admission binding's live part that the boundary must not change: everything but the PA specs (the only
-    reviewed change is the PA query)."""
-    b = c.bctx()
-    targets, _ = BD._targets_state(b)
-    out = BD.binding(b, targets)
-    out.pop("pa_specs", None)
-    return out
-
-
-def _admission_binding(c: Ctx) -> Optional[Dict]:
-    done = [e["data"] for e in X.receipts(c.record, "bounded") if e["event"] == "run-complete"
-            and e["data"].get("label") == "admission" and e["data"].get("verdict") == "PASS"]
-    if not done:
-        return None
-    b = dict(done[-1]["binding"])
-    b.pop("pa_specs", None)
-    return b
 
 
 def _pas(c: Ctx) -> Tuple[Dict[str, Dict], List[str]]:
@@ -217,26 +250,35 @@ def apply_query(c: Ctx, reviewed: Dict, reviewed_digest: str, wait_s: float = 30
         done = []
         try:
             for a in p["actions"]:
+                expected: Dict = {}
+
                 def mutate(body, a=a):
                     if body["metadata"].get("generation") != a["from_generation"]:
                         raise X.StagingError(f"{a['name']} changed since the plan")
                     body["spec"].setdefault("metrics", {}).setdefault("requests", {})["source"] = {
                         "preset": "prometheus", "query": a["query"]}
-                c.kube.update("PredictiveAutoscaler", a["name"], c.ns, a["uid"], mutate,
-                              expect=[["/spec/metrics/requests/source/query", a["query"]]])
+                    expected["spec"] = copy.deepcopy(body["spec"])        # the pre-image + the query, nothing else
+                out = c.kube.update("PredictiveAutoscaler", a["name"], c.ns, a["uid"], mutate,
+                                    expect=[["/spec/metrics/requests/source/query", a["query"]]])
+                if out.get("spec") != expected["spec"] or out["spec"].get("mode") != "Recommend":
+                    raise X.StagingError(f"{a['name']}: the update did not produce exactly the reviewed spec")
+                gen, spec_sha = out["metadata"].get("generation"), X.json_digest(out["spec"])
                 compiled = c.hb.compiled_query(c.ns, p["epoch"], p["guard_s"], a["name"])
                 end = c.now() + wait_s * 1000
                 while True:
                     pa = c.kube.get("PredictiveAutoscaler", a["name"], c.ns)
                     if pa is None or pa["metadata"]["uid"] != a["uid"]:
                         raise X.StagingError(f"{a['name']} was replaced during the query update")
+                    if pa["metadata"].get("generation") != gen or X.json_digest(pa.get("spec")) != spec_sha:
+                        raise X.StagingError(f"{a['name']} was changed by someone else after the query update "
+                                             "(generation or spec): an unreviewed change is never adopted")
                     if _status_ok(pa, compiled):
                         break
                     if c.now() >= end:
                         raise X.StagingError(f"{a['name']} did not report the compiled query and lead 600 for its "
                                              f"generation within {wait_s:.0f} s")
                     c.sleep(5)
-                done.append({"name": a["name"], "uid": a["uid"], "generation": pa["metadata"]["generation"],
+                done.append({"name": a["name"], "uid": a["uid"], "generation": gen, "spec_sha256": spec_sha,
                              "compiled_sha256": hashlib.sha256(compiled.encode()).hexdigest()})
         except Exception as e:
             X.receipt(c.record, HELPER, "attempt-incomplete", {"attempt": k, "done": done, "why": str(e)[:300]})
@@ -248,6 +290,32 @@ def apply_query(c: Ctx, reviewed: Dict, reviewed_digest: str, wait_s: float = 30
 
 
 MODE_MAX_GAP_S = 120
+
+
+def _covering_series(series: List[Dict], lo_s: float, hi_s: float, values_ok) -> Tuple[bool, str]:
+    """Exactly one series (one operator identity), every sample a finite number, a baseline within 120 s of lo_s, a
+    sample within 120 s of hi_s, no gap above 120 s, and values_ok(values) over the interval."""
+    if len(series) != 1:
+        return False, f"{len(series)} series (exactly one operator identity expected)"
+    pts = []
+    for t, v in series[0].get("values") or []:
+        try:
+            tt, vv = float(t), float(v)
+        except (TypeError, ValueError):
+            return False, "a sample is not a number"
+        if not (math.isfinite(tt) and math.isfinite(vv)):
+            return False, "a sample is not finite"
+        pts.append((tt, vv))
+    pts.sort()
+    if not pts:
+        return False, "no sample"
+    ts = [t for t, _ in pts]
+    if ts[0] - lo_s > MODE_MAX_GAP_S or hi_s - ts[-1] > MODE_MAX_GAP_S or any(b - a > MODE_MAX_GAP_S
+                                                                           for a, b in zip(ts, ts[1:])):
+        return False, "the samples do not cover the interval (baseline, gaps, freshness)"
+    if not values_ok([v for _, v in pts]):
+        return False, "the values are not as required"
+    return True, ""
 
 
 def ledger_rows(record: X.Record, path: str) -> List[Dict]:
@@ -291,19 +359,21 @@ def prove_hold(c: Ctx, k: int, fetch: Fetch, api: str, rows: List[Dict]) -> Dict
         span = int(now_s - since_s) + 1
         mode = BD._q(fetch, api, "query", query=f'predictive_autoscaler_mode{{{sel},mode="Recommend"}}[{span}s]',
                      time=f"{now_s:.3f}")
-        mts = sorted(float(t) for s_ in mode for t, v in s_["values"] if float(v) == 1)
-        covered = bool(mts) and mts[0] - since_s <= MODE_MAX_GAP_S and now_s - mts[-1] <= MODE_MAX_GAP_S and all(
-            b - a <= MODE_MAX_GAP_S for a, b in zip(mts, mts[1:]))
         writes = BD._q(fetch, api, "query", query=f'predictive_autoscaler_scale_writes_total{{{sel},result="applied"}}'
                                                    f'[{span}s]', time=f"{now_s:.3f}")
-        changed = any(len({v for _, v in s_["values"]}) > 1 for s_ in writes)
+        mode_ok, mode_why = _covering_series(mode, since_s, now_s, lambda vals: all(v == 1 for v in vals))
+        # The operator initialises its write counters at zero (stage_metrics.go), so a missing series is missing
+        # evidence, never "no write": exactly one series (one operator identity) covering the interval, its values
+        # constant (no increase, no reset).
+        writes_ok, writes_why = _covering_series(writes, since_s, now_s, lambda vals: len(set(vals)) == 1)
+        covered, changed = mode_ok, not writes_ok
         ok = ident and _status_ok(pa, compiled) and tele.get("status") == "False" and bool(mine) and not bad \
             and covered and not changed
         per[name] = {"uid": r["uid"], "generation": r["generation"],
                      "query_sha256": hashlib.sha256(compiled.encode()).hexdigest(),
                      "telemetry": [tele.get("status"), tele.get("reason")], "decisions": len(mine),
-                     "not_keep_current": len(bad), "mode_samples": len(mts), "mode_covered": covered,
-                     "applied_counter_series": len(writes), "applied_changed": changed, "ok": bool(ok)}
+                     "not_keep_current": len(bad), "mode": mode_why or "covered, Recommend throughout",
+                     "applied_counter": writes_why or "covered, constant", "ok": bool(ok)}
         if not ok:
             probs.append(f"{name}: hold not proven {per[name]}")
     out = {"proven": not probs, "pas": per, "problems": probs, "attempt": k, "at_s": now_s}
@@ -409,6 +479,8 @@ def _live_attempt_problems(c: Ctx, k: int, qu: Dict, sc: Dict) -> List[str]:
         if pa is None or pa["metadata"]["uid"] != r.get("uid"):
             out.append(f"PredictiveAutoscaler {t} is gone or replaced")
             continue
+        if X.json_digest(pa.get("spec")) != r.get("spec_sha256") or pa["spec"].get("mode") != "Recommend":
+            out.append(f"PredictiveAutoscaler {t}'s spec is not the one its query update produced (or not Recommend)")
         if pa["metadata"].get("generation") != r.get("generation"):
             out.append(f"PredictiveAutoscaler {t} changed after the query update (generation "
                        f"{pa['metadata'].get('generation')}, recorded {r.get('generation')})")
@@ -421,10 +493,7 @@ def _live_attempt_problems(c: Ctx, k: int, qu: Dict, sc: Dict) -> List[str]:
         out.append("the history scrape object is not the one created for this attempt")
     if sc.get("generator_config_digest") != c.c28.demo.generator_config(c.params)["digest"]:
         out.append("the generator configuration differs from the one the scrape was created under")
-    adm = _admission_binding(c)
-    if adm is None or _live_except_pas(c) != adm:
-        out.append("the live configuration (images, pod templates, node environment, params) differs from the "
-                   "admission binding beyond the reviewed PA query change")
+    out += basis_problems(c)
     return out
 
 
@@ -537,15 +606,18 @@ def plan_retire(c: Ctx) -> Dict:
             refs.append({"kind": kind, "name": name, "uid": ref["uid"]})
         elif live is not None:
             problems.append(f"{kind}/{name} is not the generator this run created: never touched")
-    sts = next((r for r in refs if r["kind"] == "StatefulSet"), None)
+    sts_ref = created.get(("StatefulSet", c.ns, name))
+    recorded = {x["uid"] for e in X.receipts(c.record, HELPER) if e["event"] == "retire-owned"
+                for x in e["data"].get("pods") or []}                 # durable ownership from an earlier attempt
     for p_ in c.kube.list("Pod", c.ns, strict=True):
         owners = {o.get("uid") for o in p_["metadata"].get("ownerReferences") or []}
-        if sts and sts["uid"] in owners:
+        if (sts_ref and sts_ref["uid"] in owners) or p_["metadata"]["uid"] in recorded:
             pods.append({"name": p_["metadata"]["name"], "uid": p_["metadata"]["uid"]})
         elif p_["metadata"]["name"] == c.c28.demo.generator_pod_name():
             problems.append(f"Pod/{p_['metadata']['name']} is not owned by this run's generator: never touched")
     actions = [{"delete": r["kind"], "name": r["name"], "uid": r["uid"]} for r in refs]
-    actions += [{"delete": "Pod", "name": x["name"], "uid": x["uid"], "owner": sts["uid"]} for x in pods]
+    actions += [{"delete": "Pod", "name": x["name"], "uid": x["uid"],
+                 "owner": (sts_ref or {}).get("uid")} for x in pods]
     return X.new_plan(HELPER, c.record, actions, problems=problems)
 
 
@@ -562,12 +634,16 @@ def retire(c: Ctx, reviewed: Dict, reviewed_digest: str, logs: Callable[[str], L
         pods = []
         for a in p["actions"]:
             (pods.append(a) if a["delete"] == "Pod" else acts.__setitem__(a["delete"], a))
-        out_dir = os.path.join(c.record.evidence_dir, f"generator-retired-{reviewed_digest[:12]}")
-        os.makedirs(out_dir)
+        out_dir = os.path.join(c.record.evidence_dir, "generator-retired")
+        os.makedirs(out_dir, exist_ok=True)                         # retryable: each attempt adds its own files
         log_shas = {}
         for x in pods:
             text = logs(x["name"])                                  # raises on a failed fetch: nothing deleted yet
-            log_shas[x["name"]] = X.write_new(os.path.join(out_dir, f"{x['name']}.log"), "\n".join(text) + "\n")
+            log_shas[x["name"]] = X.write_new(os.path.join(out_dir, f"{x['name']}-{x['uid'][:8]}-{int(c.now())}.log"),
+                                              "\n".join(text) + "\n")
+        if pods:                                                    # durable BEFORE any delete
+            X.receipt(c.record, HELPER, "retire-owned", {"sts_uid": (acts.get("StatefulSet") or {}).get("uid"),
+                                                          "pods": [{"name": x["name"], "uid": x["uid"]} for x in pods]})
         if "StatefulSet" in acts:
             a = acts["StatefulSet"]
             c.kube.delete("StatefulSet", a["name"], c.ns, a["uid"])

@@ -237,17 +237,24 @@ def test_a_replaced_history_scrape_object_fails_the_boundary(world):  # noqa: F8
     assert any("not the one created" in x for x in out["data"]["problems"])
 
 
-def hold_vm(mode_from, mode_to, writes=None, step=30):
-    """The observer for the hold proof: the PA's mode series (Recommend = 1) sampled every `step` s over
-    [mode_from, mode_to] (None: absent), and the applied-write counter (None: absent; a list of values otherwise)."""
+def hold_vm(mode_from, mode_to, writes="zero", step=30, mode_value="1"):
+    """The observer for the hold proof: ONE operator identity's mode series (Recommend) and applied-write counter,
+    sampled every `step` s over [mode_from, mode_to]; writes "zero" = constant 0, None = absent, a list = those values
+    spread over the interval; mode_from None = no mode series."""
     def fetch(url):
         import urllib.parse as U
         q = dict(U.parse_qsl(U.urlparse(url).query))["query"]
+        ts = [] if mode_from is None else list(range(int(mode_from), int(mode_to) + 1, step))
         if q.startswith("predictive_autoscaler_mode"):
-            res = [] if mode_from is None else [{"metric": {}, "values": [[t, "1"] for t in range(int(mode_from),
-                                                                                                     int(mode_to) + 1, step)]}]
+            res = [] if mode_from is None else [{"metric": {"pod": "operator-a"},
+                                                 "values": [[t, mode_value] for t in ts]}]
         elif q.startswith("predictive_autoscaler_scale_writes_total"):
-            res = [] if writes is None else [{"metric": {}, "values": [[mode_from + i, str(v)] for i, v in enumerate(writes)]}]
+            if writes is None or mode_from is None:
+                res = []
+            else:
+                vals = ["0"] * len(ts) if writes == "zero" else \
+                    [str(writes[min(i * len(writes) // len(ts), len(writes) - 1)]) for i in range(len(ts))]
+                res = [{"metric": {"pod": "operator-a"}, "values": [[t, v] for t, v in zip(ts, vals)]}]
         else:
             raise ValueError(q)
         return {"status": "success", "data": {"result": res}}
@@ -267,9 +274,11 @@ def test_the_hold_proof_needs_real_decisions_mode_coverage_and_no_applied_write(
     now = clock.ms / 1000
     rows = decisions(clock)
     assert BY.prove_hold(c, 1, hold_vm(since, now), "http://vm", rows)["proven"]
-    assert BY.prove_hold(c, 1, hold_vm(since, now, writes=[0, 0, 0]), "http://vm", rows)["proven"]
     assert not BY.prove_hold(c, 1, hold_vm(since, now, writes=[0, 1]), "http://vm", rows)["proven"]   # a write
-    assert not BY.prove_hold(c, 1, hold_vm(None, None), "http://vm", rows)["proven"]          # no counter evidence
+    assert not BY.prove_hold(c, 1, hold_vm(since, now, writes=None), "http://vm", rows)["proven"]     # no counter
+    assert not BY.prove_hold(c, 1, hold_vm(since, now, writes=[3, 0]), "http://vm", rows)["proven"]   # a reset
+    assert not BY.prove_hold(c, 1, hold_vm(None, None), "http://vm", rows)["proven"]          # no evidence at all
+    assert not BY.prove_hold(c, 1, hold_vm(since, now, mode_value="0"), "http://vm", rows)["proven"]  # not Recommend
     assert not BY.prove_hold(c, 1, hold_vm(since + 300, now), "http://vm", rows)["proven"]    # coverage gap
     assert not BY.prove_hold(c, 1, hold_vm(since, now), "http://vm", decisions(clock, desired_source="reactive"))["proven"]
     assert not BY.prove_hold(c, 1, hold_vm(since, now), "http://vm",
@@ -404,7 +413,7 @@ def test_a_changed_live_target_template_voids_the_startup_basis(world):  # noqa:
     record, kube, a, clock, c = boundary_world(world)
     dep = a.obj("Deployment", R, "demo")
     dep["spec"]["template"]["spec"]["containers"][0].setdefault("resources", {}).setdefault("limits", {})["memory"] = "16Mi"
-    assert any("no longer applies" in x for x in BY.plan_query(c, 1)["problems"])
+    assert any("pod_templates differs from the admission binding" in x for x in BY.plan_query(c, 1)["problems"])
 
 
 def test_an_interrupted_acceptance_is_completed_by_a_rerun(world, monkeypatch):  # noqa: F811
@@ -422,3 +431,85 @@ def test_an_interrupted_acceptance_is_completed_by_a_rerun(world, monkeypatch): 
     out = BY.accept(c, 1, _vm_series(c, O + 75, G), "http://vm")       # the same raw samples: completes
     assert out["event"] == "boundary-accepted" and BY.accepted_boundary(record)["attempt"] == 1
     assert not os.path.exists(X.lock_file(record))
+
+
+
+# --- the second review's reproductions, now handled ----------------------------------------------------------------------
+
+def test_an_origin_only_params_change_keeps_the_admission_basis(world):  # noqa: F811
+    record, kube, a, clock, c = boundary_world(world)
+    path = record.resolve(record.doc["params"])
+    p = json.load(open(path))
+    p["demonstration"]["schedule_origin_utc"] = "2026-11-13T00:00:00Z"
+    open(path, "w").write(json.dumps(p))
+    c = BY.Ctx(record, kube, now=clock.now, sleep=clock.sleep)
+    assert BY.plan_query(c, 1)["problems"] == []
+    p["proxy"]["cpu_limit"] = "250m"                                   # any OTHER params change is refused
+    open(path, "w").write(json.dumps(p))
+    c = BY.Ctx(record, kube, now=clock.now, sleep=clock.sleep)
+    assert any("params_except_origin_sha256 differs" in x for x in BY.plan_query(c, 1)["problems"])
+
+
+def test_a_retry_after_an_attempts_own_query_change_is_allowed(world):  # noqa: F811
+    record, kube, a, clock, c = _query_done(world)
+    X.receipt(record, BY.HELPER, "attempt-incomplete", {"attempt": 1, "done": []})
+    assert BY.plan_query(c, 2)["problems"] == []
+
+
+def test_a_pa_changed_during_the_status_wait_is_never_adopted(world, monkeypatch):  # noqa: F811
+    record, kube, a, clock, c = boundary_world(world)
+    p, d = saved(record, BY.plan_query(c, 1), "q")
+    real = kube.update
+
+    def change_after_write(kind, name, ns, *args, **kw):
+        out = real(kind, name, ns, *args, **kw)
+        pa = a.obj(kind, name, ns)
+        pa["spec"]["mode"] = "Active"
+        pa["metadata"]["generation"] += 1
+        return out
+    monkeypatch.setattr(kube, "update", change_after_write)
+    with pytest.raises(X.StagingError, match="never adopted"):
+        BY.apply_query(c, p, d)
+    assert X.last(X.receipts(record, BY.HELPER), "attempt-incomplete")
+
+
+def _retire_world(world):  # noqa: F811
+    record, kube = world()
+    run_until(record, kube, "generator")
+    a = world.api
+    c = BY.Ctx(record, record.kube(api=a))
+    pod = F.pod(c.c28.demo.generator_pod_name(), "demo", "worker-s", labels={})
+    pod["metadata"]["ownerReferences"] = [{"kind": "StatefulSet", "controller": True,
+                                           "uid": a.obj("StatefulSet", c.c28.demo.GENERATOR_NAME, "demo")["metadata"]["uid"]}]
+    a.put(pod)
+    X.receipt(record, BY.HELPER, "boundary-failed", {"attempt": 1})
+    return record, a, c
+
+
+def test_a_retirement_retries_after_a_failed_log_fetch(world):  # noqa: F811
+    record, a, c = _retire_world(world)
+    p, d = saved(record, BY.plan_retire(c), "r")
+
+    def failed(_):
+        raise X.StagingError("log fetch failed")
+    with pytest.raises(X.StagingError):
+        BY.retire(c, p, d, logs=failed)
+    BY.retire(c, p, d, logs=lambda _: ["ok"])                            # the identical plan, retried
+    assert a.obj("StatefulSet", c.c28.demo.GENERATOR_NAME, "demo") is None
+
+
+def test_a_surviving_pod_of_a_deleted_statefulset_is_still_ours(world, monkeypatch):  # noqa: F811
+    record, a, c = _retire_world(world)
+    p, d = saved(record, BY.plan_retire(c), "r")
+    pod = copy.deepcopy(c.kube.get("Pod", c.c28.demo.generator_pod_name(), c.ns))
+
+    def interrupted(*args, **kw):
+        a.put(pod)                                                       # background GC has not removed it yet
+        raise RuntimeError("interrupted after the StatefulSet delete")
+    with monkeypatch.context() as m:
+        m.setattr(c.kube, "step", interrupted)
+        with pytest.raises(RuntimeError):
+            BY.retire(c, p, d, logs=lambda _: ["ok"])
+    p2 = BY.plan_retire(c)
+    assert not any("not owned" in x for x in p2["problems"])
+    assert [x["uid"] for x in p2["actions"] if x["delete"] == "Pod"] == [pod["metadata"]["uid"]]
