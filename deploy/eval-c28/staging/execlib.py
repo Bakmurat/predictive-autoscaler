@@ -190,7 +190,7 @@ def load_record(path_: str, sections: Iterable[str] = ()) -> Record:
 LOCK_SCOPE = "evaluation"                 # ONE lock (common_records.exclusive_lock) for every part-2 helper's mutations
 INTENT_ANNOTATION = "c28.devkuban.com/intent"
 DEFINITIVE = (400, 401, 403, 404, 409, 422, 429)   # the API refused: nothing was applied
-PART2_HELPERS = ("reserve", "prepare", "session", "calibrate", "ledger_read", "bounded")   # journals under the shared evaluation lock
+PART2_HELPERS = ("reserve", "prepare", "session", "calibrate", "ledger_read", "bounded", "boundary")   # journals under the shared evaluation lock
 
 
 def lock_file(record: "Record") -> str:
@@ -301,7 +301,7 @@ RECONCILERS: Dict[str, Callable[["Kube", Dict, Optional["Record"]], Dict]] = {}
 # Helper-defined ops whose reconciler lives in a module another helper's process may not have loaded: recover (from any
 # helper's CLI) imports it on demand, so an open intent of that op is never left "no reconciler loaded".
 RECONCILER_MODULES: Dict[str, str] = {"ledger-reader-gone": "ledger_read", "bounded-pod-gone": "bounded",
-                                       "startup-scale": "bounded"}
+                                       "startup-scale": "bounded", "boundary-absent": "boundary"}
 
 
 def reconcile(kube: "Kube", d: Dict, record: Optional["Record"] = None) -> Dict:
