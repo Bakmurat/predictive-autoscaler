@@ -103,7 +103,6 @@ def acceptance(series_by_target: Dict[str, List[Dict]], targets: List[str], name
     out = {"accepted": False, "epoch": epoch, "namespace": namespace, "origin_s": origin_s, "guard_s": guard,
            "targets": {},
            "problems": []}
-    w_lo = guard - RATE_RANGE_S
     bad_inputs = []
     if not isinstance(targets, list) or not targets or len(set(targets)) != len(targets) \
             or not all(isinstance(t, str) and t for t in targets):
@@ -115,6 +114,7 @@ def acceptance(series_by_target: Dict[str, List[Dict]], targets: List[str], name
     if bad_inputs:
         out["problems"] = bad_inputs
         return out
+    w_lo = guard - RATE_RANGE_S                     # only after the inputs are validated (a None guard is refused)
     for t in targets:
         probs: List[str] = []
         series = series_by_target.get(t)
