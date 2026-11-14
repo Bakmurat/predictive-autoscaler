@@ -284,6 +284,17 @@ def apply_query(c: Ctx, reviewed: Dict, reviewed_digest: str, wait_s: float = 30
                         "preset": "prometheus", "query": a["query"]}
                     expected["spec"] = copy.deepcopy(body["spec"])        # the pre-image + the query, nothing else
                 pre_live = c.kube.get("PredictiveAutoscaler", a["name"], c.ns)
+                # The pre-image becomes a recovery basis ONLY when it is the reviewed state: the plan's UID and
+                # generation, and a spec that is the end of the reviewed chain or a proven query-only variant of an
+                # earlier (itself validated) pre-image. Anything else is refused before it is recorded.
+                adm, why = _admission(c)
+                if pre_live is None or pre_live["metadata"].get("uid") != a["uid"] or \
+                        pre_live["metadata"].get("generation") != a["from_generation"]:
+                    raise X.StagingError(f"{a['name']} is not the reviewed object/generation before the write")
+                if adm is None or (X.json_digest(pre_live.get("spec")) != expected_pa_spec(c, a["name"], adm)
+                                   and not query_only_change_ok(c, a["name"], pre_live)):
+                    raise X.StagingError(f"{a['name']}'s spec is not the reviewed state before the write "
+                                         f"({why or 'outside its reviewed chain'})")
                 X.receipt(c.record, HELPER, "pa-pre-image", {          # durable BEFORE the write: what may change
                     "attempt": k, "name": a["name"], "uid": a["uid"], "query": a["query"],
                     "spec_wo_query_sha256": strip_query_digest(pre_live["spec"])})

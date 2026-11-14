@@ -539,3 +539,28 @@ def test_the_hold_proof_needs_a_baseline_one_identity_and_coverage(world):  # no
     assert not BY.prove_hold(c, 1, hold_vm(since + 15, now, baseline=0, writes=[1]), "http://vm", rows)["proven"]
     assert not BY.prove_hold(c, 1, hold_vm(since, now, pods=("operator-a", "operator-b")), "http://vm", rows)["proven"]
     assert not BY.prove_hold(c, 1, hold_vm(since, since + 30, step=30, baseline=0), "http://vm", rows)["proven"]
+
+
+def test_an_unreviewed_change_before_the_pre_image_is_never_a_recovery_basis(world, monkeypatch):  # noqa: F811
+    record, kube, a, clock, c = _query_done(world)                     # attempt 1 completed
+    X.receipt(record, BY.HELPER, "attempt-incomplete", {"attempt": 1, "done": []})
+    p, d = saved(record, BY.plan_query(c, 2), "q2")
+    real_get = kube.get
+    calls = {"n": 0}
+
+    def get(kind, name, ns=None):
+        o = real_get(kind, name, ns)
+        if kind == "PredictiveAutoscaler" and name == N and calls["n"] == 0:
+            calls["n"] += 1
+            live = a.obj(kind, name, ns)
+            live["spec"]["maxReplicas"] = 7                             # another writer, before the pre-image read
+            live["metadata"]["generation"] += 1
+            o = real_get(kind, name, ns)
+        return o
+    monkeypatch.setattr(kube, "get", get)
+    with pytest.raises(X.StagingError):
+        BY.apply_query(c, p, d)
+    assert not [e for e in X.receipts(record, BY.HELPER) if e["event"] == "pa-pre-image"
+                and e["data"]["attempt"] == 2]                         # nothing recorded for the changed object
+    monkeypatch.undo()
+    assert any("reviewed chain" in x for x in BY.plan_query(c, 3)["problems"])   # never adopted later
