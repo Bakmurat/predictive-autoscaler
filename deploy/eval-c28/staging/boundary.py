@@ -130,6 +130,28 @@ def _admission(c: Ctx) -> Tuple[Optional[Dict], str]:
     return r, ""
 
 
+def strip_query_digest(spec: Dict) -> str:
+    """The spec's digest without spec.metrics.requests.source.query (what a query-only change leaves unchanged)."""
+    s_ = copy.deepcopy(spec or {})
+    src = ((s_.get("metrics") or {}).get("requests") or {}).get("source")
+    if isinstance(src, dict):
+        src.pop("query", None)
+    return X.json_digest(s_)
+
+
+def query_only_change_ok(c: Ctx, t: str, pa: Dict) -> bool:
+    """A PA whose spec differs from its recorded pre-image ONLY by a query that one of this helper's attempts wrote
+    (pa-pre-image receipts, durable before each write): a proven query-only change, e.g. a partial attempt whose status
+    confirmation never came. Nothing else may differ."""
+    pre = [e["data"] for e in X.receipts(c.record, HELPER) if e["event"] == "pa-pre-image"
+           and e["data"].get("name") == t and e["data"].get("uid") == pa["metadata"].get("uid")]
+    if not pre:
+        return False
+    query = ((((pa.get("spec") or {}).get("metrics") or {}).get("requests") or {}).get("source") or {}).get("query")
+    return strip_query_digest(pa.get("spec")) == pre[-1]["spec_wo_query_sha256"] and \
+        query in {x["query"] for x in pre}
+
+
 def expected_pa_spec(c: Ctx, t: str, adm: Dict) -> str:
     """The reviewed chain of a PA's spec: the admission's digest, then each completed query update's recorded digest
     (that update verified it changed only spec.metrics.requests.source); the latest one is what the PA must be."""
@@ -139,6 +161,8 @@ def expected_pa_spec(c: Ctx, t: str, adm: Dict) -> str:
             for row in e["data"].get("pas") or []:
                 if row.get("name") == t and row.get("spec_sha256"):
                     want = row["spec_sha256"]
+        elif e["event"] == "pa-query-written" and e["data"].get("name") == t:
+            want = e["data"]["spec_sha256"]
     return want
 
 
@@ -160,7 +184,8 @@ def basis_problems(c: Ctx) -> List[str]:
         if want.get(k) != live.get(k):
             out.append(f"{k} differs from the admission binding")
     for t in sorted(want.get("pa_specs") or {}):
-        if (live.get("pa_specs") or {}).get(t) != expected_pa_spec(c, t, adm):
+        pa = c.kube.get("PredictiveAutoscaler", t, c.ns) or {"metadata": {}}
+        if (live.get("pa_specs") or {}).get(t) != expected_pa_spec(c, t, adm) and not query_only_change_ok(c, t, pa):
             out.append(f"PredictiveAutoscaler {t}'s spec is not the end of its reviewed chain (admission, then the "
                        "recorded query updates)")
     return out
@@ -258,11 +283,17 @@ def apply_query(c: Ctx, reviewed: Dict, reviewed_digest: str, wait_s: float = 30
                     body["spec"].setdefault("metrics", {}).setdefault("requests", {})["source"] = {
                         "preset": "prometheus", "query": a["query"]}
                     expected["spec"] = copy.deepcopy(body["spec"])        # the pre-image + the query, nothing else
+                pre_live = c.kube.get("PredictiveAutoscaler", a["name"], c.ns)
+                X.receipt(c.record, HELPER, "pa-pre-image", {          # durable BEFORE the write: what may change
+                    "attempt": k, "name": a["name"], "uid": a["uid"], "query": a["query"],
+                    "spec_wo_query_sha256": strip_query_digest(pre_live["spec"])})
                 out = c.kube.update("PredictiveAutoscaler", a["name"], c.ns, a["uid"], mutate,
                                     expect=[["/spec/metrics/requests/source/query", a["query"]]])
                 if out.get("spec") != expected["spec"] or out["spec"].get("mode") != "Recommend":
                     raise X.StagingError(f"{a['name']}: the update did not produce exactly the reviewed spec")
                 gen, spec_sha = out["metadata"].get("generation"), X.json_digest(out["spec"])
+                X.receipt(c.record, HELPER, "pa-query-written", {"attempt": k, "name": a["name"], "uid": a["uid"],
+                                                                 "generation": gen, "spec_sha256": spec_sha})
                 compiled = c.hb.compiled_query(c.ns, p["epoch"], p["guard_s"], a["name"])
                 end = c.now() + wait_s * 1000
                 while True:
@@ -290,32 +321,39 @@ def apply_query(c: Ctx, reviewed: Dict, reviewed_digest: str, wait_s: float = 30
 
 
 MODE_MAX_GAP_S = 120
+BASELINE_LOOKBACK_S = 300
 
 
-def _covering_series(series: List[Dict], lo_s: float, hi_s: float, values_ok) -> Tuple[bool, str]:
-    """Exactly one series (one operator identity), every sample a finite number, a baseline within 120 s of lo_s, a
-    sample within 120 s of hi_s, no gap above 120 s, and values_ok(values) over the interval."""
+def _covering_series(series: List[Dict], lo_s: float, hi_s: float, values_ok) -> Tuple[bool, str, Optional[tuple]]:
+    """Exactly one series (one operator identity), distinct finite samples, a BASELINE sample at or before lo_s, a
+    covered endpoint (a sample within 120 s of hi_s), no gap above 120 s from the baseline to the endpoint, and
+    values_ok(values) from the baseline on. Returns (ok, why, identity) with identity = (pod, instance) labels."""
     if len(series) != 1:
-        return False, f"{len(series)} series (exactly one operator identity expected)"
-    pts = []
+        return False, f"{len(series)} series (exactly one operator identity expected)", None
+    m = series[0].get("metric") or {}
+    ident = (m.get("pod"), m.get("instance"))
+    pts: Dict[float, float] = {}
     for t, v in series[0].get("values") or []:
         try:
             tt, vv = float(t), float(v)
         except (TypeError, ValueError):
-            return False, "a sample is not a number"
+            return False, "a sample is not a number", ident
         if not (math.isfinite(tt) and math.isfinite(vv)):
-            return False, "a sample is not finite"
-        pts.append((tt, vv))
-    pts.sort()
-    if not pts:
-        return False, "no sample"
-    ts = [t for t, _ in pts]
-    if ts[0] - lo_s > MODE_MAX_GAP_S or hi_s - ts[-1] > MODE_MAX_GAP_S or any(b - a > MODE_MAX_GAP_S
-                                                                           for a, b in zip(ts, ts[1:])):
-        return False, "the samples do not cover the interval (baseline, gaps, freshness)"
-    if not values_ok([v for _, v in pts]):
-        return False, "the values are not as required"
-    return True, ""
+            return False, "a sample is not finite", ident
+        if tt in pts and pts[tt] != vv:
+            return False, f"conflicting samples at {tt}", ident
+        pts[tt] = vv
+    base = [t for t in pts if t <= lo_s]
+    if not base:
+        return False, "no baseline sample at or before the update", ident
+    ts = sorted(t for t in pts if t >= max(base))
+    if hi_s - ts[-1] > MODE_MAX_GAP_S or any(b - a > MODE_MAX_GAP_S for a, b in zip(ts, ts[1:])):
+        return False, "the samples do not cover the interval up to its endpoint", ident
+    if len([t for t in ts if t > lo_s]) < 1:
+        return False, "no sample after the update", ident
+    if not values_ok([pts[t] for t in ts]):
+        return False, "the values are not as required", ident
+    return True, "", ident
 
 
 def ledger_rows(record: X.Record, path: str) -> List[Dict]:
@@ -356,16 +394,19 @@ def prove_hold(c: Ctx, k: int, fetch: Fetch, api: str, rows: List[Dict]) -> Dict
         bad = [x for x in mine if x.get("desired_source") != "keep_current"
                or x.get("applied_replicas") != x.get("current_replicas")]
         sel = f'namespace="{c.ns}",autoscaler="{name}"'
-        span = int(now_s - since_s) + 1
+        span = int(now_s - since_s) + 1 + BASELINE_LOOKBACK_S       # extended backwards: the baseline
         mode = BD._q(fetch, api, "query", query=f'predictive_autoscaler_mode{{{sel},mode="Recommend"}}[{span}s]',
                      time=f"{now_s:.3f}")
         writes = BD._q(fetch, api, "query", query=f'predictive_autoscaler_scale_writes_total{{{sel},result="applied"}}'
                                                    f'[{span}s]', time=f"{now_s:.3f}")
-        mode_ok, mode_why = _covering_series(mode, since_s, now_s, lambda vals: all(v == 1 for v in vals))
+        mode_ok, mode_why, mode_id = _covering_series(mode, since_s, now_s, lambda vals: all(v == 1 for v in vals))
         # The operator initialises its write counters at zero (stage_metrics.go), so a missing series is missing
         # evidence, never "no write": exactly one series (one operator identity) covering the interval, its values
         # constant (no increase, no reset).
-        writes_ok, writes_why = _covering_series(writes, since_s, now_s, lambda vals: len(set(vals)) == 1)
+        writes_ok, writes_why, writes_id = _covering_series(writes, since_s, now_s, lambda vals: len(set(vals)) == 1)
+        if mode_ok and writes_ok and mode_id != writes_id:
+            writes_ok, writes_why = False, f"the mode series ({mode_id}) and the counter ({writes_id}) come from " \
+                                           "different operator identities"
         covered, changed = mode_ok, not writes_ok
         ok = ident and _status_ok(pa, compiled) and tele.get("status") == "False" and bool(mine) and not bad \
             and covered and not changed

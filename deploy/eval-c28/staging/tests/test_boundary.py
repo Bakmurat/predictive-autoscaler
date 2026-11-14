@@ -237,16 +237,17 @@ def test_a_replaced_history_scrape_object_fails_the_boundary(world):  # noqa: F8
     assert any("not the one created" in x for x in out["data"]["problems"])
 
 
-def hold_vm(mode_from, mode_to, writes="zero", step=30, mode_value="1"):
+def hold_vm(mode_from, mode_to, writes="zero", step=30, mode_value="1", baseline=60, pods=("operator-a",
+                                                                                         "operator-a")):
     """The observer for the hold proof: ONE operator identity's mode series (Recommend) and applied-write counter,
     sampled every `step` s over [mode_from, mode_to]; writes "zero" = constant 0, None = absent, a list = those values
     spread over the interval; mode_from None = no mode series."""
     def fetch(url):
         import urllib.parse as U
         q = dict(U.parse_qsl(U.urlparse(url).query))["query"]
-        ts = [] if mode_from is None else list(range(int(mode_from), int(mode_to) + 1, step))
+        ts = [] if mode_from is None else list(range(int(mode_from) - baseline, int(mode_to) + 1, step))
         if q.startswith("predictive_autoscaler_mode"):
-            res = [] if mode_from is None else [{"metric": {"pod": "operator-a"},
+            res = [] if mode_from is None else [{"metric": {"pod": pods[0]},
                                                  "values": [[t, mode_value] for t in ts]}]
         elif q.startswith("predictive_autoscaler_scale_writes_total"):
             if writes is None or mode_from is None:
@@ -254,7 +255,7 @@ def hold_vm(mode_from, mode_to, writes="zero", step=30, mode_value="1"):
             else:
                 vals = ["0"] * len(ts) if writes == "zero" else \
                     [str(writes[min(i * len(writes) // len(ts), len(writes) - 1)]) for i in range(len(ts))]
-                res = [{"metric": {"pod": "operator-a"}, "values": [[t, v] for t, v in zip(ts, vals)]}]
+                res = [{"metric": {"pod": pods[1]}, "values": [[t, v] for t, v in zip(ts, vals)]}]
         else:
             raise ValueError(q)
         return {"status": "success", "data": {"result": res}}
@@ -513,3 +514,28 @@ def test_a_surviving_pod_of_a_deleted_statefulset_is_still_ours(world, monkeypat
     p2 = BY.plan_retire(c)
     assert not any("not owned" in x for x in p2["problems"])
     assert [x["uid"] for x in p2["actions"] if x["delete"] == "Pod"] == [pod["metadata"]["uid"]]
+
+
+
+# --- the third review's reproductions, now handled -----------------------------------------------------------------------
+
+def test_a_genuinely_partial_update_does_not_block_a_retry(world):  # noqa: F811
+    record, kube, a, clock, c = boundary_world(world, stuck=[R])
+    p, d = saved(record, BY.plan_query(c, 1), "q")
+    with pytest.raises(X.StagingError, match="did not report"):
+        BY.apply_query(c, p, d, wait_s=30)                              # both writes happened; R never confirmed
+    assert BY.plan_query(c, 2)["problems"] == []                       # proven query-only changes are accepted
+    a.obj("PredictiveAutoscaler", R, "demo")["spec"]["maxReplicas"] = 7   # anything else is not
+    assert any("reviewed chain" in x for x in BY.plan_query(c, 2)["problems"])
+
+
+def test_the_hold_proof_needs_a_baseline_one_identity_and_coverage(world):  # noqa: F811
+    record, kube, a, clock, c = _query_done(world)
+    since = X.last(X.receipts(record, BY.HELPER), "query-updated")["data"]["updated_s"]
+    clock.sleep(600)
+    now = clock.ms / 1000
+    rows = decisions(clock)
+    assert BY.prove_hold(c, 1, hold_vm(since, now), "http://vm", rows)["proven"]
+    assert not BY.prove_hold(c, 1, hold_vm(since + 15, now, baseline=0, writes=[1]), "http://vm", rows)["proven"]
+    assert not BY.prove_hold(c, 1, hold_vm(since, now, pods=("operator-a", "operator-b")), "http://vm", rows)["proven"]
+    assert not BY.prove_hold(c, 1, hold_vm(since, since + 30, step=30, baseline=0), "http://vm", rows)["proven"]
