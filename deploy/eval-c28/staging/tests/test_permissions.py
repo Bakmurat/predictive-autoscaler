@@ -36,6 +36,10 @@ def fake_kubectl(lists, overrides=None, fail=()):
                     "--as-group=system:authenticated"} <= set(args)
             verb, res = args[2], args[3]
             key = (verb, res, "--subresource=scale" in args)
+            if "-A" in args:
+                key = key + ("-A",)
+            elif args[args.index("-n") + 1] != "demo":
+                key = key + (args[args.index("-n") + 1],)
             word = overrides.get(key, "yes" if verb == "get" else "no")
             if word == "ERR":
                 return 1, ""
@@ -43,6 +47,8 @@ def fake_kubectl(lists, overrides=None, fail=()):
         kind = args[1]
         if kind in fail:
             return 1, ""
+        if kind == "namespaces":
+            return 0, json.dumps({"items": [{"metadata": {"name": n}} for n in ("demo", "kube-system", "other")]})
         return 0, json.dumps({"kind": "List", "items": lists[kind]})
     run.calls = calls
     return run
@@ -60,7 +66,9 @@ def test_the_shadow_release_passes_and_every_question_was_asked():
     for name in ["deployments.apps"] + [f"deployments.apps/{t}" for t in T]:
         assert {("update", name, True), ("patch", name, True), ("get", name, True)} <= asked
     assert {("update", "deployments.apps", False), ("delete", "pods", False), ("create", "pods", False)} <= asked
-    assert {c[1] for c in k.calls if c[0] == "get"} == set(P.RBAC_KINDS)
+    assert {c[1] for c in k.calls if c[0] == "get"} == set(P.RBAC_KINDS) | {"namespaces"}
+    ns_asked = {c[c.index("-n") + 1] for c in k.calls if c[0] == "auth" and "-n" in c and "deployments.apps" == c[3]}
+    assert {"demo", "kube-system", "other"} <= ns_asked and any("-A" in c for c in k.calls if c[0] == "auth")
 
 
 @pytest.mark.parametrize("overrides, text", [
@@ -68,6 +76,8 @@ def test_the_shadow_release_passes_and_every_question_was_asked():
     ({("patch", "deployments.apps", True): "yes"}, "allows patch on deployments/scale of any"),
     ({("update", "deployments.apps", False): "yes"}, "allows update on deployments.apps"),
     ({("create", "pods", False): "yes"}, "allows create on pods"),
+    ({("update", "deployments.apps", True, "other"): "yes"}, "in namespace other"),
+    ({("patch", "deployments.apps", True, "-A"): "yes"}, "cluster-wide"),
 ])
 def test_any_write_answer_refuses(overrides, text):
     v, _ = check(overrides=overrides)
@@ -97,6 +107,7 @@ def test_any_write_grant_reaching_the_identity_refuses(edit, text):
     ({"overrides": {("update", "deployments.apps/c28-demo-pa-r", True): "ERR"}}, "no clear answer"),
     ({"overrides": {("get", "deployments.apps", True): "no"}}, "control failed"),
     ({"fail": ("rolebindings",)}, "could not be listed"),
+    ({"fail": ("namespaces",)}, "namespaces could not be listed"),
     ({"targets": []}, "no target"),
 ])
 def test_errors_and_unclear_answers_are_unproven(kw, text):

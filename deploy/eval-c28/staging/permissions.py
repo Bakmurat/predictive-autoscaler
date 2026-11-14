@@ -10,7 +10,10 @@ Asked of the API server's authorizer under impersonation of the operator's Servi
     Deployment named "scale"): update and patch must be no, get yes (the control), for the question without a name AND
     for every explicitly planned target name (the targets are given, never discovered: before the PAs exist the names
     are the planned ones);
-  * direct writes: update, patch and delete on deployments.apps, create and delete on pods: all must be no.
+  * direct writes: update, patch and delete on deployments.apps, create and delete on pods: all must be no;
+  * the scale write without a name in EVERY namespace of the cluster and cluster-wide (-A): no, never a sample.
+(Aggregated ClusterRoles are read with the rules the aggregation controller filled in, i.e. the rules in effect.
+Run it for the forecaster's and the trainer's ServiceAccounts too, with --sa.)
 And from the RBAC objects of the WHOLE cluster (ClusterRoles, Roles, ClusterRoleBindings, RoleBindings of every
 namespace; no other kind is read): every binding whose subject is the ServiceAccount, its username or one of its groups
 is resolved to its role, and any rule there that reaches the scale subresource, Deployments or pods with a write verb
@@ -57,6 +60,21 @@ def collect(kubectl: Callable[[List[str]], Tuple[int, str]], sa_ns: str, sa: str
             ask(name, verb, "deployments.apps" + ("" if name == "-" else f"/{name}"), ["--subresource=scale"])
     for verb, res in DIRECT:
         ask(f"direct:{res}", verb, res, [])
+    # The scale write without a name in EVERY namespace of the cluster, and cluster-wide (-A): never a sample.
+    rc, out = kubectl(["get", "namespaces", "-o", "json"])
+    try:
+        namespaces = sorted(i["metadata"]["name"] for i in json.loads(out)["items"]) if rc == 0 else None
+    except (ValueError, KeyError, TypeError):
+        namespaces = None
+    for other in namespaces or []:
+        for verb in ("update", "patch"):
+            rc_, out_ = kubectl(["auth", "can-i", verb, "deployments.apps", "--subresource=scale", "-n", other, *imp])
+            word = out_.strip().splitlines()[-1].strip() if out_.strip() else ""
+            answers.setdefault(f"ns:{other}", {})[verb] = word if word in ("yes", "no") else "error"
+    for verb in ("update", "patch"):
+        rc_, out_ = kubectl(["auth", "can-i", verb, "deployments.apps", "--subresource=scale", "-A", *imp])
+        word = out_.strip().splitlines()[-1].strip() if out_.strip() else ""
+        answers.setdefault("cluster", {})[verb] = word if word in ("yes", "no") else "error"
     rbac, list_errors = [], []
     for kind in RBAC_KINDS:
         rc, out = kubectl(["get", kind, "-o", "json"] + (["-A"] if kind in ("roles", "rolebindings") else []))
@@ -68,7 +86,9 @@ def collect(kubectl: Callable[[List[str]], Tuple[int, str]], sa_ns: str, sa: str
             list_errors.append(kind)
             continue
         rbac.extend(doc["items"])
-    return {"answers": answers, "rbac": rbac, "list_errors": list_errors}
+    if namespaces is None:
+        list_errors.append("namespaces")
+    return {"answers": answers, "rbac": rbac, "list_errors": list_errors, "namespaces": namespaces or []}
 
 
 def _role_kind(o: Dict) -> str:
@@ -95,6 +115,14 @@ def verdict(collected: Dict, sa_ns: str, sa: str, targets: List[str]) -> Dict:
             unproven.append(f"{verb} {res}: no clear answer ({got})")
         elif got == "yes":
             refused.append(f"the authorizer allows {verb} on {res}")
+    for key in ["cluster"] + [f"ns:{n}" for n in collected.get("namespaces") or []]:
+        for verb in ("update", "patch"):
+            got = answers.get(key, {}).get(verb)
+            where = "cluster-wide" if key == "cluster" else f"in namespace {key[3:]}"
+            if got not in ("yes", "no"):
+                unproven.append(f"{verb} deployments/scale {where}: no clear answer ({got})")
+            elif got == "yes":
+                refused.append(f"the authorizer allows {verb} on deployments/scale {where}")
     for kind in collected.get("list_errors") or []:
         unproven.append(f"the {kind} could not be listed: the binding audit is incomplete")
     user = f"system:serviceaccount:{sa_ns}:{sa}"
