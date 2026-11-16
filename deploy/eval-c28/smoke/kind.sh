@@ -383,9 +383,10 @@ EOF
 
 # scale_rules shadow|default <RBAC objects> <write ClusterRole>: S1's rule check, on rendered manifests (YAML documents)
 # or on live objects (kubectl Lists). The write role must hold exactly one rule that reaches deployments/scale, for
-# apiGroup apps and that resource alone, with verbs exactly [get] (shadow) or [get, update] (default); and the roles
-# that may write a scale subresource of apps (named or through a wildcard) must be none (shadow) or that role alone
-# (default). Prints the verdict, or the reason on stderr with exit 1.
+# apiGroup apps and that resource alone, with verbs exactly [get] (both); and the roles that may write a scale
+# subresource of apps (named or through a wildcard) must be none (shadow) or the release's scale role alone (default:
+# the write role's name with -scale for -write, holding exactly one rule, apps deployments/scale with verbs exactly
+# [update]). Prints the verdict, or the reason on stderr with exit 1.
 scale_rules() {
   "$PY" - "$1" "$2" "$3" <<'PY'
 import sys, yaml
@@ -403,13 +404,21 @@ mine = [r for d in roles if d["kind"] == "ClusterRole" and d["metadata"]["name"]
         for r in d.get("rules") or [] if reaches_scale(r)]
 if len(mine) != 1 or mine[0].get("apiGroups") != ["apps"] or mine[0].get("resources") != ["deployments/scale"]:
     sys.exit(f"scale rule: ClusterRole {write_role} does not hold exactly one apps deployments/scale rule: {mine}")
-verbs, expected = mine[0].get("verbs"), ["get"] if want == "shadow" else ["get", "update"]
-if verbs != expected:
-    sys.exit(f"scale rule: ClusterRole {write_role} gives deployments/scale {verbs}, want exactly {expected} ({want})")
+verbs = mine[0].get("verbs")
+if verbs != ["get"]:
+    sys.exit(f"scale rule: ClusterRole {write_role} gives deployments/scale {verbs}, want exactly ['get'] ({want})")
+if not write_role.endswith("-write"):
+    sys.exit(f"scale rule: {write_role} is not a write role name")
+scale_role = write_role[:-len("-write")] + "-scale"
 writers = sorted({f'{d["kind"]}/{d["metadata"]["name"]}' for d in roles for r in d.get("rules") or []
                   if reaches_scale(r) and WRITES & set(r.get("verbs") or [])})
-if writers != ([] if want == "shadow" else [f"ClusterRole/{write_role}"]):
+if writers != ([] if want == "shadow" else [f"ClusterRole/{scale_role}"]):
     sys.exit(f"scale rule: roles that may write a scale subresource: {writers} ({want})")
+if want != "shadow":
+    held = [d.get("rules") or [] for d in roles if d["kind"] == "ClusterRole" and d["metadata"]["name"] == scale_role]
+    if len(held) != 1 or len(held[0]) != 1 or held[0][0].get("apiGroups") != ["apps"] \
+            or held[0][0].get("resources") != ["deployments/scale"] or held[0][0].get("verbs") != ["update"]:
+        sys.exit(f"scale rule: ClusterRole {scale_role} is not exactly one apps deployments/scale [update] rule: {held}")
 print(f"ClusterRole {write_role} gives deployments/scale exactly {verbs}; of {len(roles)} roles, those that may write "
       f"a scale subresource: {', '.join(writers) or 'none'}")
 PY
