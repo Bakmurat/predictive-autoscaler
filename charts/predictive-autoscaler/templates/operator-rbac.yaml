@@ -50,20 +50,21 @@ subjects:
     name: {{ include "pa.fullname" . }}-operator
     namespace: {{ .Release.Namespace }}
 ---
-# The operator, writes: replicas only through deployments/scale, its autoscalers' status, events. Bound cluster-wide
-# when every namespace is watched; otherwise only in the watched namespaces, so a narrowed install cannot scale anything
-# outside them. Leader-election events in the release namespace come from the Lease Role below. With
-# operator.rbac.scaleWrite false (a shadow, Recommend-only install) the /scale rule keeps only get: no replica write is
-# authorized at all, and an autoscaler set to Active fails its write with Forbidden instead of scaling.
+# The operator, writes: its autoscalers' status and events, and the read of deployments/scale. Bound cluster-wide
+# when every namespace is watched; otherwise only in the watched namespaces, so a narrowed install cannot report or
+# scale anything outside them. Leader-election events in the release namespace come from the Lease Role below. The
+# replica write itself (update on deployments/scale) is the separate <release>-operator-scale role further down, with
+# its own binding(s): deleting them removes this chart's grant of the replica write and leaves status and events
+# working. It does not remove a grant made outside this chart or recall a request the API server already authorized.
 {{- /*
 With operator.rbac.scaleTargets (Deployment names) the write verb is granted only on those names: for a subresource the
-resourceNames entry is the parent object's name, so the rule names the Deployments. The names apply in every namespace
-the role is bound in (each of operator.watchNamespaces, or every namespace when none is set). get stays in its own rule
-without names. RBAC binds the NAME, not the object: a Deployment recreated under an allowed name is authorized here.
+resourceNames entry is the parent object's name, so the scale role's rule names the Deployments. The names apply in
+every namespace the role is bound in (each of operator.watchNamespaces, or every namespace when none is set). get stays
+in the write role, without names. RBAC binds the NAME, not the object: a Deployment recreated under an allowed name is authorized here.
 The operator refuses a replaced target only within the reconcile that read the old one (the fresh Scale read and the
 identity guard compare UIDs); on a later reconcile it adopts the replacement and can scale it reactively. Restricting
-writes to reviewed UIDs needs an operator-side check, which this value does not provide. An empty list renders exactly
-the single rule below. The names are validated here as well as in values.schema.json (schema validation can be
+writes to reviewed UIDs needs an operator-side check, which this value does not provide (operator.writeAllowlist does).
+An empty list renders the update rule without names. The names are validated here as well as in values.schema.json (schema validation can be
 skipped): Kubernetes' DNS-1123 subdomain, label by label, at most 253 characters, distinct, at most 64.
 */}}
 {{- $scaleTargets := .Values.operator.rbac.scaleTargets }}
@@ -90,22 +91,34 @@ rules:
   - apiGroups: ["autoscaling.devkuban.com"]
     resources: ["predictiveautoscalers/status"]
     verbs: ["get", "update", "patch"]
-  {{- if $scaleTargets }}
   - apiGroups: ["apps"]
     resources: ["deployments/scale"]
     verbs: ["get"]
-  - apiGroups: ["apps"]
-    resources: ["deployments/scale"]
-    resourceNames: {{ toJson $scaleTargets }}
-    verbs: ["update"]
-  {{- else }}
-  - apiGroups: ["apps"]
-    resources: ["deployments/scale"]
-    verbs: {{ if .Values.operator.rbac.scaleWrite }}["get", "update"]{{ else }}["get"]{{ end }}
-  {{- end }}
   - apiGroups: ["", "events.k8s.io"]
     resources: ["events"]
     verbs: ["create", "patch"]
+{{- if .Values.operator.rbac.scaleWrite }}
+---
+# The operator, the replica write: update on deployments/scale and nothing else, bound exactly like the write role
+# above. With operator.rbac.scaleWrite false (a shadow, Recommend-only install) neither this role nor its binding is
+# rendered: no replica write is authorized at all, and an autoscaler set to Active fails its write with Forbidden
+# instead of scaling. To withdraw this chart's grant without touching anything else, delete the binding(s) named
+# <release>-operator-scale, then set scaleWrite false (the next upgrade creates them again otherwise) and check the
+# result as docs/helm.md describes (each Deployment by name, with the ServiceAccount's groups, and the bindings that
+# name them): another binding that names the operator's identity is not removed by this.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "pa.fullname" . }}-operator-scale
+  labels: {{- include "pa.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    {{- if $scaleTargets }}
+    resourceNames: {{ toJson $scaleTargets }}
+    {{- end }}
+    verbs: ["update"]
+{{- end }}
 ---
 # The operator, reads of the targets' own workload objects: the pods of a target's current ReplicaSet and the
 # ReplicaSets that resolve them (the startup-delay measurement and ScaleOutBlocked; uncached lists, so no watch). Bound
@@ -124,7 +137,7 @@ rules:
     resources: ["replicasets"]
     verbs: ["get", "list"]
 {{- $watch := .Values.operator.watchNamespaces }}
-{{- range $role := list "write" "targets" }}
+{{- range $role := (.Values.operator.rbac.scaleWrite | ternary (list "write" "scale" "targets") (list "write" "targets")) }}
 {{- if not $watch }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1

@@ -87,9 +87,12 @@ def test_rbac_matches_the_documented_least_privilege_table(render):
     }
     assert rules_of(docs, "pa-predictive-autoscaler-operator-write") == {
         (("autoscaling.devkuban.com",), ("predictiveautoscalers/status",), (), ("get", "patch", "update")),
-        (("apps",), ("deployments/scale",), (), ("get", "update")),
+        (("apps",), ("deployments/scale",), (), ("get",)),
         (("", "events.k8s.io"), ("events",), (), ("create", "patch")),
     }
+    # The replica write is a role of its own (its binding can be deleted alone): update on /scale, nothing else.
+    assert rules_of(docs, "pa-predictive-autoscaler-operator-scale") == {
+        (("apps",), ("deployments/scale",), (), ("update",))}
     # The targets' pods and ReplicaSets (startup measurement, ScaleOutBlocked): read-only, uncached lists (no watch).
     assert rules_of(docs, "pa-predictive-autoscaler-operator-targets") == {
         (("",), ("pods",), (), ("get", "list")),
@@ -137,22 +140,29 @@ def test_a_shadow_install_cannot_write_replicas_and_changes_nothing_else(render,
     shadow = render(_merge(extra, {"operator": {"rbac": {"scaleWrite": False}}}))
     explicit = render(_merge(extra, {"operator": {"rbac": {"scaleWrite": True}}}))
     assert _rbac(explicit) == _rbac(default)                      # true is today's behaviour, exactly
-    write = "pa-predictive-autoscaler-operator-write"
-    assert {r for r in rules_of(default, write) if r[:3] == SCALE_RULE} == {SCALE_RULE + (("get", "update"),)}
+    write, scale = "pa-predictive-autoscaler-operator-write", "pa-predictive-autoscaler-operator-scale"
+    assert {r for r in rules_of(default, write) if r[:3] == SCALE_RULE} == {SCALE_RULE + (("get",),)}
+    assert rules_of(default, scale) == {SCALE_RULE + (("update",),)}
     assert {r for r in rules_of(shadow, write) if r[:3] == SCALE_RULE} == {SCALE_RULE + (("get",),)}
     # No role of the shadow install may write any /scale subresource.
     for (kind, _, name), (_, rules) in _rbac(shadow).items():
         for groups, resources, _, verbs in rules:
             if any(res.endswith("/scale") for res in resources):
                 assert set(verbs) <= {"get"}, (kind, name, resources, verbs)
-    # Every other object and rule is identical: status, events, the Lease, the reads and every binding.
+    # The shadow install lacks exactly the scale role and its binding(s), which mirror the write role's bindings (same
+    # kind, same namespaces, same subject). Every other object and rule is identical: status, events, the Lease, the
+    # reads and every other binding.
     d, s = _rbac(default), _rbac(shadow)
-    assert d.keys() == s.keys()
-    for key in d:
-        body_d, rules_d = d[key]
-        body_s, rules_s = s[key]
-        assert body_d == body_s, key
-        assert {r for r in rules_d if r[:3] != SCALE_RULE} == {r for r in rules_s if r[:3] != SCALE_RULE}, key
+    only = d.keys() - s.keys()
+    assert not s.keys() - d.keys()
+    assert all(name == scale for _, _, name in only) and ("ClusterRole", "", scale) in only
+    binds = lambda keys, name: sorted((k, ns) for k, ns, n in keys if n == name and k.endswith("Binding"))
+    assert binds(only, scale) == binds(d.keys(), write) == binds(s.keys(), write) and binds(only, scale)
+    for kind, ns in binds(only, scale):
+        assert json.loads(d[(kind, ns, scale)][0])["subjects"] == json.loads(d[(kind, ns, write)][0])["subjects"]
+        assert json.loads(d[(kind, ns, scale)][0])["roleRef"]["name"] == scale
+    for key in s:
+        assert d[key] == s[key], key
     # And the non-RBAC objects render the same (the self-signed TLS Secret is generated anew on every render).
     strip = lambda docs: [d for d in docs if d["kind"] not in RBAC_KINDS + ("Secret",)]
     assert strip(default) == strip(shadow)
@@ -166,9 +176,11 @@ def test_scale_write_must_be_a_boolean(render):
 # --- operator.rbac.scaleTargets: the replica write limited to named Deployments ----------------------------------------
 
 WRITE_ROLE = "pa-predictive-autoscaler-operator-write"
+SCALE_ROLE = "pa-predictive-autoscaler-operator-scale"
 CI_VALUES = sorted((CHART / "ci").glob("*-values.yaml"))
-LEGACY_SCALE_RULE = ('  - apiGroups: ["apps"]\n    resources: ["deployments/scale"]\n    verbs: %s\n'
-                     '  - apiGroups: ["", "events.k8s.io"]\n')
+READ_SCALE_RULE = ('  - apiGroups: ["apps"]\n    resources: ["deployments/scale"]\n    verbs: ["get"]\n'
+                   '  - apiGroups: ["", "events.k8s.io"]\n')
+UNNAMED_UPDATE_RULE = 'rules:\n  - apiGroups: ["apps"]\n    resources: ["deployments/scale"]\n    verbs: ["update"]\n'
 
 
 def _operator_rbac_text(values_file, *sets):
@@ -188,13 +200,16 @@ def _operator_rbac_text(values_file, *sets):
 
 
 @pytest.mark.parametrize("values", [f for f in CI_VALUES if f.name != "scale-targets-values.yaml"], ids=lambda f: f.name)
-def test_without_scale_targets_the_rbac_renders_exactly_as_before(values):
-    # Every value set that existed before scaleTargets: the single /scale rule, its text unchanged, no resourceNames
-    # on it; and an explicit empty list is byte-identical to leaving the value out.
+def test_without_scale_targets_no_scale_rule_carries_names(values):
+    # Every value set without scaleTargets: the read rule in the write role, and (unless it is a shadow install) the
+    # update rule alone in the scale role, without resourceNames; an explicit empty list is byte-identical to leaving
+    # the value out.
     text = _operator_rbac_text(values)
     write = (yaml.safe_load(values.read_text()).get("operator", {}).get("rbac", {}).get("scaleWrite", True))
-    assert text.count('resources: ["deployments/scale"]') == 1
-    assert LEGACY_SCALE_RULE % ('["get", "update"]' if write else '["get"]') in text
+    assert text.count('resources: ["deployments/scale"]') == (2 if write else 1)
+    assert text.count(READ_SCALE_RULE) == 1
+    assert text.count(UNNAMED_UPDATE_RULE) == (1 if write else 0)
+    assert ("name: pa-predictive-autoscaler-operator-scale\n" in text) == write
     assert text.count("resourceNames:") == 2          # only the operator's own CRD and its Lease, as before
     assert _operator_rbac_text(values, "operator.rbac.scaleTargets=[]") == text
 
@@ -204,13 +219,11 @@ def test_scale_targets_limit_the_write_verb_to_the_named_deployments(render):
     # Exactly the write verb granted today (update; never patch) carries the names; get stays in its own rule,
     # without names. For a subresource, resourceNames holds the parent object's name: the Deployment.
     assert {r for r in rules_of(named, WRITE_ROLE) if r[:2] == SCALE_RULE[:2]} == {
-        (("apps",), ("deployments/scale",), (), ("get",)),
-        (("apps",), ("deployments/scale",), ("web", "api"), ("update",))}
-    role = next(d for d in named if d["kind"] == "ClusterRole" and d["metadata"]["name"] == WRITE_ROLE)
-    scale = [r for r in role["rules"] if r["resources"] == ["deployments/scale"]]
-    assert scale == [{"apiGroups": ["apps"], "resources": ["deployments/scale"], "verbs": ["get"]},
-                     {"apiGroups": ["apps"], "resources": ["deployments/scale"], "resourceNames": ["web", "api"],
-                      "verbs": ["update"]}]
+        (("apps",), ("deployments/scale",), (), ("get",))}
+    assert rules_of(named, SCALE_ROLE) == {(("apps",), ("deployments/scale",), ("web", "api"), ("update",))}
+    role = next(d for d in named if d["kind"] == "ClusterRole" and d["metadata"]["name"] == SCALE_ROLE)
+    assert role["rules"] == [{"apiGroups": ["apps"], "resources": ["deployments/scale"],
+                              "resourceNames": ["web", "api"], "verbs": ["update"]}]
     # No rule of any role writes a /scale subresource without resourceNames, and none grants patch on it.
     for (kind, _, name), (_, rules) in _rbac(named).items():
         for _groups, resources, names, verbs in rules:
@@ -230,12 +243,13 @@ def test_scale_targets_limit_the_write_verb_to_the_named_deployments(render):
 def test_scale_targets_apply_in_each_watched_namespace_and_nowhere_else(render):
     docs = render({"operator": {"watchNamespaces": ["shop", "payments"],
                                 "rbac": {"scaleTargets": ["web"]}}})          # scaleWrite defaults to true
-    assert (("apps",), ("deployments/scale",), ("web",), ("update",)) in rules_of(docs, WRITE_ROLE)
-    bound = [b for b in by_kind(docs, "RoleBinding") if b["roleRef"]["name"] == WRITE_ROLE]
-    assert sorted(b["metadata"]["namespace"] for b in bound) == ["payments", "shop"]
-    assert all(b["roleRef"]["kind"] == "ClusterRole" for b in bound)
-    # The named write role is never bound cluster-wide when namespaces are watched.
-    assert not [b for b in by_kind(docs, "ClusterRoleBinding") if b["roleRef"]["name"] == WRITE_ROLE]
+    assert rules_of(docs, SCALE_ROLE) == {(("apps",), ("deployments/scale",), ("web",), ("update",))}
+    for role in (SCALE_ROLE, WRITE_ROLE):
+        bound = [b for b in by_kind(docs, "RoleBinding") if b["roleRef"]["name"] == role]
+        assert sorted(b["metadata"]["namespace"] for b in bound) == ["payments", "shop"]
+        assert all(b["roleRef"]["kind"] == "ClusterRole" and b["metadata"]["name"] == role for b in bound)
+        # Neither role is ever bound cluster-wide when namespaces are watched.
+        assert not [b for b in by_kind(docs, "ClusterRoleBinding") if b["roleRef"]["name"] == role]
 
 
 def test_scale_targets_need_scale_write_and_valid_distinct_names(render):
@@ -361,8 +375,8 @@ def test_the_scale_targets_ci_value_set_lists_the_reviewed_uids(tmp_path):
 
 def test_the_scale_targets_ci_value_set_renders_the_named_write():
     text = _operator_rbac_text(CHART / "ci" / "scale-targets-values.yaml")
-    assert ('  - apiGroups: ["apps"]\n    resources: ["deployments/scale"]\n    verbs: ["get"]\n'
-            '  - apiGroups: ["apps"]\n    resources: ["deployments/scale"]\n    resourceNames: ["web","api"]\n'
+    assert text.count(READ_SCALE_RULE) == 1
+    assert ('rules:\n  - apiGroups: ["apps"]\n    resources: ["deployments/scale"]\n    resourceNames: ["web","api"]\n'
             '    verbs: ["update"]\n') in text
     assert "kind: RoleBinding" in text and "namespace: shop" in text
 
@@ -402,6 +416,8 @@ def _write_bindings(docs, role="write"):
 def test_operator_writes_are_cluster_wide_only_when_every_namespace_is_watched(render):
     (b,) = _write_bindings(render())
     assert b["kind"] == "ClusterRoleBinding"
+    (sc,) = _write_bindings(render(), "scale")
+    assert sc["kind"] == "ClusterRoleBinding" and sc["subjects"] == b["subjects"]
     (t,) = _write_bindings(render(), "targets")
     assert t["kind"] == "ClusterRoleBinding" and t["subjects"][0]["name"] == "pa-predictive-autoscaler-operator"
 

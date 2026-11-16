@@ -54,12 +54,39 @@ Pods or read Secrets; Pods and ReplicaSets are only read (get/list), by the oper
 `operator.rbac.scaleTargets` (a list of Deployment names, empty by default) narrows the one replica write the operator
 has:
 
-| `scaleWrite` | `scaleTargets` | Rules on `apps` `deployments/scale` in the write role |
-|---|---|---|
-| `true` (default) | `[]` (default) | `get`, `update` in one rule, no names: every Deployment where the role is bound (unchanged) |
-| `true` | `[web, api]` | `get` in its own rule, no names; `update` with `resourceNames: [web, api]` |
-| `false` | `[]` | `get` only (a shadow install) |
-| `false` | not empty | refused at render time (the intent is ambiguous) |
+| `scaleWrite` | `scaleTargets` | Write role (`<release>-operator-write`) | Scale role (`<release>-operator-scale`) |
+|---|---|---|---|
+| `true` (default) | `[]` (default) | `get`, no names | `update`, no names: every Deployment where the role is bound |
+| `true` | `[web, api]` | `get`, no names | `update` with `resourceNames: [web, api]` |
+| `false` | `[]` | `get`, no names | not rendered, and neither is its binding (a shadow install) |
+| `false` | not empty | refused at render time (the intent is ambiguous) | |
+
+The replica write is a role and binding of its own, bound exactly where the write role is (cluster-wide, or once per
+watched namespace). **To withdraw the chart's permission to scale**, delete the binding(s) named
+`<release>-operator-scale` (`kubectl delete clusterrolebinding <release>-operator-scale`, or the RoleBinding of that
+name in each watched namespace): status, events and the forecasts keep working and nothing else changes. This removes
+the grant this chart made, and only that:
+
+- a role binding made outside the chart that names the operator's ServiceAccount or one of its groups still applies.
+  Ask about every Deployment the operator manages BY NAME, as the ServiceAccount with its groups:
+  `kubectl auth can-i update deployments.apps/<deployment> --subresource=scale -n <namespace>
+  --as=system:serviceaccount:<release namespace>:<release>-operator --as-group=system:serviceaccounts
+  --as-group=system:serviceaccounts:<release namespace> --as-group=system:authenticated` must answer `no` for each.
+  The same question without a name is not enough: a `no` there does not rule out a grant restricted to names. Then
+  read every RoleBinding and ClusterRoleBinding whose subjects include that ServiceAccount or one of those three
+  groups, and the rules of the role each one refers to: none may allow `update` or `patch` on `deployments/scale`;
+- a write the API server admitted before the deletion can still be applied. Wait at least your API server's request
+  timeout (kube-apiserver `--request-timeout`; check the value your cluster runs with), then watch the Deployments'
+  replica counts over several decision intervals. That is an observation, not a guarantee that no write follows.
+
+Then set `operator.rbac.scaleWrite: false` in your values: an upgrade that still has it `true` creates the binding
+again.
+
+**Upgrading from a chart that kept `update` in the write role.** The permissions are the same afterwards with unchanged
+values, but the change is not atomic: Helm applies the objects one by one, roles before bindings, so the write role
+loses `update` before the scale binding exists. A replica write in that moment fails with Forbidden and is retried on
+the next reconcile. Upgrade with the autoscalers in `Recommend` if that matters to you, and afterwards ask the by-name
+question above again: it must answer `yes` for exactly the Deployments you mean the operator to scale.
 
 - For a subresource, `resourceNames` holds the parent object's name, so the entries are the Deployments' names. Only
   the write verb the chart grants (`update`) carries them; no `patch` is granted. Names must be distinct DNS-1123
