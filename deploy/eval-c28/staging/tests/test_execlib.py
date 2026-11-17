@@ -200,3 +200,15 @@ def test_subset_diff():
     assert X.subset_diff({"a": {"b": 1, "c": [1, 2]}}, {"a": {"b": 1, "c": [1, 2], "d": 9}}) == []
     assert X.subset_diff({"a": {"b": "7"}}, {"a": {"b": "999"}}) == ["/a/b"]
     assert X.subset_diff({"spec": {"replicas": 2}}, {"spec": {"replicas": 5}}, ignore=["/spec/replicas"]) == []
+
+
+def test_a_lease_has_a_namespaced_path_in_the_coordination_group():
+    # The transition's heartbeat and trigger Leases (transition_objects.leases) are read and written by kind.
+    base = "/apis/coordination.k8s.io/v1/namespaces/pa-eval-system/leases"
+    assert X.path("Lease", "pa-eval-system") == base
+    assert X.path("Lease", "pa-eval-system", "c28-transition-trigger-reh1") == base + "/c28-transition-trigger-reh1"
+    assert X.group_of("Lease") == "coordination.k8s.io"
+    with pytest.raises(X.StagingError, match="needs a namespace"):
+        X.path("Lease", None, "c28-transition-trigger-reh1")              # a Lease is namespaced
+    assert X.path("RoleBinding", "demo", "pa-eval-predictive-autoscaler-operator-scale") == (
+        "/apis/rbac.authorization.k8s.io/v1/namespaces/demo/rolebindings/pa-eval-predictive-autoscaler-operator-scale")
