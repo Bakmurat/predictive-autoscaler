@@ -250,7 +250,8 @@ def apply(record, kube, reviewed, reviewed_digest, *, drain, permissions, mono=t
         # (a registration that half happened, a cleanup that failed, any exception) keeps it.
         release = False
         try:
-            executor = started(record, "revoke", activation, lock, clock)
+            executor = started(record, "revoke", activation, lock, clock,
+                               {"protocol": R.PROTOCOL, "emergency_last": live["emergency_last"]})
             try:
                 chart = R.chart_pending(record, f"revocation {executor}", clock)   # durable BEFORE any deletion
             except BaseException:
@@ -317,3 +318,113 @@ def apply(record, kube, reviewed, reviewed_digest, *, drain, permissions, mono=t
             lock.safe = bool(release)                     # the journal's own flag is not the last word here
     return {"status": "permission-revoked" if holds and recorded else "unresolved", "recorded": recorded,
             "lock_kept": not (holds and recorded), "evidence": facts, "problems": problems}
+
+
+# --- the transition's recovery -----------------------------------------------------------------------------------------
+
+def recovery_part(record, lock_sha256):
+    """What a recovery has to do for the transition, from the records alone: which executors it must fence, how each
+    unsettled revocation can be settled (or why it cannot), and whether releasing THIS stale lock rests on the
+    revoked permission (then the releasing recovery must see it itself, also when it resumes an interrupted one).
+    Deterministic: the plan's digest covers it, and it is computed again inside the entered recovery guard."""
+    summary, problem = R.owner_summary(record)
+    found, problem2 = R.revocations(record)
+    emergencies, chart = R.emergency_state(record), R.chart_state(record)
+    for what in (problem, problem2, emergencies["problem"], chart["problem"]):
+        if what:
+            raise X.StagingError(f"the transition's records cannot be read with certainty ({what})")
+    settle, problems = [], []
+    if emergencies["open"]:
+        problems.append(f"emergencies {emergencies['open']} are open: complete them first")
+    for r in found:
+        if r["outcome"] in R.SETTLED_OUTCOMES or (r["settlement"] is not None and R.settlement_problem(
+                record, r, r["settlement"], summary["completed"]) is None):
+            continue
+        if r["protocol"] != R.PROTOCOL:
+            problems.append(f"{r['executor']}: its registration is not of the current protocol; it stays unresolved")
+        elif not r["intents"] and r["outcome"] is None:
+            settle.append({"executor": r["executor"], "by": "not-started"})
+        else:
+            later = [seq for seq in emergencies["tombstones"] if r["emergency_last"] is not None
+                     and seq > r["emergency_last"]]
+            covering = [(seq, sha) for seq, (doc, sha) in ((s, R._tombstone(record, s)) for s in later)
+                        if doc is not None and R.covers(doc, r["executor"])]
+            if covering:
+                seq, sha = covering[-1]
+                settle.append({"executor": r["executor"], "by": "tombstone", "tombstone": seq,
+                               "tombstone_sha256": sha})
+            else:
+                problems.append(f"{r['executor']}: no emergency later than sequence {r['emergency_last']} fenced it "
+                                f"or found it completed: run the emergency first")
+    needing, problem = R.release_needs_proof(record, lock_sha256) if lock_sha256 else ([], None)
+    if problem:
+        raise X.StagingError(f"the transition's records cannot be read with certainty ({problem})")
+    return {"fence": [e["id"] for e in summary["outstanding"]], "settle": settle,
+            "release_needs_proof": bool(needing) or any(s["by"] == "tombstone" for s in settle),
+            "emergency": {"last": emergencies["last"], "open": emergencies["open"],
+                          "tombstones": emergencies["tombstones"]},
+            "chart_pending": chart["pending"], "problems": problems}
+
+
+def recover_plan(record, kube):
+    """The generic recovery plan (the held lock, every unresolved journal intent against the live state) and the
+    transition's part. This recovery fences, settles and releases the lock; it deletes nothing, writes no
+    PredictiveAutoscaler, runs no Helm, and closes no chart or activation obligation."""
+    generic = X.recover_plan(record, kube)
+    return X.new_plan(R.HELPER, record, generic["actions"], operation="recover", lock_sha256=generic["lock_sha256"],
+                      generic_digest=X.digest(generic), unresolved=generic["unresolved"],
+                      transition=recovery_part(record, generic["lock_sha256"]))
+
+
+def recover_apply(record, kube, reviewed, reviewed_digest, *, permissions, fence=F.fence, clock=None):
+    """Carry out the reviewed recovery. Under the entered recovery guard, in this order: the transition's part is
+    computed again and must be the reviewed one; every outstanding executor is fenced; if the release rests on the
+    revoked permission (a revocation settled by a tombstone under this lock, now or by an earlier interrupted
+    recovery), the binding must be seen absent and a fresh permission proof must hold (stored before use), every
+    time; the settlements are recorded; the guard is told what this recovery saw, and the release gate
+    (transition_records.release_problem) checks it once more. Any failure keeps the lock. An interrupted recovery
+    is resumed with a new, reviewed plan: what was already recorded no longer appears in it, the fresh checks do."""
+    if not isinstance(reviewed, dict) or reviewed.get("operation") != "recover":
+        raise X.StagingError("this is not a recovery plan")
+    live = recover_plan(record, kube)
+    X.require_live(reviewed, reviewed_digest, R.HELPER, record, live)
+    if live["transition"]["problems"]:
+        raise X.StagingError("the recovery cannot settle everything: " + "; ".join(live["transition"]["problems"]))
+    generic = X.recover_plan(record, kube)
+    if X.digest(generic) != live["generic_digest"]:
+        raise X.StagingError("the journal's state changed while the recovery was starting; plan and review again")
+    done = {"fenced": [], "settled": []}
+
+    def follow(_actions, guard):
+        part = recovery_part(record, live["lock_sha256"])  # INSIDE the guard, before any fence or settlement
+        if C.digest(part) != C.digest(live["transition"]):
+            raise X.StagingError("the transition's records changed since the review; plan and review again")
+        for executor in part["fence"]:
+            R.fenced(record, executor, guard, fence=fence, clock=clock)
+            done["fenced"].append(executor)
+        proof_digest = None
+        if part["release_needs_proof"]:
+            identity, problems = R.identity_read(record)
+            if problems:
+                raise X.StagingError("the transition identity is incomplete: " + "; ".join(problems))
+            state, _uid = E.ScaleBinding(record, kube.api, identity["release"],
+                                         identity["target_namespace"]).observe()
+            if state != "absent":
+                raise X.StagingError("the scale binding exists: a recovery deletes nothing; run the emergency")
+            proof = permissions()                         # stored durably before it is returned
+            why = R.proof_problems(proof, record, identity["operator_identity"], identity["targets"])
+            if why:
+                raise X.StagingError("the permission proof does not hold: " + "; ".join(why))
+            proof_digest = C.digest(proof)
+        for s in part["settle"]:
+            settlement = dict(s) if s["by"] == "not-started" else dict(s, binding="absent",
+                                                                       proof_sha256=proof_digest)
+            R.settle(record, guard, settlement, clock)
+            done["settled"].append(s["executor"])
+        if proof_digest is not None:
+            guard.fresh_revocation = {"binding": "absent", "proof_sha256": proof_digest}
+    receipt = X.recover(record, kube, generic, X.digest(generic), guard_factory=R.recovery,
+                        follow_up_guarded=follow)
+    return {"status": "lock-recovered", "fenced": done["fenced"], "settled": done["settled"],
+            "receipt": receipt.get("event") if isinstance(receipt, dict) else None,
+            "not_done": ["the PredictiveAutoscalers are untouched", "the chart restore to its shadow values"]}

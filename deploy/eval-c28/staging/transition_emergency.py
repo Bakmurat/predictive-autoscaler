@@ -133,27 +133,7 @@ def _remove(binding, problems, deletions):
             problems.append(f"deleting the scale binding: {type(e).__name__}: {str(e)[:200]}")
 
 
-def proof_problems(proof, record, identity, targets):
-    """Why this permission proof does not establish that the operator's scale write is denied. Empty = it does.
-    Every field must be PRESENT and of the expected type: a missing list is not an empty list."""
-    if not isinstance(proof, dict):
-        return ["the permission proof is not a result"]
-    why = []
-    if proof.get("verdict") != "pass":
-        why.append(f"the verdict is {proof.get('verdict')!r}, not 'pass'")
-    for key in ("refused", "unproven"):
-        if key not in proof or not isinstance(proof[key], list):
-            why.append(f"the proof does not carry its {key!r} list")
-        elif proof[key]:
-            why.append(f"the proof lists {len(proof[key])} {key} finding(s)")
-    if proof.get("cluster_uid") != record.cluster_uid or proof.get("recorded_cluster_uid") != record.cluster_uid:
-        why.append("the proof is not of the recorded cluster")
-    if proof.get("identity") != identity or proof.get("role") != "operator":
-        why.append("the proof is not about the operator's identity")
-    asked = proof.get("targets")
-    if not isinstance(asked, list) or not asked or sorted(map(str, asked)) != sorted(targets):
-        why.append("the proof is not about the expected targets")
-    return why
+proof_problems = R.proof_problems
 
 
 def _interval(verdict):
@@ -264,7 +244,8 @@ def run(record, binding, *, reason, drain, permissions, identity, targets, compl
     t0, started_at = mono(), C.utc_now(clock)
     out = {"status": "unresolved", "seq": None, "request_recorded": False, "completing": complete,
            "binding": None if binding is None else f"{binding.namespace}/{binding.name}", "deletions": deletions,
-           "absent": False, "fence": {"proven": False, "executors": [], "problem": None}, "drain": dict(NO_DRAIN),
+           "absent": False, "fence": {"proven": False, "executors": [], "completed": None, "problem": None},
+           "drain": dict(NO_DRAIN),
            "writes_denied": False, "permissions": None, "outcome": None, "outcome_recorded": False,
            "open_emergencies": None, "problems": problems}
 
@@ -284,8 +265,12 @@ def run(record, binding, *, reason, drain, permissions, identity, targets, compl
         _remove(binding, problems, deletions)
 
     # 3 fence every outstanding executor, whatever happened so far
-    listed = _attempt(problems, "reading the outstanding executors", lambda: R.outstanding(record))
-    executors, log_problem = listed if listed is not None else ([], "the outstanding executors could not be read")
+    listed = _attempt(problems, "reading the outstanding executors", lambda: R.owner_summary(record))
+    summary, log_problem = listed if listed is not None else (None, "the outstanding executors could not be read")
+    executors = summary["outstanding"] if summary and not log_problem else []
+    # What was already completed (finished or fenced, on record) when this emergency looked: a later recovery may
+    # settle a revocation only against an emergency that fenced its executor or saw it completed.
+    out["fence"]["completed"] = sorted(summary["completed"]) if summary and not log_problem else None
     out["fence"]["problem"] = log_problem
     proven = log_problem is None
     for e in executors:
@@ -320,7 +305,7 @@ def run(record, binding, *, reason, drain, permissions, identity, targets, compl
         "writes_denied": out["writes_denied"], "binding": out["binding"], "completing": complete,
         "started_at": started_at, "finished_at": C.utc_now(clock), "deletions": list(deletions),
         "fence": {"problem": log_problem, "completed_at_offset": fence_done_offset,
-                  "executors": out["fence"]["executors"]},
+                  "executors": out["fence"]["executors"], "completed": out["fence"]["completed"]},
         "drain": drain_evidence,
         "permissions": {"sha256": C.digest(proof) if isinstance(proof, dict) else None,
                         "verdict": out["permissions"], "expected_identity": identity if known else None,
