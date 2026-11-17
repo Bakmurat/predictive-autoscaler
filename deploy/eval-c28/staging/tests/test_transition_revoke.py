@@ -106,11 +106,13 @@ class World:
         self.permissions = lambda: (self.permission_calls.append(self.clock.t), proof())[1]
         self.registered = []
 
-    def started(self, record, operation, activation, lock, clock=None):
+    def started(self, record, operation, activation, lock, clock=None, detail=None):
         assert R._holds_lock(record, lock) is None
-        executor = f"{operation}-{activation}-{len(self.registered) + 1}"
-        X.receipt(record, R.HELPER, "executor-started", {"id": executor, "operation": operation,
-                                                         "activation": activation, "owner": owner(9)})
+        executor = f"{operation}-{activation}-{len(R._owner_log(record)[0]['order']) + 1}"
+        data = {"id": executor, "operation": operation, "activation": activation, "owner": owner(9)}
+        if detail is not None:
+            data["detail"] = detail
+        X.receipt(record, R.HELPER, "executor-started", data)
         self.registered.append(executor)
         return executor
 
@@ -636,6 +638,9 @@ def lost(a, uid):
 if sys.argv[4] in ("lost", "die"):
     import subprocess
     api.fail["delete"] = lost
+if sys.argv[4] == "early":                         # dies after its registration, before anything else
+    import transition_records as R
+    R.chart_pending = lambda *a, **k: os._exit(9)
 rc = transition.main(["--record", sys.argv[1], "revoke", "apply", "--plan", sys.argv[2], "--digest", sys.argv[3]],
                      api_factory=lambda _r: api, kubectl_run=T.kubectl_run(overrides=overrides))
 print(json.dumps({{"rc": rc, "pid": os.getpid(), "pgid": os.getpgid(0), "uid": api.uid}}))
@@ -820,8 +825,8 @@ def test_a_generic_recovery_reconciles_the_journal_but_does_not_release_the_tran
 
 def test_a_registration_that_half_happened_keeps_the_lock(world):
     # The reviewer's reproduction: the owner record is appended, then the registration raises (durability).
-    def half(record, operation, activation, lock, clock=None):
-        world.started(record, operation, activation, lock, clock)
+    def half(record, operation, activation, lock, clock=None, detail=None):
+        world.started(record, operation, activation, lock, clock, detail)
         raise OSError(5, "Input/output error")
     with pytest.raises(OSError):
         V.apply(world.record, world.kube, world.plan(), X.digest(world.plan()), drain=world.drain,
@@ -853,3 +858,516 @@ def test_a_never_started_revocation_releases_the_lock_only_after_its_whole_clean
         world.apply(finished=finished)
     assert world.lock_held() and world.deleted() == []
     assert [e["id"] for e in R.outstanding(world.record)[0]] == ["revoke-reh1-1"]
+
+
+# --- the transition's recovery ---------------------------------------------------------------------------------------
+
+def crashed(world, capsys, mode):
+    """A revocation run through the command in a process of its own, which is gone afterwards and has left the lock:
+    "unproven" (finished, proved nothing), "lost" (finished, a deletion's outcome unknown), "die" (killed inside the
+    deletion), "early" (killed right after its registration). The in-memory cluster is set to what it left behind."""
+    rc, _line, saved = cli(world, ["revoke", "plan", "--activation", "reh1"], capsys)
+    script = CHILD.format(staging=STAGING, tests=os.path.join(STAGING, "tests"))
+    p = subprocess.run([sys.executable, "-c", script, world.record.path, saved["plan"], saved["plan_digest"], mode],
+                       capture_output=True, text=True, timeout=120)
+    assert p.returncode == (9 if mode in ("die", "early") else 0), p.stderr[-2000:]
+    assert world.lock_held()
+    if mode != "early":
+        world.api.uid = None
+
+
+def emergency(world, monkeypatch, capsys, fenced=None):
+    for key in ("mono", "sleep"):
+        monkeypatch.setitem(E.run.__kwdefaults__, key, getattr(world.clock, key))
+    monkeypatch.setitem(E.run.__kwdefaults__, "fence",
+                        lambda o: (fenced if fenced is not None else []).append(o["pid"]) or {"proven": True})
+    rc, _line, out = cli(world, ["emergency", "--reason", "the revocation proved nothing"], capsys)
+    assert rc == 0 and out["status"] == "revoked", out["problems"]
+    return out
+
+
+def recover(world, plan=None, **kw):
+    plan = V.recover_plan(world.record, world.kube) if plan is None else plan
+    return V.recover_apply(world.record, world.kube, plan, X.digest(plan),
+                           permissions=kw.pop("permissions", world.permissions), **kw)
+
+
+def settled(world):
+    return [e["data"] for e in X.receipts(world.record, R.HELPER) if e["event"] == "revocation-settled"]
+
+
+def test_a_revocation_that_proved_nothing_is_settled_only_after_an_emergency_that_covers_it(world, capsys, monkeypatch):
+    crashed(world, capsys, "unproven")
+    before = V.recover_plan(world.record, world.kube)
+    assert before["transition"]["settle"] == [] and before["transition"]["fence"] == []
+    assert "revoke-reh1-1: no emergency later than sequence 0" in before["transition"]["problems"][0]
+    with pytest.raises(X.StagingError, match="cannot settle everything"):
+        recover(world, before)
+    assert world.lock_held() and settled(world) == []
+
+    out = emergency(world, monkeypatch, capsys)             # no lock needed; it finds the executor completed
+    assert out["evidence"]["fence"]["completed"] == ["revoke-reh1-1"]
+    plan = V.recover_plan(world.record, world.kube)
+    part = plan["transition"]
+    tombstone = os.path.join(R._dir(world.record), "000001-revoked.json")
+    assert part["problems"] == [] and part["fence"] == [] and part["settle"] == [
+        {"executor": "revoke-reh1-1", "by": "tombstone", "tombstone": 1, "tombstone_sha256": C.sha256_file(tombstone)}]
+    assert part["emergency"] == {"last": 1, "open": [], "tombstones": [1]} and part["chart_pending"] == [1]
+    world.permission_calls.clear()
+    done = recover(world, plan)
+    assert done["status"] == "lock-recovered" and done["settled"] == ["revoke-reh1-1"] and done["fenced"] == []
+    assert not world.lock_held() and len(world.permission_calls) == 1       # a FRESH proof was asked
+    [record] = settled(world)
+    assert record["binding"] == "absent" and record["tombstone"] == 1 and len(record["proof_sha256"]) == 64
+    assert os.path.exists(os.path.join(world.record.evidence_dir, R.PROOF_DIR, record["proof_sha256"] + ".json"))
+    assert R.unresolved_revocations(world.record) == ([], None) and R.release_problem(world.record) is None
+    assert world.deleted() == [] and R.chart_state(world.record)["pending"] == [1]   # nothing deleted, nothing closed
+    assert done["not_done"]
+
+
+def test_a_killed_revocation_is_fenced_reconciled_and_settled(world, capsys, monkeypatch):
+    crashed(world, capsys, "die")
+    by_emergency = []
+    out = emergency(world, monkeypatch, capsys, by_emergency)
+    assert len(by_emergency) == 1 and out["evidence"]["fence"]["executors"][0]["id"] == "revoke-reh1-1"
+    plan = V.recover_plan(world.record, world.kube)
+    assert [(a["helper"], a["op"], a["observed"]) for a in plan["actions"]] == [("transition", "delete", "done")]
+    assert plan["transition"]["fence"] == ["revoke-reh1-1"] and plan["transition"]["settle"][0]["by"] == "tombstone"
+    fenced = []
+    done = recover(world, plan, fence=lambda o: fenced.append(o["pid"]) or {"proven": True, "why": "gone"})
+    assert done["fenced"] == ["revoke-reh1-1"] and done["settled"] == ["revoke-reh1-1"] and len(fenced) == 1
+    events = world.events()
+    assert events.index("reconciled-1") < events.index("executor-fenced") < events.index("revocation-settled")
+    assert not world.lock_held() and R.outstanding(world.record) == ([], None)
+
+
+def test_a_revocation_killed_right_after_its_registration_is_settled_as_never_started(world, capsys):
+    crashed(world, capsys, "early")
+    plan = V.recover_plan(world.record, world.kube)
+    assert plan["actions"] == [] and plan["transition"]["fence"] == ["revoke-reh1-1"]
+    assert plan["transition"]["settle"] == [{"executor": "revoke-reh1-1", "by": "not-started"}]
+    world.permission_calls.clear()
+    done = recover(world, plan, fence=lambda o: {"proven": True, "why": "gone"})
+    assert done["settled"] == ["revoke-reh1-1"] and not world.lock_held()
+    assert world.api.uid == B1 and world.permission_calls == []            # it did nothing; nothing is claimed
+    [record] = settled(world)
+    assert (record["executor"], record["by"]) == ("revoke-reh1-1", "not-started") and len(record["lock_sha256"]) == 64
+
+
+def test_an_executor_that_cannot_be_fenced_keeps_the_lock(world, capsys):
+    crashed(world, capsys, "early")
+    with pytest.raises(X.StagingError, match="NOT fenced"):
+        recover(world, fence=lambda o: {"proven": False, "why": "another host"})
+    assert world.lock_held() and settled(world) == [] and R.outstanding(world.record)[0]
+
+
+def test_a_recovery_deletes_nothing_a_binding_that_exists_keeps_the_lock(world, capsys, monkeypatch):
+    crashed(world, capsys, "unproven")
+    emergency(world, monkeypatch, capsys)
+    plan = V.recover_plan(world.record, world.kube)
+    world.api.uid = B2                                     # granted again after the emergency
+    with pytest.raises(X.StagingError, match="a recovery deletes nothing"):
+        recover(world, plan)
+    assert world.lock_held() and settled(world) == [] and world.deleted() == [] and world.api.uid == B2
+
+
+@pytest.mark.parametrize("overrides", [{("update", "deployments.apps", True): "yes"},
+                                       {("patch", "deployments.apps", True): "ERR"}])
+def test_a_recovery_without_a_fresh_proof_that_holds_keeps_the_lock(world, capsys, monkeypatch, overrides):
+    crashed(world, capsys, "unproven")
+    emergency(world, monkeypatch, capsys)
+    with pytest.raises(X.StagingError, match="permission proof does not hold"):
+        recover(world, permissions=V.proof_reader(world.record, world.identity, kubectl_run(overrides=overrides)))
+    assert world.lock_held() and settled(world) == []
+
+
+def test_the_transitions_part_is_compared_again_inside_the_recovery_guard(world, capsys, monkeypatch):
+    crashed(world, capsys, "early")
+    plan = V.recover_plan(world.record, world.kube)
+    real = R.recovery.__enter__
+
+    def enter_then_change(guard):
+        entered = real(guard)
+        R.emergency_request(world.record, "opened while the recovery was starting")
+        return entered
+    monkeypatch.setattr(R.recovery, "__enter__", enter_then_change)
+    fenced = []
+    with pytest.raises(X.StagingError, match="changed since the review"):
+        recover(world, plan, fence=lambda o: fenced.append(o) or {"proven": True})
+    assert fenced == [] and world.lock_held() and settled(world) == []     # nothing was fenced or settled
+
+
+def test_an_emergency_before_the_revocation_does_not_settle_it(world, capsys, monkeypatch):
+    emergency(world, monkeypatch, capsys)                   # sequence 1, BEFORE the revocation
+    world.api.uid = B1                                      # granted again (as a grant would)
+    crashed(world, capsys, "unproven")
+    started = [e["data"] for e in X.receipts(world.record, R.HELPER) if e["event"] == "executor-started"][0]
+    assert started["detail"] == {"protocol": R.PROTOCOL, "emergency_last": 1}
+    part = V.recover_plan(world.record, world.kube)["transition"]
+    assert part["settle"] == [] and "no emergency later than sequence 1" in part["problems"][0]
+
+
+def test_a_later_emergency_that_does_not_cover_the_executor_does_not_settle_it(world, capsys):
+    crashed(world, capsys, "unproven")
+    seq = R.emergency_request(world.record, "an emergency whose record does not show this executor")
+    R.emergency_close(world.record, seq, "revoked", {"binding_removed": True, "fence_proven": True,
+                                                     "writes_denied": True,
+                                                     "fence": {"problem": None, "executors": [], "completed": []}})
+    part = V.recover_plan(world.record, world.kube)["transition"]
+    assert part["settle"] == [] and "fenced it or found it completed" in part["problems"][0]
+
+
+def test_an_interrupted_recovery_is_resumed_with_a_new_plan(world, capsys, monkeypatch):
+    crashed(world, capsys, "die")
+    emergency(world, monkeypatch, capsys)
+    first = V.recover_plan(world.record, world.kube)
+    with pytest.raises(X.StagingError, match="permission proof does not hold"):   # fenced, then the proof fails
+        recover(world, first, fence=lambda o: {"proven": True},
+                permissions=V.proof_reader(world.record, world.identity,
+                                           kubectl_run(overrides={("patch", "deployments.apps", True): "ERR"})))
+    assert world.lock_held() and R.outstanding(world.record) == ([], None) and settled(world) == []
+    with pytest.raises(X.StagingError, match="no longer produces the reviewed plan"):
+        recover(world, first)                              # the old plan is dead
+    second = V.recover_plan(world.record, world.kube)
+    assert second["transition"]["fence"] == [] and second["actions"] == []   # what was recorded no longer appears
+    assert recover(world, second)["settled"] == ["revoke-reh1-1"] and not world.lock_held()
+
+
+def test_only_a_recovery_plan_is_applied(world, capsys):
+    crashed(world, capsys, "early")
+    plan = V.recover_plan(world.record, world.kube)
+    with pytest.raises(X.StagingError, match="not a recovery plan"):
+        V.recover_apply(world.record, world.kube, dict(plan, operation="revoke"), X.digest(plan),
+                        permissions=world.permissions)
+    with pytest.raises(X.StagingError):
+        V.recover_apply(world.record, world.kube, plan, "0" * 64, permissions=world.permissions)
+    assert world.lock_held()
+
+
+def test_the_recover_commands(world, capsys, monkeypatch):
+    crashed(world, capsys, "unproven")
+    rc, line, saved = cli(world, ["recover", "plan"], capsys)
+    assert rc == 0 and line.startswith("RECOVER planned WITH PROBLEMS (apply will refuse)") and saved["problems"]
+    rc, line, _ = cli(world, ["recover", "apply", "--plan", saved["plan"], "--digest", saved["plan_digest"]], capsys)
+    assert rc == 1 and line.startswith("RECOVER REFUSED: the recovery cannot settle everything") and world.lock_held()
+    emergency(world, monkeypatch, capsys)
+    rc, line, saved = cli(world, ["recover", "plan"], capsys)
+    assert rc == 0 and line.startswith("RECOVER planned; open emergencies: none") and saved["problems"] == []
+    rc, line, out = cli(world, ["recover", "apply", "--plan", saved["plan"], "--digest", saved["plan_digest"]], capsys)
+    assert rc == 0 and out["settled"] == ["revoke-reh1-1"] and not world.lock_held()
+    assert line == ("RECOVER: the shared lock is released (not a rollback: nothing was deleted, restored or "
+                    "deactivated); open emergencies: none; chart restoration pending: [1]")
+
+
+def a_settled_revocation(world, capsys, monkeypatch):
+    crashed(world, capsys, "unproven")
+    emergency(world, monkeypatch, capsys)
+    recover(world)
+    [revocation] = R.revocations(world.record)[0]
+    return revocation, dict(revocation["settlement"]), {"revoke-reh1-1": "executor-finished"}
+
+
+def test_the_word_settled_settles_nothing_every_reference_is_checked(world, capsys, monkeypatch):
+    rev, good, completed = a_settled_revocation(world, capsys, monkeypatch)
+    check = lambda s, r=rev, c=completed: R.settlement_problem(world.record, r, s, c)   # noqa: E731
+    assert check(good) is None
+    failing = R.store_proof(world.record, dict(json.load(open(os.path.join(
+        world.record.evidence_dir, R.PROOF_DIR, good["proof_sha256"] + ".json"))), verdict="refused"))
+    for change, text in [
+        ({"executor": "revoke-reh1-9"}, "not about this revocation"), ({"by": "settled"}, "names no ground"),
+        ({"by": None}, "names no ground"), ({"tombstone": 0}, "not later"), ({"tombstone": True}, "not later"),
+        ({"tombstone": "1"}, "not later"), ({"tombstone": 7}, "has no tombstone"),
+        ({"tombstone_sha256": "0" * 64}, "sha256 differs"), ({"tombstone_sha256": None}, "sha256 differs"),
+        ({"binding": "present"}, "saw the binding absent"), ({"binding": None}, "saw the binding absent"),
+        ({"proof_sha256": None}, "names no stored permission proof"), ({"proof_sha256": "x"}, "names no stored"),
+        ({"proof_sha256": "0" * 64}, "cannot be read"), ({"proof_sha256": failing}, "does not hold"),
+    ]:
+        problem = check(dict(good, **change))
+        assert problem and text in problem, (change, problem)
+    assert "not about this revocation" in check(None) and "not about this revocation" in check("settled")
+    assert "current protocol" in check(good, dict(rev, protocol=None))
+    assert "current protocol" in check(good, dict(rev, protocol=1))
+    assert "neither finished nor fenced" in check(good, rev, {})
+    assert "not later" in check(good, dict(rev, emergency_last=1))
+    assert "not later" in check(good, dict(rev, emergency_last=None))
+    never = {"executor": rev["executor"], "by": "not-started"}
+    assert "it started" in check(never)                                    # this one has a result of its own
+    assert "it started" in check(never, dict(rev, outcome=None, intents=1))
+    assert check(never, dict(rev, outcome=None, intents=0)) is None
+    assert "it started" in check(never, dict(rev, intents=0))             # no intent, but a result of its own
+    # a LATER tombstone, named with its true hash, that does not show this executor
+    seq = R.emergency_request(world.record, "another emergency")
+    R.emergency_close(world.record, seq, "revoked", {"binding_removed": True, "fence_proven": True,
+                                                     "writes_denied": True,
+                                                     "fence": {"problem": None, "executors": [], "completed": []}})
+    other = C.sha256_file(os.path.join(R._dir(world.record), f"{seq:06d}-revoked.json"))
+    assert "neither fenced this executor nor found it completed" in check(
+        dict(good, tombstone=seq, tombstone_sha256=other))
+    # the stored proof rewritten: the same statements, other bytes
+    stored = os.path.join(world.record.evidence_dir, R.PROOF_DIR, good["proof_sha256"] + ".json")
+    same = json.load(open(stored))
+    open(stored, "w").write(json.dumps(same, indent=1))
+    assert "not the one the settlement names" in check(good)
+
+
+def test_a_settlement_is_checked_again_every_time_the_lock_is_to_be_released(world, capsys, monkeypatch):
+    rev, good, _ = a_settled_revocation(world, capsys, monkeypatch)
+    assert R.unresolved_revocations(world.record) == ([], None)
+    proof = os.path.join(world.record.evidence_dir, R.PROOF_DIR, good["proof_sha256"] + ".json")
+    kept = open(proof, "rb").read()
+    os.unlink(proof)                                                       # the proof it names is gone
+    assert R.unresolved_revocations(world.record) == (["revoke-reh1-1"], None) and R.release_problem(world.record)
+    open(proof, "wb").write(kept)
+    assert R.release_problem(world.record) is None
+    tombstone = os.path.join(R._dir(world.record), "000001-revoked.json")
+    doc = json.load(open(tombstone))
+    doc["facts"]["fence"]["completed"] = []                                # the tombstone no longer covers it
+    original = open(tombstone, "rb").read()
+    open(tombstone, "w").write(json.dumps(doc))
+    assert R.unresolved_revocations(world.record) == (["revoke-reh1-1"], None)
+    open(tombstone, "wb").write(original)
+    assert R.release_problem(world.record) is None
+    os.unlink(os.path.join(world.record.evidence_dir, R.IDENTITY_FILE))    # the proof can no longer be checked
+    assert R.unresolved_revocations(world.record) == (["revoke-reh1-1"], None)
+
+
+def test_a_settlement_is_recorded_only_under_a_held_recovery_and_only_when_it_checks_out(world, capsys, monkeypatch):
+    crashed(world, capsys, "unproven")
+    emergency(world, monkeypatch, capsys)
+    part = V.recover_plan(world.record, world.kube)["transition"]
+    with pytest.raises(X.StagingError, match="under a recovery held by this process"):
+        R.settle(world.record, None, dict(part["settle"][0], binding="absent", proof_sha256="0" * 64))
+    lock_sha = C.sha256_file(X.lock_file(world.record))
+    with R.recovery(world.record, lock_sha) as guard:
+        for bad in (dict(part["settle"][0]), dict(part["settle"][0], binding="absent", proof_sha256="0" * 64),
+                    {"executor": "revoke-reh1-9", "by": "not-started"}, {"executor": "revoke-reh1-1", "by": "not-started"},
+                    None):
+            with pytest.raises(X.StagingError):
+                R.settle(world.record, guard, bad)
+    assert settled(world) == [] and world.lock_held()
+
+
+@pytest.mark.parametrize("fence,covered", [
+    ({"problem": None, "executors": [{"id": "x", "proven": True}], "completed": []}, True),
+    ({"problem": None, "executors": [], "completed": ["x"]}, True),
+    ({"problem": None, "executors": [{"id": "x", "proven": False}], "completed": []}, False),
+    ({"problem": None, "executors": [{"id": "x", "proven": "yes"}], "completed": []}, False),
+    ({"problem": None, "executors": [{"id": "y", "proven": True}], "completed": ["y"]}, False),
+    ({"problem": "the log could not be read", "executors": [{"id": "x", "proven": True}], "completed": ["x"]}, False),
+    ({"problem": None, "executors": [], "completed": None}, False), ({"problem": None}, False), (None, False),
+    ({"executors": [{"id": "x", "proven": True}]}, True),
+])
+def test_what_an_emergencys_record_must_show_to_cover_an_executor(fence, covered):
+    assert R.covers({"facts": {"fence": fence}}, "x") is covered
+    assert R.covers(None, "x") is False and R.covers({}, "x") is False
+
+
+def test_a_registration_of_an_earlier_form_stays_unresolved(world):
+    X.receipt(world.record, R.HELPER, "executor-started", {"id": "revoke-reh1-1", "operation": "revoke",
+                                                           "activation": "reh1", "owner": owner(1)})
+    X.receipt(world.record, R.HELPER, "executor-finished", {"id": "revoke-reh1-1"})
+    [rev] = R.revocations(world.record)[0]
+    assert rev["protocol"] is None and rev["emergency_last"] is None
+    part = V.recovery_part(world.record, None)
+    assert part["settle"] == [] and "not of the current protocol" in part["problems"][0]
+    assert R.unresolved_revocations(world.record) == (["revoke-reh1-1"], None)
+
+
+def test_a_tombstone_from_before_the_revocation_is_never_proposed_whatever_it_says(world, capsys):
+    # An emergency record that names the (predictable) id of a revocation that had not started yet.
+    seq = R.emergency_request(world.record, "before the revocation")
+    R.emergency_close(world.record, seq, "revoked", {
+        "binding_removed": True, "fence_proven": True, "writes_denied": True,
+        "fence": {"problem": None, "executors": [], "completed": ["revoke-reh1-1"]}})
+    crashed(world, capsys, "unproven")
+    [rev] = R.revocations(world.record)[0]
+    assert rev["emergency_last"] == 1 and R.covers(R._tombstone(world.record, 1)[0], "revoke-reh1-1")
+    part = V.recovery_part(world.record, None)
+    assert part["settle"] == [] and "no emergency later than sequence 1" in part["problems"][0]
+
+
+# --- code review 1 of the recovery: settled is not the same as allowed to release -----------------------------------
+
+def interrupted_after_settling(world, capsys, monkeypatch):
+    """A recovery that fenced nothing, settled the revocation, and was interrupted before it released the lock."""
+    crashed(world, capsys, "unproven")
+    emergency(world, monkeypatch, capsys)
+    real = R.recovery.release_stale
+
+    def interrupted(_guard):
+        raise KeyboardInterrupt()
+    monkeypatch.setattr(R.recovery, "release_stale", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        recover(world)
+    monkeypatch.setattr(R.recovery, "release_stale", real)
+    assert world.lock_held() and len(settled(world)) == 1
+    assert settled(world)[0]["lock_sha256"] == C.sha256_file(X.lock_file(world.record))
+    world.permission_calls.clear()
+
+
+def test_a_resumed_release_asks_the_fresh_proof_again(world, capsys, monkeypatch):
+    # The reviewer's reproduction: interrupted after the settlement, the binding recreated, a new plan: the lock was
+    # released with ZERO permission calls, and the generic recovery released it too.
+    interrupted_after_settling(world, capsys, monkeypatch)
+    world.api.uid = B2                                     # granted again in the meantime
+    plan = V.recover_plan(world.record, world.kube)
+    assert plan["transition"]["settle"] == [] and plan["transition"]["release_needs_proof"] is True
+    with pytest.raises(X.StagingError, match="a recovery deletes nothing"):
+        recover(world, plan)
+    assert world.lock_held()
+    generic = X.recover_plan(world.record, world.kube)
+    with pytest.raises(X.StagingError, match="in the SAME recovery"):
+        X.recover(world.record, world.kube, generic, X.digest(generic))    # the generic recovery cannot have it
+    assert world.lock_held() and world.permission_calls == []
+    world.api.uid = None                                   # (the emergency removed it again)
+    done = recover(world)
+    assert done["settled"] == [] and not world.lock_held() and len(world.permission_calls) == 1
+
+
+def test_a_resumed_release_with_a_proof_that_no_longer_holds_keeps_the_lock(world, capsys, monkeypatch):
+    interrupted_after_settling(world, capsys, monkeypatch)
+    with pytest.raises(X.StagingError, match="permission proof does not hold"):
+        recover(world, permissions=V.proof_reader(world.record, world.identity, kubectl_run(
+            overrides={("update", "deployments.apps", True): "yes"})))
+    assert world.lock_held()
+
+
+@pytest.mark.parametrize("fresh,text", [
+    (None, "in the SAME recovery"), ("yes", "in the SAME recovery"),
+    ({"binding": "present", "proof_sha256": "0" * 64}, "did not see the scale binding absent"),
+    ({"binding": "absent"}, "names no stored permission proof"),
+    ({"binding": "absent", "proof_sha256": "0" * 64}, "cannot be read"),
+])
+def test_the_release_gate_checks_what_the_releasing_recovery_saw(world, capsys, monkeypatch, fresh, text):
+    interrupted_after_settling(world, capsys, monkeypatch)
+    lock_sha = C.sha256_file(X.lock_file(world.record))
+    assert R.release_needs_proof(world.record, lock_sha) == (["revoke-reh1-1"], None)
+    assert R.release_needs_proof(world.record, "0" * 64) == ([], None)
+    assert R.release_needs_proof(world.record, None) == ([], "the stale lock is not identified")
+    assert "in the SAME recovery" in R.release_problem(world.record)       # no guard at all
+    with R.recovery(world.record, lock_sha) as guard:
+        guard.fresh_revocation = fresh
+        assert text in R.release_problem(world.record, guard)
+        good = settled(world)[0]["proof_sha256"]
+        guard.fresh_revocation = {"binding": "absent", "proof_sha256": good}
+        assert R.release_problem(world.record, guard) is None
+    assert guard.fresh_revocation is None                                  # it does not outlive the recovery
+    other = types.SimpleNamespace(fresh_revocation={"binding": "absent", "proof_sha256": good})
+    assert "in the SAME recovery" in R.release_problem(world.record, other)   # not a held transition recovery
+
+
+def test_an_open_emergency_blocks_the_plan_the_settlement_and_the_release(world, capsys, monkeypatch):
+    # The reviewer's reproductions: a covering tombstone 1 and emergency 2 open: the recovery succeeded; so did one
+    # where emergency 2 was opened during the permission callback.
+    crashed(world, capsys, "unproven")
+    emergency(world, monkeypatch, capsys)
+    clean = V.recover_plan(world.record, world.kube)
+
+    def proof_then_an_emergency():
+        proof = world.permissions()
+        R.emergency_request(world.record, "opened during the permission callback")
+        return proof
+    with pytest.raises(X.StagingError, match="while an emergency is open"):
+        recover(world, clean, permissions=proof_then_an_emergency)
+    assert world.lock_held() and settled(world) == []
+    part = V.recover_plan(world.record, world.kube)["transition"]
+    assert part["emergency"]["open"] == [2] and "emergencies [2] are open" in part["problems"][0]
+    with pytest.raises(X.StagingError, match="cannot settle everything"):
+        recover(world)
+    assert R.release_problem(world.record)
+
+
+def test_an_emergency_opened_after_the_settlement_still_stops_the_release(world, capsys, monkeypatch):
+    crashed(world, capsys, "unproven")
+    emergency(world, monkeypatch, capsys)
+    real = R.settle
+
+    def settle_then_an_emergency(record, guard, settlement, clock=None):
+        real(record, guard, settlement, clock)
+        R.emergency_request(record, "opened right after the settlement")
+    monkeypatch.setattr(R, "settle", settle_then_an_emergency)
+    with pytest.raises(X.StagingError, match=r"emergencies \[2\] are open"):
+        recover(world)
+    assert world.lock_held() and len(settled(world)) == 1
+
+
+def test_chart_records_that_cannot_be_read_keep_the_lock(world, capsys, monkeypatch):
+    # The reviewer's reproduction: an unexpected file among the chart records gave chart_pending None, no problem,
+    # and a released lock.
+    crashed(world, capsys, "unproven")
+    emergency(world, monkeypatch, capsys)
+    stray = os.path.join(R._chart_dir(world.record), "notes.txt")
+    open(stray, "w").write("x")
+    with pytest.raises(X.StagingError, match="cannot be read with certainty"):
+        V.recover_plan(world.record, world.kube)
+    assert R.release_problem(world.record)
+    generic = X.recover_plan(world.record, world.kube)
+    with pytest.raises(X.StagingError):
+        X.recover(world.record, world.kube, generic, X.digest(generic))
+    assert world.lock_held()
+    os.unlink(stray)
+    assert recover(world)["settled"] == ["revoke-reh1-1"] and not world.lock_held()   # a PENDING obligation may stay
+    assert R.chart_state(world.record)["pending"] == [1]
+
+
+def test_the_release_gate_holds_on_an_open_emergency_and_on_unreadable_records_by_themselves(world):
+    # Nothing else is wrong in this run: no executor, no revocation.
+    assert R.release_problem(world.record) is None
+    seq = R.emergency_request(world.record, "open")
+    assert R.release_problem(world.record) == "emergencies [1] are open"
+    R.emergency_close(world.record, seq, "revoked", {"binding_removed": True, "fence_proven": True,
+                                                     "writes_denied": True})
+    assert R.release_problem(world.record) is None
+    stray = os.path.join(R._dir(world.record), "notes.txt")
+    open(stray, "w").write("x")
+    assert "emergency records cannot be read" in R.release_problem(world.record)
+    os.unlink(stray)
+    os.makedirs(R._chart_dir(world.record))
+    open(os.path.join(R._chart_dir(world.record), "notes.txt"), "w").write("x")
+    assert "chart records cannot be read" in R.release_problem(world.record)
+
+
+# --- code review 2 of the recovery: what cannot be read is not "no proof needed" -------------------------------------
+
+@pytest.mark.parametrize("failure", ["the lock cannot be hashed", "the receipts cannot be read"])
+def test_a_read_failure_at_the_release_gate_keeps_the_lock(world, capsys, monkeypatch, failure):
+    # The reviewer's reproductions: after an interrupted settlement and a recreated binding, either failure at the
+    # gate was read as "no proof required": the generic recovery removed the lock with zero permission calls.
+    interrupted_after_settling(world, capsys, monkeypatch)
+    world.api.uid = B2
+    generic = X.recover_plan(world.record, world.kube)
+    at_the_gate = {"on": False}
+    real_unresolved, real_sha, real_revocations = R.unresolved_revocations, C.sha256_file, R.revocations
+
+    def unresolved(record):
+        out = real_unresolved(record)
+        at_the_gate["on"] = True                           # the failures below happen only after this point
+        return out
+
+    def sha(path):
+        if at_the_gate["on"] and failure == "the lock cannot be hashed" and path == X.lock_file(world.record):
+            raise PermissionError(13, "Permission denied")
+        return real_sha(path)
+
+    def revocations(record):
+        if at_the_gate["on"] and failure == "the receipts cannot be read":
+            return [], "the transition receipts cannot be read (OSError)"
+        return real_revocations(record)
+    monkeypatch.setattr(R, "unresolved_revocations", unresolved)
+    monkeypatch.setattr(C, "sha256_file", sha)
+    monkeypatch.setattr(R, "revocations", revocations)
+    with pytest.raises(X.StagingError, match="needs a fresh proof is unknown"):
+        X.recover(world.record, world.kube, generic, X.digest(generic))
+    monkeypatch.undo()
+    assert world.lock_held() and world.permission_calls == [] and world.api.uid == B2
+
+
+def test_a_lock_that_is_gone_during_its_recovery_is_unknown_not_released(world, capsys, monkeypatch):
+    interrupted_after_settling(world, capsys, monkeypatch)
+    lock, lock_sha = X.lock_file(world.record), C.sha256_file(X.lock_file(world.record))
+    with R.recovery(world.record, lock_sha) as guard:
+        kept = open(lock, "rb").read()
+        os.unlink(lock)
+        assert "the stale lock is gone" in R.release_problem(world.record, guard)
+        assert R.release_problem(world.record) is None      # asked outside a recovery: there is nothing to release
+        open(lock, "wb").write(kept)

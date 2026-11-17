@@ -158,7 +158,7 @@ def test_everything_holds_revoked_with_a_valid_tombstone(world):
     out = world.run()
     assert out["status"] == "revoked" and out["outcome"] == "revoked" and out["outcome_recorded"] is True
     assert out["seq"] == 1 and out["request_recorded"] and out["absent"] and out["deletions"] == ["b-1"]
-    assert out["fence"] == {"proven": True, "problem": None, "executors": [
+    assert out["fence"] == {"proven": True, "problem": None, "completed": [], "executors": [
         {"id": "grant-reh1-1", "owner": owner(1), "proven": True,
          "result": {"proven": True, "why": "gone", "signalled": True}}]}
     assert out["drain"] == {"verified": True, "seconds": 90.0, "elapsed": True, "elapsed_seconds": 90.0,
@@ -182,7 +182,7 @@ def test_a_binding_that_is_already_absent_needs_no_deletion(record):
     w = World(record, uid=None)
     out = w.run()
     assert out["status"] == "revoked" and out["deletions"] == [] and w.deleted() == []
-    assert out["fence"] == {"proven": True, "problem": None, "executors": []}
+    assert out["fence"] == {"proven": True, "problem": None, "completed": [], "executors": []}
 
 
 def test_it_touches_one_binding_and_the_cluster_identity_and_nothing_else(world):

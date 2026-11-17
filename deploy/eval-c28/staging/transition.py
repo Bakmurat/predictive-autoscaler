@@ -14,6 +14,12 @@
   transition.py --record R revoke apply --plan FILE --digest SHA256
       The ordinary, reviewed revocation under the shared lock.
 
+  transition.py --record R recover plan
+  transition.py --record R recover apply --plan FILE --digest SHA256
+      The recovery of a stale shared lock with the transition's part: fence the executors that are neither finished
+      nor fenced, settle the revocations that proved nothing (only against a later emergency that covers them, a
+      binding seen absent and a fresh permission proof), then release the lock. It deletes nothing.
+
 The FIRST output line states the result, the emergencies still open and the chart restorations still pending; a
 state that could not be read is printed as UNKNOWN, never as an empty list. The JSON result follows.
 Exit status: 0 only when THIS run's permission revocation was proven and recorded AND the chart obligation is on
@@ -111,6 +117,11 @@ def main(argv=None, api_factory=E.bounded_api, kubectl_run=subprocess.run) -> in
     ra = rv.add_parser("apply")
     ra.add_argument("--plan", required=True)
     ra.add_argument("--digest", required=True)
+    rc = sub.add_parser("recover").add_subparsers(dest="step", required=True)
+    rc.add_parser("plan")
+    rca = rc.add_parser("apply")
+    rca.add_argument("--plan", required=True)
+    rca.add_argument("--digest", required=True)
     a = ap.parse_args(argv)
     record = X.load_record(a.record)
     try:
@@ -130,6 +141,21 @@ def main(argv=None, api_factory=E.bounded_api, kubectl_run=subprocess.run) -> in
             return 0 if revoked and obliged else 2
         api = api_factory(record)
         kube = record.kube(api=api)
+        if a.cmd == "recover":
+            if a.step == "plan":
+                saved = X.cli_plan(record, R.HELPER, V.recover_plan(record, kube), "recover-plan")
+                saved["problems"] = X.load_plan(saved["plan"])["transition"]["problems"]
+                print(first_line("RECOVER planned" + (" WITH PROBLEMS (apply will refuse)" if saved["problems"]
+                                                      else ""), record))
+                X.emit(saved)
+                return 0
+            fields, _ = R.identity_read(record)
+            out = V.recover_apply(record, kube, X.load_plan(a.plan), a.digest,
+                                  permissions=V.proof_reader(record, fields, kubectl_run))
+            print(first_line("RECOVER: the shared lock is released (not a rollback: nothing was deleted, restored "
+                             "or deactivated)", record))
+            X.emit(out)
+            return 0
         drain = V.drain_reader(record, api)
         if a.step == "plan":
             saved = X.cli_plan(record, R.HELPER, V.plan(record, kube, drain, activation=a.activation), "revoke-plan")

@@ -166,6 +166,9 @@ class recovery:
         self.record, self.lock_sha256 = record, lock_sha256
         self._guard = C.recovery_guard(record.doc, X.LOCK_SCOPE, lock_sha256)
         self._token = None
+        # What THIS recovery saw, itself, about the revoked permission: {"binding": "absent", "proof_sha256": ...}.
+        # It lives in this object only: a release that needs it cannot borrow it from an earlier, interrupted run.
+        self.fresh_revocation = None
 
     def __enter__(self):
         self._guard.__enter__()                           # raises unless this process may recover this lock
@@ -187,6 +190,7 @@ class recovery:
         guard alone: a successful release_stale() has removed the stale lock by now, legitimately."""
         problem = self._guard_problem()
         self._token = None
+        self.fresh_revocation = None
         if problem is None:
             return self._guard.__exit__(exc_type, exc, tb)
         if exc_type is None:
@@ -227,8 +231,10 @@ class recovery:
         return None
 
 
-def started(record, operation, activation, lock, clock=None):
-    """Register THIS process as a transition executor, before it can do anything. Returns the executor id. The owner
+def started(record, operation, activation, lock, clock=None, detail=None):
+    """Register THIS process as a transition executor, before it can do anything. Returns the executor id. `detail`
+    (a plain object) is kept in the same record: what the operation must have on record from its first moment (a
+    revocation: its protocol and the emergency sequence it started at). The owner
     record is taken from the running process; it refuses one that could not be fenced later (in practice: call
     transition_fence.own_group() first), one that does not hold the shared lock, and a log that is not in order."""
     problem = _holds_lock(record, lock)
@@ -246,8 +252,13 @@ def started(record, operation, activation, lock, clock=None):
     if problem:
         raise X.StagingError(f"{problem}: nothing may be registered on top of it")
     executor = f"{operation}-{activation}-{len(log['order']) + 1}"
-    _append(record, "executor-started", {"id": executor, "operation": operation, "activation": activation,
-                                         "owner": {k: owner[k] for k in F.FIELDS}}, clock)
+    data = {"id": executor, "operation": operation, "activation": activation,
+            "owner": {k: owner[k] for k in F.FIELDS}}
+    if detail is not None:
+        if not isinstance(detail, dict):
+            raise X.StagingError("an executor's detail is a plain object")
+        data["detail"] = json.loads(json.dumps(detail))
+    _append(record, "executor-started", data, clock)
     return executor
 
 
@@ -274,16 +285,21 @@ def finished(record, executor, lock, *, children_collected, clock=None):
     _append(record, "executor-finished", {"id": executor}, clock)
 
 
+def _held(record, guard):
+    """Why `guard` is not an ENTERED recovery of this record's evaluation lock held by this process, or None."""
+    if not isinstance(guard, recovery) or guard._guard.path != X.lock_file(record) \
+            or guard.record.sha256 != record.sha256:
+        return "not a recovery of this record's evaluation lock"
+    return guard.problem()
+
+
 def fenced(record, executor, guard, *, fence=F.fence, clock=None):
     """The proof-based completion, for a recovery: run the fence on the executor's RECORDED owner and, only when it
     is proven, record it. `guard` is an ENTERED transition_records.recovery of this record, held by this process:
     that is checked before the fence and again immediately before the append, because the owner log has one chain
     and one writer. Returns the fence's result; raises (and writes nothing) when anything does not hold."""
     def held():
-        if not isinstance(guard, recovery) or guard._guard.path != X.lock_file(record) \
-                or guard.record.sha256 != record.sha256:
-            return "not a recovery of this record's evaluation lock"
-        return guard.problem()
+        return _held(record, guard)
     problem = held()
     if problem:
         raise X.StagingError(f"an executor is fenced under a recovery held by this process: {problem}")
@@ -303,6 +319,16 @@ def fenced(record, executor, guard, *, fence=F.fence, clock=None):
         raise X.StagingError(f"the recovery was lost while fencing ({problem}): nothing was recorded")
     _append(record, "executor-fenced", {"id": executor, "fence": json.loads(json.dumps(result))}, clock)
     return result
+
+
+def owner_summary(record):
+    """({"outstanding": [started records, in order], "completed": {id: event}}, problem). With a problem: (None,
+    problem), and nothing is known."""
+    log, problem = _owner_log(record)
+    if problem:
+        return None, problem
+    return {"outstanding": [log["starts"][i] for i in log["order"] if i not in log["completed"]],
+            "completed": dict(log["completed"])}, None
 
 
 def outstanding(record):
@@ -661,34 +687,212 @@ def store_proof(record, proof):
 
 # --- what a recovery of the stale lock must respect ---------------------------------------------------------------------
 
-SETTLED_REVOCATIONS = ("revoked", "not-started")
+SETTLED_OUTCOMES = ("revoked", "not-started")
+PROTOCOL = 2          # revocations whose registration carries {"protocol": 2, "emergency_last": n} in its detail
 
 
-def unresolved_revocations(record):
-    """(the revoke executors that did not end in a recorded, proven revocation, in order; problem). A revoke executor
-    is settled by its own "revocation" receipt with the outcome "revoked" (or "not-started": it stopped before its
-    first deletion). One with another outcome, or with no such receipt at all, is unresolved, and nothing in this
-    module settles it later: that is the transition recovery's to define. With a problem the list means UNKNOWN."""
+def proof_problems(proof, record, identity, targets):
+    """Why this permission proof does not establish that the operator's scale write is denied. Empty = it does.
+    Every field must be PRESENT and of the expected type: a missing list is not an empty list."""
+    if not isinstance(proof, dict):
+        return ["the permission proof is not a result"]
+    why = []
+    if proof.get("verdict") != "pass":
+        why.append(f"the verdict is {proof.get('verdict')!r}, not 'pass'")
+    for key in ("refused", "unproven"):
+        if key not in proof or not isinstance(proof[key], list):
+            why.append(f"the proof does not carry its {key!r} list")
+        elif proof[key]:
+            why.append(f"the proof lists {len(proof[key])} {key} finding(s)")
+    if proof.get("cluster_uid") != record.cluster_uid or proof.get("recorded_cluster_uid") != record.cluster_uid:
+        why.append("the proof is not of the recorded cluster")
+    if proof.get("identity") != identity or proof.get("role") != "operator":
+        why.append("the proof is not about the operator's identity")
+    asked = proof.get("targets")
+    if not isinstance(asked, list) or not asked or sorted(map(str, asked)) != sorted(targets):
+        why.append("the proof is not about the expected targets")
+    return why
+
+
+def revocations(record):
+    """(every revoke executor in order, problem). Each: {"executor", "protocol", "emergency_last" (both from the
+    registration's detail, None for a record of an earlier form), "outcome" (of its own "revocation" receipt),
+    "intents" (journal intents written while it was the latest executor), "settlement" (the data of a
+    "revocation-settled" receipt, unchecked)}. With a problem the list means UNKNOWN."""
     try:
         entries = X.receipts(record, HELPER)
     except Exception as e:
         return [], f"the transition receipts cannot be read ({type(e).__name__})"
-    revokes, outcome = [], {}
+    found, current = {}, None
     for e in entries:
-        data = e.get("data") if isinstance(e, dict) else None
-        if not isinstance(data, dict):
-            continue
-        if e.get("event") == "executor-started" and data.get("operation") == "revoke":
-            revokes.append(data.get("id"))
-        elif e.get("event") == "revocation":
-            outcome[data.get("executor")] = data.get("outcome")
-    return [r for r in revokes if outcome.get(r) not in SETTLED_REVOCATIONS], None
+        event, data = (e.get("event"), e.get("data")) if isinstance(e, dict) else (None, None)
+        if not isinstance(event, str) or not isinstance(data, dict):
+            return [], "the transition receipts hold an entry that is not in the expected form"
+        if event == "executor-started":
+            current = data.get("id")
+            if data.get("operation") == "revoke":
+                detail = data.get("detail") if isinstance(data.get("detail"), dict) else {}
+                last = detail.get("emergency_last")
+                found[current] = {"executor": current, "protocol": detail.get("protocol"),
+                                  "emergency_last": last if isinstance(last, int) and not isinstance(last, bool)
+                                  and last >= 0 else None, "outcome": None, "intents": 0, "settlement": None}
+        elif event.startswith("intent-") and current in found:
+            found[current]["intents"] += 1
+        elif event == "revocation" and data.get("executor") in found:
+            found[data["executor"]]["outcome"] = data.get("outcome")
+        elif event == "revocation-settled" and data.get("executor") in found:
+            found[data["executor"]]["settlement"] = data
+    return list(found.values()), None
 
 
-def release_problem(record):
+def _tombstone(record, seq):
+    """(the tombstone document of emergency `seq`, the sha256 of its file), or (None, why)."""
+    state = emergency_state(record)
+    if state["problem"]:
+        return None, f"the emergency records cannot be read with certainty ({state['problem']})"
+    if isinstance(seq, bool) or not isinstance(seq, int) or seq not in state["tombstones"]:
+        return None, f"emergency {seq!r} has no tombstone"
+    path = os.path.join(_dir(record), f"{seq:06d}-revoked.json")
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+        return json.loads(data), hashlib.sha256(data).hexdigest()
+    except (OSError, ValueError) as e:
+        return None, f"the tombstone of emergency {seq} cannot be read ({type(e).__name__})"
+
+
+def covers(tombstone, executor):
+    """Whether this emergency's tombstone shows that it fenced `executor` (a proven fence) or found it already
+    completed on record when it looked. Only then did the emergency's revocation come after that executor's last
+    possible action."""
+    fence = (tombstone.get("facts") or {}).get("fence") if isinstance(tombstone, dict) else None
+    if not isinstance(fence, dict) or fence.get("problem") is not None:
+        return False
+    fenced_ = any(isinstance(e, dict) and e.get("id") == executor and e.get("proven") is True
+                  for e in fence.get("executors") or [])
+    return fenced_ or (isinstance(fence.get("completed"), list) and executor in fence["completed"])
+
+
+def settlement_problem(record, revocation, settlement, completed):
+    """Why this settlement does not settle this revocation, or None. `completed`: the ids the owner log shows as
+    finished or fenced. The word "settled" settles nothing: every reference is opened and checked, each time.
+      by "not-started": a registration of the current protocol, completed, with no journal intent after it and no
+                        result of its own: it did nothing.
+      by "tombstone":   an emergency tombstone LATER than the sequence the revocation started at, which covers this
+                        executor (covers()), named with the hash of its file; the binding seen absent by the
+                        recovery; and a stored permission proof, named by its digest, that holds for this run's
+                        operator identity and targets."""
+    if not isinstance(settlement, dict) or settlement.get("executor") != revocation["executor"]:
+        return "the settlement is not about this revocation"
+    if revocation["protocol"] != PROTOCOL:
+        return "the revocation's registration is not of the current protocol: what it did cannot be inferred"
+    if revocation["executor"] not in completed:
+        return "the executor is neither finished nor fenced"
+    if settlement.get("by") == "not-started":
+        if revocation["intents"] or revocation["outcome"] is not None:
+            return "the revocation has a journal intent or a result of its own: it started"
+        return None
+    if settlement.get("by") != "tombstone":
+        return "the settlement names no ground"
+    last, seq = revocation["emergency_last"], settlement.get("tombstone")
+    if last is None or isinstance(seq, bool) or not isinstance(seq, int) or seq <= last:
+        return "the tombstone is not later than the emergency sequence the revocation started at"
+    tombstone, sha = _tombstone(record, seq)
+    if tombstone is None:
+        return sha
+    if settlement.get("tombstone_sha256") != sha:
+        return "the tombstone is not the file the settlement names (sha256 differs)"
+    if not covers(tombstone, revocation["executor"]):
+        return "the emergency neither fenced this executor nor found it completed"
+    if settlement.get("binding") != "absent":
+        return "the settlement does not state that the recovery saw the binding absent"
+    return stored_proof_problem(record, settlement.get("proof_sha256"))
+
+
+def stored_proof_problem(record, digest):
+    """Why the stored permission proof named by `digest` does not hold for this run's identity, or None."""
+    identity, problems = identity_read(record)
+    if problems:
+        return "the transition identity is incomplete: the proof cannot be checked"
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        return "the settlement names no stored permission proof"
+    try:
+        with open(os.path.join(record.evidence_dir, PROOF_DIR, f"{digest}.json"), "rb") as fh:
+            data = fh.read()
+        proof = json.loads(data)
+    except (OSError, ValueError) as e:
+        return f"the stored permission proof cannot be read ({type(e).__name__})"
+    if hashlib.sha256(data).hexdigest() != digest:
+        return "the stored permission proof is not the one the settlement names"
+    why = proof_problems(proof, record, identity["operator_identity"], identity["targets"])
+    return ("the stored permission proof does not hold: " + "; ".join(why)) if why else None
+
+
+def unresolved_revocations(record):
+    """(the revoke executors that are not settled, in order; problem). Settled: its own "revocation" receipt says
+    revoked or not-started, or a "revocation-settled" receipt whose every reference checks out NOW
+    (settlement_problem). With a problem the list means UNKNOWN."""
+    found, problem = revocations(record)
+    if problem:
+        return [], problem
+    summary, problem = owner_summary(record)
+    if problem:
+        return [], problem
+    return [r["executor"] for r in found if r["outcome"] not in SETTLED_OUTCOMES
+            and (r["settlement"] is None
+                 or settlement_problem(record, r, r["settlement"], summary["completed"]) is not None)], None
+
+
+def settle(record, guard, settlement, clock=None):
+    """Record that a revocation is settled, under an ENTERED recovery held by this process, only when the settlement
+    checks out (settlement_problem) and no emergency is open. The record names the stale lock it was made under:
+    being settled is durable, being allowed to release THAT lock is not (release_problem). Raises, and writes
+    nothing, otherwise."""
+    problem = _held(record, guard)
+    if problem:
+        raise X.StagingError(f"a revocation is settled under a recovery held by this process: {problem}")
+    emergencies = emergency_state(record)
+    if emergencies["problem"] or emergencies["open"]:
+        raise X.StagingError(f"nothing is settled while an emergency is open or its records are unreadable "
+                             f"({emergencies['problem'] or emergencies['open']})")
+    found, problem = revocations(record)
+    summary, problem2 = owner_summary(record)
+    if problem or problem2:
+        raise X.StagingError(f"{problem or problem2}: refusing")
+    match = [r for r in found if isinstance(settlement, dict) and r["executor"] == settlement.get("executor")]
+    if not match:
+        raise X.StagingError("the settlement names no revocation of this run")
+    problem = settlement_problem(record, match[0], settlement, summary["completed"])
+    if problem:
+        raise X.StagingError(f"revocation {match[0]['executor']!r} is NOT settled: {problem}")
+    problem = _held(record, guard)
+    if problem:
+        raise X.StagingError(f"the recovery was lost ({problem}): nothing was recorded")
+    _append(record, "revocation-settled", dict(json.loads(json.dumps(settlement)), lock_sha256=guard.lock_sha256),
+            clock)
+
+
+def release_needs_proof(record, lock_sha256):
+    """(the revocations settled by a tombstone UNDER THIS stale lock, in order; problem). Releasing this lock then
+    rests on the permission being revoked, and that has to be seen by the recovery that releases it. With a problem
+    the list means UNKNOWN: receipts that cannot be read do not establish that no proof is needed."""
+    found, problem = revocations(record)
+    if problem:
+        return [], problem
+    if not isinstance(lock_sha256, str) or not lock_sha256:
+        return [], "the stale lock is not identified"
+    return [r["executor"] for r in found if isinstance(r["settlement"], dict)
+            and r["settlement"].get("by") == "tombstone" and r["settlement"].get("lock_sha256") == lock_sha256], None
+
+
+def release_problem(record, guard=None):
     """Why a recovery must NOT release this record's stale evaluation lock on the transition's account, or None.
-    The generic recovery (execlib.recover) asks this after it reconciled the journal: resolved intents alone say
-    nothing about an executor that is neither finished nor fenced, or about a revocation that proved nothing."""
+    Every recovery asks this last (execlib.recover, with its entered guard): resolved intents alone say nothing
+    about an executor that is neither finished nor fenced, a revocation that proved nothing, an open emergency, or
+    chart records that cannot be read. And when a revocation was settled by a tombstone under THIS lock, the release
+    needs what the releasing recovery saw ITSELF (guard.fresh_revocation: the binding absent, a stored proof that
+    holds): a settlement recorded by an earlier, interrupted recovery does not carry that over, and a recovery
+    without the transition's guard cannot have it."""
     log, problem = _owner_log(record)
     if problem:
         return problem
@@ -700,4 +904,33 @@ def release_problem(record):
         return problem
     if unresolved:
         return f"revocations {unresolved} did not end in a proven, recorded revocation"
+    emergencies, chart = emergency_state(record), chart_state(record)
+    if emergencies["problem"]:
+        return f"the emergency records cannot be read with certainty ({emergencies['problem']})"
+    if emergencies["open"]:
+        return f"emergencies {emergencies['open']} are open"
+    if chart["problem"]:
+        return f"the chart records cannot be read with certainty ({chart['problem']})"
+    try:
+        lock_sha256 = C.sha256_file(X.lock_file(record))
+    except FileNotFoundError:
+        if guard is not None:
+            return "the stale lock is gone while its recovery is in progress: what is being released is unknown"
+        return None                                       # asked outside a recovery, and there is no lock to release
+    except OSError as e:
+        return (f"the stale lock cannot be read ({type(e).__name__}): whether its release needs a fresh proof is "
+                f"unknown")
+    needing, problem = release_needs_proof(record, lock_sha256)
+    if problem:
+        return f"{problem}: whether the release needs a fresh proof is unknown"
+    if needing:
+        fresh = guard.fresh_revocation if isinstance(guard, recovery) and _held(record, guard) is None else None
+        if not isinstance(fresh, dict):
+            return (f"revocations {needing} were settled under this stale lock: releasing it needs the binding seen "
+                    f"absent and a fresh permission proof in the SAME recovery (transition.py recover)")
+        if fresh.get("binding") != "absent":
+            return "this recovery did not see the scale binding absent"
+        problem = stored_proof_problem(record, fresh.get("proof_sha256"))
+        if problem:
+            return f"this recovery's permission proof: {problem}"
     return None

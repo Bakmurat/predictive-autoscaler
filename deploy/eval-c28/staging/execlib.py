@@ -355,14 +355,19 @@ def recover_plan(record: "Record", kube: "Kube") -> Dict:
 
 
 def recover(record: "Record", kube: "Kube", reviewed: Dict, reviewed_digest: str,
-            follow_up: Optional[Callable[[List[Dict]], None]] = None) -> Dict:
+            follow_up: Optional[Callable[[List[Dict]], None]] = None, *,
+            guard_factory: Optional[Callable] = None,
+            follow_up_guarded: Optional[Callable[[List[Dict], object], None]] = None) -> Dict:
     """common_records.recovery_guard (one recoverer, the lock's executor proven terminated), then reconciled-<n> for
     every decided outcome; the stale lock is released only when nothing stays unresolved, and not while the Active
     transition has an executor that is neither finished nor fenced or a revocation that proved nothing
     (transition_records.release_problem): reconciled intents say nothing about those."""
     live = recover_plan(record, kube)
     require_live(reviewed, reviewed_digest, "recover", record, live)
-    with C.recovery_guard(record.doc, LOCK_SCOPE, live["lock_sha256"]) as guard:
+    # guard_factory(record, lock_sha256): a recovery guard of another kind (it must enter the shared one and offer
+    # release_stale()); follow_up_guarded(actions, guard) gets the ENTERED guard. Both raise to keep the lock.
+    factory = guard_factory or (lambda rec, sha: C.recovery_guard(rec.doc, LOCK_SCOPE, sha))
+    with factory(record, live["lock_sha256"]) as guard:
         C.require_cluster(kube.api, record.cluster_uid)
         for a in live["actions"]:
             if a["observed"] != "unresolved":
@@ -375,8 +380,10 @@ def recover(record: "Record", kube: "Kube", reviewed: Dict, reviewed_digest: str
                                "the lock stays; reconcile them by hand")
         if follow_up:
             follow_up(live["actions"])
+        if follow_up_guarded:
+            follow_up_guarded(live["actions"], guard)
         import transition_records                         # here: transition_records imports this module
-        held = transition_records.release_problem(record)
+        held = transition_records.release_problem(record, guard)
         if held:
             receipt(record, "recover", "recovery-unresolved", {"plan_sha256": reviewed_digest, "transition": held})
             raise StagingError(f"the Active transition still needs handling ({held}): the lock stays")
