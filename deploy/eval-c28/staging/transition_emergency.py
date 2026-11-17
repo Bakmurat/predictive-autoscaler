@@ -11,6 +11,9 @@ PredictiveAutoscaler: deactivation is done afterwards by the reviewed recover/re
 
 The steps fail independently. A step that fails is recorded and the next one still runs:
 
+  0 inputs    the binding is named from the release and the target namespace. If they are not known, nothing can be
+              deleted or observed; that is said, the executors are fenced all the same, and the result is never
+              "revoked". An unknown operator identity or target list never stops a step: the proof then cannot hold.
   1 request   record the emergency (transition_records), or, with `complete=<seq>`, take up an emergency that is
               still open (a new sequence never closes an earlier one: each open emergency needs its own tombstone).
               If this fails, everything below still happens; the result can then never be "revoked".
@@ -59,7 +62,7 @@ def binding_name(release):
 
 def operator_identity(release, control_namespace):
     """The user name of the operator's ServiceAccount, as permissions.py reports it."""
-    return f"system:serviceaccount:{control_namespace}:{release}-predictive-autoscaler-operator"
+    return R.operator_identity(release, control_namespace)
 
 
 def bounded_api(record, timeout=CALL_TIMEOUT_SECONDS):
@@ -163,70 +166,14 @@ def _interval(verdict):
     return float(seconds)
 
 
-def run(record, binding, *, reason, drain, permissions, identity, targets, complete=None, fence=F.fence,
-        mono=time.monotonic, sleep=time.sleep, clock=None):
-    """Do the emergency. `binding`: a ScaleBinding; `drain()`: a transition_drain verdict read NOW (may raise);
-    `permissions()`: a permissions.verdict read NOW (may raise); `identity`, `targets`: whom and what the proof must
-    be about; `complete`: the sequence number of an OPEN emergency to take up instead of opening a new one.
-    Returns the result; status is "revoked" only when every fact holds and the tombstone was written."""
-    if not isinstance(binding, ScaleBinding):
-        raise X.StagingError("emergency acts on a ScaleBinding and on nothing else")
-    if not isinstance(identity, str) or not identity or not isinstance(targets, (list, tuple)) or not targets \
-            or not all(isinstance(t, str) and t for t in targets):
-        raise X.StagingError("emergency needs the operator's identity and the targets its proof must cover")
-    targets = sorted(targets)
-    problems, deletions, observations = [], [], []
-    t0, started_at = mono(), C.utc_now(clock)
-
-    def offset():
-        return round(mono() - t0, 3)
-
-    out = {"status": "unresolved", "seq": None, "request_recorded": False, "completing": complete,
-           "binding": f"{binding.namespace}/{binding.name}", "deletions": deletions, "absent": False,
-           "fence": {"proven": False, "executors": [], "problem": None},
-           "drain": {"verified": False, "seconds": None, "elapsed": False, "elapsed_seconds": None,
-                     "unchanged": False, "reappearances": 0},
-           "writes_denied": False, "permissions": None, "outcome": None, "outcome_recorded": False,
-           "open_emergencies": None, "problems": problems}
-
-    # 1 request, or an open emergency taken up
-    if complete is None:
-        seq = _attempt(problems, "recording the emergency request", lambda: R.emergency_request(record, reason, clock))
-    else:
-        state = _attempt(problems, "reading the emergency records", lambda: R.emergency_state(record))
-        seq = complete if isinstance(state, dict) and not state["problem"] and not isinstance(complete, bool) \
-            and isinstance(complete, int) and complete in state["open"] else None
-        if seq is None:
-            problems.append(f"emergency {complete!r} is not an open emergency that can be completed")
-    out["seq"], out["request_recorded"] = seq, seq is not None
-
-    # 2 delete (never waits for anything above or below; states nothing)
-    _remove(binding, problems, deletions)
-
-    # 3 fence every outstanding executor, whatever happened so far
-    listed = _attempt(problems, "reading the outstanding executors", lambda: R.outstanding(record))
-    executors, log_problem = listed if listed is not None else ([], "the outstanding executors could not be read")
-    out["fence"]["problem"] = log_problem
-    proven = log_problem is None
-    for e in executors:
-        result = _attempt(problems, f"fencing {e.get('id')}", lambda e=e: fence(dict(e["owner"])))
-        ok = isinstance(result, dict) and result.get("proven") is True
-        out["fence"]["executors"].append({"id": e.get("id"), "owner": e.get("owner"), "proven": ok,
-                                          "result": result if isinstance(result, dict) else None})
-        proven = proven and ok
-    out["fence"]["proven"] = proven
-    fence_done = mono()
-    fence_done_offset = offset()
-
-    # 4 drain: a full verified interval of CONFIRMED absence, not earlier than the fence
-    first = _attempt(problems, "reading the drain interval", drain)
-    seconds = _interval(first)
-    out["drain"].update(verified=seconds is not None, seconds=seconds)
-    if seconds is None:
-        problems.append("the drain interval is not verified: "
-                        + str(first.get("why") if isinstance(first, dict) and first.get("why") else "no usable reading"))
+def settle(binding, seconds, fence_done, *, problems, deletions, observations, offset, mono, sleep):
+    """Look at the binding every POLL_SECONDS until a full interval of CONFIRMED absence has elapsed (module text,
+    step 4), deleting it again when it is seen. `binding`: anything with observe() and delete(uid) of a ScaleBinding
+    (the ordinary revocation passes one whose deletions go through the journal). `seconds` None = no verified
+    interval: one more look, a poll later, and no claim.
+    Returns {"absent", "absent_since", "reappearances", "elapsed", "elapsed_seconds"}."""
     give_up = mono() + (MAX_REAPPEARANCES + 2) * ((seconds or POLL_SECONDS) + POLL_SECONDS)
-    absent_since = None
+    absent_since, reappearances = None, 0
     wait = 0.0 if seconds is not None else POLL_SECONDS   # unverified: the one more look comes a poll later
     while True:
         sleep(wait)
@@ -242,8 +189,8 @@ def run(record, binding, *, reason, drain, permissions, identity, targets, compl
         else:                                             # it is there: whatever was counted is void
             observations.append([offset(), "present"])
             absent_since = None
-            out["drain"]["reappearances"] += 1
-            if out["drain"]["reappearances"] > MAX_REAPPEARANCES:
+            reappearances += 1
+            if reappearances > MAX_REAPPEARANCES:
                 problems.append("the scale binding kept reappearing: unresolved")
                 break
             _remove(binding, problems, deletions)
@@ -257,22 +204,109 @@ def run(record, binding, *, reason, drain, permissions, identity, targets, compl
             break
         wait = POLL_SECONDS if counted_from is None else max(0.0, min(POLL_SECONDS, counted_from + seconds - now))
     end = mono()
-    out["absent"] = absent_since is not None and out["drain"]["reappearances"] <= MAX_REAPPEARANCES
+    absent = absent_since is not None and reappearances <= MAX_REAPPEARANCES
     counted_from = max(absent_since, fence_done) if absent_since is not None else None
     elapsed_seconds = end - counted_from if counted_from is not None else None
-    out["drain"]["elapsed_seconds"] = None if elapsed_seconds is None else round(elapsed_seconds, 3)
-    out["drain"]["elapsed"] = seconds is not None and out["absent"] and elapsed_seconds is not None \
-        and elapsed_seconds >= seconds
-    last = None
+    return {"absent": absent, "absent_since": absent_since, "reappearances": reappearances,
+            "elapsed_seconds": None if elapsed_seconds is None else round(elapsed_seconds, 3),
+            "elapsed": seconds is not None and absent and elapsed_seconds is not None and elapsed_seconds >= seconds}
+
+
+def confirm_absence(binding, drain, fence_done, t0, *, problems, deletions, mono, sleep):
+    """Step 4 as a whole, for emergency and for the ordinary revocation: read the drain interval, settle, read it
+    again. Returns (absent, state, evidence): `state` is the short summary, `evidence` what a record keeps."""
+    observations = []
+    first = _attempt(problems, "reading the drain interval", drain)
+    seconds = _interval(first)
+    if seconds is None:
+        problems.append("the drain interval is not verified: "
+                        + str(first.get("why") if isinstance(first, dict) and first.get("why") else "no usable reading"))
+    got = settle(binding, seconds, fence_done, problems=problems, deletions=deletions, observations=observations,
+                 offset=lambda: round(mono() - t0, 3), mono=mono, sleep=sleep)
+    last, unchanged = None, False
     if seconds is not None:
         last = _attempt(problems, "reading the drain interval again", drain)
-        out["drain"]["unchanged"] = D.same_servers(first, last)
-        if not out["drain"]["unchanged"]:
+        unchanged = D.same_servers(first, last)
+        if not unchanged:
             problems.append("the API servers are not the ones the drain interval was read from")
+    state = {"verified": seconds is not None, "seconds": seconds, "elapsed": got["elapsed"],
+             "elapsed_seconds": got["elapsed_seconds"], "unchanged": unchanged, "reappearances": got["reappearances"]}
+    evidence = {"verified": state["verified"], "required_seconds": seconds, "elapsed_seconds": got["elapsed_seconds"],
+                "elapsed": got["elapsed"], "unchanged": unchanged, "reappearances": got["reappearances"],
+                "confirmed_absent_at_offset": None if got["absent_since"] is None else round(got["absent_since"] - t0, 3),
+                "first_reading": first if isinstance(first, dict) else None,
+                "last_reading": last if isinstance(last, dict) else None,
+                "observations": observations[-MAX_OBSERVATIONS_KEPT:], "observations_total": len(observations)}
+    return got["absent"], state, evidence
+
+
+NO_DRAIN = {"verified": False, "seconds": None, "elapsed": False, "elapsed_seconds": None, "unchanged": False,
+            "reappearances": 0}
+
+
+def run(record, binding, *, reason, drain, permissions, identity, targets, complete=None, fence=F.fence,
+        mono=time.monotonic, sleep=time.sleep, clock=None):
+    """Do the emergency. `binding`: a ScaleBinding, or None when it cannot be named; `drain()`: a transition_drain
+    verdict read NOW (may raise); `permissions()`: a permissions.verdict read NOW (may raise); `identity`, `targets`:
+    whom and what the proof must be about (None when unknown: the proof then cannot hold); `complete`: the sequence
+    number of an OPEN emergency to take up instead of opening a new one.
+    Returns the result; status is "revoked" only when every fact holds and the tombstone was written."""
+    if binding is not None and not isinstance(binding, ScaleBinding):
+        raise X.StagingError("emergency acts on a ScaleBinding and on nothing else")
+    problems, deletions = [], []
+    known = isinstance(identity, str) and bool(identity) and isinstance(targets, (list, tuple)) and bool(targets) \
+        and all(isinstance(t, str) and t for t in targets)
+    targets = sorted(targets) if known else None
+    if not known:
+        problems.append("the operator's identity or the targets are not known: the permission proof cannot hold")
+    if binding is None:
+        problems.append("the scale binding cannot be named (release or target namespace unknown): nothing is deleted")
+    t0, started_at = mono(), C.utc_now(clock)
+    out = {"status": "unresolved", "seq": None, "request_recorded": False, "completing": complete,
+           "binding": None if binding is None else f"{binding.namespace}/{binding.name}", "deletions": deletions,
+           "absent": False, "fence": {"proven": False, "executors": [], "problem": None}, "drain": dict(NO_DRAIN),
+           "writes_denied": False, "permissions": None, "outcome": None, "outcome_recorded": False,
+           "open_emergencies": None, "problems": problems}
+
+    # 1 request, or an open emergency taken up
+    if complete is None:
+        seq = _attempt(problems, "recording the emergency request", lambda: R.emergency_request(record, reason, clock))
+    else:
+        state = _attempt(problems, "reading the emergency records", lambda: R.emergency_state(record))
+        seq = complete if isinstance(state, dict) and not state["problem"] and not isinstance(complete, bool) \
+            and isinstance(complete, int) and complete in state["open"] else None
+        if seq is None:
+            problems.append(f"emergency {complete!r} is not an open emergency that can be completed")
+    out["seq"], out["request_recorded"] = seq, seq is not None
+
+    # 2 delete (never waits for anything above or below; states nothing)
+    if binding is not None:
+        _remove(binding, problems, deletions)
+
+    # 3 fence every outstanding executor, whatever happened so far
+    listed = _attempt(problems, "reading the outstanding executors", lambda: R.outstanding(record))
+    executors, log_problem = listed if listed is not None else ([], "the outstanding executors could not be read")
+    out["fence"]["problem"] = log_problem
+    proven = log_problem is None
+    for e in executors:
+        result = _attempt(problems, f"fencing {e.get('id')}", lambda e=e: fence(dict(e["owner"])))
+        ok = isinstance(result, dict) and result.get("proven") is True
+        out["fence"]["executors"].append({"id": e.get("id"), "owner": e.get("owner"), "proven": ok,
+                                          "result": result if isinstance(result, dict) else None})
+        proven = proven and ok
+    out["fence"]["proven"] = proven
+    fence_done, fence_done_offset = mono(), round(mono() - t0, 3)
+
+    # 4 drain: a full verified interval of CONFIRMED absence, not earlier than the fence
+    drain_evidence = None
+    if binding is not None:
+        out["absent"], out["drain"], drain_evidence = confirm_absence(
+            binding, drain, fence_done, t0, problems=problems, deletions=deletions, mono=mono, sleep=sleep)
 
     # 5 proof
     proof = _attempt(problems, "the permission proof", permissions)
-    why = proof_problems(proof, record, identity, targets)
+    why = proof_problems(proof, record, identity, targets) if known \
+        else ["the expected identity and targets are not known"]
     out["permissions"] = proof.get("verdict") if isinstance(proof, dict) else None
     out["writes_denied"] = not why
     problems.extend(f"the permission proof: {w}" for w in why)
@@ -287,16 +321,10 @@ def run(record, binding, *, reason, drain, permissions, identity, targets, compl
         "started_at": started_at, "finished_at": C.utc_now(clock), "deletions": list(deletions),
         "fence": {"problem": log_problem, "completed_at_offset": fence_done_offset,
                   "executors": out["fence"]["executors"]},
-        "drain": {"verified": out["drain"]["verified"], "required_seconds": seconds,
-                  "elapsed_seconds": out["drain"]["elapsed_seconds"], "elapsed": out["drain"]["elapsed"],
-                  "unchanged": out["drain"]["unchanged"], "reappearances": out["drain"]["reappearances"],
-                  "confirmed_absent_at_offset": None if absent_since is None else round(absent_since - t0, 3),
-                  "first_reading": first if isinstance(first, dict) else None,
-                  "last_reading": last if isinstance(last, dict) else None,
-                  "observations": observations[-MAX_OBSERVATIONS_KEPT:], "observations_total": len(observations)},
+        "drain": drain_evidence,
         "permissions": {"sha256": C.digest(proof) if isinstance(proof, dict) else None,
-                        "verdict": out["permissions"], "expected_identity": identity, "expected_targets": targets,
-                        "problems": why},
+                        "verdict": out["permissions"], "expected_identity": identity if known else None,
+                        "expected_targets": targets, "problems": why},
         "problems": list(problems)[:50],
     }
     out["evidence"] = facts

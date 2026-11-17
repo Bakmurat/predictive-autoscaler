@@ -787,3 +787,239 @@ def test_leaving_when_the_guard_is_gone_or_was_never_entered(record):
     with R.recovery(record, sha):                                         # a real recovery can still be entered
         assert os.path.exists(guard)
     assert not os.path.exists(guard)
+
+
+# --- the transition's identity ---------------------------------------------------------------------------------------
+
+IDENT = {"release": "pa-eval", "control_namespace": "pa-eval-system", "target_namespace": "demo",
+         "targets": ["c28-demo-pa-r", "c28-demo-pa-n"], "decision_interval_seconds": 60,
+         "cadence_source": "params.demonstration.cadence.update_interval_seconds"}
+OPERATOR = "system:serviceaccount:pa-eval-system:pa-eval-predictive-autoscaler-operator"
+
+
+def identity_path(record):
+    return os.path.join(record.evidence_dir, R.IDENTITY_FILE)
+
+
+def test_the_identity_is_written_once_bound_to_the_run_and_read_back(record):
+    doc = R.identity_write(record, **IDENT)
+    assert doc == {"schema": R.IDENTITY_SCHEMA, "run_id": "c28-demo-1", "cluster_uid": CLUSTER, "release": "pa-eval",
+                   "control_namespace": "pa-eval-system", "target_namespace": "demo",
+                   "targets": ["c28-demo-pa-n", "c28-demo-pa-r"], "operator_identity": OPERATOR,
+                   "decision_interval_seconds": 60, "cadence_source": IDENT["cadence_source"]}
+    assert json.load(open(identity_path(record))) == doc
+    assert R.identity_read(record) == ({"release": "pa-eval", "control_namespace": "pa-eval-system",
+                                        "target_namespace": "demo", "targets": ["c28-demo-pa-n", "c28-demo-pa-r"],
+                                        "operator_identity": OPERATOR, "decision_interval_seconds": 60,
+                                        "cadence_source": IDENT["cadence_source"]}, [])
+    before = open(identity_path(record), "rb").read()
+    assert R.identity_write(record, **dict(IDENT, targets=["c28-demo-pa-n", "c28-demo-pa-r"])) == doc   # the same again
+    for change in ({"release": "other"}, {"control_namespace": "x"}, {"target_namespace": "y"},
+                   {"targets": ["c28-demo-pa-n"]}, {"decision_interval_seconds": 30}, {"cadence_source": "other"}):
+        with pytest.raises(X.StagingError, match="DIFFERENT transition identity"):
+            R.identity_write(record, **dict(IDENT, **change))
+    assert open(identity_path(record), "rb").read() == before
+    assert not [n for n in os.listdir(record.evidence_dir) if n.startswith(".tmp-")]
+
+
+@pytest.mark.parametrize("change", [{"release": ""}, {"release": None}, {"release": "a/b"}, {"release": "Upper"},
+                                    {"control_namespace": " x"}, {"target_namespace": 3}, {"targets": []},
+                                    {"targets": None}, {"targets": "c28-demo-pa-n"}, {"targets": ["a", "a"]},
+                                    {"targets": ["a", ""]}, {"targets": ["a", 1]},
+                                    {"decision_interval_seconds": 0}, {"decision_interval_seconds": -60},
+                                    {"decision_interval_seconds": 60.0}, {"decision_interval_seconds": True},
+                                    {"decision_interval_seconds": "60"}, {"decision_interval_seconds": None},
+                                    {"decision_interval_seconds": 3601}, {"cadence_source": ""},
+                                    {"cadence_source": None}])
+def test_an_incomplete_identity_is_not_written(record, change):
+    with pytest.raises(X.StagingError, match="transition identity needs"):
+        R.identity_write(record, **dict(IDENT, **change))
+    assert not os.path.exists(identity_path(record))
+
+
+def test_no_identity_reads_as_nothing_known(record):
+    fields, problems = R.identity_read(record)
+    assert fields == dict.fromkeys(R.IDENTITY_FIELDS) and problems == [
+        "the transition identity cannot be read (FileNotFoundError)"]
+
+
+@pytest.mark.parametrize("change", [{"run_id": "another-run"}, {"cluster_uid": "another"}, {"schema": "x"}])
+def test_an_identity_of_another_run_or_cluster_gives_nothing(record, change):
+    doc = R.identity_write(record, **IDENT)
+    os.chmod(identity_path(record), 0o640)
+    open(identity_path(record), "w").write(json.dumps(dict(doc, **change)))
+    fields, problems = R.identity_read(record)
+    assert fields == dict.fromkeys(R.IDENTITY_FIELDS) and problems == [
+        "the transition identity is not this run's on this cluster"]
+
+
+@pytest.mark.parametrize("text", ["", "{", "[]", "null", '"x"'])
+def test_an_unreadable_identity_gives_nothing(record, text):
+    R.identity_write(record, **IDENT)
+    open(identity_path(record), "w").write(text)
+    fields, problems = R.identity_read(record)
+    assert fields == dict.fromkeys(R.IDENTITY_FIELDS) and len(problems) == 1
+
+
+@pytest.mark.parametrize("change,lost", [
+    ({"targets": None}, {"targets"}), ({"targets": []}, {"targets"}), ({"targets": ["a", "a"]}, {"targets"}),
+    ({"targets": "a"}, {"targets"}), ({"targets": ["a", 2]}, {"targets"}),
+    ({"operator_identity": "system:serviceaccount:pa-eval-system:other"}, {"operator_identity"}),
+    ({"control_namespace": None}, {"control_namespace", "operator_identity"}),
+    ({"release": "A B"}, {"release", "operator_identity"}), ({"target_namespace": ""}, {"target_namespace"}),
+    ({"decision_interval_seconds": 0}, {"decision_interval_seconds", "cadence_source"}),
+    ({"decision_interval_seconds": 0.5}, {"decision_interval_seconds", "cadence_source"}),
+    ({"cadence_source": ""}, {"decision_interval_seconds", "cadence_source"}),
+])
+def test_a_damaged_identity_still_gives_every_field_that_is_sound(record, change, lost):
+    # An emergency must be able to name the binding (release + target namespace) even when the targets are damaged.
+    doc = R.identity_write(record, **IDENT)
+    open(identity_path(record), "w").write(json.dumps(dict(doc, **change)))
+    fields, problems = R.identity_read(record)
+    assert {k for k, v in fields.items() if v is None} == lost and problems
+    assert len(problems) == len(lost - {"cadence_source"})                 # the interval and its source are one finding
+    for key in set(R.IDENTITY_FIELDS) - lost:
+        assert fields[key] == (sorted(doc[key]) if key == "targets" else doc[key])
+
+
+# --- the chart-restoration obligation --------------------------------------------------------------------------------
+
+def chart_dir(record):
+    return os.path.join(record.evidence_dir, "receipts", R.CHART_DIR)
+
+
+def test_a_chart_obligation_is_durable_single_and_blocks(record):
+    assert R.chart_state(record) == {"pending": [], "last": 0, "problem": None}
+    R.refuse_if_chart_pending(record)                                      # nothing pending: no refusal
+    assert R.chart_pending(record, "revoke reh1") == 1
+    assert R.chart_pending(record, "again") == 1                           # the pending one, not a second one
+    assert os.listdir(chart_dir(record)) == ["000001-restore-pending.json"]
+    doc = json.load(open(os.path.join(chart_dir(record), "000001-restore-pending.json")))
+    assert doc["reason"] == "revoke reh1" and doc["event"] == "restore-pending" and doc["seq"] == 1 and doc["at"]
+    assert R.chart_state(record) == {"pending": [1], "last": 1, "problem": None}
+    with pytest.raises(X.StagingError, match=r"chart restoration \[1\] is pending"):
+        R.refuse_if_chart_pending(record)
+
+
+def test_nothing_closes_a_chart_obligation_yet_not_even_a_file_that_says_restored(record):
+    # The reviewer's reproduction: a header-only "restored" file made refuse_if_chart_pending pass. No restoration,
+    # no record of one and no evidence for one are defined yet, so such a file is a problem, never a closure.
+    R.chart_pending(record, "first")
+    closing = {"schema": R.CHART_SCHEMA, "run_id": "c28-demo-1", "seq": 1, "event": "restored", "at": "t"}
+    open(os.path.join(chart_dir(record), "000001-restored.json"), "w").write(json.dumps(closing))
+    state = R.chart_state(record)
+    assert state["pending"] is None and "000001-restored.json" in state["problem"]
+    with pytest.raises(X.StagingError, match="cannot be read with certainty"):
+        R.refuse_if_chart_pending(record)
+    os.unlink(os.path.join(chart_dir(record), "000001-restored.json"))
+    assert R.chart_state(record) == {"pending": [1], "last": 1, "problem": None}
+    assert not [n for n in dir(R) if "restored" in n.lower()]              # and nothing here writes one
+
+
+@pytest.mark.parametrize("name,content", [
+    ("notes.txt", "x"), (".tmp-1-aa", "x"), ("000001-restored.json", "{"),
+    ("000001-restored.json", json.dumps({"schema": "c28-transition-chart/v1", "run_id": "other", "seq": 1,
+                                         "event": "restored", "at": "t"})),
+    ("000001-restored.json", json.dumps({"schema": "c28-transition-chart/v1", "run_id": "c28-demo-1", "seq": 2,
+                                         "event": "restored", "at": "t"})),
+    ("000002-restored.json", json.dumps({"schema": "c28-transition-chart/v1", "run_id": "c28-demo-1", "seq": 2,
+                                         "event": "restored", "at": "t"})),
+    ("000003-restore-pending.json", json.dumps({"schema": "c28-transition-chart/v1", "run_id": "c28-demo-1",
+                                                "seq": 3, "event": "restore-pending", "at": "t"})),
+])
+def test_chart_records_in_disorder_are_unknown_and_block(record, name, content):
+    R.chart_pending(record, "first")
+    open(os.path.join(chart_dir(record), name), "w").write(content)
+    state = R.chart_state(record)
+    assert state["pending"] is None and state["last"] is None and state["problem"]   # unknown, never "none pending"
+    with pytest.raises(X.StagingError, match="cannot be read with certainty"):
+        R.refuse_if_chart_pending(record)
+    with pytest.raises(X.StagingError, match="cannot be read with certainty"):
+        R.chart_pending(record, "another")
+
+
+@pytest.mark.parametrize("reason", ["", "  ", None, 3])
+def test_a_chart_obligation_needs_a_reason(record, reason):
+    with pytest.raises(X.StagingError, match="needs its reason"):
+        R.chart_pending(record, reason)
+    assert R.chart_state(record)["pending"] == []
+
+
+# --- the permission proof's durable copy -----------------------------------------------------------------------------
+
+def test_a_proof_is_stored_under_its_digest_and_read_back(record):
+    proof = {"verdict": "pass", "refused": [], "unproven": [], "answers": {"-": {"update": "no"}}}
+    sha = R.store_proof(record, proof)
+    path = os.path.join(record.evidence_dir, R.PROOF_DIR, sha + ".json")
+    assert sha == C.digest(proof) == C.sha256_file(path) and json.load(open(path)) == proof
+    assert R.store_proof(record, dict(proof)) == sha                       # the same proof again
+    assert os.listdir(os.path.dirname(path)) == [sha + ".json"]
+    assert R.store_proof(record, dict(proof, verdict="refused")) != sha
+
+
+def test_a_stored_proof_that_does_not_match_its_name_is_no_proof(record):
+    proof = {"verdict": "pass", "refused": [], "unproven": []}
+    sha = R.store_proof(record, proof)
+    path = os.path.join(record.evidence_dir, R.PROOF_DIR, sha + ".json")
+    open(path, "w").write(json.dumps(dict(proof, verdict="refused")))      # someone changed the stored copy
+    with pytest.raises(X.StagingError, match="not the proof that was read"):
+        R.store_proof(record, proof)
+
+
+@pytest.mark.parametrize("fail", ["fsync", "link"])
+def test_a_proof_that_cannot_be_stored_is_an_error(record, monkeypatch, fail):
+    def broken(*_a, **_k):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(os, fail, broken)
+    with pytest.raises(OSError):
+        R.store_proof(record, {"verdict": "pass", "refused": [], "unproven": []})
+
+
+@pytest.mark.parametrize("proof", [None, "pass", [], 1])
+def test_only_a_result_object_is_a_proof(record, proof):
+    with pytest.raises(X.StagingError, match="result object"):
+        R.store_proof(record, proof)
+
+
+# --- what a recovery of the stale lock must respect ------------------------------------------------------------------
+
+def start(record, executor, operation):
+    X.receipt(record, R.HELPER, "executor-started", {"id": executor, "operation": operation, "activation": "reh1",
+                                                     "owner": {"host": socket.gethostname(), "boot_id": BOOT,
+                                                               "pid": 4001, "pid_start": "1", "pgid": 4001}})
+
+
+def test_a_run_without_a_transition_holds_nothing(record):
+    assert R.unresolved_revocations(record) == ([], None) and R.release_problem(record) is None
+
+
+def test_an_executor_that_is_neither_finished_nor_fenced_holds_the_lock(record):
+    start(record, "grant-reh1-1", "grant")
+    assert "grant-reh1-1" in R.release_problem(record) and "neither finished nor fenced" in R.release_problem(record)
+    X.receipt(record, R.HELPER, "executor-finished", {"id": "grant-reh1-1"})
+    assert R.release_problem(record) is None
+
+
+@pytest.mark.parametrize("outcome,held", [("revoked", False), ("not-started", False), ("not-revoked", True),
+                                          (None, True), ("REVOKED", True), (True, True)])
+def test_only_a_proven_revocation_or_one_that_never_started_lets_the_lock_go(record, outcome, held):
+    start(record, "revoke-reh1-1", "revoke")
+    X.receipt(record, R.HELPER, "revocation", {"executor": "revoke-reh1-1", "outcome": outcome})
+    X.receipt(record, R.HELPER, "executor-finished", {"id": "revoke-reh1-1"})
+    assert R.unresolved_revocations(record) == (["revoke-reh1-1"] if held else [], None)
+    assert (R.release_problem(record) is not None) is held
+
+
+def test_a_finished_revoke_without_any_result_holds_the_lock(record):
+    start(record, "revoke-reh1-1", "revoke")
+    X.receipt(record, R.HELPER, "executor-finished", {"id": "revoke-reh1-1"})
+    assert "revoke-reh1-1" in R.release_problem(record)
+    X.receipt(record, R.HELPER, "revocation", {"executor": "another", "outcome": "revoked"})   # not its result
+    assert "revoke-reh1-1" in R.release_problem(record)
+
+
+def test_receipts_that_cannot_be_read_hold_the_lock(record, monkeypatch):
+    def broken(_record, _helper):
+        raise X.StagingError("the receipt chain is broken")
+    monkeypatch.setattr(X, "receipts", broken)
+    assert R.unresolved_revocations(record)[1] and R.release_problem(record)

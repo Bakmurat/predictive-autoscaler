@@ -29,6 +29,7 @@ Two kinds of record, kept apart because they are written under different conditi
 Unknown is never "nothing there". Deleting the binding does not depend on any of this; but a failure to write or read
 these records can never produce a claim that the permission was revoked.
 """
+import hashlib
 import json
 import os
 import re
@@ -49,6 +50,16 @@ EVENT_FILE = re.compile(r"(\d{6})-(requested|revoked|fence-unproven|not-revoked)
 CLAIMS_SEQ = re.compile(r"(\d{6})(?!\d)")            # any name that starts with a sequence number
 OWNER_EVENTS = ("executor-started", "executor-finished", "executor-fenced")
 MAX_SEQ = 999_999
+IDENTITY_FILE = "transition-identity.json"
+IDENTITY_SCHEMA = "c28-transition-identity/v1"
+IDENTITY_FIELDS = ("release", "control_namespace", "target_namespace", "targets", "operator_identity",
+                   "decision_interval_seconds", "cadence_source")
+MAX_DECISION_INTERVAL_SECONDS = 3600
+K8S_NAME = re.compile(r"[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\Z")
+CHART_DIR = "transition-chart"
+CHART_SCHEMA = "c28-transition-chart/v1"
+CHART_FILE = re.compile(r"(\d{6})-restore-pending\.json\Z")
+PROOF_DIR = "transition-proofs"
 
 
 # --- durability --------------------------------------------------------------------------------------------------------
@@ -312,15 +323,19 @@ def _dir(record):
 def _create(record, name, obj):
     """Put the file in place under its final name with its WHOLE content, exclusively, and durably: written and
     synced under a temporary name, then linked (the link fails if the name is taken). FileExistsError if taken."""
-    directory = _dir(record)
     text = json.dumps(obj, indent=1, sort_keys=True) + "\n"
     C.assert_clean(text)
+    _publish(record, _dir(record), name, text.encode())
+
+
+def _publish(record, directory, name, data):
+    """Put `data` in place as <directory>/<name>, exclusively and durably (see _create). FileExistsError if taken."""
     os.makedirs(directory, exist_ok=True)
     tmp = os.path.join(directory, f".tmp-{os.getpid()}-{secrets.token_hex(8)}")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
     try:
-        with os.fdopen(fd, "w") as fh:
-            fh.write(text)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
         os.link(tmp, os.path.join(directory, name))
@@ -459,3 +474,230 @@ def refuse_dead_grant(record, plan_last_seq):
     if state["last"] != plan_last_seq:
         raise X.StagingError(f"the grant plan was made at emergency sequence {plan_last_seq}, now {state['last']}: "
                              "a plan reviewed before an emergency is dead")
+
+
+# --- the transition's identity: written once, BEFORE any action that can grant ------------------------------------------
+
+def operator_identity(release, control_namespace):
+    """The user name of the operator's ServiceAccount, as permissions.py reports it."""
+    return f"system:serviceaccount:{control_namespace}:{release}-predictive-autoscaler-operator"
+
+
+def _cadence_ok(seconds, source):
+    return not isinstance(seconds, bool) and isinstance(seconds, int) \
+        and 0 < seconds <= MAX_DECISION_INTERVAL_SECONDS and isinstance(source, str) and bool(source.strip())
+
+
+def identity_write(record, *, release, control_namespace, target_namespace, targets, decision_interval_seconds,
+                   cadence_source):
+    """Fix, for this run on this cluster, what a later emergency must be able to name without the params file: the
+    release, both namespaces, the operator's identity and the targets; and the decision interval with where it was
+    read from (a revocation's /scale observation spans two of them). Written once; writing the SAME identity again
+    is fine, a different one is refused (the params may change later; the grant they described does not)."""
+    for value, what in ((release, "release"), (control_namespace, "control namespace"),
+                        (target_namespace, "target namespace")):
+        if not isinstance(value, str) or not K8S_NAME.match(value):
+            raise X.StagingError(f"the transition identity needs the {what}")
+    if not isinstance(targets, (list, tuple)) or not targets or len(set(map(str, targets))) != len(targets) \
+            or not all(isinstance(t, str) and K8S_NAME.match(t) for t in targets):
+        raise X.StagingError("the transition identity needs the targets (distinct names)")
+    if not _cadence_ok(decision_interval_seconds, cadence_source):
+        raise X.StagingError("the transition identity needs the decision interval (whole seconds) and its source")
+    doc = {"schema": IDENTITY_SCHEMA, "run_id": record.run_id, "cluster_uid": record.cluster_uid, "release": release,
+           "control_namespace": control_namespace, "target_namespace": target_namespace, "targets": sorted(targets),
+           "operator_identity": operator_identity(release, control_namespace),
+           "decision_interval_seconds": decision_interval_seconds, "cadence_source": cadence_source}
+    data = (json.dumps(doc, indent=1, sort_keys=True) + "\n").encode()
+    path = os.path.join(record.evidence_dir, IDENTITY_FILE)
+    try:
+        _publish(record, record.evidence_dir, IDENTITY_FILE, data)
+    except FileExistsError:
+        with open(path, "rb") as fh:
+            if fh.read() != data:
+                raise X.StagingError("this run already has a DIFFERENT transition identity: it is written once") from None
+        _durable_entry(path, record.evidence_dir)
+    return doc
+
+
+def identity_read(record):
+    """(fields, problems). `fields` always has every key of IDENTITY_FIELDS; a value that cannot be trusted is None.
+    Plain JSON and per-field checks only, so that an emergency can use whatever IS readable: with the release and the
+    target namespace it can name the binding even when the targets are damaged. A file of another run or cluster
+    gives nothing."""
+    fields = dict.fromkeys(IDENTITY_FIELDS)
+    try:
+        with open(os.path.join(record.evidence_dir, IDENTITY_FILE)) as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError) as e:
+        return fields, [f"the transition identity cannot be read ({type(e).__name__})"]
+    if not isinstance(doc, dict) or doc.get("schema") != IDENTITY_SCHEMA or doc.get("run_id") != record.run_id \
+            or doc.get("cluster_uid") != record.cluster_uid:
+        return fields, ["the transition identity is not this run's on this cluster"]
+    problems = []
+    for key in ("release", "control_namespace", "target_namespace"):
+        value = doc.get(key)
+        if isinstance(value, str) and K8S_NAME.match(value):
+            fields[key] = value
+        else:
+            problems.append(f"the transition identity holds no usable {key}")
+    targets = doc.get("targets")
+    if isinstance(targets, list) and targets and all(isinstance(t, str) and K8S_NAME.match(t) for t in targets) \
+            and len(set(targets)) == len(targets):
+        fields["targets"] = sorted(targets)
+    else:
+        problems.append("the transition identity holds no usable targets")
+    if fields["release"] and fields["control_namespace"] \
+            and doc.get("operator_identity") == operator_identity(fields["release"], fields["control_namespace"]):
+        fields["operator_identity"] = doc["operator_identity"]
+    else:
+        problems.append("the transition identity holds no usable operator identity")
+    if _cadence_ok(doc.get("decision_interval_seconds"), doc.get("cadence_source")):
+        fields["decision_interval_seconds"], fields["cadence_source"] = \
+            doc["decision_interval_seconds"], doc["cadence_source"]
+    else:
+        problems.append("the transition identity holds no usable decision interval")
+    return fields, problems
+
+
+# --- the chart-restoration obligation (a revocation leaves the chart granting; restoring it is a later step) ----------
+
+def _chart_dir(record):
+    return os.path.join(record.evidence_dir, "receipts", CHART_DIR)
+
+
+def chart_state(record):
+    """{"pending": [seq] or None, "last": highest sequence, "problem": ...}. An obligation is pending from its
+    restore-pending file on. NOTHING closes one yet: the chart restore, its record and the evidence that record must
+    carry are not defined, so a file that claims a restoration is not accepted as one (it is a problem like any
+    other unexpected file). With a problem, pending is None: UNKNOWN, never "none"."""
+    try:
+        names = sorted(os.listdir(_chart_dir(record)))
+    except FileNotFoundError:
+        return {"pending": [], "last": 0, "problem": None}
+    except OSError as e:
+        return {"pending": None, "last": None, "problem": f"the chart records cannot be listed ({type(e).__name__})"}
+    opened, problems = set(), []
+    for name in names:
+        m = CHART_FILE.match(name)
+        if not m:
+            problems.append(f"an unexpected file is among the chart records: {name!r}")
+            continue
+        seq = int(m.group(1))
+        try:
+            with open(os.path.join(_chart_dir(record), name)) as fh:
+                doc = json.load(fh)
+        except (OSError, ValueError) as e:
+            problems.append(f"{name} cannot be read ({type(e).__name__})")
+            continue
+        if not isinstance(doc, dict) or doc.get("schema") != CHART_SCHEMA or doc.get("run_id") != record.run_id \
+                or isinstance(doc.get("seq"), bool) or doc.get("seq") != seq or doc.get("event") != "restore-pending" \
+                or not isinstance(doc.get("at"), str) or not doc["at"]:
+            problems.append(f"{name} does not hold a restore-pending record {seq} of this run")
+            continue
+        opened.add(seq)
+    if opened and opened != set(range(1, max(opened) + 1)):
+        problems.append("the chart obligations are not numbered without a gap")
+    if problems:
+        return {"pending": None, "last": None, "problem": "; ".join(problems)}
+    return {"pending": sorted(opened), "last": max(opened, default=0), "problem": None}
+
+
+def chart_pending(record, reason, clock=None):
+    """Establish, durably, that the chart still has to be restored to its shadow values. Call it BEFORE the first
+    deletion of a revocation. Returns the pending sequence: the one already pending if there is one, else a new one.
+    Nothing closes it yet (see chart_state), and finishing an executor does not."""
+    if not isinstance(reason, str) or not reason.strip():
+        raise X.StagingError("a chart obligation needs its reason")
+    state = chart_state(record)
+    if state["problem"]:
+        raise X.StagingError(f"the chart records cannot be read with certainty ({state['problem']})")
+    if state["pending"]:
+        return state["pending"][-1]
+    seq = state["last"] + 1
+    if seq > MAX_SEQ:
+        raise X.StagingError("the chart obligations are exhausted")
+    text = json.dumps({"schema": CHART_SCHEMA, "run_id": record.run_id, "seq": seq, "event": "restore-pending",
+                       "at": C.utc_now(clock), "reason": reason}, indent=1, sort_keys=True) + "\n"
+    C.assert_clean(text)
+    try:
+        _publish(record, _chart_dir(record), f"{seq:06d}-restore-pending.json", text.encode())
+    except FileExistsError:
+        raise X.StagingError(f"chart obligation {seq} was taken by another writer: read the records again") from None
+    return seq
+
+
+def refuse_if_chart_pending(record):
+    """For grant and activate: no new permission and no activation while the chart still has to be restored, or
+    while that cannot be known."""
+    state = chart_state(record)
+    if state["problem"]:
+        raise X.StagingError(f"the chart records cannot be read with certainty ({state['problem']}): refusing")
+    if state["pending"]:
+        raise X.StagingError(f"chart restoration {state['pending']} is pending: restore the chart to its shadow "
+                             f"values first")
+
+
+# --- the permission proof's durable copy -------------------------------------------------------------------------------
+
+def store_proof(record, proof):
+    """Store the full permission proof under its own digest (common_records.digest), durably, and read it back.
+    Returns the digest. Call it BEFORE the proof is used: any failure here means there is no proof."""
+    if not isinstance(proof, dict):
+        raise X.StagingError("a permission proof is a result object")
+    data = C.canonical(proof)
+    sha = hashlib.sha256(data).hexdigest()
+    C.assert_clean(data.decode())
+    directory = os.path.join(record.evidence_dir, PROOF_DIR)
+    path = os.path.join(directory, f"{sha}.json")
+    try:
+        _publish(record, directory, f"{sha}.json", data)
+    except FileExistsError:
+        _durable_entry(path, record.evidence_dir)
+    with open(path, "rb") as fh:
+        if hashlib.sha256(fh.read()).hexdigest() != sha:
+            raise X.StagingError("the stored permission proof is not the proof that was read")
+    return sha
+
+
+# --- what a recovery of the stale lock must respect ---------------------------------------------------------------------
+
+SETTLED_REVOCATIONS = ("revoked", "not-started")
+
+
+def unresolved_revocations(record):
+    """(the revoke executors that did not end in a recorded, proven revocation, in order; problem). A revoke executor
+    is settled by its own "revocation" receipt with the outcome "revoked" (or "not-started": it stopped before its
+    first deletion). One with another outcome, or with no such receipt at all, is unresolved, and nothing in this
+    module settles it later: that is the transition recovery's to define. With a problem the list means UNKNOWN."""
+    try:
+        entries = X.receipts(record, HELPER)
+    except Exception as e:
+        return [], f"the transition receipts cannot be read ({type(e).__name__})"
+    revokes, outcome = [], {}
+    for e in entries:
+        data = e.get("data") if isinstance(e, dict) else None
+        if not isinstance(data, dict):
+            continue
+        if e.get("event") == "executor-started" and data.get("operation") == "revoke":
+            revokes.append(data.get("id"))
+        elif e.get("event") == "revocation":
+            outcome[data.get("executor")] = data.get("outcome")
+    return [r for r in revokes if outcome.get(r) not in SETTLED_REVOCATIONS], None
+
+
+def release_problem(record):
+    """Why a recovery must NOT release this record's stale evaluation lock on the transition's account, or None.
+    The generic recovery (execlib.recover) asks this after it reconciled the journal: resolved intents alone say
+    nothing about an executor that is neither finished nor fenced, or about a revocation that proved nothing."""
+    log, problem = _owner_log(record)
+    if problem:
+        return problem
+    waiting = [i for i in log["order"] if i not in log["completed"]]
+    if waiting:
+        return f"transition executors {waiting} are neither finished nor fenced"
+    unresolved, problem = unresolved_revocations(record)
+    if problem:
+        return problem
+    if unresolved:
+        return f"revocations {unresolved} did not end in a proven, recorded revocation"
+    return None

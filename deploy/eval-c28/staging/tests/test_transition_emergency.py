@@ -709,11 +709,32 @@ def test_a_closed_emergency_cannot_be_completed_again(world):
 
 @pytest.mark.parametrize("identity,targets", [("", TARGETS), (None, TARGETS), (IDENTITY, []), (IDENTITY, None),
                                               (IDENTITY, "c28-demo-pa-n"), (IDENTITY, ["", "x"]), (IDENTITY, [1])])
-def test_emergency_needs_to_know_whom_and_what_the_proof_must_cover(world, identity, targets):
-    with pytest.raises(X.StagingError, match="identity and the targets"):
-        E.run(world.record, world.binding, reason="x", drain=world.drain, permissions=world.permissions,
-              identity=identity, targets=targets)
-    assert world.api.calls == []
+def test_unknown_proof_inputs_never_stop_the_deletion_or_the_fence(world, identity, targets):
+    # It used to refuse to start. An emergency that cannot say whom its proof is about still removes the binding,
+    # fences and waits; it can only never be "revoked".
+    register(world.record, 1)
+    world.drains = [drain_verdict()]
+    out = E.run(world.record, world.binding, reason="x", drain=world.drain, permissions=world.permissions,
+                identity=identity, targets=targets, fence=world.fence, mono=world.clock.mono, sleep=world.clock.sleep)
+    assert world.deleted() == ["b-1"] and world.api.uid is None and len(world.fenced) == 1
+    assert out["absent"] is True and out["drain"]["elapsed"] is True and out["fence"]["proven"] is True
+    assert out["writes_denied"] is False and out["status"] == "unresolved" and out["outcome"] == "not-revoked"
+    assert out["evidence"]["permissions"]["expected_targets"] is None
+    assert any("not known" in p for p in out["problems"])
+
+
+def test_a_binding_that_cannot_be_named_still_gets_the_executors_fenced(world):
+    register(world.record, 1)
+    register(world.record, 2)
+    world.drains = [drain_verdict()]
+    out = E.run(world.record, None, reason="no identity", drain=world.drain, permissions=world.permissions,
+                identity=IDENTITY, targets=TARGETS, fence=world.fence, mono=world.clock.mono, sleep=world.clock.sleep)
+    assert world.api.calls == [] and world.api.uid == "b-1"                # nothing read, nothing deleted
+    assert len(world.fenced) == 2 and out["fence"]["proven"] is True       # but every executor was fenced
+    assert out["binding"] is None and out["absent"] is False and out["drain"] == E.NO_DRAIN
+    assert out["status"] == "unresolved" and out["outcome"] == "not-revoked" and out["seq"] == 1
+    assert out["evidence"]["drain"] is None and any("cannot be named" in p for p in out["problems"])
+    assert state(world.record)["open"] == [1]
 
 
 def test_the_operators_identity_is_the_one_permissions_py_reports():
