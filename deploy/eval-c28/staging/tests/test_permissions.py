@@ -224,3 +224,28 @@ def test_each_identity_passes_against_its_rendered_roles(role):
     sa = f"pa-eval-predictive-autoscaler-{role}"
     v = P.verdict(P.collect(authorizer(docs, sa), SA_NS, sa, NS, T, role), SA_NS, sa, T, "cluster-uid-1")
     assert v["verdict"] == "pass", (role, v["refused"], v["unproven"])
+    # The verdict names the role that was asked about, also when the identity has bindings (it always has here).
+    assert v["bindings_of_the_identity"] and v["role"] == role
+    assert v["identity"] == f"system:serviceaccount:{SA_NS}:{sa}"
+
+
+@pytest.mark.parametrize("role", P.ROLES)
+def test_the_verdict_keeps_the_requested_role_when_the_identity_has_bindings(role):
+    # The binding audit used a local variable named `role` and overwrote the requested role with the bound Role
+    # OBJECT (or None); the verdict then returned that object as its "role". Needs no helm.
+    k = fake_kubectl(rbac())
+    v = P.verdict(P.collect(k, SA_NS, SA, NS, T, role), SA_NS, SA, T, "cluster-uid-1")
+    assert v["bindings_of_the_identity"] == [{"binding": "RoleBinding/demo/op-write", "role": "ClusterRole/op-write",
+                                              "role_found": True, "subjects": [f"ServiceAccount:{SA}"]}]
+    assert v["role"] == role and isinstance(v["role"], str)
+    json.dumps(v)                                                         # and the whole verdict is plain data
+
+
+def test_the_verdict_keeps_the_requested_role_when_a_bound_role_is_missing_or_there_is_no_binding():
+    missing = rbac()
+    missing["clusterroles"] = []                                          # the binding refers to a role that is gone
+    v = P.verdict(P.collect(fake_kubectl(missing), SA_NS, SA, NS, T), SA_NS, SA, T, "cluster-uid-1")
+    assert v["verdict"] == "unproven" and v["role"] == "operator"        # it was None before
+    none = {"clusterroles": [], "roles": [], "clusterrolebindings": [], "rolebindings": []}
+    v = P.verdict(P.collect(fake_kubectl(none), SA_NS, SA, NS, T), SA_NS, SA, T, "cluster-uid-1")
+    assert v["bindings_of_the_identity"] == [] and v["role"] == "operator"

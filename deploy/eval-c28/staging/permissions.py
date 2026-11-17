@@ -186,14 +186,15 @@ def verdict(collected: Dict, sa_ns: str, sa: str, targets: List[str], cluster_ui
         if not subjects:
             continue
         ref = b.get("roleRef") or {}
-        role = roles.get((ref.get("kind"), ns if ref.get("kind") == "Role" else "", ref.get("name")))
+        # NOT named `role`: that name holds the requested role ("operator", ...) and is returned in the verdict.
+        bound = roles.get((ref.get("kind"), ns if ref.get("kind") == "Role" else "", ref.get("name")))
         bid = f'{b["kind"]}/{ns + "/" if ns else ""}{b["metadata"]["name"]}'
         rid = f'{ref.get("kind")}/{ns + "/" if ref.get("kind") == "Role" and ns else ""}{ref.get("name")}'
-        bindings.append({"binding": bid, "role": rid, "role_found": role is not None,
+        bindings.append({"binding": bid, "role": rid, "role_found": bound is not None,
                          "subjects": sorted(f'{s.get("kind")}:{s.get("name")}' for s in subjects)})
-        if role is None:
+        if bound is None:
             unproven.append(f"{bid} refers to {rid}, which was not found: its rules are unknown")
-        for rule in (role or {}).get("rules") or []:
+        for rule in (bound or {}).get("rules") or []:
             if reaches(rule) and WRITES & set(rule.get("verbs") or []):
                 gr = {"binding": bid, "role": rid, "where": ns or "(every namespace)", "verbs": rule.get("verbs"),
                       "apiGroups": rule.get("apiGroups"), "resources": rule.get("resources"),

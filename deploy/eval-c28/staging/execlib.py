@@ -89,6 +89,7 @@ KIND_KEY = {
     "CronHorizontalPodAutoscaler": "cronhpas", "VerticalPodAutoscaler": "vpas",
     "ServiceAccount": "serviceaccounts", "Role": "roles", "RoleBinding": "rolebindings",
     "EndpointSlice": "endpointslices",
+    "Lease": "leases",                 # the transition watchdog's heartbeat and trigger (coordination.k8s.io)
 }
 if C.KINDS["pa-legacy"][0] != f"/apis/{legacy_allowlist.LEGACY_GROUP}/v1alpha1":     # pragma: no cover
     raise ImportError("common_records and legacy_allowlist disagree on the legacy API group")
