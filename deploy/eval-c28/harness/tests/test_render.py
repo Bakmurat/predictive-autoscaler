@@ -290,10 +290,54 @@ def test_route_policies_are_rendered_only_for_an_enforcing_release(params):
     assert not [o for o in render.render_all(params) if o["kind"] == "NetworkPolicy"]
     params["release_network_policies"] = True
     pols = {o["metadata"]["name"]: o for o in render.render_all(params) if o["kind"] == "NetworkPolicy"}
-    assert set(pols) == {"c28-release-to-routes", "c28-forecast-route-to-forecaster"}
+    assert set(pols) == {"c28-release-to-routes", "c28-forecast-route-to-forecaster", "c28-forecast-route-ingress",
+                         "c28-metrics-route-ingress"}
     assert pols["c28-forecast-route-to-forecaster"]["spec"]["podSelector"]["matchLabels"] == {
         "app.kubernetes.io/name": "predictive-autoscaler", "app.kubernetes.io/instance": "pa-eval",
         "app.kubernetes.io/component": "forecaster"}
+
+
+def test_the_routes_own_ingress_is_restricted_to_the_release(params):
+    # Found on the first real install: no rendered NetworkPolicy restricted the route pods' ingress (actual
+    # reachability from other pods was not probed then).
+    params["release_network_policies"] = True
+    objs = render.render_all(params)
+    pols = {o["metadata"]["name"]: o for o in objs if o["kind"] == "NetworkPolicy"}
+    release = {"app.kubernetes.io/name": "predictive-autoscaler", "app.kubernetes.io/instance": params["release"]}
+    run = {render.RUN_LABEL: params["run_id"]}
+    assert pols["c28-forecast-route-ingress"]["metadata"]["namespace"] == params["control_namespace"]
+    assert pols["c28-forecast-route-ingress"]["spec"] == {
+        "podSelector": {"matchLabels": {**run, "app.kubernetes.io/name": "c28-forecast-route"}},
+        "policyTypes": ["Ingress"],
+        "ingress": [{"from": [{"podSelector": {"matchLabels": {**release, "app.kubernetes.io/component": "operator"}}}],
+                     "ports": [{"protocol": "TCP", "port": 8443}]}]}
+    assert pols["c28-metrics-route-ingress"]["spec"] == {
+        "podSelector": {"matchLabels": {**run, "app.kubernetes.io/name": "c28-metrics-route"}},
+        "policyTypes": ["Ingress"],
+        "ingress": [{"from": [{"podSelector": {"matchLabels": release}}],
+                     "ports": [{"protocol": "TCP", "port": render.METRICS_ROUTE_PORT}]}]}
+    # every route pod is selected by exactly one ingress policy, by its name AND the run label, and nothing else is
+    routes = {o["metadata"]["name"]: o["spec"]["template"]["metadata"]["labels"] for o in objs
+              if o["kind"] == "Deployment" and o["metadata"]["name"].endswith("-route")}
+    assert set(routes) == {"c28-forecast-route", "c28-metrics-route"}
+
+    def selects(policy, labels):
+        return all(labels.get(k) == v for k, v in policy["spec"]["podSelector"]["matchLabels"].items())
+    ingress = [p for p in pols.values() if "Ingress" in p["spec"]["policyTypes"]]
+    for name, labels in routes.items():
+        assert [p["metadata"]["name"] for p in ingress if selects(p, labels)] == [f"{name}-ingress"]
+        assert selects(pols[f"{name}-ingress"], labels) and not selects(pols[f"{name}-ingress"], dict(labels, **{
+            render.RUN_LABEL: "another-run"}))                         # another run's route is not this policy's
+    others = [o for o in objs if o["kind"] == "Deployment" and not o["metadata"]["name"].endswith("-route")]
+    assert others and not [o["metadata"]["name"] for o in others for p in (pols["c28-forecast-route-ingress"],
+                                                                         pols["c28-metrics-route-ingress"])
+                           if selects(p, o["spec"]["template"]["metadata"]["labels"])]
+    # no peer is "everything", no namespace-wide peer, and the routes' metrics port is opened to no pod
+    for p in (pols["c28-forecast-route-ingress"], pols["c28-metrics-route-ingress"]):
+        for rule in p["spec"]["ingress"]:
+            assert rule["from"] and all(set(peer) == {"podSelector"} and peer["podSelector"]["matchLabels"]
+                                        for peer in rule["from"])
+            assert 9091 not in [port["port"] for port in rule["ports"]]
 
 
 # --- the ingress routes per request over READY endpoints, with a namespaced EndpointSlice reader identity ---------------

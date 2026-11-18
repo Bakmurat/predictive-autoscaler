@@ -563,8 +563,14 @@ def chart_pods(values: Dict) -> List[Tuple[str, int, Decimal, Decimal]]:
 
 
 def _route_policies(p: Dict) -> List[Dict]:
-    """Additive NetworkPolicies for a release that enforces them: its operator and forecaster may reach the routes, and
-    the forecaster accepts the forecast route (the release's own policies admit only the operator)."""
+    """NetworkPolicies for a release that enforces them. Additive ones: its operator and forecaster may reach the
+    routes, and the forecaster accepts the forecast route (the release's own policies admit only the operator).
+    And the routes' OWN ingress: on the first real install no rendered NetworkPolicy restricted it (whether another
+    pod could in fact reach the forecaster's API through the forecast route, or the metrics upstream through the
+    metrics route, was not probed then). The forecast route accepts its port only from this release's operator, the
+    metrics route its port only from this release's pods. Each route is selected by its name AND the run label. Their metrics port
+    (9091) is opened to no pod: no scrape object selects the routes in any scrape mode, and the readiness probe on
+    that port comes from the node, which a NetworkPolicy does not filter."""
     ns, labels = p["control_namespace"], _labels(p)
     release = {"app.kubernetes.io/name": "predictive-autoscaler", "app.kubernetes.io/instance": p["release"]}
     routes = {"matchLabels": {RUN_LABEL: p["run_id"]}, "matchExpressions": [
@@ -582,6 +588,21 @@ def _route_policies(p: Dict) -> List[Dict]:
                   "ingress": [{"from": [{"podSelector": {"matchLabels": {RUN_LABEL: p["run_id"],
                                                                         "app.kubernetes.io/name": "c28-forecast-route"}}}],
                                "ports": [{"protocol": "TCP", "port": 8443}]}]}},
+        {"apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
+         "metadata": {"name": "c28-forecast-route-ingress", "namespace": ns, "labels": labels},
+         "spec": {"podSelector": {"matchLabels": {RUN_LABEL: p["run_id"],
+                                                  "app.kubernetes.io/name": "c28-forecast-route"}},
+                  "policyTypes": ["Ingress"],
+                  "ingress": [{"from": [{"podSelector": {"matchLabels": {**release,
+                                                                        "app.kubernetes.io/component": "operator"}}}],
+                               "ports": [{"protocol": "TCP", "port": 8443}]}]}},
+        {"apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
+         "metadata": {"name": "c28-metrics-route-ingress", "namespace": ns, "labels": labels},
+         "spec": {"podSelector": {"matchLabels": {RUN_LABEL: p["run_id"],
+                                                  "app.kubernetes.io/name": "c28-metrics-route"}},
+                  "policyTypes": ["Ingress"],
+                  "ingress": [{"from": [{"podSelector": {"matchLabels": release}}],
+                               "ports": [{"protocol": "TCP", "port": METRICS_ROUTE_PORT}]}]}},
     ]
 
 

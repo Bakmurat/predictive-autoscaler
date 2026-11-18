@@ -761,3 +761,131 @@ def test_a_release_that_could_land_on_w_still_fails_the_gate_for_later_phases(wo
     found = problems(record, kube, "targets")
     assert found == ["reservation gate: pa-eval-system/Deployment/pa-eval-predictive-autoscaler-forecaster tolerates "
                      "the run taint and is not allowlisted"], found
+
+
+# --- a completed "common" phase planned again after objects were added to it -----------------------------------------
+
+ADDED = {"c28-forecast-route-ingress", "c28-metrics-route-ingress"}
+
+
+def completed_common_then_two_more(world, monkeypatch):
+    """prodcluster, 2026-11-17/18: "common" was applied with 16 objects; the renderer then gained two route-ingress
+    NetworkPolicies. Returns (record, kube) with the 16 applied by the OLD renderer and the NEW renderer restored."""
+    c28 = X.import_harness()
+    params = demo_params()
+    params["release_network_policies"] = True
+    record, kube = world(params=params)
+    original = c28.render._route_policies
+    monkeypatch.setattr(c28.render, "_route_policies",
+                        lambda p: [o for o in original(p) if o["metadata"]["name"] not in ADDED])
+    run_until(record, kube, "common")
+    monkeypatch.setattr(c28.render, "_route_policies", original)
+    return record, kube
+
+
+def test_a_completed_common_phase_plans_and_applies_only_what_was_added(world, monkeypatch):
+    # The review's reproduction: the delta plan failed with "the scoped quota must start at its approved normal
+    # limit", because the quota check looked only among the objects the plan creates.
+    record, kube = completed_common_then_two_more(world, monkeypatch)
+    before = {k: (o["metadata"]["uid"], o["metadata"].get("resourceVersion")) for k, o in world.api.objects.items()}
+    plan = plan_at(record, kube, "common")
+    assert {a["name"] for a in plan["actions"]} == ADDED and {a["create"] for a in plan["actions"]} == {"NetworkPolicy"}
+    assert len(plan["already_created_by_this_run"]) == 16 and plan["problems"] == []
+    world.api.calls.clear()
+    run_phase(record, kube, "common")
+    created = [p for v, p in world.api.mutations() if v == "create"]
+    assert len(created) == 2 and all("networkpolicies" in p for p in created)       # nothing else was written
+    assert {v for v, _ in world.api.mutations()} == {"create"}
+    for k, ident in before.items():                                                  # the 16 are untouched
+        o = world.api.objects[k]
+        assert (o["metadata"]["uid"], o["metadata"].get("resourceVersion")) == ident
+    for name in ADDED:
+        assert world.api.obj("NetworkPolicy", name, "pa-eval-system") is not None
+    again = plan_at(record, kube, "common")
+    assert again["actions"] == [] and again["problems"] == [] and len(again["already_created_by_this_run"]) == 18
+    for ph in ("targets", "pas"):                                                    # and the run goes on
+        run_phase(record, kube, ph)
+
+
+def quota(world):
+    return world.api.obj("ResourceQuota", "c28-demo-fixture-quota", "demo")
+
+
+def test_a_changed_quota_is_refused_when_common_is_planned_again(world, monkeypatch):
+    record, kube = completed_common_then_two_more(world, monkeypatch)
+    quota(world)["spec"]["hard"]["pods"] = "1"                                       # e.g. left at a fault's limit
+    assert plan_at(record, kube, "common")["problems"] == [
+        "the scoped quota no longer has its approved normal limit and scope"]
+    quota(world)["spec"]["hard"]["pods"] = "64"
+    assert plan_at(record, kube, "common")["problems"] == []
+    quota(world)["spec"]["scopeSelector"]["matchExpressions"][0]["values"] = ["another-class"]
+    assert plan_at(record, kube, "common")["problems"] == [
+        "the scoped quota no longer has its approved normal limit and scope"]
+
+
+def test_a_replaced_or_foreign_quota_is_refused_when_common_is_planned_again(world, monkeypatch):
+    record, kube = completed_common_then_two_more(world, monkeypatch)
+    q = quota(world)
+    kept_uid = q["metadata"]["uid"]
+    q["metadata"]["uid"] = "00000000-0000-4000-8000-00000000beef"                    # same name and mark, another object
+    assert "the scoped quota is not the object this run's journal created (never adopted)" in \
+        plan_at(record, kube, "common")["problems"]
+    q["metadata"]["uid"] = kept_uid
+    assert plan_at(record, kube, "common")["problems"] == []
+    q["metadata"]["annotations"].pop(X.INTENT_ANNOTATION)                            # a foreign object of that name
+    found = plan_at(record, kube, "common")["problems"]
+    assert any("already exists (never adopted)" in p for p in found)
+    with pytest.raises(X.StagingError):
+        run_phase_unchecked(record, kube, "common")
+
+
+def run_phase_unchecked(record, kube, phase):
+    plan, digest = reviewed(record, kube, phase)
+    return apply_at(record, kube, phase, plan, digest)
+
+
+@pytest.mark.parametrize("how", ["another limit", "no quota", "two quotas"])
+def test_a_first_common_phase_still_needs_exactly_one_quota_at_the_normal_limit(world, monkeypatch, how):
+    record, kube = world()
+    run_until(record, kube, "values")
+    real = prepare._objects_for
+
+    def rendered(phase, *a, **k):
+        objs = real(phase, *a, **k)
+        if phase != "common":
+            return objs
+        quotas = [o for o in objs if o["kind"] == "ResourceQuota"]
+        assert len(quotas) == 1
+        if how == "another limit":
+            quotas[0]["spec"]["hard"]["pods"] = "1"
+        elif how == "no quota":
+            objs = [o for o in objs if o["kind"] != "ResourceQuota"]
+        else:
+            objs = objs + [copy.deepcopy(quotas[0])]
+        return objs
+    monkeypatch.setattr(prepare, "_objects_for", rendered)
+    assert "the scoped quota must start at its approved normal limit" in plan_at(record, kube, "common")["problems"]
+
+
+def test_a_quota_carrying_another_objects_mark_is_not_the_journals_quota(world, monkeypatch):
+    # The journal of this run never created a quota (an earlier renderer had none); a live quota of the right name
+    # carries the intent mark of ANOTHER object of the run. The mark makes it look like ours; the journal says no.
+    record, kube = world()
+    run_until(record, kube, "values")
+    real = prepare._objects_for
+    monkeypatch.setattr(prepare, "_objects_for", lambda phase, *a, **k: [
+        o for o in real(phase, *a, **k) if phase != "common" or o["kind"] != "ResourceQuota"])
+    plan, digest = reviewed(record, kube, "common")
+    assert plan["problems"] == ["the scoped quota must start at its approved normal limit"]
+    monkeypatch.setattr(prepare, "quota_problems", lambda *a, **k: [])            # only to build that journal
+    apply_at(record, kube, "common", *reviewed(record, kube, "common"))
+    monkeypatch.undo()
+    assert ("ResourceQuota", "demo", "c28-demo-fixture-quota") not in prepare.created_objects(record)
+    c28 = X.import_harness()
+    wanted = [o for o in c28.demo.render(demo_params())["common"] if o["kind"] == "ResourceQuota"][0]
+    forged = copy.deepcopy(wanted)
+    mark = world.api.obj("PriorityClass", "c28-demo-fixture")["metadata"]["annotations"][X.INTENT_ANNOTATION]
+    forged["metadata"].setdefault("annotations", {})[X.INTENT_ANNOTATION] = mark
+    world.api.put(forged)
+    found = plan_at(record, kube, "common")["problems"]
+    assert found == ["the scoped quota is not the object this run's journal created (never adopted)"], found
