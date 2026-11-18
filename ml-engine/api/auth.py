@@ -135,6 +135,13 @@ def _b64url(segment: str) -> Optional[bytes]:
         return None
 
 
+def _strict_json(raw: bytes):
+    """UTF-8 JSON as RFC 8259 has it: Python's parser also takes NaN, Infinity and -Infinity, which are not JSON."""
+    def refuse(name):
+        raise ValueError("not a JSON value")
+    return json.loads(raw.decode("utf-8"), parse_constant=refuse)
+
+
 def well_formed_token(token: str) -> bool:
     """Whether the bearer token has the FORM of a compact JWS: exactly three non-empty unpadded base64url segments,
     all three decodable, a header that is a UTF-8 JSON object with a non-empty string "alg" and a payload that is a
@@ -149,8 +156,8 @@ def well_formed_token(token: str) -> bool:
     if any(d is None for d in decoded):
         return False
     try:
-        header = json.loads(decoded[0].decode("utf-8"))
-        payload = json.loads(decoded[1].decode("utf-8"))
+        header = _strict_json(decoded[0])
+        payload = _strict_json(decoded[1])
     except (ValueError, RecursionError):               # not UTF-8, not JSON, or nested beyond what the parser takes
         return False
     alg = header.get("alg") if isinstance(header, dict) else None

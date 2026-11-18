@@ -430,6 +430,8 @@ _H, _P, _S = _seg(b'{"alg":"RS256"}'), _seg(b'{"aud":["x"]}'), _seg(b"signature-
 _ALG_EMPTY, _ALG_NUMBER, _ALG_NONE = _seg(b'{"alg":""}'), _seg(b'{"alg":5}'), _seg(b'{"alg":"none"}')
 _NOT_UTF8_OBJECT, _NOT_UTF8, _STRING = _seg(bytes([0xff, 0xfe]) + b"{}"), _seg(bytes([0xc3, 0x28])), _seg(b'"x"')
 _DEEP = _seg(b"[" * 2500 + b"]" * 2500)
+# NaN, Infinity and -Infinity are not JSON (RFC 8259); Python's parser takes them unless told otherwise
+_NOT_JSON_CONSTANTS = {"NaN": b"NaN", "Infinity": b"Infinity", "minus Infinity": b"-Infinity"}
 MALFORMED = {
     "a word": "not-a-token",
     "one segment": _H,
@@ -463,6 +465,18 @@ MALFORMED = {
     "a payload nested about as deep as the header cap allows": f"{_H}.{_DEEP}.{_S}",
     "a header nested about as deep as the header cap allows": f"{_DEEP}.{_P}.{_S}",
 }
+
+
+for _name, _constant in _NOT_JSON_CONSTANTS.items():
+    MALFORMED[f"a header with {_name}"] = _seg(b'{"alg":"RS256","x":' + _constant + b"}") + f".{_P}.{_S}"
+    MALFORMED[f"a payload with {_name}"] = f"{_H}." + _seg(b'{"x":' + _constant + b"}") + f".{_S}"
+    MALFORMED[f"a payload with {_name} nested in an array"] = f"{_H}." + _seg(b'{"x":[1,' + _constant + b"]}") + f".{_S}"
+
+
+def test_the_not_json_constant_cases_are_what_they_say():
+    for _n, constant in _NOT_JSON_CONSTANTS.items():
+        assert isinstance(json.loads(b'{"alg":"RS256","x":' + constant + b"}"), dict)   # the lenient parser takes it
+    assert len(MALFORMED) == 39
 
 
 def test_the_length_and_padding_cases_are_what_they_say():
