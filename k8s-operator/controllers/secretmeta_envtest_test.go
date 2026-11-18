@@ -49,6 +49,7 @@ func TestEnvtestSecretMetadataReaderAgainstARealAPIServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the real API server's answer was refused: %v", err)
 	}
+	firstUID := got.UID
 	if !got.Found || got.UID != string(created.UID) || got.ResourceVersion != created.ResourceVersion ||
 		got.Labels["c28.devkuban.com/release-op"] != "0123456789abcdef0123" || got.Labels["version"] != "2" || len(got.Labels) != 2 {
 		t.Fatalf("got %+v, created uid %s rv %s", got, created.UID, created.ResourceVersion)
@@ -77,8 +78,8 @@ func TestEnvtestSecretMetadataReaderAgainstARealAPIServer(t *testing.T) {
 		t.Fatal(err)
 	}
 	second, err := secretmeta.Get(ctx, req)
-	if err != nil || second.UID != string(again.UID) || second.UID == got.UID || second.UID == "" {
-		t.Fatalf("after a delete and recreate: %+v, %v", second, err)
+	if err != nil || firstUID == "" || second.UID == "" || second.UID != string(again.UID) || second.UID == firstUID {
+		t.Fatalf("after a delete and recreate: %+v (first UID %q), %v", second, firstUID, err)
 	}
 }
 

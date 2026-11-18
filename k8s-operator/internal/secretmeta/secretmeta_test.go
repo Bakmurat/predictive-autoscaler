@@ -222,6 +222,83 @@ func TestAnythingButExactlyThatMetadataIsRefusedWithAFixedPhrase(t *testing.T) {
 	}
 }
 
+func TestAServerPathPrefixInTheKubeconfigIsKept(t *testing.T) {
+	for _, prefix := range []string{"/k8s/clusters/test-cluster", "/k8s/clusters/test-cluster/", "/one"} {
+		a := newAPI(t, respond(200, partial(nil)))
+		r := a.request()
+		doc, _ := os.ReadFile(r.Kubeconfig)
+		_ = os.WriteFile(r.Kubeconfig, []byte(strings.Replace(string(doc), "server: "+a.srv.URL, "server: "+a.srv.URL+prefix, 1)), 0o600)
+		got, err := Get(context.Background(), r)
+		if err != nil || got == nil || !got.Found {
+			t.Fatalf("prefix %q: %+v, %v", prefix, got, err)
+		}
+		want := strings.TrimSuffix(prefix, "/") + path
+		if len(a.calls) != 1 || a.calls[0].Path != want || a.calls[0].Query != "" {
+			t.Fatalf("prefix %q: requested %+v, want the path %s", prefix, a.calls, want)
+		}
+	}
+}
+
+func TestACredentialPluginIsRefusedAndNeverStarted(t *testing.T) {
+	a := newAPI(t, respond(200, partial(nil)))
+	ran := filepath.Join(t.TempDir(), "plugin-ran")
+	plugin := filepath.Join(t.TempDir(), "plugin.sh")
+	if err := os.WriteFile(plugin, []byte("#!/bin/sh\necho PLUGIN-MARKER >&2\ntouch "+ran+"\nsleep 1\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	users := map[string]string{
+		"an exec plugin":         "    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      command: " + plugin + "\n      interactiveMode: Never\n",
+		"a legacy auth-provider": "    auth-provider:\n      name: oidc\n      config: {idp-issuer-url: https://issuer.invalid, client-id: x}\n",
+	}
+	for what, user := range users {
+		r := a.request()
+		doc, _ := os.ReadFile(r.Kubeconfig)
+		changed := strings.Replace(string(doc), "    token: "+token+"\n", user, 1)
+		if changed == string(doc) {
+			t.Fatal("the kubeconfig's static token was not replaced")
+		}
+		_ = os.WriteFile(r.Kubeconfig, []byte(changed), 0o600)
+		r.Timeout = 200 * time.Millisecond
+		start := time.Now()
+		got, err := Get(context.Background(), r)
+		if err == nil || got != nil || !strings.Contains(err.Error(), "credential plugin") {
+			t.Fatalf("%s: %+v, %v", what, got, err)
+		}
+		if time.Since(start) > 800*time.Millisecond {
+			t.Fatalf("%s: the refusal took %s (a plugin ran?)", what, time.Since(start))
+		}
+	}
+	if _, err := os.Stat(ran); err == nil {
+		t.Fatal("the credential plugin was started")
+	}
+	if len(a.calls) != 0 {
+		t.Fatalf("%d requests reached the server", len(a.calls))
+	}
+}
+
+func TestTheDeclaredContentTypeMustBeJSON(t *testing.T) {
+	for contentType, ok := range map[string]bool{"application/json": true, "application/json; charset=utf-8": true,
+		"application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1": true, "text/plain": false, "": false,
+		"application/vnd.kubernetes.protobuf": false, "application/yaml": false, "garbage;;": false} {
+		a := newAPI(t, func(w http.ResponseWriter, _ *http.Request) {
+			if contentType != "" {
+				w.Header().Set("Content-Type", contentType)
+			} else {
+				w.Header()["Content-Type"] = nil
+			}
+			w.WriteHeader(200)
+			_, _ = w.Write(partial(nil))
+		})
+		got, err := Get(context.Background(), a.request())
+		if ok && (err != nil || got == nil || !got.Found) {
+			t.Fatalf("content type %q refused: %v", contentType, err)
+		}
+		if !ok && (err == nil || !strings.Contains(err.Error(), "not declared as application/json")) {
+			t.Fatalf("content type %q: %+v, %v", contentType, got, err)
+		}
+	}
+}
+
 func TestOnlyTheAPIServersOwnNotFoundForThisSecretMeansAbsent(t *testing.T) {
 	a := newAPI(t, respond(404, []byte(`{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","details":{"name":"`+name+`","kind":"secrets"},"code":404}`)))
 	got, err := Get(context.Background(), a.request())

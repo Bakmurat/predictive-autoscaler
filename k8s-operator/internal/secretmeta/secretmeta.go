@@ -16,7 +16,10 @@
 //   - time and response size are bounded, redirects are not followed, and no error carries a response body, a header
 //     or a credential: errors are fixed phrases.
 //
-// Authentication and TLS come from client-go's own kubeconfig handling; this package parses no credential.
+// Authentication and TLS come from client-go's own kubeconfig handling; this package parses no credential. Only static
+// credentials are supported: a kubeconfig that names an exec or auth-provider plugin is refused before any transport
+// exists, because such a plugin runs outside the request's deadline and writes to the caller's stderr. A path prefix
+// in the kubeconfig's server URL is kept.
 package secretmeta
 
 import (
@@ -25,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -108,6 +112,11 @@ func Get(ctx context.Context, r Request) (*Metadata, error) {
 	if err != nil {
 		return nil, refuse("the kubeconfig or its context cannot be used")
 	}
+	// A credential plugin would run outside this request's deadline and write to this process's stderr. This reader
+	// supports static credentials only and refuses a plugin BEFORE any transport is built, so the plugin never starts.
+	if cfg.ExecProvider != nil || cfg.AuthProvider != nil {
+		return nil, refuse("the kubeconfig uses an exec or auth-provider credential plugin, which this reader does not run")
+	}
 	cfg.Timeout = r.Timeout
 	client, err := rest.HTTPClientFor(cfg)
 	if err != nil {
@@ -124,8 +133,9 @@ func get(ctx context.Context, client *http.Client, base *url.URL, r Request) (*M
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	ctx, cancel := context.WithTimeout(ctx, r.Timeout)
 	defer cancel()
-	target := *base
-	target.Path = "/api/v1/namespaces/" + r.Namespace + "/secrets/" + r.Name
+	// The kubeconfig's server may carry a path prefix (an API reached through a proxy path): it is kept, and the
+	// resource path is appended to it. Namespace and name are validated names, so nothing in them needs escaping.
+	target := base.JoinPath("api", "v1", "namespaces", r.Namespace, "secrets", r.Name)
 	target.RawQuery, target.Fragment = "", ""
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 	if err != nil {
@@ -154,6 +164,10 @@ func get(ctx context.Context, client *http.Client, base *url.URL, r Request) (*M
 	}
 	switch {
 	case resp.StatusCode == http.StatusOK:
+		// The declared type is checked as well as the body; a header alone would prove nothing.
+		if mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type")); err != nil || mediaType != "application/json" {
+			return nil, refuse("the response is not declared as application/json")
+		}
 		return decode(body, r)
 	case resp.StatusCode == http.StatusNotFound:
 		if definitelyAbsent(body, r) {
