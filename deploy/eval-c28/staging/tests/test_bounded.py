@@ -175,9 +175,13 @@ class FakeVM:
                 res = []
             elif mode == "empty":
                 res = [{"metric": {}, "values": []}]
-            elif mode in ("nan", "text", "short"):
+            elif mode in ("nan", "text", "short", "no-value", "text-value", "nan-value", "inf-value", "bool-value",
+                          "bool-time", "three"):
                 good = self.series(lo, hi, 15, 1.0)["values"]
-                res = [{"metric": {}, "values": good + [{"nan": ["NaN", "1"], "text": ["soon", "1"], "short": []}[mode]]}]
+                bad = {"nan": ["NaN", "1"], "text": ["soon", "1"], "short": [], "no-value": [hi], "text-value": [hi, "not-a-number"],
+                       "nan-value": [hi, "NaN"], "inf-value": [hi, "+Inf"], "bool-value": [hi, True], "bool-time": [True, "1"],
+                       "three": [hi, "1", "extra"]}[mode]
+                res = [{"metric": {}, "values": good + [bad]}]          # fresh, well-formed samples beside one bad one
             elif isinstance(mode, tuple) and mode[0] == "stale":
                 res = [self.series(lo, hi - mode[1], 15, 1.0)]
             elif isinstance(mode, tuple) and mode[0] == "future":
@@ -318,6 +322,37 @@ def test_live_stops_end_the_load_before_any_evidence_is_collected(world, kw, tex
 W_INSTANCE, S_INSTANCE = (INSTANCES[n] for n in ("worker-w", "worker-s"))
 
 
+@pytest.mark.parametrize("steal", ["NaN", "+Inf", "-Inf"])
+def test_a_steal_rate_that_is_not_a_finite_number_stops_the_load(world, steal):  # noqa: F811
+    """Full, fresh bins whose value is NaN or infinite: NaN compares false with the limit, so without its own check
+    this would read as "below 5 %". The raw counter samples are healthy here: they cannot vouch for the derived rate."""
+    record, kube, a, clock, c, p, d, logs, vm = _run(world, steal=steal)
+    seen = []
+    inner = vm.__call__
+
+    class Probe:
+        def __call__(self, url):
+            if "c28_ingress_requests_total" in url:
+                seen.append(len(_gen_pods(a)))
+            return inner(url)
+    out = B.run_admission(c, p, d, Probe(), "http://vm", logs=logs)
+    assert out["data"]["verdict"] == "STOPPED" and "is not a finite number" in out["data"]["stopped"], out["data"]["stopped"]
+    assert "raw steal samples" not in out["data"]["stopped"]
+    assert seen and all(n == 0 for n in seen)
+    assert not os.path.exists(X.lock_file(record)) and not X.open_intents(X.receipts(record, B.HELPER))
+
+
+def test_unusable_raw_values_and_unusable_bins_together_stop_through_live_stops(world):  # noqa: F811
+    """The combined case from the review: fresh raw timestamps carrying NaN counter values AND fresh NaN bins."""
+    record, kube, a, clock, c, p, d, logs, vm = _run(world, steal="NaN", raw_steal={W_INSTANCE: "nan-value", S_INSTANCE: "nan-value"})
+    out = B.run_admission(c, p, d, vm, "http://vm", logs=logs)
+    assert out["data"]["verdict"] == "STOPPED"
+    for text in ("steal observation of workload node is not a finite number", "steal observation of support node is not a finite number",
+                 "raw steal samples of the workload node missing or malformed", "raw steal samples of the support node missing or malformed"):
+        assert text in out["data"]["stopped"], out["data"]["stopped"]
+    assert not os.path.exists(X.lock_file(record)) and not X.open_intents(X.receipts(record, B.HELPER))
+
+
 @pytest.mark.parametrize("raw_steal, text", [
     ({S_INSTANCE: ("stale", 121)}, "the newest raw steal sample of the support node is older than 120 s"),
     ({W_INSTANCE: ("stale", 300)}, "the newest raw steal sample of the workload node is older than 120 s"),
@@ -326,6 +361,13 @@ W_INSTANCE, S_INSTANCE = (INSTANCES[n] for n in ("worker-w", "worker-s"))
     ({S_INSTANCE: "nan"}, "raw steal samples of the support node missing or malformed"),
     ({W_INSTANCE: "text"}, "raw steal samples of the workload node missing or malformed"),
     ({W_INSTANCE: "short"}, "raw steal samples of the workload node missing or malformed"),
+    ({S_INSTANCE: "no-value"}, "raw steal samples of the support node missing or malformed"),
+    ({W_INSTANCE: "text-value"}, "raw steal samples of the workload node missing or malformed"),
+    ({S_INSTANCE: "nan-value"}, "raw steal samples of the support node missing or malformed"),
+    ({W_INSTANCE: "inf-value"}, "raw steal samples of the workload node missing or malformed"),
+    ({S_INSTANCE: "bool-value"}, "raw steal samples of the support node missing or malformed"),
+    ({W_INSTANCE: "bool-time"}, "raw steal samples of the workload node missing or malformed"),
+    ({S_INSTANCE: "three"}, "raw steal samples of the support node missing or malformed"),
     ({S_INSTANCE: ("future", 60)}, "raw steal samples of the support node are from the future"),
     ({S_INSTANCE: "refused"}, "an observer query failed"),
     # Within the live limit the load is NOT stopped. (The evidence collected afterwards has its own, stricter

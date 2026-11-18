@@ -563,6 +563,10 @@ def steal_stops(c: Ctx, fetch: Fetch, api: str, now_s: float) -> List[str]:
         if len(vals) < 5 or now_s - vals[-1][0] > 120:
             out.append(f"steal observation of {role} node missing or stale")
             continue
+        if not all(math.isfinite(t) and math.isfinite(v) for t, v in vals):
+            # NaN compares false with every threshold: an unusable observation must not read as "below the limit"
+            out.append(f"steal observation of {role} node is not a finite number")
+            continue
         if all(v > c.verdicts.FROZEN["steal_percent"] for _, v in vals[-c.verdicts.FROZEN["steal_bins"]:]):
             out.append(f"steal above {c.verdicts.FROZEN['steal_percent']} % for 5 minutes on the {role} node")
     return out
@@ -578,8 +582,9 @@ def raw_steal_selector(instance: str) -> str:
 def raw_steal_stops(c: Ctx, fetch: Fetch, api: str, now_s: float) -> List[str]:
     """The newest UNDERLYING steal sample of W and of S, from RAW samples (a range-vector instant query: never a
     stepped range query, whose bins carry a value forward and so look fresh after the scrapes have stopped). The load
-    may continue only while its safety observation is alive: no series, no sample, a malformed or non-finite
-    timestamp, a sample from the future, or a newest sample older than RAW_STEAL_MAX_AGE_S is a stop."""
+    may continue only while its safety observation is alive: no series, no sample, a sample that is not exactly a
+    finite timestamp with a finite numeric value, a sample from the future, or a newest sample older than
+    RAW_STEAL_MAX_AGE_S is a stop."""
     out = []
     inst = node_instances(c, fetch, api)
     for role, key in (("workload", "w"), ("support", "s")):
@@ -592,12 +597,17 @@ def raw_steal_stops(c: Ctx, fetch: Fetch, api: str, now_s: float) -> List[str]:
                 malformed = True
                 continue
             for pair in values:
+                # a sample is exactly [timestamp, value], both numbers (the value may arrive as a numeric string),
+                # both finite, neither a boolean: a fresh timestamp on an unusable value is not an observation
                 try:
-                    stamp = float(pair[0])
-                    if isinstance(pair[0], bool) or not math.isfinite(stamp):
-                        raise ValueError("timestamp")
+                    if not isinstance(pair, (list, tuple)) or len(pair) != 2 or isinstance(pair[0], bool) or \
+                            isinstance(pair[1], bool):
+                        raise ValueError("sample")
+                    stamp, sample = float(pair[0]), float(pair[1])
+                    if not (math.isfinite(stamp) and math.isfinite(sample)):
+                        raise ValueError("sample")
                     stamps.append(stamp)
-                except (TypeError, ValueError, IndexError, KeyError):
+                except (TypeError, ValueError):
                     malformed = True
         if malformed or not stamps:
             out.append(f"raw steal samples of the {role} node missing or malformed")
