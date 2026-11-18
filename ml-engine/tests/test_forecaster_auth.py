@@ -26,7 +26,8 @@ NOW = 1_800_000_000.0
 def jwt(exp=NOW + 3600, extra=None):
     claims = {"aud": [auth.DEFAULT_AUDIENCE], **({"exp": exp} if exp is not None else {}), **(extra or {})}
     b64 = lambda d: base64.urlsafe_b64encode(json.dumps(d).encode()).rstrip(b"=").decode()
-    return f"{b64({'alg': 'RS256'})}.{b64(claims)}.signature"
+    signature = base64.urlsafe_b64encode(b"not-a-real-signature").rstrip(b"=").decode()
+    return f"{b64({'alg': 'RS256'})}.{b64(claims)}.{signature}"
 
 
 def review_body(user=OPERATOR, authenticated=True, audiences=(auth.DEFAULT_AUDIENCE,), error=None):
@@ -312,9 +313,9 @@ def test_health_is_open_and_metrics_follow_their_own_subjects():
     assert tc.get("/health").status_code == 200 and tc.get("/metrics").status_code == 200 and stub.calls == []
     protected = auth.AuthConfig(mode="tokenreview", subjects=frozenset({OPERATOR}), metrics_subjects=frozenset({SCRAPER}),
                                 open_paths=frozenset({"/health", "/ready"}))
-    assert client(StubReviewer(OPERATOR), protected).get("/metrics", headers={"Authorization": "Bearer t"}).status_code == 403
-    assert client(StubReviewer(SCRAPER), protected).get("/metrics", headers={"Authorization": "Bearer t"}).status_code == 200
-    assert client(StubReviewer(SCRAPER), protected).post("/predict", json={}, headers={"Authorization": "Bearer t"}).status_code == 403
+    assert client(StubReviewer(OPERATOR), protected).get("/metrics", headers={"Authorization": f"Bearer {jwt()}"}).status_code == 403
+    assert client(StubReviewer(SCRAPER), protected).get("/metrics", headers={"Authorization": f"Bearer {jwt()}"}).status_code == 200
+    assert client(StubReviewer(SCRAPER), protected).post("/predict", json={}, headers={"Authorization": f"Bearer {jwt()}"}).status_code == 403
 
 
 def test_the_body_is_not_read_before_authentication():
@@ -333,7 +334,7 @@ def test_the_body_is_not_read_before_authentication():
         raise AssertionError("the app must not run")
 
     mw = auth.AuthMiddleware(app, CONFIG, StubReviewer(auth.Unauthenticated("no")))
-    scope = {"type": "http", "path": "/predict", "scheme": "https", "headers": [(b"authorization", b"Bearer t")]}
+    scope = {"type": "http", "path": "/predict", "scheme": "https", "headers": [(b"authorization", f"Bearer {jwt()}".encode())]}
     asyncio.run(mw(scope, receive, send))
     assert received == [] and sent[0]["status"] == 401
 
@@ -353,7 +354,7 @@ def test_an_oversized_body_is_refused_even_when_chunked():
         raise AssertionError("the app must not run")
 
     mw = auth.AuthMiddleware(app, CONFIG, StubReviewer(), max_body=1000)
-    scope = {"type": "http", "path": "/predict", "scheme": "https", "headers": [(b"authorization", b"Bearer t")]}
+    scope = {"type": "http", "path": "/predict", "scheme": "https", "headers": [(b"authorization", f"Bearer {jwt()}".encode())]}
     asyncio.run(mw(scope, receive, send))
     assert sent[0]["status"] == 413
 
@@ -417,3 +418,167 @@ def test_a_websocket_is_refused():
 
     asyncio.run(auth.AuthMiddleware(app, CONFIG, StubReviewer())({"type": "websocket", "path": "/predict"}, None, send))
     assert sent == [{"type": "websocket.close", "code": 1008}]
+
+
+# --- the form of the bearer token is checked locally, before any review slot or TokenReview ------------------------
+
+def _seg(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+_H, _P, _S = _seg(b'{"alg":"RS256"}'), _seg(b'{"aud":["x"]}'), _seg(b"signature-bytes")
+_ALG_EMPTY, _ALG_NUMBER, _ALG_NONE = _seg(b'{"alg":""}'), _seg(b'{"alg":5}'), _seg(b'{"alg":"none"}')
+_NOT_UTF8_OBJECT, _NOT_UTF8, _STRING = _seg(bytes([0xff, 0xfe]) + b"{}"), _seg(bytes([0xc3, 0x28])), _seg(b'"x"')
+_DEEP = _seg(b"[" * 2500 + b"]" * 2500)
+# NaN, Infinity and -Infinity are not JSON (RFC 8259); Python's parser takes them unless told otherwise
+_NOT_JSON_CONSTANTS = {"NaN": b"NaN", "Infinity": b"Infinity", "minus Infinity": b"-Infinity"}
+MALFORMED = {
+    "a word": "not-a-token",
+    "one segment": _H,
+    "two segments": f"{_H}.{_P}",
+    "four segments": f"{_H}.{_P}.{_S}.{_S}",
+    "empty header": f".{_P}.{_S}",
+    "empty payload": f"{_H}..{_S}",
+    "empty signature": f"{_H}.{_P}.",
+    "only dots": "..",
+    # the padded forms a padding encoder would produce (their lengths are possible: only the alphabet refuses them)
+    "padding in the header": base64.urlsafe_b64encode(b'{"alg":"RS256" }').decode() + f".{_P}.{_S}",
+    "padding in the payload": f"{_H}.e30=.{_S}",
+    "padding in the signature": f"{_H}.{_P}.eA==",
+    "a space": f"{_H}.{_P}.{_S[:4]} {_S[4:]}",
+    "a tab at the end": f"{_H}.{_P}.{_S}\t",
+    "a plus": f"{_H}.{_P}.ab+d",
+    "a slash": f"{_H}.{_P}.ab/d",
+    "an impossible signature length": f"{_H}.{_P}.abcde",
+    "an impossible header length": f"{_H}x.{_P}.{_S}",
+    "an impossible payload length": f"{_H}.abcde.{_S}",
+    "a header that is not JSON": f"{_seg(b'not json')}.{_P}.{_S}",
+    "a header that is an array": f"{_seg(b'[1]')}.{_P}.{_S}",
+    "a header without alg": f"{_seg(b'{}')}.{_P}.{_S}",
+    "an empty alg": f"{_ALG_EMPTY}.{_P}.{_S}",
+    "an alg that is not a string": f"{_ALG_NUMBER}.{_P}.{_S}",
+    "a header that is not UTF-8": f"{_NOT_UTF8_OBJECT}.{_P}.{_S}",
+    "a payload that is not JSON": f"{_H}.{_seg(b'claims')}.{_S}",
+    "a payload that is an array": f"{_H}.{_seg(b'[]')}.{_S}",
+    "a payload that is a string": f"{_H}.{_STRING}.{_S}",
+    "a payload that is not UTF-8": f"{_H}.{_NOT_UTF8}.{_S}",
+    "a payload nested about as deep as the header cap allows": f"{_H}.{_DEEP}.{_S}",
+    "a header nested about as deep as the header cap allows": f"{_DEEP}.{_P}.{_S}",
+}
+
+
+for _name, _constant in _NOT_JSON_CONSTANTS.items():
+    MALFORMED[f"a header with {_name}"] = _seg(b'{"alg":"RS256","x":' + _constant + b"}") + f".{_P}.{_S}"
+    MALFORMED[f"a payload with {_name}"] = f"{_H}." + _seg(b'{"x":' + _constant + b"}") + f".{_S}"
+    MALFORMED[f"a payload with {_name} nested in an array"] = f"{_H}." + _seg(b'{"x":[1,' + _constant + b"]}") + f".{_S}"
+
+
+def test_the_not_json_constant_cases_are_what_they_say():
+    for _n, constant in _NOT_JSON_CONSTANTS.items():
+        assert isinstance(json.loads(b'{"alg":"RS256","x":' + constant + b"}"), dict)   # the lenient parser takes it
+    assert len(MALFORMED) == 39
+
+
+def test_the_length_and_padding_cases_are_what_they_say():
+    assert len(_H) % 4 == 0                                               # so one more character is impossible
+    for name in ("an impossible signature length", "an impossible header length", "an impossible payload length"):
+        assert any(len(p) % 4 == 1 for p in MALFORMED[name].split(".")), name
+    for name in ("padding in the header", "padding in the payload", "padding in the signature"):
+        (padded,) = [p for p in MALFORMED[name].split(".") if "=" in p]
+        assert len(padded) % 4 == 0 and base64.urlsafe_b64decode(padded), name    # a real padded encoding
+
+
+@pytest.mark.parametrize("name", sorted(MALFORMED))
+def test_a_token_without_the_form_of_a_token_is_not_well_formed(name):
+    assert auth.well_formed_token(MALFORMED[name]) is False
+
+
+@pytest.mark.parametrize("token", [None, b"a.b.c", 5, ["a", "b", "c"]])
+def test_a_non_string_is_not_well_formed(token):
+    assert auth.well_formed_token(token) is False
+
+
+def test_the_form_check_trusts_nothing_in_the_token():
+    assert auth.well_formed_token(jwt()) and auth.well_formed_token(f"{_H}.{_P}.{_S}")
+    # format only: no algorithm is preferred, no claim is read, an expired or absurd token is still "well formed"
+    assert auth.well_formed_token(f"{_ALG_NONE}.{_seg(b'{}')}.{_S}")
+    assert auth.well_formed_token(jwt(exp=1.0)) and auth.well_formed_token(jwt(exp=None, extra={"sub": 7}))
+    assert auth.well_formed_token(f"{_H}.{_P}.{_seg(b'x')}")           # two characters: a possible length
+
+
+@pytest.mark.parametrize("where", ["header", "payload"])
+def test_nesting_beyond_what_the_parser_takes_is_not_well_formed_and_never_an_exception(where):
+    # Deeper than any Authorization header this service reads (MAX_BEARER) can carry: the function itself must still
+    # answer False when the JSON parser gives up, whatever limit this interpreter has.
+    deep = _seg(b"[" * 200_000 + b"]" * 200_000)
+    with pytest.raises(RecursionError):
+        json.loads("[" * 200_000 + "]" * 200_000)                          # the parser does give up at this depth
+    token = f"{deep}.{_P}.{_S}" if where == "header" else f"{_H}.{deep}.{_S}"
+    assert auth.well_formed_token(token) is False
+
+
+class NoAdmission:
+    """Review admission that is deliberately unavailable: every use is counted and answered as an outage."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def run(self, fn, *args):
+        self.calls += 1
+        raise auth.AuthUnavailable("all token review slots are busy")
+
+
+def _asgi(token, stub, admission):
+    received, sent = [], []
+
+    async def receive():
+        received.append(1)
+        return {"type": "http.request", "body": b"{}", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    async def app(scope, receive, send):
+        raise AssertionError("the app must not run")
+
+    mw = auth.AuthMiddleware(app, CONFIG, stub, admission=admission)
+    scope = {"type": "http", "path": "/predict", "scheme": "https",
+             "headers": [(b"authorization", b"Bearer " + token.encode("ascii"))]}
+    asyncio.run(mw(scope, receive, send))
+    return received, sent
+
+
+@pytest.mark.parametrize("name", sorted(MALFORMED))
+def test_a_malformed_token_gets_401_with_no_review_slot_no_review_and_no_body_read(name, caplog):
+    token = MALFORMED[name]
+    assert len(b"Bearer " + token.encode()) <= auth.MAX_BEARER          # it is the form check that answers, not the cap
+    stub, admission = StubReviewer(), NoAdmission()
+    with caplog.at_level("DEBUG"):
+        received, sent = _asgi(token, stub, admission)
+    assert sent[0]["status"] == 401 and admission.calls == 0 and stub.calls == [] and received == []
+    headers = dict(sent[0]["headers"])
+    assert headers[b"www-authenticate"].startswith(b"Bearer")
+    body = sent[1]["body"]
+    assert json.loads(body) == {"detail": {"error": "Unauthenticated", "message": "the bearer token is malformed"}}
+    assert token.encode() not in body and token not in caplog.text
+
+
+def test_a_well_formed_token_is_what_reaches_the_unavailable_admission():
+    stub, admission = StubReviewer(), NoAdmission()
+    received, sent = _asgi(jwt(), stub, admission)
+    assert sent[0]["status"] == 503 and admission.calls == 1 and stub.calls == [] and received == []
+
+
+@pytest.mark.parametrize("authenticated", [False, True])
+def test_a_well_formed_token_whose_review_reports_an_error_is_still_an_outage(sa_dir, authenticated):
+    # Kubernetes: status.error = "the token could not be checked". Never a rejection, whatever its text.
+    api = FakeAPI(body=review_body(authenticated=authenticated, error="invalid bearer token"))
+    r = client(reviewer(sa_dir, api)).post("/predict", json={}, headers={"Authorization": f"Bearer {jwt()}"})
+    assert r.status_code == 503 and r.json()["detail"]["error"] == "AuthUnavailable" and len(api.calls) == 1
+
+
+def test_a_malformed_token_through_the_real_reviewer_makes_no_token_review(sa_dir):
+    api = FakeAPI()
+    r = client(reviewer(sa_dir, api)).post("/predict", json={}, headers={"Authorization": "Bearer not-a-token"})
+    assert r.status_code == 401 and r.json()["detail"]["message"] == "the bearer token is malformed"
+    assert api.calls == []

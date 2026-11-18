@@ -126,6 +126,9 @@ def test_tokenreview_protects_everything_but_the_open_paths(tmp_path):
             r = c.post(path, json={})
             assert r.status_code == 401, path
         r = c.post("/v2/predict", json={}, headers={"Authorization": "Bearer x"})
+        assert r.status_code == 401                    # not the form of a token: refused without any review
+        well_formed = "eyJhbGciOiJSUzI1NiJ9.e30.c2ln"   # {"alg":"RS256"} . {} . "sig": the form only
+        r = c.post("/v2/predict", json={}, headers={"Authorization": f"Bearer {well_formed}"})
         assert r.status_code == 503                    # TokenReview unreachable outside a cluster: never open
     assert svc.calls == []
 

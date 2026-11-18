@@ -483,6 +483,9 @@ It is on by default (`forecaster.auth.enabled`).
 - The forecasting service checks each token with TokenReview, before reading the request, and accepts only the
   operator's service account: another caller gets 401 or 403. If TokenReview cannot answer it gets 503, never an open
   door. Kubernetes may report a wrong-audience token as a TokenReview error; that also returns 503 AuthUnavailable.
+  A bearer value that does not have the form of a token (three unpadded base64url segments, a JSON header that names
+  an algorithm, a JSON payload) is refused with 401 by the service itself, before any TokenReview. That check judges
+  the form only; a well-formed token whose TokenReview reports an error still gets 503.
   API docs and new endpoints require authentication too; only `/health`, `/ready` and open `/metrics` are exempt.
 - Everything runs over TLS (port 8443). The operator verifies the certificate against the CA, and it mounts only the
   CA, never the private key. `/health` and `/metrics` stay open, behind the network policies.
