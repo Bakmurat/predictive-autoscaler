@@ -9,11 +9,15 @@ FORECASTER_AUTH_METRICS=true), so a new endpoint, FastAPI's /docs and /openapi.j
 read through a hard cap.
 
 Outcomes:
-  - 401: a missing, repeated, malformed or oversized Authorization header, or a token the API server does not
+  - 401: a missing, repeated, malformed or oversized Authorization header, a bearer token that is not a well-formed
+    compact JWS (checked locally, before any review slot or TokenReview is used: such a token cannot be a
+    ServiceAccount token, so there is nothing for the API server to judge), or a token the API server does not
     authenticate for the audience;
   - 403: an authenticated caller that is not a configured subject;
   - 503 AuthUnavailable: the service cannot judge (TokenReview unreachable, an error or malformed answer, its own
-    credentials refused, or all review slots busy). Never an open door;
+    credentials refused, or all review slots busy). Never an open door. A well-formed token whose TokenReview answer
+    carries status.error is in this class too: Kubernetes defines that field as "the token could not be checked", so
+    it is never read as a rejection, and error texts are never classified;
   - 500 TLSRequired: the request did not arrive over TLS (authentication is never served in clear text, unless
     FORECASTER_AUTH_ALLOW_PLAINTEXT=true, which is for tests only).
 
@@ -115,6 +119,42 @@ def config_from_env(env=os.environ) -> AuthConfig:
     open_paths = {"/health", "/ready"} | (set() if metrics else {"/metrics"})
     return AuthConfig(mode=mode, audience=audience, subjects=subjects, metrics_subjects=metrics_subjects if metrics
                       else frozenset(), allow_plaintext=allow_plaintext, open_paths=frozenset(open_paths))
+
+
+_B64URL = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _b64url(segment: str) -> Optional[bytes]:
+    """The bytes of one unpadded base64url segment (RFC 7515 compact form), or None: empty, padding, whitespace, '+'
+    or '/', any other character (the pattern), or a length no encoder produces (the strict decoder)."""
+    if not _B64URL.match(segment):
+        return None
+    try:
+        return base64.b64decode(segment + "=" * (-len(segment) % 4), altchars=b"-_", validate=True)
+    except ValueError:
+        return None
+
+
+def well_formed_token(token: str) -> bool:
+    """Whether the bearer token has the FORM of a compact JWS: exactly three non-empty unpadded base64url segments,
+    all three decodable, a header that is a UTF-8 JSON object with a non-empty string "alg" and a payload that is a
+    UTF-8 JSON object. Format only: nothing in the token is trusted, no algorithm is preferred, and a token that
+    passes is still judged by TokenReview alone. Never raises and never reports any part of the token."""
+    if not isinstance(token, str):
+        return False
+    parts = token.split(".")
+    if len(parts) != 3:
+        return False
+    decoded = [_b64url(p) for p in parts]
+    if any(d is None for d in decoded):
+        return False
+    try:
+        header = json.loads(decoded[0].decode("utf-8"))
+        payload = json.loads(decoded[1].decode("utf-8"))
+    except (ValueError, RecursionError):               # not UTF-8, not JSON, or nested beyond what the parser takes
+        return False
+    alg = header.get("alg") if isinstance(header, dict) else None
+    return isinstance(alg, str) and alg != "" and isinstance(payload, dict)
 
 
 def _jwt_exp(token: str) -> Optional[float]:
@@ -294,6 +334,8 @@ class AuthMiddleware:
             token = value[len(b"Bearer "):].decode("ascii")
         except UnicodeDecodeError:
             return await _respond(send, 401, "Unauthenticated", "a bearer token is required", challenge)
+        if not well_formed_token(token):               # before any review slot: garbage costs no TokenReview
+            return await _respond(send, 401, "Unauthenticated", "the bearer token is malformed", challenge)
         allowed = self.config.metrics_subjects if scope["path"] == "/metrics" else self.config.subjects
         try:
             subject = await self.admission.run(self.reviewer.review, token, allowed)
