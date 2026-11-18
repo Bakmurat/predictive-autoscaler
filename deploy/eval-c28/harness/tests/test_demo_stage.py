@@ -428,7 +428,8 @@ def test_scrape_objects_and_route_policies_under_the_run_label(scrape, kind):
     p["scrape"], p["release_network_policies"] = scrape, True
     common = demo.render(p)["common"]
     assert by_kind(common)[kind] == ["c28-ingress"]
-    assert by_kind(common)["NetworkPolicy"] == ["c28-forecast-route-to-forecaster", "c28-release-to-routes"]
+    assert by_kind(common)["NetworkPolicy"] == ["c28-forecast-route-ingress", "c28-forecast-route-to-forecaster",
+                                                "c28-metrics-route-ingress", "c28-release-to-routes"]
     assert all(o["metadata"]["labels"][render.RUN_LABEL] == "c28-demo-1" for o in common)
 
 

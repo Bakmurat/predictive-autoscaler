@@ -727,13 +727,37 @@ def plan(record: X.Record, kube: X.Kube, phase: str, fetch: Optional[Fetch] = No
     if phase == "generator":
         problems += generator_problems(record, kube, params, parts, ours, now)
     if phase == "common":
-        rq = [o for o in create if o["kind"] == "ResourceQuota"]
-        if len(rq) != 1 or rq[0]["spec"]["hard"]["pods"] != str(params["quota"]["pods_normal"]):
-            problems.append("the scoped quota must start at its approved normal limit")
+        problems += quota_problems(record, kube, params, objs, create)
     actions = [{"create": o["kind"], "namespace": o["metadata"].get("namespace"), "name": o["metadata"]["name"],
                 "sha256": X.json_digest(o)} for o in create]
     return X.new_plan(HELPER, record, actions, existing=existing, already_created_by_this_run=ours,
                       problems=problems, **out)
+
+
+def quota_problems(record: X.Record, kube: X.Kube, params: Dict, objs: List[Dict], create: List[Dict]) -> List[str]:
+    """The scoped quota of the common phase. Exactly one is rendered, at the approved normal limit. Either this plan
+    creates it (a live object of that name without this run's intent mark is in `create` too, with its own "already
+    exists (never adopted)" problem from the caller), or (the phase was completed earlier and is planned again
+    because objects were added to it) it is the object THIS run's journal created: the live object has the journal's
+    UID and still the rendered limit and scope. A quota that is foreign, replaced or changed is refused; the plan
+    never adopts or repairs one."""
+    want = str(params["quota"]["pods_normal"])
+    rendered = [o for o in objs if o["kind"] == "ResourceQuota"]
+    if len(rendered) != 1 or rendered[0]["spec"]["hard"]["pods"] != want:
+        return ["the scoped quota must start at its approved normal limit"]
+    q = rendered[0]
+    if [o for o in create if o["kind"] == "ResourceQuota"]:
+        return []                                          # this plan creates it, as rendered
+    m = q["metadata"]
+    ref = created_objects(record).get(("ResourceQuota", m.get("namespace"), m["name"]))
+    live = _exists(kube, q)
+    if ref is None or live is None or not ref.get("uid") or live["metadata"].get("uid") != ref["uid"]:
+        return ["the scoped quota is not the object this run's journal created (never adopted)"]
+    spec = live.get("spec") or {}
+    if spec.get("hard") != q["spec"]["hard"] or spec.get("scopeSelector") != q["spec"].get("scopeSelector") \
+            or spec.get("scopes") != q["spec"].get("scopes"):
+        return ["the scoped quota no longer has its approved normal limit and scope"]
+    return []
 
 
 def apply(record: X.Record, kube: X.Kube, phase: str, reviewed: Dict, reviewed_digest: str,
