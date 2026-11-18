@@ -247,3 +247,55 @@ def test_the_first_api_refuses_to_start_on_a_malformed_list():
     r = subprocess.run([sys.executable, "-c", "import api.main"], env=env, capture_output=True, text=True,
                        cwd=os.path.join(os.path.dirname(__file__), ".."), timeout=300)
     assert r.returncode != 0 and "the namespace policy is refused" in r.stderr
+
+
+# --- the first API's benchmark experiment arms never go through api.identity: refused under a restricted policy ----
+
+class _Arm:
+    """An experiment arm that matches every request."""
+    source_application, source_namespace = "source", "other"
+
+    def matches(self, application, namespace, metric_type):
+        return True
+
+
+@pytest.mark.parametrize("mode", ["ensemble", "seasonal"])
+@pytest.mark.parametrize("namespace", ["other", "shop", None])
+def test_no_experiment_arm_answers_under_a_restricted_policy(monkeypatch, mode, namespace):
+    from fastapi.testclient import TestClient
+    from api import main as api_main
+    reached = []
+
+    async def ensemble(*args, **kwargs):
+        reached.append("ensemble")
+        return {}
+
+    async def fetch(*args, **kwargs):
+        reached.append("seasonal")
+        return []
+
+    monkeypatch.setattr(api_main, "predict_ensemble", ensemble)
+    monkeypatch.setattr(api_main, "fetch_metrics_from_vm", fetch)
+    monkeypatch.setattr(api_main, "ensemble_experiments", [_Arm()] if mode == "ensemble" else [])
+    monkeypatch.setattr(api_main.predictor, "seasonal_experiment", _Arm() if mode == "seasonal" else None,
+                        raising=False)
+    body = {"application": "web", **({"namespace": namespace} if namespace else {})}
+    client = TestClient(api_main.app)
+    monkeypatch.setattr(api_main, "WATCH_POLICY", SHOP)
+    r = client.post("/predict", json=body)
+    assert r.status_code == 422, r.text
+    assert "not served under a restricted namespace policy" in r.json()["detail"] and reached == []
+    monkeypatch.setattr(api_main, "WATCH_POLICY", CLUSTER_WIDE)        # the control: unrestricted, the arm is reached
+    client.post("/predict", json=body)
+    assert reached == [mode]
+
+
+@pytest.mark.parametrize("variable", ["SEASONAL_EXPERIMENT", "ENSEMBLE_EXPERIMENT"])
+def test_the_first_api_refuses_to_start_with_an_experiment_under_a_restricted_policy(variable):
+    env = {**os.environ, "WATCH_NAMESPACES": "shop", "ALLOW_BENCHMARK_EXPERIMENTS": "1", "KUBECONFIG": "/dev/null"}
+    for name in ("SEASONAL_EXPERIMENT", "ENSEMBLE_EXPERIMENT"):
+        env.pop(name, None)
+    env[variable] = '{"id": "x"}'
+    r = subprocess.run([sys.executable, "-c", "import api.main"], env=env, capture_output=True, text=True,
+                       cwd=os.path.join(os.path.dirname(__file__), ".."), timeout=300)
+    assert r.returncode != 0 and "are refused under a restricted namespace policy" in r.stderr
