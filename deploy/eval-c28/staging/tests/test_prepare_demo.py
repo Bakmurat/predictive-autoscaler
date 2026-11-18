@@ -732,3 +732,32 @@ def test_cli_plans_every_demonstration_phase(world, capsys):
     out = json.loads(capsys.readouterr().out)
     assert rc == 0 and len(out) == len(prepare.DEMO_PHASES)
     assert [os.path.basename(o["plan"]).split("-")[1] for o in out] == list(prepare.DEMO_PHASES)
+
+
+# --- the order used on the cluster: the release is installed BETWEEN "common" and "targets" ------------------------------
+
+def test_targets_and_pas_can_be_planned_and_applied_after_the_release_is_installed(world):
+    # prodcluster, 2026-11-17: namespaces, storage, values and common were applied, then `helm install`; after that
+    # the plans for targets and pas failed the reservation gate on the release's own two Deployments. No test had
+    # the release present when a later phase was planned.
+    from test_reserve import install_release
+    record, kube = world()
+    run_until(record, kube, "common")
+    install_release(world.api, "operator", taint_value=OWNER)
+    install_release(world.api, "forecaster", taint_value=OWNER)
+    for ph in ("targets", "pas"):
+        assert problems(record, kube, ph) == [], ph
+        run_phase(record, kube, ph)
+    assert world.api.obj("PredictiveAutoscaler", N, "demo")["spec"]["mode"] == "Recommend"
+
+
+def test_a_release_that_could_land_on_w_still_fails_the_gate_for_later_phases(world):
+    from test_reserve import install_release, support_terms
+    record, kube = world()
+    run_until(record, kube, "common")
+    install_release(world.api, "operator", taint_value=OWNER)
+    install_release(world.api, "forecaster", taint_value=OWNER,
+                    template_terms=support_terms(("worker-s", "worker-w")))
+    found = problems(record, kube, "targets")
+    assert found == ["reservation gate: pa-eval-system/Deployment/pa-eval-predictive-autoscaler-forecaster tolerates "
+                     "the run taint and is not allowlisted"], found

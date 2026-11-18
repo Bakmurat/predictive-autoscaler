@@ -210,11 +210,72 @@ def _occupants(kube: X.Kube, record: X.Record, params: Dict, s: Dict,
     return out
 
 
+RELEASE_CONTROLLERS = ("operator", "forecaster")     # the chart's Deployments that the reviewed values place on S
+
+
+def release_controller_pod(kube: X.Kube, params: Optional[Dict], s: Dict, pod: Dict, cache: Dict) -> bool:
+    """Whether a pod belongs to one of the evaluation release's OWN controllers, placed as the reviewed values place
+    them. classify() accepts such pods on the support node; the toleration check must not then refuse their
+    Deployments (it did: after the release was installed, every later plan failed the gate). All of this must hold:
+      * the pod is in the control namespace;
+      * its OWNER CHAIN is exactly pod -> ReplicaSet -> Deployment, each step a controller reference with a non-empty
+        UID that equals the UID of the object found under that name in the control namespace (a stale or foreign
+        ReplicaSet, or a pod pointing straight at the Deployment, is not that chain); a label proves nothing;
+      * the Deployment is <release>-predictive-autoscaler-<operator|forecaster> and carries the release's instance
+        label;
+      * BOTH the pod and the Deployment's template REQUIRE the support role and the support node's hostname, in
+        exactly the reviewed form, and neither names another node: the template sets no nodeName, and the pod is
+        unscheduled or on the support node. A placement that could admit W, or any other node, is not accepted.
+    Anything else that tolerates the taint stays what it was: an owner that could land on W or S later."""
+    if not params:
+        return False
+    ns, release = params.get("control_namespace"), params.get("release")
+    m = pod.get("metadata") or {}
+    if not ns or not release or m.get("namespace") != ns:
+        return False
+
+    def controller(obj, kind):
+        """The one controller reference of `obj`, if it is of `kind` with a name and a UID; else None."""
+        refs = [r for r in ((obj.get("metadata") or {}).get("ownerReferences") or []) if r.get("controller")]
+        if len(refs) != 1 or refs[0].get("kind") != kind or not refs[0].get("name") or not refs[0].get("uid"):
+            return None
+        return refs[0]
+
+    def referenced(kind, ref):
+        """The object the reference names in the control namespace, only if its UID is the reference's."""
+        key = ("release-chain", kind, ns, ref["name"])
+        if key not in cache:
+            cache[key] = kube.get(kind, ref["name"], ns)
+        obj = cache[key]
+        return obj if obj is not None and (obj.get("metadata") or {}).get("uid") == ref["uid"] else None
+    to_rs = controller(pod, "ReplicaSet")
+    rs = referenced("ReplicaSet", to_rs) if to_rs else None
+    to_deployment = controller(rs, "Deployment") if rs else None
+    d = referenced("Deployment", to_deployment) if to_deployment else None
+    if d is None or to_deployment["name"] not in {f"{release}-predictive-autoscaler-{c}" for c in RELEASE_CONTROLLERS} \
+            or (d["metadata"].get("labels") or {}).get("app.kubernetes.io/instance") != release:
+        return False
+    support = s["nodes"]["support"]["name"]
+    want = [{"matchExpressions": [{"key": s["role_label"], "operator": "In", "values": ["support"]},
+                                  {"key": "kubernetes.io/hostname", "operator": "In", "values": [support]}]}]
+    template = ((d.get("spec") or {}).get("template") or {}).get("spec") or {}
+    if template.get("nodeName") or (pod.get("spec") or {}).get("nodeName") not in (None, "", support):
+        return False
+    for spec in (pod.get("spec") or {}, template):
+        required = ((spec.get("affinity") or {}).get("nodeAffinity") or {}) \
+            .get("requiredDuringSchedulingIgnoredDuringExecution") or {}
+        if required.get("nodeSelectorTerms") != want:
+            return False
+    return True
+
+
 def _broad_tolerations(kube: X.Kube, record: X.Record, s: Dict, taint: Dict,
-                       calibration: Optional[Dict] = None, occupant: Optional[Dict] = None) -> List[Dict]:
+                       calibration: Optional[Dict] = None, occupant: Optional[Dict] = None,
+                       params: Optional[Dict] = None) -> List[Dict]:
     """Owners of pods anywhere that would tolerate the run taint, other than allowed DaemonSets, the run's own pods,
-    the open calibration's verified own pods (calibration_owned) and reviewed exceptions: they could land on W/S
-    later."""
+    the open calibration's verified own pods (calibration_owned), an authorized occupant's pods, the evaluation
+    release's own controllers as the reviewed values place them (release_controller_pod; `params` = this
+    reservation's) and reviewed exceptions: they could land on W/S later."""
     allowed = s.get("allowed") or {}
     ds = {(d.get("namespace"), d.get("name")) for d in allowed.get("daemonsets", [])}
     ok = {(d.get("namespace"), d.get("kind"), d.get("name")) for d in allowed.get("broad_tolerations", [])}
@@ -225,6 +286,8 @@ def _broad_tolerations(kube: X.Kube, record: X.Record, s: Dict, taint: Dict,
         if calibration_owned(kube, p, calibration, None, cache) or occupant_owned(p, occupant):
             continue
         if not any(_tolerates(t, taint) for t in p.get("spec", {}).get("tolerations", []) or []):
+            continue
+        if release_controller_pod(kube, params, s, p, cache):
             continue
         o = _owner(kube, p, cache)
         if (o["kind"] == "DaemonSet" and (o["namespace"], o["name"]) in ds) or (o["namespace"], o["kind"], o["name"]) in ok:
@@ -271,7 +334,7 @@ def plan(record: X.Record, kube: X.Kube) -> Dict:
                         "original_taints": copy.deepcopy(taints), "original_role_label": cur_label,
                         "add_taint": add_taint, "add_label": add_label, "conflicts": conflicts})
     occupants = _occupants(kube, record, params, s)
-    broad = _broad_tolerations(kube, record, s, taint)
+    broad = _broad_tolerations(kube, record, s, taint, params=params)
     problems = [c for a in actions for c in a["conflicts"]]
     return X.new_plan(HELPER, record, actions, taint=taint, role_label=s["role_label"], occupants=occupants,
                       broad_tolerations=broad, problems=problems,
@@ -457,7 +520,7 @@ def verify(record: X.Record, kube: X.Kube, calibration: Optional[Dict] = None,
             if e["class"] not in accepted:
                 problems.append(f"{role}: {e['namespace']}/{e['pod']} ({e['owner']['kind']} {e['owner']['name']}) is "
                                 f"{e['class']}")
-    broad = _broad_tolerations(kube, record, s, taint, calibration, occupant)
+    broad = _broad_tolerations(kube, record, s, taint, calibration, occupant, params)
     for b in broad:
         problems.append(f"{b['namespace']}/{b['kind']}/{b['name']} tolerates the run taint and is not allowlisted")
     incomplete = X.experiment_params_problems(params)

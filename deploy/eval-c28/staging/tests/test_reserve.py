@@ -406,3 +406,217 @@ def test_reservation_pass_gate_needs_no_experiment_params(api, make_record):
     reserve.require_reservation_pass(out)
     with pytest.raises(X.StagingError, match="not ready for the experiment"):
         reserve.require_ready_for_experiment(out)
+
+
+# --- the evaluation release's own controllers and the toleration check ---------------------------------------------
+
+def support_terms(hostnames=("worker-s",), roles=("support",)):
+    return [{"matchExpressions": [{"key": "c28.devkuban.com/role", "operator": "In", "values": list(roles)},
+                                  {"key": "kubernetes.io/hostname", "operator": "In", "values": list(hostnames)}]}]
+
+
+def affinity(terms):
+    return {"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": terms}}}
+
+
+def install_release(api, component="operator", *, namespace="pa-eval-system", name=None, node="worker-s",
+                    pod_terms="same", template_terms=None, instance="pa-eval", pod_labels=None, chain_uid=None,
+                    deployment=True, taint_value=RUN, pod_rs_uid=None, direct=False, template_node=None,
+                    replicaset=True):
+    """The chart's Deployment, its ReplicaSet and one pod, as they are after `helm install` with the reviewed values:
+    no run label on the pod, the release's instance label, the run taint tolerated, S required."""
+    name = name or f"pa-eval-predictive-autoscaler-{component}"
+    template_terms = support_terms() if template_terms is None else template_terms
+    pod_terms = template_terms if pod_terms == "same" else pod_terms
+    uid = f"d-{namespace}-{name}"
+    tolerations = [{"key": "c28.devkuban.com/reserved", "operator": "Equal", "value": taint_value,
+                    "effect": "NoSchedule"}]
+    if deployment:
+        api.put({"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {
+            "name": name, "namespace": namespace, "uid": uid,
+            "labels": {"app.kubernetes.io/instance": instance, "app.kubernetes.io/component": component}},
+            "spec": {"template": {"spec": {"affinity": affinity(template_terms), "tolerations": tolerations,
+                                           **({"nodeName": template_node} if template_node else {})}}}})
+    rs_uid = f"rs-{namespace}-{name}"
+    if replicaset:
+        api.put({"apiVersion": "apps/v1", "kind": "ReplicaSet", "metadata": {
+            "name": f"{name}-7d6c", "namespace": namespace, "uid": rs_uid,
+            "ownerReferences": [{"kind": "Deployment", "name": name, "controller": True,
+                                 "uid": uid if chain_uid is None else chain_uid}]}})
+    pod = F.pod(f"{name}-7d6c-x", namespace, node, owner=("ReplicaSet", f"{name}-7d6c"),
+                labels={"app.kubernetes.io/instance": "pa-eval", "app.kubernetes.io/component": component,
+                        **(pod_labels or {})}, tolerations=tolerations)
+    pod["metadata"]["ownerReferences"][0]["uid"] = rs_uid if pod_rs_uid is None else pod_rs_uid
+    if direct:                                             # the pod points straight at the Deployment
+        pod["metadata"]["ownerReferences"] = [{"kind": "Deployment", "name": name, "controller": True, "uid": uid}]
+    if pod_terms is not None:
+        pod["spec"]["affinity"] = affinity(pod_terms)
+    api.put(pod)
+    return name
+
+
+def test_the_installed_release_does_not_fail_the_toleration_check(api, make_record):
+    # Found on prodcluster 2026-11-17: after `helm install`, every later plan failed with "pa-eval-system/Deployment/
+    # pa-eval-predictive-autoscaler-operator tolerates the run taint and is not allowlisted" (and the forecaster),
+    # although classify() accepts those very pods on the support node.
+    record, kube = setup(api, make_record)
+    do_apply(record, kube)
+    install_release(api, "operator")
+    install_release(api, "forecaster")
+    out = reserve.verify(record, kube)
+    assert out["broad_tolerations"] == [] and out["problems"] == [] and out["reservation"] == "PASS"
+    assert {e["class"] for e in out["occupants"]["support"]} == {"evaluation"}
+    assert reserve.plan(record, kube)["broad_tolerations"] == []
+
+
+@pytest.mark.parametrize("why,kw,flagged", [
+    ("the same names in another namespace", {"namespace": "elsewhere"},
+     "elsewhere/Deployment/pa-eval-predictive-autoscaler-operator"),
+    ("an unrelated controller in the control namespace", {"name": "something-else"},
+     "pa-eval-system/Deployment/something-else"),
+    ("a release controller the values do not place on S", {"name": "pa-eval-predictive-autoscaler-trainer"},
+     "pa-eval-system/Deployment/pa-eval-predictive-autoscaler-trainer"),
+    ("another release's Deployment under this name", {"instance": "another"},
+     "pa-eval-system/Deployment/pa-eval-predictive-autoscaler-operator"),
+    ("a placement that admits W by hostname", {"template_terms": support_terms(("worker-s", "worker-w"))},
+     "pa-eval-system/Deployment/pa-eval-predictive-autoscaler-operator"),
+    ("a placement that admits the workload role", {"template_terms": support_terms(roles=("support", "workload"))},
+     "pa-eval-system/Deployment/pa-eval-predictive-autoscaler-operator"),
+    ("a placement on W", {"template_terms": support_terms(("worker-w",), ("workload",))},
+     "pa-eval-system/Deployment/pa-eval-predictive-autoscaler-operator"),
+    ("a second term that admits any node", {"template_terms": support_terms() + [{"matchExpressions": []}]},
+     "pa-eval-system/Deployment/pa-eval-predictive-autoscaler-operator"),
+    ("no required placement at all", {"template_terms": []},
+     "pa-eval-system/Deployment/pa-eval-predictive-autoscaler-operator"),
+    ("a pod whose own placement differs from the reviewed one", {"pod_terms": support_terms(("worker-w",))},
+     "pa-eval-system/Deployment/pa-eval-predictive-autoscaler-operator"),
+    ("a pod without a required placement", {"pod_terms": None},
+     "pa-eval-system/Deployment/pa-eval-predictive-autoscaler-operator"),
+    ("a template that admits W under a pod that does not", {"template_terms": support_terms(("worker-s", "worker-w")),
+                                                             "pod_terms": support_terms()},
+     "pa-eval-system/Deployment/pa-eval-predictive-autoscaler-operator"),
+    ("an owner chain that names another object's UID", {"chain_uid": "d-other"},
+     "pa-eval-system/Deployment/pa-eval-predictive-autoscaler-operator"),
+    ("a ReplicaSet reference without the Deployment's UID", {"chain_uid": ""},
+     "pa-eval-system/Deployment/pa-eval-predictive-autoscaler-operator"),
+    ("a pod that names a stale ReplicaSet UID", {"pod_rs_uid": "rs-of-an-earlier-rollout"},
+     "pa-eval-system/Deployment/pa-eval-predictive-autoscaler-operator"),
+    ("a pod reference without a ReplicaSet UID", {"pod_rs_uid": ""},
+     "pa-eval-system/Deployment/pa-eval-predictive-autoscaler-operator"),
+    ("a pod that points straight at the Deployment", {"direct": True},
+     "pa-eval-system/Deployment/pa-eval-predictive-autoscaler-operator"),
+    ("a template that names W although its affinity says S", {"template_node": "worker-w"},
+     "pa-eval-system/Deployment/pa-eval-predictive-autoscaler-operator"),
+    ("a template that names even the support node", {"template_node": "worker-s"},
+     "pa-eval-system/Deployment/pa-eval-predictive-autoscaler-operator"),
+    ("a pod running on W although its affinity says S", {"node": "worker-w"},
+     "pa-eval-system/Deployment/pa-eval-predictive-autoscaler-operator"),
+    ("a pod running on another node", {"node": "worker-x"},
+     "pa-eval-system/Deployment/pa-eval-predictive-autoscaler-operator"),
+    ("a chain to a Deployment that does not exist", {"deployment": False},
+     "pa-eval-system/Deployment/pa-eval-predictive-autoscaler-operator"),
+])
+def test_only_the_releases_own_controllers_as_reviewed_pass_the_toleration_check(api, make_record, why, kw, flagged):
+    record, kube = setup(api, make_record)
+    do_apply(record, kube)
+    kw = dict({"node": None}, **kw)                        # unscheduled: only the condition under test is wrong
+    install_release(api, "operator", **kw)
+    out = reserve.verify(record, kube)
+    assert [f"{b['namespace']}/{b['kind']}/{b['name']}" for b in out["broad_tolerations"]] == [flagged], why
+    assert f"{flagged} tolerates the run taint and is not allowlisted" in out["problems"]
+
+
+def test_copied_labels_do_not_make_a_pod_the_releases(api, make_record):
+    # Every label of the operator's pod, on a pod in the control namespace that another controller owns.
+    record, kube = setup(api, make_record)
+    do_apply(record, kube)
+    install_release(api, "operator")
+    api.put({"apiVersion": "apps/v1", "kind": "ReplicaSet", "metadata": {
+        "name": "lookalike-1", "namespace": "pa-eval-system",
+        "ownerReferences": [{"kind": "Deployment", "name": "lookalike", "controller": True, "uid": "d-lookalike"}]}})
+    pod = F.pod("lookalike-1-x", "pa-eval-system", None, owner=("ReplicaSet", "lookalike-1"),
+                labels={"app.kubernetes.io/instance": "pa-eval", "app.kubernetes.io/component": "operator"},
+                tolerations=[{"key": "c28.devkuban.com/reserved", "operator": "Equal", "value": RUN,
+                              "effect": "NoSchedule"}])
+    pod["spec"]["affinity"] = affinity(support_terms())
+    api.put(pod)
+    bare = F.pod("pa-eval-predictive-autoscaler-operator-bare", "pa-eval-system", None,
+                 labels={"app.kubernetes.io/instance": "pa-eval"},
+                 tolerations=[{"operator": "Exists"}])              # no controller at all
+    bare["spec"]["affinity"] = affinity(support_terms())
+    api.put(bare)
+    out = reserve.verify(record, kube)
+    assert [(b["kind"], b["name"]) for b in out["broad_tolerations"]] == [
+        ("", "pa-eval-predictive-autoscaler-operator-bare"), ("Deployment", "lookalike")]
+
+
+def test_without_params_nothing_is_recognized_as_the_release(api, make_record):
+    record, kube = setup(api, make_record)
+    do_apply(record, kube)
+    install_release(api, "operator")
+    s = reserve._section(record, X.load_params_stage(record, reserve.STAGE))
+    taint = reserve._taint(s, record.run_id)
+    assert reserve._broad_tolerations(kube, record, s, taint) != []
+    assert reserve._broad_tolerations(kube, record, s, taint, params=X.load_params_stage(record, reserve.STAGE)) == []
+
+
+def test_a_forged_owner_reference_in_another_namespace_or_of_another_kind_is_not_the_release(api, make_record):
+    # The real release is installed. Two impostors name the real Deployment's UID in their owner chains: one from
+    # another namespace, one through a controller of another kind with the Deployment's name.
+    record, kube = setup(api, make_record)
+    do_apply(record, kube)
+    real = install_release(api, "operator")
+    real_uid = api.obj("Deployment", real, "pa-eval-system")["metadata"]["uid"]
+    real_rs_uid = api.obj("ReplicaSet", real + "-7d6c", "pa-eval-system")["metadata"]["uid"]
+    install_release(api, "operator", namespace="elsewhere", node=None, deployment=False, chain_uid=real_uid,
+                    pod_rs_uid=real_rs_uid)
+    tolerations = [{"key": "c28.devkuban.com/reserved", "operator": "Equal", "value": RUN, "effect": "NoSchedule"}]
+    pod = F.pod("sts-0", "pa-eval-system", None, labels={"app.kubernetes.io/instance": "pa-eval"},
+                tolerations=tolerations)
+    pod["metadata"]["ownerReferences"] = [{"kind": "StatefulSet", "name": real, "controller": True, "uid": real_uid}]
+    pod["spec"]["affinity"] = affinity(support_terms())
+    api.put(pod)
+    out = reserve.verify(record, kube)
+    assert sorted((b["namespace"], b["kind"], b["name"]) for b in out["broad_tolerations"]) == [
+        ("elsewhere", "Deployment", real), ("pa-eval-system", "StatefulSet", real)]
+
+
+def test_an_unscheduled_pod_of_the_release_passes_like_one_on_the_support_node(api, make_record):
+    record, kube = setup(api, make_record)
+    do_apply(record, kube)
+    install_release(api, "operator", node=None)              # Pending: nodeName not set yet
+    install_release(api, "forecaster")                       # Running on S
+    assert reserve.verify(record, kube)["broad_tolerations"] == []
+
+
+def test_a_missing_replicaset_breaks_the_chain(api, make_record):
+    record, kube = setup(api, make_record)
+    do_apply(record, kube)
+    install_release(api, "operator", node=None, replicaset=False)
+    out = reserve.verify(record, kube)
+    assert len(out["broad_tolerations"]) == 1 and out["reservation"] == "FAIL"
+
+
+def test_references_of_another_kind_or_without_a_uid_are_not_followed(api, make_record):
+    record, kube = setup(api, make_record)
+    do_apply(record, kube)
+    real = install_release(api, "operator")
+    rs = api.obj("ReplicaSet", real + "-7d6c", "pa-eval-system")
+    tolerations = [{"key": "c28.devkuban.com/reserved", "operator": "Equal", "value": RUN, "effect": "NoSchedule"}]
+
+    def pod(name, ref):
+        p = F.pod(name, "pa-eval-system", None, tolerations=tolerations)
+        p["metadata"]["ownerReferences"] = [dict(ref, controller=True)]
+        p["spec"]["affinity"] = affinity(support_terms())
+        api.put(p)
+    # the real ReplicaSet's name and UID, under a reference that says it is something else
+    pod("kind-lie", {"kind": "StatefulSet", "name": rs["metadata"]["name"], "uid": rs["metadata"]["uid"]})
+    # a ReplicaSet stored without a UID, referenced without one: "equal", and still not a verified chain
+    api.put({"apiVersion": "apps/v1", "kind": "ReplicaSet", "metadata": {
+        "name": "no-uid", "namespace": "pa-eval-system", "uid": "",
+        "ownerReferences": [{"kind": "Deployment", "name": real, "controller": True,
+                             "uid": api.obj("Deployment", real, "pa-eval-system")["metadata"]["uid"]}]}})
+    pod("uid-less", {"kind": "ReplicaSet", "name": "no-uid", "uid": ""})
+    out = reserve.verify(record, kube)
+    stored = api.obj("ReplicaSet", "no-uid", "pa-eval-system")["metadata"].get("uid")
+    assert len(out["broad_tolerations"]) == 2, (out["broad_tolerations"], stored)
