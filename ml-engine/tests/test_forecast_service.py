@@ -87,9 +87,9 @@ def test_refusals_and_outages_are_told_apart(api, monkeypatch, failure, status):
     install_model(api_main.predictor, _Model(), SIGNAL)
     exc = getattr(api_main, failure)("simulated")
     if failure in ("ProvenanceRefused", "LookupFailed"):
-        monkeypatch.setattr(api_main, "resolve_signal", lambda request, reader: (_ for _ in ()).throw(exc))
+        monkeypatch.setattr(api_main, "resolve_signal", lambda request, reader, watch: (_ for _ in ()).throw(exc))
     else:
-        monkeypatch.setattr(api_main, "resolve_signal", lambda request, reader: SIGNAL)
+        monkeypatch.setattr(api_main, "resolve_signal", lambda request, reader, watch: SIGNAL)
         monkeypatch.setattr(api_main, "query_history", lambda url, query: (_ for _ in ()).throw(exc))
     r = client.post("/predict", json=product_body(SIGNAL))
     assert r.status_code == status, r.text
@@ -108,7 +108,7 @@ def test_a_full_house_is_503_and_a_slot_is_held_until_the_worker_finishes(api, m
     monkeypatch.setattr(api_main, "_admission", threading.BoundedSemaphore(1))
     entered, release = threading.Event(), threading.Event()
 
-    def slow_resolve(request, reader):
+    def slow_resolve(request, reader, watch):
         entered.set()
         release.wait(10)
         return SIGNAL

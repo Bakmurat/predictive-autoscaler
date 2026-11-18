@@ -101,7 +101,7 @@ def api(monkeypatch):
     from api import main as api_main
 
     install_model(api_main.predictor, _FakeTrainedModel(), SIGNAL)
-    monkeypatch.setattr(api_main, "resolve_signal", lambda request, reader: SIGNAL)
+    monkeypatch.setattr(api_main, "resolve_signal", lambda request, reader, watch: SIGNAL)
     monkeypatch.setattr(api_main, "query_history", lambda url, query: list(HISTORY))
     api_main.accuracy_tracker.pending.clear()
     api_main.accuracy_tracker.history.clear()

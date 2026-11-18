@@ -21,6 +21,7 @@ ORIGIN = int(datetime(2026, 11, 6, 12, 0, tzinfo=timezone.utc).timestamp())
 NOW_MS = ORIGIN * 1000 + 4_321
 LEAD = {"seconds": 1200, "startupDelaySeconds": 420, "actuationAllowanceSeconds": 30, "method": "configured",
         "sampleCount": 0, "observedGeneration": 3}
+from api.identity import CLUSTER_WIDE  # noqa: E402
 
 
 def pa_object(prediction=None, lead=LEAD, generation=3):
@@ -163,7 +164,7 @@ def test_timestamps_are_utc_z_only():
 
 def test_a_request_binds_to_the_live_autoscaler():
     reader = FakeReader()
-    b = c.bind_request(request(), reader, now_ms=NOW_MS)
+    b = c.bind_request(request(), reader, watch=CLUSTER_WIDE, now_ms=NOW_MS)
     assert (b.signal.query, b.signal.autoscaler_uid, b.signal.target_uid, b.signal.generation) == (
         QUERY, "pa-uid", "dep-uid", 3)
     assert b.settings_sha256 == settings_sha() and b.decision_origin == ORIGIN and b.lead_problem == ""
@@ -206,19 +207,19 @@ def test_a_request_binds_to_the_live_autoscaler():
 ])
 def test_requests_that_do_not_match_are_refused(req, reader, err):
     with pytest.raises(err):
-        c.bind_request(req, reader, now_ms=NOW_MS)
+        c.bind_request(req, reader, watch=CLUSTER_WIDE, now_ms=NOW_MS)
 
 
 def test_schema_refusals_happen_before_any_lookup():
     reader = FakeReader()
     with pytest.raises(ContractRefused):
-        c.bind_request(request(history=[]), reader, now_ms=NOW_MS)
+        c.bind_request(request(history=[]), reader, watch=CLUSTER_WIDE, now_ms=NOW_MS)
     assert reader.paths == []
 
 
 def test_lookup_failures_stay_unavailable():
     with pytest.raises(LookupFailed):
-        c.bind_request(request(), FakeReader(fail=LookupFailed("api down")), now_ms=NOW_MS)
+        c.bind_request(request(), FakeReader(fail=LookupFailed("api down")), watch=CLUSTER_WIDE, now_ms=NOW_MS)
 
 
 @pytest.mark.parametrize("lead,why", [
@@ -232,7 +233,7 @@ def test_lookup_failures_stay_unavailable():
     ({**LEAD, "sampleCount": -1}, "non-negative"),
 ])
 def test_an_invalid_lead_leaves_no_window(lead, why):
-    b = c.bind_request(request(), FakeReader(pa=pa_object(lead=lead)), now_ms=NOW_MS)
+    b = c.bind_request(request(), FakeReader(pa=pa_object(lead=lead)), watch=CLUSTER_WIDE, now_ms=NOW_MS)
     assert b.lead is None and why in b.lead_problem and b.window is None and b.evidence_key is None
 
 
@@ -244,7 +245,7 @@ def test_automatic_lead_rounds_up_with_origin_slack():
 
 
 def test_evidence_key_resets_on_identity_and_policy_but_not_on_mode():
-    b = c.bind_request(request(), FakeReader(), now_ms=NOW_MS)
+    b = c.bind_request(request(), FakeReader(), watch=CLUSTER_WIDE, now_ms=NOW_MS)
     base = b.evidence_key
     sig = b.signal
     s = b.settings
@@ -281,7 +282,7 @@ def make_response(bound, **over):
 
 
 def test_a_shadow_response_round_trips_and_matches_its_request():
-    b = c.bind_request(request(), FakeReader(), now_ms=NOW_MS)
+    b = c.bind_request(request(), FakeReader(), watch=CLUSTER_WIDE, now_ms=NOW_MS)
     r = make_response(b)
     wire = r.to_wire()
     assert wire["issued_at"] == c.format_ms(NOW_MS) and wire["upper_window_max_rps"] is None
@@ -306,7 +307,7 @@ def test_a_shadow_response_round_trips_and_matches_its_request():
     {"issued_at_ms": ORIGIN * 1000 - 1}, {"target_namespace": "other"}, {"autoscaler_generation": True},
 ])
 def test_incoherent_responses_are_refused(over):
-    b = c.bind_request(request(), FakeReader(), now_ms=NOW_MS)
+    b = c.bind_request(request(), FakeReader(), watch=CLUSTER_WIDE, now_ms=NOW_MS)
     with pytest.raises(ContractRefused):
         c.check_response(make_response(b, **over))
 
@@ -317,7 +318,7 @@ def test_incoherent_responses_are_refused(over):
                                                                                             "window_end": ORIGIN + 1500},
 ])
 def test_responses_for_another_request_are_refused(over):
-    b = c.bind_request(request(), FakeReader(), now_ms=NOW_MS)
+    b = c.bind_request(request(), FakeReader(), watch=CLUSTER_WIDE, now_ms=NOW_MS)
     r = make_response(b, **over)
     if "lead_seconds" in over:
         w = c.ForecastWindow(ORIGIN, 300, 1500)
@@ -339,31 +340,31 @@ ELIGIBLE = dict(predictive_eligible=True, upper_window_max_rps=3.0, trust_state=
     {**ELIGIBLE, "issued_at_ms": (ORIGIN + 270) * 1000 + 1},
 ])
 def test_issuance_timing_is_enforced(over):
-    b = c.bind_request(request(), FakeReader(), now_ms=NOW_MS)
+    b = c.bind_request(request(), FakeReader(), watch=CLUSTER_WIDE, now_ms=NOW_MS)
     with pytest.raises(ContractRefused):
         c.check_response(make_response(b, **over))
 
 
 def test_a_late_shadow_response_is_coherent_but_never_eligible():
     # After valid_until but before the first target: a shadow issuance may still be recorded; it cannot be eligible.
-    b = c.bind_request(request(), FakeReader(), now_ms=NOW_MS)
+    b = c.bind_request(request(), FakeReader(), watch=CLUSTER_WIDE, now_ms=NOW_MS)
     c.check_response(make_response(b, issued_at_ms=(ORIGIN + 280) * 1000), b)
 
 
 def test_the_calibration_epoch_must_be_the_requests_evidence_key():
-    b = c.bind_request(request(), FakeReader(), now_ms=NOW_MS)
+    b = c.bind_request(request(), FakeReader(), watch=CLUSTER_WIDE, now_ms=NOW_MS)
     for epoch in ("f" * 64, "", c.evidence_key(b.signal, b.settings, 900)):
         with pytest.raises(ContractRefused):
             c.check_response(make_response(b, calibration_epoch=epoch), b)
 
 
 def test_an_eligible_response_is_coherent_only_when_trusted():
-    b = c.bind_request(request(), FakeReader(), now_ms=NOW_MS)
+    b = c.bind_request(request(), FakeReader(), watch=CLUSTER_WIDE, now_ms=NOW_MS)
     c.check_response(make_response(b, **ELIGIBLE), b)
 
 
 def test_wire_decoding_is_strict():
-    b = c.bind_request(request(), FakeReader(), now_ms=NOW_MS)
+    b = c.bind_request(request(), FakeReader(), watch=CLUSTER_WIDE, now_ms=NOW_MS)
     wire = make_response(b).to_wire()
     for mutate in (lambda w: w.pop("valid_until"), lambda w: w.update(confidence=0.9),
                    lambda w: w.update(issued_at=c.format_ts(ORIGIN)), lambda w: w.update(point_rps="1,2")):

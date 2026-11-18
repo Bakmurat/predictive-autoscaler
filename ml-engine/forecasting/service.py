@@ -93,6 +93,7 @@ from dataclasses import dataclass, replace
 from typing import Callable, Dict, Mapping, Optional, Tuple
 
 from api.identity import API_GROUP, API_VERSION, AutoscalerNotFound, LookupFailed, ProvenanceRefused
+from api.identity import CLUSTER_WIDE, WatchPolicy
 from data.bounded_http import bounded_get
 from forecasting import calibration as cal
 from forecasting import demonstration as D
@@ -151,12 +152,17 @@ class ServiceConfig:
     lab_qualification: Optional[Q.LabQualification] = None          # verified by forecasting.qualification.load
     # verified, with its contract, by forecasting.demonstration.load; never beside a lab qualification
     demonstration_qualification: Optional[D.DemonstrationQualification] = None
+    # the installation's namespace policy (api.identity.parse_watch_namespaces of WATCH_NAMESPACES); the same object
+    # is used when a request is bound and when its binding is read again before an issuance
+    watch: WatchPolicy = CLUSTER_WIDE
 
 
 class ForecastService:
     def __init__(self, config: ServiceConfig, *, reader, fetch: Callable = bounded_get, clock=None, worker=None):
         if config.fit_mode not in ("worker", "inline", "off"):
             raise ValueError(f"unknown fit mode {config.fit_mode!r}")
+        if not isinstance(config.watch, WatchPolicy):
+            raise ValueError("config.watch must be a WatchPolicy")
         if config.max_autoscalers < 1 or config.slot_idle_seconds < 0:
             raise ValueError("max_autoscalers must be at least 1 and slot_idle_seconds 0 (never) or more")
         q = config.lab_qualification
@@ -382,7 +388,7 @@ class ForecastService:
     def predict(self, body) -> Dict:
         now_ms = self.clock.now_ms()
         try:
-            bound = bind_request(body, self.reader, now_ms=now_ms)
+            bound = bind_request(body, self.reader, now_ms=now_ms, watch=self.config.watch)
         except AutoscalerNotFound as e:
             for ns, name, uid, seen in self.metrics.slots():   # the live lookup's definite 404: it is gone, so the
                 if (ns, name) == (e.namespace, e.name) and seen <= now_ms:     # registration it held then is released
@@ -441,7 +447,8 @@ class ForecastService:
         request's own time is used, so only the objects can make the answer differ. A refusal or a failed read is
         not a confirmation."""
         try:
-            return bind_request(body, self.reader, now_ms=now_ms).evidence_key == bound.evidence_key
+            return bind_request(body, self.reader, now_ms=now_ms,
+                                watch=self.config.watch).evidence_key == bound.evidence_key
         except (AutoscalerNotFound, ContractRefused, ProvenanceRefused, LookupFailed):
             return False
 

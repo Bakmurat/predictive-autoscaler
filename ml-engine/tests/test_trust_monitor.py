@@ -41,6 +41,7 @@ PRE_POLICY_ADDED = ("policy", "rolling_alarm_ppm", "consecutive_alarm_ppm", "day
 # that policy (commit a774a68): what an operator or a forecaster one revision back presents.
 POLICY_V1_IDENTITY = ("fd30e6a0d857054071bfffa53d1d2db229b22d39e937180470a7e453bf6eb87b",
                       "53b55a6d085491bf1ab92912a04cb5efc961ce6698825320286ca44248c5d796")
+from api.identity import CLUSTER_WIDE  # noqa: E402
 
 
 def tail(n, k, a=A):
@@ -292,7 +293,7 @@ def test_the_update_interval_is_part_of_the_validated_profile_and_of_the_identit
     assert profile_settings(updateIntervalSeconds=60) == base and profile_settings(updateIntervalSeconds=0) == base
     assert base.canonical()["settings"]["update_interval_seconds"] == 60
     sig = c.bind_request(svc_helpers.body(svc_helpers.T0), svc_helpers.Reader(),
-                         now_ms=svc_helpers.T0 * 1000 + 10_000).signal
+                         watch=CLUSTER_WIDE, now_ms=svc_helpers.T0 * 1000 + 10_000).signal
     # 300 is what the CRD writes into every object that does not set it; 10 is raised to the operator's floor.
     for configured, effective in ((30, 30), (10, 30), (61, 61), (120, 120), (300, 300), (3600, 3600)):
         s = profile_settings(updateIntervalSeconds=configured)
@@ -356,7 +357,7 @@ def test_the_lead_is_never_below_the_configured_minimum():
     a, b = profile_settings(), profile_settings(minLeadSeconds=540)
     assert a.fingerprint() != b.fingerprint() and a.canonical()["settings"]["min_lead_seconds"] == 600
     sig = c.bind_request(svc_helpers.body(svc_helpers.T0), svc_helpers.Reader(),
-                         now_ms=svc_helpers.T0 * 1000 + 10_000).signal
+                         watch=CLUSTER_WIDE, now_ms=svc_helpers.T0 * 1000 + 10_000).signal
     assert c.evidence_key(sig, a, 600) != c.evidence_key(sig, b, 600)
 
 
@@ -778,7 +779,7 @@ def test_the_trust_policy_and_its_thresholds_are_in_the_fingerprint_and_the_poli
         other = dataclasses.replace(s, trust=dataclasses.replace(s.trust, **{name: value}))
         assert other.fingerprint() != s.fingerprint(), name
     sig = c.bind_request(svc_helpers.body(svc_helpers.T0), svc_helpers.Reader(),
-                         now_ms=svc_helpers.T0 * 1000 + 10_000).signal
+                         watch=CLUSTER_WIDE, now_ms=svc_helpers.T0 * 1000 + 10_000).signal
     key = c.evidence_key(sig, s, svc_helpers.LEAD)
     revised = dataclasses.replace(s, trust=dataclasses.replace(s.trust, policy="other/v9"))
     assert c.evidence_key(sig, revised, svc_helpers.LEAD) != key     # a policy revision is a new evidence epoch
@@ -842,7 +843,7 @@ def test_a_peer_of_the_earlier_trust_policy_gets_no_forecast(tmp_path, earlier):
     svc, clock = svc_helpers.make(tmp_path)
     old_sha, old_ek = earlier(svc_helpers.pa_object(), svc_helpers.LEAD)
     bound = c.bind_request(svc_helpers.body(svc_helpers.T0), svc_helpers.Reader(),
-                           now_ms=svc_helpers.T0 * 1000 + 10_000)
+                           watch=CLUSTER_WIDE, now_ms=svc_helpers.T0 * 1000 + 10_000)
     assert bound.settings_sha256 != old_sha and bound.evidence_key != old_ek
     clock.set(svc_helpers.T0 * 1000 + 10_000)
     with pytest.raises(ServiceError) as e:

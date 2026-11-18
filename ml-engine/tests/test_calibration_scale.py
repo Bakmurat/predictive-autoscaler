@@ -30,6 +30,7 @@ ADDED_KEYS = ("method", "scale_bins", "scale_floor_bps", "scale_min_season_bps")
 # What trust policy budgeted-coverage-tests/v1 (stacked on this method) added to and changed in the trust settings.
 ADDED_TRUST_KEYS = ("policy", "rolling_alarm_ppm", "consecutive_alarm_ppm", "day_alarm_ppm", "seven_day_alarm_ppm",
                     "miss_dependence_bps")
+from api.identity import CLUSTER_WIDE  # noqa: E402
 
 
 def strip_to_additive(canon):
@@ -273,7 +274,7 @@ def test_the_method_is_in_the_fingerprint_and_the_evidence_key():
     pa = svc_helpers.pa_object()
     old_sha, old_ek = legacy_identity(pa, svc_helpers.LEAD)
     bound = c.bind_request(svc_helpers.body(svc_helpers.T0), svc_helpers.Reader(),
-                           now_ms=svc_helpers.T0 * 1000 + 10_000)
+                           watch=CLUSTER_WIDE, now_ms=svc_helpers.T0 * 1000 + 10_000)
     assert bound.settings_sha256 != old_sha and bound.evidence_key != old_ek
     # The spec cannot choose the method or the constants of its fit.
     for key in ("method", "scaleBins", "scaleFloorBps", "scaleMinSeasonBps"):
@@ -333,7 +334,7 @@ def test_an_old_trusted_state_does_not_survive_the_method_change(tmp_path):
 def test_a_checkpoint_of_another_state_schema_is_refused(tmp_path):
     svc, clock = svc_helpers.make(tmp_path)
     ek = c.bind_request(svc_helpers.body(svc_helpers.T0), svc_helpers.Reader(),
-                        now_ms=svc_helpers.T0 * 1000 + 10_000).evidence_key
+                        watch=CLUSTER_WIDE, now_ms=svc_helpers.T0 * 1000 + 10_000).evidence_key
     svc.store.write_checkpoint(ek, {"schema": "statistical-service-state/v1", "epoch": ek, "last_outcome_seq": 0,
                                     "last_issuance_seq": 0, "models": {}, "trust": {}, "pairs": {}}, 0)
     with pytest.raises(ServiceError) as e:

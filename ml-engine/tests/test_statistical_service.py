@@ -27,6 +27,7 @@ SHA = hashlib.sha256(QUERY.encode()).hexdigest()
 T0 = 1_793_923_200 - 1_793_923_200 % DAY + 3 * DAY       # three days of history before the first request
 PREDICTION = {"horizonMinutes": 60, "sampleIntervalSeconds": DT, "historyDays": 2,
               "calibration": {"minWindows": 16, "maxScores": 64, "minMiscoverageBps": 600}}  # 16: rank needs a >= 1/17
+from api.identity import CLUSTER_WIDE  # noqa: E402
 
 
 def pa_object(prediction=None, lead=True, uid="pa-uid"):
@@ -114,7 +115,7 @@ def test_a_request_gets_a_coherent_shadow_forecast(tmp_path):
     assert r.upper_window_max_rps is None and r.calibration_windows == 0      # cold start: no bound yet
     assert r.predictive_eligible is False and r.trust_state in ("Calibrating", "Collecting", "Shadow")
     assert r.input_end == T0 - DT                       # the settlement watermark at origin + 10 s
-    assert r.calibration_epoch == c.bind_request(body(T0), Reader(), now_ms=T0 * 1000 + 10_000).evidence_key
+    assert r.calibration_epoch == c.bind_request(body(T0), Reader(), watch=CLUSTER_WIDE, now_ms=T0 * 1000 + 10_000).evidence_key
 
 
 def test_a_retry_returns_the_same_issuance(tmp_path):
@@ -346,7 +347,7 @@ def test_a_real_change_of_epoch_takes_the_publication_over(tmp_path):
     # A read that fails during the confirmation is not a confirmation: nothing is taken over.
     reader.pa = pa_object(prediction=dict(PREDICTION, updateIntervalSeconds=300))
     third_settings = c.resolve_settings(reader.pa).fingerprint()
-    bound = c.bind_request(body(T0 + DT, third_settings), reader, now_ms=clock.now_ms())
+    bound = c.bind_request(body(T0 + DT, third_settings), reader, watch=CLUSTER_WIDE, now_ms=clock.now_ms())
     reader.fail = LookupFailed("api down")
     assert svc._still_bound(body(T0 + DT, third_settings), bound, clock.now_ms()) is False
     reader.fail = None
@@ -562,7 +563,7 @@ def test_the_forecast_and_its_digest_come_from_one_artifact_read(tmp_path, monke
     svc.predict(request)
     stat = svc.store.issuances()[0].payload()["candidates"]["statistical"]
     from forecasting.artifacts import Binding
-    bound = c.bind_request(request, Reader(pa_object(prediction=pred)), now_ms=clock.now_ms())
+    bound = c.bind_request(request, Reader(pa_object(prediction=pred)), watch=CLUSTER_WIDE, now_ms=clock.now_ms())
     sha, cutoff, data = svc.artifacts.current(Binding.for_signal(bound.signal, bound.settings, "e1-product/v1"))
     assert stat["artifact_sha256"] == sha == hashlib.sha256(data).hexdigest() and stat["fit_cutoff"] == cutoff
 
@@ -696,7 +697,7 @@ def test_the_challenger_is_selected_only_on_bound_same_policy_costs(tmp_path, mo
     assert last["selected"] == "seasonal_naive" and {v["phase"] for v in last["verdict"]["candidates"].values()} == \
         {"Trusted"}                                                    # both trusted: only the costs keep E1 out
     o = last["decision_origin"]
-    bound = c.bind_request(body(o, c.resolve_settings(pa).fingerprint()), Reader(pa), now_ms=o * 1000 + 10_000)
+    bound = c.bind_request(body(o, c.resolve_settings(pa).fingerprint()), Reader(pa), watch=CLUSTER_WIDE, now_ms=o * 1000 + 10_000)
     params, _ = P.resolve_policy(bound.spec, bound.settings, bound.lead)
     assert last["policy_sha256"] == params.fingerprint()
     cost = last["costs"]["statistical"]
@@ -942,7 +943,7 @@ def test_costs_follow_late_truth_receipts_and_survive_a_restart(tmp_path, monkey
     last = out[-1][1]
     assert last["costs"], "the run reached the cost replay"
     o = last["decision_origin"]
-    bound = c.bind_request(body(o, c.resolve_settings(pa).fingerprint()), Reader(pa), now_ms=o * 1000 + 10_000)
+    bound = c.bind_request(body(o, c.resolve_settings(pa).fingerprint()), Reader(pa), watch=CLUSTER_WIDE, now_ms=o * 1000 + 10_000)
     state = svc.store.latest_checkpoint(last["evidence_key"]).state
     both = {"seasonal_naive": None, "statistical": None}
     lo, _hi = svc._costs[("shop", "web-pa")][1]["statistical"]["binding"]["window"]

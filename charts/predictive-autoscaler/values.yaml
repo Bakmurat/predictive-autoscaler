@@ -23,7 +23,8 @@ prometheus:
 
 operator:
   replicas: 1                # more replicas only add standby leaders (leader election is always on)
-  watchNamespaces: []        # empty: every namespace
+  watchNamespaces: []        # empty: every namespace. The forecaster gets the same list and refuses a request that
+                             # names an autoscaler or target namespace outside it, before reading anything.
   rbac:
     # false: a shadow (Recommend-only) install. The operator may only read deployments/scale (no update), so it cannot
     # change any replica count even if an autoscaler is set to Active (that write fails with Forbidden). Status,

@@ -105,13 +105,19 @@ def default_service(env: Mapping[str, str]):
         demo = D.load(*demo_paths, build, int(time.time()), env.get("FORECAST_IMAGE_DIGEST") or None)
     except Q.QualificationRefused as e:
         raise Refused(f"the demonstration qualification is refused: {e}") from e
+    from api.identity import WatchConfigError, parse_watch_namespaces
+    try:
+        watch = parse_watch_namespaces(env.get("WATCH_NAMESPACES"))
+    except WatchConfigError as e:
+        raise Refused(f"the namespace policy is refused: {e}") from e
+    logger.warning("NAMESPACE POLICY: forecasts are %s", watch.describe())
     cfg = ServiceConfig(prometheus_url=url, state_dir=env.get("FORECAST_STATE_DIR", "/state"),
                         quota_bytes=_int_env(env, "FORECAST_STATE_QUOTA_BYTES", 1536 << 20, MIN_STATE_QUOTA_BYTES,
                                              MAX_STATE_QUOTA_BYTES),
                         fit_mode=env.get("FORECAST_FIT_MODE", "worker"),
                         max_autoscalers=_int_env(env, "FORECAST_MAX_AUTOSCALERS", 8, 1),
                         slot_idle_seconds=_int_env(env, "FORECAST_AUTOSCALER_IDLE_SECONDS", 86400, 0),
-                        build=build, lab_qualification=lab, demonstration_qualification=demo)
+                        build=build, lab_qualification=lab, demonstration_qualification=demo, watch=watch)
     if lab is not None:
         logger.warning("LAB QUALIFICATION %s active for cluster %s, namespaces %s, %d targets, until %s (evaluation "
                        "build %s)", lab.sha256, lab.cluster_uid, sorted(lab.namespaces), len(lab.targets),

@@ -1114,3 +1114,18 @@ def test_pod_labels_reach_the_pods_and_never_replace_the_selector(render):
     for key in ("app.kubernetes.io/name", "app.kubernetes.io/instance", "app.kubernetes.io/component"):
         p = render({"operator": {"podLabels": {key: "x"}}}, check=False)
         assert p.returncode != 0 and "podLabels" in p.stderr, key
+
+
+# --- the forecaster enforces the operator's watched namespaces (one value, both workloads) --------------------------
+
+def _forecaster_env(docs):
+    (container,) = forecaster_of(docs)["spec"]["template"]["spec"]["containers"]
+    return {e["name"]: e.get("value") for e in container["env"]}
+
+
+@pytest.mark.parametrize("engine", [{}, STAT])
+def test_the_forecaster_gets_the_operators_watched_namespaces_from_the_same_value(render, engine):
+    docs = render(_merge(engine, {"operator": {"watchNamespaces": ["shop", "payments"]}}))
+    assert _forecaster_env(docs)["WATCH_NAMESPACES"] == _operator_env(docs)["WATCH_NAMESPACES"] == "shop,payments"
+    docs = render(engine)                                    # no list: neither workload is restricted
+    assert "WATCH_NAMESPACES" not in _forecaster_env(docs) and "WATCH_NAMESPACES" not in _operator_env(docs)
