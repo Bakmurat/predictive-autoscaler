@@ -68,6 +68,10 @@ spec:
             {{- include "pa.pythonEnv" . | nindent 12 }}
             - name: PROMETHEUS_URL
               value: {{ required "prometheus.url is required" .Values.prometheus.url | quote }}
+            {{- with .Values.operator.watchNamespaces }}
+            - name: WATCH_NAMESPACES          # the operator's list, from the same value: the forecaster enforces it
+              value: {{ join "," . | quote }}
+            {{- end }}
             - name: POD_NAMESPACE
               valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
             {{- if $stat }}

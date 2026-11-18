@@ -40,5 +40,5 @@ def product_body(signal, horizon=60):
 
 def route_product_path(monkeypatch, api_main, signal, history):
     """The service resolves `signal` and reads `history` (list of {"timestamp", "value" (req/min)})."""
-    monkeypatch.setattr(api_main, "resolve_signal", lambda request, reader: signal)
+    monkeypatch.setattr(api_main, "resolve_signal", lambda request, reader, watch: signal)
     monkeypatch.setattr(api_main, "query_history", lambda url, query: list(history))

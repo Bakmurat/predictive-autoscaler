@@ -21,6 +21,7 @@ from forecasting.service import ServiceConfig, ServiceError  # noqa: E402
 from tests.test_statistical_service import DT, T0, Backend, body, make, pa_object  # noqa: E402
 
 SWEEP_MS = service_module.SLOT_SWEEP_SECONDS * 1000
+from api.identity import CLUSTER_WIDE  # noqa: E402
 
 
 class Cluster:
@@ -241,7 +242,7 @@ def test_evidence_and_fit_artifacts_are_bound_to_the_autoscaler_uid():
     from tests.test_statistical_service import Reader
 
     def bound(uid):
-        return c.bind_request(dict(body(T0), autoscaler_uid=uid), Reader(pa_object(uid=uid)), now_ms=T0 * 1000)
+        return c.bind_request(dict(body(T0), autoscaler_uid=uid), Reader(pa_object(uid=uid)), watch=CLUSTER_WIDE, now_ms=T0 * 1000)
 
     a, b = bound("uid-old"), bound("uid-new")
     assert a.settings_sha256 == b.settings_sha256 and a.signal.sha256 == b.signal.sha256   # only the UID differs

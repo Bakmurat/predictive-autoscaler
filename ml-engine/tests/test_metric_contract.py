@@ -27,6 +27,7 @@ SHA = hashlib.sha256(QUERY.encode()).hexdigest()
 
 
 # --- strict history ---------------------------------------------------------------------------------------------
+from api.identity import CLUSTER_WIDE  # noqa: E402
 
 class FakeFetch:
     def __init__(self, status=200, body=b"", exc=None):
@@ -230,7 +231,7 @@ def request(**over):
 
 def test_identity_resolves_the_compiled_query():
     reader = FakeReader()
-    sig = resolve_signal(request(), reader)
+    sig = resolve_signal(request(), reader, CLUSTER_WIDE)
     assert sig == ResolvedSignal(namespace="shop", name="web", metric="requests", query=QUERY, sha256=SHA,
                                  contract=CONTRACT, autoscaler_uid="pa-uid", target_uid="dep-uid", generation=3)
     assert reader.paths == ["/apis/autoscaling.devkuban.com/v1alpha1/namespaces/shop/predictiveautoscalers/web-pa",
@@ -259,12 +260,12 @@ def test_identity_resolves_the_compiled_query():
 ])
 def test_identity_refuses_every_mismatch(req, reader):
     with pytest.raises(ProvenanceRefused):
-        resolve_signal(req, reader)
+        resolve_signal(req, reader, CLUSTER_WIDE)
 
 
 def test_lookup_failures_are_not_refusals():
     with pytest.raises(LookupFailed):
-        resolve_signal(request(), FakeReader(fail=LookupFailed("api down")))
+        resolve_signal(request(), FakeReader(fail=LookupFailed("api down")), CLUSTER_WIDE)
 
 
 def test_kube_reader_rereads_the_token_and_maps_statuses(tmp_path):
@@ -308,7 +309,7 @@ def test_kube_reader_rereads_the_token_and_maps_statuses(tmp_path):
 ])
 def test_malformed_objects_are_refused(pa, dep):
     with pytest.raises(ProvenanceRefused):
-        resolve_signal(request(), FakeReader(pa=pa, dep=dep))
+        resolve_signal(request(), FakeReader(pa=pa, dep=dep), CLUSTER_WIDE)
 
 
 # --- model records ----------------------------------------------------------------------------------------------

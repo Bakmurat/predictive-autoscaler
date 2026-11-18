@@ -32,6 +32,7 @@ BUILD = Q.BuildInfo(H.TREE, True)
 PREDICTION = {"horizonMinutes": 60, "sampleIntervalSeconds": G, "historyDays": 2, "updateIntervalSeconds": 60,
               "families": ["seasonalNaive"], "trust": base.FAST_TRUST,
               "calibration": {"minWindows": 16, "maxScores": 64, "minMiscoverageBps": 600}}
+from api.identity import CLUSTER_WIDE  # noqa: E402
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -309,7 +310,7 @@ def test_a_changed_trust_setting_is_refused_and_old_answers_are_not_served_again
     assert (g["passed"], g["basis"], g["refused"]) == (False, None, "settings")
     assert g["demonstration_contract_sha256"] == doc.contract_sha256
     # Even handed the old bundle directly, the answer path refuses it for the changed autoscaler.
-    bound = c.bind_request(base.body(LAST, new), svc.reader, now_ms=svc.clock.now_ms())
+    bound = c.bind_request(base.body(LAST, new), svc.reader, watch=CLUSTER_WIDE, now_ms=svc.clock.now_ms())
     b = trusted["bundles"][-1]
     assert b["release_gate"]["passed"] is True and b["settings_sha256"] == old
     assert svc._authorized(bound, b) is False
@@ -414,7 +415,7 @@ def test_a_change_of_the_mounted_files_withdraws_the_basis_without_a_restart(tru
 def test_the_selected_family_decides_at_every_answer(trusted, tmp_path):
     svc, _clock, _pa, settings = reopen(trusted, tmp_path, demonstration_qualification=trusted["doc"])
     b = trusted["bundles"][-1]
-    bound = c.bind_request(base.body(LAST, settings), svc.reader, now_ms=svc.clock.now_ms())
+    bound = c.bind_request(base.body(LAST, settings), svc.reader, watch=CLUSTER_WIDE, now_ms=svc.clock.now_ms())
     assert b["selected"] == "seasonal_naive" and svc._authorized(bound, b) is True
     # The same stored answer with any other selected family (a challenger, a family this document cannot list, a
     # configuration name instead of the wire name, or none) is never authorized: cached and replayed answers included.
@@ -469,7 +470,7 @@ def test_a_family_outside_the_list_is_never_eligible(tmp_path, monkeypatch):
     assert plain_out[-1][1]["verdict"]["reason"] == "ReplayGateMissing"
     # Even a stored bundle that claimed the gate passed is refused for this family at the answer.
     o = last["decision_origin"]
-    bound = c.bind_request(base.body(o, c.resolve_settings(pa).fingerprint()), svc.reader, now_ms=o * 1000 + 10_000)
+    bound = c.bind_request(base.body(o, c.resolve_settings(pa).fingerprint()), svc.reader, watch=CLUSTER_WIDE, now_ms=o * 1000 + 10_000)
     def forged(d):
         return {**last, "verdict": {**last["verdict"], "reason": "Ready", "prediction_ready": True},
                 "release_gate": {"passed": True, "basis": "demonstration", "lab_qualification_sha256": None,
@@ -574,7 +575,7 @@ def test_eligibility_is_reauthorised_at_every_answer(trusted, tmp_path):
                                 "demonstration_contract_sha256")
     svc, _clock, _pa, settings = reopen(trusted, tmp_path, demonstration_qualification=doc)
     b = trusted["bundles"][-1]
-    bound = c.bind_request(base.body(LAST, settings), svc.reader, now_ms=svc.clock.now_ms())
+    bound = c.bind_request(base.body(LAST, settings), svc.reader, watch=CLUSTER_WIDE, now_ms=svc.clock.now_ms())
     assert svc._authorized(bound, b) is True
     for key in S._GATE_IDENTITY[2:]:
         forged = {**b, "release_gate": {**b["release_gate"], key: "0" * 64}}

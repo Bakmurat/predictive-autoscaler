@@ -40,7 +40,7 @@ from datetime import datetime, timezone
 from typing import Dict, Mapping, Optional, Tuple
 
 from api.identity import API_GROUP, API_VERSION, CONTRACT as SIGNAL_CONTRACT, KubeReader, ResolvedSignal, \
-    resolve_signal
+    resolve_signal, WatchPolicy
 
 FORECAST_CONTRACT = "window-max-rps/v1"
 SETTINGS_SCHEMA = "forecast-settings/v1"
@@ -661,12 +661,14 @@ class BoundRequest:
         return evidence_key(self.signal, self.settings, self.lead.lead_seconds) if self.lead else None
 
 
-def bind_request(body, reader: KubeReader, *, now_ms: int) -> BoundRequest:
+def bind_request(body, reader: KubeReader, *, now_ms: int, watch: WatchPolicy) -> BoundRequest:
     """Validate a v2 request against the live autoscaler: identity (api.identity), exact settings hash, and a decision
-    origin that is the current grid origin at now_ms. Nothing else about the forecast is taken from the caller."""
+    origin that is the current grid origin at now_ms. Nothing else about the forecast is taken from the caller.
+    watch (required) is the installation's namespace policy: api.identity refuses a namespace it does not serve before
+    any read."""
     req = parse_request(body)
     rec = _RecordingReader(reader)
-    sig = resolve_signal(dict(req.identity), rec)
+    sig = resolve_signal(dict(req.identity), rec, watch)
     path = (f"/apis/{API_GROUP}/{API_VERSION}/namespaces/{req.identity['autoscaler_namespace']}"
             f"/predictiveautoscalers/{req.identity['autoscaler_name']}")
     pa = rec.objects.get(path)

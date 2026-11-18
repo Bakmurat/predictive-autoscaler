@@ -117,7 +117,7 @@ cluster, or give several releases disjoint `operator.watchNamespaces`. Other opt
 
 | Value | What it does |
 |---|---|
-| `operator.watchNamespaces` | Limit the operator to these namespaces (empty: all). |
+| `operator.watchNamespaces` | Limit the operator to these namespaces (empty: all). The forecaster enforces the same list: a forecast request for another namespace is refused (`422 IdentityMismatch`) before any lookup. Its read permissions stay cluster-wide, so the list, not RBAC, is the forecaster's namespace boundary. |
 | `operator.forecastLedger.enabled` | Keep an append-only JSON-lines ledger of every forecast attempt and decision, for auditing; on an emptyDir unless you give `persistence.existingClaim`. |
 | `forecaster.persistence.*` | The model volume: size, storage class, access mode (`ReadWriteOnce` or `ReadWriteMany`, never `ReadWriteOncePod`), `retain` (`true` by default: the chart-created claim is kept on uninstall), or your own `existingClaim`. |
 | `forecaster.auth.*`, `forecaster.tls.*` | Authentication and TLS between the operator and the forecasting service (on by default; see [Security](#12-security)). |

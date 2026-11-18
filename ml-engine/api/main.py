@@ -32,7 +32,8 @@ from models.lstm_model import LSTMForecastModel, asymmetric_mse  # noqa: F401 â€
 from data.victoriametrics_collector import VictoriaMetricsCollector
 from api.accuracy import AccuracyTracker
 from api.auth import AuthMiddleware, TokenReviewer, config_from_env
-from api.identity import CONTRACT, KubeReader, LookupFailed, ProvenanceRefused, resolve_signal
+from api.identity import (
+    CONTRACT, KubeReader, LookupFailed, ProvenanceRefused, WatchConfigError, parse_watch_namespaces, resolve_signal)
 from api.registry import ModelIncompatible, ModelRegistry, artifact_paths, load_record, model_key as registry_key
 from data.history import HistoryRefused, HistoryUnavailable, query_history
 from api.seasonal_experiment import SeasonalExperiment
@@ -811,6 +812,14 @@ if not ALLOW_BENCHMARK_EXPERIMENTS and (os.getenv("SEASONAL_EXPERIMENT") is not 
     raise RuntimeError("SEASONAL_EXPERIMENT/ENSEMBLE_EXPERIMENT are benchmark tooling: set "
                        "ALLOW_BENCHMARK_EXPERIMENTS=1 to run them (their forecasts are never product-attested)")
 
+# The installation's namespace policy (the chart gives WATCH_NAMESPACES to the forecaster as to the operator). A
+# malformed list stops the service here: it is never read as "every namespace".
+try:
+    WATCH_POLICY = parse_watch_namespaces(os.getenv("WATCH_NAMESPACES"))
+except WatchConfigError as e:
+    raise RuntimeError(f"the namespace policy is refused: {e}") from e
+logger.warning("NAMESPACE POLICY: forecasts are %s", WATCH_POLICY.describe())
+
 predictor = LSTMPredictor()
 
 # The product path: the autoscaler's compiled query, resolved from the Kubernetes API (api/identity.py) and read from the
@@ -844,7 +853,7 @@ def accuracy_scope(signal) -> str:
 
 def _serve_forecast(request: Dict, horizon_minutes: int):
     """The product forecast job (a worker thread of _forecast_executor, run under an admission slot)."""
-    signal = resolve_signal(request, kube_reader)
+    signal = resolve_signal(request, kube_reader, WATCH_POLICY)
     history = query_history(PROMETHEUS_URL, signal.query)
     if not _inference_slots.acquire(timeout=INFERENCE_WAIT_S):
         raise ServiceBusy("inference capacity busy")

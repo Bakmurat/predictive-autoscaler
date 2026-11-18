@@ -24,7 +24,7 @@ import os
 import re
 import ssl
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, FrozenSet, Optional
 
 from data.bounded_http import BodyTooLarge, TransportFailure, bounded_get
 
@@ -61,6 +61,58 @@ def definite_not_found(path: str, body) -> bool:
     want = m.groupdict()
     return (details.get("name"), details.get("kind"), details.get("group") or "") == \
         (want["name"], want["resource"], want.get("group") or "")
+
+
+AUTOSCALER_NAMESPACE_NOT_WATCHED = "the autoscaler's namespace is not watched by this installation"
+TARGET_NAMESPACE_NOT_WATCHED = "the target's namespace is not watched by this installation"
+
+
+class WatchConfigError(ValueError):
+    """WATCH_NAMESPACES is set to something that is not a list of namespace names. Never read as "unrestricted"."""
+
+
+@dataclass(frozen=True)
+class WatchPolicy:
+    """The namespaces this installation serves forecasts for. namespaces None: cluster-wide, no restriction (the
+    operator's own meaning of an unset WATCH_NAMESPACES). A set: only autoscalers and targets in those namespaces."""
+    namespaces: Optional[FrozenSet[str]]
+
+    def __post_init__(self):
+        ns = self.namespaces
+        if ns is not None and (not isinstance(ns, frozenset) or not ns or not all(valid_namespace(n) for n in ns)):
+            raise WatchConfigError("a restricted watch policy needs a non-empty frozenset of namespace names")
+
+    @property
+    def restricted(self) -> bool:
+        return self.namespaces is not None
+
+    def allows(self, namespace) -> bool:
+        return self.namespaces is None or (isinstance(namespace, str) and namespace in self.namespaces)
+
+    def describe(self) -> str:
+        return "cluster-wide (every namespace)" if self.namespaces is None else \
+            "restricted to " + ", ".join(sorted(self.namespaces))
+
+
+CLUSTER_WIDE = WatchPolicy(None)
+
+
+def parse_watch_namespaces(raw) -> WatchPolicy:
+    """WATCH_NAMESPACES as the chart gives it to the operator (operator.watchNamespaces, comma separated). Unset or
+    blank: cluster-wide, as for the operator. Anything else must be a list of valid namespace names: an empty entry or
+    a malformed name is WatchConfigError, so a typing mistake stops the service instead of serving every namespace."""
+    if raw is None:
+        return CLUSTER_WIDE
+    if not isinstance(raw, str):
+        raise WatchConfigError("WATCH_NAMESPACES is not text")
+    if raw.strip() == "":
+        return CLUSTER_WIDE
+    names = [n.strip() for n in raw.split(",")]
+    bad = sorted({n for n in names if not valid_namespace(n)})
+    if bad:
+        raise WatchConfigError(f"WATCH_NAMESPACES has {len(bad)} entr{'y' if len(bad) == 1 else 'ies'} that "
+                               f"{'is' if len(bad) == 1 else 'are'} not a namespace name (an empty entry counts)")
+    return WatchPolicy(frozenset(names))
 
 
 class ProvenanceRefused(Exception):
@@ -207,11 +259,22 @@ def resolve_autoscaler(reader: KubeReader, pa_ns: str, pa_name: str) -> Resolved
                           autoscaler_uid=uid, target_uid=live_uid, generation=generation)
 
 
-def resolve_signal(request: dict, reader: KubeReader) -> ResolvedSignal:
-    """Validate a forecast request's reference against the live objects and return the compiled query to use."""
+def resolve_signal(request: dict, reader: KubeReader, watch: WatchPolicy) -> ResolvedSignal:
+    """Validate a forecast request's reference against the live objects and return the compiled query to use.
+
+    watch is required (no default): every forecast path states the installation's namespace policy. Under a restricted
+    policy the autoscaler's namespace and the request's target namespace are checked BEFORE any read of the Kubernetes
+    API, so a request for a namespace this installation does not serve costs no lookup and learns nothing about what
+    exists there. The live identity checks below are unchanged."""
+    if not isinstance(watch, WatchPolicy):
+        raise TypeError("resolve_signal needs the installation's WatchPolicy")
     if not isinstance(request, dict):
         raise ProvenanceRefused("the request is not an object")
     pa_ns = _require(request, "autoscaler_namespace", valid_namespace, "a namespace")
+    if not watch.allows(pa_ns):
+        raise ProvenanceRefused(AUTOSCALER_NAMESPACE_NOT_WATCHED)
+    if watch.restricted and "namespace" in request and not watch.allows(request["namespace"]):
+        raise ProvenanceRefused(TARGET_NAMESPACE_NOT_WATCHED)
     pa_name = _require(request, "autoscaler_name", valid_name, "a name")
     req_uid = _require(request, "autoscaler_uid", lambda v: isinstance(v, str) and v != "", "the autoscaler UID")
     req_gen = _require(request, "autoscaler_generation",
