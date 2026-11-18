@@ -22,8 +22,11 @@ What it guarantees, each covered by a test with harmless local commands:
 - **No surprises from the environment.** `env` is the complete environment: nothing is inherited, and the variable the
   trampoline shell would add (PWD) is removed again; an `env` that itself names PWD or OLDPWD is refused. stdin is
   /dev/null.
-- **It does not raise for anything the command does.** Failures of the runner itself come back as
-  `Result.runner_error` (an exception class name, never a message that could quote output).
+- **It does not raise for anything the command does, and an interruption cannot leave the command behind.**
+  Failures of the runner itself, an interrupt included, come back as `Result.runner_error` (the first exception's
+  class name, never a message that could quote output); termination, reaping and the final group check still run, and
+  an attempt that is interrupted is followed by another, which goes on to SIGKILL. `started` is set before the gate is
+  written, so an interrupted write is never reported as "never executed".
 
 `group_state(identity)` answers later, from the recorded identity alone, whether that group can still hold a live
 process: "empty", "alive" or "unknown" (another host or boot, an unreadable /proc). Recovery uses it: the shared
@@ -52,7 +55,8 @@ _TRAMPOLINE = 'IFS= read -r _ || exit %d; unset PWD OLDPWD; exec "$@" </dev/null
 
 @dataclass
 class Result:
-    started: bool = False                    # the gate was opened: the command may have run
+    started: bool = False                    # the identity was recorded and the gate MAY have been opened: the
+    #                                          command may have run. False only when the gate was provably never opened
     identity: Optional[Dict] = None          # {pid, pgid, start, host, boot_id}
     exit_kind: Optional[str] = None          # "exited" | "signaled" | None (never reaped)
     exit_status: Optional[int] = None        # the exit status, or the signal number
@@ -211,9 +215,9 @@ def run(argv: List[str], *, env: Dict[str, str], cwd: str, deadline_s: float, re
             raise RuntimeError("identity")                     # unreadable, or not its own group leader: never released
         res.identity = ident
         record(dict(ident))                                    # durable BEFORE the gate opens; raising keeps it closed
-        os.write(gate_w, b"go\n")
-        res.started = True
-    except BaseException as e:                                 # the gate stays closed: the command never runs
+        res.started = True                                     # from here on the command MAY run: set before the write,
+        os.write(gate_w, b"go\n")                              # so an interrupted write is never "never executed"
+    except BaseException as e:                                 # before `started`: the gate stays closed, nothing ran
         res.runner_error = type(e).__name__
     finally:
         for fd in (gate_r, gate_w):                            # closing the write end unopened is the refusal (EOF)
@@ -225,6 +229,7 @@ def run(argv: List[str], *, env: Dict[str, str], cwd: str, deadline_s: float, re
     if proc is None:
         return res
     pgid = proc.pid
+    escalate = False
     try:
         try:
             proc.wait(timeout=deadline_s if res.started else reap_s)
@@ -238,32 +243,47 @@ def run(argv: List[str], *, env: Dict[str, str], cwd: str, deadline_s: float, re
             elif live:
                 res.survivors = True                           # the leader is gone, something of its group is not
                 escalate = _wait_empty(pgid, linger_s, sleep) is not True
-        if escalate:
-            _signal_group(pgid, signal.SIGTERM)
-            res.signals_sent.append("TERM")
-            end = time.monotonic() + grace_s
-            while time.monotonic() < end and (proc.poll() is None or members(pgid) != []):
-                sleep(0.05)
-            if proc.poll() is None or members(pgid) != []:
-                _signal_group(pgid, signal.SIGKILL)
-                res.signals_sent.append("KILL")
-        try:
-            proc.wait(timeout=reap_s)
-        except subprocess.TimeoutExpired:
-            pass
-        if proc.returncode is not None:
-            res.exit_kind = "signaled" if proc.returncode < 0 else "exited"
-            res.exit_status = -proc.returncode if proc.returncode < 0 else proc.returncode
-            if not res.started and res.exit_kind == "exited" and res.exit_status == GATE_REFUSED:
-                res.exit_kind, res.exit_status = "never-executed", None
-        res.group_empty = _wait_empty(pgid, reap_s, sleep)
-        for d in drains:
-            d.join(timeout=reap_s if res.group_empty else 0.5)
-        res.output_complete = all(d.done for d in drains)
-        res.stdout_bytes, res.stdout_sha256 = drains[0].count, drains[0].digest.hexdigest()
-        res.stderr_bytes, res.stderr_sha256 = drains[1].count, drains[1].digest.hexdigest()
-    except BaseException as e:
+    except BaseException as e:                                 # interrupted while waiting: the command must still end
         res.runner_error = res.runner_error or type(e).__name__
-        if res.group_empty is not True:
+        escalate = True
+    # Termination, reaping and the final group check are on a path that an interruption cannot skip: an interrupted
+    # attempt is followed by another, which does not repeat a signal already sent (so an interruption during the grace
+    # time leads straight to KILL). The first error's class is the one reported.
+    for _attempt in range(4):
+        try:
+            _finish(res, proc, pgid, drains, escalate, grace_s, reap_s, sleep)
+            break
+        except BaseException as e:
+            res.runner_error = res.runner_error or type(e).__name__
             res.group_empty = None
+            escalate = True
     return res
+
+
+def _finish(res: Result, proc, pgid: int, drains: List[_Drain], escalate: bool, grace_s: float, reap_s: float,
+            sleep: Callable[[float], None]) -> None:
+    """End the group if asked, reap the leader, check the group, collect the output counters. Safe to call again."""
+    if escalate and "TERM" not in res.signals_sent:
+        _signal_group(pgid, signal.SIGTERM)
+        res.signals_sent.append("TERM")
+        end = time.monotonic() + grace_s
+        while time.monotonic() < end and (proc.poll() is None or members(pgid) != []):
+            sleep(0.05)
+    if escalate and "KILL" not in res.signals_sent and (proc.poll() is None or members(pgid) != []):
+        _signal_group(pgid, signal.SIGKILL)
+        res.signals_sent.append("KILL")
+    try:
+        proc.wait(timeout=reap_s)
+    except subprocess.TimeoutExpired:
+        pass
+    if proc.returncode is not None:
+        res.exit_kind = "signaled" if proc.returncode < 0 else "exited"
+        res.exit_status = -proc.returncode if proc.returncode < 0 else proc.returncode
+        if not res.started and res.exit_kind == "exited" and res.exit_status == GATE_REFUSED:
+            res.exit_kind, res.exit_status = "never-executed", None       # only when the gate was provably never opened
+    res.group_empty = _wait_empty(pgid, reap_s, sleep)
+    for d in drains:
+        d.join(timeout=reap_s if res.group_empty else 0.5)
+    res.output_complete = all(d.done for d in drains)
+    res.stdout_bytes, res.stdout_sha256 = drains[0].count, drains[0].digest.hexdigest()
+    res.stderr_bytes, res.stderr_sha256 = drains[1].count, drains[1].digest.hexdigest()

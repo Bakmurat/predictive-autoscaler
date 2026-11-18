@@ -89,6 +89,86 @@ def test_a_command_that_is_not_an_absolute_path_is_never_started(tmp_path):
     assert not (tmp_path / "ran").exists()
 
 
+def test_an_interrupted_gate_write_is_never_reported_as_never_executed(tmp_path, monkeypatch):
+    """The write that opens the gate succeeds and the parent is interrupted right after it: the command runs. Even a
+    command that itself exits with the trampoline's refusal status must not look unexecuted."""
+    ran = tmp_path / "ran"
+    real = os.write
+
+    def write_then_interrupt(fd, data):
+        n = real(fd, data)
+        if bytes(data) == b"go\n":
+            raise KeyboardInterrupt()
+        return n
+
+    monkeypatch.setattr(P.os, "write", write_then_interrupt)
+    res, seen = sh(f"touch {ran}; exit {P.GATE_REFUSED}")
+    assert ran.exists() and len(seen) == 1
+    assert res.started is True and res.exit_kind == "exited" and res.exit_status == P.GATE_REFUSED
+    assert res.runner_error == "KeyboardInterrupt" and res.group_empty is True
+
+
+def test_a_gate_write_that_fails_outright_is_still_possibly_started(tmp_path, monkeypatch):
+    real = os.write
+
+    def fail(fd, data):
+        if bytes(data) == b"go\n":
+            raise OSError("injected")
+        return real(fd, data)
+
+    monkeypatch.setattr(P.os, "write", fail)
+    res, _ = run(["/usr/bin/touch", str(tmp_path / "ran")])
+    assert not (tmp_path / "ran").exists()                # the gate got end of file: the trampoline refused
+    assert res.started is True and res.exit_kind == "exited" and res.exit_status == P.GATE_REFUSED   # never "never-executed"
+    assert res.runner_error == "OSError" and res.group_empty is True
+
+
+def test_an_interruption_during_the_wait_does_not_leave_the_command_running(monkeypatch):
+    real_wait = subprocess.Popen.wait
+    state = {"n": 0}
+
+    def wait(self, timeout=None):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise KeyboardInterrupt()
+        return real_wait(self, timeout=timeout)
+
+    monkeypatch.setattr(subprocess.Popen, "wait", wait)
+    res, seen = sh(f"sleep {LONG}", deadline_s=30, grace_s=3)
+    assert res.runner_error == "KeyboardInterrupt" and res.signals_sent == ["TERM"]
+    assert res.exit_kind == "signaled" and res.group_empty is True and P.group_state(seen[0]) == "empty"
+
+
+def test_an_interruption_during_the_grace_time_still_ends_in_kill(monkeypatch):
+    state = {"n": 0}
+
+    def interrupted_sleep(seconds):
+        state["n"] += 1
+        if state["n"] == 2:                               # inside the grace wait after TERM
+            raise KeyboardInterrupt()
+        time.sleep(seconds)
+
+    res, seen = sh('trap "" TERM; while :; do sleep 0.1; done', deadline_s=0.3, grace_s=30, sleep=interrupted_sleep)
+    assert res.runner_error == "KeyboardInterrupt" and res.signals_sent == ["TERM", "KILL"]
+    assert res.exit_kind == "signaled" and res.exit_status == signal.SIGKILL
+    assert res.group_empty is True and P.group_state(seen[0]) == "empty"
+
+
+def test_repeated_interruptions_end_with_an_unknown_group_never_a_claim(monkeypatch):
+    def always(seconds):
+        raise KeyboardInterrupt()
+
+    res, seen = sh('trap "" TERM; while :; do sleep 0.1; done', deadline_s=0.3, grace_s=30, sleep=always)
+    try:
+        assert res.runner_error == "KeyboardInterrupt" and "KILL" in res.signals_sent
+        assert res.group_empty is not True or P.group_state(seen[0]) == "empty"   # True only if it really is empty
+    finally:
+        try:
+            os.killpg(seen[0]["pgid"], signal.SIGKILL)
+        except OSError:
+            pass
+
+
 # --- bounded: the deadline, the escalation, what is left in the group ---------------------------------------------------
 
 def test_at_the_deadline_the_group_is_terminated_reaped_and_proven_empty():
