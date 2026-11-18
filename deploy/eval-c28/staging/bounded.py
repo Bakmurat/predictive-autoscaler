@@ -58,6 +58,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -363,7 +364,7 @@ def collect_vm(c: Ctx, fetch: Fetch, api: str, origin_s: float, gen_pod: str, po
         out["steal"][role] = guard(f"steal/{role}", lambda: _range(fetch, api, steal_expr([node]), lo, hi, 60), [])
         if role in inst:
             out["freshness"][f"steal_raw/{role}"] = guard(f"steal-raw/{role}", lambda: _worst(_raw(
-                fetch, api, f'node_cpu_seconds_total{{job="node-exporter",mode="steal",instance="{inst[role]}"}}',
+                fetch, api, raw_steal_selector(inst[role]),
                 lo, hi), lo, hi))
     out["freshness"] = {k: v for k, v in out["freshness"].items() if v is not None}
     return out
@@ -562,8 +563,58 @@ def steal_stops(c: Ctx, fetch: Fetch, api: str, now_s: float) -> List[str]:
         if len(vals) < 5 or now_s - vals[-1][0] > 120:
             out.append(f"steal observation of {role} node missing or stale")
             continue
+        if not all(math.isfinite(t) and math.isfinite(v) for t, v in vals):
+            # NaN compares false with every threshold: an unusable observation must not read as "below the limit"
+            out.append(f"steal observation of {role} node is not a finite number")
+            continue
         if all(v > c.verdicts.FROZEN["steal_percent"] for _, v in vals[-c.verdicts.FROZEN["steal_bins"]:]):
             out.append(f"steal above {c.verdicts.FROZEN['steal_percent']} % for 5 minutes on the {role} node")
+    return out
+
+
+RAW_STEAL_MAX_AGE_S, RAW_STEAL_LOOKBACK_S, RAW_STEAL_FUTURE_S = 120, 300, 5
+
+
+def raw_steal_selector(instance: str) -> str:
+    return f'node_cpu_seconds_total{{job="node-exporter",mode="steal",instance="{instance}"}}'
+
+
+def raw_steal_stops(c: Ctx, fetch: Fetch, api: str, now_s: float) -> List[str]:
+    """The newest UNDERLYING steal sample of W and of S, from RAW samples (a range-vector instant query: never a
+    stepped range query, whose bins carry a value forward and so look fresh after the scrapes have stopped). The load
+    may continue only while its safety observation is alive: no series, no sample, a sample that is not exactly a
+    finite timestamp with a finite numeric value, a sample from the future, or a newest sample older than
+    RAW_STEAL_MAX_AGE_S is a stop."""
+    out = []
+    inst = node_instances(c, fetch, api)
+    for role, key in (("workload", "w"), ("support", "s")):
+        series = _raw(fetch, api, raw_steal_selector(inst[key]), now_s - RAW_STEAL_LOOKBACK_S, now_s)
+        stamps: List[float] = []
+        malformed = not isinstance(series, list)
+        for s in series if isinstance(series, list) else []:
+            values = s.get("values") if isinstance(s, dict) else None
+            if not isinstance(values, list):
+                malformed = True
+                continue
+            for pair in values:
+                # a sample is exactly [timestamp, value], both numbers (the value may arrive as a numeric string),
+                # both finite, neither a boolean: a fresh timestamp on an unusable value is not an observation
+                try:
+                    if not isinstance(pair, (list, tuple)) or len(pair) != 2 or isinstance(pair[0], bool) or \
+                            isinstance(pair[1], bool):
+                        raise ValueError("sample")
+                    stamp, sample = float(pair[0]), float(pair[1])
+                    if not (math.isfinite(stamp) and math.isfinite(sample)):
+                        raise ValueError("sample")
+                    stamps.append(stamp)
+                except (TypeError, ValueError):
+                    malformed = True
+        if malformed or not stamps:
+            out.append(f"raw steal samples of the {role} node missing or malformed")
+        elif max(stamps) > now_s + RAW_STEAL_FUTURE_S:
+            out.append(f"raw steal samples of the {role} node are from the future")
+        elif now_s - max(stamps) > RAW_STEAL_MAX_AGE_S:
+            out.append(f"the newest raw steal sample of the {role} node is older than {RAW_STEAL_MAX_AGE_S} s")
     return out
 
 
@@ -599,6 +650,7 @@ def live_stops(c: Ctx, obs: "Observer", fetch: Fetch, api: str, baseline_s: floa
         stops.append(f"the {label} Job failed before its end")
     try:
         stops += steal_stops(c, fetch, api, t)
+        stops += raw_steal_stops(c, fetch, api, t)
         stops += neighbour_alerts(c, fetch, api)
     except Exception as e:
         stops.append(f"an observer query failed: {type(e).__name__}")

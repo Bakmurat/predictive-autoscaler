@@ -117,9 +117,14 @@ class FakeVM:
     0.01, a queue of 1, equal per-pod request increases. Every selector is VALIDATED: an unknown query raises (an
     observer refusal), so a wrong label (e.g. nodename on node_cpu_seconds_total) never silently returns data."""
 
-    def __init__(self, sim_ingress, pod_names, steal=1.0, alerts=()):
+    def __init__(self, sim_ingress, pod_names, steal=1.0, alerts=(), raw_steal=None):
         self.ingress, self.pod_names, self.steal, self.alerts = sim_ingress, pod_names, steal, list(alerts)
         self.queries = []
+        # raw_steal: {instance: mode} for the UNDERLYING steal samples of that node-exporter instance, while the
+        # stepped range query (the bins) keeps answering as if all were well. Modes: ("stale", seconds) the newest
+        # sample is that old; "absent" no series; "empty" a series without samples; "nan" / "text" / "short" a
+        # malformed timestamp; ("future", seconds); "refused" the query itself fails.
+        self.raw_steal = dict(raw_steal or {})
 
     def series(self, lo, hi, step, value, metric=None):
         return {"metric": metric or {}, "values": [[t, str(value)] for t in range(int(-(-lo // step) * step),
@@ -160,9 +165,27 @@ class FakeVM:
                      % "|".join(re.escape(i) for i in INSTANCES.values()))
             if not any(re.match(k, sel) for k in known):
                 raise ValueError(f"FakeVM: unknown raw selector {sel}")
+            mode = next((m for i, m in self.raw_steal.items() if f'mode="steal",instance="{i}"' in sel), None)
             if sel.startswith("c28_ingress_requests_total"):
                 t = expr.split('target="')[1].split('"')[0]
                 res = [{"metric": {}, "values": [[a, str(b)] for a, b in self.ingress[t] if lo < a <= hi]}]
+            elif mode == "refused":
+                return {"status": "error", "error": "simulated refusal"}
+            elif mode == "absent":
+                res = []
+            elif mode == "empty":
+                res = [{"metric": {}, "values": []}]
+            elif mode in ("nan", "text", "short", "no-value", "text-value", "nan-value", "inf-value", "bool-value",
+                          "bool-time", "three"):
+                good = self.series(lo, hi, 15, 1.0)["values"]
+                bad = {"nan": ["NaN", "1"], "text": ["soon", "1"], "short": [], "no-value": [hi], "text-value": [hi, "not-a-number"],
+                       "nan-value": [hi, "NaN"], "inf-value": [hi, "+Inf"], "bool-value": [hi, True], "bool-time": [True, "1"],
+                       "three": [hi, "1", "extra"]}[mode]
+                res = [{"metric": {}, "values": good + [bad]}]          # fresh, well-formed samples beside one bad one
+            elif isinstance(mode, tuple) and mode[0] == "stale":
+                res = [self.series(lo, hi - mode[1], 15, 1.0)]
+            elif isinstance(mode, tuple) and mode[0] == "future":
+                res = [self.series(lo, hi + mode[1], 15, 1.0)]
             else:
                 res = [self.series(lo, hi, 15, 1.0)]
         return {"status": "success", "data": {"result": res}}
@@ -235,7 +258,7 @@ def test_prepares_generator_phase_refuses_while_a_bounded_workload_exists(world)
     assert any("a bounded admission workload exists" in x for x in probs)
 
 
-def _run(world, steal=1.0, alerts=(), **kw):  # noqa: F811
+def _run(world, steal=1.0, alerts=(), raw_steal=None, **kw):  # noqa: F811
     record, kube, base = ready_world(world)
     clock = Clock(O_MS - 180_000)
     a = JobApi(base, clock, O_MS + 40 * 60_000 + 60_000, **kw)
@@ -244,7 +267,7 @@ def _run(world, steal=1.0, alerts=(), **kw):  # noqa: F811
     assert p["problems"] == [], p["problems"]
     _, lines, ingress = simulated(c.params, "admission", O_MS)
     names = {t: [f"{t}-{i:02d}" for i in range(12)] for t in (N, R)}
-    vm = FakeVM(ingress, names, steal=steal, alerts=alerts)
+    vm = FakeVM(ingress, names, steal=steal, alerts=alerts, raw_steal=raw_steal)
     logs = lambda c_, pod: lines
     return record, kube, a, clock, c, p, d, logs, vm
 
@@ -294,6 +317,102 @@ def test_live_stops_end_the_load_before_any_evidence_is_collected(world, kw, tex
         return
     assert text in out["data"]["stopped"] and out["data"]["verdict"] == "STOPPED"
     assert seen and all(n == 0 for n in seen)                         # the generator pod was gone before collection
+
+
+W_INSTANCE, S_INSTANCE = (INSTANCES[n] for n in ("worker-w", "worker-s"))
+
+
+@pytest.mark.parametrize("steal", ["NaN", "+Inf", "-Inf"])
+def test_a_steal_rate_that_is_not_a_finite_number_stops_the_load(world, steal):  # noqa: F811
+    """Full, fresh bins whose value is NaN or infinite: NaN compares false with the limit, so without its own check
+    this would read as "below 5 %". The raw counter samples are healthy here: they cannot vouch for the derived rate."""
+    record, kube, a, clock, c, p, d, logs, vm = _run(world, steal=steal)
+    seen = []
+    inner = vm.__call__
+
+    class Probe:
+        def __call__(self, url):
+            if "c28_ingress_requests_total" in url:
+                seen.append(len(_gen_pods(a)))
+            return inner(url)
+    out = B.run_admission(c, p, d, Probe(), "http://vm", logs=logs)
+    assert out["data"]["verdict"] == "STOPPED" and "is not a finite number" in out["data"]["stopped"], out["data"]["stopped"]
+    assert "raw steal samples" not in out["data"]["stopped"]
+    assert seen and all(n == 0 for n in seen)
+    assert not os.path.exists(X.lock_file(record)) and not X.open_intents(X.receipts(record, B.HELPER))
+
+
+def test_unusable_raw_values_and_unusable_bins_together_stop_through_live_stops(world):  # noqa: F811
+    """The combined case from the review: fresh raw timestamps carrying NaN counter values AND fresh NaN bins."""
+    record, kube, a, clock, c, p, d, logs, vm = _run(world, steal="NaN", raw_steal={W_INSTANCE: "nan-value", S_INSTANCE: "nan-value"})
+    out = B.run_admission(c, p, d, vm, "http://vm", logs=logs)
+    assert out["data"]["verdict"] == "STOPPED"
+    for text in ("steal observation of workload node is not a finite number", "steal observation of support node is not a finite number",
+                 "raw steal samples of the workload node missing or malformed", "raw steal samples of the support node missing or malformed"):
+        assert text in out["data"]["stopped"], out["data"]["stopped"]
+    assert not os.path.exists(X.lock_file(record)) and not X.open_intents(X.receipts(record, B.HELPER))
+
+
+@pytest.mark.parametrize("raw_steal, text", [
+    ({S_INSTANCE: ("stale", 121)}, "the newest raw steal sample of the support node is older than 120 s"),
+    ({W_INSTANCE: ("stale", 300)}, "the newest raw steal sample of the workload node is older than 120 s"),
+    ({W_INSTANCE: "absent"}, "raw steal samples of the workload node missing or malformed"),
+    ({S_INSTANCE: "empty"}, "raw steal samples of the support node missing or malformed"),
+    ({S_INSTANCE: "nan"}, "raw steal samples of the support node missing or malformed"),
+    ({W_INSTANCE: "text"}, "raw steal samples of the workload node missing or malformed"),
+    ({W_INSTANCE: "short"}, "raw steal samples of the workload node missing or malformed"),
+    ({S_INSTANCE: "no-value"}, "raw steal samples of the support node missing or malformed"),
+    ({W_INSTANCE: "text-value"}, "raw steal samples of the workload node missing or malformed"),
+    ({S_INSTANCE: "nan-value"}, "raw steal samples of the support node missing or malformed"),
+    ({W_INSTANCE: "inf-value"}, "raw steal samples of the workload node missing or malformed"),
+    ({S_INSTANCE: "bool-value"}, "raw steal samples of the support node missing or malformed"),
+    ({W_INSTANCE: "bool-time"}, "raw steal samples of the workload node missing or malformed"),
+    ({S_INSTANCE: "three"}, "raw steal samples of the support node missing or malformed"),
+    ({S_INSTANCE: ("future", 60)}, "raw steal samples of the support node are from the future"),
+    ({S_INSTANCE: "refused"}, "an observer query failed"),
+    # Within the live limit the load is NOT stopped. (The evidence collected afterwards has its own, stricter
+    # staleness criterion, so a 105 s hole still leaves that run INCOMPLETE: not stopped is not the same as accepted.)
+    ({S_INSTANCE: ("stale", 105)}, "INCOMPLETE"),
+    ({W_INSTANCE: ("future", 0)}, "PASS")])
+def test_lost_underlying_steal_samples_stop_the_load_though_the_bins_look_fresh(world, raw_steal, text):  # noqa: F811
+    """The stepped range query keeps answering with full, low bins in every case here: only the raw samples show that
+    the safety observation is gone, and that must reach the executor's own stop path."""
+    record, kube, a, clock, c, p, d, logs, vm = _run(world, raw_steal=raw_steal)
+    seen = []
+    inner = vm.__call__
+
+    class Probe:
+        def __call__(self, url):
+            if "c28_ingress_requests_total" in url:                   # the collection's first query
+                seen.append(len(_gen_pods(a)))
+            return inner(url)
+    out = B.run_admission(c, p, d, Probe(), "http://vm", logs=logs)
+    assert any("node_uname_info" in q and 'mode="steal"' in q and "rate(" in q for q in vm.queries)   # the bins were asked
+    if text in ("PASS", "INCOMPLETE"):
+        assert not out["data"]["stopped"] and out["data"]["verdict"] == text
+        return
+    assert text in out["data"]["stopped"] and out["data"]["verdict"] == "STOPPED", out["data"]["stopped"]
+    assert "steal above" not in out["data"]["stopped"] and "steal observation of" not in out["data"]["stopped"]
+    assert seen and all(n == 0 for n in seen)                         # the generator pod was gone before collection
+    assert not os.path.exists(X.lock_file(record)) and not X.open_intents(X.receipts(record, B.HELPER))
+
+
+def test_the_raw_steal_check_reads_raw_samples_at_the_evaluation_time(world):  # noqa: F811
+    record, kube, a, clock, c, p, d, logs, vm = _run(world)
+    urls = []
+    inner = vm.__call__
+
+    def fetch(url):
+        urls.append(url)
+        return inner(url)
+    now = 1_800_000_000.0
+    assert B.raw_steal_stops(c, fetch, "http://vm", now) == []
+    import urllib.parse as U
+    raw = [dict(U.parse_qsl(U.urlparse(u).query)) for u in urls if "node_cpu_seconds_total" in u]
+    assert len(raw) == 2 and all(U.urlparse(u).path.endswith("/api/v1/query") for u in urls)      # never query_range
+    assert sorted(r["query"] for r in raw) == sorted(
+        f'node_cpu_seconds_total{{job="node-exporter",mode="steal",instance="{i}"}}[300s]' for i in (W_INSTANCE, S_INSTANCE))
+    assert all(float(r["time"]) == now for r in raw)
 
 
 def test_stop_load_acts_on_recorded_identities_only(world):  # noqa: F811
