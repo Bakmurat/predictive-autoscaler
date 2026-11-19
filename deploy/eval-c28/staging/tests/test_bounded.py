@@ -40,6 +40,7 @@ def ready_world(world):  # noqa: F811
         conds = a.obj("Node", n).setdefault("status", {}).setdefault("conditions", [])
         if not any(x["type"] == "PIDPressure" for x in conds):
             conds.append({"type": "PIDPressure", "status": "False"})
+        a.obj("Node", n)["status"]["capacity"] = {"cpu": str(CPUS)}       # node-exporter: one steal series per CPU
     for name in (N, R):
         dep = a.obj("Deployment", name, "demo")
         dep["status"] = {"replicas": 12, "readyReplicas": 12, "updatedReplicas": 12}
@@ -53,6 +54,9 @@ def ready_world(world):  # noqa: F811
         a.put({"apiVersion": "discovery.k8s.io/v1", "kind": "EndpointSlice",
                "metadata": {"name": f"{name}-x", "namespace": "demo", "labels": {"kubernetes.io/service-name": name}},
                "endpoints": [{"conditions": {"ready": True}, "targetRef": {"uid": u}} for u in uids]})
+    ing = F.pod(INGRESS_POD, "demo", "worker-w", labels={"app.kubernetes.io/name": "c28-ingress", X.RUN_LABEL: DEMO})
+    ing["status"]["conditions"] = [{"type": "Ready", "status": "True", "lastTransitionTime": "2026-11-10T00:00:00Z"}]
+    a.put(ing)
     return record, kube, a
 
 
@@ -109,6 +113,9 @@ class JobApi(F.FakeApi2):
 
 
 INSTANCES = {"worker-w": "10.0.0.1:9100", "worker-s": "10.0.0.2:9100"}
+INGRESS_POD = "c28-ingress-7c9d-abcde"
+CPUS = 4
+POD_NAMES = {t: [f"{t}-{i:02d}" for i in range(12)] for t in ("c28-demo-pa-n", "c28-demo-pa-r")}
 
 
 class FakeVM:
@@ -117,14 +124,24 @@ class FakeVM:
     0.01, a queue of 1, equal per-pod request increases. Every selector is VALIDATED: an unknown query raises (an
     observer refusal), so a wrong label (e.g. nodename on node_cpu_seconds_total) never silently returns data."""
 
-    def __init__(self, sim_ingress, pod_names, steal=1.0, alerts=(), raw_steal=None):
+    def __init__(self, sim_ingress, pod_names, steal=1.0, alerts=(), raw_steal=None, telemetry=None,
+                 raw_steal_from_s=0.0):
         self.ingress, self.pod_names, self.steal, self.alerts = sim_ingress, pod_names, steal, list(alerts)
         self.queries = []
+        # telemetry: {freshness key or "cfs/generator": mode} for the RAW series the telemetry gate reads. Modes:
+        # "absent" no series; ("drop", pod) that pod's series are missing; ("extra", pod) one more pod's series;
+        # "twice" every series a second time under another job (scraped twice); ("stale", seconds); ("short", n)
+        # only the newest n samples; ("gap", seconds) a hole that long before the newest sample; "nan-value";
+        # ("future", seconds); "refused". A callable mode(now_s) returns the mode in force at that time.
+        self.telemetry = dict(telemetry or {})
         # raw_steal: {instance: mode} for the UNDERLYING steal samples of that node-exporter instance, while the
         # stepped range query (the bins) keeps answering as if all were well. Modes: ("stale", seconds) the newest
         # sample is that old; "absent" no series; "empty" a series without samples; "nan" / "text" / "short" a
         # malformed timestamp; ("future", seconds); "refused" the query itself fails.
         self.raw_steal = dict(raw_steal or {})
+        # ... in force only for queries evaluated at or after raw_steal_from_s: a source that is lost DURING a run
+        # (one that is already lost before it is refused by the telemetry gate, before anything is created).
+        self.raw_steal_from_s = raw_steal_from_s
 
     def series(self, lo, hi, step, value, metric=None):
         return {"metric": metric or {}, "values": [[t, str(value)] for t in range(int(-(-lo // step) * step),
@@ -140,8 +157,8 @@ class FakeVM:
         res = []
         if u.path.endswith("query_range"):
             lo, hi, step = float(q["start"]), float(q["end"]), int(q["step"][:-1])
-            if "mode=\"steal\"" in expr and "node_uname_info" in expr:
-                res = [self.series(lo, hi, step, self.steal)]
+            if "mode=\"steal\"" in expr and "node_uname_info" in expr:      # steal: a value, or a function of the time
+                res = [self.series(lo, hi, step, self.steal(hi) if callable(self.steal) else self.steal)]
             elif "container_cpu_cfs_throttled_periods_total" in expr:
                 res = [self.series(lo, hi, step, 0.01)]
             elif expr.startswith("sum(c28_queue{"):
@@ -165,10 +182,13 @@ class FakeVM:
                      % "|".join(re.escape(i) for i in INSTANCES.values()))
             if not any(re.match(k, sel) for k in known):
                 raise ValueError(f"FakeVM: unknown raw selector {sel}")
-            mode = next((m for i, m in self.raw_steal.items() if f'mode="steal",instance="{i}"' in sel), None)
-            if sel.startswith("c28_ingress_requests_total"):
-                t = expr.split('target="')[1].split('"')[0]
-                res = [{"metric": {}, "values": [[a, str(b)] for a, b in self.ingress[t] if lo < a <= hi]}]
+            mode = next((m for i, m in self.raw_steal.items() if f'mode="steal",instance="{i}"' in sel
+                         and hi >= self.raw_steal_from_s), None)
+            tele = self._telemetry(sel, lo, hi)
+            if tele is not None:
+                if tele == "refused":
+                    return {"status": "error", "error": "simulated refusal"}
+                res = tele
             elif mode == "refused":
                 return {"status": "error", "error": "simulated refusal"}
             elif mode == "absent":
@@ -188,7 +208,85 @@ class FakeVM:
                 res = [self.series(lo, hi + mode[1], 15, 1.0)]
             else:
                 res = [self.series(lo, hi, 15, 1.0)]
+            if tele is None and sel.startswith("node_cpu_seconds_total"):
+                res = self._per_cpu(res, mode, hi)
         return {"status": "success", "data": {"result": res}}
+
+    def _per_cpu(self, res, mode, hi):
+        """node-exporter's shape: the steal counter once per CPU. CPU modes: "one-cpu" (a single series, as a
+        one-CPU node or a broken relabeling would give), "cpu-twice", "cpu-extra", ("cpu-stale", seconds) for ONE
+        CPU while the others stay fresh."""
+        out = [dict(x, metric={**x["metric"], "cpu": str(i)}) for i in range(CPUS) for x in res]
+        if mode == "one-cpu":
+            return out[:1]
+        if mode == "cpu-twice":
+            return out + [dict(out[0], metric={**out[0]["metric"], "job": "other"})]
+        if mode == "cpu-sparse":                          # the right number of CPUs, ids not 0..n-1
+            return out[:-1] + [dict(out[-1], metric={**out[-1]["metric"], "cpu": str(CPUS + 1)})]
+        if mode == "no-cpu-label":
+            return [dict(x, metric={}) for x in out[:1]]
+        if mode == "cpu-extra":
+            return out + [dict(out[0], metric={"cpu": str(CPUS + 3)})]
+        if isinstance(mode, tuple) and mode[0] == "cpu-stale":
+            return out[:-1] + [dict(out[-1], values=[v for v in out[-1]["values"] if v[0] <= hi - mode[1]])]
+        return out
+
+
+def _telemetry_method(self, sel, lo, hi):
+    """The RAW series of the fixture, the ingress and cAdvisor: one series per pod, as a scraper stores them."""
+    import re
+    if sel.startswith("c28_"):
+        t = sel.split('target="')[1].split('"')[0]
+        kind = {"c28_ingress_requests_total": "ingress", "c28_queue": "queue", "c28_requests_total": "requests"}[
+            sel.split("{")[0]]
+        key = f"{kind}/{t}"
+        if kind == "ingress":
+            samples = self.ingress.get(t) if self.ingress else None
+            series = [{"metric": {"target": t, "pod": INGRESS_POD}, "values":
+                       [[a, str(b)] for a, b in samples if lo < a <= hi]}] if samples is not None else \
+                [self.series(lo, hi, 15, 100.0, {"target": t, "pod": INGRESS_POD})]
+        else:
+            extra = {"code": "200"} if kind == "requests" else {}
+            series = [self.series(lo, hi, 15, 1.0, {"target": t, "pod": n, **extra}) for n in self.pod_names.get(t, [])]
+    elif sel.startswith("container_cpu_cfs_"):
+        rx = sel.split('pod=~"')[1].split('"')[0]
+        who = "ingress" if rx.startswith("c28-ingress") else "fixture" if ".*" in rx else "generator"
+        key = ("cfs_throttled/" if "throttled" in sel else "cfs_periods/") + who
+        known = [n for ns in self.pod_names.values() for n in ns] + [INGRESS_POD]
+        pods = [n for n in known if re.fullmatch(rx, n)] or ([rx] if who == "generator" else [])
+        series = [self.series(lo, hi, 15, 1.0, {"pod": n, "container": "c"}) for n in pods]
+    else:
+        return None
+    mode = self.telemetry.get(key)
+    if callable(mode):
+        mode = mode(hi)
+    if mode is None:
+        return series
+    if mode == "refused":
+        return "refused"
+    if mode == "absent":
+        return []
+    if mode == "twice":
+        return series + [dict(x, metric={**x["metric"], "job": "kubernetes-pods"}) for x in series]
+    if mode == "nan-value":
+        return [dict(x, values=x["values"] + [[hi, "NaN"]]) for x in series]
+    kind_, arg = mode
+    if kind_ == "drop":
+        return [x for x in series if x["metric"].get("pod") != arg]
+    if kind_ == "extra":
+        return series + [self.series(lo, hi, 15, 1.0, {**series[0]["metric"], "pod": arg})]
+    if kind_ == "stale":
+        return [dict(x, values=[v for v in x["values"] if v[0] <= hi - arg]) for x in series]
+    if kind_ == "short":
+        return [dict(x, values=x["values"][-arg:] if arg else []) for x in series]
+    if kind_ == "gap":
+        return [dict(x, values=[v for v in x["values"] if not hi - arg - 15 < v[0] < hi - 15]) for x in series]
+    if kind_ == "future":
+        return [dict(x, values=x["values"] + [[hi + arg, "1"]]) for x in series]
+    raise ValueError(f"FakeVM: unknown telemetry mode {mode}")
+
+
+FakeVM._telemetry = _telemetry_method
 
 
 def simulated(params, label, origin_ms, stalls=()):
@@ -209,9 +307,10 @@ def simulated(params, label, origin_ms, stalls=()):
     return cfg, [json.dumps(l) for l in out["lines"]], out["ingress"]
 
 
-def plan_now(record, kube, clock):
+def plan_now(record, kube, clock, vm=None):
+    """A plan made with the observer (vm; default: a steady one on which every series the gate reads is healthy)."""
     c = B.Ctx(record, kube, now=clock.now, sleep=clock.sleep)
-    p = B.plan_admission(c, ORIGIN)
+    p = B.plan_admission(c, ORIGIN, vm or FakeVM(None, POD_NAMES), "http://vm")
     saved = X.save_plan(record, B.HELPER, p, "plan-admission")
     return c, X.load_plan(saved["plan"]), saved["plan_digest"]
 
@@ -267,7 +366,7 @@ def _run(world, steal=1.0, alerts=(), raw_steal=None, **kw):  # noqa: F811
     assert p["problems"] == [], p["problems"]
     _, lines, ingress = simulated(c.params, "admission", O_MS)
     names = {t: [f"{t}-{i:02d}" for i in range(12)] for t in (N, R)}
-    vm = FakeVM(ingress, names, steal=steal, alerts=alerts, raw_steal=raw_steal)
+    vm = FakeVM(ingress, names, steal=steal, alerts=alerts, raw_steal=raw_steal, raw_steal_from_s=O_MS / 1000)
     logs = lambda c_, pod: lines
     return record, kube, a, clock, c, p, d, logs, vm
 
@@ -344,7 +443,9 @@ def test_a_steal_rate_that_is_not_a_finite_number_stops_the_load(world, steal): 
 
 def test_unusable_raw_values_and_unusable_bins_together_stop_through_live_stops(world):  # noqa: F811
     """The combined case from the review: fresh raw timestamps carrying NaN counter values AND fresh NaN bins."""
-    record, kube, a, clock, c, p, d, logs, vm = _run(world, steal="NaN", raw_steal={W_INSTANCE: "nan-value", S_INSTANCE: "nan-value"})
+    # both from the origin on: sources already unusable BEFORE the run are refused by the telemetry gate instead
+    record, kube, a, clock, c, p, d, logs, vm = _run(world, steal=lambda hi: "NaN" if hi >= O_MS / 1000 else 1.0,
+                                                     raw_steal={W_INSTANCE: "nan-value", S_INSTANCE: "nan-value"})
     out = B.run_admission(c, p, d, vm, "http://vm", logs=logs)
     assert out["data"]["verdict"] == "STOPPED"
     for text in ("steal observation of workload node is not a finite number", "steal observation of support node is not a finite number",
@@ -373,7 +474,15 @@ def test_unusable_raw_values_and_unusable_bins_together_stop_through_live_stops(
     # Within the live limit the load is NOT stopped. (The evidence collected afterwards has its own, stricter
     # staleness criterion, so a 105 s hole still leaves that run INCOMPLETE: not stopped is not the same as accepted.)
     ({S_INSTANCE: ("stale", 105)}, "INCOMPLETE"),
-    ({W_INSTANCE: ("future", 0)}, "PASS")])
+    ({W_INSTANCE: ("future", 0)}, "PASS"),
+    # node-exporter exports the counter per CPU: a healthy CPU must not hide another CPU's lost series during the run
+    ({S_INSTANCE: ("cpu-stale", 121)}, "the newest raw steal sample of the support node is older than 120 s"),
+    ({W_INSTANCE: ("cpu-stale", 300)}, "the newest raw steal sample of the workload node is older than 120 s"),
+    ({W_INSTANCE: "one-cpu"}, "raw steal samples of the workload node do not cover exactly its 4 CPUs, each once"),
+    ({S_INSTANCE: "cpu-twice"}, "raw steal samples of the support node do not cover exactly its 4 CPUs, each once"),
+    ({S_INSTANCE: "cpu-sparse"}, "raw steal samples of the support node do not cover exactly its 4 CPUs, each once"),
+    ({S_INSTANCE: "no-cpu-label"}, "raw steal samples of the support node missing or malformed"),
+    ({S_INSTANCE: ("cpu-stale", 105)}, "INCOMPLETE")])
 def test_lost_underlying_steal_samples_stop_the_load_though_the_bins_look_fresh(world, raw_steal, text):  # noqa: F811
     """The stepped range query keeps answering with full, low bins in every case here: only the raw samples show that
     the safety observation is gone, and that must reach the executor's own stop path."""
@@ -543,11 +652,11 @@ def _startup(world, admission=True, stalls=(), **kw):  # noqa: F811
     a = StartupApi(base, clock, o2 + 15 * 60_000 + 40_000, **kw)
     kube = record.kube(api=a)
     c = B.Ctx(record, kube, now=clock.now, sleep=clock.sleep)
-    p = B.plan_startup(c, _ts(o2))
+    p = B.plan_startup(c, _ts(o2), FakeVM(None, POD_NAMES), "http://vm")
     saved = X.save_plan(record, B.HELPER, p, "plan-startup")
     _, lines, ingress = simulated(c.params, "startup", o2,
                                   stalls=[{"at_ms": o2 + x[0], "for_ms": x[1]} for x in stalls])
-    vm = FakeVM(ingress, {R: []})
+    vm = FakeVM(ingress, POD_NAMES)
     return record, kube, a, clock, c, X.load_plan(saved["plan"]), saved["plan_digest"], vm, lines
 
 
@@ -566,7 +675,7 @@ def test_an_admission_pass_for_another_configuration_does_not_count(world):  # n
     r = X.last(X.receipts(record, B.HELPER), "run-complete")["data"]
     with open(os.path.join(r["dir"], "verdict.json"), "a") as fh:      # the verdict file altered after the run
         fh.write(" ")
-    assert any("no longer hashes" in x for x in B.plan_startup(c, p["origin_utc"])["problems"])
+    assert any("no longer hashes" in x for x in B.plan_startup(c, p["origin_utc"], FakeVM(None, POD_NAMES), "http://vm")["problems"])
 
 
 def test_a_startup_step_measures_six_starts_under_proven_load_and_meets_its_obligation(world):  # noqa: F811
@@ -671,7 +780,7 @@ def test_an_evidence_failure_never_blocks_the_restore(world, monkeypatch):  # no
     real = B._write
 
     def broken(path, doc):
-        if "startup-" in path:
+        if "startup-" in path and "telemetry-" not in path:      # the evidence, not the gate's archive before it
             raise OSError("disk full")
         return real(path, doc)
     monkeypatch.setattr(B, "_write", broken)
@@ -709,7 +818,7 @@ def test_an_admission_pass_is_void_for_a_changed_live_workload(world):  # noqa: 
     assert p["problems"] == []
     tpl = a.obj("Deployment", N, "demo")["spec"]["template"]["spec"]["containers"][0]
     tpl.setdefault("resources", {}).setdefault("limits", {})["memory"] = "16Mi"
-    assert any("other images, configuration" in x for x in B.plan_startup(c, p["origin_utc"])["problems"])
+    assert any("other images, configuration" in x for x in B.plan_startup(c, p["origin_utc"], FakeVM(None, POD_NAMES), "http://vm")["problems"])
 
 
 def test_a_stalled_generator_is_not_the_scheduled_load(world):  # noqa: F811
@@ -727,7 +836,7 @@ def test_a_configuration_changed_during_the_run_is_never_a_pass(world):  # noqa:
 
     class Probe:
         def __call__(self, url):
-            if "c28_ingress_requests_total" in url:                   # during the collection
+            if "c28_ingress_requests_total" in url and clock.ms > O_MS:   # during the collection (not the gate)
                 tpl = a.obj("Deployment", N, "demo")["spec"]["template"]["spec"]["containers"][0]
                 tpl.setdefault("resources", {}).setdefault("limits", {})["memory"] = "16Mi"
             return inner(url)
@@ -788,3 +897,424 @@ def test_a_crashed_admission_is_cleaned_up_through_plan_stop_and_stop(world):  #
     assert out["event"] == "run-stopped-by-operator"
     assert not _gen_pods(a) and a.obj("Job", "c28-demo-admission", "demo") is None
     assert a.obj("ConfigMap", "c28-demo-admission", "demo") is None and not os.path.exists(X.lock_file(record))
+
+
+# --- the telemetry gate (after the admission run of 2026-11-19, whose verdict could not pass) -----------------------
+
+def _gate_plan(world, telemetry=None, raw_steal=None, edit=None):  # noqa: F811
+    record, kube, a = ready_world(world)
+    if edit:
+        edit(a)
+    vm = FakeVM(None, POD_NAMES, telemetry=telemetry, raw_steal=raw_steal)
+    c, p, d = plan_now(record, kube, Clock(O_MS - 180_000), vm)
+    return record, kube, a, c, p, d, vm
+
+
+def test_the_plan_binds_exactly_the_verdicts_freshness_inventory_and_nothing_that_varies(world):  # noqa: F811
+    record, kube, a, c, p, d, vm = _gate_plan(world)
+    assert p["problems"] == [], p["problems"]
+    tele = p["telemetry"]
+    assert sorted(r["key"] for part in ("existing", "generator") for r in tele[part]) == \
+        c.verdicts.freshness_inventory([N, R])
+    assert [r["key"] for r in tele["generator"]] == ["cfs_periods/generator", "cfs_throttled/generator"]
+    text = json.dumps(tele)
+    assert "at_s" not in text and INGRESS_POD not in text and not any(n in text for n in POD_NAMES[N] + POD_NAMES[R])
+    assert not any(i in text for i in INSTANCES.values())                 # the node instance is resolved when observed
+    # what was observed is on the context, outside the plan: a later observation gives the SAME plan digest
+    first = c.telemetry
+    assert first["problems"] == [] and set(first["observed"]) == {r["key"] for r in tele["existing"]}
+    assert first["observed"][f"queue/{N}"]["series"] == 12 and first["observed"][f"ingress/{R}"]["series"] == 1
+    c2, p2, d2 = plan_now(record, kube, Clock(O_MS - 150_000), vm)
+    assert d2 == d and c2.telemetry["at_s"] == first["at_s"] + 30
+
+
+@pytest.mark.parametrize("telemetry, key, text", [
+    ({f"queue/{N}": "absent"}, f"queue/{N}", "no series"),                 # the installation of 2026-11-19
+    ({f"requests/{R}": "absent"}, f"requests/{R}", "no series"),
+    ({f"ingress/{N}": "absent"}, f"ingress/{N}", "no series"),             # a counter born at the first request
+    ({f"ingress/{N}": "twice"}, f"ingress/{N}", "2 series where exactly one is expected"),
+    ({f"queue/{N}": ("drop", f"{N}-03")}, f"queue/{N}", "no series for 1 of 12 expected pods"),
+    ({f"requests/{N}": ("drop", f"{N}-00")}, f"requests/{N}", "no series for 1 of 12 expected pods"),
+    ({f"queue/{N}": ("extra", f"{N}-zz")}, f"queue/{N}", "series of 1 pods that are not live Ready pods of it"),
+    ({f"queue/{R}": "twice"}, f"queue/{R}", "more than one series for the same pod (scraped twice?)"),
+    ({f"requests/{N}": "twice"}, f"requests/{N}", "more than one series for the same pod and code (scraped twice?)"),
+    ({f"queue/{N}": ("stale", 61)}, f"queue/{N}", "the newest sample of a series is older than 60 s"),
+    ({f"requests/{N}": ("short", 2)}, f"requests/{N}", "a series with fewer than 3 samples in the lookback"),
+    ({f"queue/{N}": ("short", 0)}, f"queue/{N}", "a series with fewer than 3 samples in the lookback"),
+    ({f"queue/{N}": ("gap", 61)}, f"queue/{N}", "a gap above 60 s between samples"),
+    ({f"queue/{N}": "nan-value"}, f"queue/{N}", "a sample that is not a finite [timestamp, value]"),
+    ({f"queue/{N}": ("future", 6)}, f"queue/{N}", "a sample from the future"),
+    ({f"queue/{N}": "refused"}, f"queue/{N}", "the query failed"),
+    ({"cfs_periods/fixture": ("drop", f"{R}-11")}, "cfs_periods/fixture", "no series for 1 of 24 expected pods"),
+    ({"cfs_throttled/ingress": "absent"}, "cfs_throttled/ingress", "no series"),
+    ({"cfs_throttled/fixture": ("stale", 61)}, "cfs_throttled/fixture", "older than 60 s"),
+])
+def test_the_plan_refuses_when_a_series_the_verdict_reads_is_not_there_as_expected(world, telemetry, key, text):  # noqa: F811
+    *_, p, d, vm = _gate_plan(world, telemetry)
+    assert p["problems"] and all(x.startswith(f"telemetry {key}: ") for x in p["problems"]), p["problems"]
+    assert any(text in x for x in p["problems"]), p["problems"]
+
+
+@pytest.mark.parametrize("telemetry", [
+    {f"queue/{N}": ("stale", 60)},                                         # exactly at the limit
+    {f"queue/{N}": ("future", 5)},
+    {f"requests/{N}": ("short", 3)},
+    {"cfs_periods/fixture": ("extra", "some-other-pod")},                  # cAdvisor: other pods' series do not matter
+    {"cfs_periods/generator": "absent"},                                   # not part of what exists before the run
+])
+def test_the_plan_accepts_what_is_within_the_limits(world, telemetry):  # noqa: F811
+    *_, p, d, vm = _gate_plan(world, telemetry)
+    assert p["problems"] == [], p["problems"]
+
+
+@pytest.mark.parametrize("raw_steal, text", [
+    ({W_INSTANCE: "absent"}, "telemetry steal_raw/w: no series"),
+    ({S_INSTANCE: ("stale", 121)}, "telemetry steal_raw/s: the newest sample of a series is older than 120 s"),
+    ({S_INSTANCE: "nan-value"}, "telemetry steal_raw/s: a sample that is not a finite [timestamp, value]"),
+    ({W_INSTANCE: "refused"}, "telemetry steal_raw/w: the query failed"),
+    # node-exporter exports the steal counter per CPU: exactly the node's CPUs, each once, EVERY one fresh
+    ({W_INSTANCE: "one-cpu"}, "telemetry steal_raw/w: no series for 3 of 4 expected CPUs (for example 1)"),
+    ({S_INSTANCE: "cpu-twice"}, "telemetry steal_raw/s: more than one series for the same cpu (scraped twice?)"),
+    ({W_INSTANCE: "cpu-extra"}, "telemetry steal_raw/w: series of 1 CPUs that the node does not have (for example 7)"),
+    ({S_INSTANCE: ("cpu-stale", 121)}, "telemetry steal_raw/s: the newest sample of a series is older than 120 s"),
+    # the Node object gives a CPU COUNT; the ids 0..n-1 are an assumption, verified here before any run
+    ({W_INSTANCE: "cpu-sparse"}, "telemetry steal_raw/w: the node has 4 CPUs but their ids are not 0..3: the gate assumes "
+                                 "dense CPU ids"),
+])
+def test_the_plan_refuses_a_steal_source_that_is_already_lost(world, raw_steal, text):  # noqa: F811
+    *_, p, d, vm = _gate_plan(world, raw_steal=raw_steal)
+    assert any(text in x for x in p["problems"]), p["problems"]
+
+
+def test_a_steal_source_within_the_live_limit_is_accepted_by_the_plan(world):  # noqa: F811
+    *_, c, p, d, vm = _gate_plan(world, raw_steal={S_INSTANCE: ("stale", 105)})
+    assert p["problems"] == []
+    seen = c.telemetry["observed"]                                         # a healthy multi-CPU node: every CPU judged
+    assert seen["steal_raw/w"]["series"] == seen["steal_raw/w"]["judged"] == seen["steal_raw/w"]["expected"] == CPUS
+
+
+def test_a_node_that_reports_no_cpu_count_cannot_have_its_steal_source_judged(world):  # noqa: F811
+    def no_capacity(a):
+        a.obj("Node", "worker-s")["status"].pop("capacity")
+    *_, p, d, vm = _gate_plan(world, edit=no_capacity)
+    assert p["problems"] == ["telemetry steal_raw/s: the query failed (StagingError)"]
+
+
+def _unready(a):
+    a.obj("Pod", f"{N}-05", "demo")["status"]["conditions"] = [{"type": "Ready", "status": "False"}]
+
+
+def _ingress_leaving(a):
+    a.obj("Pod", INGRESS_POD, "demo")["metadata"]["deletionTimestamp"] = "2026-11-11T00:00:00Z"
+
+
+@pytest.mark.parametrize("edit, text", [
+    (_unready, f"telemetry queue/{N}: series of 1 pods that are not live Ready pods of it"),
+    (_ingress_leaving, "telemetry cfs_periods/ingress: no live Ready pod is known for it")])
+def test_the_expected_pods_are_the_live_ready_ones(world, edit, text):  # noqa: F811
+    *_, p, d, vm = _gate_plan(world, edit=edit)
+    assert any(text in x for x in p["problems"]), p["problems"]
+
+
+def test_planning_needs_the_observer(world):  # noqa: F811
+    record, kube, a = ready_world(world)
+    c = B.Ctx(record, kube, now=Clock(O_MS - 180_000).now)
+    p = B.plan_admission(c, ORIGIN)
+    assert p["problems"] == ["telemetry: no query API was given, so the series the verdict reads cannot be checked"]
+    assert c.telemetry is None
+
+
+def test_a_run_refuses_before_any_mutation_when_the_telemetry_was_lost_after_the_review(world):  # noqa: F811
+    record, kube, a, clock, c, p, d, logs, vm = _run(world)
+    vm.telemetry[f"queue/{N}"] = "absent"                                  # healthy at the review, gone at apply
+    with pytest.raises(X.StagingError):
+        B.run_admission(c, p, d, vm, "http://vm", logs=logs)
+    assert kube.mutations == [] and not _gen_pods(a)
+    assert X.last(X.receipts(record, B.HELPER), "run-begin") is None
+    assert not os.path.exists(X.lock_file(record)) and not X.open_intents(X.receipts(record, B.HELPER))
+
+
+def test_a_run_whose_generator_has_no_telemetry_is_void_and_stopped_before_the_origin(world, monkeypatch):  # noqa: F811
+    record, kube, a, clock, c, p, d, logs, vm = _run(world)
+    vm.telemetry["cfs_throttled/generator"] = "absent"
+    stopped_at = []
+    real = B.stop_load
+    monkeypatch.setattr(B, "stop_load", lambda c_, run: (stopped_at.append(clock.ms), real(c_, run))[1])
+    out = B.run_admission(c, p, d, vm, "http://vm", logs=logs)
+    assert "VOID: the generator's telemetry was not complete before the origin" in out["data"]["stopped"]
+    assert "telemetry cfs_throttled/generator: no series" in out["data"]["stopped"]
+    assert out["data"]["verdict"] != "PASS"
+    # it waited for the telemetry, gave up 30 s before the origin, and the load generator was gone before it could send
+    assert stopped_at and O_MS - 30_000 <= stopped_at[0] < O_MS, (stopped_at, O_MS)
+    assert not _gen_pods(a) and a.obj("Job", "c28-demo-admission", "demo") is None
+    arch = json.load(open(os.path.join(out["data"]["dir"], "telemetry-generator.json")))
+    assert arch["problems"] == ["telemetry cfs_throttled/generator: no series"] and arch["pod"].startswith("c28-demo-admission-")
+    before = json.load(open(os.path.join(out["data"]["dir"], "telemetry-before-mutation.json")))
+    assert before["problems"] == [] and before["part"] == "existing"
+    assert not os.path.exists(X.lock_file(record)) and not X.open_intents(X.receipts(record, B.HELPER))
+
+
+def test_generator_telemetry_that_arrives_before_the_deadline_lets_the_run_go_on(world):  # noqa: F811
+    record, kube, a, clock, c, p, d, logs, vm = _run(world)
+    vm.telemetry["cfs_periods/generator"] = lambda hi: "absent" if hi < O_MS / 1000 - 100 else None
+    out = B.run_admission(c, p, d, vm, "http://vm", logs=logs)
+    assert out["data"]["verdict"] == "PASS" and not out["data"]["stopped"]
+    arch = json.load(open(os.path.join(out["data"]["dir"], "telemetry-generator.json")))
+    assert arch["problems"] == [] and O_MS / 1000 - 100 <= arch["at_s"] < O_MS / 1000 - 30
+    # the gate reads the collector's own selectors: every raw selector it asked for is one the collection asks for
+    gate = {q.rsplit("[", 1)[0] for q in vm.queries if q.endswith("[180s]")}
+    collected = {q.rsplit("[", 1)[0] for q in vm.queries if q.endswith("s]") and not q.endswith("[180s]")
+                 and not q.startswith(("sum", "100"))}
+    assert gate and gate <= collected, sorted(gate - collected)
+
+
+def test_the_commands_take_the_observer_and_keep_the_observation_outside_the_plan(world, capsys):  # noqa: F811
+    record, kube, a = ready_world(world)
+    vm = FakeVM(None, POD_NAMES)
+    assert B.main(["--record", record.path, "check-telemetry", "--query-api", "http://vm"], api=a, fetch=vm) == 0
+    seen = json.loads(capsys.readouterr().out)
+    assert seen["problems"] == [] and seen["telemetry"]["observed"][f"requests/{N}"]["expected"] == 12
+    vm.telemetry[f"queue/{R}"] = "absent"
+    assert B.main(["--record", record.path, "check-telemetry", "--query-api", "http://vm"], api=a, fetch=vm) == 4
+    assert json.loads(capsys.readouterr().out)["problems"] == [f"telemetry queue/{R}: no series"]
+    with pytest.raises(SystemExit):                                        # --query-api is required for a plan
+        B.main(["--record", record.path, "plan-admission", "--origin", ORIGIN], api=a, fetch=vm)
+    capsys.readouterr()
+    assert B.main(["--record", record.path, "plan-admission", "--origin", ORIGIN, "--query-api", "http://vm"],
+                  api=a, fetch=vm) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert any(f"telemetry queue/{R}: no series" in x for x in out["problems"])
+    obs = json.load(open(out["telemetry_observation"]))
+    assert obs["problems"] == [f"telemetry queue/{R}: no series"] and "at_s" in obs
+    assert os.path.dirname(out["telemetry_observation"]) == os.path.dirname(out["plan"])
+    assert "at_s" not in open(out["plan"]).read()
+
+
+def test_the_startup_plan_has_the_same_gate(world):  # noqa: F811
+    record, kube, a, clock, c, p, d, vm, lines = _startup(world)
+    assert p["problems"] == [] and sorted(r["key"] for part in ("existing", "generator") for r in p["telemetry"][part]) \
+        == c.verdicts.freshness_inventory([N, R])
+    bad = FakeVM(None, POD_NAMES, telemetry={f"requests/{R}": "absent"})
+    assert B.plan_startup(c, p["origin_utc"], bad, "http://vm")["problems"] == [f"telemetry requests/{R}: no series"]
+    assert any("no query API" in x for x in B.plan_startup(c, p["origin_utc"])["problems"])
+
+
+def test_a_startup_whose_generator_has_no_telemetry_is_void_and_restores_twelve(world):  # noqa: F811
+    record, kube, a, clock, c, p, d, vm, lines = _startup(world)
+    vm.telemetry["cfs_periods/generator"] = "absent"
+    data = run_s(c, p, d, vm, lines)["data"]
+    assert "VOID: the generator's telemetry was not complete before the origin" in data["stopped"]
+    assert data["measured"] is False
+    assert a.obj("Deployment", R, "demo")["spec"]["replicas"] == 12 and not B.open_obligations(record)
+    assert not [k for k in a.objects if k[0] in ("jobs", "configmaps", "pods") and "startup" in k[2]]
+
+
+def test_a_startup_refuses_before_any_mutation_when_the_telemetry_was_lost_after_the_review(world):  # noqa: F811
+    record, kube, a, clock, c, p, d, vm, lines = _startup(world)
+    before = len(kube.mutations)
+    vm.telemetry[f"queue/{R}"] = ("stale", 61)
+    with pytest.raises(X.StagingError):
+        run_s(c, p, d, vm, lines)
+    assert len(kube.mutations) == before and a.obj("Deployment", R, "demo")["spec"]["replicas"] == 12
+    assert not os.path.exists(X.lock_file(record)) and not B.open_obligations(record)
+
+
+# --- the generator deadline is enforced (Codex review of b48cbbd: acceptance at deadline + 5 s and after a slow query) ---
+
+class TimedVM:
+    """An observer that takes a timeout, like http_json: records the budget each generator query was given; `slow`
+    (seconds) is how long a generator query takes once the clock has reached `slow_from_s`; `fail` raises instead."""
+
+    def __init__(self, vm, clock, slow=0.0, slow_from_s=0.0, fail=False):
+        self.vm, self.clock, self.slow, self.slow_from_s, self.fail, self.budgets = vm, clock, slow, slow_from_s, fail, []
+
+    def __call__(self, url, timeout=None):
+        gate = "180s" in url                              # the gate's lookback; the collection asks other ranges
+        if gate and "container_cpu_cfs" in url and "c28-demo-" in url and ".%2A" not in url and ".*" not in url:
+            self.budgets.append(timeout)
+            if self.fail:
+                raise TimeoutError("timed out")
+            if self.clock.ms / 1000 >= self.slow_from_s:
+                self.clock.ms += self.slow * 1000                         # a slow but SUCCESSFUL answer
+        return self.vm(url)
+
+
+def _executor(world, kind):  # noqa: F811
+    """(record, api, clock, vm, origin_ms, run(fetch) -> data, generator name) for either bounded executor."""
+    if kind == "admission":
+        record, kube, a, clock, c, p, d, logs, vm = _run(world)
+        return record, a, clock, vm, O_MS, (
+            lambda fetch: B.run_admission(c, p, d, fetch, "http://vm", logs=logs)["data"]), "c28-demo-admission"
+    record, kube, a, clock, c, p, d, vm, lines = _startup(world)
+    return record, a, clock, vm, _ms_of(p["origin_utc"]), (
+        lambda fetch: B.run_startup(c, p, d, fetch, "http://vm", logs=lambda c_, pod: lines)["data"]), "c28-demo-startup"
+
+
+def _void_and_clean(record, a, data, gen):
+    assert "VOID: the generator's telemetry was not complete before the origin" in data["stopped"], data["stopped"]
+    assert data.get("verdict") != "PASS" and data.get("measured") is not True
+    assert not [k for k in a.objects if k[0] in ("jobs", "configmaps", "pods") and gen in k[2]]
+    assert a.obj("Deployment", R, "demo")["spec"]["replicas"] == 12 and not B.open_obligations(record)
+    assert not os.path.exists(X.lock_file(record)) and not X.open_intents(X.receipts(record, B.HELPER))
+
+
+@pytest.mark.parametrize("kind", ["admission", "startup"])
+@pytest.mark.parametrize("ready_after_deadline_s", [0.001, 5, 25])
+def test_generator_telemetry_that_becomes_ready_after_the_deadline_is_never_accepted(world, kind, ready_after_deadline_s):  # noqa: F811
+    record, a, clock, vm, origin, run, gen = _executor(world, kind)
+    ready_at = origin / 1000 - 30 + ready_after_deadline_s
+    vm.telemetry["cfs_periods/generator"] = lambda hi: "absent" if hi < ready_at else None
+    data = run(vm)
+    _void_and_clean(record, a, data, gen)
+    assert "telemetry cfs_periods/generator: no series" in data["stopped"]
+
+
+@pytest.mark.parametrize("kind", ["admission", "startup"])
+def test_generator_telemetry_ready_at_the_deadline_is_accepted(world, kind):  # noqa: F811
+    record, a, clock, vm, origin, run, gen = _executor(world, kind)
+    vm.telemetry["cfs_periods/generator"] = lambda hi: "absent" if hi < origin / 1000 - 35 else None
+    data = run(vm)
+    assert "VOID" not in (data["stopped"] or "")
+
+
+@pytest.mark.parametrize("kind", ["admission", "startup"])
+@pytest.mark.parametrize("slow_s", [40, 100])                               # past the deadline; past the origin itself
+def test_a_slow_successful_generator_query_cannot_be_accepted_late(world, kind, slow_s):  # noqa: F811
+    record, a, clock, vm, origin, run, gen = _executor(world, kind)
+    vm.telemetry["cfs_periods/generator"] = lambda hi: "absent" if hi < origin / 1000 - 60 else None
+    timed = TimedVM(vm, clock, slow=slow_s, slow_from_s=origin / 1000 - 60)
+    data = run(timed)
+    _void_and_clean(record, a, data, gen)
+    assert "the observation ended after the deadline" in data["stopped"]
+    # every generator query was given no more than the time left before the deadline
+    assert timed.budgets and all(b is not None and 0 < b <= 270 for b in timed.budgets)
+    assert min(timed.budgets) <= 30.5, timed.budgets
+
+
+@pytest.mark.parametrize("kind", ["admission", "startup"])
+def test_generator_queries_that_time_out_end_in_a_void_run_that_is_cleaned_up(world, kind):  # noqa: F811
+    record, a, clock, vm, origin, run, gen = _executor(world, kind)
+    timed = TimedVM(vm, clock, fail=True)
+    data = run(timed)
+    _void_and_clean(record, a, data, gen)
+    assert "the query failed (TimeoutError)" in data["stopped"]
+    budgets = [b for b in timed.budgets if b is not None]
+    assert budgets == sorted(budgets, reverse=True) and budgets[-1] <= 5.5    # shrinking towards the deadline
+
+
+def test_the_same_timestamp_twice_is_one_sample(world):  # noqa: F811
+    record, kube, a = ready_world(world)
+    c = B.Ctx(record, kube, now=Clock(O_MS - 180_000).now)
+    r = {"min_samples": 2, "max_age_s": 60, "unique": None}
+    now = (O_MS - 180_000) / 1000
+    twice = [{"metric": {"pod": "g"}, "values": [[now - 5, "1"], [now - 5, "1"]]}]
+    two = [{"metric": {"pod": "g"}, "values": [[now - 20, "1"], [now - 5, "2"]]}]
+    assert B._judge_series(r, twice, ["g"], "pod", now, 5)[1] == ["a series with fewer than 2 samples in the lookback"]
+    assert B._judge_series(r, two, ["g"], "pod", now, 5)[1] == []
+
+
+def test_an_observation_archived_after_the_deadline_is_not_accepted(world, monkeypatch):  # noqa: F811
+    record, a, clock, vm, origin, run, gen = _executor(world, "admission")
+    vm.telemetry["cfs_periods/generator"] = lambda hi: "absent" if hi < origin / 1000 - 35 else None
+    real = B._write
+
+    def slow_disk(path, doc):
+        if path.endswith("telemetry-generator.json"):
+            clock.ms += 20_000                                             # complete at -35 s, on disk at -15 s
+        return real(path, doc)
+    monkeypatch.setattr(B, "_write", slow_disk)
+    data = run(vm)
+    _void_and_clean(record, a, data, gen)
+    assert "the observation was archived after the deadline" in data["stopped"]
+
+
+# --- the observer request has a TOTAL time bound (Codex review of caf3274: a slowly delivered answer held the caller) ---
+
+def _serve(handler):
+    """A loopback HTTP server on a free port, in a thread: (base url, close)."""
+    import http.server
+    import threading
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            try:
+                handler(self)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+
+        def log_message(self, *a):
+            pass
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{srv.server_address[1]}", lambda: (srv.shutdown(), srv.server_close())
+
+
+def _slow_body(h):
+    import time
+    h.send_response(200)
+    h.send_header("Content-Type", "application/json")
+    h.end_headers()
+    for piece in ['{"status": "success", ', '"data": ', '{"result": ', "[", "]", "}", "}"] * 1:
+        h.wfile.write(piece.encode())
+        h.wfile.flush()
+        time.sleep(0.4)                                    # every piece arrives well inside a per-operation timeout
+
+
+def _slow_headers(h):
+    import time
+    for piece in [b"HTTP/1.1 200 OK\r\n", b"Content-Type: application/json\r\n", b"X-A: 1\r\n", b"X-B: 2\r\n",
+                  b"Content-Length: 2\r\n", b"\r\n", b"{}"]:
+        h.wfile.write(piece)
+        h.wfile.flush()
+        time.sleep(0.4)
+
+
+def _never(h):
+    import time
+    time.sleep(3)
+
+
+@pytest.mark.parametrize("handler", [_slow_body, _slow_headers, _never])
+def test_the_observer_request_is_bounded_in_total_not_per_operation(handler):
+    import time
+    url, close = _serve(handler)
+    try:
+        t0 = time.monotonic()
+        with pytest.raises(TimeoutError):
+            B.http_json(url + "/api/v1/query?query=up", timeout=0.5)
+        elapsed = time.monotonic() - t0
+        assert 0.45 <= elapsed < 0.9, elapsed              # the budget, not the 2.8 s the answer would take
+        t0 = time.monotonic()
+        with pytest.raises(TimeoutError):                  # through the gate's own limiter, with a budget under 0.5 s
+            B._fetch_within(B.http_json, url + "/x", 0.2)
+        assert time.monotonic() - t0 < 0.45                # the budget itself, never rounded up to half a second
+    finally:
+        close()
+
+
+def test_the_observer_request_still_returns_a_prompt_answer_and_refuses_an_error_status():
+    import urllib.error
+
+    def ok(h):
+        body = b'{"status": "success", "data": {"result": []}}'
+        h.send_response(200)
+        h.send_header("Content-Length", str(len(body)))
+        h.end_headers()
+        h.wfile.write(body)
+
+    def bad(h):
+        h.send_response(503)
+        h.send_header("Content-Length", "0")
+        h.end_headers()
+    url, close = _serve(lambda h: ok(h) if h.path.startswith("/ok") else bad(h))
+    try:
+        assert B.http_json(url + "/ok?query=up%7Ba%3D%221%22%7D", timeout=5) == {"status": "success", "data": {"result": []}}
+        with pytest.raises(urllib.error.HTTPError):
+            B.http_json(url + "/bad", timeout=5)
+        with pytest.raises(TimeoutError):
+            B.http_json(url + "/ok", timeout=0)
+        with pytest.raises(TimeoutError):
+            B._fetch_within(B.http_json, url + "/ok", 0.0)
+    finally:
+        close()

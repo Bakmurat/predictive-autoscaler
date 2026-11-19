@@ -168,6 +168,20 @@ func (c *counterVec) inc(labels string) {
 	c.m[labels]++
 }
 
+// ensure creates the series at zero when it does not exist yet and never changes an existing count. A counter that
+// first appears with its first increment has no sample before the traffic starts: a rate over the start of a run has
+// no left bracket, and "no requests yet" cannot be told from "not scraped".
+func (c *counterVec) ensure(labels string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.m == nil {
+		c.m = map[string]uint64{}
+	}
+	if _, ok := c.m[labels]; !ok {
+		c.m[labels] = 0
+	}
+}
+
 func (c *counterVec) write(w io.Writer, name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -222,6 +236,7 @@ func newServer(cfg serverConfig, now func() time.Time) (*server, error) {
 	for i := range s.body {
 		s.body[i] = 'x'
 	}
+	s.requests.ensure(label("code", "200")) // c28_requests_total exists, at zero, before the first request
 	sch, err := loadSchedule(cfg.FaultFile)
 	if err != nil {
 		return nil, err
@@ -381,8 +396,12 @@ func parseUpstreams(spec string) (map[string]string, error) {
 
 func newIngress(upstreams map[string]string, timeout time.Duration, now func() time.Time) *ingress {
 	tr := upstreamTransport(timeout)
-	return &ingress{upstreams: upstreams, now: now, latency: map[string]*histogram{}, timeout: timeout,
+	g := &ingress{upstreams: upstreams, now: now, latency: map[string]*histogram{}, timeout: timeout,
 		routing: routingService, client: &http.Client{Timeout: timeout, Transport: tr, CheckRedirect: noRedirect}}
+	for target := range upstreams {
+		g.arrivals.ensure(label("target", target)) // c28_ingress_requests_total exists, at zero, for every route
+	}
+	return g
 }
 
 func noRedirect(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
