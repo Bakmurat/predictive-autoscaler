@@ -70,14 +70,18 @@ Run (under the shared lock, every create and delete journalled):
 from __future__ import annotations
 
 import argparse
+import http.client
 import importlib
 import inspect
 import json
 import math
 import os
+import socket
 import subprocess
 import sys
+import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -295,18 +299,69 @@ class Observer:
 # --- the observer's evidence (VictoriaMetrics, read-only) -------------------------------------------------------------
 
 def http_json(url: str, timeout: float = 60.0) -> Dict:
-    with urllib.request.urlopen(url, timeout=timeout) as r:     # the reviewed observer endpoint (a local forward)
-        return json.loads(r.read())
+    """GET the reviewed observer endpoint (a local forward) and parse its JSON answer. `timeout` bounds the WHOLE
+    exchange: connecting, the headers and every part of the body. (A socket timeout bounds each operation only, so an
+    answer delivered in slow pieces could hold the caller, and with it the start of a cleanup, far beyond it.) At the
+    deadline the connection is shut down from a timer, which ends any read in progress; the result is a TimeoutError
+    whatever the read then reports. Name resolution is outside the bound: the endpoint is a literal address."""
+    if not timeout > 0:
+        raise TimeoutError("no time is left for the observer query")
+    end = time.monotonic() + timeout
+    u = urllib.parse.urlsplit(url)
+    if u.scheme not in ("http", "https") or not u.hostname:
+        raise ValueError("the observer endpoint must be an http(s) URL")
+    cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
+    conn = cls(u.hostname, u.port, timeout=timeout)
+    expired = threading.Event()
+
+    held: List[socket.socket] = []                       # the connected socket: http.client drops ITS reference
+                                                         # (conn.sock = None) for an answer that ends with the
+                                                         # connection, while the response still reads from it
+
+    def cut() -> None:
+        expired.set()
+        for sock in held:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+    timer: Optional[threading.Timer] = None
+    try:
+        try:
+            conn.connect()                                   # bounded by the connection's own timeout
+            held.append(conn.sock)
+            timer = threading.Timer(max(end - time.monotonic(), 0.0), cut)
+            timer.daemon = True
+            timer.start()
+            conn.request("GET", (u.path or "/") + (f"?{u.query}" if u.query else ""))
+            resp = conn.getresponse()
+            body = resp.read()
+        except (OSError, http.client.HTTPException) as e:
+            if expired.is_set() or time.monotonic() >= end:
+                raise TimeoutError(f"the observer did not answer completely within {timeout:g} s") from e
+            raise
+        if expired.is_set() or time.monotonic() >= end:      # a cut read can look like a short, clean answer
+            raise TimeoutError(f"the observer did not answer completely within {timeout:g} s")
+        if resp.status != 200:
+            raise urllib.error.HTTPError(url, resp.status, resp.reason, resp.headers, None)
+        return json.loads(body)
+    finally:
+        if timer is not None:
+            timer.cancel()
+        conn.close()
 
 
 def _fetch_within(fetch: Fetch, url: str, seconds: float) -> Dict:
-    """fetch(url) limited to `seconds` where the fetcher takes a timeout (http_json does). A fetcher without one (a
-    test double) is called as it is: the caller checks the clock after every call either way."""
+    """fetch(url) limited to exactly `seconds` where the fetcher takes a timeout (http_json does, as a bound on the
+    whole exchange). A fetcher without one (a test double) is called as it is: the caller checks the clock after
+    every call either way."""
+    if not seconds > 0:
+        raise TimeoutError("no time is left for the observer query")
     try:
         takes = "timeout" in inspect.signature(fetch).parameters
     except (TypeError, ValueError):
         takes = False
-    return fetch(url, timeout=max(0.5, seconds)) if takes else fetch(url)
+    return fetch(url, timeout=seconds) if takes else fetch(url)
 
 
 def _q(fetch: Fetch, api: str, path: str, **params) -> List[Dict]:
@@ -448,7 +503,12 @@ def _live_pods(c: Ctx) -> Dict[str, List[str]]:
 
 
 def _node_cpus(c: Ctx, role: str) -> List[str]:
-    """The CPU identities node-exporter exports for W or S: "0" .. "n-1" for the Node object's capacity."""
+    """The CPU identities expected from node-exporter for W or S: "0" .. "n-1" for the n CPUs of the Node object's
+    capacity. The Node object gives a COUNT, not identities: this ASSUMES the dense numbering Linux gives the online
+    CPUs of a node without offline or hot-unplugged CPUs. The assumption is verified wherever it is used: the gate
+    (at planning and before the first mutation) and the live stop compare these identities with the cpu labels the
+    observer actually holds, so a node with sparse ids is refused before a run, with a problem that names the
+    assumption (it would then need an explicit CPU inventory)."""
     name = c.params["nodes"]["workload" if role == "w" else "support"]
     cpu = str((((c.kube.get("Node", name) or {}).get("status") or {}).get("capacity") or {}).get("cpu") or "")
     if not cpu.isdigit() or int(cpu) < 1:
@@ -546,6 +606,11 @@ def telemetry_observe(c: Ctx, fetch: Fetch, api: str, tele: Dict, part: str, now
             problems.append(f"telemetry {r['key']}: the query failed ({type(e).__name__})")
             continue
         seen[r["key"]], why = _judge_series(r, series, want, label, now_s, tele["future_s"])
+        if label == "cpu" and isinstance(series, list):
+            ids = {str(x["metric"].get("cpu")) for x in series if isinstance(x, dict) and isinstance(x.get("metric"), dict)}
+            if len(ids) == len(want) and ids != set(want):
+                why = why + [f"the node has {len(want)} CPUs but their ids are not 0..{len(want) - 1}: the gate assumes "
+                             "dense CPU ids (a node with sparse ids needs an explicit CPU inventory)"]
         problems += [f"telemetry {r['key']}: {w}" for w in why]
     return seen, problems
 
@@ -881,28 +946,39 @@ def raw_steal_selector(instance: str) -> str:
 
 
 def raw_steal_stops(c: Ctx, fetch: Fetch, api: str, now_s: float) -> List[str]:
-    """The newest UNDERLYING steal sample of W and of S, from RAW samples (a range-vector instant query: never a
-    stepped range query, whose bins carry a value forward and so look fresh after the scrapes have stopped). The load
-    may continue only while its safety observation is alive: no series, no sample, a sample that is not exactly a
-    finite timestamp with a finite numeric value, a sample from the future, or a newest sample older than
-    RAW_STEAL_MAX_AGE_S is a stop."""
+    """The UNDERLYING steal samples of W and of S, from RAW samples (a range-vector instant query: never a stepped
+    range query, whose bins carry a value forward and so look fresh after the scrapes have stopped). node-exporter
+    exports the counter per CPU, and a healthy CPU must not hide another one's lost series: the series must be
+    exactly the node's CPUs (_node_cpus), each once, and EVERY CPU's newest sample must be no older than
+    RAW_STEAL_MAX_AGE_S. The load may continue only while its safety observation is alive: no series, a CPU without
+    its series or with two, a series without a cpu label, no sample, a sample that is not exactly a finite timestamp
+    with a finite numeric value, a sample from the future, or a stale CPU is a stop."""
     out = []
     inst = node_instances(c, fetch, api)
     for role, key in (("workload", "w"), ("support", "s")):
         series = _raw(fetch, api, raw_steal_selector(inst[key]), now_s - RAW_STEAL_LOOKBACK_S, now_s)
-        stamps: List[float] = []
+        try:
+            want = _node_cpus(c, key)
+        except X.StagingError:
+            out.append(f"raw steal samples of the {role} node cannot be judged: its CPUs are not known")
+            continue
+        per_cpu: Dict[str, List[List[float]]] = {}
         malformed = not isinstance(series, list)
         for item in series if isinstance(series, list) else []:
             got = _stamps(item)
-            if got is None:
+            metric = item.get("metric") if isinstance(item, dict) else None
+            cpu = metric.get("cpu") if isinstance(metric, dict) else None
+            if got is None or not got or cpu is None:
                 malformed = True
             else:
-                stamps += got
-        if malformed or not stamps:
+                per_cpu.setdefault(str(cpu), []).append(got)
+        if malformed or not per_cpu:
             out.append(f"raw steal samples of the {role} node missing or malformed")
-        elif max(stamps) > now_s + RAW_STEAL_FUTURE_S:
+        elif set(per_cpu) != set(want) or any(len(v) != 1 for v in per_cpu.values()):
+            out.append(f"raw steal samples of the {role} node do not cover exactly its {len(want)} CPUs, each once")
+        elif max(max(v[0]) for v in per_cpu.values()) > now_s + RAW_STEAL_FUTURE_S:
             out.append(f"raw steal samples of the {role} node are from the future")
-        elif now_s - max(stamps) > RAW_STEAL_MAX_AGE_S:
+        elif now_s - min(max(v[0]) for v in per_cpu.values()) > RAW_STEAL_MAX_AGE_S:
             out.append(f"the newest raw steal sample of the {role} node is older than {RAW_STEAL_MAX_AGE_S} s")
     return out
 

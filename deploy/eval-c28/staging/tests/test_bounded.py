@@ -221,6 +221,10 @@ class FakeVM:
             return out[:1]
         if mode == "cpu-twice":
             return out + [dict(out[0], metric={**out[0]["metric"], "job": "other"})]
+        if mode == "cpu-sparse":                          # the right number of CPUs, ids not 0..n-1
+            return out[:-1] + [dict(out[-1], metric={**out[-1]["metric"], "cpu": str(CPUS + 1)})]
+        if mode == "no-cpu-label":
+            return [dict(x, metric={}) for x in out[:1]]
         if mode == "cpu-extra":
             return out + [dict(out[0], metric={"cpu": str(CPUS + 3)})]
         if isinstance(mode, tuple) and mode[0] == "cpu-stale":
@@ -470,7 +474,15 @@ def test_unusable_raw_values_and_unusable_bins_together_stop_through_live_stops(
     # Within the live limit the load is NOT stopped. (The evidence collected afterwards has its own, stricter
     # staleness criterion, so a 105 s hole still leaves that run INCOMPLETE: not stopped is not the same as accepted.)
     ({S_INSTANCE: ("stale", 105)}, "INCOMPLETE"),
-    ({W_INSTANCE: ("future", 0)}, "PASS")])
+    ({W_INSTANCE: ("future", 0)}, "PASS"),
+    # node-exporter exports the counter per CPU: a healthy CPU must not hide another CPU's lost series during the run
+    ({S_INSTANCE: ("cpu-stale", 121)}, "the newest raw steal sample of the support node is older than 120 s"),
+    ({W_INSTANCE: ("cpu-stale", 300)}, "the newest raw steal sample of the workload node is older than 120 s"),
+    ({W_INSTANCE: "one-cpu"}, "raw steal samples of the workload node do not cover exactly its 4 CPUs, each once"),
+    ({S_INSTANCE: "cpu-twice"}, "raw steal samples of the support node do not cover exactly its 4 CPUs, each once"),
+    ({S_INSTANCE: "cpu-sparse"}, "raw steal samples of the support node do not cover exactly its 4 CPUs, each once"),
+    ({S_INSTANCE: "no-cpu-label"}, "raw steal samples of the support node missing or malformed"),
+    ({S_INSTANCE: ("cpu-stale", 105)}, "INCOMPLETE")])
 def test_lost_underlying_steal_samples_stop_the_load_though_the_bins_look_fresh(world, raw_steal, text):  # noqa: F811
     """The stepped range query keeps answering with full, low bins in every case here: only the raw samples show that
     the safety observation is gone, and that must reach the executor's own stop path."""
@@ -965,6 +977,9 @@ def test_the_plan_accepts_what_is_within_the_limits(world, telemetry):  # noqa: 
     ({S_INSTANCE: "cpu-twice"}, "telemetry steal_raw/s: more than one series for the same cpu (scraped twice?)"),
     ({W_INSTANCE: "cpu-extra"}, "telemetry steal_raw/w: series of 1 CPUs that the node does not have (for example 7)"),
     ({S_INSTANCE: ("cpu-stale", 121)}, "telemetry steal_raw/s: the newest sample of a series is older than 120 s"),
+    # the Node object gives a CPU COUNT; the ids 0..n-1 are an assumption, verified here before any run
+    ({W_INSTANCE: "cpu-sparse"}, "telemetry steal_raw/w: the node has 4 CPUs but their ids are not 0..3: the gate assumes "
+                                 "dense CPU ids"),
 ])
 def test_the_plan_refuses_a_steal_source_that_is_already_lost(world, raw_steal, text):  # noqa: F811
     *_, p, d, vm = _gate_plan(world, raw_steal=raw_steal)
@@ -1211,3 +1226,95 @@ def test_an_observation_archived_after_the_deadline_is_not_accepted(world, monke
     data = run(vm)
     _void_and_clean(record, a, data, gen)
     assert "the observation was archived after the deadline" in data["stopped"]
+
+
+# --- the observer request has a TOTAL time bound (Codex review of caf3274: a slowly delivered answer held the caller) ---
+
+def _serve(handler):
+    """A loopback HTTP server on a free port, in a thread: (base url, close)."""
+    import http.server
+    import threading
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            try:
+                handler(self)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+
+        def log_message(self, *a):
+            pass
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{srv.server_address[1]}", lambda: (srv.shutdown(), srv.server_close())
+
+
+def _slow_body(h):
+    import time
+    h.send_response(200)
+    h.send_header("Content-Type", "application/json")
+    h.end_headers()
+    for piece in ['{"status": "success", ', '"data": ', '{"result": ', "[", "]", "}", "}"] * 1:
+        h.wfile.write(piece.encode())
+        h.wfile.flush()
+        time.sleep(0.4)                                    # every piece arrives well inside a per-operation timeout
+
+
+def _slow_headers(h):
+    import time
+    for piece in [b"HTTP/1.1 200 OK\r\n", b"Content-Type: application/json\r\n", b"X-A: 1\r\n", b"X-B: 2\r\n",
+                  b"Content-Length: 2\r\n", b"\r\n", b"{}"]:
+        h.wfile.write(piece)
+        h.wfile.flush()
+        time.sleep(0.4)
+
+
+def _never(h):
+    import time
+    time.sleep(3)
+
+
+@pytest.mark.parametrize("handler", [_slow_body, _slow_headers, _never])
+def test_the_observer_request_is_bounded_in_total_not_per_operation(handler):
+    import time
+    url, close = _serve(handler)
+    try:
+        t0 = time.monotonic()
+        with pytest.raises(TimeoutError):
+            B.http_json(url + "/api/v1/query?query=up", timeout=0.5)
+        elapsed = time.monotonic() - t0
+        assert 0.45 <= elapsed < 0.9, elapsed              # the budget, not the 2.8 s the answer would take
+        t0 = time.monotonic()
+        with pytest.raises(TimeoutError):                  # through the gate's own limiter, with a budget under 0.5 s
+            B._fetch_within(B.http_json, url + "/x", 0.2)
+        assert time.monotonic() - t0 < 0.45                # the budget itself, never rounded up to half a second
+    finally:
+        close()
+
+
+def test_the_observer_request_still_returns_a_prompt_answer_and_refuses_an_error_status():
+    import urllib.error
+
+    def ok(h):
+        body = b'{"status": "success", "data": {"result": []}}'
+        h.send_response(200)
+        h.send_header("Content-Length", str(len(body)))
+        h.end_headers()
+        h.wfile.write(body)
+
+    def bad(h):
+        h.send_response(503)
+        h.send_header("Content-Length", "0")
+        h.end_headers()
+    url, close = _serve(lambda h: ok(h) if h.path.startswith("/ok") else bad(h))
+    try:
+        assert B.http_json(url + "/ok?query=up%7Ba%3D%221%22%7D", timeout=5) == {"status": "success", "data": {"result": []}}
+        with pytest.raises(urllib.error.HTTPError):
+            B.http_json(url + "/bad", timeout=5)
+        with pytest.raises(TimeoutError):
+            B.http_json(url + "/ok", timeout=0)
+        with pytest.raises(TimeoutError):
+            B._fetch_within(B.http_json, url + "/ok", 0.0)
+    finally:
+        close()
