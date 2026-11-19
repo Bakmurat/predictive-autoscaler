@@ -40,6 +40,7 @@ def ready_world(world):  # noqa: F811
         conds = a.obj("Node", n).setdefault("status", {}).setdefault("conditions", [])
         if not any(x["type"] == "PIDPressure" for x in conds):
             conds.append({"type": "PIDPressure", "status": "False"})
+        a.obj("Node", n)["status"]["capacity"] = {"cpu": str(CPUS)}       # node-exporter: one steal series per CPU
     for name in (N, R):
         dep = a.obj("Deployment", name, "demo")
         dep["status"] = {"replicas": 12, "readyReplicas": 12, "updatedReplicas": 12}
@@ -113,6 +114,7 @@ class JobApi(F.FakeApi2):
 
 INSTANCES = {"worker-w": "10.0.0.1:9100", "worker-s": "10.0.0.2:9100"}
 INGRESS_POD = "c28-ingress-7c9d-abcde"
+CPUS = 4
 POD_NAMES = {t: [f"{t}-{i:02d}" for i in range(12)] for t in ("c28-demo-pa-n", "c28-demo-pa-r")}
 
 
@@ -206,7 +208,24 @@ class FakeVM:
                 res = [self.series(lo, hi + mode[1], 15, 1.0)]
             else:
                 res = [self.series(lo, hi, 15, 1.0)]
+            if tele is None and sel.startswith("node_cpu_seconds_total"):
+                res = self._per_cpu(res, mode, hi)
         return {"status": "success", "data": {"result": res}}
+
+    def _per_cpu(self, res, mode, hi):
+        """node-exporter's shape: the steal counter once per CPU. CPU modes: "one-cpu" (a single series, as a
+        one-CPU node or a broken relabeling would give), "cpu-twice", "cpu-extra", ("cpu-stale", seconds) for ONE
+        CPU while the others stay fresh."""
+        out = [dict(x, metric={**x["metric"], "cpu": str(i)}) for i in range(CPUS) for x in res]
+        if mode == "one-cpu":
+            return out[:1]
+        if mode == "cpu-twice":
+            return out + [dict(out[0], metric={**out[0]["metric"], "job": "other"})]
+        if mode == "cpu-extra":
+            return out + [dict(out[0], metric={"cpu": str(CPUS + 3)})]
+        if isinstance(mode, tuple) and mode[0] == "cpu-stale":
+            return out[:-1] + [dict(out[-1], values=[v for v in out[-1]["values"] if v[0] <= hi - mode[1]])]
+        return out
 
 
 def _telemetry_method(self, sel, lo, hi):
@@ -941,6 +960,11 @@ def test_the_plan_accepts_what_is_within_the_limits(world, telemetry):  # noqa: 
     ({S_INSTANCE: ("stale", 121)}, "telemetry steal_raw/s: the newest sample of a series is older than 120 s"),
     ({S_INSTANCE: "nan-value"}, "telemetry steal_raw/s: a sample that is not a finite [timestamp, value]"),
     ({W_INSTANCE: "refused"}, "telemetry steal_raw/w: the query failed"),
+    # node-exporter exports the steal counter per CPU: exactly the node's CPUs, each once, EVERY one fresh
+    ({W_INSTANCE: "one-cpu"}, "telemetry steal_raw/w: no series for 3 of 4 expected CPUs (for example 1)"),
+    ({S_INSTANCE: "cpu-twice"}, "telemetry steal_raw/s: more than one series for the same cpu (scraped twice?)"),
+    ({W_INSTANCE: "cpu-extra"}, "telemetry steal_raw/w: series of 1 CPUs that the node does not have (for example 7)"),
+    ({S_INSTANCE: ("cpu-stale", 121)}, "telemetry steal_raw/s: the newest sample of a series is older than 120 s"),
 ])
 def test_the_plan_refuses_a_steal_source_that_is_already_lost(world, raw_steal, text):  # noqa: F811
     *_, p, d, vm = _gate_plan(world, raw_steal=raw_steal)
@@ -948,8 +972,17 @@ def test_the_plan_refuses_a_steal_source_that_is_already_lost(world, raw_steal, 
 
 
 def test_a_steal_source_within_the_live_limit_is_accepted_by_the_plan(world):  # noqa: F811
-    *_, p, d, vm = _gate_plan(world, raw_steal={S_INSTANCE: ("stale", 105)})
+    *_, c, p, d, vm = _gate_plan(world, raw_steal={S_INSTANCE: ("stale", 105)})
     assert p["problems"] == []
+    seen = c.telemetry["observed"]                                         # a healthy multi-CPU node: every CPU judged
+    assert seen["steal_raw/w"]["series"] == seen["steal_raw/w"]["judged"] == seen["steal_raw/w"]["expected"] == CPUS
+
+
+def test_a_node_that_reports_no_cpu_count_cannot_have_its_steal_source_judged(world):  # noqa: F811
+    def no_capacity(a):
+        a.obj("Node", "worker-s")["status"].pop("capacity")
+    *_, p, d, vm = _gate_plan(world, edit=no_capacity)
+    assert p["problems"] == ["telemetry steal_raw/s: the query failed (StagingError)"]
 
 
 def _unready(a):
@@ -1025,7 +1058,7 @@ def test_the_commands_take_the_observer_and_keep_the_observation_outside_the_pla
     vm = FakeVM(None, POD_NAMES)
     assert B.main(["--record", record.path, "check-telemetry", "--query-api", "http://vm"], api=a, fetch=vm) == 0
     seen = json.loads(capsys.readouterr().out)
-    assert seen["problems"] == [] and seen["telemetry"]["observed"][f"requests/{N}"]["expected_pods"] == 12
+    assert seen["problems"] == [] and seen["telemetry"]["observed"][f"requests/{N}"]["expected"] == 12
     vm.telemetry[f"queue/{R}"] = "absent"
     assert B.main(["--record", record.path, "check-telemetry", "--query-api", "http://vm"], api=a, fetch=vm) == 4
     assert json.loads(capsys.readouterr().out)["problems"] == [f"telemetry queue/{R}: no series"]
@@ -1069,3 +1102,112 @@ def test_a_startup_refuses_before_any_mutation_when_the_telemetry_was_lost_after
         run_s(c, p, d, vm, lines)
     assert len(kube.mutations) == before and a.obj("Deployment", R, "demo")["spec"]["replicas"] == 12
     assert not os.path.exists(X.lock_file(record)) and not B.open_obligations(record)
+
+
+# --- the generator deadline is enforced (Codex review of b48cbbd: acceptance at deadline + 5 s and after a slow query) ---
+
+class TimedVM:
+    """An observer that takes a timeout, like http_json: records the budget each generator query was given; `slow`
+    (seconds) is how long a generator query takes once the clock has reached `slow_from_s`; `fail` raises instead."""
+
+    def __init__(self, vm, clock, slow=0.0, slow_from_s=0.0, fail=False):
+        self.vm, self.clock, self.slow, self.slow_from_s, self.fail, self.budgets = vm, clock, slow, slow_from_s, fail, []
+
+    def __call__(self, url, timeout=None):
+        gate = "180s" in url                              # the gate's lookback; the collection asks other ranges
+        if gate and "container_cpu_cfs" in url and "c28-demo-" in url and ".%2A" not in url and ".*" not in url:
+            self.budgets.append(timeout)
+            if self.fail:
+                raise TimeoutError("timed out")
+            if self.clock.ms / 1000 >= self.slow_from_s:
+                self.clock.ms += self.slow * 1000                         # a slow but SUCCESSFUL answer
+        return self.vm(url)
+
+
+def _executor(world, kind):  # noqa: F811
+    """(record, api, clock, vm, origin_ms, run(fetch) -> data, generator name) for either bounded executor."""
+    if kind == "admission":
+        record, kube, a, clock, c, p, d, logs, vm = _run(world)
+        return record, a, clock, vm, O_MS, (
+            lambda fetch: B.run_admission(c, p, d, fetch, "http://vm", logs=logs)["data"]), "c28-demo-admission"
+    record, kube, a, clock, c, p, d, vm, lines = _startup(world)
+    return record, a, clock, vm, _ms_of(p["origin_utc"]), (
+        lambda fetch: B.run_startup(c, p, d, fetch, "http://vm", logs=lambda c_, pod: lines)["data"]), "c28-demo-startup"
+
+
+def _void_and_clean(record, a, data, gen):
+    assert "VOID: the generator's telemetry was not complete before the origin" in data["stopped"], data["stopped"]
+    assert data.get("verdict") != "PASS" and data.get("measured") is not True
+    assert not [k for k in a.objects if k[0] in ("jobs", "configmaps", "pods") and gen in k[2]]
+    assert a.obj("Deployment", R, "demo")["spec"]["replicas"] == 12 and not B.open_obligations(record)
+    assert not os.path.exists(X.lock_file(record)) and not X.open_intents(X.receipts(record, B.HELPER))
+
+
+@pytest.mark.parametrize("kind", ["admission", "startup"])
+@pytest.mark.parametrize("ready_after_deadline_s", [0.001, 5, 25])
+def test_generator_telemetry_that_becomes_ready_after_the_deadline_is_never_accepted(world, kind, ready_after_deadline_s):  # noqa: F811
+    record, a, clock, vm, origin, run, gen = _executor(world, kind)
+    ready_at = origin / 1000 - 30 + ready_after_deadline_s
+    vm.telemetry["cfs_periods/generator"] = lambda hi: "absent" if hi < ready_at else None
+    data = run(vm)
+    _void_and_clean(record, a, data, gen)
+    assert "telemetry cfs_periods/generator: no series" in data["stopped"]
+
+
+@pytest.mark.parametrize("kind", ["admission", "startup"])
+def test_generator_telemetry_ready_at_the_deadline_is_accepted(world, kind):  # noqa: F811
+    record, a, clock, vm, origin, run, gen = _executor(world, kind)
+    vm.telemetry["cfs_periods/generator"] = lambda hi: "absent" if hi < origin / 1000 - 35 else None
+    data = run(vm)
+    assert "VOID" not in (data["stopped"] or "")
+
+
+@pytest.mark.parametrize("kind", ["admission", "startup"])
+@pytest.mark.parametrize("slow_s", [40, 100])                               # past the deadline; past the origin itself
+def test_a_slow_successful_generator_query_cannot_be_accepted_late(world, kind, slow_s):  # noqa: F811
+    record, a, clock, vm, origin, run, gen = _executor(world, kind)
+    vm.telemetry["cfs_periods/generator"] = lambda hi: "absent" if hi < origin / 1000 - 60 else None
+    timed = TimedVM(vm, clock, slow=slow_s, slow_from_s=origin / 1000 - 60)
+    data = run(timed)
+    _void_and_clean(record, a, data, gen)
+    assert "the observation ended after the deadline" in data["stopped"]
+    # every generator query was given no more than the time left before the deadline
+    assert timed.budgets and all(b is not None and 0 < b <= 270 for b in timed.budgets)
+    assert min(timed.budgets) <= 30.5, timed.budgets
+
+
+@pytest.mark.parametrize("kind", ["admission", "startup"])
+def test_generator_queries_that_time_out_end_in_a_void_run_that_is_cleaned_up(world, kind):  # noqa: F811
+    record, a, clock, vm, origin, run, gen = _executor(world, kind)
+    timed = TimedVM(vm, clock, fail=True)
+    data = run(timed)
+    _void_and_clean(record, a, data, gen)
+    assert "the query failed (TimeoutError)" in data["stopped"]
+    budgets = [b for b in timed.budgets if b is not None]
+    assert budgets == sorted(budgets, reverse=True) and budgets[-1] <= 5.5    # shrinking towards the deadline
+
+
+def test_the_same_timestamp_twice_is_one_sample(world):  # noqa: F811
+    record, kube, a = ready_world(world)
+    c = B.Ctx(record, kube, now=Clock(O_MS - 180_000).now)
+    r = {"min_samples": 2, "max_age_s": 60, "unique": None}
+    now = (O_MS - 180_000) / 1000
+    twice = [{"metric": {"pod": "g"}, "values": [[now - 5, "1"], [now - 5, "1"]]}]
+    two = [{"metric": {"pod": "g"}, "values": [[now - 20, "1"], [now - 5, "2"]]}]
+    assert B._judge_series(r, twice, ["g"], "pod", now, 5)[1] == ["a series with fewer than 2 samples in the lookback"]
+    assert B._judge_series(r, two, ["g"], "pod", now, 5)[1] == []
+
+
+def test_an_observation_archived_after_the_deadline_is_not_accepted(world, monkeypatch):  # noqa: F811
+    record, a, clock, vm, origin, run, gen = _executor(world, "admission")
+    vm.telemetry["cfs_periods/generator"] = lambda hi: "absent" if hi < origin / 1000 - 35 else None
+    real = B._write
+
+    def slow_disk(path, doc):
+        if path.endswith("telemetry-generator.json"):
+            clock.ms += 20_000                                             # complete at -35 s, on disk at -15 s
+        return real(path, doc)
+    monkeypatch.setattr(B, "_write", slow_disk)
+    data = run(vm)
+    _void_and_clean(record, a, data, gen)
+    assert "the observation was archived after the deadline" in data["stopped"]

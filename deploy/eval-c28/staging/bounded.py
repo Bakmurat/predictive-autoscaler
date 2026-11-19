@@ -40,8 +40,9 @@ The plan also binds the TELEMETRY REQUIREMENTS (the telemetry gate, below in the
 reads, with its expected identity and cardinality and its freshness limits. A plan is refused, and a run refuses
 before its first mutation, unless what exists before the run is there as required (the ingress counter, every Ready
 target pod's queue and request counters, the cAdvisor counters of the ingress and the fixture pods, the steal source
-of W and S); the generator's own counters are required after its pod is Running and by 30 s before the origin, else
-the exercise is VOID and the generator is removed before it sends anything. What was observed is written beside the
+of W and S, one series per CPU); the generator's own counters are required after its pod is Running, observed and
+archived by 30 s before the origin, else the exercise is VOID and the stop path removes the generator (the 30 s are an
+allowance for that removal, not a proof that it completes before the first request). What was observed is written beside the
 plan and into the run directory, never into the plan.
 
 Run (under the shared lock, every create and delete journalled):
@@ -70,6 +71,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import inspect
 import json
 import math
 import os
@@ -292,9 +294,19 @@ class Observer:
 
 # --- the observer's evidence (VictoriaMetrics, read-only) -------------------------------------------------------------
 
-def http_json(url: str) -> Dict:
-    with urllib.request.urlopen(url, timeout=60) as r:          # the reviewed observer endpoint (a local forward)
+def http_json(url: str, timeout: float = 60.0) -> Dict:
+    with urllib.request.urlopen(url, timeout=timeout) as r:     # the reviewed observer endpoint (a local forward)
         return json.loads(r.read())
+
+
+def _fetch_within(fetch: Fetch, url: str, seconds: float) -> Dict:
+    """fetch(url) limited to `seconds` where the fetcher takes a timeout (http_json does). A fetcher without one (a
+    test double) is called as it is: the caller checks the clock after every call either way."""
+    try:
+        takes = "timeout" in inspect.signature(fetch).parameters
+    except (TypeError, ValueError):
+        takes = False
+    return fetch(url, timeout=max(0.5, seconds)) if takes else fetch(url)
 
 
 def _q(fetch: Fetch, api: str, path: str, **params) -> List[Dict]:
@@ -355,7 +367,7 @@ def fixture_pod_rx(names: List[str]) -> str:
 #     counters of the ingress and the fixture pods, the steal source of W and S): at planning and again, under the
 #     lock, before the first mutation;
 #   * the generator's own cAdvisor counters, which cannot exist before its pod does: after the pod is Running and
-#     before the origin; missing by the deadline, the run is VOID and stopped before any load is sent.
+#     by a deadline before the origin; not complete by then, the run is VOID and its stop path removes the generator.
 # The requirements are part of the reviewed plan (no timestamp and no live identity in them); what was observed is
 # archived beside the plan and in the run directory, outside the plan's digest.
 
@@ -367,8 +379,10 @@ TELEMETRY_GENERATOR_MARGIN_S, TELEMETRY_GENERATOR_POLL_S = 30, 5
 def telemetry_requirements(c: Ctx) -> Dict:
     """What the verdict's telemetry must look like before a run; its keys are exactly the verdict's freshness
     inventory. `pods`: None = exactly one series; a target's name = one identity per live Ready pod of that target
-    and no other pod; "ingress" / "fixture" / "generator" = every such live pod is covered. `unique`: the labels
-    that identify one series per pod (two series with the same values = scraped twice)."""
+    and no other pod; "ingress" / "fixture" / "generator" = every such live pod is covered. `node`: the steal source
+    of W or S, one series per CPU of that node (node-exporter exports node_cpu_seconds_total per CPU): exactly the
+    CPUs the Node object reports, every one judged. `unique`: the labels that identify one series (two series with
+    the same values = scraped twice)."""
     ns, names = c.ns, c.c28.demo.target_names(c.params)
     limit = c.verdicts.FROZEN["max_staleness_s"]
 
@@ -383,7 +397,8 @@ def telemetry_requirements(c: Ctx) -> Dict:
     for key, metric in CFS:
         existing += [req(f"{key}/ingress", "ingress", metric + cfs_selector(ns, INGRESS_POD_RX)),
                      req(f"{key}/fixture", "fixture", metric + cfs_selector(ns, fixture_pod_rx(names)))]
-    existing += [req(f"steal_raw/{role}", None, node=role, max_age_s=RAW_STEAL_MAX_AGE_S) for role in ("w", "s")]
+    existing += [req(f"steal_raw/{role}", None, unique=["cpu"], node=role, max_age_s=RAW_STEAL_MAX_AGE_S)
+                 for role in ("w", "s")]
     generator = [req(f"{key}/generator", "generator", metric=metric, min_samples=TELEMETRY_GENERATOR_MIN_SAMPLES)
                  for key, metric in CFS]
     return {"lookback_s": TELEMETRY_LOOKBACK_S, "future_s": TELEMETRY_FUTURE_S,
@@ -432,9 +447,23 @@ def _live_pods(c: Ctx) -> Dict[str, List[str]]:
     return out
 
 
-def _judge_series(r: Dict, series, want: Optional[List[str]], now_s: float, future_s: float) -> Tuple[Dict, List[str]]:
-    """One requirement against the raw series the observer returned: (what was seen, why it is not enough)."""
+def _node_cpus(c: Ctx, role: str) -> List[str]:
+    """The CPU identities node-exporter exports for W or S: "0" .. "n-1" for the Node object's capacity."""
+    name = c.params["nodes"]["workload" if role == "w" else "support"]
+    cpu = str((((c.kube.get("Node", name) or {}).get("status") or {}).get("capacity") or {}).get("cpu") or "")
+    if not cpu.isdigit() or int(cpu) < 1:
+        raise X.StagingError(f"node {name} does not report a whole number of CPUs")
+    return [str(i) for i in range(int(cpu))]
+
+
+def _judge_series(r: Dict, series, want: Optional[List[str]], label: str, now_s: float, future_s: float
+                  ) -> Tuple[Dict, List[str]]:
+    """One requirement against the raw series the observer returned: (what was seen, why it is not enough). `want`:
+    None = exactly one series; else the expected values of `label` ("pod" or "cpu"). With r["unique"] the series
+    must be exactly those identities, each once; without it they must cover them (other series are not judged)."""
     why: List[str] = []
+    noun, other = ("pods", "that are not live Ready pods of it") if label == "pod" else \
+        ("CPUs", "that the node does not have")
     if not isinstance(series, list) or not all(isinstance(s, dict) and isinstance(s.get("metric"), dict) for s in series):
         return {"series": None}, ["the answer is malformed"]
     if not series:
@@ -445,31 +474,31 @@ def _judge_series(r: Dict, series, want: Optional[List[str]], now_s: float, futu
             why.append(f"{len(items)} series where exactly one is expected")
         judged = items
     else:
-        got = [m.get("pod") for m, _ in items]
+        got = [m.get(label) for m, _ in items]
         missing = sorted(set(want) - set(got))
         if not want:
             why.append("no live Ready pod is known for it")
         if missing:
-            why.append(f"no series for {len(missing)} of {len(want)} expected pods (for example {missing[0]})")
+            why.append(f"no series for {len(missing)} of {len(want)} expected {noun} (for example {missing[0]})")
         if r["unique"]:
             extra = sorted({str(x) for x in got if x not in want})
             if extra:
-                why.append(f"series of {len(extra)} pods that are not live Ready pods of it (for example {extra[0]})")
+                why.append(f"series of {len(extra)} {noun} {other} (for example {extra[0]})")
             ids = [tuple(str(m.get(k)) for k in r["unique"]) for m, _ in items]
             if len(set(ids)) != len(ids):
                 why.append("more than one series for the same " + " and ".join(r["unique"]) + " (scraped twice?)")
-        judged = [(m, st) for m, st in items if m.get("pod") in want]
+        judged = [(m, st) for m, st in items if m.get(label) in want]
     ages, gaps, counts = [], [], []
     for _, st in judged:
         if st is None:
             why.append("a sample that is not a finite [timestamp, value]")
             continue
-        counts.append(len(st))
-        if len(st) < r["min_samples"]:
+        ts = sorted(set(st))                          # DISTINCT sample times: a repeated timestamp is one sample
+        counts.append(len(ts))
+        if len(ts) < r["min_samples"]:
             why.append(f"a series with fewer than {r['min_samples']} samples in the lookback")
-        if not st:
+        if not ts:
             continue
-        ts = sorted(st)
         if ts[-1] > now_s + future_s:
             why.append("a sample from the future")
         ages.append(now_s - ts[-1])
@@ -478,7 +507,7 @@ def _judge_series(r: Dict, series, want: Optional[List[str]], now_s: float, futu
         why.append(f"the newest sample of a series is older than {r['max_age_s']} s")
     if gaps and max(gaps) > r["max_age_s"]:
         why.append(f"a gap above {r['max_age_s']} s between samples")
-    seen = {"series": len(items), "judged": len(judged), "expected_pods": None if want is None else len(want),
+    seen = {"series": len(items), "judged": len(judged), "expected": None if want is None else len(want),
             "fewest_samples": min(counts) if counts else None,
             "oldest_newest_sample_age_s": round(max(ages), 3) if ages else None,
             "largest_gap_s": round(max(gaps), 3) if gaps else None}
@@ -499,10 +528,12 @@ def telemetry_observe(c: Ctx, fetch: Fetch, api: str, tele: Dict, part: str, now
         pods["generator"] = [generator_pod]
     instances: Optional[Dict[str, str]] = None
     for r in tele[part]:
+        want, label = (None, "pod") if r["pods"] is None else (pods.get(r["pods"], []), "pod")
         try:
             if r.get("node"):
                 instances = node_instances(c, fetch, api) if instances is None else instances
                 selector = raw_steal_selector(instances[r["node"]])
+                want, label = _node_cpus(c, r["node"]), "cpu"
             elif r["pods"] == "generator":
                 if not generator_pod:
                     raise X.StagingError("the generator pod is not known")
@@ -514,8 +545,7 @@ def telemetry_observe(c: Ctx, fetch: Fetch, api: str, tele: Dict, part: str, now
             seen[r["key"]] = {"error": f"{type(e).__name__}: {str(e)[:160]}"}
             problems.append(f"telemetry {r['key']}: the query failed ({type(e).__name__})")
             continue
-        seen[r["key"]], why = _judge_series(r, series, None if r["pods"] is None else pods.get(r["pods"], []), now_s,
-                                           tele["future_s"])
+        seen[r["key"]], why = _judge_series(r, series, want, label, now_s, tele["future_s"])
         problems += [f"telemetry {r['key']}: {w}" for w in why]
     return seen, problems
 
@@ -534,26 +564,46 @@ def existing_telemetry(c: Ctx, fetch: Optional[Fetch], api: Optional[str], tele:
 
 def wait_generator_telemetry(c: Ctx, fetch: Fetch, api: str, tele: Dict, pod: str, origin_ms: float,
                              out_dir: str, tick: Callable[[], None]) -> None:
-    """The generator's own telemetry, before the origin: polled until it is complete; still incomplete
-    TELEMETRY_GENERATOR_MARGIN_S before the origin, the exercise is VOID (the caller's stop path removes the load
-    generator before it sends anything). The last observation is archived either way. `tick` runs on every poll:
-    the run's pod watch must not get a hole while this waits."""
+    """The generator's own telemetry, before the origin. Accepted ONLY when a complete observation was made and
+    archived no later than the deadline (TELEMETRY_GENERATOR_MARGIN_S before the origin): the deadline is checked
+    before every query, after the observation and after the archive, and every query is limited to the time that is
+    left. Otherwise the exercise is VOID and the caller's stop path removes the generator. The margin is an allowance
+    for that removal, not a proof that it completes before the generator's first request: a removal that is still
+    running at the origin shows in the receipts, and the exercise is VOID either way. `tick` runs on every poll: the
+    run's pod watch must not get a hole while this waits."""
     deadline = origin_ms - TELEMETRY_GENERATOR_MARGIN_S * 1000
+
+    def left_s() -> float:
+        return (deadline - c.now()) / 1000
+
+    def limited(url: str) -> Dict:
+        if left_s() <= 0:
+            raise X.StagingError("the deadline passed before the query")
+        return _fetch_within(fetch, url, left_s())
+    at_s, seen, problems = c.now() / 1000, {}, ["telemetry of the generator: not observed before the deadline"]
     while True:
         tick()
-        now_s = c.now() / 1000
-        seen, problems = telemetry_observe(c, fetch, api, tele, "generator", now_s, generator_pod=pod)
-        if not problems or c.now() >= deadline:
-            try:
-                _write(os.path.join(out_dir, "telemetry-generator.json"),
-                       {"at_s": now_s, "part": "generator", "pod": pod, "observed": seen, "problems": problems})
-            except (OSError, X.StagingError) as e:        # an observation that cannot be kept is not an observation
-                problems = problems + [f"the observation could not be archived ({type(e).__name__})"]
-            if problems:
-                raise X.StagingError("VOID: the generator's telemetry was not complete before the origin: "
-                                     + "; ".join(problems)[:300])
-            return
-        c.sleep(TELEMETRY_GENERATOR_POLL_S)
+        if left_s() <= 0:
+            break                                         # VOID with the last observation's problems
+        at_s = c.now() / 1000
+        seen, problems = telemetry_observe(c, limited, api, tele, "generator", at_s, generator_pod=pod)
+        if left_s() < 0:
+            problems = problems + ["telemetry of the generator: the observation ended after the deadline"]
+            break
+        if not problems:
+            break
+        c.sleep(min(TELEMETRY_GENERATOR_POLL_S, max(left_s(), 0.001)))
+    try:
+        _write(os.path.join(out_dir, "telemetry-generator.json"),
+               {"at_s": at_s, "part": "generator", "pod": pod, "observed": seen, "problems": problems,
+                "deadline_s": deadline / 1000})
+    except (OSError, X.StagingError) as e:                # an observation that cannot be kept is not an observation
+        problems = problems + [f"telemetry of the generator: the observation could not be archived ({type(e).__name__})"]
+    if not problems and left_s() < 0:
+        problems = ["telemetry of the generator: the observation was archived after the deadline"]
+    if problems:
+        raise X.StagingError("VOID: the generator's telemetry was not complete before the origin: "
+                             + "; ".join(problems)[:300])
 
 
 def _archive_before(out_dir: str, observation: Optional[Dict]) -> None:
