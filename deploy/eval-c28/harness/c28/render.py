@@ -47,6 +47,7 @@ RUN_LABEL = "c28.devkuban.com/run"
 ARM_LABEL = "c28.devkuban.com/arm"
 PROFILE_LABEL = "c28.devkuban.com/profile"
 TARGET_LABEL = "c28.devkuban.com/target"
+TARGETS_SCRAPE_NAME = "c28-targets"      # the scrape object for the fixture targets' own metrics (object modes)
 
 _DNS = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
 _DIGEST_IMAGE = re.compile(r"^[a-z0-9][a-z0-9./:-]*@sha256:[0-9a-f]{64}$")
@@ -868,10 +869,21 @@ def common_objects(p: Dict, targets: List[str]) -> List[Dict]:
     if p["scrape"] != "annotations":
         group = "monitoring.coreos.com/v1" if p["scrape"] == "PodMonitor" else "operator.victoriametrics.com/v1beta1"
         endpoints_key = "podMetricsEndpoints"
-        out.append({"apiVersion": group, "kind": p["scrape"], "metadata": {"name": "c28-ingress", "namespace": ns, "labels": labels},
-                    "spec": {"selector": {"matchLabels": {"app.kubernetes.io/name": "c28-ingress", RUN_LABEL: p["run_id"]}},
+
+        def scrape(name: str, selector: Dict) -> Dict:
+            return {"apiVersion": group, "kind": p["scrape"], "metadata": {"name": name, "namespace": ns, "labels": labels},
+                    "spec": {"selector": selector,
                              endpoints_key: [{"port": "http", "path": "/metrics",
-                                              "interval": f"{F.SCRAPE_INTERVAL_S}s"}]}})
+                                              "interval": f"{F.SCRAPE_INTERVAL_S}s"}]}}
+        out.append(scrape("c28-ingress", {"matchLabels": {"app.kubernetes.io/name": "c28-ingress", RUN_LABEL: p["run_id"]}}))
+        # The fixture targets' OWN metrics (c28_queue, c28_requests_total: the queue, the per-pod distribution and
+        # their freshness in every verdict). Without this object nothing scrapes the target pods in the two object
+        # modes: the pod annotations are read only where the cluster scrapes by annotation (scrape "annotations"). The
+        # first real installation had the ingress object alone, and its admission run could not pass. Exactly this
+        # run's listed targets, by the label their pod templates carry; the scraper adds namespace and pod, the
+        # fixture exports target.
+        out.append(scrape(TARGETS_SCRAPE_NAME, {"matchLabels": {RUN_LABEL: p["run_id"]}, "matchExpressions": [
+            {"key": TARGET_LABEL, "operator": "In", "values": sorted(targets)}]}))
     return out
 
 

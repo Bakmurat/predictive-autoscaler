@@ -462,6 +462,9 @@ func (r *rrRouter) applyLocked() {
 			}
 			delete(keep, ref)
 			delete(r.retired, dispatchLabel(t.name, ref.pod))
+			// the dispatch counter of a discovered endpoint exists, at zero, BEFORE the swap makes it pickable
+			// (ensure never resets the count of an endpoint that was already known or came back)
+			r.dispatched.ensure(dispatchLabel(t.name, ref.pod))
 			next.eps = append(next.eps, e)
 		}
 		t.set.Store(next) // the swap: every later pick sees only the new set

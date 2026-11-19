@@ -53,6 +53,9 @@ def ready_world(world):  # noqa: F811
         a.put({"apiVersion": "discovery.k8s.io/v1", "kind": "EndpointSlice",
                "metadata": {"name": f"{name}-x", "namespace": "demo", "labels": {"kubernetes.io/service-name": name}},
                "endpoints": [{"conditions": {"ready": True}, "targetRef": {"uid": u}} for u in uids]})
+    ing = F.pod(INGRESS_POD, "demo", "worker-w", labels={"app.kubernetes.io/name": "c28-ingress", X.RUN_LABEL: DEMO})
+    ing["status"]["conditions"] = [{"type": "Ready", "status": "True", "lastTransitionTime": "2026-11-10T00:00:00Z"}]
+    a.put(ing)
     return record, kube, a
 
 
@@ -109,6 +112,8 @@ class JobApi(F.FakeApi2):
 
 
 INSTANCES = {"worker-w": "10.0.0.1:9100", "worker-s": "10.0.0.2:9100"}
+INGRESS_POD = "c28-ingress-7c9d-abcde"
+POD_NAMES = {t: [f"{t}-{i:02d}" for i in range(12)] for t in ("c28-demo-pa-n", "c28-demo-pa-r")}
 
 
 class FakeVM:
@@ -117,14 +122,24 @@ class FakeVM:
     0.01, a queue of 1, equal per-pod request increases. Every selector is VALIDATED: an unknown query raises (an
     observer refusal), so a wrong label (e.g. nodename on node_cpu_seconds_total) never silently returns data."""
 
-    def __init__(self, sim_ingress, pod_names, steal=1.0, alerts=(), raw_steal=None):
+    def __init__(self, sim_ingress, pod_names, steal=1.0, alerts=(), raw_steal=None, telemetry=None,
+                 raw_steal_from_s=0.0):
         self.ingress, self.pod_names, self.steal, self.alerts = sim_ingress, pod_names, steal, list(alerts)
         self.queries = []
+        # telemetry: {freshness key or "cfs/generator": mode} for the RAW series the telemetry gate reads. Modes:
+        # "absent" no series; ("drop", pod) that pod's series are missing; ("extra", pod) one more pod's series;
+        # "twice" every series a second time under another job (scraped twice); ("stale", seconds); ("short", n)
+        # only the newest n samples; ("gap", seconds) a hole that long before the newest sample; "nan-value";
+        # ("future", seconds); "refused". A callable mode(now_s) returns the mode in force at that time.
+        self.telemetry = dict(telemetry or {})
         # raw_steal: {instance: mode} for the UNDERLYING steal samples of that node-exporter instance, while the
         # stepped range query (the bins) keeps answering as if all were well. Modes: ("stale", seconds) the newest
         # sample is that old; "absent" no series; "empty" a series without samples; "nan" / "text" / "short" a
         # malformed timestamp; ("future", seconds); "refused" the query itself fails.
         self.raw_steal = dict(raw_steal or {})
+        # ... in force only for queries evaluated at or after raw_steal_from_s: a source that is lost DURING a run
+        # (one that is already lost before it is refused by the telemetry gate, before anything is created).
+        self.raw_steal_from_s = raw_steal_from_s
 
     def series(self, lo, hi, step, value, metric=None):
         return {"metric": metric or {}, "values": [[t, str(value)] for t in range(int(-(-lo // step) * step),
@@ -140,8 +155,8 @@ class FakeVM:
         res = []
         if u.path.endswith("query_range"):
             lo, hi, step = float(q["start"]), float(q["end"]), int(q["step"][:-1])
-            if "mode=\"steal\"" in expr and "node_uname_info" in expr:
-                res = [self.series(lo, hi, step, self.steal)]
+            if "mode=\"steal\"" in expr and "node_uname_info" in expr:      # steal: a value, or a function of the time
+                res = [self.series(lo, hi, step, self.steal(hi) if callable(self.steal) else self.steal)]
             elif "container_cpu_cfs_throttled_periods_total" in expr:
                 res = [self.series(lo, hi, step, 0.01)]
             elif expr.startswith("sum(c28_queue{"):
@@ -165,10 +180,13 @@ class FakeVM:
                      % "|".join(re.escape(i) for i in INSTANCES.values()))
             if not any(re.match(k, sel) for k in known):
                 raise ValueError(f"FakeVM: unknown raw selector {sel}")
-            mode = next((m for i, m in self.raw_steal.items() if f'mode="steal",instance="{i}"' in sel), None)
-            if sel.startswith("c28_ingress_requests_total"):
-                t = expr.split('target="')[1].split('"')[0]
-                res = [{"metric": {}, "values": [[a, str(b)] for a, b in self.ingress[t] if lo < a <= hi]}]
+            mode = next((m for i, m in self.raw_steal.items() if f'mode="steal",instance="{i}"' in sel
+                         and hi >= self.raw_steal_from_s), None)
+            tele = self._telemetry(sel, lo, hi)
+            if tele is not None:
+                if tele == "refused":
+                    return {"status": "error", "error": "simulated refusal"}
+                res = tele
             elif mode == "refused":
                 return {"status": "error", "error": "simulated refusal"}
             elif mode == "absent":
@@ -191,6 +209,63 @@ class FakeVM:
         return {"status": "success", "data": {"result": res}}
 
 
+def _telemetry_method(self, sel, lo, hi):
+    """The RAW series of the fixture, the ingress and cAdvisor: one series per pod, as a scraper stores them."""
+    import re
+    if sel.startswith("c28_"):
+        t = sel.split('target="')[1].split('"')[0]
+        kind = {"c28_ingress_requests_total": "ingress", "c28_queue": "queue", "c28_requests_total": "requests"}[
+            sel.split("{")[0]]
+        key = f"{kind}/{t}"
+        if kind == "ingress":
+            samples = self.ingress.get(t) if self.ingress else None
+            series = [{"metric": {"target": t, "pod": INGRESS_POD}, "values":
+                       [[a, str(b)] for a, b in samples if lo < a <= hi]}] if samples is not None else \
+                [self.series(lo, hi, 15, 100.0, {"target": t, "pod": INGRESS_POD})]
+        else:
+            extra = {"code": "200"} if kind == "requests" else {}
+            series = [self.series(lo, hi, 15, 1.0, {"target": t, "pod": n, **extra}) for n in self.pod_names.get(t, [])]
+    elif sel.startswith("container_cpu_cfs_"):
+        rx = sel.split('pod=~"')[1].split('"')[0]
+        who = "ingress" if rx.startswith("c28-ingress") else "fixture" if ".*" in rx else "generator"
+        key = ("cfs_throttled/" if "throttled" in sel else "cfs_periods/") + who
+        known = [n for ns in self.pod_names.values() for n in ns] + [INGRESS_POD]
+        pods = [n for n in known if re.fullmatch(rx, n)] or ([rx] if who == "generator" else [])
+        series = [self.series(lo, hi, 15, 1.0, {"pod": n, "container": "c"}) for n in pods]
+    else:
+        return None
+    mode = self.telemetry.get(key)
+    if callable(mode):
+        mode = mode(hi)
+    if mode is None:
+        return series
+    if mode == "refused":
+        return "refused"
+    if mode == "absent":
+        return []
+    if mode == "twice":
+        return series + [dict(x, metric={**x["metric"], "job": "kubernetes-pods"}) for x in series]
+    if mode == "nan-value":
+        return [dict(x, values=x["values"] + [[hi, "NaN"]]) for x in series]
+    kind_, arg = mode
+    if kind_ == "drop":
+        return [x for x in series if x["metric"].get("pod") != arg]
+    if kind_ == "extra":
+        return series + [self.series(lo, hi, 15, 1.0, {**series[0]["metric"], "pod": arg})]
+    if kind_ == "stale":
+        return [dict(x, values=[v for v in x["values"] if v[0] <= hi - arg]) for x in series]
+    if kind_ == "short":
+        return [dict(x, values=x["values"][-arg:] if arg else []) for x in series]
+    if kind_ == "gap":
+        return [dict(x, values=[v for v in x["values"] if not hi - arg - 15 < v[0] < hi - 15]) for x in series]
+    if kind_ == "future":
+        return [dict(x, values=x["values"] + [[hi + arg, "1"]]) for x in series]
+    raise ValueError(f"FakeVM: unknown telemetry mode {mode}")
+
+
+FakeVM._telemetry = _telemetry_method
+
+
 def simulated(params, label, origin_ms, stalls=()):
     """The generator configuration and the REAL script's output for one bounded run (harness simulator)."""
     import sys
@@ -209,9 +284,10 @@ def simulated(params, label, origin_ms, stalls=()):
     return cfg, [json.dumps(l) for l in out["lines"]], out["ingress"]
 
 
-def plan_now(record, kube, clock):
+def plan_now(record, kube, clock, vm=None):
+    """A plan made with the observer (vm; default: a steady one on which every series the gate reads is healthy)."""
     c = B.Ctx(record, kube, now=clock.now, sleep=clock.sleep)
-    p = B.plan_admission(c, ORIGIN)
+    p = B.plan_admission(c, ORIGIN, vm or FakeVM(None, POD_NAMES), "http://vm")
     saved = X.save_plan(record, B.HELPER, p, "plan-admission")
     return c, X.load_plan(saved["plan"]), saved["plan_digest"]
 
@@ -267,7 +343,7 @@ def _run(world, steal=1.0, alerts=(), raw_steal=None, **kw):  # noqa: F811
     assert p["problems"] == [], p["problems"]
     _, lines, ingress = simulated(c.params, "admission", O_MS)
     names = {t: [f"{t}-{i:02d}" for i in range(12)] for t in (N, R)}
-    vm = FakeVM(ingress, names, steal=steal, alerts=alerts, raw_steal=raw_steal)
+    vm = FakeVM(ingress, names, steal=steal, alerts=alerts, raw_steal=raw_steal, raw_steal_from_s=O_MS / 1000)
     logs = lambda c_, pod: lines
     return record, kube, a, clock, c, p, d, logs, vm
 
@@ -344,7 +420,9 @@ def test_a_steal_rate_that_is_not_a_finite_number_stops_the_load(world, steal): 
 
 def test_unusable_raw_values_and_unusable_bins_together_stop_through_live_stops(world):  # noqa: F811
     """The combined case from the review: fresh raw timestamps carrying NaN counter values AND fresh NaN bins."""
-    record, kube, a, clock, c, p, d, logs, vm = _run(world, steal="NaN", raw_steal={W_INSTANCE: "nan-value", S_INSTANCE: "nan-value"})
+    # both from the origin on: sources already unusable BEFORE the run are refused by the telemetry gate instead
+    record, kube, a, clock, c, p, d, logs, vm = _run(world, steal=lambda hi: "NaN" if hi >= O_MS / 1000 else 1.0,
+                                                     raw_steal={W_INSTANCE: "nan-value", S_INSTANCE: "nan-value"})
     out = B.run_admission(c, p, d, vm, "http://vm", logs=logs)
     assert out["data"]["verdict"] == "STOPPED"
     for text in ("steal observation of workload node is not a finite number", "steal observation of support node is not a finite number",
@@ -543,11 +621,11 @@ def _startup(world, admission=True, stalls=(), **kw):  # noqa: F811
     a = StartupApi(base, clock, o2 + 15 * 60_000 + 40_000, **kw)
     kube = record.kube(api=a)
     c = B.Ctx(record, kube, now=clock.now, sleep=clock.sleep)
-    p = B.plan_startup(c, _ts(o2))
+    p = B.plan_startup(c, _ts(o2), FakeVM(None, POD_NAMES), "http://vm")
     saved = X.save_plan(record, B.HELPER, p, "plan-startup")
     _, lines, ingress = simulated(c.params, "startup", o2,
                                   stalls=[{"at_ms": o2 + x[0], "for_ms": x[1]} for x in stalls])
-    vm = FakeVM(ingress, {R: []})
+    vm = FakeVM(ingress, POD_NAMES)
     return record, kube, a, clock, c, X.load_plan(saved["plan"]), saved["plan_digest"], vm, lines
 
 
@@ -566,7 +644,7 @@ def test_an_admission_pass_for_another_configuration_does_not_count(world):  # n
     r = X.last(X.receipts(record, B.HELPER), "run-complete")["data"]
     with open(os.path.join(r["dir"], "verdict.json"), "a") as fh:      # the verdict file altered after the run
         fh.write(" ")
-    assert any("no longer hashes" in x for x in B.plan_startup(c, p["origin_utc"])["problems"])
+    assert any("no longer hashes" in x for x in B.plan_startup(c, p["origin_utc"], FakeVM(None, POD_NAMES), "http://vm")["problems"])
 
 
 def test_a_startup_step_measures_six_starts_under_proven_load_and_meets_its_obligation(world):  # noqa: F811
@@ -671,7 +749,7 @@ def test_an_evidence_failure_never_blocks_the_restore(world, monkeypatch):  # no
     real = B._write
 
     def broken(path, doc):
-        if "startup-" in path:
+        if "startup-" in path and "telemetry-" not in path:      # the evidence, not the gate's archive before it
             raise OSError("disk full")
         return real(path, doc)
     monkeypatch.setattr(B, "_write", broken)
@@ -709,7 +787,7 @@ def test_an_admission_pass_is_void_for_a_changed_live_workload(world):  # noqa: 
     assert p["problems"] == []
     tpl = a.obj("Deployment", N, "demo")["spec"]["template"]["spec"]["containers"][0]
     tpl.setdefault("resources", {}).setdefault("limits", {})["memory"] = "16Mi"
-    assert any("other images, configuration" in x for x in B.plan_startup(c, p["origin_utc"])["problems"])
+    assert any("other images, configuration" in x for x in B.plan_startup(c, p["origin_utc"], FakeVM(None, POD_NAMES), "http://vm")["problems"])
 
 
 def test_a_stalled_generator_is_not_the_scheduled_load(world):  # noqa: F811
@@ -727,7 +805,7 @@ def test_a_configuration_changed_during_the_run_is_never_a_pass(world):  # noqa:
 
     class Probe:
         def __call__(self, url):
-            if "c28_ingress_requests_total" in url:                   # during the collection
+            if "c28_ingress_requests_total" in url and clock.ms > O_MS:   # during the collection (not the gate)
                 tpl = a.obj("Deployment", N, "demo")["spec"]["template"]["spec"]["containers"][0]
                 tpl.setdefault("resources", {}).setdefault("limits", {})["memory"] = "16Mi"
             return inner(url)
@@ -788,3 +866,206 @@ def test_a_crashed_admission_is_cleaned_up_through_plan_stop_and_stop(world):  #
     assert out["event"] == "run-stopped-by-operator"
     assert not _gen_pods(a) and a.obj("Job", "c28-demo-admission", "demo") is None
     assert a.obj("ConfigMap", "c28-demo-admission", "demo") is None and not os.path.exists(X.lock_file(record))
+
+
+# --- the telemetry gate (after the admission run of 2026-11-19, whose verdict could not pass) -----------------------
+
+def _gate_plan(world, telemetry=None, raw_steal=None, edit=None):  # noqa: F811
+    record, kube, a = ready_world(world)
+    if edit:
+        edit(a)
+    vm = FakeVM(None, POD_NAMES, telemetry=telemetry, raw_steal=raw_steal)
+    c, p, d = plan_now(record, kube, Clock(O_MS - 180_000), vm)
+    return record, kube, a, c, p, d, vm
+
+
+def test_the_plan_binds_exactly_the_verdicts_freshness_inventory_and_nothing_that_varies(world):  # noqa: F811
+    record, kube, a, c, p, d, vm = _gate_plan(world)
+    assert p["problems"] == [], p["problems"]
+    tele = p["telemetry"]
+    assert sorted(r["key"] for part in ("existing", "generator") for r in tele[part]) == \
+        c.verdicts.freshness_inventory([N, R])
+    assert [r["key"] for r in tele["generator"]] == ["cfs_periods/generator", "cfs_throttled/generator"]
+    text = json.dumps(tele)
+    assert "at_s" not in text and INGRESS_POD not in text and not any(n in text for n in POD_NAMES[N] + POD_NAMES[R])
+    assert not any(i in text for i in INSTANCES.values())                 # the node instance is resolved when observed
+    # what was observed is on the context, outside the plan: a later observation gives the SAME plan digest
+    first = c.telemetry
+    assert first["problems"] == [] and set(first["observed"]) == {r["key"] for r in tele["existing"]}
+    assert first["observed"][f"queue/{N}"]["series"] == 12 and first["observed"][f"ingress/{R}"]["series"] == 1
+    c2, p2, d2 = plan_now(record, kube, Clock(O_MS - 150_000), vm)
+    assert d2 == d and c2.telemetry["at_s"] == first["at_s"] + 30
+
+
+@pytest.mark.parametrize("telemetry, key, text", [
+    ({f"queue/{N}": "absent"}, f"queue/{N}", "no series"),                 # the installation of 2026-11-19
+    ({f"requests/{R}": "absent"}, f"requests/{R}", "no series"),
+    ({f"ingress/{N}": "absent"}, f"ingress/{N}", "no series"),             # a counter born at the first request
+    ({f"ingress/{N}": "twice"}, f"ingress/{N}", "2 series where exactly one is expected"),
+    ({f"queue/{N}": ("drop", f"{N}-03")}, f"queue/{N}", "no series for 1 of 12 expected pods"),
+    ({f"requests/{N}": ("drop", f"{N}-00")}, f"requests/{N}", "no series for 1 of 12 expected pods"),
+    ({f"queue/{N}": ("extra", f"{N}-zz")}, f"queue/{N}", "series of 1 pods that are not live Ready pods of it"),
+    ({f"queue/{R}": "twice"}, f"queue/{R}", "more than one series for the same pod (scraped twice?)"),
+    ({f"requests/{N}": "twice"}, f"requests/{N}", "more than one series for the same pod and code (scraped twice?)"),
+    ({f"queue/{N}": ("stale", 61)}, f"queue/{N}", "the newest sample of a series is older than 60 s"),
+    ({f"requests/{N}": ("short", 2)}, f"requests/{N}", "a series with fewer than 3 samples in the lookback"),
+    ({f"queue/{N}": ("short", 0)}, f"queue/{N}", "a series with fewer than 3 samples in the lookback"),
+    ({f"queue/{N}": ("gap", 61)}, f"queue/{N}", "a gap above 60 s between samples"),
+    ({f"queue/{N}": "nan-value"}, f"queue/{N}", "a sample that is not a finite [timestamp, value]"),
+    ({f"queue/{N}": ("future", 6)}, f"queue/{N}", "a sample from the future"),
+    ({f"queue/{N}": "refused"}, f"queue/{N}", "the query failed"),
+    ({"cfs_periods/fixture": ("drop", f"{R}-11")}, "cfs_periods/fixture", "no series for 1 of 24 expected pods"),
+    ({"cfs_throttled/ingress": "absent"}, "cfs_throttled/ingress", "no series"),
+    ({"cfs_throttled/fixture": ("stale", 61)}, "cfs_throttled/fixture", "older than 60 s"),
+])
+def test_the_plan_refuses_when_a_series_the_verdict_reads_is_not_there_as_expected(world, telemetry, key, text):  # noqa: F811
+    *_, p, d, vm = _gate_plan(world, telemetry)
+    assert p["problems"] and all(x.startswith(f"telemetry {key}: ") for x in p["problems"]), p["problems"]
+    assert any(text in x for x in p["problems"]), p["problems"]
+
+
+@pytest.mark.parametrize("telemetry", [
+    {f"queue/{N}": ("stale", 60)},                                         # exactly at the limit
+    {f"queue/{N}": ("future", 5)},
+    {f"requests/{N}": ("short", 3)},
+    {"cfs_periods/fixture": ("extra", "some-other-pod")},                  # cAdvisor: other pods' series do not matter
+    {"cfs_periods/generator": "absent"},                                   # not part of what exists before the run
+])
+def test_the_plan_accepts_what_is_within_the_limits(world, telemetry):  # noqa: F811
+    *_, p, d, vm = _gate_plan(world, telemetry)
+    assert p["problems"] == [], p["problems"]
+
+
+@pytest.mark.parametrize("raw_steal, text", [
+    ({W_INSTANCE: "absent"}, "telemetry steal_raw/w: no series"),
+    ({S_INSTANCE: ("stale", 121)}, "telemetry steal_raw/s: the newest sample of a series is older than 120 s"),
+    ({S_INSTANCE: "nan-value"}, "telemetry steal_raw/s: a sample that is not a finite [timestamp, value]"),
+    ({W_INSTANCE: "refused"}, "telemetry steal_raw/w: the query failed"),
+])
+def test_the_plan_refuses_a_steal_source_that_is_already_lost(world, raw_steal, text):  # noqa: F811
+    *_, p, d, vm = _gate_plan(world, raw_steal=raw_steal)
+    assert any(text in x for x in p["problems"]), p["problems"]
+
+
+def test_a_steal_source_within_the_live_limit_is_accepted_by_the_plan(world):  # noqa: F811
+    *_, p, d, vm = _gate_plan(world, raw_steal={S_INSTANCE: ("stale", 105)})
+    assert p["problems"] == []
+
+
+def _unready(a):
+    a.obj("Pod", f"{N}-05", "demo")["status"]["conditions"] = [{"type": "Ready", "status": "False"}]
+
+
+def _ingress_leaving(a):
+    a.obj("Pod", INGRESS_POD, "demo")["metadata"]["deletionTimestamp"] = "2026-11-11T00:00:00Z"
+
+
+@pytest.mark.parametrize("edit, text", [
+    (_unready, f"telemetry queue/{N}: series of 1 pods that are not live Ready pods of it"),
+    (_ingress_leaving, "telemetry cfs_periods/ingress: no live Ready pod is known for it")])
+def test_the_expected_pods_are_the_live_ready_ones(world, edit, text):  # noqa: F811
+    *_, p, d, vm = _gate_plan(world, edit=edit)
+    assert any(text in x for x in p["problems"]), p["problems"]
+
+
+def test_planning_needs_the_observer(world):  # noqa: F811
+    record, kube, a = ready_world(world)
+    c = B.Ctx(record, kube, now=Clock(O_MS - 180_000).now)
+    p = B.plan_admission(c, ORIGIN)
+    assert p["problems"] == ["telemetry: no query API was given, so the series the verdict reads cannot be checked"]
+    assert c.telemetry is None
+
+
+def test_a_run_refuses_before_any_mutation_when_the_telemetry_was_lost_after_the_review(world):  # noqa: F811
+    record, kube, a, clock, c, p, d, logs, vm = _run(world)
+    vm.telemetry[f"queue/{N}"] = "absent"                                  # healthy at the review, gone at apply
+    with pytest.raises(X.StagingError):
+        B.run_admission(c, p, d, vm, "http://vm", logs=logs)
+    assert kube.mutations == [] and not _gen_pods(a)
+    assert X.last(X.receipts(record, B.HELPER), "run-begin") is None
+    assert not os.path.exists(X.lock_file(record)) and not X.open_intents(X.receipts(record, B.HELPER))
+
+
+def test_a_run_whose_generator_has_no_telemetry_is_void_and_stopped_before_the_origin(world, monkeypatch):  # noqa: F811
+    record, kube, a, clock, c, p, d, logs, vm = _run(world)
+    vm.telemetry["cfs_throttled/generator"] = "absent"
+    stopped_at = []
+    real = B.stop_load
+    monkeypatch.setattr(B, "stop_load", lambda c_, run: (stopped_at.append(clock.ms), real(c_, run))[1])
+    out = B.run_admission(c, p, d, vm, "http://vm", logs=logs)
+    assert "VOID: the generator's telemetry was not complete before the origin" in out["data"]["stopped"]
+    assert "telemetry cfs_throttled/generator: no series" in out["data"]["stopped"]
+    assert out["data"]["verdict"] != "PASS"
+    # it waited for the telemetry, gave up 30 s before the origin, and the load generator was gone before it could send
+    assert stopped_at and O_MS - 30_000 <= stopped_at[0] < O_MS, (stopped_at, O_MS)
+    assert not _gen_pods(a) and a.obj("Job", "c28-demo-admission", "demo") is None
+    arch = json.load(open(os.path.join(out["data"]["dir"], "telemetry-generator.json")))
+    assert arch["problems"] == ["telemetry cfs_throttled/generator: no series"] and arch["pod"].startswith("c28-demo-admission-")
+    before = json.load(open(os.path.join(out["data"]["dir"], "telemetry-before-mutation.json")))
+    assert before["problems"] == [] and before["part"] == "existing"
+    assert not os.path.exists(X.lock_file(record)) and not X.open_intents(X.receipts(record, B.HELPER))
+
+
+def test_generator_telemetry_that_arrives_before_the_deadline_lets_the_run_go_on(world):  # noqa: F811
+    record, kube, a, clock, c, p, d, logs, vm = _run(world)
+    vm.telemetry["cfs_periods/generator"] = lambda hi: "absent" if hi < O_MS / 1000 - 100 else None
+    out = B.run_admission(c, p, d, vm, "http://vm", logs=logs)
+    assert out["data"]["verdict"] == "PASS" and not out["data"]["stopped"]
+    arch = json.load(open(os.path.join(out["data"]["dir"], "telemetry-generator.json")))
+    assert arch["problems"] == [] and O_MS / 1000 - 100 <= arch["at_s"] < O_MS / 1000 - 30
+    # the gate reads the collector's own selectors: every raw selector it asked for is one the collection asks for
+    gate = {q.rsplit("[", 1)[0] for q in vm.queries if q.endswith("[180s]")}
+    collected = {q.rsplit("[", 1)[0] for q in vm.queries if q.endswith("s]") and not q.endswith("[180s]")
+                 and not q.startswith(("sum", "100"))}
+    assert gate and gate <= collected, sorted(gate - collected)
+
+
+def test_the_commands_take_the_observer_and_keep_the_observation_outside_the_plan(world, capsys):  # noqa: F811
+    record, kube, a = ready_world(world)
+    vm = FakeVM(None, POD_NAMES)
+    assert B.main(["--record", record.path, "check-telemetry", "--query-api", "http://vm"], api=a, fetch=vm) == 0
+    seen = json.loads(capsys.readouterr().out)
+    assert seen["problems"] == [] and seen["telemetry"]["observed"][f"requests/{N}"]["expected_pods"] == 12
+    vm.telemetry[f"queue/{R}"] = "absent"
+    assert B.main(["--record", record.path, "check-telemetry", "--query-api", "http://vm"], api=a, fetch=vm) == 4
+    assert json.loads(capsys.readouterr().out)["problems"] == [f"telemetry queue/{R}: no series"]
+    with pytest.raises(SystemExit):                                        # --query-api is required for a plan
+        B.main(["--record", record.path, "plan-admission", "--origin", ORIGIN], api=a, fetch=vm)
+    capsys.readouterr()
+    assert B.main(["--record", record.path, "plan-admission", "--origin", ORIGIN, "--query-api", "http://vm"],
+                  api=a, fetch=vm) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert any(f"telemetry queue/{R}: no series" in x for x in out["problems"])
+    obs = json.load(open(out["telemetry_observation"]))
+    assert obs["problems"] == [f"telemetry queue/{R}: no series"] and "at_s" in obs
+    assert os.path.dirname(out["telemetry_observation"]) == os.path.dirname(out["plan"])
+    assert "at_s" not in open(out["plan"]).read()
+
+
+def test_the_startup_plan_has_the_same_gate(world):  # noqa: F811
+    record, kube, a, clock, c, p, d, vm, lines = _startup(world)
+    assert p["problems"] == [] and sorted(r["key"] for part in ("existing", "generator") for r in p["telemetry"][part]) \
+        == c.verdicts.freshness_inventory([N, R])
+    bad = FakeVM(None, POD_NAMES, telemetry={f"requests/{R}": "absent"})
+    assert B.plan_startup(c, p["origin_utc"], bad, "http://vm")["problems"] == [f"telemetry requests/{R}: no series"]
+    assert any("no query API" in x for x in B.plan_startup(c, p["origin_utc"])["problems"])
+
+
+def test_a_startup_whose_generator_has_no_telemetry_is_void_and_restores_twelve(world):  # noqa: F811
+    record, kube, a, clock, c, p, d, vm, lines = _startup(world)
+    vm.telemetry["cfs_periods/generator"] = "absent"
+    data = run_s(c, p, d, vm, lines)["data"]
+    assert "VOID: the generator's telemetry was not complete before the origin" in data["stopped"]
+    assert data["measured"] is False
+    assert a.obj("Deployment", R, "demo")["spec"]["replicas"] == 12 and not B.open_obligations(record)
+    assert not [k for k in a.objects if k[0] in ("jobs", "configmaps", "pods") and "startup" in k[2]]
+
+
+def test_a_startup_refuses_before_any_mutation_when_the_telemetry_was_lost_after_the_review(world):  # noqa: F811
+    record, kube, a, clock, c, p, d, vm, lines = _startup(world)
+    before = len(kube.mutations)
+    vm.telemetry[f"queue/{R}"] = ("stale", 61)
+    with pytest.raises(X.StagingError):
+        run_s(c, p, d, vm, lines)
+    assert len(kube.mutations) == before and a.obj("Deployment", R, "demo")["spec"]["replicas"] == 12
+    assert not os.path.exists(X.lock_file(record)) and not B.open_obligations(record)

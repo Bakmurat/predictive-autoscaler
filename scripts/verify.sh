@@ -90,7 +90,10 @@ if [ "$run_py" = 1 ]; then
   ( cd deploy/eval-c28/harness && "$PYTHON" -m pytest -q -p no:cacheprovider tests ) 2>&1 | tee -a "$LOG"; rc=${PIPESTATUS[0]}
   status_line "c28 harness" "$rc" | tee -a "$LOG"; [ "$rc" -eq 0 ] || overall=1
   # The C2.8 prod staging helpers (deploy/eval-c28/staging), offline against fake API fixtures.
-  ( cd deploy/eval-c28/staging && KUBECONFIG=/dev/null "$PYTHON" -m pytest -q -p no:cacheprovider tests ) 2>&1 | tee -a "$LOG"; rc=${PIPESTATUS[0]}
+  # (tests/test_cold_install.py builds the fixture: with a Go toolchain, or with C28_REQUIRE_GO=1 as in CI, it must
+  # run; it is skipped only where there is no toolchain and nobody required one.)
+  ( cd deploy/eval-c28/staging && KUBECONFIG=/dev/null GO="$GO" C28_REQUIRE_GO="${C28_REQUIRE_GO:-$([ -n "$GO" ] && echo 1 || echo 0)}" \
+      "$PYTHON" -m pytest -q -p no:cacheprovider tests ) 2>&1 | tee -a "$LOG"; rc=${PIPESTATUS[0]}
   status_line "c28 staging" "$rc" | tee -a "$LOG"; [ "$rc" -eq 0 ] || overall=1
   # The C2.8 public-trace demonstration's selection/transformation (deploy/eval-c28/trace), on synthetic inputs only.
   ( cd deploy/eval-c28/trace && KUBECONFIG=/dev/null "$PYTHON" -m pytest -q -p no:cacheprovider tests ) 2>&1 | tee -a "$LOG"; rc=${PIPESTATUS[0]}

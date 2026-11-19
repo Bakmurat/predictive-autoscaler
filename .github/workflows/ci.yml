@@ -64,10 +64,14 @@ jobs:
           cache-dependency-path: |
             ml-engine/requirements.txt
             ml-engine/requirements-dev.txt
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e   # v7.0.0
+        with:
+          go-version: "1.25.x"            # the staging suite's cold-install test builds the C2.8 fixture
+          cache-dependency-path: k8s-operator/go.sum
       - name: install
         run: python -m pip install -r ml-engine/requirements.txt -r ml-engine/requirements-dev.txt
       - name: verify (Python)
-        run: LOG=/dev/null PYTHON=python scripts/verify.sh --python-only
+        run: LOG=/dev/null PYTHON=python C28_REQUIRE_GO=1 scripts/verify.sh --python-only
 
   chart:
     name: chart (helm ${{ matrix.helm }} lint + template, kubeconform 1.33–1.35)

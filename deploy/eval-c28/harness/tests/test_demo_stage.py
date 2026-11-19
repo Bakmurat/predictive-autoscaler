@@ -427,7 +427,29 @@ def test_scrape_objects_and_route_policies_under_the_run_label(scrape, kind):
     p = prod_like()
     p["scrape"], p["release_network_policies"] = scrape, True
     common = demo.render(p)["common"]
-    assert by_kind(common)[kind] == ["c28-ingress"]
+    assert by_kind(common)[kind] == ["c28-ingress", "c28-targets"]
+    ingress, tgt = (next(o for o in common if o["kind"] == kind and o["metadata"]["name"] == n)
+                    for n in ("c28-ingress", "c28-targets"))
+    # The targets' own metrics need their own scrape object: on the first real installation only the ingress had one,
+    # no c28_queue or c28_requests_total series existed, and the admission verdict could not pass.
+    assert tgt["spec"]["selector"] == {"matchLabels": {render.RUN_LABEL: "c28-demo-1"}, "matchExpressions": [
+        {"key": render.TARGET_LABEL, "operator": "In", "values": ["c28-demo-pa-n", "c28-demo-pa-r"]}]}
+    assert tgt["spec"]["podMetricsEndpoints"] == ingress["spec"]["podMetricsEndpoints"] == [
+        {"port": "http", "path": "/metrics", "interval": "15s"}]
+    assert tgt["apiVersion"] == ingress["apiVersion"]
+    # ... and it selects every target pod of the stage and nothing else that the stage renders
+    parts = demo.render(p)
+    sel = tgt["spec"]["selector"]
+
+    def selected(labels):
+        return all(labels.get(k) == v for k, v in sel["matchLabels"].items()) and all(
+            labels.get(e["key"]) in e["values"] for e in sel["matchExpressions"])
+    pods = {o["metadata"]["name"]: o["spec"]["template"] for part in parts.values() for o in part
+            if o["kind"] in ("Deployment", "Job")}
+    assert {n for n, t in pods.items() if selected(t["metadata"]["labels"])} == {"c28-demo-pa-n", "c28-demo-pa-r"}
+    for n in ("c28-demo-pa-n", "c28-demo-pa-r"):
+        ports = pods[n]["spec"]["containers"][0]["ports"]
+        assert [x["name"] for x in ports] == ["http"]                       # the endpoint's port name exists on the pod
     assert by_kind(common)["NetworkPolicy"] == ["c28-forecast-route-ingress", "c28-forecast-route-to-forecaster",
                                                 "c28-metrics-route-ingress", "c28-release-to-routes"]
     assert all(o["metadata"]["labels"][render.RUN_LABEL] == "c28-demo-1" for o in common)

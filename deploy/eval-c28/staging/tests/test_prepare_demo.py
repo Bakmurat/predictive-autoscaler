@@ -790,19 +790,19 @@ def test_a_completed_common_phase_plans_and_applies_only_what_was_added(world, m
     before = {k: (o["metadata"]["uid"], o["metadata"].get("resourceVersion")) for k, o in world.api.objects.items()}
     plan = plan_at(record, kube, "common")
     assert {a["name"] for a in plan["actions"]} == ADDED and {a["create"] for a in plan["actions"]} == {"NetworkPolicy"}
-    assert len(plan["already_created_by_this_run"]) == 16 and plan["problems"] == []
+    assert len(plan["already_created_by_this_run"]) == 17 and plan["problems"] == []    # with the targets' scrape object
     world.api.calls.clear()
     run_phase(record, kube, "common")
     created = [p for v, p in world.api.mutations() if v == "create"]
     assert len(created) == 2 and all("networkpolicies" in p for p in created)       # nothing else was written
     assert {v for v, _ in world.api.mutations()} == {"create"}
-    for k, ident in before.items():                                                  # the 16 are untouched
+    for k, ident in before.items():                                                  # the 17 are untouched
         o = world.api.objects[k]
         assert (o["metadata"]["uid"], o["metadata"].get("resourceVersion")) == ident
     for name in ADDED:
         assert world.api.obj("NetworkPolicy", name, "pa-eval-system") is not None
     again = plan_at(record, kube, "common")
-    assert again["actions"] == [] and again["problems"] == [] and len(again["already_created_by_this_run"]) == 18
+    assert again["actions"] == [] and again["problems"] == [] and len(again["already_created_by_this_run"]) == 19
     for ph in ("targets", "pas"):                                                    # and the run goes on
         run_phase(record, kube, ph)
 
