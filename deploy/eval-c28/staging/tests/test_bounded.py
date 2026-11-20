@@ -620,6 +620,8 @@ class StartupApi(JobApi):
     # id 5 s later. "no-status": no containerStatuses at all first, then Running with an id. "restart-before-id":
     # like "pending", but the first id comes with restartCount 1. "replaced": like "pending", and 40 s after
     # creation the established id is replaced by another one with the restart count unchanged.
+    # "restarted-first-seen" / "oom-first-seen": the pod is ALREADY Running with an id and restartCount 1 (and an
+    # OOMKilled last state) when it is first seen, and never changes afterwards.
     new_pods = None
 
     def get(self, path):
@@ -653,12 +655,18 @@ class StartupApi(JobApi):
                                           "lastTransitionTime": _ts(self.clock.ms + 20_000)}]
             p["status"]["containerStatuses"] = [{"name": "fixture", "restartCount": 0,
                                                  "state": {"running": {"startedAt": _ts(self.clock.ms + 5_000)}}}]
-            if self.new_pods:
+            if self.new_pods in ("restarted-first-seen", "oom-first-seen"):
+                p["status"]["phase"] = "Running"
+                p["status"]["containerStatuses"] = [{
+                    "name": "fixture", "containerID": f"containerd://seen-{i}", "restartCount": 1,
+                    "state": {"running": {"startedAt": _ts(self.clock.ms)}},
+                    **({"lastState": {"terminated": {"reason": "OOMKilled"}}} if self.new_pods == "oom-first-seen" else {})}]
+            elif self.new_pods:
                 p["status"]["phase"] = "Pending"
                 p["status"]["containerStatuses"] = [] if self.new_pods == "no-status" else [{
                     "name": "fixture", "containerID": "", "restartCount": 0, "state": {"waiting": {"reason": "ContainerCreating"}}}]
             self.put(p)
-            if self.new_pods:
+            if self.new_pods and self.new_pods not in ("restarted-first-seen", "oom-first-seen"):
                 self.__dict__.setdefault("_starting", {})[("pods", "demo", p["metadata"]["name"])] = (self.clock.ms, self.new_pods)
         return out
 
@@ -1437,11 +1445,14 @@ def test_a_startup_whose_new_pods_start_as_on_a_real_cluster_is_measured(world, 
     assert a.obj("Deployment", R, "demo")["spec"]["replicas"] == 12 and not B.open_obligations(record)
 
 
-@pytest.mark.parametrize("mode, what", [("restart-before-id", "restart"), ("replaced", "container-changed")])
+@pytest.mark.parametrize("mode, what", [("restart-before-id", "restart"), ("replaced", "container-changed"),
+                                        # the pod's FIRST observed status already carries the event (review of 4babde8:
+                                        # both were measured=true before, with restartCount 1 on all six new pods)
+                                        ("restarted-first-seen", "restart"), ("oom-first-seen", "oom")])
 def test_a_startup_whose_new_pods_really_restart_or_change_still_stops_and_restores(world, mode, what):  # noqa: F811
     record, kube, a, clock, c, p, d, vm, lines = _startup(world, new_pods=mode)
     data = run_s(c, p, d, vm, lines)["data"]
-    assert f"STOP: {what} of pod" in data["stopped"] and data["measured"] is False
+    assert data["stopped"].startswith("STOP: ") and f"{what} of pod" in data["stopped"] and data["measured"] is False
     assert a.obj("Deployment", R, "demo")["spec"]["replicas"] == 12 and not B.open_obligations(record)
     assert not [k for k in a.objects if k[0] in ("jobs", "configmaps", "pods") and "startup" in k[2]]
 
@@ -1468,3 +1479,29 @@ def test_an_admission_run_with_a_replaced_pod_still_does_not_pass(world):  # noq
     assert out["data"]["verdict"] != "PASS" and "deleted of pod" in out["data"]["stopped"], out["data"]
     assert "container-changed" not in out["data"]["stopped"]
     assert not os.path.exists(X.lock_file(record)) and not X.open_intents(X.receipts(record, B.HELPER))
+
+
+def test_what_a_new_pods_first_status_already_reports_is_judged_at_once(world):  # noqa: F811
+    """A pod that appears after the baseline has no earlier observation: a restart count above zero or an OOM record
+    in its FIRST status is an event now (later polls see unchanged counters). The baseline itself stays silent."""
+    obs, a, add, poll = _watch(world)
+    assert obs.transitions == []                                           # the baseline: nothing, whatever it holds
+    add(f"{R}-new1", _cs("containerd://a", restarts=1), phase="Running")
+    assert poll() == ["appeared", "restart"]
+    assert poll() == ["appeared", "restart"]                               # once, not on every poll
+    add(f"{R}-new2", _cs("containerd://b", restarts=2, lastState={"terminated": {"reason": "OOMKilled"}}), phase="Running")
+    assert poll()[2:] == ["appeared", "restart", "oom"]
+    add(f"{R}-new3", _cs("containerd://c"), phase="Running")               # a healthy pod first seen Running
+    assert poll()[5:] == ["appeared"]
+
+
+def test_a_baseline_pod_with_old_restarts_is_not_an_event(world):  # noqa: F811
+    import tempfile
+    record, kube, a = ready_world(world)
+    a.obj("Pod", f"{N}-02", "demo")["status"]["containerStatuses"] = _cs("containerd://old", restarts=3,
+                                                                         lastState={"terminated": {"reason": "OOMKilled"}})
+    clock = Clock(O_MS)
+    obs = B.Observer(B.Ctx(record, kube, now=clock.now, sleep=clock.sleep), tempfile.mkdtemp(), {N: [], R: []})
+    obs.poll_pods(clock.ms / 1000)
+    obs.poll_pods(clock.ms / 1000 + 10)
+    assert obs.transitions == []

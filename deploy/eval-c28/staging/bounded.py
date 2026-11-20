@@ -274,6 +274,14 @@ class Observer:
                     self.transitions.append({"t_s": t_s, "pod_uid": uid, "what": "deleted"})
             elif not first:
                 self.transitions.append({"t_s": t_s, "pod_uid": uid, "what": "appeared", "name": now["name"]})
+                # A pod that appears AFTER the baseline has no earlier observation to compare with: what its first
+                # status already reports is judged at once (later polls would see unchanged counters and stay
+                # silent for ever). A healthy first start reports zero restarts and no OOM record.
+                for k, v in cs.items():
+                    if v["restarts"] > 0:
+                        self.transitions.append({"t_s": t_s, "pod_uid": uid, "what": "restart", "container": k})
+                    if v["oom"]:
+                        self.transitions.append({"t_s": t_s, "pod_uid": uid, "what": "oom", "container": k})
             self.pods[uid] = now
         for uid in set(self.pods) - seen:
             if not self.pods[uid].get("gone"):
