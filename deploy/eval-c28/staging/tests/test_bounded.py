@@ -615,6 +615,28 @@ class StartupApi(JobApi):
     created now and become Ready 20 s later (the Ready condition's lastTransitionTime)."""
 
     fail_restore = False
+    # How a NEW pod's container first shows up (None: as before, a status without a container id that never
+    # changes). "pending": as on a real cluster, Pending with an EMPTY id and a waiting state, Running with its first
+    # id 5 s later. "no-status": no containerStatuses at all first, then Running with an id. "restart-before-id":
+    # like "pending", but the first id comes with restartCount 1. "replaced": like "pending", and 40 s after
+    # creation the established id is replaced by another one with the restart count unchanged.
+    # "restarted-first-seen" / "oom-first-seen": the pod is ALREADY Running with an id and restartCount 1 (and an
+    # OOMKilled last state) when it is first seen, and never changes afterwards.
+    new_pods = None
+
+    def get(self, path):
+        for k, (made_ms, mode) in list(getattr(self, "_starting", {}).items()):
+            p = self.objects.get(k)
+            if p is None:
+                continue
+            age = self.clock.ms - made_ms
+            if age >= 5_000:
+                p["status"]["phase"] = "Running"
+                p["status"]["containerStatuses"] = [{
+                    "name": "fixture", "containerID": "containerd://new-" + k[2] + ("-b" if mode == "replaced" and age >= 40_000 else ""),
+                    "restartCount": 1 if mode == "restart-before-id" else 0,
+                    "state": {"running": {"startedAt": _ts(made_ms + 5_000)}}}]
+        return super().get(path)
 
     def _scale(self, o, body):
         want, name = body["spec"]["replicas"], o["metadata"]["name"]
@@ -633,11 +655,23 @@ class StartupApi(JobApi):
                                           "lastTransitionTime": _ts(self.clock.ms + 20_000)}]
             p["status"]["containerStatuses"] = [{"name": "fixture", "restartCount": 0,
                                                  "state": {"running": {"startedAt": _ts(self.clock.ms + 5_000)}}}]
+            if self.new_pods in ("restarted-first-seen", "oom-first-seen"):
+                p["status"]["phase"] = "Running"
+                p["status"]["containerStatuses"] = [{
+                    "name": "fixture", "containerID": f"containerd://seen-{i}", "restartCount": 1,
+                    "state": {"running": {"startedAt": _ts(self.clock.ms)}},
+                    **({"lastState": {"terminated": {"reason": "OOMKilled"}}} if self.new_pods == "oom-first-seen" else {})}]
+            elif self.new_pods:
+                p["status"]["phase"] = "Pending"
+                p["status"]["containerStatuses"] = [] if self.new_pods == "no-status" else [{
+                    "name": "fixture", "containerID": "", "restartCount": 0, "state": {"waiting": {"reason": "ContainerCreating"}}}]
             self.put(p)
+            if self.new_pods and self.new_pods not in ("restarted-first-seen", "oom-first-seen"):
+                self.__dict__.setdefault("_starting", {})[("pods", "demo", p["metadata"]["name"])] = (self.clock.ms, self.new_pods)
         return out
 
 
-def _startup(world, admission=True, stalls=(), **kw):  # noqa: F811
+def _startup(world, admission=True, stalls=(), new_pods=None, **kw):  # noqa: F811
     """A world whose admission really PASSED (a full simulated run), then a startup plan 3 minutes ahead."""
     record, kube, base = ready_world(world)
     clock = Clock(O_MS - 180_000)
@@ -650,6 +684,7 @@ def _startup(world, admission=True, stalls=(), **kw):  # noqa: F811
         assert B.run_admission(c1, p1, d1, vm1, "http://vm", logs=lambda c_, pod: lines)["data"]["verdict"] == "PASS"
     o2 = (clock.ms // 60_000 + 4) * 60_000
     a = StartupApi(base, clock, o2 + 15 * 60_000 + 40_000, **kw)
+    a.new_pods = new_pods
     kube = record.kube(api=a)
     c = B.Ctx(record, kube, now=clock.now, sleep=clock.sleep)
     p = B.plan_startup(c, _ts(o2), FakeVM(None, POD_NAMES), "http://vm")
@@ -1318,3 +1353,155 @@ def test_the_observer_request_still_returns_a_prompt_answer_and_refuses_an_error
             B._fetch_within(B.http_json, url + "/ok", 0.0)
     finally:
         close()
+
+
+# --- a new pod's first container start is not a container change (the startup step of 2026-11-20 stopped itself) ---
+
+def _watch(world):  # noqa: F811
+    """An Observer on the ready world after its baseline poll: (observer, api, add(name, statuses, phase), poll())."""
+    import tempfile
+    record, kube, a = ready_world(world)
+    clock = Clock(O_MS)
+    c = B.Ctx(record, kube, now=clock.now, sleep=clock.sleep)
+    obs = B.Observer(c, tempfile.mkdtemp(), {N: [], R: []})
+
+    def poll():
+        clock.ms += 10_000
+        obs.poll_pods(clock.ms / 1000)
+        return [x["what"] for x in obs.transitions]
+
+    def add(name, statuses, phase="Pending"):
+        p = F.pod(name, "demo", "worker-w", labels={"c28.devkuban.com/target": R, X.RUN_LABEL: DEMO})
+        p["status"]["phase"], p["status"]["containerStatuses"] = phase, statuses
+        a.put(p)
+        return a.obj("Pod", name, "demo")
+    obs.poll_pods(clock.ms / 1000)                                         # the baseline
+    return obs, a, add, poll
+
+
+def _cs(cid, restarts=0, **extra):
+    return [{"name": "fixture", "containerID": cid, "restartCount": restarts, **extra}]
+
+
+STOPPING = {"oom", "restart", "deleted", "container-changed"}             # the kinds live_stops acts on
+
+
+def test_a_new_pods_first_container_id_is_its_start_not_a_change(world):  # noqa: F811
+    obs, a, add, poll = _watch(world)
+    p = add(f"{R}-new1", _cs(""))                                          # Pending, the id EMPTY (the real shape)
+    assert poll() == ["appeared"]
+    assert poll() == ["appeared"]                                          # still waiting: nothing new
+    p["status"].update(phase="Running", containerStatuses=_cs("containerd://first"))
+    assert not STOPPING & set(poll())
+    assert not STOPPING & set(poll())                                      # and it stays quiet afterwards
+    q = add(f"{R}-new2", [])                                               # no containerStatuses at all first
+    poll()
+    q["status"].update(phase="Running", containerStatuses=_cs("containerd://q"))
+    assert not STOPPING & set(poll())
+    r = add(f"{R}-new3", [{"name": "fixture", "restartCount": 0}])         # a status without the id key
+    poll()
+    r["status"].update(phase="Running", containerStatuses=_cs("containerd://r"))
+    assert not STOPPING & set(poll())
+
+
+@pytest.mark.parametrize("first, then, what", [
+    (_cs("containerd://a"), _cs("containerd://b"), "container-changed"),   # an ESTABLISHED id replaced, restarts unchanged
+    (_cs("containerd://a"), _cs(""), "container-changed"),                 # ... or gone
+    (_cs("containerd://a"), [{"name": "fixture", "restartCount": 0}], "container-changed"),
+    (_cs("containerd://a"), [], "container-changed"),                      # the container disappears from the status
+    (_cs(""), _cs("containerd://a", restarts=1), "restart"),               # a restart before the first observed id
+    ([], _cs("containerd://a", restarts=1), "restart"),                    # ... or before any status was seen
+    (_cs("containerd://a"), _cs("containerd://a", restarts=1), "restart"),
+    (_cs("containerd://a"), _cs("containerd://a", lastState={"terminated": {"reason": "OOMKilled"}}), "oom"),
+])
+def test_every_real_container_event_of_a_new_pod_still_stops(world, first, then, what):  # noqa: F811
+    obs, a, add, poll = _watch(world)
+    p = add(f"{R}-new1", first, phase="Running" if first and first[0].get("containerID") else "Pending")
+    assert not STOPPING & set(poll())
+    p["status"]["containerStatuses"] = then
+    assert what in poll()
+
+
+def test_an_established_id_of_a_baseline_pod_that_changes_still_stops_and_first_ids_then_establish(world):  # noqa: F811
+    obs, a, add, poll = _watch(world)
+    a.obj("Pod", f"{N}-03", "demo")["status"]["containerStatuses"] = _cs("containerd://other")
+    assert poll() == ["container-changed"]
+    p = add(f"{R}-new1", _cs(""))
+    poll()
+    p["status"].update(phase="Running", containerStatuses=_cs("containerd://first"))
+    poll()
+    p["status"]["containerStatuses"] = _cs("containerd://second")           # the first id is now established
+    assert poll().count("container-changed") == 2
+    p["metadata"]["deletionTimestamp"] = "2026-11-11T00:10:00Z"
+    assert "deleted" in poll()
+
+
+@pytest.mark.parametrize("mode", ["pending", "no-status"])
+def test_a_startup_whose_new_pods_start_as_on_a_real_cluster_is_measured(world, mode):  # noqa: F811
+    """The run of 2026-11-20 on prod: new pods first seen Pending with an empty container id. Not a stop."""
+    record, kube, a, clock, c, p, d, vm, lines = _startup(world, new_pods=mode)
+    data = run_s(c, p, d, vm, lines)["data"]
+    assert not data["stopped"] and data["measured"] is True, (data["stopped"], data.get("load_problems"))
+    assert a.obj("Deployment", R, "demo")["spec"]["replicas"] == 12 and not B.open_obligations(record)
+
+
+@pytest.mark.parametrize("mode, what", [("restart-before-id", "restart"), ("replaced", "container-changed"),
+                                        # the pod's FIRST observed status already carries the event (review of 4babde8:
+                                        # both were measured=true before, with restartCount 1 on all six new pods)
+                                        ("restarted-first-seen", "restart"), ("oom-first-seen", "oom")])
+def test_a_startup_whose_new_pods_really_restart_or_change_still_stops_and_restores(world, mode, what):  # noqa: F811
+    record, kube, a, clock, c, p, d, vm, lines = _startup(world, new_pods=mode)
+    data = run_s(c, p, d, vm, lines)["data"]
+    assert data["stopped"].startswith("STOP: ") and f"{what} of pod" in data["stopped"] and data["measured"] is False
+    assert a.obj("Deployment", R, "demo")["spec"]["replicas"] == 12 and not B.open_obligations(record)
+    assert not [k for k in a.objects if k[0] in ("jobs", "configmaps", "pods") and "startup" in k[2]]
+
+
+def test_an_admission_run_with_a_replaced_pod_still_does_not_pass(world):  # noqa: F811
+    """Pod churn during admission: the old pod is deleted (a live stop) and the new one appears; the new pod's first
+    container start being no longer a change must not let such a run pass."""
+    record, kube, a, clock, c, p, d, logs, vm = _run(world)
+    inner, done = vm.__call__, []
+
+    class Churn:
+        def __call__(self, url):
+            if clock.ms > O_MS + 5 * 60_000 and not done:
+                done.append(1)
+                del a.objects[("pods", "demo", f"{N}-04")]
+                new = F.pod(f"{N}-zz", "demo", "worker-w", labels={"c28.devkuban.com/target": N, X.RUN_LABEL: DEMO})
+                new["status"].update(phase="Pending", containerStatuses=_cs(""))
+                a.put(new)
+            elif done and clock.ms > O_MS + 6 * 60_000 and len(done) == 1:
+                done.append(2)
+                a.obj("Pod", f"{N}-zz", "demo")["status"].update(phase="Running", containerStatuses=_cs("containerd://zz"))
+            return inner(url)
+    out = B.run_admission(c, p, d, Churn(), "http://vm", logs=logs)
+    assert out["data"]["verdict"] != "PASS" and "deleted of pod" in out["data"]["stopped"], out["data"]
+    assert "container-changed" not in out["data"]["stopped"]
+    assert not os.path.exists(X.lock_file(record)) and not X.open_intents(X.receipts(record, B.HELPER))
+
+
+def test_what_a_new_pods_first_status_already_reports_is_judged_at_once(world):  # noqa: F811
+    """A pod that appears after the baseline has no earlier observation: a restart count above zero or an OOM record
+    in its FIRST status is an event now (later polls see unchanged counters). The baseline itself stays silent."""
+    obs, a, add, poll = _watch(world)
+    assert obs.transitions == []                                           # the baseline: nothing, whatever it holds
+    add(f"{R}-new1", _cs("containerd://a", restarts=1), phase="Running")
+    assert poll() == ["appeared", "restart"]
+    assert poll() == ["appeared", "restart"]                               # once, not on every poll
+    add(f"{R}-new2", _cs("containerd://b", restarts=2, lastState={"terminated": {"reason": "OOMKilled"}}), phase="Running")
+    assert poll()[2:] == ["appeared", "restart", "oom"]
+    add(f"{R}-new3", _cs("containerd://c"), phase="Running")               # a healthy pod first seen Running
+    assert poll()[5:] == ["appeared"]
+
+
+def test_a_baseline_pod_with_old_restarts_is_not_an_event(world):  # noqa: F811
+    import tempfile
+    record, kube, a = ready_world(world)
+    a.obj("Pod", f"{N}-02", "demo")["status"]["containerStatuses"] = _cs("containerd://old", restarts=3,
+                                                                         lastState={"terminated": {"reason": "OOMKilled"}})
+    clock = Clock(O_MS)
+    obs = B.Observer(B.Ctx(record, kube, now=clock.now, sleep=clock.sleep), tempfile.mkdtemp(), {N: [], R: []})
+    obs.poll_pods(clock.ms / 1000)
+    obs.poll_pods(clock.ms / 1000 + 10)
+    assert obs.transitions == []

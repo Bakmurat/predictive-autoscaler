@@ -256,9 +256,16 @@ class Observer:
                     self.transitions.append({"t_s": t_s, "pod_uid": uid, "what": "container-changed", "container": k})
                 for k, v in cs.items():
                     o = old["containers"].get(k)
-                    if o and v["restarts"] != o["restarts"]:
+                    # A restart: the count changed, or a container whose status is seen for the first time in a
+                    # pod we already know reports a count above zero (it restarted before we saw it).
+                    if (o and v["restarts"] != o["restarts"]) or (o is None and v["restarts"] > 0):
                         self.transitions.append({"t_s": t_s, "pod_uid": uid, "what": "restart", "container": k})
-                    if o and v["id"] != o["id"]:
+                    # A container CHANGE needs an ESTABLISHED id: one we have seen for this pod and container. The
+                    # first id of a container (none or an empty one before: the pod was Pending, the container
+                    # waiting) is that container's start, not a change. The startup step of 2026-11-20 stopped
+                    # itself on exactly that, for three new pods first seen while Pending. An established id that
+                    # is replaced or disappears is a change, whatever the restart count says.
+                    if o and o["id"] and v["id"] != o["id"]:
                         self.transitions.append({"t_s": t_s, "pod_uid": uid, "what": "container-changed",
                                                  "container": k})
                     if v["oom"] and not (o or {}).get("oom"):
@@ -267,6 +274,14 @@ class Observer:
                     self.transitions.append({"t_s": t_s, "pod_uid": uid, "what": "deleted"})
             elif not first:
                 self.transitions.append({"t_s": t_s, "pod_uid": uid, "what": "appeared", "name": now["name"]})
+                # A pod that appears AFTER the baseline has no earlier observation to compare with: what its first
+                # status already reports is judged at once (later polls would see unchanged counters and stay
+                # silent for ever). A healthy first start reports zero restarts and no OOM record.
+                for k, v in cs.items():
+                    if v["restarts"] > 0:
+                        self.transitions.append({"t_s": t_s, "pod_uid": uid, "what": "restart", "container": k})
+                    if v["oom"]:
+                        self.transitions.append({"t_s": t_s, "pod_uid": uid, "what": "oom", "container": k})
             self.pods[uid] = now
         for uid in set(self.pods) - seen:
             if not self.pods[uid].get("gone"):
