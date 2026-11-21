@@ -618,6 +618,9 @@ imageroll.py --record R plan-open-recover | plan-void | recover-plan ->  open-re
 The spec comparison is whole-object: a live field the render does not set is ignored only when it holds an
 enumerated server default (`imageroll.DEFAULTS`); every other difference is shown.
 
+`status` is a report, not a gate: it shows the fence, the transition's journal state, each member's state and, for an
+open transition, the problems a plan would refuse on (another record loaded, a bound params file that changed).
+
 ## Restore to the common starting count
 
 ```sh
