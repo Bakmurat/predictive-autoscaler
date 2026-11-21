@@ -1033,13 +1033,28 @@ def test_a_params_file_changed_during_the_roll_stops_before_the_next_patch(w):
     assert image_of(w.dep("c28-ingress")) == OLD and len([e for e in w.events() if e.startswith("intent-")]) == 2
 
 
+def test_a_changed_params_file_is_refused_where_only_the_resume_check_looks(w):
+    """plan-void runs no safety conditions (it only fences a lost patch): the bound files are checked by the resume
+    check alone, and status reports the same problems without being a gate."""
+    w.open()
+    lose(w, commit=False)
+    assert I.plan_void(w.ctx())["problems"] == [] and I.status(w.ctx())["problems"] == []
+    _rewrite(w, "demo-params-new.json", release="other")
+    for problems in (I.plan_void(w.ctx())["problems"], I.status(w.ctx())["problems"]):
+        assert any("demo-params-new.json is not the file the transition bound" in p for p in problems), problems
+    assert I.plan_void(w.ctx())["actions"] == []
+    with pytest.raises(X.StagingError, match="not the file the transition bound"):
+        w.run(I.plan_void, I.void)
+    assert w.events()[-1] == "intent-1"                                 # no fencing write was sent
+
+
 # --- the command line ------------------------------------------------------------------------------------------------
 
 def test_the_commands_plan_and_report(w, capsys, monkeypatch):
     monkeypatch.setattr(I, "_operator_permissions", lambda c: PASS)
     assert I.main(["--record", w.path, "status"], api=w.api) == 0
     assert json.loads(capsys.readouterr().out) == {"action": "status", "fence": None, "helper": "imageroll",
-                                                   "members": [], "transition": None}
+                                                   "members": [], "problems": [], "transition": None}
     assert I.main(["--record", w.path, "plan-open", "--new-params", "demo-params-new.json"], api=w.api) == 0
     saved = json.loads(capsys.readouterr().out)
     assert saved["problems"] == [] and os.path.basename(saved["plan"]).startswith("plan-open-")

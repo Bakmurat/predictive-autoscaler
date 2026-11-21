@@ -3,7 +3,7 @@
 transition. `prepare` creates objects and never updates them; this helper is the only way the shared fixture digest of
 an existing installation changes.
 
-  imageroll.py --record R status                               read-only: the transition and every member's state
+  imageroll.py --record R status                               read-only report: the transition, every member's state
   imageroll.py --record R plan-open --new-params P [--supersedes ID]
   imageroll.py --record R open --plan F --plan-digest D        journal the transition, THEN publish the new record
   imageroll.py --record R plan-open-recover | open-recover --plan F --plan-digest D     a crash inside `open`
@@ -576,10 +576,14 @@ def _open_transition(c: Ctx) -> Tuple[Optional[Dict], List[str]]:
 
 
 def status(c: Ctx) -> Dict:
+    """A REPORT, not a gate: the fence, the transition's journal state and each member's state. For an open
+    transition it also lists what `_open_transition` would refuse (another record loaded, a bound params file that
+    changed) under `problems`; the plans and the applies are what enforce them."""
     t = _transition(c.record)
     out = {"helper": HELPER, "action": "status", "fence": X.image_fence(c.record),
-           "transition": {"id": t["id"], "state": t["state"]} if t else None, "members": []}
+           "transition": {"id": t["id"], "state": t["state"]} if t else None, "members": [], "problems": []}
     if t and t["state"] == "open":
+        out["problems"] = _open_transition(c)[1]
         out["members"] = [member_view(c, t, m) for m in t["data"]["members"]]
     return out
 
