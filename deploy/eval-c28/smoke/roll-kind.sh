@@ -61,17 +61,25 @@ for tool in docker "$KIND" kubectl helm "$PY"; do command -v "$tool" >/dev/null 
 mkdir -p "$OUT"; OUT="$(cd "$OUT" && pwd)"
 KCFG="$OUT/kubeconfig"
 export HELM_CONFIG_HOME="$OUT/helm/config" HELM_CACHE_HOME="$OUT/helm/cache" HELM_DATA_HOME="$OUT/helm/data"
-OWN_CLUSTER=0 FORWARD_PID=""
+OWN_CLUSTER=0 FORWARD_PID="" RESULT=""
+# The result is published HERE, after the cleanup: a cluster that could not be deleted is a failed run, whatever the
+# stages said. KEEP=1 is the one exception, and the result line then says that the cluster was kept.
 cleanup() {
-  local rc=$?
+  local rc=$? kept=""
   [ -z "$FORWARD_PID" ] || kill "$FORWARD_PID" 2>/dev/null || true
   if [ "$OWN_CLUSTER" = 1 ] && [ "${KEEP:-0}" != 1 ]; then
     if "$KIND" delete cluster --name "$CLUSTER" >/dev/null 2>&1; then echo "deleted $CLUSTER" > "$OUT/cleanup.txt"
-    else echo "COULD NOT delete $CLUSTER" > "$OUT/cleanup.txt"; log "could not delete $CLUSTER"; fi
+    else
+      echo "COULD NOT delete $CLUSTER" > "$OUT/cleanup.txt"
+      log "FAIL: could not delete $CLUSTER (delete it with: $KIND delete cluster --name $CLUSTER)"
+      [ "$rc" -ne 0 ] || rc=1
+    fi
   elif [ "$OWN_CLUSTER" = 1 ]; then
     echo "kept $CLUSTER (KEEP=1)" > "$OUT/cleanup.txt"
-    log "kept: kubeconfig $KCFG ; delete with: $KIND delete cluster --name $CLUSTER"
+    kept=" -- the cluster was KEPT (KEEP=1): kubeconfig $KCFG ; delete with: $KIND delete cluster --name $CLUSTER"
   fi
+  if [ "$rc" -eq 0 ] && [ -n "$RESULT" ]; then log "PASS: $RESULT$kept"
+  elif [ -n "$kept" ]; then log "${kept# -- }"; fi
   exit "$rc"
 }
 trap cleanup EXIT
@@ -186,4 +194,4 @@ guard
 "$PY" "$ROOT/deploy/eval-c28/smoke/roll_kind.py" --work "$OUT" --kubeconfig "$KCFG" --context "kind-$CLUSTER" \
   --images "$OUT/images.json" ${NEW_FIXTURE:+--new-fixture "$NEW_FIXTURE"} \
   --query-api "http://127.0.0.1:$PORT/prometheus" --replicas "$REPLICAS" "${STAGES[@]}" || die "the driver failed"
-log "PASS: scenario $SCENARIO, $REPLICAS replicas per target: ${STAGES[*]} (functional smoke evidence)"
+RESULT="scenario $SCENARIO, $REPLICAS replicas per target: ${STAGES[*]} (functional smoke evidence)"

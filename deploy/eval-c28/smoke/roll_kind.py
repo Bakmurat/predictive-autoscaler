@@ -51,6 +51,9 @@ PARAMS_DIR = os.path.join(ROOT, "deploy", "eval-c28", "params")
 CHART = os.path.join(ROOT, "charts", "predictive-autoscaler")
 OWNER, DEMO = "c28-roll-owner", "c28-roll-demo"
 STORAGE_CLASS = "c28-retained"
+TARGETS = ("c28-demo-pa-n", "c28-demo-pa-r")
+# What the UNMODIFIED telemetry gate says about an image whose counters are born at the first request, and nothing else
+COLD_GAP = frozenset(f"telemetry {kind}/{t}: no series" for kind in ("ingress", "requests") for t in TARGETS)
 MEMBERS = (("pa-eval-system", "c28-forecast-route"), ("pa-eval-system", "c28-metrics-route"), ("demo", "c28-ingress"),
            ("demo", "c28-demo-pa-n"), ("demo", "c28-demo-pa-r"))
 SYSTEM_DAEMONSETS = (("kube-system", "kindnet"), ("kube-system", "kube-proxy"),
@@ -72,6 +75,7 @@ class Smoke:
         if d.get("schema") != "c28-images/v1" or d.get("verified") is not True:
             raise Failed("--images is not a verified c28-images/v1 record")
         self.images = {k: v["ref"] for k, v in d["images"].items()}
+        self.installing = "install" in a.stages
         self.checks = []
         prior = os.path.join(self.work, "checks.json")       # stages may run as separate invocations: one record
         if os.path.exists(prior):
@@ -99,9 +103,31 @@ class Smoke:
         if not self.ctx.startswith("kind-") or not server.startswith("https://127.0.0.1:"):
             raise Failed(f"not a local kind API server: context {self.ctx}, server {server}")
         uid = self.kj("get", "namespace", "kube-system")["metadata"]["uid"]
-        if getattr(self, "cluster_uid", uid) != uid:
-            raise Failed("the cluster answering is not the one this smoke recorded")
+        recorded = self.recorded_cluster()
+        if recorded is None:
+            if not self.installing:
+                raise Failed("this work directory records no cluster identity: only the install stage may start one")
+            fd = os.open(os.path.join(self.work, "cluster-uid"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
+            with os.fdopen(fd, "w") as fh:               # written once, before anything is installed
+                fh.write(uid + "\n")
+        elif recorded != uid:
+            raise Failed(f"the cluster answering ({uid}) is not the one this work directory recorded ({recorded})")
         self.cluster_uid = uid
+
+    def recorded_cluster(self):
+        """The cluster this work directory belongs to: recorded by the first guard of the install stage, and equal to
+        the records' cluster_uid once they exist. Every later invocation, and every direct write, requires it."""
+        path, found = os.path.join(self.work, "cluster-uid"), set()
+        if os.path.exists(path):
+            with open(path) as fh:
+                found.add(fh.read().strip())
+        for name in ("demo.json", "owner.json"):
+            if os.path.exists(os.path.join(self.work, name)):
+                with open(os.path.join(self.work, name)) as fh:
+                    found.add(json.load(fh)["cluster_uid"])
+        if len(found) > 1:
+            raise Failed(f"the work directory names more than one cluster: {sorted(found)}")
+        return found.pop() if found else None
 
     def k(self, *args, check=True, stdin=None):
         return self.run(["kubectl", "--request-timeout=30s", "--kubeconfig", self.kcfg, "--context", self.ctx, *args],
@@ -276,12 +302,13 @@ class Smoke:
         deadline = time.time() + 300                       # the first scrapes of 26 new pods need a few intervals
         while True:
             rc, problems, observed = self.telemetry("check-telemetry-before.json")
-            cold = [p for p in problems if p.endswith(": no series") and
-                    p.split()[1].split("/")[0] in ("ingress", "requests")]
-            if set(problems) == set(cold) or time.time() > deadline:
+            cold = sorted(set(problems) & COLD_GAP)
+            if set(problems) in (set(), set(COLD_GAP)) or time.time() > deadline:
                 break
             time.sleep(15)
-        other = sorted(set(problems) - set(cold))
+        other = sorted(set(problems) - COLD_GAP)
+        if cold and set(cold) != set(COLD_GAP):
+            other.append(f"only part of the cold-counter series are missing: {cold}")
         if other:
             raise Failed(f"the UNMODIFIED telemetry gate does not work on this bed: {other[:6]} (a bed mismatch is "
                          "diagnosed, never hidden)")
@@ -307,11 +334,16 @@ class Smoke:
         return os.path.join(self.work, "evidence-demo", "receipts", "imageroll.jsonl")
 
     def journal(self):
+        """The helper's receipts. The file is appended to while it is read: a last line WITHOUT its newline is a write
+        in progress and is left for the next read; a complete line that is not a receipt is corruption and raises."""
         path = self.journal_path()
         if not os.path.exists(path):
             return []
         with open(path) as fh:
-            return [json.loads(line) for line in fh if line.strip()]
+            text = fh.read()
+        lines = text.split("\n")
+        lines.pop()                                         # "" after a final newline, or an incomplete last line
+        return [json.loads(line) for line in lines if line.strip()]
 
     def status(self):
         return self.helper("imageroll.py", self.demo, "status")[1]
@@ -350,28 +382,43 @@ class Smoke:
         if synchronized:
             folder, reached = self.barrier(after)
             env["PATH"] = folder + os.pathsep + env["PATH"]
-        p = subprocess.Popen([self.py, os.path.join(STAGING, "imageroll.py"), "--record", self.demo, "roll", "--plan",
-                              saved["plan"], "--plan-digest", saved["plan_digest"]], stdout=log,
-                             stderr=subprocess.STDOUT, start_new_session=True, env=env)
-        while len([e for e in self.journal() if e["event"] == "member-rolled"]) < after or \
-                (reached and not os.path.exists(reached)):
-            if p.poll() is not None:
-                raise Failed(f"the roll ended (exit {p.returncode}) before the interruption point")
-            time.sleep(0.2)
-        os.killpg(p.pid, signal.SIGKILL)
+        p = subprocess.Popen(self.executor(saved), stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+                             env=env)
+        deadline = time.time() + self.a.interrupt_budget
+        try:                                               # whatever happens while waiting: the group never survives
+            while len([e for e in self.journal() if e["event"] == "member-rolled"]) < after or \
+                    (reached and not os.path.exists(reached)):
+                if p.poll() is not None:
+                    raise Failed(f"the roll ended (exit {p.returncode}) before the interruption point")
+                if time.time() > deadline:
+                    raise Failed(f"the interruption point was not reached within {self.a.interrupt_budget} s")
+                time.sleep(0.2)
+        finally:
+            self.end_group(p)
+        self.write("roll-killed.json", {"process_group": p.pid, "signal": "SIGKILL", "exit": p.returncode,
+                                        "after_member_rolled_receipts": after, "synchronized": synchronized})
+        self.ok(f"the executor was killed after {after} member-rolled receipts; its process group is empty",
+                f"pgid {p.pid}")
+
+    def executor(self, saved):
+        return [self.py, os.path.join(STAGING, "imageroll.py"), "--record", self.demo, "roll", "--plan", saved["plan"],
+                "--plan-digest", saved["plan_digest"]]
+
+    @staticmethod
+    def end_group(p):
+        """SIGKILL to the executor's whole process group, the executor reaped, and the group proven empty."""
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         p.wait()
         for _ in range(100):                               # the executor AND its child commands are gone
             try:
                 os.killpg(p.pid, 0)
             except ProcessLookupError:
-                break
+                return
             time.sleep(0.1)
-        else:
-            raise Failed("the killed executor's process group still has a process")
-        self.write("roll-killed.json", {"process_group": p.pid, "signal": "SIGKILL", "exit": p.returncode,
-                                        "after_member_rolled_receipts": after, "synchronized": synchronized})
-        self.ok(f"the executor was killed after {after} member-rolled receipts; its process group is empty",
-                f"pgid {p.pid}")
+        raise Failed("the killed executor's process group still has a process")
 
     def recover(self):
         """The normal recovery protocol, whatever the kill left: an unknown patch that can still commit gets the
@@ -414,22 +461,40 @@ class Smoke:
     def cluster_check(self, before, new, old):
         """From the cluster, not from the helper: only the image changed; the pods, their images and the endpoints."""
         after = self.snapshot("cluster-after.json")
+        self.compare_cluster(before, after, new, old)
+        self.ok("the cluster shows it: five Deployments differ in the image only; new pods on the new digest; ready "
+                "endpoints = the new pods; the release's pods untouched")
+
+    @staticmethod
+    def compare_cluster(before, after, new, old):
+        """Raises unless, for every member: the same Deployment whose spec differs from the earlier one in exactly one
+        container's `image` field (old -> new); as many pods as replicas, none of them a pod from before, none
+        terminating, each with a status of THAT container whose image id is non-empty and ends with the new digest;
+        and the Service's ready endpoints being exactly those pods. And the release's pods are the ones from before."""
         digest = new.rsplit("@", 1)[1]
         for ns, name in MEMBERS:
             b = next(d for d in before[f"{ns}/deployments"] if d["metadata"]["name"] == name)
             a = next(d for d in after[f"{ns}/deployments"] if d["metadata"]["name"] == name)
-            spec = json.loads(json.dumps(a["spec"]).replace(new, old))
-            if a["metadata"]["uid"] != b["metadata"]["uid"] or spec != b["spec"] or new not in json.dumps(a["spec"]):
-                raise Failed(f"{name}: the Deployment changed in more than its image (or was replaced)")
+            at = [i for i, c in enumerate(b["spec"]["template"]["spec"]["containers"]) if c["image"] == old]
+            if len(at) != 1:
+                raise Failed(f"{name}: not exactly one container ran the old image before")
+            ctr = a["spec"]["template"]["spec"]["containers"][at[0]]
+            spec = json.loads(json.dumps(a["spec"]))
+            spec["template"]["spec"]["containers"][at[0]]["image"] = old       # that one field, nothing else
+            if a["metadata"]["uid"] != b["metadata"]["uid"] or ctr["image"] != new or spec != b["spec"]:
+                raise Failed(f"{name}: the Deployment changed in more than that container's image (or was replaced)")
             rs = {r["metadata"]["uid"]: r for r in after[f"{ns}/replicasets"]
                   if any(o.get("uid") == a["metadata"]["uid"] for o in r["metadata"].get("ownerReferences") or [])}
             pods = [p for p in after[f"{ns}/pods"]
                     if any(o.get("uid") in rs for o in p["metadata"].get("ownerReferences") or [])]
             old_uids = {p["metadata"]["uid"] for p in before[f"{ns}/pods"]}
-            ids = {s.get("imageID", "") for p in pods for s in p["status"].get("containerStatuses") or []}
+            ids = [[s.get("imageID") or "" for s in p["status"].get("containerStatuses") or []
+                    if s.get("name") == ctr["name"]] for p in pods]
             if len(pods) != a["spec"]["replicas"] or {p["metadata"]["uid"] for p in pods} & old_uids or \
-                    not all(i.endswith(digest) for i in ids) or any(p["metadata"].get("deletionTimestamp") for p in pods):
-                raise Failed(f"{name}: its pods are not exactly the new ones on the new image: {sorted(ids)}")
+                    any(p["metadata"].get("deletionTimestamp") for p in pods) or \
+                    any(len(i) != 1 or not i[0] or not i[0].endswith(digest) for i in ids):
+                raise Failed(f"{name}: its pods are not exactly the new ones, each with a status of container "
+                             f"{ctr['name']} on the new image: {ids}")
             ready = {(e.get("targetRef") or {}).get("uid") for s in after[f"{ns}/endpointslices"]
                      if s["metadata"]["labels"].get("kubernetes.io/service-name") == name
                      for e in s.get("endpoints") or [] if (e.get("conditions") or {}).get("ready")}
@@ -440,8 +505,6 @@ class Smoke:
                                      for s in p["status"].get("containerStatuses") or [])
         if release(before) != release(after) or not release(after):
             raise Failed("the release's pods are not the ones from before the roll")
-        self.ok("the cluster shows it: five Deployments differ in the image only; new pods on the new digest; ready "
-                "endpoints = the new pods; the release's pods untouched")
 
     def forward(self):
         self.roll()
@@ -628,11 +691,11 @@ class Smoke:
         deadline = time.time() + 420          # the replaced ingress's last series must first leave the gate's lookback
         while True:
             rc, problems, _obs = self.telemetry("check-telemetry-after-reverse.json")
-            cold = [p for p in problems if p.endswith(": no series")]
-            if (rc != 0 and sorted(problems) == sorted(cold)) or time.time() > deadline:
+            cold = sorted(problems)
+            if (rc != 0 and set(problems) == set(COLD_GAP)) or time.time() > deadline:
                 break
             time.sleep(15)
-        if rc == 0 or sorted(problems) != sorted(cold):
+        if rc == 0 or set(problems) != set(COLD_GAP) or len(problems) != len(COLD_GAP):
             raise Failed(f"after a reverse to an image without zero-valued counters the gate should refuse for "
                          f"exactly that reason: exit {rc}, {problems[:6]}")
         if self.helper("prepare.py", self.demo, "verify", check=False)[0] != 0 or self.status()["fence"] is not None:
@@ -762,6 +825,7 @@ class Smoke:
         if sorted(before) != pods or not all(before.values()):
             raise Failed(f"before the churn the ingress should count exactly the live pods, each above zero: {before}")
         victim = pods[0]
+        self.guard()                                       # a direct write: only ever on the recorded cluster
         self.k("-n", "demo", "delete", "pod", victim, "--wait=true", "--timeout=120s")
         self.wait_rolled_out()
         new = sorted(set(live()) - set(pods))
@@ -778,6 +842,7 @@ class Smoke:
         self.ok("no traffic: the removed endpoint's count is kept, the replacement is a new identity at zero",
                 f"{victim} {before[victim]} kept; {new[0]} 0")
         sent = 0
+        self.guard()
         for _ in range(5 * len(pods)):
             p = self.k("get", "--raw", f"/api/v1/namespaces/demo/services/c28-ingress:80/proxy/t/{target}/work",
                        check=False)
@@ -831,6 +896,8 @@ def main():
     ap.add_argument("--query-api", default="", help="the bed's Prometheus API base")
     ap.add_argument("--replicas", type=int, default=12)
     ap.add_argument("--kill-after", type=int, default=2, help="member-rolled receipts before the executor is killed")
+    ap.add_argument("--interrupt-budget", type=int, default=1800,
+                    help="seconds to wait for the interruption point before the executor is killed and the smoke fails")
     ap.add_argument("--complete-budget", type=int, default=1500,
                     help="seconds to keep re-planning completion (the ingress keeps removed endpoints 15 minutes)")
     ap.add_argument("stages", nargs="+", choices=["install", "bedcheck", "forward", "roll", "complete", "admission",
