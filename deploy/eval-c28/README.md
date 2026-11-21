@@ -657,6 +657,54 @@ patch response (the API-server test and the unit tests do) or the same endpoint 
 fixture's unit tests do). A fixture built locally can be used through an owned local registry for development
 (`REGISTRY_MIRROR`); a qualifying run uses published digests.
 
+## Upgrading the release of an existing installation: `staging/release.py`
+
+The chart release is changed by one reviewed helper, never by a typed `helm upgrade`. Version 1 does exactly one
+thing: the forecaster's image and one added environment entry (`WATCH_NAMESPACES=<the demonstration namespace>`),
+with the operator in Recommend and no replica-write permission. It is not a grant-capable upgrade.
+
+```
+release.py --record R status
+release.py --record R plan-upgrade   ->  apply-upgrade  --plan F --plan-digest D
+release.py --record R plan-rollback  ->  apply-rollback --plan F --plan-digest D
+release.py --record R recover-plan   ->  recover        --plan F --plan-digest D
+```
+
+The record gets a section `release_upgrade`: `from` (the installed revision, the commit whose chart tree was
+installed, its values file and sha256), `to` (a NEW immutable values file and its sha256), `helm` (binary, sha256,
+version, timeout, kube_version and, for the offline renderings, optionally api_versions) and `metadata_reader` (the `c28-secretmeta` binary and its sha256). The new chart is
+the tree of the record's `source.commit`, which must be the clean executing checkout.
+
+- **The plan** renders the installed chart tree with the installed values and the new tree with the new values,
+  offline, through the sanitizer (Secret documents are discarded), and refuses any difference but the two allowed
+  ones: an added or removed object, a Role, a NetworkPolicy, a ConfigMap, another field of the forecaster. It also
+  binds the release's history (each description as a class and a sha256, never its text), the storage Secret of the
+  installed revision by UID (metadata only), both chart trees (extracted once under the evidence directory and
+  verified file by file against git's listing), the live forecaster against the installed rendering (every field,
+  minus enumerated server defaults), the TLS Secret's metadata, the release's pods, the safety conditions of the
+  other helpers, and the exact argument array.
+- **The call.** Helm runs once through `staging/helmrun.py`: in a process group of its own that cannot execute
+  before its identity is recorded, with a deadline (Helm's timeout plus a margin), TERM, then KILL, and a proof that
+  the group is empty. Its output is counted and hashed, never stored. The call is journalled with the shared intent
+  protocol, so every other helper's "no open intent" gate sees it.
+- **The outcome is read, not inferred from the exit status.** `applied` needs revision from+1 as the newest,
+  `deployed`, with a storage Secret that carries this operation's identifier (a Helm release label) and the UID
+  first seen. A `failed` or `pending-upgrade` revision of ours, no revision evidence after Helm executed (whatever
+  its exit), a revision that is not ours, a replaced storage Secret, a surviving process or a failed read all keep
+  the lock. Nothing is retried, and the same operation identifier is never submitted twice. A command that was never
+  released certainly did not execute and may be planned again.
+- **Rollback** is `helm rollback` to the installed revision: a NEW revision that restores the unfixed forecaster.
+  After an applied upgrade it is an ordinary reviewed operation. For a failed or pending upgrade it runs under the
+  recovery guard, with the dead executor's lock retained and only that upgrade's intent open. Helm does not mark a
+  rollback as ours, so it counts only when our own Helm process ended cleanly and the expected revision appeared as
+  a rollback to the destination; an interrupted rollback stays unresolved and is not attempted again by the helper.
+- **Recovery** decides only what is proven: an intent without a launch receipt never executed; a released upgrade
+  is done only when its own revision is deployed; everything else stays unresolved.
+
+`applied` means that Helm recorded our revision as deployed. The application read-back (pods, certificate,
+PredictiveAutoscalers, ledger, permissions) is a separate reviewed step. No test runs Helm: the process runner is
+tested with harmless local commands and the helper against a fake Helm state machine.
+
 ## Restore to the common starting count
 
 ```sh

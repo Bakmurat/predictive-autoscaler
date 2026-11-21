@@ -192,7 +192,7 @@ LOCK_SCOPE = "evaluation"                 # ONE lock (common_records.exclusive_l
 INTENT_ANNOTATION = "c28.devkuban.com/intent"
 DEFINITIVE = (400, 401, 403, 404, 409, 422, 429)   # the API refused: nothing was applied
 PART2_HELPERS = ("reserve", "prepare", "session", "calibrate", "ledger_read", "bounded", "boundary",
-                 "transition", "imageroll")   # journals under the shared evaluation lock
+                 "transition", "imageroll", "release")   # journals under the shared evaluation lock
 IMAGEROLL = "imageroll"                   # the image-transition helper: its journal carries the transition fence
 # (helper, context["operation"]) that an open image transition does NOT fence: the ordinary revocation REMOVES the
 # operator's replica-write permission and touches no Deployment; it must never wait for an image roll. Nothing else
@@ -363,7 +363,8 @@ RECONCILERS: Dict[str, Callable[["Kube", Dict, Optional["Record"]], Dict]] = {}
 # helper's CLI) imports it on demand, so an open intent of that op is never left "no reconciler loaded".
 RECONCILER_MODULES: Dict[str, str] = {"ledger-reader-gone": "ledger_read", "bounded-pod-gone": "bounded",
                                        "startup-scale": "bounded", "boundary-absent": "boundary",
-                                       "image-roll": "imageroll", "image-roll-void": "imageroll"}
+                                       "image-roll": "imageroll", "image-roll-void": "imageroll",
+                                       "helm-upgrade": "release", "helm-rollback": "release"}
 
 
 def reconcile(kube: "Kube", d: Dict, record: Optional["Record"] = None) -> Dict:
