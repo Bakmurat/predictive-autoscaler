@@ -462,6 +462,7 @@ def plan_open(c: Ctx, new_params: str, nonce: Optional[str] = None, supersedes: 
              "container": ctr["name"], "index": r["index"]}
         _rss, pods = _member_pods(c, live)
         m["nodes"] = sorted({p["spec"].get("nodeName") for p in pods if p["spec"].get("nodeName")})
+        m["pods_at_open"] = sorted(p["metadata"]["name"] for p in pods)       # for diagnostics only (section 5)
         at_from = not spec_diff(_spec_with(r["object"], r["index"], c.params["image"]), live["spec"])
         at_to = not spec_diff(_spec_with(r["object"], r["index"], new["image"]), live["spec"])
         m["start"] = "from" if at_from else "target" if (kind == "reverse" and at_to) else "divergent"
@@ -847,7 +848,14 @@ def zero_counter_evidence(c: Ctx, t: Dict, fetch: Fetch, api: str) -> Tuple[Dict
                          and no series with any other code (another code means a request was already answered).
     Every series needs at least ZERO_MIN_SAMPLES samples, the newest at most ZERO_MAX_AGE_S old, no gap longer than
     that, none in the future, and every value exactly 0. The evidence keeps the selectors, every sample with its
-    timestamp and the replacement pods' names and UIDs from the member-rolled receipts."""
+    timestamp and the replacement pods' names and UIDs from the member-rolled receipts.
+
+    The contract is strict on purpose. The ingress keeps the dispatch counter of a REMOVED endpoint for some time
+    (fixture/endpoints.go, retiredSeriesKeep) and the roll replaces the ingress before the targets, so for that long
+    after a target's rollout, plus this lookback, the old pods' series (and then their staleness markers) are still in
+    the window and completion is refused. Nothing is classified away: completion is repeated until a fresh window
+    holds exactly the replacement identities. The refusal names the unexpected identities and how many of them are
+    pods this transition replaced; it promises nothing about the others."""
     import bounded
     now, problems, checks = c.now(), [], []
     rolled = {m["name"]: _rolled_receipt(c.record, t["id"], m["member"]) for m in t["data"]["members"]}
@@ -856,6 +864,7 @@ def zero_counter_evidence(c: Ctx, t: Dict, fetch: Fetch, api: str) -> Tuple[Dict
     if any(r is None for r in rolled.values()) or len(ingress) != 1:
         return {}, ["not every member was rolled by this transition: no zero-counter evidence is possible"]
     ingress_pods = {p["name"] for p in rolled[ingress[0]]["pods"]}
+    replaced = {n for m in t["data"]["members"] for n in m.get("pods_at_open") or []}
 
     def judge(where: str, vals: List) -> None:
         # bounded._stamps: every sample exactly [timestamp, value], both finite numbers, neither a boolean
@@ -890,8 +899,13 @@ def zero_counter_evidence(c: Ctx, t: Dict, fetch: Fetch, api: str) -> Tuple[Dict
             got[ident] = got.get(ident, 0) + 1
             judge(f"{label}/{target} {ident}", vals)
         if set(got) != want or any(n != 1 for n in got.values()):
-            problems.append(f"{label}/{target}: series for {sorted(got)} (x{sorted(set(got.values()))}), expected "
-                            f"exactly one each for {sorted(want)}")
+            extra, missing = sorted(set(got) - want), sorted(want - set(got))
+            known = [n for n in extra if n in replaced]
+            problems.append(
+                f"{label}/{target}: {len(got)} identities (x{sorted(set(got.values()))}), expected exactly one series "
+                f"each for the {len(want)} replacement pods; missing {missing}; unexpected endpoint identities {extra}"
+                + (f" ({len(known)} of them are pods this transition replaced: the ingress keeps a removed "
+                   f"endpoint's counter for a while; completion needs a query window without them)" if known else ""))
         checks.append({"check": f"{label}/{target}", "selector": sel, "series": kept})
     for tname in names:
         pods = {p["name"] for p in rolled[tname]["pods"]}
