@@ -192,7 +192,8 @@ LOCK_SCOPE = "evaluation"                 # ONE lock (common_records.exclusive_l
 INTENT_ANNOTATION = "c28.devkuban.com/intent"
 DEFINITIVE = (400, 401, 403, 404, 409, 422, 429)   # the API refused: nothing was applied
 PART2_HELPERS = ("reserve", "prepare", "session", "calibrate", "ledger_read", "bounded", "boundary",
-                 "transition")   # journals under the shared evaluation lock
+                 "transition", "imageroll")   # journals under the shared evaluation lock
+IMAGEROLL = "imageroll"                   # the image-transition helper: its journal carries the transition fence
 
 
 def lock_file(record: "Record") -> str:
@@ -229,6 +230,56 @@ def open_intents(entries: List[Dict]) -> List[Dict]:
     """Intents with neither an outcome nor a reconciliation: UNRESOLVED (they keep the lock)."""
     return [{"step": n, "data": s["intent"]} for n, s in sorted(_steps(entries).items(), key=lambda kv: int(kv[0]))
             if s["intent"] is not None and s["outcome"] is None and s["reconciled"] is None]
+
+
+def image_transitions(entries: List[Dict]) -> Dict[str, Dict]:
+    """{id: {"state", "seq", "data"}} of the image transitions in the imageroll journal, in journal order. States:
+    prepared (journalled, the new record not yet proven published), open, complete, abandoned, superseded (a later
+    transition-prepared names it in data.supersedes: that successor is then the open one). A completion or an
+    abandonment closes only the transition whose id it names."""
+    out: Dict[str, Dict] = {}
+    for e in entries:
+        ev, d = e["event"], e["data"]
+        if ev == "transition-prepared":
+            if d["id"] in out:
+                raise StagingError(f"image transition id {d['id']} appears twice in the journal")
+            out[d["id"]] = {"state": "prepared", "seq": len(out) + 1, "data": d}
+            old = d.get("supersedes")
+            if old:
+                if out.get(old, {}).get("state") not in ("prepared", "open"):
+                    raise StagingError(f"image transition {d['id']} supersedes {old}, which is not open")
+                out[old]["state"] = "superseded"
+        elif ev in ("transition-open", "transition-complete", "transition-abandoned"):
+            t = out.get(d["id"])
+            want = {"transition-open": ("prepared",), "transition-complete": ("open",),
+                    "transition-abandoned": ("prepared",)}[ev]
+            if t is None or t["state"] not in want:
+                raise StagingError(f"{ev} for image transition {d['id']} does not follow its journal state")
+            t["state"] = ev[len("transition-"):]
+    return out
+
+
+def image_fence(record: "Record") -> Optional[str]:
+    """The id of the image transition that fences the installation, or None. It holds while the journal has a prepared
+    or open transition, and also while the LOADED record names a transition the journal has not completed: the fence is
+    read from the run's receipts, so removing the record field or loading an archived record does not lift it."""
+    ts = image_transitions(receipts(record, IMAGEROLL))
+    held = [i for i, t in ts.items() if t["state"] in ("prepared", "open")]
+    if len(held) > 1:
+        raise StagingError(f"more than one image transition is open ({held}): the journal is inconsistent")
+    if held:
+        return held[0]
+    named = (record.doc.get("image_transition") or {}).get("id")
+    if named and ts.get(named, {}).get("state") != "complete":
+        return str(named)
+    return None
+
+
+def image_fence_problems(record: "Record") -> List[str]:
+    """For the other helpers' plans: the fence as a planning problem (visible before any apply)."""
+    fence = image_fence(record)
+    return [f"image transition {fence} is open: only the imageroll helper may act until it is complete"] if fence \
+        else []
 
 
 class Journal:
@@ -303,7 +354,8 @@ RECONCILERS: Dict[str, Callable[["Kube", Dict, Optional["Record"]], Dict]] = {}
 # Helper-defined ops whose reconciler lives in a module another helper's process may not have loaded: recover (from any
 # helper's CLI) imports it on demand, so an open intent of that op is never left "no reconciler loaded".
 RECONCILER_MODULES: Dict[str, str] = {"ledger-reader-gone": "ledger_read", "bounded-pod-gone": "bounded",
-                                       "startup-scale": "bounded", "boundary-absent": "boundary"}
+                                       "startup-scale": "bounded", "boundary-absent": "boundary",
+                                       "image-roll": "imageroll", "image-roll-void": "imageroll"}
 
 
 def reconcile(kube: "Kube", d: Dict, record: Optional["Record"] = None) -> Dict:
@@ -357,7 +409,8 @@ def recover_plan(record: "Record", kube: "Kube") -> Dict:
 def recover(record: "Record", kube: "Kube", reviewed: Dict, reviewed_digest: str,
             follow_up: Optional[Callable[[List[Dict]], None]] = None, *,
             guard_factory: Optional[Callable] = None,
-            follow_up_guarded: Optional[Callable[[List[Dict], object], None]] = None) -> Dict:
+            follow_up_guarded: Optional[Callable[[List[Dict], object], None]] = None,
+            image_transition: Optional[str] = None) -> Dict:
     """common_records.recovery_guard (one recoverer, the lock's executor proven terminated), then reconciled-<n> for
     every decided outcome; the stale lock is released only when nothing stays unresolved, and not while the Active
     transition has an executor that is neither finished nor fenced or a revocation that proved nothing
@@ -369,6 +422,13 @@ def recover(record: "Record", kube: "Kube", reviewed: Dict, reviewed_digest: str
     factory = guard_factory or (lambda rec, sha: C.recovery_guard(rec.doc, LOCK_SCOPE, sha))
     with factory(record, live["lock_sha256"]) as guard:
         C.require_cluster(kube.api, record.cluster_uid)
+        # An open image transition fences recovery's follow-ups too (they act on the installation): only the
+        # recovery of THAT transition (image_transition: its id, passed by imageroll) may run one. Reconciling
+        # intents and releasing the stale lock stay possible; the release never lifts the fence.
+        fence = image_fence(record)
+        if fence and (follow_up or follow_up_guarded) and image_transition != fence:
+            raise StagingError(f"image transition {fence} is open: this recovery's follow-up is refused; the lock "
+                               "stays (recover through the imageroll helper)")
         for a in live["actions"]:
             if a["observed"] != "unresolved":
                 C.append_receipt(record.doc, a["helper"], f"reconciled-{a['step']}",
@@ -390,7 +450,8 @@ def recover(record: "Record", kube: "Kube", reviewed: Dict, reviewed_digest: str
         guard.release_stale()
         return receipt(record, "recover", "lock-recovered", {"plan_sha256": reviewed_digest,
                                                               "lock_sha256": live["lock_sha256"],
-                                                              "reconciled": len(live["actions"])})
+                                                              "reconciled": len(live["actions"]),
+                                                              **({"image_transition_open": fence} if fence else {})})
 
 
 # --- typed API access -----------------------------------------------------------------------------------------------
@@ -552,6 +613,38 @@ class Kube:
             "spec": {"replicas": replicas}})
         return confirm_scale(resp, kind, name, uid, replicas)
 
+    def json_patch(self, op: str, kind: str, name: str, namespace: str, uid: str,
+                   build: Callable[[str], List[Dict]], validate: Callable[[Dict, str], None],
+                   pre: Optional[Dict] = None) -> Dict:
+        """ONE journalled JSON Patch (op: the helper's reconciler key in RECONCILERS). build(mark) returns the
+        operations; the intent's mark is known only then, and the helper writes it into the object as its operation
+        id. The preconditions are `test` operations, enforced by the API server in the same request. Outcomes:
+        a definitive refusal (a failed test is one) -> step-<n> not-applied and the ApiError is raised;
+        an answer that validate(response, mark) accepts -> step-<n> applied;
+        no answer, or one validate rejects (it raises StagingError) -> the intent stays UNRESOLVED and keeps the lock:
+        only the op's reconciler decides it, under the recovery guard. Returns {"out", "mark", "step"}."""
+        j = self._journal()
+        if not (isinstance(uid, str) and _UUID.match(uid)):
+            raise StagingError(f"{kind}/{name}: a patch needs the bound UID")
+        C.require_cluster(self.api, self.cluster_uid)
+        result: Dict = {}
+
+        def do(mark):
+            result["mark"] = mark
+            ops = build(mark)
+            try:
+                out = self.api.json_patch(path(kind, namespace, name), ops)
+            except C.ApiError as e:
+                if getattr(e, "status", None) in DEFINITIVE:
+                    raise
+                raise StagingError(f"{kind}/{name}: the outcome of the {op} patch is unknown ({e})") from e
+            validate(out, mark)
+            result["out"] = out
+            return out
+        r = j.run(op, kind, namespace, name, do, uid=uid, pre=pre or {})
+        self.mutations.append({"op": op, "kind": kind, "namespace": namespace, "name": name, "uid": uid})
+        return {"out": result["out"], "mark": r["mark"], "step": r["step"]}
+
     def delete(self, kind: str, name: str, namespace: Optional[str], uid: str) -> None:
         j = self._journal()
         if not (isinstance(uid, str) and _UUID.match(uid)):
@@ -572,8 +665,23 @@ class mutating:
 
     def __enter__(self):
         self.lock.__enter__()
+        try:
+            self._image_fence()
+        except BaseException:
+            os.unlink(self.lock.path)          # nothing was journalled under this lock: it is released at once
+            raise
         self.kube.journal = Journal(self.record, self.helper, self.lock, self.context)
         return self.lock
+
+    def _image_fence(self) -> None:
+        """Under the lock, before any journal is attached: while an image transition fences the installation, every
+        helper is refused except imageroll acting for exactly that transition (context transition == the open id) or
+        preparing its reviewed successor (context supersedes == the open id)."""
+        fence = image_fence(self.record)
+        ctx = self.context or {}
+        if fence and not (self.helper == IMAGEROLL and fence in (ctx.get("transition"), ctx.get("supersedes"))):
+            raise StagingError(f"image transition {fence} is open: {self.helper} is refused until the imageroll "
+                               "helper completes it")
 
     def __exit__(self, exc_type, exc, tb):
         """Release only when EVERY intent of the part-2 journals is resolved (an outcome or a reconciliation), not

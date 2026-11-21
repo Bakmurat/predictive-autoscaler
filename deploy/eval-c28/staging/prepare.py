@@ -650,7 +650,7 @@ def plan(record: X.Record, kube: X.Kube, phase: str, fetch: Optional[Fetch] = No
                                                          if phase in DEMO_PHASES else ""))
     params = load_params(record, stage)
     parts = split(params) if stage == "experiment" else split(params, stage)
-    problems: List[str] = admission_problems(record, params, s, parts)
+    problems: List[str] = admission_problems(record, params, s, parts) + X.image_fence_problems(record)
     if stage == "demonstration":
         gate, gate_problems = demonstration_gate(record, kube, params, s, parts)
     else:
@@ -855,8 +855,13 @@ def verify(record: X.Record, kube: X.Kube) -> Dict:
     if stage == "demonstration":
         problems += generator_verify_problems(kube, params, seen)
     problems += injection_problems(kube, params)
+    # While an image transition fences the installation the result is never PASS: the objects are in between two
+    # renders by design, and only `imageroll.py status` says which member is where.
+    fence = X.image_fence(record)
+    result = "IN_TRANSITION" if fence else "PASS" if not problems else "FAIL"
     return {"helper": HELPER, "action": "verify", "run_id": record.run_id, "objects": seen, "problems": problems,
-            "result": "PASS" if not problems else "FAIL", "storage_class": s["storage"]["storage_class"]}
+            "result": result, "storage_class": s["storage"]["storage_class"],
+            **({"image_transition": fence} if fence else {})}
 
 
 def generator_verify_problems(kube: X.Kube, params: Dict, seen: List[Dict]) -> List[str]:
@@ -931,7 +936,7 @@ def main(argv=None, api=None, fetch: Optional[Fetch] = None, now: Callable[[], s
         else:
             out = verify(record, kube)
             X.emit(out)
-            return 0 if out["result"] == "PASS" else 1
+            return {"PASS": 0, "IN_TRANSITION": 5}.get(out["result"], 1)
     except X.StagingError as e:
         print(f"prepare: refused: {e}", file=sys.stderr)
         return 1

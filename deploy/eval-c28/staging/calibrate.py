@@ -2890,7 +2890,7 @@ def gate_problems(ctx: Context, fixture_state: Optional[Dict] = None, reservatio
 # --- plan -----------------------------------------------------------------------------------------------------------
 
 def plan(ctx: Context) -> Dict:
-    problems: List[str] = []
+    problems: List[str] = X.image_fence_problems(ctx.record)
     entries = ctx.entries()
     if ctx.kube.identity() != ctx.record.cluster_uid:
         raise X.StagingError("the kubeconfig does not reach the recorded cluster (kube-system UID differs); refusing")

@@ -556,7 +556,7 @@ def _writer_obj(c: Context) -> Dict:
 # --- start ----------------------------------------------------------------------------------------------------------
 
 def plan_start(c: Context) -> Dict:
-    problems: List[str] = []
+    problems: List[str] = X.image_fence_problems(c.record)
     entries = X.receipts(c.record, HELPER)
     dep = c.kube.get("Deployment", c.target, c.ns)
     if dep is None or dep["metadata"]["uid"] != c.target_uid:

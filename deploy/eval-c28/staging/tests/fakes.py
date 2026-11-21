@@ -123,6 +123,50 @@ class FakeApi:
         o["metadata"]["resourceVersion"] = self._next_rv()
         return copy.deepcopy(o)
 
+    def json_patch(self, path, ops):
+        """application/json-patch+json as kube-apiserver 1.35 answers it: atomic; a failed `test`, a missing path or
+        an unknown operation refuses the whole patch with 422; a change of the spec or of the annotations raises the
+        generation (a Deployment's annotations do); every applied patch moves the resourceVersion."""
+        self.calls.append(("json_patch", path))
+        kind, ns, name, _sub = self._parse(path)
+        o = self.objects.get((kind, ns, name))
+        if o is None:
+            raise C.NotFound("not found", 404)
+        new = copy.deepcopy(o)
+
+        def walk(ptr):
+            parts = [p.replace("~1", "/").replace("~0", "~") for p in ptr.split("/")[1:]]
+            cur = new
+            for p in parts[:-1]:
+                try:
+                    cur = cur[int(p)] if isinstance(cur, list) else cur[p]
+                except (KeyError, IndexError, ValueError, TypeError):
+                    raise C.ApiError("invalid", 422)
+            last = parts[-1]
+            return cur, (int(last) if isinstance(cur, list) else last)
+        for op in ops:
+            cur, key = walk(op["path"])
+            present = (isinstance(cur, dict) and key in cur) or (isinstance(cur, list) and 0 <= key < len(cur))
+            if op["op"] == "test":
+                if not present or cur[key] != op["value"]:
+                    raise C.ApiError("invalid", 422)
+            elif op["op"] == "replace":
+                if not present:
+                    raise C.ApiError("invalid", 422)
+                cur[key] = copy.deepcopy(op["value"])
+            elif op["op"] == "add" and isinstance(cur, dict):
+                cur[key] = copy.deepcopy(op["value"])
+            else:
+                raise C.ApiError("invalid", 422)
+        if new == o:
+            return copy.deepcopy(o)
+        if new.get("spec") != o.get("spec") or \
+                (new["metadata"].get("annotations") or {}) != (o["metadata"].get("annotations") or {}):
+            new["metadata"]["generation"] = o["metadata"].get("generation", 1) + 1
+        new["metadata"]["resourceVersion"] = self._next_rv()
+        self.objects[(kind, ns, name)] = new
+        return copy.deepcopy(new)
+
     def create(self, path, body):
         self.calls.append(("create", path))
         kind, ns, _name, _ = self._parse(path)

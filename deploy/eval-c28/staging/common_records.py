@@ -228,6 +228,34 @@ class KubectlApi:
         return self._call("delete", path, {"kind": "DeleteOptions", "apiVersion": "v1", "preconditions": pre,
                                            "propagationPolicy": "Background"})
 
+    def json_patch(self, path: str, ops: Sequence[Mapping]) -> Dict:
+        """PATCH application/json-patch+json through `kubectl patch --type=json` (kubectl has no raw PATCH). Only a
+        namespaced apps/v1 Deployment path is accepted. The API server applies the operations atomically: a failed
+        `test` (or any invalid patch) refuses the whole request with 422 and changes nothing (observed against
+        kube-apiserver 1.35: "The request is invalid", reason Invalid). An answer without the object is an error with
+        no status: the caller must treat the outcome as unknown."""
+        m = _DEPLOYMENT_PATH.match(path)
+        if not m:
+            raise StagingError(f"json_patch: only an apps/v1 Deployment path is supported, not {path!r}")
+        args = self.base + ["patch", "deployments.v1.apps", m.group(3), "-n", m.group(1), "--type=json",
+                            "-p", json.dumps([dict(o) for o in ops], sort_keys=True), "-o", "json"]
+        p = self.run(args, input=None, capture_output=True, text=True)
+        if p.returncode != 0:
+            status = _classify(p.stderr or "")              # never echo kubectl's stderr: classify it
+            if status == 404:
+                raise NotFound(f"patch {path}: not found", 404)
+            raise ApiError(f"patch {path}: failed ({_STATUS.get(status, 'error')}, exit {p.returncode})", status)
+        try:
+            out = json.loads((p.stdout or "").strip())
+        except ValueError:
+            out = None
+        if not isinstance(out, dict) or not isinstance(out.get("metadata"), dict):
+            raise ApiError(f"patch {path}: the answer carries no object", None)
+        return out
+
+
+_DEPLOYMENT_PATH = re.compile(r"^/apis/apps/v1/namespaces/([a-z0-9]([-a-z0-9]*[a-z0-9])?)/deployments/"
+                              r"([a-z0-9]([-a-z0-9.]*[a-z0-9])?)$")
 
 # Resource kinds the helpers read: name -> (API prefix, plural, namespaced).
 KINDS = {
