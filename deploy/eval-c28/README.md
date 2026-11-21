@@ -572,7 +572,9 @@ imageroll.py --record R plan-open-recover | plan-void | recover-plan ->  open-re
   appends `transition-open`. From the first receipt until `transition-complete` every other helper is refused at the
   shared mutation entry (`execlib.mutating`), in recovery follow-ups and, visibly, in its plans; `prepare.py verify`
   answers `IN_TRANSITION` (exit 5), never PASS. The fence is read from the run's receipts, so loading an archived
-  record does not lift it. Ids are `ir-<sequence>-<hash over the binding and a nonce>`: a later attempt at the same
+  record does not lift it. One operation is exempt: the ordinary revocation of the operator's replica-write
+  permission (`transition.py revoke` and its reviewed recovery), which removes a permission and touches no
+  Deployment; its plans show the open transition as a note, and its lock, journal and proofs are unchanged. Ids are `ir-<sequence>-<hash over the binding and a nonce>`: a later attempt at the same
   change never shares an id, and a completion closes only the transition it names.
 - **One member at a time.** Each Deployment gets ONE JSON Patch whose `test` operations (UID, resourceVersion,
   container name, old image) the API server enforces in the same request, and which writes the operation id into the
@@ -581,7 +583,8 @@ imageroll.py --record R plan-open-recover | plan-void | recover-plan ->  open-re
   unresolved intent that keeps the lock. The rollout is then verified before the next member is touched: generation
   observed, exact counts, one active ReplicaSet on the new image, no pod of an older ReplicaSet left (terminating
   ones included), every pod's imageID, placement, and the Service's ready endpoints being exactly the new pods.
-- **Safety, every time.** Before every patch and on every resume: no generator-like workload, no restore obligation,
+- **Safety, every time.** Before every patch and on every resume: the params files the transition bound are still
+  those files (the same bytes are hashed and parsed) and are what this process loaded, no generator-like workload, no restore obligation,
   no unresolved intent, the structural checks of `prepare.py verify` (both PredictiveAutoscalers in Recommend, empty
   fault schedules), the reservation gate, the operator's missing replica-write permission (the `permissions.py`
   proof, in process), Ready nodes, and room for the member's worst case of extra pods. `maxSurge: 0` bounds starting

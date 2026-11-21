@@ -194,6 +194,10 @@ DEFINITIVE = (400, 401, 403, 404, 409, 422, 429)   # the API refused: nothing wa
 PART2_HELPERS = ("reserve", "prepare", "session", "calibrate", "ledger_read", "bounded", "boundary",
                  "transition", "imageroll")   # journals under the shared evaluation lock
 IMAGEROLL = "imageroll"                   # the image-transition helper: its journal carries the transition fence
+# (helper, context["operation"]) that an open image transition does NOT fence: the ordinary revocation REMOVES the
+# operator's replica-write permission and touches no Deployment; it must never wait for an image roll. Nothing else
+# of that helper is exempt (a grant stays fenced), and the lock, the journal and every proof are unchanged.
+IMAGE_FENCE_EXEMPT = (("transition", "revoke"),)
 
 
 def lock_file(record: "Record") -> str:
@@ -414,7 +418,7 @@ def recover(record: "Record", kube: "Kube", reviewed: Dict, reviewed_digest: str
             follow_up: Optional[Callable[[List[Dict]], None]] = None, *,
             guard_factory: Optional[Callable] = None,
             follow_up_guarded: Optional[Callable[[List[Dict], object], None]] = None,
-            image_transition: Optional[str] = None) -> Dict:
+            image_transition: Optional[str] = None, revocation: bool = False) -> Dict:
     """common_records.recovery_guard (one recoverer, the lock's executor proven terminated), then reconciled-<n> for
     every decided outcome; the stale lock is released only when nothing stays unresolved, and not while the Active
     transition has an executor that is neither finished nor fenced or a revocation that proved nothing
@@ -427,10 +431,12 @@ def recover(record: "Record", kube: "Kube", reviewed: Dict, reviewed_digest: str
     with factory(record, live["lock_sha256"]) as guard:
         C.require_cluster(kube.api, record.cluster_uid)
         # An open image transition fences recovery's follow-ups too (they act on the installation): only the
-        # recovery of THAT transition (image_transition: its id, passed by imageroll) may run one. Reconciling
-        # intents and releasing the stale lock stay possible; the release never lifts the fence.
+        # recovery of THAT transition (image_transition: its id, passed by imageroll) may run one, and the reviewed
+        # recovery of a revocation (revocation=True, passed by transition_revoke.recover_apply alone: it fences an
+        # executor and settles a revocation, it grants nothing). Reconciling intents and releasing the stale lock
+        # stay possible; the release never lifts the fence.
         fence = image_fence(record)
-        if fence and (follow_up or follow_up_guarded) and image_transition != fence:
+        if fence and (follow_up or follow_up_guarded) and image_transition != fence and not revocation:
             raise StagingError(f"image transition {fence} is open: this recovery's follow-up is refused; the lock "
                                "stays (recover through the imageroll helper)")
         for a in live["actions"]:
@@ -680,9 +686,12 @@ class mutating:
     def _image_fence(self) -> None:
         """Under the lock, before any journal is attached: while an image transition fences the installation, every
         helper is refused except imageroll acting for exactly that transition (context transition == the open id) or
-        preparing its reviewed successor (context supersedes == the open id)."""
+        preparing its reviewed successor (context supersedes == the open id), and the operations of
+        IMAGE_FENCE_EXEMPT (the revocation of the operator's write permission)."""
         fence = image_fence(self.record)
         ctx = self.context or {}
+        if fence and (self.helper, ctx.get("operation")) in IMAGE_FENCE_EXEMPT:
+            return
         if fence and not (self.helper == IMAGEROLL and fence in (ctx.get("transition"), ctx.get("supersedes"))):
             raise StagingError(f"image transition {fence} is open: {self.helper} is refused until the imageroll "
                                "helper completes it")

@@ -712,7 +712,12 @@ def _code(m, t, s):
     (_samples("c28_requests_total", lambda v: v[:2]), "not at least 3 fresh samples"),
     (_samples("c28_ingress_requests_total", lambda v: [[t - 100, x] for t, x in v]), "not at least 3 fresh samples"),
     (_samples("c28_requests_total", lambda v: [[v[0][0] - 90, "0"]] + v[1:]), "without a gap"),
-    (_samples("c28_ingress_requests_total", lambda v: v[:2] + [[v[2][0], "NaN"]]), "not exactly zero"),
+    (_samples("c28_ingress_requests_total", lambda v: v[:2] + [[v[2][0], "NaN"]]), "finite numbers"),
+    (_samples("c28_ingress_dispatched_total", lambda v: [v[-1]] * 3), "1 distinct samples of 3"),
+    (_samples("c28_ingress_dispatched_total", lambda v: [[float("nan"), "0"] for _ in v]), "finite numbers"),
+    (_samples("c28_ingress_dispatched_total", lambda v: [[t, False] for t, _x in v]), "finite numbers"),
+    (_samples("c28_ingress_dispatched_total", lambda v: [[t, x, "extra"] for t, x in v]), "finite numbers"),
+    (_samples("c28_requests_total", lambda v: [v[0], v[1], v[1], v[2]]), "3 distinct samples of 4"),
     (_code, "a series with code '503'"),
     (_drop("c28_ingress_requests_total"), f"ingress-arrivals/{N}: series for []"),
     (_drop("c28_ingress_dispatched_total"), f"ingress-dispatch/{N}: series for"),
@@ -966,6 +971,66 @@ def test_completion_resumes_after_an_interrupted_attempt(rolled, monkeypatch):
     assert out["data"]["zero_counters"]["file"] == f"zero-counters-{tid}-02.json"       # the attempt that completed
     assert os.path.exists(os.path.join(folder, f"zero-counters-{tid}-01.json"))        # the interrupted one is kept
     assert X.image_fence(w.ctx().record) is None
+
+
+def _rewrite(w, name, **change):
+    path = w.tmp / name
+    path.write_text(json.dumps(dict(json.loads(path.read_text()), **change)))
+
+
+def test_a_params_file_changed_after_the_review_stops_everything(rolled):
+    w, vm = rolled, VM(rolled)
+    plan = I.plan_complete(w.ctx(), vm, "http://vm")
+    assert plan["problems"] == []
+    saved = X.save_plan(w.ctx().record, I.HELPER, plan, "plan-complete")
+    _rewrite(w, "demo-params-new.json", image=OLD)                      # the bound NEW params now say the old image
+    c = w.ctx()
+    assert c.params["image"] == OLD and {image_of(w.dep(n)) for n in ORDER} == {NEW}
+    problems = I.plan_complete(c, vm, "http://vm")["problems"]
+    assert any("is not the file the transition bound" in p for p in problems), problems
+    with pytest.raises(X.StagingError):
+        I.complete(c, X.load_plan(saved["plan"]), saved["plan_digest"], vm, "http://vm")
+    assert "transition-complete" not in w.events() and I.plan_roll(c)["problems"]
+    _rewrite(w, "demo-params-new.json", image=NEW)
+    assert I.plan_complete(w.ctx(), vm, "http://vm")["problems"] == []
+    _rewrite(w, "demo-params.json", release="other")                    # the bound OLD file is checked as well
+    assert any("demo-params.json is not the file the transition bound" in p
+               for p in I.plan_complete(w.ctx(), vm, "http://vm")["problems"])
+
+
+def test_params_changed_between_the_plan_and_the_apply_send_nothing(w):
+    plan = I.plan_open(w.ctx(), "demo-params-new.json")
+    saved = X.save_plan(w.ctx().record, I.HELPER, plan, "plan-open")
+    third = OLD.rsplit(":", 1)[0] + ":" + "c" * 64
+    _rewrite(w, "demo-params-new.json", image=third)                    # after the review of the open plan
+    with pytest.raises(X.StagingError, match="no longer produces the reviewed plan"):
+        I.open_(w.ctx(), X.load_plan(saved["plan"]), saved["plan_digest"])
+    assert w.events() == []
+    _rewrite(w, "demo-params-new.json", image=NEW)
+    w.open()
+    c = w.ctx()                                                         # this executor loaded the bound params...
+    plan = I.plan_roll(c)
+    saved = X.save_plan(c.record, I.HELPER, plan, "plan-roll")
+    _rewrite(w, "demo-params-new.json", image=third)                    # ...and the file changes before its apply
+    assert any("not the file the transition bound" in p for p in I.plan_roll(c)["problems"])
+    with pytest.raises(X.StagingError, match="no longer produces the reviewed plan"):
+        I.roll(c, X.load_plan(saved["plan"]), saved["plan_digest"])
+    assert not [e for e in w.events() if e.startswith("intent-")] and not w.lock()
+    assert {image_of(w.dep(n)) for n in ORDER} == {OLD}
+
+
+def test_a_params_file_changed_during_the_roll_stops_before_the_next_patch(w):
+    w.open()
+    real = w.ctl.sync
+
+    def sync(api, ns, name, dep):
+        real(api, ns, name, dep)
+        if name == "c28-metrics-route" and image_of(dep) == NEW:        # while the second member rolls
+            (w.tmp / "demo-params-new.json").write_text(json.dumps(dict(demo_params(), image=NEW, release="other")))
+    w.ctl.sync = sync
+    with pytest.raises(X.StagingError, match="c28-ingress: not safe to continue"):
+        w.run(I.plan_roll, I.roll)
+    assert image_of(w.dep("c28-ingress")) == OLD and len([e for e in w.events() if e.startswith("intent-")]) == 2
 
 
 # --- the command line ------------------------------------------------------------------------------------------------

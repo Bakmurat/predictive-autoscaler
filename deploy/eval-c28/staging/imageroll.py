@@ -304,6 +304,36 @@ def member_view(c: Ctx, t: Dict, m: Dict, live: Optional[Dict] = None) -> Dict:
     return dict(base, state="divergent", why=why)
 
 
+# --- the bound files -------------------------------------------------------------------------------------------------
+
+def _read_json(path: str) -> Tuple[Dict, str]:
+    """A JSON file and its sha256, from the SAME bytes (never hash one read and parse another)."""
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    return json.loads(raw), hashlib.sha256(raw).hexdigest()
+
+
+def binding_problems(c: Ctx, t: Dict) -> List[str]:
+    """The params files the transition bound are still those files, and the params this process loaded are the bound
+    new file's content: a params file edited after the review changes what every check here renders."""
+    d, out = t["data"], []
+    if c.record.doc.get("params") != d["to_params"]["path"]:
+        out.append("the loaded record does not name the transition's new params file")
+    for which in ("to_params", "from_params"):
+        try:
+            doc, sha = _read_json(c.record.resolve(d[which]["path"]))
+        except (OSError, ValueError) as e:
+            out.append(f"the params file {d[which]['path']} cannot be read ({type(e).__name__})")
+            continue
+        if sha != d[which]["sha256"]:
+            out.append(f"the params file {d[which]['path']} is not the file the transition bound (sha256 differs)")
+        elif which == "to_params" and doc != c.params:
+            out.append("the loaded params are not the bound new params file's content")
+    if c.params.get("image") != d["to_image"]:
+        out.append("the loaded params do not name the transition's new image")
+    return out
+
+
 # --- safety conditions (before every patch and on every resume) ------------------------------------------------------
 
 def _operator_permissions(c: Ctx) -> Dict:
@@ -360,7 +390,7 @@ def headroom_problems(c: Ctx, m: Dict) -> List[str]:
 def safety_problems(c: Ctx, t: Dict) -> List[str]:
     """The conditions that must hold whenever this helper is about to change a member."""
     import bounded
-    out = list(bounded.fence_problems(bounded.Ctx(c.record, c.kube), image_roll=True))
+    out = binding_problems(c, t) + list(bounded.fence_problems(bounded.Ctx(c.record, c.kube), image_roll=True))
     left = C.unresolved_intents(c.record.doc)
     if left:
         out.append(f"intents with unknown outcomes {left}: recover first")
@@ -403,11 +433,13 @@ def plan_open(c: Ctx, new_params: str, nonce: Optional[str] = None, supersedes: 
         problems.append(f"intents with unknown outcomes {left}: resolve them before a transition is opened")
     old_path, new_path = record.resolve(record.doc["params"]), record.resolve(new_params)
     try:
-        with open(new_path) as fh:
-            new = json.load(fh)
+        new, new_sha = _read_json(new_path)                 # the bytes that are bound are the bytes that are parsed
+        old, old_sha = _read_json(old_path)
         c.c28.render.validate_stage(new, "demonstration")
     except (OSError, ValueError, c.c28.render.ParamsError) as e:
-        raise X.StagingError(f"the new params file cannot be used: {e}") from e
+        raise X.StagingError(f"the params files cannot be used: {e}") from e
+    if old != c.params:
+        problems.append("the current params file changed after this process loaded it")
     if {k: v for k, v in new.items() if k != "image"} != {k: v for k, v in c.params.items() if k != "image"}:
         problems.append("the new params differ from the current ones in more than `image`")
     if new["image"] == c.params["image"]:
@@ -416,7 +448,7 @@ def plan_open(c: Ctx, new_params: str, nonce: Optional[str] = None, supersedes: 
     # may leave members that were never patched where they are. Every other successor is a forward transition.
     pd = parent.get("data") or {}
     kind = "reverse" if (pd.get("kind") == "forward" and new["image"] == pd.get("from_image") and
-                         X.sha256_file(new_path) == pd["from_params"]["sha256"]) else "forward"
+                         new_sha == pd["from_params"]["sha256"]) else "forward"
     members = []
     rendered = _rendered(c.params)
     created = prepare.created_objects(record)
@@ -443,8 +475,8 @@ def plan_open(c: Ctx, new_params: str, nonce: Optional[str] = None, supersedes: 
         problems.append("no rendered Deployment runs the fixture image")
     binding = {"run_id": record.run_id, "cluster_uid": record.cluster_uid, "kind": kind,
                "record_path": os.path.realpath(record.path), "old_record_sha256": record.sha256,
-               "from_params": {"path": record.doc["params"], "sha256": X.sha256_file(old_path)},
-               "to_params": {"path": new_params, "sha256": X.sha256_file(new_path)},
+               "from_params": {"path": record.doc["params"], "sha256": old_sha},
+               "to_params": {"path": new_params, "sha256": new_sha},
                "from_image": c.params["image"], "to_image": new["image"], "members": members,
                **({"supersedes": supersedes} if supersedes else {})}
     nonce = nonce or secrets.token_hex(16)
@@ -540,7 +572,7 @@ def _open_transition(c: Ctx) -> Tuple[Optional[Dict], List[str]]:
     if os.path.realpath(c.record.path) != t["data"]["record_path"] or named != t["id"] or \
             C.digest(_raw_record(c.record)) != opened["record_sha256"]:
         return t, [f"the loaded record is not the one transition {t['id']} published"]
-    return t, []
+    return t, binding_problems(c, t)
 
 
 def status(c: Ctx) -> Dict:
@@ -822,17 +854,19 @@ def zero_counter_evidence(c: Ctx, t: Dict, fetch: Fetch, api: str) -> Tuple[Dict
     ingress_pods = {p["name"] for p in rolled[ingress[0]]["pods"]}
 
     def judge(where: str, vals: List) -> None:
-        try:
-            ts, vs = [float(x[0]) for x in vals], [float(x[1]) for x in vals]
-        except (TypeError, ValueError, IndexError):
-            problems.append(f"{where}: samples that cannot be read")
+        # bounded._stamps: every sample exactly [timestamp, value], both finite numbers, neither a boolean
+        stamps = bounded._stamps({"values": vals})
+        if stamps is None:
+            problems.append(f"{where}: samples that are not [timestamp, value] pairs of finite numbers")
             return
+        ts = sorted(set(stamps))                                   # DISTINCT timestamps: a repeated one adds nothing
         gaps = [b - a for a, b in zip(ts, ts[1:])]
-        if len(ts) < ZERO_MIN_SAMPLES or ts != sorted(ts) or now - ts[-1] > ZERO_MAX_AGE_S or \
+        if len(ts) < ZERO_MIN_SAMPLES or len(ts) != len(stamps) or now - ts[-1] > ZERO_MAX_AGE_S or \
                 ts[-1] - now > ZERO_FUTURE_S or (gaps and max(gaps) > ZERO_MAX_AGE_S):
-            problems.append(f"{where}: {len(ts)} samples, the newest {now - ts[-1] if ts else None} s old: not at "
-                            f"least {ZERO_MIN_SAMPLES} fresh samples without a gap")
-        if not vs or any(v != 0.0 for v in vs):                    # NaN compares unequal: never zero
+            problems.append(f"{where}: {len(ts)} distinct samples of {len(stamps)}, the newest "
+                            f"{now - ts[-1] if ts else None} s old: not at least {ZERO_MIN_SAMPLES} fresh samples "
+                            "without a gap")
+        if any(float(pair[1]) != 0.0 for pair in vals):
             problems.append(f"{where}: not exactly zero in every sample")
 
     def read(label: str, metric: str, target: str, by: str, want: set, scraped: set, code: bool = False) -> None:

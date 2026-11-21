@@ -203,6 +203,15 @@ def test_the_fence_in_the_shared_mutation_entry(api, make_record):
             with X.mutating(record, k, helper, ctx):
                 raise AssertionError("entered")
         assert not os.path.exists(lock) and k.journal is None       # refused under the lock, which is released
+    for ctx in ({"operation": "grant"}, {"operation": "recover"}, {}, None):       # of that helper only the revocation
+        with pytest.raises(X.StagingError, match="image transition ir-1-aaaaaaaaaaaa is open"):
+            with X.mutating(record, k, "transition", ctx):
+                raise AssertionError("entered")
+    with pytest.raises(X.StagingError, match="is open"), X.mutating(record, k, "bounded", {"operation": "revoke"}):
+        raise AssertionError("entered")
+    with X.mutating(record, k, "transition", {"operation": "revoke"}):          # removing a permission is not fenced
+        assert k.journal is not None
+    assert not os.path.exists(lock) and X.image_fence(record) == "ir-1-aaaaaaaaaaaa"
     with X.mutating(record, k, "imageroll", {"transition": "ir-1-aaaaaaaaaaaa"}):
         assert k.journal is not None
     with X.mutating(record, k, "imageroll", {"transition": "ir-2-bbbbbbbbbbbb", "supersedes": "ir-1-aaaaaaaaaaaa"}):
