@@ -719,13 +719,13 @@ def _code(m, t, s):
     (_samples("c28_ingress_dispatched_total", lambda v: [[t, x, "extra"] for t, x in v]), "finite numbers"),
     (_samples("c28_requests_total", lambda v: [v[0], v[1], v[1], v[2]]), "3 distinct samples of 4"),
     (_code, "a series with code '503'"),
-    (_drop("c28_ingress_requests_total"), f"ingress-arrivals/{N}: series for []"),
-    (_drop("c28_ingress_dispatched_total"), f"ingress-dispatch/{N}: series for"),
-    (_drop("c28_requests_total", 3), f"fixture-requests/{N}: series for"),
+    (_drop("c28_ingress_requests_total"), f"ingress-arrivals/{N}: 0 identities"),
+    (_drop("c28_ingress_dispatched_total"), f"ingress-dispatch/{N}: 11 identities"),
+    (_drop("c28_requests_total", 3), f"fixture-requests/{N}: 9 identities"),
     (_value("c28_ingress_dispatched_total", "1"), f"ingress-dispatch/{R}"),
     (_value("c28_requests_total", "7"), "not exactly zero in every sample"),
     (_foreign, "which is not a replacement pod"),
-    (_twice, f"ingress-arrivals/{N}: series for"),
+    (_twice, f"ingress-arrivals/{N}: 1 identities (x[2])"),
 ])
 def test_completion_refuses_without_exact_zero_counter_evidence(rolled, edit, text):
     w, vm = rolled, VM(rolled)
@@ -735,6 +735,40 @@ def test_completion_refuses_without_exact_zero_counter_evidence(rolled, edit, te
     with pytest.raises(X.StagingError):
         w.run(lambda c: I.plan_complete(c, vm, "http://vm"), lambda c, p, d: I.complete(c, p, d, vm, "http://vm"))
     assert "transition-complete" not in w.events() and X.image_fence(w.ctx().record) and not w.lock()
+
+
+def test_retired_endpoints_of_the_new_ingress_refuse_completion_until_they_leave_the_window(rolled):
+    """What a real ingress does (found on the kind bed): it is replaced BEFORE the targets, discovers the old target
+    pods and keeps the dispatch counter of each removed endpoint for a while, at zero; when it finally drops one,
+    the scraper leaves a staleness marker. All of that refuses; only a window with exactly the replacement
+    identities completes."""
+    w, vm = rolled, VM(rolled)
+    opened = next(e for e in X.receipts(w.ctx().record, I.HELPER) if e["event"] == "transition-prepared")["data"]
+    old = next(m["pods_at_open"] for m in opened["members"] if m["name"] == N)
+    assert len(old) == 12 and not set(old) & set(vm.pods(N))
+
+    def retired(stale):
+        def edit(m, t, s):
+            if m == "c28_ingress_dispatched_total" and t == N:
+                for name in old[:5]:
+                    vals = copy.deepcopy(s[0]["values"])
+                    if stale:
+                        vals[-1][1] = "NaN"                                # dropped by the ingress: a staleness marker
+                    s.append({"metric": dict(s[0]["metric"], endpoint_pod=name), "values": vals})
+            return s
+        return edit
+    for stale in (False, True):
+        vm.edit = retired(stale)
+        problems = I.plan_complete(w.ctx(), vm, "http://vm")["problems"]
+        text = next(p for p in problems if p.startswith(f"ingress-dispatch/{N}: 17 identities"))
+        assert "5 of them are pods this transition replaced" in text and old[0] in text and "missing []" in text
+        assert any("finite numbers" in p for p in problems) is stale       # a terminal NaN is never a sample
+    vm.edit = lambda m, t, s: s + [{"metric": dict(s[0]["metric"], endpoint_pod="somebody-else"),
+                                    "values": s[0]["values"]}] if m == "c28_ingress_dispatched_total" else s
+    text = next(p for p in I.plan_complete(w.ctx(), vm, "http://vm")["problems"] if "unexpected endpoint" in p)
+    assert "somebody-else" in text and "this transition replaced" not in text   # nothing is promised about a stranger
+    vm.edit = None                                                         # the retired series left the window
+    assert I.plan_complete(w.ctx(), vm, "http://vm")["problems"] == []
 
 
 def test_completion_needs_every_member_rolled_and_the_telemetry_gate(w, monkeypatch):

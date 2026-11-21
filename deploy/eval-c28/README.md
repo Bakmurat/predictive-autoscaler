@@ -621,6 +621,42 @@ enumerated server default (`imageroll.DEFAULTS`); every other difference is show
 `status` is a report, not a gate: it shows the fence, the transition's journal state, each member's state and, for an
 open transition, the problems a plan would refuse on (another record loaded, a bound params file that changed).
 
+### The roll on a throwaway cluster: `smoke/roll-kind.sh`
+
+The unit tests run the helper against an in-memory API and the API-server test checks the patch itself; neither has a
+Deployment controller, a scrape path or a real installation. `smoke/roll-kind.sh` does, on its own kind cluster (own
+kubeconfig, a local API server, the cluster UID in the records; it deletes only the cluster it created):
+
+- **The bed.** One control plane, W and S. The images are pulled by digest inside the nodes with no registry
+  credential. The metrics path is the lab's: the victoria-metrics-k8s-stack chart (pinned by version and sha256),
+  reconciled by its operator, with node-exporter and the kubelet/cAdvisor scrape, everything but node-exporter on the
+  control plane. The demonstration is installed as a real one is: `reserve.py` for an owner run, `prepare.py` phase by
+  phase, the chart release with prepare's staging values, a StorageClass that retains.
+- **bedcheck.** The permission proof and the UNMODIFIED telemetry gate must work on the bed before anything is
+  rolled: with an image whose counters are born at the first request, the gate's only refusals are those missing
+  series; anything else is a bed mismatch and stops the smoke.
+- **Scenario `forward`** (12 replicas per target, about 90 minutes): `open`; `roll` in a process group of its own,
+  killed with SIGKILL after two members; the dead executor's lock refuses an apply while status and planning still
+  answer; `recover`; the fence stays; the reviewed resume; exactly one applied patch per member; and from the cluster
+  itself: the Deployments differ in the image only, all pods are new and on the new digest, the ready endpoints are
+  the new pods, the release's pods are untouched. Then cold completion: re-planned read-only until a fresh window is
+  clean, because the new ingress keeps the dispatch counters of the old target pods it discovered for a while
+  (`retiredSeriesKeep`), and nothing is classified away. Then ONE unmodified `bounded.py` admission run, of which the
+  origin's first minute is asserted (the generator ran before the origin; raw ingress samples bracket the minute
+  from a zero; the reducer observes it). Then an endpoint leaves and another arrives, read from the ingress's own
+  counters without and with requests.
+- **Scenario `reverse`** (4 replicas, a reduced size, about 10 minutes): a roll held before the fourth member's patch
+  by a smoke-only barrier (a `kubectl` in front of the real one on the executor's PATH that passes every call through
+  until three members are rolled and then waits; no answer is fabricated and no helper code changes) and killed
+  there; the mixed state asserted; a successor transition with the original params (kind reverse); the fence
+  continuous; the three members rolled back; completion without an observer, with its limitation, which the gate then
+  shows to be real.
+
+Its results are functional smoke evidence, not production performance or admission evidence. It does not show a lost
+patch response (the API-server test and the unit tests do) or the same endpoint identity leaving and returning (the
+fixture's unit tests do). A fixture built locally can be used through an owned local registry for development
+(`REGISTRY_MIRROR`); a qualifying run uses published digests.
+
 ## Restore to the common starting count
 
 ```sh
