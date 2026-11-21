@@ -7,6 +7,7 @@ import copy
 import json
 import os
 import re
+import signal
 import urllib.parse
 
 import pytest
@@ -233,6 +234,7 @@ def test_the_open_plan_binds_the_members_in_order_and_reads_only(w):
     b = p["binding"]
     assert [m["name"] for m in b["members"]] == ORDER and [m["member"] for m in b["members"]] == [1, 2, 3, 4, 5]
     assert {m["start"] for m in b["members"]} == {"from"} and (b["from_image"], b["to_image"]) == (OLD, NEW)
+    assert b["kind"] == "forward" and b["record_path"] == os.path.realpath(w.path)
     assert b["members"][0]["nodes"] == ["worker-s"] and b["members"][4]["nodes"] == ["worker-w"]
     assert [m["container"] for m in b["members"]] == ["proxy", "proxy", "ingress", "fixture", "fixture"]
     assert re.fullmatch(r"ir-1-[0-9a-f]{12}", p["id"]) and p["candidate"]["image_transition"]["id"] == p["id"]
@@ -405,8 +407,8 @@ def test_terminating_pods_overlap_their_replacements_and_block_until_gone(w):
     seen = []
     real = I.rollout_problems
 
-    def spy(c, m, image, nodes, fresh):
-        probs, pods = real(c, m, image, nodes, fresh)
+    def spy(c, m, image, nodes, fresh, dep=None):
+        probs, pods = real(c, m, image, nodes, fresh, dep)
         seen.append((m["name"], [p for p in probs if "terminating" in p]))
         return probs, pods
     I.rollout_problems, restore = spy, real
@@ -651,10 +653,16 @@ def test_forward_completion_needs_the_zero_counters_of_the_replacement_processes
     out = w.run(lambda c: I.plan_complete(c, vm, "http://vm"), lambda c, p, d: I.complete(c, p, d, vm, "http://vm"))
     assert out["event"] == "transition-complete" and out["data"]["id"] == tid and not w.lock()
     assert w.events()[-2:] == ["zero-counters", "transition-complete"]
-    ev = json.load(open(os.path.join(w.ctx().record.evidence_dir, "imageroll", f"zero-counters-{tid}.json")))
-    assert len(ev["series"]) == 2 * (1 + 12 + 12) and {v for s in ev["series"] for v in s["values"]} == {"0"}
-    assert C.sha256_file(os.path.join(w.ctx().record.evidence_dir, "imageroll", f"zero-counters-{tid}.json")) == \
-        out["data"]["zero_counters_sha256"]
+    path = os.path.join(w.ctx().record.evidence_dir, "imageroll", f"zero-counters-{tid}-01.json")
+    ev = json.load(open(path))
+    assert out["data"]["zero_counters"] == {"file": os.path.basename(path), "sha256": C.sha256_file(path)}
+    assert ev["series"] == 2 * (1 + 12 + 12) and len(ev["checks"]) == 6
+    assert all(k["selector"].startswith("c28_") and 'namespace="demo"' in k["selector"] for k in ev["checks"])
+    samples = [x for k in ev["checks"] for s in k["series"] for x in s["samples"]]
+    assert {v for _t, v in samples} == {"0"} and len(samples) == 3 * ev["series"]     # every sample, with its time
+    assert sorted(ev["replacements"]) == sorted(ORDER) and len(ev["replacements"][N]) == 12
+    live = {p["metadata"]["name"]: p["metadata"]["uid"] for k, p in w.api.objects.items() if k[0] == "pods"}
+    assert all(live[p["name"]] == p["uid"] for pods in ev["replacements"].values() for p in pods)
     c = w.ctx()
     assert X.image_fence(c.record) is None and prepare.verify(c.record, c.kube)["result"] == "PASS"
     assert not any("image transition" in p for p in B.fence_problems(B.Ctx(c.record, c.kube)))
@@ -684,7 +692,28 @@ def _twice(m, t, s):
     return s + s[:1] if m == "c28_ingress_requests_total" and t == N else s
 
 
+def _samples(metric, make):
+    def edit(m, t, s):
+        if m == metric:
+            for x in s:
+                x["values"] = make(x["values"])
+        return s
+    return edit
+
+
+def _code(m, t, s):
+    if m == "c28_requests_total" and t == N:
+        s[0]["metric"]["code"] = "503"
+    return s
+
+
 @pytest.mark.parametrize("edit,text", [
+    (_samples("c28_ingress_dispatched_total", lambda v: [[v[-1][0] - 179, "0"]]), "not at least 3 fresh samples"),
+    (_samples("c28_requests_total", lambda v: v[:2]), "not at least 3 fresh samples"),
+    (_samples("c28_ingress_requests_total", lambda v: [[t - 100, x] for t, x in v]), "not at least 3 fresh samples"),
+    (_samples("c28_requests_total", lambda v: [[v[0][0] - 90, "0"]] + v[1:]), "without a gap"),
+    (_samples("c28_ingress_requests_total", lambda v: v[:2] + [[v[2][0], "NaN"]]), "not exactly zero"),
+    (_code, "a series with code '503'"),
     (_drop("c28_ingress_requests_total"), f"ingress-arrivals/{N}: series for []"),
     (_drop("c28_ingress_dispatched_total"), f"ingress-dispatch/{N}: series for"),
     (_drop("c28_requests_total", 3), f"fixture-requests/{N}: series for"),
@@ -725,6 +754,7 @@ def test_a_reverse_supersedes_the_open_transition_and_completes_with_its_limitat
     assert list(w.states().values()) == ["rolled", "rolled", "rolled", "from", "from"]
     plan = I.plan_open(w.ctx(), "demo-params.json", supersedes=first)
     assert plan["problems"] == [] and plan["id"].startswith("ir-2-") and plan["binding"]["supersedes"] == first
+    assert plan["binding"]["kind"] == "reverse"
     assert [m["start"] for m in plan["binding"]["members"]] == ["from", "from", "from", "target", "target"]
     assert (plan["binding"]["from_image"], plan["binding"]["to_image"]) == (NEW, OLD)
     second = w.open("demo-params.json", supersedes=first)["data"]["id"]
@@ -755,6 +785,187 @@ def test_a_successor_waits_for_outstanding_writes(w):
     assert any("unknown outcomes" in p for p in problems)
     assert any("is not the open image transition" in p
                for p in I.plan_open(w.ctx(), "demo-params.json", supersedes="ir-9-ffffffffffff")["problems"])
+
+
+def _forward(w):
+    return w.run(I.plan_roll, I.roll)
+
+
+def test_a_successor_to_a_third_image_is_a_forward_transition(w, monkeypatch):
+    monkeypatch.setattr(B, "existing_telemetry", lambda *a, **k: [])
+    first = w.open()["data"]["id"]
+    _forward(w)
+    third = OLD.rsplit(":", 1)[0] + ":" + "c" * 64
+    (w.tmp / "third.json").write_text(json.dumps(dict(demo_params(), image=third)))
+    plan = I.plan_open(w.ctx(), "third.json", supersedes=first)
+    assert plan["problems"] == [] and plan["binding"]["kind"] == "forward"       # not what the parent started from
+    w.open("third.json", supersedes=first)
+    _forward(w)
+    assert {image_of(w.dep(n)) for n in ORDER} == {third}
+    assert "needs --query-api" in I.plan_complete(w.ctx())["problems"][0]       # no reverse exemption
+    plan = I.plan_complete(w.ctx(), VM(w), "http://vm")
+    assert plan["problems"] == [] and plan["kind"] == "forward"
+
+
+def test_a_successor_that_is_not_a_reverse_may_not_leave_members_behind(w):
+    first = w.open()["data"]["id"]
+    w.perm_calls, w.perm = 0, lambda n: PASS if n <= 5 else {"verdict": "unproven"}
+    with pytest.raises(X.StagingError):
+        _forward(w)                                                     # three members on NEW, the targets on OLD
+    w.perm = lambda n: PASS
+    (w.tmp / "third.json").write_text(json.dumps(dict(demo_params(), image=OLD.rsplit(":", 1)[0] + ":" + "c" * 64)))
+    problems = I.plan_open(w.ctx(), "third.json", supersedes=first)["problems"]
+    assert any(f"{N}: the live spec is neither render" in p for p in problems)
+
+
+def test_abandoning_a_successor_gives_the_parent_its_fence_back(w):
+    original = copy.deepcopy(w.ctx().record.doc)
+    original.pop("image_transition", None)
+    first = w.open()["data"]["id"]
+    _forward(w)
+
+    def crash(path, tid, doc):
+        raise RuntimeError("before publication")
+    with pytest.raises(RuntimeError):
+        w.run(lambda c: I.plan_open(c, "demo-params.json", supersedes=first), lambda c, p, d: I.open_(c, p, d, crash))
+    ts = X.image_transitions(X.receipts(w.ctx().record, I.HELPER))
+    assert ts[first]["state"] == "superseded" and X.image_fence(w.ctx().record).startswith("ir-2-")
+    w.run(I.plan_open_recover, I.open_recover)
+    assert w.events()[-1] == "transition-abandoned"
+    c = w.ctx()
+    assert X.image_transitions(X.receipts(c.record, I.HELPER))[first]["state"] == "open"
+    assert X.image_fence(c.record) == first and set(w.states().values()) == {"rolled"}
+    archived = X.Record(w.path, original)                               # no field, no successor: still fenced
+    with pytest.raises(X.StagingError, match="is open"), X.mutating(archived, archived.kube(w.api), "bounded"):
+        pass
+
+
+def test_an_archived_record_decides_nothing_about_a_published_transition(w):
+    def crash(path, tid, doc):
+        I._publish(path, tid, doc)
+        raise RuntimeError("after publication")
+    with pytest.raises(RuntimeError):
+        w.run(lambda c: I.plan_open(c, "demo-params-new.json"), lambda c, p, d: I.open_(c, p, d, crash))
+    tid = X.image_fence(w.ctx().record)
+    archived = X.load_record(f"{w.path}.before-{tid}", ("prepare",))
+    c = I.Ctx(archived, archived.kube(w.api), now=w.clock.now, sleep=w.clock.sleep, permission_check=lambda: PASS)
+    plan = I.plan_open_recover(c)
+    assert plan["actions"] == [] and "an archived copy decides nothing" in plan["problems"][0]
+    saved = X.save_plan(c.record, I.HELPER, plan, "plan-open-recover")
+    with pytest.raises(X.StagingError, match="archived copy"):
+        I.open_recover(c, X.load_plan(saved["plan"]), saved["plan_digest"])
+    assert w.events() == ["transition-prepared"] and X.image_fence(archived) == tid
+    w.run(I.plan_open_recover, I.open_recover)                          # the canonical record decides: published
+    assert w.events()[-1] == "transition-open"
+    assert "not the one transition" in I.plan_roll(c)["problems"][0]    # and the archived copy cannot roll either
+
+
+@pytest.mark.parametrize("when", ["before-publish", "after-publish"])
+def test_a_killed_executor_leaves_the_lock_and_the_fence_and_each_is_recovered_explicitly(w, when):
+    c = w.ctx()
+    plan = I.plan_open(c, "demo-params-new.json")
+    saved = X.save_plan(c.record, I.HELPER, plan, "plan-open")
+    tid, pid = plan["id"], os.fork()
+    if pid == 0:                                    # the executor: killed, not unwound, inside `open`
+        def publish(path, t, doc):
+            if when == "after-publish":
+                I._publish(path, t, doc)
+            os.kill(os.getpid(), signal.SIGKILL)
+        try:
+            I.open_(w.ctx(), X.load_plan(saved["plan"]), saved["plan_digest"], publish)
+        finally:
+            os._exit(99)
+    _pid, status = os.waitpid(pid, 0)
+    assert os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL
+    assert w.events() == ["transition-prepared"] and w.lock()           # nothing unwound: the lock is still there
+    assert (json.load(open(w.path)).get("image_transition") or {}).get("id") == (tid if when == "after-publish"
+                                                                                else None)
+    with pytest.raises(X.StagingError, match="exists"):
+        w.run(I.plan_open_recover, I.open_recover)                      # the dead executor's lock comes first
+    if when == "after-publish":                     # the lock was taken with the OLD record: the new one is refused
+        new = w.ctx()
+        rp = X.save_plan(new.record, "recover", X.recover_plan(new.record, new.kube), "recover-plan")
+        with pytest.raises(X.StagingError, match="another run or record"):
+            X.recover(new.record, new.kube, X.load_plan(rp["plan"]), rp["plan_digest"], image_transition=tid)
+        assert w.lock()
+    owner = X.load_record(w.path if when == "before-publish" else f"{w.path}.before-{tid}")
+    rp = X.save_plan(owner, "recover", X.recover_plan(owner, owner.kube(w.api)), "recover-plan-owner")
+    out = X.recover(owner, owner.kube(w.api), X.load_plan(rp["plan"]), rp["plan_digest"], image_transition=tid)
+    assert out["data"]["image_transition_open"] == tid and not w.lock()
+    assert X.image_fence(w.ctx().record) == tid                         # the lock is gone, the fence is not
+    w.run(I.plan_open_recover, I.open_recover)
+    assert w.events()[-1] == ("transition-open" if when == "after-publish" else "transition-abandoned")
+
+
+def test_an_earlier_member_that_lost_readiness_blocks_the_next_patch(w, monkeypatch):
+    w.open()
+    real = I._wait
+
+    def wait(c, t, m):
+        out = real(c, t, m)
+        if m["member"] == 1:                        # right after its receipt, the first route's pod stops being Ready
+            for p in I._member_pods(c, w.dep(m["name"]))[1]:
+                w.api.obj("Pod", p["metadata"]["name"], m["namespace"])["status"]["conditions"] = [
+                    {"type": "Ready", "status": "False"}]
+        return out
+    monkeypatch.setattr(I, "_wait", wait)
+    with pytest.raises(X.StagingError, match="the earlier member c28-forecast-route is patched"):
+        _forward(w)
+    assert [e for e in w.events() if e.startswith("intent-")] == ["intent-1"] and not w.lock()
+    assert image_of(w.dep("c28-metrics-route")) == OLD
+
+
+def test_the_last_read_before_a_patch_must_be_the_reviewed_object(w, monkeypatch):
+    w.open()
+    real = I._patch
+
+    def patch(c, t, m, reviewed):                   # somebody edits the Deployment after the plan and the checks
+        dep = w.dep(m["name"])
+        dep["spec"]["template"]["spec"]["hostNetwork"] = True
+        dep["metadata"]["generation"] += 1
+        dep["metadata"]["resourceVersion"] = str(int(dep["metadata"]["resourceVersion"]) + 100)
+        return real(c, t, m, reviewed)
+    monkeypatch.setattr(I, "_patch", patch)
+    with pytest.raises(X.StagingError, match="c28-forecast-route is not as reviewed"):
+        _forward(w)
+    assert not [e for e in w.events() if e.startswith("intent-")] and not w.lock()      # nothing was sent
+
+
+def test_a_spec_changed_during_the_rollout_stops_the_wait(w):
+    w.open()
+    real = w.ctl.sync
+
+    def sync(api, ns, name, dep):
+        real(api, ns, name, dep)
+        if name == "c28-ingress" and image_of(dep) == NEW:
+            dep["spec"]["template"]["spec"]["hostNetwork"] = True
+    w.ctl.sync = sync
+    with pytest.raises(X.StagingError, match="c28-ingress: the object is no longer this patch's post-state"):
+        _forward(w)
+    assert "member-rolled" not in w.events()[-1:] and w.states()["c28-ingress"] == "divergent"
+
+
+def test_completion_resumes_after_an_interrupted_attempt(rolled, monkeypatch):
+    w, vm = rolled, VM(rolled)
+    tid, real = X.image_fence(w.ctx().record), X.receipt
+
+    def crash(record, helper, event, data, *a, **k):
+        if event == "zero-counters":
+            raise RuntimeError("after the evidence file")
+        return real(record, helper, event, data, *a, **k)
+    go = (lambda c: I.plan_complete(c, vm, "http://vm"), lambda c, p, d: I.complete(c, p, d, vm, "http://vm"))
+    with monkeypatch.context() as mp:
+        mp.setattr(X, "receipt", crash)
+        with pytest.raises(RuntimeError):
+            w.run(*go)
+    folder = os.path.join(w.ctx().record.evidence_dir, "imageroll")
+    assert [f for f in sorted(os.listdir(folder)) if f.startswith("zero-")] == [f"zero-counters-{tid}-01.json"]
+    assert X.image_fence(w.ctx().record) == tid and not w.lock()
+    w.clock.sleep(5)
+    out = w.run(*go)
+    assert out["data"]["zero_counters"]["file"] == f"zero-counters-{tid}-02.json"       # the attempt that completed
+    assert os.path.exists(os.path.join(folder, f"zero-counters-{tid}-01.json"))        # the interrupted one is kept
+    assert X.image_fence(w.ctx().record) is None
 
 
 # --- the command line ------------------------------------------------------------------------------------------------

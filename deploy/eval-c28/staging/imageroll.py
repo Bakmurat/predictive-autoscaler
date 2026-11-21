@@ -16,8 +16,9 @@ The transition. Its id is `ir-<seq>-<12 hex>`: the journal sequence plus a hash 
 planning, so a second attempt at the same change never shares an id. `open` appends `transition-prepared` (from that
 receipt on execlib.image_fence refuses every other helper, whichever record is loaded), replaces the canonical record
 by the candidate (same record, the new params file, an `image_transition` block; the old bytes are kept beside it), and
-appends `transition-open`. A crash in between is decided by `open-recover`: abandoned while the old record is still
-canonical, opened when the new one already is.
+appends `transition-open`. A crash in between is decided by `open-recover`, from the canonical record's path, which
+the transition binds (an archived copy decides nothing): abandoned while the old record is still canonical, opened
+when the new one already is. An abandoned successor returns its parent to open.
 
 One member = one patch + one verified rollout, in the bound order. The patch is ONE JSON Patch whose `test` operations
 (UID, resourceVersion, container name, old image) the API server enforces in the same request; it also writes the
@@ -45,9 +46,10 @@ applied the resourceVersion has moved and the lost patch can never commit; `reco
 `complete` writes `transition-complete` only after one final pass: every member rolled and re-verified, the
 structural checks, both PredictiveAutoscalers in Recommend, the telemetry gate, and the zero-counter evidence the gate
 does not give: the replacement processes expose the ingress arrival counters, the dispatch counters of every
-discovered endpoint and the fixture request counters at exactly zero before any traffic. A REVERSE is a successor
-transition (plan-open --supersedes): its completion needs neither the zero counters nor the gate, and says so (the old
-binary creates its counters at the first request).
+discovered endpoint and the fixture request counters at exactly zero before any traffic. A successor transition
+(plan-open --supersedes) is a REVERSE only when it restores exactly the params file and image a forward transition
+started from: then its completion needs neither the zero counters nor the gate, and says so (the old binary creates
+its counters at the first request). Every other successor completes like a forward transition.
 """
 
 from __future__ import annotations
@@ -71,7 +73,7 @@ HELPER = X.IMAGEROLL
 PATCH_OP, VOID_OP = "image-roll", "image-roll-void"
 ROLL_ANNOTATION, VOID_ANNOTATION = "c28.devkuban.com/image-roll", "c28.devkuban.com/image-roll-void"
 WAIT_SINGLE_S, WAIT_TARGET_S, POLL_S = 300, 900, 5
-ZERO_LOOKBACK_S = 180
+ZERO_LOOKBACK_S, ZERO_MIN_SAMPLES, ZERO_MAX_AGE_S, ZERO_FUTURE_S = 180, 3, 60, 5
 SERVICE_LABEL = "kubernetes.io/service-name"
 Fetch = Callable[[str], Dict]
 
@@ -217,10 +219,11 @@ def _digest_of(image: str) -> str:
     return image.rsplit("@", 1)[1]
 
 
-def rollout_problems(c: Ctx, m: Dict, image: str, nodes: List[str], fresh: bool) -> Tuple[List[str], List[Dict]]:
+def rollout_problems(c: Ctx, m: Dict, image: str, nodes: List[str], fresh: bool,
+                     dep: Optional[Dict] = None) -> Tuple[List[str], List[Dict]]:
     """Every reason member m is not completely rolled out on `image`, and its pods as recorded. fresh: the pods are
-    this transition's replacements (0 restarts required)."""
-    dep = c.kube.get("Deployment", m["name"], m["namespace"])
+    this transition's replacements (0 restarts required). dep: the Deployment as the caller just read it."""
+    dep = dep if dep is not None else c.kube.get("Deployment", m["name"], m["namespace"])
     if dep is None or dep["metadata"]["uid"] != m["uid"]:
         return [f"{m['name']}: the Deployment is gone or was replaced"], []
     out, st, want = [], dep.get("status") or {}, int(dep["spec"].get("replicas") or 0)
@@ -268,10 +271,11 @@ def rollout_problems(c: Ctx, m: Dict, image: str, nodes: List[str], fresh: bool)
     return out, seen
 
 
-def member_view(c: Ctx, t: Dict, m: Dict) -> Dict:
-    """One member's state under transition t (the journal's data), with the differences that explain it."""
+def member_view(c: Ctx, t: Dict, m: Dict, live: Optional[Dict] = None) -> Dict:
+    """One member's state under transition t (the journal's data), with the differences that explain it. live: the
+    Deployment as the caller just read it (the state then describes exactly that snapshot)."""
     tid, d = t["id"], t["data"]
-    live = c.kube.get("Deployment", m["name"], m["namespace"])
+    live = live if live is not None else c.kube.get("Deployment", m["name"], m["namespace"])
     if live is None or live["metadata"]["uid"] != m["uid"]:
         return {"member": m["member"], "name": m["name"], "state": "divergent", "why": ["gone or replaced"]}
     obj = _rendered(c.params)[(m["namespace"], m["name"])]["object"]
@@ -287,7 +291,7 @@ def member_view(c: Ctx, t: Dict, m: Dict) -> Dict:
     if last and ann == operation_id(tid, m["member"], last["data"]["mark"]) and not d_to:
         rec = _rolled_receipt(c.record, tid, m["member"])
         if rec:
-            probs, pods = rollout_problems(c, m, d["to_image"], m["nodes"], fresh=True)
+            probs, pods = rollout_problems(c, m, d["to_image"], m["nodes"], fresh=True, dep=live)
             if not probs and sorted(p["uid"] for p in pods) == sorted(p["uid"] for p in rec["pods"]):
                 return dict(base, state="rolled", why=[])
             return dict(base, state="patched", why=probs or ["the pods differ from the member-rolled receipt"])
@@ -386,9 +390,12 @@ def plan_open(c: Ctx, new_params: str, nonce: Optional[str] = None, supersedes: 
     record, problems = c.record, []
     ts = X.image_transitions(X.receipts(record, HELPER))
     fence = X.image_fence(record)
+    parent = (ts.get(supersedes) or {}) if supersedes else {}
     if supersedes:
-        if fence != supersedes:
+        if fence != supersedes or parent.get("state") != "open":
             problems.append(f"{supersedes} is not the open image transition ({fence})")
+        elif os.path.realpath(record.path) != parent["data"]["record_path"]:
+            problems.append(f"the loaded record is not {supersedes}'s canonical record")
     elif fence:
         problems.append(f"image transition {fence} is open: complete it, or plan its successor with --supersedes")
     left = C.unresolved_intents(record.doc)
@@ -405,6 +412,11 @@ def plan_open(c: Ctx, new_params: str, nonce: Optional[str] = None, supersedes: 
         problems.append("the new params differ from the current ones in more than `image`")
     if new["image"] == c.params["image"]:
         problems.append("the new params name the image that is already current")
+    # A REVERSE restores exactly what a forward transition started from (its params file and image); only a reverse
+    # may leave members that were never patched where they are. Every other successor is a forward transition.
+    pd = parent.get("data") or {}
+    kind = "reverse" if (pd.get("kind") == "forward" and new["image"] == pd.get("from_image") and
+                         X.sha256_file(new_path) == pd["from_params"]["sha256"]) else "forward"
     members = []
     rendered = _rendered(c.params)
     created = prepare.created_objects(record)
@@ -420,7 +432,7 @@ def plan_open(c: Ctx, new_params: str, nonce: Optional[str] = None, supersedes: 
         m["nodes"] = sorted({p["spec"].get("nodeName") for p in pods if p["spec"].get("nodeName")})
         at_from = not spec_diff(_spec_with(r["object"], r["index"], c.params["image"]), live["spec"])
         at_to = not spec_diff(_spec_with(r["object"], r["index"], new["image"]), live["spec"])
-        m["start"] = "from" if at_from else "target" if (supersedes and at_to) else "divergent"
+        m["start"] = "from" if at_from else "target" if (kind == "reverse" and at_to) else "divergent"
         if m["start"] == "divergent":
             problems.append(f"{key[1]}: the live spec is neither render (it differs from the current params' render "
                             f"in {spec_diff(_spec_with(r['object'], r['index'], c.params['image']), live['spec'])[:4]})")
@@ -429,7 +441,8 @@ def plan_open(c: Ctx, new_params: str, nonce: Optional[str] = None, supersedes: 
         members.append(m)
     if not members:
         problems.append("no rendered Deployment runs the fixture image")
-    binding = {"run_id": record.run_id, "cluster_uid": record.cluster_uid, "old_record_sha256": record.sha256,
+    binding = {"run_id": record.run_id, "cluster_uid": record.cluster_uid, "kind": kind,
+               "record_path": os.path.realpath(record.path), "old_record_sha256": record.sha256,
                "from_params": {"path": record.doc["params"], "sha256": X.sha256_file(old_path)},
                "to_params": {"path": new_params, "sha256": X.sha256_file(new_path)},
                "from_image": c.params["image"], "to_image": new["image"], "members": members,
@@ -484,8 +497,12 @@ def plan_open_recover(c: Ctx) -> Dict:
     t, problems, actions = _transition(c.record), [], []
     if not t or t["state"] != "prepared":
         problems.append("no prepared image transition waits for its record")
+    elif os.path.realpath(c.record.path) != t["data"]["record_path"]:
+        problems.append(f"the loaded record is not the transition's canonical record {t['data']['record_path']}: "
+                        "an archived copy decides nothing")
     else:
-        d, canonical = t["data"], C.digest(_raw_record(c.record))
+        d = t["data"]
+        canonical = C.digest(C.load_record(d["record_path"]))          # the bound path, whatever was loaded
         touched = [k for m in d["members"] for k, v in _ops(c.record, t["id"], m["member"]).items() if v]
         if canonical == d["new_record_sha256"]:
             actions.append({"journal": "transition-open", "id": t["id"]})
@@ -504,6 +521,8 @@ def open_recover(c: Ctx, reviewed: Dict, reviewed_digest: str) -> Dict:
         raise X.StagingError("; ".join(live["problems"]))
     a = live["actions"][0]
     with X.mutating(c.record, c.kube, HELPER, {"transition": a["id"]}):
+        if X.digest(plan_open_recover(c)) != reviewed_digest:           # again, under the lock
+            raise X.StagingError("the state changed before the lock was taken; re-plan")
         data = {"id": a["id"]}
         if a["journal"] == "transition-open":
             data["record_sha256"] = C.digest(_raw_record(c.record))
@@ -518,7 +537,8 @@ def _open_transition(c: Ctx) -> Tuple[Optional[Dict], List[str]]:
         return None, ["no image transition is open"]
     named = (c.record.doc.get("image_transition") or {}).get("id")
     opened = X.last(X.receipts(c.record, HELPER), "transition-open", id=t["id"])["data"]
-    if named != t["id"] or C.digest(_raw_record(c.record)) != opened["record_sha256"]:
+    if os.path.realpath(c.record.path) != t["data"]["record_path"] or named != t["id"] or \
+            C.digest(_raw_record(c.record)) != opened["record_sha256"]:
         return t, [f"the loaded record is not the one transition {t['id']} published"]
     return t, []
 
@@ -551,17 +571,30 @@ def plan_roll(c: Ctx) -> Dict:
                 problems += headroom_problems(c, m)
             if do == "patch":
                 problems += rollout_problems(c, m, t["data"]["from_image"], m["nodes"], fresh=False)[0]
+            if do == "none":
+                problems += rollout_problems(c, m, t["data"]["to_image"], m["nodes"], fresh=False)[0]
             actions.append({"member": m["member"], "name": m["name"], "namespace": m["namespace"], "uid": m["uid"],
                             "do": do, "generation": v["generation"], "spec_sha256": v["spec_sha256"]})
     return X.new_plan(HELPER, c.record, actions, command="roll", id=t["id"] if t else None, problems=problems)
 
 
-def _patch(c: Ctx, t: Dict, m: Dict) -> Dict:
+def _patch(c: Ctx, t: Dict, m: Dict, reviewed: Dict) -> Dict:
+    """ONE read decides everything: that snapshot must be the reviewed one (generation and spec digest of the plan's
+    action), in state `from` and fully rolled out; its resourceVersion is what the patch tests, so the API server
+    refuses the request if anything changed after this read."""
     tid, d = t["id"], t["data"]
     live = c.kube.get("Deployment", m["name"], m["namespace"])
+    v = member_view(c, t, m, live=live)
+    if v["state"] != "from" or v["generation"] != reviewed["generation"] or v["spec_sha256"] != reviewed["spec_sha256"]:
+        raise X.StagingError(f"{m['name']} is not as reviewed (state {v['state']}, generation {v.get('generation')}, "
+                             f"{v['why'][:3]}); nothing was sent")
+    unready = rollout_problems(c, m, d["from_image"], m["nodes"], fresh=False, dep=live)[0]
+    if unready:
+        raise X.StagingError(f"{m['name']} is not fully rolled out on its current image ({unready[:3]}); nothing "
+                             "was sent")
     expected = copy.deepcopy(live["spec"])
     ctr = expected["template"]["spec"]["containers"][m["index"]]
-    if live["metadata"]["uid"] != m["uid"] or ctr["name"] != m["container"] or ctr["image"] != d["from_image"]:
+    if ctr["name"] != m["container"] or ctr["image"] != d["from_image"]:
         raise X.StagingError(f"{m['name']} is not as planned; nothing was sent")
     ctr["image"] = d["to_image"]
     rv, base = live["metadata"]["resourceVersion"], f"/spec/template/spec/containers/{m['index']}"
@@ -591,8 +624,15 @@ def _wait(c: Ctx, t: Dict, m: Dict) -> Dict:
     obj = _rendered(c.params)[(m["namespace"], m["name"])]["object"]
     limit = WAIT_TARGET_S if int(obj["spec"].get("replicas") or 1) > 1 else WAIT_SINGLE_S
     deadline = c.now() + limit
+    op = _ops(c.record, t["id"], m["member"])["applied"][-1]["data"]          # the patch this rollout belongs to
     while True:
-        probs, pods = rollout_problems(c, m, t["data"]["to_image"], m["nodes"], fresh=True)
+        dep = c.kube.get("Deployment", m["name"], m["namespace"])
+        if dep is None or dep["metadata"]["uid"] != m["uid"] or \
+                C.digest(dep["spec"]) != op["pre"]["expected_spec_sha256"] or \
+                (dep["metadata"].get("annotations") or {}).get(ROLL_ANNOTATION) != \
+                operation_id(t["id"], m["member"], op["mark"]):
+            raise X.StagingError(f"{m['name']}: the object is no longer this patch's post-state; stopped")
+        probs, pods = rollout_problems(c, m, t["data"]["to_image"], m["nodes"], fresh=True, dep=dep)
         if not probs:
             return X.receipt(c.record, HELPER, "member-rolled", {"id": t["id"], "member": m["member"],
                                                                  "name": m["name"], "pods": pods})
@@ -600,6 +640,21 @@ def _wait(c: Ctx, t: Dict, m: Dict) -> Dict:
             raise X.StagingError(f"{m['name']}: the rollout did not verify within {limit} s ({probs[:4]}); stopped: "
                                  "no retry, no rollback; the fence stays")
         c.sleep(POLL_S)
+
+
+def _earlier_problems(c: Ctx, t: Dict, m: Dict) -> List[str]:
+    """Every member before m must still be rolled by this transition (its pods re-verified against its receipt), or,
+    in a reverse, untouched and fully rolled out on the target image."""
+    out = []
+    for e in t["data"]["members"]:
+        if e["member"] >= m["member"]:
+            break
+        v = member_view(c, t, e)
+        if v["state"] == "target":
+            out += rollout_problems(c, e, t["data"]["to_image"], e["nodes"], fresh=False)[0]
+        elif v["state"] != "rolled":
+            out.append(f"the earlier member {e['name']} is {v['state']}: {v['why'][:3]}")
+    return out
 
 
 def roll(c: Ctx, reviewed: Dict, reviewed_digest: str) -> Dict:
@@ -614,12 +669,15 @@ def roll(c: Ctx, reviewed: Dict, reviewed_digest: str) -> Dict:
             m = members[a["member"]]
             if a["do"] in ("verify", "none"):
                 continue
-            again = safety_problems(c, t) + headroom_problems(c, m)       # before EVERY patch, under the lock
-            state = member_view(c, t, m)["state"]
-            if again or state != {"patch": "from", "wait": "patched"}[a["do"]]:
-                raise X.StagingError(f"{m['name']}: not safe to continue ({again[:4] or state}); stopped")
+            # before EVERY patch, under the lock: the safety conditions, the room, and every earlier member still
+            # where this transition left it
+            again = safety_problems(c, t) + headroom_problems(c, m) + _earlier_problems(c, t, m)
+            if again:
+                raise X.StagingError(f"{m['name']}: not safe to continue ({again[:4]}); stopped")
             if a["do"] == "patch":
-                _patch(c, t, m)
+                _patch(c, t, m, a)
+            elif member_view(c, t, m)["state"] != "patched":
+                raise X.StagingError(f"{m['name']} is no longer waiting for its rollout; stopped")
             _wait(c, t, m)
     return {"helper": HELPER, "action": "roll", "id": t["id"], "members": status(c)["members"]}
 
@@ -745,11 +803,17 @@ X.RECONCILERS[VOID_OP] = reconcile_void
 
 def zero_counter_evidence(c: Ctx, t: Dict, fetch: Fetch, api: str) -> Tuple[Dict, List[str]]:
     """What the telemetry gate does not show: the REPLACEMENT processes expose their counters at exactly zero before
-    any traffic. Raw samples of the last ZERO_LOOKBACK_S: the ingress arrival counter of every target (one series, on
-    the new ingress pod), the dispatch counter of every discovered endpoint (exactly the replacement target pods) and
-    the fixture request counter of every replacement target pod. Missing, extra, foreign or non-zero: a problem."""
+    any traffic. For every target, from RAW samples of the last ZERO_LOOKBACK_S:
+      ingress-arrivals   c28_ingress_requests_total: exactly one series, scraped from the new ingress pod;
+      ingress-dispatch   c28_ingress_dispatched_total: exactly one series per discovered endpoint (endpoint_pod) =
+                         exactly the replacement pods of that target, scraped from the new ingress pod;
+      fixture-requests   c28_requests_total: exactly one series with code="200" per replacement pod of that target,
+                         and no series with any other code (another code means a request was already answered).
+    Every series needs at least ZERO_MIN_SAMPLES samples, the newest at most ZERO_MAX_AGE_S old, no gap longer than
+    that, none in the future, and every value exactly 0. The evidence keeps the selectors, every sample with its
+    timestamp and the replacement pods' names and UIDs from the member-rolled receipts."""
     import bounded
-    now, problems, series_out = c.now(), [], []
+    now, problems, checks = c.now(), [], []
     rolled = {m["name"]: _rolled_receipt(c.record, t["id"], m["member"]) for m in t["data"]["members"]}
     names = c.c28.demo.target_names(c.params)
     ingress = [m["name"] for m in t["data"]["members"] if m["namespace"] == c.ns and m["name"] not in names]
@@ -757,30 +821,50 @@ def zero_counter_evidence(c: Ctx, t: Dict, fetch: Fetch, api: str) -> Tuple[Dict
         return {}, ["not every member was rolled by this transition: no zero-counter evidence is possible"]
     ingress_pods = {p["name"] for p in rolled[ingress[0]]["pods"]}
 
-    def read(label: str, metric: str, target: str, by: Optional[str], want: set, scraped: set) -> None:
+    def judge(where: str, vals: List) -> None:
+        try:
+            ts, vs = [float(x[0]) for x in vals], [float(x[1]) for x in vals]
+        except (TypeError, ValueError, IndexError):
+            problems.append(f"{where}: samples that cannot be read")
+            return
+        gaps = [b - a for a, b in zip(ts, ts[1:])]
+        if len(ts) < ZERO_MIN_SAMPLES or ts != sorted(ts) or now - ts[-1] > ZERO_MAX_AGE_S or \
+                ts[-1] - now > ZERO_FUTURE_S or (gaps and max(gaps) > ZERO_MAX_AGE_S):
+            problems.append(f"{where}: {len(ts)} samples, the newest {now - ts[-1] if ts else None} s old: not at "
+                            f"least {ZERO_MIN_SAMPLES} fresh samples without a gap")
+        if not vs or any(v != 0.0 for v in vs):                    # NaN compares unequal: never zero
+            problems.append(f"{where}: not exactly zero in every sample")
+
+    def read(label: str, metric: str, target: str, by: str, want: set, scraped: set, code: bool = False) -> None:
         sel = bounded.target_selector(metric, c.ns, target)
         got: Dict[str, int] = {}
+        kept = []
         for s in bounded._raw(fetch, api, sel, now - ZERO_LOOKBACK_S, now):
             lab, vals = s.get("metric") or {}, s.get("values") or []
-            ident = lab.get(by, "") if by else lab.get("pod", "")
-            got[ident] = got.get(ident, 0) + 1
-            series_out.append({"check": f"{label}/{target}", "labels": {k: lab[k] for k in sorted(lab)},
-                               "samples": len(vals), "first_sample_s": float(vals[0][0]) if vals else None,
-                               "values": sorted({str(v) for _t, v in vals})})
-            if not vals or any(float(v) != 0.0 for _t, v in vals):
-                problems.append(f"{label}/{target} {ident}: not exactly zero in every sample")
+            ident = str(lab.get(by, ""))
+            kept.append({"labels": {k: lab[k] for k in sorted(lab)}, "samples": vals})
             if lab.get("pod") not in scraped:
                 problems.append(f"{label}/{target}: a series of pod {lab.get('pod')}, which is not a replacement pod")
+            if code and lab.get("code") != "200":
+                problems.append(f"{label}/{target} {ident}: a series with code {lab.get('code')!r}: a request was "
+                                "already answered, or the counter is not the one created at start")
+                continue
+            got[ident] = got.get(ident, 0) + 1
+            judge(f"{label}/{target} {ident}", vals)
         if set(got) != want or any(n != 1 for n in got.values()):
             problems.append(f"{label}/{target}: series for {sorted(got)} (x{sorted(set(got.values()))}), expected "
                             f"exactly one each for {sorted(want)}")
+        checks.append({"check": f"{label}/{target}", "selector": sel, "series": kept})
     for tname in names:
         pods = {p["name"] for p in rolled[tname]["pods"]}
-        read("ingress-arrivals", "c28_ingress_requests_total", tname, None, ingress_pods, ingress_pods)
+        read("ingress-arrivals", "c28_ingress_requests_total", tname, "pod", ingress_pods, ingress_pods)
         read("ingress-dispatch", "c28_ingress_dispatched_total", tname, "endpoint_pod", pods, ingress_pods)
-        read("fixture-requests", "c28_requests_total", tname, None, pods, pods)
-    return {"schema": "c28-image-roll-zero-counters/v1", "id": t["id"], "evaluated_at_s": now,
-            "lookback_s": ZERO_LOOKBACK_S, "series": series_out}, problems
+        read("fixture-requests", "c28_requests_total", tname, "pod", pods, pods, code=True)
+    return {"schema": "c28-image-roll-zero-counters/v2", "id": t["id"], "evaluated_at_s": now,
+            "lookback_s": ZERO_LOOKBACK_S, "min_samples": ZERO_MIN_SAMPLES, "max_age_s": ZERO_MAX_AGE_S,
+            "replacements": {name: [{"name": p["name"], "uid": p["uid"]} for p in r["pods"]]
+                             for name, r in sorted(rolled.items())},
+            "checks": checks, "series": sum(len(k["series"]) for k in checks)}, problems
 
 
 REVERSE_LIMIT = ("reverse completion: the old binary creates its counters at the first request, so this installation "
@@ -793,7 +877,7 @@ def _completion(c: Ctx, fetch: Optional[Fetch], api: Optional[str]) -> Tuple[Opt
     t, problems = _open_transition(c)
     if not t or problems:
         return t, {}, problems, {}
-    reverse = bool(t["data"].get("supersedes"))
+    reverse = t["data"]["kind"] == "reverse"
     for m in t["data"]["members"]:
         v = member_view(c, t, m)
         if v["state"] == "target":
@@ -832,10 +916,15 @@ def complete(c: Ctx, reviewed: Dict, reviewed_digest: str, fetch: Optional[Fetch
             raise X.StagingError("; ".join(problems))
         data = {"id": t["id"], **kind}
         if kind["kind"] == "forward":
-            p = os.path.join(c.record.evidence_dir, HELPER, f"zero-counters-{t['id']}.json")
-            data["zero_counters_sha256"] = C.write_json_once(p, evidence)
-            X.receipt(c.record, HELPER, "zero-counters", {"id": t["id"], "file": p, "series": len(evidence["series"]),
-                                                          "sha256": data["zero_counters_sha256"]})
+            # every attempt keeps its own evidence file (an interrupted attempt's stays); the terminal receipt binds
+            # the one that completed
+            folder = os.path.join(c.record.evidence_dir, HELPER)
+            prefix = f"zero-counters-{t['id']}-"
+            n = 1 + len([f for f in (os.listdir(folder) if os.path.isdir(folder) else []) if f.startswith(prefix)])
+            name = f"{prefix}{n:02d}.json"
+            data["zero_counters"] = {"file": name, "sha256": C.write_json_once(os.path.join(folder, name), evidence)}
+            X.receipt(c.record, HELPER, "zero-counters", {"id": t["id"], "attempt": n, **data["zero_counters"],
+                                                          "series": evidence["series"]})
         return X.receipt(c.record, HELPER, "transition-complete", data)
 
 

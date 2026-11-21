@@ -151,6 +151,13 @@ def test_transition_states_and_the_fence(make_record):
     assert X.image_fence(record) == "ir-3-cccccccccccc"
     _journal(record, ("transition-abandoned", {"id": "ir-3-cccccccccccc"}))
     assert X.image_fence(record) is None
+    # an abandoned successor (its record was never published) gives its parent the fence back
+    _journal(record, ("transition-prepared", {"id": "ir-4-dddddddddddd"}), ("transition-open", {"id": "ir-4-dddddddddddd"}),
+             ("transition-prepared", {"id": "ir-5-eeeeeeeeeeee", "supersedes": "ir-4-dddddddddddd"}))
+    assert X.image_fence(record) == "ir-5-eeeeeeeeeeee"
+    _journal(record, ("transition-abandoned", {"id": "ir-5-eeeeeeeeeeee"}))
+    ts = X.image_transitions(X.receipts(record, "imageroll"))
+    assert ts["ir-4-dddddddddddd"]["state"] == "open" and X.image_fence(record) == "ir-4-dddddddddddd"
 
 
 @pytest.mark.parametrize("events,match", [
@@ -160,6 +167,8 @@ def test_transition_states_and_the_fence(make_record):
     ([("transition-prepared", {"id": "a"}), ("transition-open", {"id": "a"}), ("transition-abandoned", {"id": "a"})],
      "does not follow"),
     ([("transition-prepared", {"id": "b", "supersedes": "a"})], "which is not open"),
+    ([("transition-prepared", {"id": "a"}), ("transition-prepared", {"id": "b", "supersedes": "a"})],
+     "which is not open"),
     ([("transition-prepared", {"id": "a"}), ("transition-prepared", {"id": "b"})], "more than one"),
 ])
 def test_an_inconsistent_transition_journal_is_refused(make_record, events, match):

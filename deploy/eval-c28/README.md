@@ -589,7 +589,8 @@ imageroll.py --record R plan-open-recover | plan-void | recover-plan ->  open-re
   replica count and a single-replica member with two.
 - **No retry, no rollback.** A stop leaves the fence in place; a new reviewed `plan-roll` resumes (rolled members are
   re-verified and skipped, a patched member is only waited for). A member whose image changed without this
-  transition's patch is `divergent` and refuses.
+  transition's patch is `divergent` and refuses. The read that precedes a patch must be exactly the reviewed object
+  (generation and spec digest of the plan), and every earlier member must still verify before the next one is touched.
 - **A lost patch.** If the object still shows the old image and the original resourceVersion, the request may still
   commit, so the intent stays unresolved. `void` (under the recovery guard) sends one JSON Patch that tests the
   original UID and resourceVersion and adds `c28.devkuban.com/image-roll-void`; once applied, the lost patch can never
@@ -598,10 +599,18 @@ imageroll.py --record R plan-open-recover | plan-void | recover-plan ->  open-re
 - **Completion.** `complete` requires every member rolled and re-verified in one pass, the structural checks, the
   telemetry gate, and evidence the gate does not give: the replacement processes expose the ingress arrival
   counters, the dispatch counters of every discovered endpoint and the fixture request counters at exactly zero
-  before any traffic (`evidence/imageroll/zero-counters-<id>.json`).
-- **Going back** is a successor transition (`plan-open --supersedes`), never automatic. Its completion needs neither
-  the zero counters nor the gate and records why: an image without the zero-valued counters has none before its first
-  request.
+  before any traffic: per series at least three fresh raw samples without a gap, every value exactly 0, the fixture
+  counters only with `code="200"`. Each attempt keeps its own file (`evidence/imageroll/zero-counters-<id>-<nn>.json`);
+  the terminal receipt names the one that completed.
+- **Going back** is a successor transition (`plan-open --supersedes`), never automatic. It is a REVERSE only when it
+  restores exactly the params file and image a forward transition started from; then members that were never
+  patched may stay as they are, and its completion needs neither the zero counters nor the gate and records why (an
+  image without the zero-valued counters has none before its first request). Every other successor is a forward
+  transition with the full completion criteria. Abandoning a successor whose record was never published returns its
+  parent to open.
+- **A killed executor.** The lock of a process that died inside `open` is released by `recover` with the record that
+  took it (after publication: the kept copy `<record>.before-<id>`); the fence stays, and `open-recover` then decides
+  from the canonical record's path, which the transition binds. An archived copy decides nothing.
 
 The spec comparison is whole-object: a live field the render does not set is ignored only when it holds an
 enumerated server default (`imageroll.DEFAULTS`); every other difference is shown.

@@ -1,5 +1,5 @@
 # Publication is gated on `make verify` returning 0. See scripts/verify.sh and README "Testing".
-.PHONY: setup verify verify-selftest verify-python verify-go precommit-selftest envtest manifests manifests-check chart-check smoke quickstart
+.PHONY: setup verify verify-selftest verify-python verify-go precommit-selftest envtest envtest-python manifests manifests-check chart-check smoke quickstart
 
 setup:
 	@git config core.hooksPath .githooks
@@ -51,3 +51,10 @@ ENVTEST_BIN_DIR ?= $(HOME)/.local/share/kubebuilder-envtest
 envtest:
 	@assets=$$(go run sigs.k8s.io/controller-runtime/tools/setup-envtest@$(SETUP_ENVTEST_VERSION) use $(ENVTEST_K8S_VERSION) --bin-dir "$(ENVTEST_BIN_DIR)" -p path) && \
 	cd k8s-operator && env -u KUBERNETES_SERVICE_HOST -u KUBERNETES_SERVICE_PORT KUBECONFIG=/dev/null KUBEBUILDER_ASSETS="$$assets" ENVTEST_REQUIRED=1 go test -race -count=1 -run Envtest -v ./controllers/
+
+# The evaluation tooling's conditional JSON Patch against the same API server binaries (a throwaway kube-apiserver and
+# etcd on 127.0.0.1, started by the test itself; kubectl comes from the same directory).
+ENVTEST_PYTHON ?= python3
+envtest-python:
+	@assets=$$(go run sigs.k8s.io/controller-runtime/tools/setup-envtest@$(SETUP_ENVTEST_VERSION) use $(ENVTEST_K8S_VERSION) --bin-dir "$(ENVTEST_BIN_DIR)" -p path) && \
+	cd deploy/eval-c28/staging && env -u KUBERNETES_SERVICE_HOST -u KUBERNETES_SERVICE_PORT KUBECONFIG=/dev/null C28_ENVTEST_ASSETS="$$assets" C28_ENVTEST_REQUIRED=1 $(ENVTEST_PYTHON) -m pytest -q -p no:cacheprovider tests/test_json_patch_apiserver.py

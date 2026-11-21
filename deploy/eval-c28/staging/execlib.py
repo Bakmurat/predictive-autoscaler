@@ -236,7 +236,8 @@ def image_transitions(entries: List[Dict]) -> Dict[str, Dict]:
     """{id: {"state", "seq", "data"}} of the image transitions in the imageroll journal, in journal order. States:
     prepared (journalled, the new record not yet proven published), open, complete, abandoned, superseded (a later
     transition-prepared names it in data.supersedes: that successor is then the open one). A completion or an
-    abandonment closes only the transition whose id it names."""
+    abandonment closes only the transition whose id it names; abandoning a successor (its record was never
+    published) gives its parent the state it had, so the parent's fence is never lost."""
     out: Dict[str, Dict] = {}
     for e in entries:
         ev, d = e["event"], e["data"]
@@ -246,7 +247,7 @@ def image_transitions(entries: List[Dict]) -> Dict[str, Dict]:
             out[d["id"]] = {"state": "prepared", "seq": len(out) + 1, "data": d}
             old = d.get("supersedes")
             if old:
-                if out.get(old, {}).get("state") not in ("prepared", "open"):
+                if out.get(old, {}).get("state") != "open":
                     raise StagingError(f"image transition {d['id']} supersedes {old}, which is not open")
                 out[old]["state"] = "superseded"
         elif ev in ("transition-open", "transition-complete", "transition-abandoned"):
@@ -256,6 +257,9 @@ def image_transitions(entries: List[Dict]) -> Dict[str, Dict]:
             if t is None or t["state"] not in want:
                 raise StagingError(f"{ev} for image transition {d['id']} does not follow its journal state")
             t["state"] = ev[len("transition-"):]
+            parent = out.get(t["data"].get("supersedes") or "")
+            if ev == "transition-abandoned" and parent is not None:
+                parent["state"] = "open"                 # only an open transition can be superseded
     return out
 
 

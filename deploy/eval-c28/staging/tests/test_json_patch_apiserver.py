@@ -2,8 +2,8 @@
 server in the same request, and kubectl's refusal is classified as definitive.
 
 Needs the envtest binaries (kube-apiserver, etcd, kubectl in one directory: `make envtest` downloads them to
-~/.local/share/kubebuilder-envtest/k8s/<version>). Set C28_ENVTEST_ASSETS to that directory; without it the test is
-skipped. The API server and etcd are throwaway processes on 127.0.0.1 with their own data directory and a random
+~/.local/share/kubebuilder-envtest/k8s/<version>). Set C28_ENVTEST_ASSETS to that directory (`make envtest-python`
+does); without it the test is skipped, unless C28_ENVTEST_REQUIRED=1 (CI), where it must run. The API server and etcd are throwaway processes on 127.0.0.1 with their own data directory and a random
 token; nothing here can reach a cluster."""
 
 import json
@@ -20,7 +20,9 @@ import common_records as C
 import execlib as X
 
 ASSETS = os.environ.get("C28_ENVTEST_ASSETS", "")
-pytestmark = pytest.mark.skipif(not ASSETS, reason="C28_ENVTEST_ASSETS is not set (the envtest binaries)")
+REQUIRED = os.environ.get("C28_ENVTEST_REQUIRED") == "1"
+pytestmark = pytest.mark.skipif(not ASSETS and not REQUIRED,
+                                reason="C28_ENVTEST_ASSETS is not set (the envtest binaries)")
 OLD = "registry.example/c28-fixture@sha256:" + "1" * 64
 NEW = "registry.example/c28-fixture@sha256:" + "2" * 64
 PATH = "/apis/apps/v1/namespaces/default/deployments/t"
@@ -34,6 +36,8 @@ def _port():
 
 @pytest.fixture(scope="module")
 def api(tmp_path_factory):
+    assert all(os.path.isfile(os.path.join(ASSETS, b)) for b in ("etcd", "kube-apiserver", "kubectl")), \
+        "C28_ENVTEST_REQUIRED=1 but C28_ENVTEST_ASSETS does not hold etcd, kube-apiserver and kubectl"
     d = tmp_path_factory.mktemp("apiserver")
     client, peer, secure, token = _port(), _port(), _port(), secrets.token_hex(16)
     subprocess.run(["openssl", "genrsa", "-out", str(d / "sa.key"), "2048"], check=True, capture_output=True)
