@@ -131,10 +131,11 @@ class Ctx:
 
 # --- the shared fence -------------------------------------------------------------------------------------------------
 
-def fence_problems(c: Ctx, own_run: Optional[str] = None) -> List[str]:
-    """Any generator-like workload in the namespace, by name label or component, a Terminating pod included, or any
-    unresolved intent of this helper or prepare's: refuse. Listings are strict (a failed list is never "none")."""
-    out = []
+def fence_problems(c: Ctx, own_run: Optional[str] = None, image_roll: bool = False) -> List[str]:
+    """Any generator-like workload in the namespace, by name label or component, a Terminating pod included, any
+    unresolved intent of this helper or prepare's, or an open image transition: refuse. Listings are strict (a failed
+    list is never "none"). image_roll: the caller is the image roll itself, checking that no load is present."""
+    out = [] if image_roll else X.image_fence_problems(c.record)
     names = [c.c28.demo.GENERATOR_NAME] + [c.c28.demo.bounded_name(lab) for lab in LABELS]
     for kind in ("StatefulSet", "Job", "Deployment", "Pod", "ConfigMap"):
         for o in c.kube.list(kind, c.ns, strict=True):

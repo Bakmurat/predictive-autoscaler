@@ -225,7 +225,16 @@ def plan(record, kube, drain, *, activation):
                       scale_gap_seconds=SCALE_GAP_DECISION_INTERVALS * identity["decision_interval_seconds"],
                       scale_gap_source=f"{SCALE_GAP_DECISION_INTERVALS} x {identity['cadence_source']}",
                       emergency_last=emergencies["last"], chart_pending=chart["pending"],
-                      leaves_pending=list(LEFT_PENDING), problems=found)
+                      leaves_pending=list(LEFT_PENDING), problems=found, **_image_note(record))
+
+
+def _image_note(record):
+    """An open image transition is a NOTE in a revocation's plans, never a problem: removing the operator's write
+    permission is not fenced by it (execlib.IMAGE_FENCE_EXEMPT); the image fence itself stays as it is."""
+    fence = X.image_fence(record)
+    return {"image_transition": {"open": fence, "note": "not fenced: a revocation removes a permission and touches "
+                                                        "no Deployment; the image fence stays in place"}} if fence \
+        else {}
 
 
 def apply(record, kube, reviewed, reviewed_digest, *, drain, permissions, mono=time.monotonic, sleep=time.sleep,
@@ -373,7 +382,7 @@ def recover_plan(record, kube):
     generic = X.recover_plan(record, kube)
     return X.new_plan(R.HELPER, record, generic["actions"], operation="recover", lock_sha256=generic["lock_sha256"],
                       generic_digest=X.digest(generic), unresolved=generic["unresolved"],
-                      transition=recovery_part(record, generic["lock_sha256"]))
+                      transition=recovery_part(record, generic["lock_sha256"]), **_image_note(record))
 
 
 def recover_apply(record, kube, reviewed, reviewed_digest, *, permissions, fence=F.fence, clock=None):
@@ -424,7 +433,7 @@ def recover_apply(record, kube, reviewed, reviewed_digest, *, permissions, fence
         if proof_digest is not None:
             guard.fresh_revocation = {"binding": "absent", "proof_sha256": proof_digest}
     receipt = X.recover(record, kube, generic, X.digest(generic), guard_factory=R.recovery,
-                        follow_up_guarded=follow)
+                        follow_up_guarded=follow, revocation=True)
     return {"status": "lock-recovered", "fenced": done["fenced"], "settled": done["settled"],
             "receipt": receipt.get("event") if isinstance(receipt, dict) else None,
             "not_done": ["the PredictiveAutoscalers are untouched", "the chart restore to its shadow values"]}

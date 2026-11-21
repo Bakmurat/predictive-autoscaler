@@ -553,6 +553,71 @@ into an in-cluster VictoriaMetrics.
   default full mode of this script, 24-hour segments, the operator and the forecaster (not installed), and any rate
   above the one used.
 
+## Changing the fixture image of an existing installation: `staging/imageroll.py`
+
+`prepare.py` creates objects and never updates them. The fixture image is one digest shared by every rendered
+Deployment that runs it (the two routes in the control namespace, the ingress and the targets), so changing it on an
+existing demonstration installation is its own journalled operation, a **transition**:
+
+```
+imageroll.py --record R status
+imageroll.py --record R plan-open --new-params P [--supersedes ID]   ->  open --plan F --plan-digest D
+imageroll.py --record R plan-roll                                    ->  roll --plan F --plan-digest D
+imageroll.py --record R plan-complete --query-api U                  ->  complete --plan F --plan-digest D --query-api U
+imageroll.py --record R plan-open-recover | plan-void | recover-plan ->  open-recover | void | recover
+```
+
+- **The fence.** `open` first appends `transition-prepared` to the `imageroll` journal, then replaces the record by
+  one that names the new params file (identical except `image`) and carries an `image_transition` block, then
+  appends `transition-open`. From the first receipt until `transition-complete` every other helper is refused at the
+  shared mutation entry (`execlib.mutating`), in recovery follow-ups and, visibly, in its plans; `prepare.py verify`
+  answers `IN_TRANSITION` (exit 5), never PASS. The fence is read from the run's receipts, so loading an archived
+  record does not lift it. One operation is exempt: the ordinary revocation of the operator's replica-write
+  permission (`transition.py revoke` and its reviewed recovery), which removes a permission and touches no
+  Deployment; its plans show the open transition as a note, and its lock, journal and proofs are unchanged. Ids are `ir-<sequence>-<hash over the binding and a nonce>`: a later attempt at the same
+  change never shares an id, and a completion closes only the transition it names.
+- **One member at a time.** Each Deployment gets ONE JSON Patch whose `test` operations (UID, resourceVersion,
+  container name, old image) the API server enforces in the same request, and which writes the operation id into the
+  annotation `c28.devkuban.com/image-roll`. A refusal is recorded as not-applied; an answer is accepted only when it
+  shows the same UID, that annotation, a moved resourceVersion and exactly the expected spec; anything else stays an
+  unresolved intent that keeps the lock. The rollout is then verified before the next member is touched: generation
+  observed, exact counts, one active ReplicaSet on the new image, no pod of an older ReplicaSet left (terminating
+  ones included), every pod's imageID, placement, and the Service's ready endpoints being exactly the new pods.
+- **Safety, every time.** Before every patch and on every resume: the params files the transition bound are still
+  those files (the same bytes are hashed and parsed) and are what this process loaded, no generator-like workload, no restore obligation,
+  no unresolved intent, the structural checks of `prepare.py verify` (both PredictiveAutoscalers in Recommend, empty
+  fault schedules), the reservation gate, the operator's missing replica-write permission (the `permissions.py`
+  proof, in process), Ready nodes, and room for the member's worst case of extra pods. `maxSurge: 0` bounds starting
+  pods, not existing ones: terminating pods overlap their replacements, so a target is budgeted with its whole
+  replica count and a single-replica member with two.
+- **No retry, no rollback.** A stop leaves the fence in place; a new reviewed `plan-roll` resumes (rolled members are
+  re-verified and skipped, a patched member is only waited for). A member whose image changed without this
+  transition's patch is `divergent` and refuses. The read that precedes a patch must be exactly the reviewed object
+  (generation and spec digest of the plan), and every earlier member must still verify before the next one is touched.
+- **A lost patch.** If the object still shows the old image and the original resourceVersion, the request may still
+  commit, so the intent stays unresolved. `void` (under the recovery guard) sends one JSON Patch that tests the
+  original UID and resourceVersion and adds `c28.devkuban.com/image-roll-void`; once applied, the lost patch can never
+  commit and `recover` reconciles it as not-applied. If the original commits first, the void write is refused and
+  the patch is reconciled as done.
+- **Completion.** `complete` requires every member rolled and re-verified in one pass, the structural checks, the
+  telemetry gate, and evidence the gate does not give: the replacement processes expose the ingress arrival
+  counters, the dispatch counters of every discovered endpoint and the fixture request counters at exactly zero
+  before any traffic: per series at least three fresh raw samples without a gap, every value exactly 0, the fixture
+  counters only with `code="200"`. Each attempt keeps its own file (`evidence/imageroll/zero-counters-<id>-<nn>.json`);
+  the terminal receipt names the one that completed.
+- **Going back** is a successor transition (`plan-open --supersedes`), never automatic. It is a REVERSE only when it
+  restores exactly the params file and image a forward transition started from; then members that were never
+  patched may stay as they are, and its completion needs neither the zero counters nor the gate and records why (an
+  image without the zero-valued counters has none before its first request). Every other successor is a forward
+  transition with the full completion criteria. Abandoning a successor whose record was never published returns its
+  parent to open.
+- **A killed executor.** The lock of a process that died inside `open` is released by `recover` with the record that
+  took it (after publication: the kept copy `<record>.before-<id>`); the fence stays, and `open-recover` then decides
+  from the canonical record's path, which the transition binds. An archived copy decides nothing.
+
+The spec comparison is whole-object: a live field the render does not set is ignored only when it holds an
+enumerated server default (`imageroll.DEFAULTS`); every other difference is shown.
+
 ## Restore to the common starting count
 
 ```sh

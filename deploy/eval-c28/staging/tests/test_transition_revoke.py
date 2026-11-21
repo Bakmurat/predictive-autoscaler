@@ -1371,3 +1371,77 @@ def test_a_lock_that_is_gone_during_its_recovery_is_unknown_not_released(world, 
         assert "the stale lock is gone" in R.release_problem(world.record, guard)
         assert R.release_problem(world.record) is None      # asked outside a recovery: there is nothing to release
         open(lock, "wb").write(kept)
+
+
+# --- an open image transition never fences a revocation ----------------------------------------------------------------
+
+FENCE = "ir-1-aaaaaaaaaaaa"
+
+
+def image_transition(world):
+    X.receipt(world.record, X.IMAGEROLL, "transition-prepared", {"id": FENCE})
+    assert X.image_fence(world.record) == FENCE
+
+
+def test_a_revocation_runs_while_an_image_transition_is_open_and_says_so(world):
+    image_transition(world)
+    plan = world.plan()
+    assert plan["problems"] == [] and plan["image_transition"]["open"] == FENCE     # a note, never a problem
+    out = world.apply(plan)
+    assert out["status"] == "permission-revoked" and out["evidence"]["writes_denied"] is True
+    assert world.deleted() == [B1] and not world.lock_held()
+    assert world.events() == ["executor-started", "intent-1", "step-1", "revocation", "executor-finished"]
+    assert X.image_fence(world.record) == FENCE                 # the image fence is untouched...
+    with pytest.raises(X.StagingError, match="is open"):         # ...and still refuses everything else,
+        with X.mutating(world.record, world.kube, "bounded"):
+            raise AssertionError("entered")
+    with pytest.raises(X.StagingError, match="is open"):         # a grant of the same helper included
+        with X.mutating(world.record, world.kube, R.HELPER, {"operation": "grant"}):
+            raise AssertionError("entered")
+
+
+def test_a_fenced_revocation_without_its_proof_still_keeps_the_lock(world):
+    image_transition(world)
+    out = world.apply(permissions=V.proof_reader(world.record, world.identity, kubectl_run(
+        overrides={("update", "deployments.apps", True): "yes"})))
+    assert out["status"] == "unresolved" and out["evidence"]["writes_denied"] is False
+    assert world.lock_held() and out["lock_kept"] is True       # the exemption relaxes nothing but the image fence
+    assert R.unresolved_revocations(world.record) == (["revoke-reh1-1"], None) and X.image_fence(world.record) == FENCE
+
+
+def test_an_interrupted_revocation_is_recovered_while_an_image_transition_is_open(world, capsys, monkeypatch):
+    image_transition(world)
+    crashed(world, capsys, "unproven")
+    before = V.recover_plan(world.record, world.kube)
+    assert before["image_transition"]["open"] == FENCE
+    with pytest.raises(X.StagingError, match="cannot settle everything"):
+        recover(world, before)                                  # the recovery's own rules are unchanged
+    assert world.lock_held()
+    emergency(world, monkeypatch, capsys)
+    plan = V.recover_plan(world.record, world.kube)
+    assert plan["transition"]["problems"] == []
+    failing = V.proof_reader(world.record, world.identity, kubectl_run(
+        overrides={("update", "deployments.apps", True): "yes"}))
+    with pytest.raises(X.StagingError):
+        recover(world, plan, permissions=failing)               # no fresh proof: the lock stays, fence or not
+    assert world.lock_held() and settled(world) == []
+    done = recover(world, V.recover_plan(world.record, world.kube))
+    assert done["status"] == "lock-recovered" and done["settled"] == ["revoke-reh1-1"] and not world.lock_held()
+    assert X.image_fence(world.record) == FENCE                 # recovered, and the image fence is still there
+    assert X.last(X.receipts(world.record, "recover"), "lock-recovered")["data"]["image_transition_open"] == FENCE
+    with pytest.raises(X.StagingError, match="follow-up is refused"):   # any OTHER recovery follow-up stays fenced
+        X.lock_file(world.record) and open(X.lock_file(world.record), "w").write("{}")
+        rp = X.recover_plan(world.record, world.kube)
+        X.recover(world.record, world.kube, rp, X.digest(rp), follow_up=lambda actions: None,
+                  guard_factory=lambda rec, sha: _PassGuard())
+
+
+class _PassGuard:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def release_stale(self):
+        raise AssertionError("released")
