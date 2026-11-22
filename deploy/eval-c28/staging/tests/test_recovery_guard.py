@@ -200,6 +200,8 @@ def _leave_guard(rec, **change):
     (dict(pid=None), "owner record is incomplete"),
     (dict(pid_start=None), "owner record is incomplete"),
     (dict(pid_start=""), "owner record is incomplete"),
+    (dict(pid_start="not-a-start-time"), "owner record is incomplete"),
+    (dict(pid_start="12 34"), "owner record is incomplete"),
     (dict(pid=0), "owner record is incomplete"),
     (dict(pid=-5), "owner record is incomplete"),
     (dict(pid="77"), "owner record is incomplete"),
@@ -317,8 +319,106 @@ def test_the_stale_lock_is_validated_before_anything_is_journalled_or_published(
 def test_the_coordination_descriptor_is_not_inherited_by_child_commands(rec):
     _path, sha = stale_lock(rec)
     with C.recovery_guard(rec, SCOPE, sha) as g:
-        out = subprocess.run([sys.executable, "-c", f"import os; os.fstat({g._fd})"], capture_output=True, text=True)
+        # close_fds=False: nothing but the descriptor's own close-on-exec flag keeps it from the child
+        out = subprocess.run([sys.executable, "-c", f"import os; os.fstat({g._fd})"], capture_output=True, text=True,
+                             close_fds=False)
         assert out.returncode != 0 and "Bad file descriptor" in out.stderr
+        assert os.get_inheritable(g._fd) is False
+
+
+# --- entry that fails part of the way ---------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_a_recoverer_that_cannot_describe_itself_journals_and_publishes_nothing(rec, monkeypatch, stale):
+    path, sha = stale_lock(rec)
+    left = _leave_guard(rec) if stale else None
+    real = C.process_start
+    monkeypatch.setattr(C, "process_start", lambda pid: None if pid == os.getpid() else real(pid))
+    with pytest.raises(C.StagingError, match="cannot describe itself verifiably"):
+        C.recovery_guard(rec, SCOPE, sha).__enter__()
+    monkeypatch.undo()
+    assert guard_of(rec) == left and recover_receipts(rec) == [] and os.path.exists(path)
+    with C.recovery_guard(rec, SCOPE, sha):                # and the coordination lock was released
+        pass
+
+
+def test_a_recovery_whose_identity_can_no_longer_be_read_owns_nothing(rec, monkeypatch):
+    path, sha = stale_lock(rec)
+    g = C.recovery_guard(rec, SCOPE, sha)
+    g.__enter__()
+    mine = guard_of(rec)
+    monkeypatch.setattr(C, "process_start", lambda pid: None)
+    assert g.owns() is False
+    nameless = dict(mine, pid_start=None)                  # and "no start time" never equals "no start time"
+    with open(path + ".recovery", "w") as fh:
+        fh.write(json.dumps(nameless, sort_keys=True))
+    assert g.owns() is False
+    with pytest.raises(C.StagingError, match="only by the recovery that holds the guard"):
+        g.release_stale()
+    g.__exit__(None, None, None)
+    assert guard_of(rec) == nameless and os.path.exists(path)  # neither the record nor the lock was touched
+
+
+def _fail_directory_sync(monkeypatch, error, before=None):
+    real = C.os.fsync
+
+    def fsync(fd):
+        import stat
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            if before:
+                before()
+            raise error
+        return real(fd)
+    monkeypatch.setattr(C.os, "fsync", fsync)
+
+
+@pytest.mark.parametrize("stale", [False, True])
+@pytest.mark.parametrize("error", [OSError(5, "I/O error"), KeyboardInterrupt()])
+def test_a_failure_after_the_record_is_published_does_not_strand_it(rec, monkeypatch, stale, error):
+    path, sha = stale_lock(rec)
+    if stale:
+        _leave_guard(rec)
+    _fail_directory_sync(monkeypatch, error)
+    with pytest.raises(type(error)):
+        C.recovery_guard(rec, SCOPE, sha).__enter__()
+    monkeypatch.undo()
+    assert guard_of(rec) is None and os.path.exists(path)  # this attempt's own record is withdrawn, the lock stays
+    assert not [n for n in os.listdir(os.path.dirname(path)) if ".tmp-" in n]
+    with C.recovery_guard(rec, SCOPE, sha) as g:           # a live process that never entered blocks nobody
+        assert guard_of(rec)["token"] == g.token
+    assert [r["event"] for r in recover_receipts(rec)] == (["recovery-guard-takeover"] if stale else [])
+
+
+def test_withdrawing_after_a_failed_entry_never_removes_somebody_elses_record(rec, monkeypatch):
+    path, sha = stale_lock(rec)
+    foreign = {}
+
+    def replaced_meanwhile():                              # between our publication and our failure
+        foreign.update(dict(guard_of(rec), token="e" * 32))
+        with open(path + ".recovery", "w") as fh:
+            fh.write(json.dumps(foreign, sort_keys=True))
+    _fail_directory_sync(monkeypatch, OSError(5, "I/O error"), before=replaced_meanwhile)
+    with pytest.raises(OSError):
+        C.recovery_guard(rec, SCOPE, sha).__enter__()
+    monkeypatch.undo()
+    assert guard_of(rec) == foreign and os.path.exists(path)
+
+
+def test_an_interruption_right_after_the_coordination_lock_was_taken_releases_it(rec, monkeypatch):
+    _path, sha = stale_lock(rec)
+    real = C.fcntl.flock
+
+    def flock(fd, op):
+        real(fd, op)                                       # acquired...
+        raise KeyboardInterrupt()                          # ...and interrupted before anything else
+    monkeypatch.setattr(C.fcntl, "flock", flock)
+    g = C.recovery_guard(rec, SCOPE, sha)
+    with pytest.raises(KeyboardInterrupt):
+        g.__enter__()
+    monkeypatch.undo()
+    assert g._fd is None and guard_of(rec) is None
+    with C.recovery_guard(rec, SCOPE, sha):                # nobody is locked out
+        pass
 
 
 # --- the owner check that mutation-lock recovery uses too ---------------------------------------------------------------
@@ -334,6 +434,8 @@ def test_an_owner_is_terminated_only_on_evidence(monkeypatch):
     assert C.owner_state(_owner()) == ("alive", f"its executor (pid {os.getpid()}) is still running")
     assert C.owner_state(_owner(pid=dead_pid())) == ("terminated", "executor gone")
     assert C.owner_state(_owner(pid_start="1"))[0] == "terminated"     # this pid, started at another time: reused
+    for malformed in ("not-a-start-time", "12x", " 12", "-5", "1.5"):  # never "another start time, so terminated"
+        assert C.owner_state(_owner(pid_start=malformed))[0] == "unknown", malformed
     for incomplete in (_owner(pid=None), _owner(pid_start=None), _owner(host=None), _owner(boot_id=None),
                        _owner(pid=0), _owner(pid="1"), _owner(pid_start=5), {}):
         assert C.owner_state(incomplete)[0] == "unknown" and C.owner_terminated(incomplete)[0] is False

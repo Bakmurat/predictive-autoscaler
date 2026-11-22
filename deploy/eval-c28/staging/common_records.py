@@ -476,7 +476,8 @@ def owner_state(body: Mapping) -> Tuple[str, str]:
     boot, or a /proc that cannot be read is unknown, never terminated."""
     import socket
     pid, start, host, boot = body.get("pid"), body.get("pid_start"), body.get("host"), body.get("boot_id")
-    if not (isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and isinstance(start, str) and start
+    if not (isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+            and isinstance(start, str) and start.isdigit()       # /proc's start time: clock ticks, digits only
             and isinstance(host, str) and host and isinstance(boot, str) and boot):
         return "unknown", "its owner record is incomplete (pid, start time, host, boot id): nothing can be proven"
     if host != socket.gethostname():
@@ -566,17 +567,18 @@ class recovery_guard:
     def __enter__(self):
         if not os.path.exists(self.path):
             raise StagingError("no mutation lock is held: nothing to recover")
-        fd = os.open(self.coordination, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o640)
+        # The descriptor is this object's from the moment it exists: whatever interrupts the acquisition or anything
+        # after it, the one cleanup below closes it (which is what releases the flock).
+        self._fd = os.open(self.coordination, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o640)
+        body = None
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            os.close(fd)
-            raise StagingError("another recovery is in progress") from None
-        self._fd = fd
-        try:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                raise StagingError("another recovery is in progress") from None
             self._validate_lock()                         # before anything is written to this run's journal
             stale = self._stale_guard()
-            body = self._body()
+            body = self._body()                           # this recoverer's own identity, complete, or a refusal
             if stale is not None:                         # durable BEFORE the guard changes hands
                 append_receipt(self.rec, "recover", "recovery-guard-takeover", {
                     "scope": self.scope, "lock_sha256": self.sha, "stale_guard": stale,
@@ -584,9 +586,23 @@ class recovery_guard:
             self._publish(body, replace=stale is not None)
             self.token = body["token"]
         except BaseException:
+            if body is not None:                          # still under the flock: only what THIS attempt published
+                self._withdraw(body)
             self._unlock()
             raise
         return self
+
+    def _withdraw(self, body: Dict) -> None:
+        """After a failed entry: remove the guard record only if it is exactly the one this attempt published (a
+        failure after the link or the rename, e.g. while syncing the directory, would otherwise leave a record of a
+        LIVE process that never entered recovery, and nobody could recover any more). Anything else stays."""
+        try:
+            with open(self.guard) as fh:
+                on_disk = json.load(fh)
+            if isinstance(on_disk, dict) and all(on_disk.get(k) == body[k] for k in ("token", "pid", "pid_start")):
+                os.unlink(self.guard)
+        except (OSError, ValueError):
+            pass
 
     def _validate_lock(self) -> None:
         if sha256_file(self.path) != self.sha:
@@ -627,11 +643,18 @@ class recovery_guard:
                 "owner": {k: body.get(k) for k in ("token", "pid", "pid_start", "host", "boot_id", "at")}}
 
     def _body(self) -> Dict:
+        """This recovery's guard record. It is only made when this process can describe itself verifiably: the same
+        check that will later judge the record must read it back, now, as a live process."""
         import socket
-        return {"schema": GUARD_SCHEMA, "token": secrets.token_hex(16), "pid": os.getpid(),
+        body = {"schema": GUARD_SCHEMA, "token": secrets.token_hex(16), "pid": os.getpid(),
                 "pid_start": process_start(os.getpid()), "host": socket.gethostname(), "boot_id": _boot_id(),
                 "at": utc_now(), "scope": self.scope, "run_id": self.rec["run_id"],
                 "cluster_uid": self.rec["cluster_uid"], "record_sha256": digest(self.rec), "lock_sha256": self.sha}
+        state, why = owner_state(body)
+        if state != "alive":
+            raise StagingError(f"this recoverer cannot describe itself verifiably ({why}): nothing was journalled "
+                               "or published")
+        return body
 
     def _publish(self, body: Dict, replace: bool) -> None:
         tmp = f"{self.guard}.tmp-{body['token']}"
@@ -658,7 +681,8 @@ class recovery_guard:
 
     def owns(self) -> bool:
         """Whether the guard record is still this recovery's."""
-        if self.token is None:
+        mine = process_start(os.getpid())
+        if self.token is None or not mine:                # an identity that cannot be read owns nothing
             return False
         try:
             with open(self.guard) as fh:
@@ -666,7 +690,7 @@ class recovery_guard:
         except (OSError, ValueError):
             return False
         return isinstance(body, dict) and body.get("token") == self.token and body.get("pid") == os.getpid() \
-            and body.get("pid_start") == process_start(os.getpid())
+            and body.get("pid_start") == mine
 
     def _unlock(self) -> None:
         if self._fd is not None:
