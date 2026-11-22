@@ -470,20 +470,107 @@ def test_a_group_that_is_not_proven_empty_is_a_problem_within_a_bound(tmp_path, 
     assert time.time() - t0 < 5 and p.poll() is None                     # and it was NOT signalled
 
 
-def test_a_process_naming_this_runs_kubeconfig_is_ended_and_reported(tmp_path, spawn):
+def test_a_process_naming_this_runs_kubeconfig_is_reported_and_never_signalled(tmp_path, spawn, monkeypatch):
+    """A command line is not ownership: the search only reports, and what it reports prevents a pass."""
     s = smoke(tmp_path)
     assert s.strays() == []
-    made = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)", "--kubeconfig", s.kcfg],
-                            start_new_session=True)
+    made = [subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)", *args], start_new_session=True)
+            for args in (["--kubeconfig", s.kcfg], ["--kubeconfig", s.kcfg + ".another-run"])]
     try:
-        other = spawn.sleeper()                                          # names nothing of this run
+        spawn.sleeper()                                                  # names nothing of this run
+        sent = []
+        monkeypatch.setattr(os, "kill", lambda pid, sig: sent.append(pid))
+        monkeypatch.setattr(os, "killpg", lambda pgid, sig: sent.append(pgid))
         problems = s.reap()
-        assert problems == ["1 process(es) naming this run's kubeconfig were still running at cleanup"]
-        assert made.wait(timeout=10) == -signal.SIGKILL and other.poll() is None
+        assert problems == [f"processes naming this run's kubeconfig are still running (not signalled: a command "
+                            f"line is not ownership): {sorted(p.pid for p in made)}"]
+        assert sent == [] and all(p.poll() is None for p in made)
     finally:
-        if made.poll() is None:
-            made.kill()
-            made.wait()
+        monkeypatch.undo()
+        for p in made:
+            p.kill()
+            p.wait()
+
+
+@pytest.mark.parametrize("error,problem", [
+    (PermissionError(13, "denied"), "1 process(es) could not be read: the search is incomplete and proves no absence"),
+    (OSError(5, "EIO"), "1 process(es) could not be read: the search is incomplete and proves no absence"),
+    (FileNotFoundError(2, "gone"), None), (ProcessLookupError(3, "gone"), None)])
+def test_a_process_that_cannot_be_read_makes_the_search_incomplete_and_one_that_ended_does_not(tmp_path, spawn,
+                                                                                               monkeypatch, error,
+                                                                                               problem):
+    s = smoke(tmp_path)
+    target = spawn.sleeper()
+    real = open
+
+    def opening(path, *a, **kw):
+        if path == f"/proc/{target.pid}/cmdline":
+            raise error
+        return real(path, *a, **kw)
+    monkeypatch.setattr(RS, "open", opening, raising=False)
+    assert s.strays() == ([problem] if problem else [])
+    monkeypatch.undo()
+    monkeypatch.setattr(os, "listdir", lambda path: (_ for _ in ()).throw(PermissionError(13, "denied")))
+    [only] = s.strays()
+    monkeypatch.undo()
+    assert only.startswith("the process table could not be listed (PermissionError)")
+
+
+def test_one_groups_signalling_error_does_not_stop_the_cleanup_of_the_others(tmp_path, spawn, monkeypatch):
+    s = smoke(tmp_path)
+    (p1, first), (p2, second) = spawn.group(), spawn.group()
+    s.known = [first, "not an identity", second]
+    monkeypatch.setattr(RS, "REAP_S", 0.3)
+    s.strays = lambda: ["the search ran"]
+
+    def killpg(pgid, sig):
+        if pgid == first["pgid"]:
+            raise PermissionError(1, "not permitted")
+        return _KILLPG(pgid, sig)
+    monkeypatch.setattr(os, "killpg", killpg)
+    problems = s.reap()
+    monkeypatch.undo()
+    assert problems == [f"Helm's recorded group {first['pgid']} could not be signalled (PermissionError)"] * 2 + [
+        f"Helm's recorded group {first['pgid']} is alive after the cleanup: not proven empty",
+        "Helm's recorded group ? is unknown after the cleanup: not proven empty", "the search ran"]
+    p2.wait(timeout=10)
+    assert s.group(second) == "empty" and p1.poll() is None             # the second WAS cleaned up
+    s.known, s.strays = [second], (lambda: (_ for _ in ()).throw(RuntimeError("x")))
+    assert s.reap() == ["the search for processes of this run failed (RuntimeError)"]
+    s.owned = lambda ident: (_ for _ in ()).throw(RuntimeError("x"))
+    s.known, s.strays = [first, second], (lambda: [])
+    assert s.reap() == [f"Helm's recorded group {i['pgid']} could not be cleaned up (RuntimeError)"
+                        for i in (first, second)]
+
+
+@pytest.mark.parametrize("scenario", ["executor_dies", "interrupt_rollback"])
+def test_a_scenarios_resume_signal_needs_ownership_again(tmp_path, monkeypatch, scenario):
+    """The barrier's SIGCONT goes through the same proof as its SIGSTOP: ownership lost in between fails the scenario."""
+    s = smoke(tmp_path)
+    ident, live, sent = {"pgid": 424242, "pid": 424242}, [True], []
+    helper = argparse.Namespace(pid=999, kill=lambda: None, wait=lambda: live.__setitem__(0, False))
+    s.start = lambda *a, **kw: helper
+    s.plan = lambda cmd: ({"plan": "p"}, {"problems": []})
+    s.release = lambda *a, **kw: (0, {"plan": "p"}, "")
+    s.load = lambda path: {"actions": [{"observed": "unresolved", "why": "it is alive"}]}
+    s.apply = lambda *a, **kw: (1, {}, "")
+    s.status = lambda *a, **kw: {"lock_held": True}
+    s.wait_for = lambda what, cond, *a, **kw: ident
+    s.owned = lambda i: 424242 if live[0] else None                      # the proof holds until the executor is gone
+    s.group = lambda i: "alive"
+    s.wait_rolled_out = lambda: None
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: sent.append((pgid, sig)))
+    with pytest.raises(RS.Failed, match="scenario setup failed: Helm's recorded group is alive, not a live group"):
+        s.executor_dies("D") if scenario == "executor_dies" else s.interrupt_rollback({}, "E", 2, 3)
+    assert sent == [(424242, signal.SIGSTOP)]
+
+
+def test_only_two_places_send_a_signal_to_a_group_and_none_to_a_process():
+    src = open(os.path.join(SMOKE, "release_kind.py")).read()
+    driver = src.replace(RS.FINALIZE_CHILD, "")                          # the child's own SIGKILL to ITSELF apart
+    assert driver.count("os.killpg(") == 2 and driver.count("os.kill(") == 0
+    assert "pgid = self.owned(ident)" in driver.split("def signal_group")[1].split("os.killpg(")[0]
+    assert "pgid = self.owned(ident)" in driver.split("def reap")[1].split("os.killpg(")[0]
 
 
 def test_the_driver_reaps_even_when_a_scenario_fails_and_refuses_a_stage_of_another_scenario(tmp_path, monkeypatch):

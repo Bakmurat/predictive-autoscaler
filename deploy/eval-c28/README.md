@@ -763,8 +763,9 @@ never as a pass. A signal goes to a Helm group only when it is proven to be the 
 its recorded start time on this host and boot: a group id can be reused, so liveness alone authorizes nothing) and
 never to the driver's own group, session or parent. Every path ends in the same cleanup: the helper processes are ended
 first, then their last launch receipts are read, then each recorded group is ended and must be seen empty within a
-bound, and no process naming the run's kubeconfig may be left; a journal that cannot be read, a group that is not
-proven empty or a stray process is a failed run, whatever the scenario showed. Mutating Helm commands are counted from
+bound; finally the process table is searched for anything naming the run's kubeconfig, which is only reported, never
+signalled (a command line is not ownership). A journal that cannot be read, a signal that could not be sent, a group
+that is not proven empty, an incomplete search or a process it finds is a failed run, whatever the scenario showed. Mutating Helm commands are counted from
 the helper's journal and compared with the release's history.
 
 What the driver writes about cluster objects is their identity only (uid, resourceVersion, generation, owners,

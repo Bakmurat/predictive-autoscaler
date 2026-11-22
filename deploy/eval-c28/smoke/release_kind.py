@@ -639,41 +639,43 @@ class Scenarios(Smoke):
         return ident
 
     def strays(self):
-        """Processes whose command line names THIS run's kubeconfig (the work directory's; no other run has it), apart
-        from this driver and its ancestors: for example a Helm the helper launched but did not get to journal. Each
-        is ended by its PID. Returns the problems: finding one is already a problem."""
+        """DIAGNOSTIC ONLY: nothing is signalled here. Returns the problems of a search of the process table for
+        processes whose command line holds THIS run's kubeconfig path, apart from this driver and its ancestors (for
+        example a Helm the helper launched but did not get to journal). A matching command line is not proof of
+        ownership, so such a process is named, not ended, and it prevents a pass. A process that cannot be read
+        makes the search incomplete, which proves no absence and also prevents a pass; a process that ended during
+        the search does not."""
         needle, skip, pid = os.fsencode(self.kcfg), set(), os.getpid()
         while pid > 1 and pid not in skip:
             skip.add(pid)
             pid = _ppid(pid)
-
-        def found():
-            out = []
-            for name in os.listdir("/proc"):
-                if name.isdigit() and int(name) not in skip:
-                    try:
-                        with open(f"/proc/{name}/cmdline", "rb") as fh:
-                            if needle in fh.read():
-                                out.append(int(name))
-                    except OSError:
-                        pass
-            return sorted(out)
-        first = found()
-        for pid in first:
+        try:
+            names = [n for n in os.listdir("/proc") if n.isdigit() and int(n) not in skip]
+        except OSError as e:
+            return [f"the process table could not be listed ({type(e).__name__}): nothing proves that no process of "
+                    f"this run is left"]
+        found, unreadable = [], 0
+        for name in names:
             try:
-                os.kill(pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-        end = time.time() + REAP_S
-        while first and found() and time.time() < end:
-            time.sleep(0.1)
-        left = found() if first else []
-        return ([f"{len(first)} process(es) naming this run's kubeconfig were still running at cleanup"] if first
-                else []) + ([f"processes naming this run's kubeconfig could not be ended: {left}"] if left else [])
+                with open(f"/proc/{name}/cmdline", "rb") as fh:
+                    if needle in fh.read():
+                        found.append(int(name))
+            except (FileNotFoundError, ProcessLookupError):  # it ended during the search
+                continue
+            except OSError:
+                unreadable += 1
+        problems = []
+        if found:
+            problems.append(f"processes naming this run's kubeconfig are still running (not signalled: a command "
+                            f"line is not ownership): {sorted(found)}")
+        if unreadable:
+            problems.append(f"{unreadable} process(es) could not be read: the search is incomplete and proves no "
+                            f"absence")
+        return problems
 
     def reap(self):
         """Every path ends here. Returns the problems; an EMPTY list is the proof that no helper process, no Helm
-        group this run knows of and no process naming this run's kubeconfig is left. The order matters: the helpers
+        group this run knows of and no process naming this run's kubeconfig is left (that last search only reports). The order matters: the helpers
         are ended FIRST (a living helper can still launch Helm and publish its receipt), then their final launch
         receipts are read, then each recorded group is ended, if it is provably ours, and must be seen empty within
         a bound. Nothing here stops the rest of the cleanup, and anything unproven is a problem, never a pass."""
@@ -689,21 +691,31 @@ class Scenarios(Smoke):
             self.launched()
         except Exception as e:                              # the identities already known are still cleaned up
             problems.append(f"the helper's journal could not be read for the cleanup ({type(e).__name__})")
-        for ident in self.known:
-            pgid = self.owned(ident)
-            if pgid is not None:
-                for sig in (signal.SIGCONT, signal.SIGKILL):
-                    try:
-                        os.killpg(pgid, sig)
-                    except ProcessLookupError:
-                        pass
-            end = time.time() + REAP_S
-            while self.group(ident) != "empty" and time.time() < end:
-                time.sleep(0.1)
-            if self.group(ident) != "empty":
-                problems.append(f"Helm's recorded group {ident.get('pgid') if isinstance(ident, dict) else '?'} is "
-                                f"{self.group(ident)} after the cleanup: not proven empty")
-        return problems + self.strays()
+        for ident in self.known:                            # one group's trouble does not stop the others
+            label = ident.get("pgid") if isinstance(ident, dict) else "?"
+            try:
+                pgid = self.owned(ident)
+                if pgid is not None:
+                    for sig in (signal.SIGCONT, signal.SIGKILL):
+                        try:
+                            os.killpg(pgid, sig)
+                        except ProcessLookupError:
+                            pass
+                        except OSError as e:
+                            problems.append(f"Helm's recorded group {label} could not be signalled "
+                                            f"({type(e).__name__})")
+                end = time.time() + REAP_S
+                while self.group(ident) != "empty" and time.time() < end:
+                    time.sleep(0.1)
+                if self.group(ident) != "empty":
+                    problems.append(f"Helm's recorded group {label} is {self.group(ident)} after the cleanup: not "
+                                    f"proven empty")
+            except Exception as e:
+                problems.append(f"Helm's recorded group {label} could not be cleaned up ({type(e).__name__})")
+        try:
+            return problems + self.strays()
+        except Exception as e:
+            return problems + [f"the search for processes of this run failed ({type(e).__name__})"]
 
     def expect_outcome(self, classification, step, op):
         st = self.status()
@@ -818,7 +830,7 @@ class Scenarios(Smoke):
         if rc == 0 or not self.status()["lock_held"]:
             raise Failed("recovery released the lock while Helm's group was alive")
         self.ok("while Helm's group lives, recovery answers unresolved (\"it is alive\") and keeps the lock")
-        os.killpg(ident["pgid"], signal.SIGCONT)
+        self.signal_group(ident, signal.SIGCONT)           # only while it is still provably the recorded group
         self.wait_for("Helm's group to end by itself", lambda: self.group(ident) == "empty", 420, every=1)
         self.wait_for("revision 2 deployed", lambda: (self.revision(2) or {}).get("status") == "deployed", 60)
         self.wait_rolled_out()
@@ -860,7 +872,7 @@ class Scenarios(Smoke):
         p.wait()
         if self.group(ident) != "alive":
             raise Failed("scenario setup failed: Helm's group did not survive its executor")
-        os.killpg(ident["pgid"], signal.SIGCONT)
+        self.signal_group(ident, signal.SIGCONT)           # only while it is still provably the recorded group
         self.wait_for("Helm's group to end by itself", lambda: self.group(ident) == "empty", 420, every=1)
         self.wait_for(f"revision {revision} deployed",
                       lambda: (self.revision(revision) or {}).get("status") == "deployed", 60)
