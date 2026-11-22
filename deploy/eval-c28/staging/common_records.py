@@ -516,8 +516,11 @@ def lock_dir_state(rec: Mapping) -> Dict:
                                                             it is never removed, by a helper or by hand, because a
                                                             removed file would let two recoverers hold "the" flock
     Each lock and guard is reported with what its owner record proves (owner_state: alive, terminated or unknown).
-    Entries of another cluster are named and not judged. Everything else is unexpected: an interrupted guard
-    publication (.tmp-...), a name of no known form, a directory, a symbolic link, a file that cannot be read.
+    Entries of another cluster that are regular files of one of these three forms are named and not judged.
+    Everything else is unexpected, whichever cluster its name carries: an interrupted guard publication (.tmp-...),
+    a name of no known form, a directory, a symbolic link, an entry that cannot be examined. The lock directory
+    itself must be a real directory: a symbolic link in its place, dangling or not, is a problem and is not followed;
+    only a path that does not exist at all counts as "never used yet".
 
     `clear` is True only when there is no lock, no recovery guard, nothing unexpected and no problem; coordination
     files do not prevent it. It says nothing about open intents or obligations: those are each helper's own status."""
@@ -526,12 +529,18 @@ def lock_dir_state(rec: Mapping) -> Dict:
         raise StagingError("the record needs lock_dir (absolute) and cluster_uid")
     out = {"schema": "c28-lock-dir/v1", "lock_dir": root, "cluster_uid": uid, "exists": True, "locks": [],
            "recovery_guards": [], "coordination": [], "other_clusters": [], "unexpected": [], "problems": []}
+    names = []
     try:
-        names = sorted(os.listdir(root))
+        mode = os.lstat(root).st_mode                          # the directory ITSELF: a link is not followed either
+        if _stat.S_ISLNK(mode):
+            out["problems"].append("the lock directory is a symbolic link (dangling or not): it is not looked into")
+        elif not _stat.S_ISDIR(mode):
+            out["problems"].append("the lock directory's path is not a directory")
+        else:
+            names = sorted(os.listdir(root))
     except FileNotFoundError:
-        names, out["exists"] = [], False                       # never used yet: the first lock creates it
+        out["exists"] = False                                  # never used yet: the first lock creates it
     except OSError as e:
-        names = []
         out["problems"].append(f"the lock directory could not be listed ({type(e).__name__})")
 
     def owner(path: str) -> Dict:
@@ -560,22 +569,21 @@ def lock_dir_state(rec: Mapping) -> Dict:
         except OSError as e:
             out["unexpected"].append({"name": name, "why": f"it could not be examined ({type(e).__name__})"})
             continue
-        if m is not None and m.group("uid") != uid:            # exactly as lock_path() writes it
-            out["other_clusters"].append(name)
-        elif not _stat.S_ISREG(mode):
+        rest = m.group("rest") if m is not None else None
+        if not _stat.S_ISREG(mode):                            # the type and the form first, whoever's entry it is
             out["unexpected"].append({"name": name, "why": "it is not a regular file"})
-        elif m is None:
-            out["unexpected"].append({"name": name, "why": "its name is not of a known form"})
-        elif m.group("rest") == "":
-            out["locks"].append({"name": name, **owner(path)})
-        elif m.group("rest") == ".recovery":
-            out["recovery_guards"].append({"name": name, **owner(path)})
-        elif m.group("rest") == ".recovery.flock":
-            out["coordination"].append(name)
-        elif m.group("rest").startswith(".recovery.tmp-"):
+        elif rest is not None and rest.startswith(".recovery.tmp-"):
             out["unexpected"].append({"name": name, "why": "a recovery guard's publication was interrupted"})
-        else:
+        elif rest not in ("", ".recovery", ".recovery.flock"):
             out["unexpected"].append({"name": name, "why": "its name is not of a known form"})
+        elif m.group("uid") != uid:                            # exactly as lock_path() writes it; a KNOWN form only
+            out["other_clusters"].append(name)
+        elif rest == "":
+            out["locks"].append({"name": name, **owner(path)})
+        elif rest == ".recovery":
+            out["recovery_guards"].append({"name": name, **owner(path)})
+        else:
+            out["coordination"].append(name)
     out["clear"] = not (out["locks"] or out["recovery_guards"] or out["unexpected"] or out["problems"])
     return out
 

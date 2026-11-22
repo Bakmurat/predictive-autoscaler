@@ -793,8 +793,11 @@ classified:
 | `<uid>-<scope>.lock` | a mutation lock: an execution is running or crashed (the helper's `recover-plan`); reported with what its owner record proves (alive, terminated, unknown) |
 | `<uid>-<scope>.lock.recovery` | a recovery in progress or interrupted; the next recovery takes a dead recoverer's guard over |
 | `<uid>-<scope>.lock.recovery.flock` | the recoverers' flock file. **Expected and permanent** once a recovery has run. It is never deleted to make the directory look empty: a deleted file would let two recoverers each hold "the" flock |
-| entries of another cluster | named, not judged |
-| anything else | unexpected (an interrupted guard publication, an unknown name, a directory, a symbolic link): explain it before a run |
+| a regular file of one of these three forms with another cluster's uid | named, not judged |
+| anything else, whichever cluster its name carries | unexpected (an interrupted guard publication, an unknown name, a directory, a symbolic link): explain it before a run |
+
+The lock directory itself must be a real directory: a symbolic link in its place, dangling or not, is reported as a
+problem and not followed; only a path that does not exist at all counts as never used.
 
 `clear` means no lock, no recovery guard, nothing unexpected and nothing unreadable. It says nothing about open
 intents or obligations: those are each helper's own `status`.

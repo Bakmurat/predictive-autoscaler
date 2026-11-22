@@ -125,6 +125,37 @@ def test_another_clusters_entries_are_named_and_not_judged(rec):
     assert spelled["coordination"] == [] and LOCK + ".recovery.flock" in spelled["other_clusters"]
 
 
+@pytest.mark.parametrize("make,why", [
+    (lambda p: os.mkdir(p + "-evaluation.lock"), "it is not a regular file"),
+    (lambda p: os.symlink("/etc/hostname", p + "-evaluation.lock.recovery.flock"), "it is not a regular file"),
+    (lambda p: open(p + "-evaluation.lock.unknown", "w").close(), "its name is not of a known form"),
+    (lambda p: open(p + "-evaluation.lock.recovery.tmp-abc", "w").close(),
+     "a recovery guard's publication was interrupted"),
+])
+def test_another_clusters_name_exempts_only_a_regular_file_of_a_known_form(rec, make, why):
+    make(os.path.join(rec["lock_dir"], OTHER))
+    state = C.lock_dir_state(rec)
+    assert not state["clear"] and state["other_clusters"] == [] and [u["why"] for u in state["unexpected"]] == [why]
+
+
+@pytest.mark.parametrize("kind", ["link to a directory", "dangling link", "a file"])
+def test_the_lock_directory_itself_must_be_a_real_directory(tmp_path, kind):
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / (LOCK + ".recovery.flock")).write_text("")
+    path = tmp_path / "locks"
+    if kind == "link to a directory":
+        os.symlink(real, path)
+    elif kind == "dangling link":
+        os.symlink(tmp_path / "nowhere", path)
+    else:
+        path.write_text("")
+    state = C.lock_dir_state({"lock_dir": str(path), "cluster_uid": UID})
+    assert not state["clear"] and state["exists"] and state["coordination"] == []        # and it was not looked into
+    assert state["problems"] == (["the lock directory's path is not a directory"] if kind == "a file" else
+                                 ["the lock directory is a symbolic link (dangling or not): it is not looked into"])
+
+
 def test_what_cannot_be_read_is_never_clear(rec, monkeypatch):
     put(rec, LOCK + ".recovery.flock", "")
     real = os.listdir
@@ -134,7 +165,11 @@ def test_what_cannot_be_read_is_never_clear(rec, monkeypatch):
     assert not state["clear"] and state["problems"] == ["the lock directory could not be listed (PermissionError)"]
     lstat = os.lstat
     monkeypatch.setattr(os, "lstat", lambda p: (_ for _ in ()).throw(PermissionError(13, "x")))
-    state = C.lock_dir_state(rec)
+    state = C.lock_dir_state(rec)                                        # the directory itself cannot be examined
+    assert not state["clear"] and state["problems"] == ["the lock directory could not be listed (PermissionError)"]
+    monkeypatch.setattr(os, "lstat", lambda p: lstat(p) if p == rec["lock_dir"] else (_ for _ in ()).throw(
+        PermissionError(13, "x")))
+    state = C.lock_dir_state(rec)                                        # one entry cannot be examined
     monkeypatch.setattr(os, "lstat", lstat)
     assert not state["clear"] and state["unexpected"] == [
         {"name": LOCK + ".recovery.flock", "why": "it could not be examined (PermissionError)"}]
