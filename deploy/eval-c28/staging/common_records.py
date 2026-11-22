@@ -518,6 +518,13 @@ class exclusive_lock:
                                 "boot_id": _boot_id(), "at": utc_now(clock)}, sort_keys=True)
 
     def __enter__(self):
+        # A lock whose owner record could not later be judged would be unrecoverable by design: an executor that
+        # cannot describe itself verifiably (its own record must read back, now, as a live process) takes no lock
+        # and so mutates nothing.
+        state, why = owner_state(json.loads(self.body))
+        if state != "alive":
+            raise StagingError(f"this executor cannot describe itself verifiably ({why}): the mutation lock is not "
+                               "taken and nothing is changed")
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         try:
             fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
