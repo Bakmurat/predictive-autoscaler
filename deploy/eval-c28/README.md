@@ -778,6 +778,27 @@ lab cluster's timing or admission webhooks, or the application after an upgrade.
 locally can be used through an owned local registry for development (`REGISTRY_MIRROR`); a qualifying run uses
 published digests.
 
+## Before a run: the shared lock directory (`staging/lockdir.py`)
+
+Every helper that changes the cluster takes the one mutation lock in the record's `lock_dir`. A pre-flight looks at
+that directory with
+
+    staging/lockdir.py --record R status        # exit 0: clear; exit 3: not clear; read the whole answer
+
+It is read-only: it creates, writes, locks and removes nothing, and follows no symbolic link. Every entry is
+classified:
+
+| Entry | Meaning |
+|---|---|
+| `<uid>-<scope>.lock` | a mutation lock: an execution is running or crashed (the helper's `recover-plan`); reported with what its owner record proves (alive, terminated, unknown) |
+| `<uid>-<scope>.lock.recovery` | a recovery in progress or interrupted; the next recovery takes a dead recoverer's guard over |
+| `<uid>-<scope>.lock.recovery.flock` | the recoverers' flock file. **Expected and permanent** once a recovery has run. It is never deleted to make the directory look empty: a deleted file would let two recoverers each hold "the" flock |
+| entries of another cluster | named, not judged |
+| anything else | unexpected (an interrupted guard publication, an unknown name, a directory, a symbolic link): explain it before a run |
+
+`clear` means no lock, no recovery guard, nothing unexpected and nothing unreadable. It says nothing about open
+intents or obligations: those are each helper's own `status`.
+
 ## Restore to the common starting count
 
 ```sh

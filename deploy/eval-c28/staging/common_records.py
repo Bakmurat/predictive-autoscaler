@@ -38,6 +38,7 @@ import json
 import os
 import re
 import secrets
+import stat as _stat
 import subprocess
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -497,6 +498,86 @@ def owner_terminated(body: Mapping) -> (bool, str):
     """Whether the process that wrote an owner record has CERTAINLY ended (owner_state == "terminated")."""
     state, why = owner_state(body)
     return state == "terminated", why
+
+
+LOCK_DIR_BODY_BYTES = 65536
+_LOCK_NAME = re.compile(r"^(?P<uid>[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})-(?P<scope>[A-Za-z0-9_]+)\.lock"
+                        r"(?P<rest>.*)$")
+
+
+def lock_dir_state(rec: Mapping) -> Dict:
+    """READ-ONLY classification of EVERY entry of the record's shared lock directory, for a pre-flight. Nothing is
+    created, written, locked or removed, and no file is followed through a symbolic link.
+
+    For this record's cluster an entry is one of:
+      lock            <uid>-<scope>.lock                    a mutation lock: an execution is running or crashed
+      recovery guard  <uid>-<scope>.lock.recovery           a recovery in progress or interrupted
+      coordination    <uid>-<scope>.lock.recovery.flock     the recoverers' flock file. It is EXPECTED and PERMANENT:
+                                                            it is never removed, by a helper or by hand, because a
+                                                            removed file would let two recoverers hold "the" flock
+    Each lock and guard is reported with what its owner record proves (owner_state: alive, terminated or unknown).
+    Entries of another cluster are named and not judged. Everything else is unexpected: an interrupted guard
+    publication (.tmp-...), a name of no known form, a directory, a symbolic link, a file that cannot be read.
+
+    `clear` is True only when there is no lock, no recovery guard, nothing unexpected and no problem; coordination
+    files do not prevent it. It says nothing about open intents or obligations: those are each helper's own status."""
+    root, uid = rec.get("lock_dir"), rec.get("cluster_uid")
+    if not isinstance(root, str) or not os.path.isabs(root) or not isinstance(uid, str) or not uid:
+        raise StagingError("the record needs lock_dir (absolute) and cluster_uid")
+    out = {"schema": "c28-lock-dir/v1", "lock_dir": root, "cluster_uid": uid, "exists": True, "locks": [],
+           "recovery_guards": [], "coordination": [], "other_clusters": [], "unexpected": [], "problems": []}
+    try:
+        names = sorted(os.listdir(root))
+    except FileNotFoundError:
+        names, out["exists"] = [], False                       # never used yet: the first lock creates it
+    except OSError as e:
+        names = []
+        out["problems"].append(f"the lock directory could not be listed ({type(e).__name__})")
+
+    def owner(path: str) -> Dict:
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                raw = os.read(fd, LOCK_DIR_BODY_BYTES + 1)
+            finally:
+                os.close(fd)
+            body = json.loads(raw.decode("utf-8")) if len(raw) <= LOCK_DIR_BODY_BYTES else None
+        except (OSError, ValueError):
+            body = None
+        if not isinstance(body, dict):
+            return {"owner": "unknown", "why": "its owner record could not be read as one JSON object"}
+        state, why = owner_state(body)
+        said = {k: (body[k] if isinstance(body[k], int) else body[k][:120])       # what the record says of itself
+                for k in ("run_id", "holder", "scope", "pid", "host", "at")
+                if isinstance(body.get(k), (str, int)) and not isinstance(body.get(k), bool)}
+        return {"owner": state, "why": why, **said}
+
+    for name in names:
+        path = os.path.join(root, name)
+        m = _LOCK_NAME.match(name)
+        try:
+            mode = os.lstat(path).st_mode
+        except OSError as e:
+            out["unexpected"].append({"name": name, "why": f"it could not be examined ({type(e).__name__})"})
+            continue
+        if m is not None and m.group("uid") != uid:            # exactly as lock_path() writes it
+            out["other_clusters"].append(name)
+        elif not _stat.S_ISREG(mode):
+            out["unexpected"].append({"name": name, "why": "it is not a regular file"})
+        elif m is None:
+            out["unexpected"].append({"name": name, "why": "its name is not of a known form"})
+        elif m.group("rest") == "":
+            out["locks"].append({"name": name, **owner(path)})
+        elif m.group("rest") == ".recovery":
+            out["recovery_guards"].append({"name": name, **owner(path)})
+        elif m.group("rest") == ".recovery.flock":
+            out["coordination"].append(name)
+        elif m.group("rest").startswith(".recovery.tmp-"):
+            out["unexpected"].append({"name": name, "why": "a recovery guard's publication was interrupted"})
+        else:
+            out["unexpected"].append({"name": name, "why": "its name is not of a known form"})
+    out["clear"] = not (out["locks"] or out["recovery_guards"] or out["unexpected"] or out["problems"])
+    return out
 
 
 class exclusive_lock:
