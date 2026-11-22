@@ -71,10 +71,13 @@ INSTANCE = f"app.kubernetes.io/instance={RELEASE}"
 FORECASTER = f"{RELEASE}-predictive-autoscaler-forecaster"
 ROLES = ("operator", "forecaster", "trainer")
 OP_LABEL = "c28.devkuban.com/release-op"
-# What a release snapshot holds: every namespaced kind the chart renders, EXCEPT Secrets, which are never fetched
-# (their metadata comes from c28-secretmeta).
-KINDS = ("deployments", "replicasets", "pods", "services", "endpointslices", "configmaps", "serviceaccounts", "roles",
-         "rolebindings", "networkpolicies", "persistentvolumeclaims")
+# What a release snapshot holds: EVERY object the installed chart renders, whatever its namespace or scope (the
+# identities come from the pinned Helm's offline rendering), anything else that carries the release's instance label,
+# and the objects the cluster generates for the release's workloads. Secrets are never fetched: their uid and
+# resourceVersion come from c28-secretmeta.
+GENERATED = ("replicaset.apps", "pod", "endpointslice.discovery.k8s.io")
+DEPLOYMENT = f"Deployment/{CONTROL_NS}/{FORECASTER}"
+REAP_S = 20                                # the bound of every wait in the cleanup
 # Fragments of what Helm prints on success: none of it may be in any file of the work directory.
 HELM_OUTPUT = ("has been upgraded", "Happy Helming", "Rollback was a success", "REVISION:", "LAST DEPLOYED:")
 Failed = RK.Failed
@@ -111,6 +114,20 @@ sys.exit(release.main(sys.argv[2:]))
 """
 
 
+def okey(o):
+    """An object's key in a snapshot: kind, namespace ("-" for a cluster-scoped object) and name."""
+    m = o["metadata"]
+    return f"{o['kind']}/{m.get('namespace') or '-'}/{m['name']}"
+
+
+def _ppid(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as fh:
+            return int(fh.read().rpartition(")")[2].split()[1])
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
 class Smoke(RK.Smoke):
     def __init__(self, a):
         super().__init__(a)
@@ -119,6 +136,8 @@ class Smoke(RK.Smoke):
         self.variant = VARIANTS[a.scenario]
         self.flags = os.path.join(self.work, "shim-flags")
         self.procs = []                                    # helper processes this driver started and must reap
+        self.known = []                                    # every Helm group identity read from the journal so far
+        self._ids = None                                   # the rendered identities of the installed release
 
     def log(self, text):
         print(f"{time.strftime('%H:%M:%SZ', time.gmtime())} release-smoke: {text}", flush=True)
@@ -225,20 +244,84 @@ class Smoke(RK.Smoke):
         return v.lstrip("v")
 
     # --- observation, independent of the helper -----------------------------------------------------------------------
+    def identities(self):
+        """Kind, API group, namespace and name of every document the INSTALLED chart renders with the installed values
+        (the pinned Helm, offline). The rendering stays in memory and is never shown; only these identities are kept.
+        The helper's own plan refuses an upgrade whose rendering differs in anything but the forecaster's Deployment,
+        so the upgraded release has the same inventory."""
+        if self._ids is None:
+            chart = self.load(os.path.join(self.work, "chart-installed.json"))
+            values = os.path.join(self.work, "evidence-demo", "release-staging.yaml")
+            p = self.run([self.helm, "template", RELEASE, chart["dir"], "--namespace", CONTROL_NS, "-f", values,
+                          "--kube-version", self.kube_version()], check=False)
+            if p.returncode != 0:
+                raise Failed(f"helm template of the installed chart: exit {p.returncode}")    # its output is not shown
+            try:
+                ids = sorted(({"kind": d["kind"], "group": d["apiVersion"].rpartition("/")[0],
+                               "namespace": d["metadata"].get("namespace"), "name": d["metadata"]["name"]}
+                              for d in yaml.safe_load_all(p.stdout) if d),
+                             key=lambda i: (i["kind"], i["namespace"] or "", i["name"]))
+            except (yaml.YAMLError, KeyError, TypeError, AttributeError):
+                raise Failed("helm template of the installed chart gave a document without an identity") from None
+            if not ids or len({json.dumps(i, sort_keys=True) for i in ids}) != len(ids):
+                raise Failed("the installed chart's rendering is empty or names an object twice")
+            self.write("release-identities.json", ids)
+            self._ids = ids
+        return self._ids
+
+    @staticmethod
+    def archived(o):
+        """What of an object reaches a FILE: its identity and the counters the comparison reads. No spec, no data, no
+        labels or annotations, no environment values: nothing an object could carry a credential in."""
+        m = o["metadata"]
+        out = {"uid": m.get("uid"), "resourceVersion": m.get("resourceVersion"), "generation": m.get("generation"),
+               "owners": sorted(str(r.get("uid")) for r in m.get("ownerReferences") or [])}
+        if o.get("kind") == "Pod":
+            out["containers"] = [[c.get("name"), c.get("containerID"), c.get("restartCount")]
+                                 for c in (o.get("status") or {}).get("containerStatuses") or []]
+        if o.get("kind") == "Deployment":
+            ctrs = (((o.get("spec") or {}).get("template") or {}).get("spec") or {}).get("containers") or []
+            out["containers"] = [{"name": c.get("name"), "image": c.get("image"),
+                                  "env_names": [e.get("name") for e in c.get("env") or []]} for c in ctrs]
+        return out
+
     def snapshot(self, name):
-        """The release's objects as the cluster holds them. Secrets are not fetched."""
-        doc = {}
-        for kind in KINDS:
-            for o in self.kj("-n", CONTROL_NS, "get", kind, "-l", INSTANCE)["items"]:
-                doc[f"{kind}/{o['metadata']['name']}"] = o
-        for kind in ("endpointslices", "replicasets", "pods"):       # owned objects do not all carry the label
-            for o in self.kj("-n", CONTROL_NS, "get", kind)["items"]:
-                doc.setdefault(f"{kind}/{o['metadata']['name']}", o)
-        self.write(name, doc)
+        """The release's objects as the cluster holds them:
+          - every rendered identity, fetched by its own kind, namespace and name (cluster-scoped objects and objects
+            of other namespaces included; one that is missing fails the run); a Secret only through the metadata
+            reader (uid and resourceVersion);
+          - every further object of those kinds that carries the release's instance label, in any namespace;
+          - the ReplicaSets, pods and EndpointSlices of the control namespace (owned objects carry no such label).
+        The objects are returned for the comparison and stay in memory; the file holds `archived()` of each."""
+        doc, kinds = {}, []
+        for i in self.identities():
+            ns = i["namespace"] or CONTROL_NS
+            if i["kind"] == "Secret":
+                meta = self.secret_meta(i["name"], namespace=ns)
+                if not meta.get("found"):
+                    raise Failed(f"the rendered Secret {ns}/{i['name']} was not found by the metadata reader")
+                o = {"kind": "Secret", "metadata": {"name": i["name"], "namespace": ns, "uid": meta["uid"],
+                                                    "resourceVersion": meta["resourceVersion"]}}
+            else:
+                res = i["kind"].lower() + (f".{i['group']}" if i["group"] else "")
+                if res not in kinds:
+                    kinds.append(res)
+                p = self.k("-n", ns, "get", res, i["name"], "-o", "json", check=False)
+                if p.returncode != 0:
+                    raise Failed(f"the rendered {i['kind']} {i['namespace'] or '-'}/{i['name']} is not in the cluster")
+                o = json.loads(p.stdout)
+            doc[okey(o)] = o
+        for res in kinds:                                    # anything else that claims to belong to the release
+            for o in self.kj("get", res, "-A", "-l", INSTANCE)["items"]:
+                doc.setdefault(okey(o), o)
+        for res in GENERATED:                                # owned objects do not all carry the label
+            for o in self.kj("-n", CONTROL_NS, "get", res)["items"]:
+                doc.setdefault(okey(o), o)
+        self.write(name, {k: self.archived(o) for k, o in sorted(doc.items())})
         return doc
 
-    def secret_meta(self, name, *label_keys):
-        argv = [self.meta, "--kubeconfig", self.kcfg, "--context", self.ctx, "--namespace", CONTROL_NS, "--name", name]
+    def secret_meta(self, name, *label_keys, namespace=CONTROL_NS):
+        argv = [self.meta, "--kubeconfig", self.kcfg, "--context", self.ctx, "--namespace", namespace, "--name", name]
         for k in label_keys:
             argv += ["--label-key", k]
         return json.loads(self.run(argv, env={"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "")}
@@ -344,13 +427,13 @@ class Smoke(RK.Smoke):
     def forecaster_family(doc):
         """The objects that necessarily change with the forecaster's pod template: its ReplicaSets, pods and
         EndpointSlices (found by ownership and by the Service name)."""
-        dep = doc[f"deployments/{FORECASTER}"]
-        rs = {k for k, o in doc.items() if k.startswith("replicasets/") and any(
+        dep = doc[DEPLOYMENT]
+        rs = {k for k, o in doc.items() if o.get("kind") == "ReplicaSet" and any(
             r.get("uid") == dep["metadata"]["uid"] for r in o["metadata"].get("ownerReferences") or [])}
         rs_uids = {doc[k]["metadata"]["uid"] for k in rs}
-        pods = {k for k, o in doc.items() if k.startswith("pods/") and any(
+        pods = {k for k, o in doc.items() if o.get("kind") == "Pod" and any(
             r.get("uid") in rs_uids for r in o["metadata"].get("ownerReferences") or [])}
-        slices = {k for k, o in doc.items() if k.startswith("endpointslices/") and
+        slices = {k for k, o in doc.items() if o.get("kind") == "EndpointSlice" and
                   (o["metadata"].get("labels") or {}).get("kubernetes.io/service-name") == FORECASTER}
         return rs | pods | slices
 
@@ -360,7 +443,7 @@ class Smoke(RK.Smoke):
         the one environment entry added (or, for a rollback, removed) on the same object, its ReplicaSets, pods and
         EndpointSlices changed, and EVERY other object of the release the same object with the same resourceVersion."""
         fam = Smoke.forecaster_family(before) | Smoke.forecaster_family(after)
-        key = f"deployments/{FORECASTER}"
+        key = DEPLOYMENT
         rest_b, rest_a = set(before) - fam - {key}, set(after) - fam - {key}
         if rest_b != rest_a:
             raise Failed(f"objects appeared or vanished: +{sorted(rest_a - rest_b)[:5]} -{sorted(rest_b - rest_a)[:5]}")
@@ -384,7 +467,7 @@ class Smoke(RK.Smoke):
         if a["metadata"]["uid"] != b["metadata"]["uid"] or got != expected:
             raise Failed("the forecaster Deployment changed in more than its image and the one environment entry")
         for k in sorted(rest_b):
-            if k.startswith("pods/"):
+            if before[k].get("kind") == "Pod":
                 ids = lambda o: [(s["name"], s.get("containerID"), s.get("restartCount"))  # noqa: E731
                                  for s in o["status"].get("containerStatuses") or []]
                 if ids(before[k]) != ids(after[k]) or not ids(after[k]):
@@ -432,7 +515,7 @@ class Smoke(RK.Smoke):
             raise Failed(f"the history after the rollback: {hist}")
         self.wait_rolled_out()
         back = self.snapshot("A-cluster-after-rollback.json")
-        key = f"deployments/{FORECASTER}"
+        key = DEPLOYMENT
         if back[key]["spec"] != before[key]["spec"] or back[key]["metadata"]["uid"] != before[key]["metadata"]["uid"]:
             raise Failed("after the rollback the forecaster Deployment is not the installed one")
         self.ok("after the rollback the forecaster Deployment's spec is the installed one again",
@@ -444,7 +527,6 @@ class Smoke(RK.Smoke):
         _rc, st, _err = self.release("status")
         if st["lock_held"] or st["open_intents"]:
             raise Failed(f"the helper is not at rest: {st}")
-        self.no_helm_output()
         self.ok("two mutating Helm commands, three revisions, no lock, no open intent")
 
     def same_tls(self, a, b, what):
@@ -499,19 +581,52 @@ class Scenarios(Smoke):
                 raise Failed(f"scenario setup failed: {what} was not reached within {seconds} s")
             time.sleep(every)
 
-    def launch(self, n):
-        """The process-group identity of the n-th mutating Helm command, from the helper's journal."""
+    def launched(self):
+        """The process-group identities of the mutating Helm commands, from the helper's journal. Each is remembered,
+        so the cleanup knows it even when the journal cannot be read later."""
         found = [e["data"]["identity"] for e in self.journal() if e["event"] == "helm-launch"]
+        for ident in found:
+            if ident not in self.known:
+                self.known.append(ident)
+        return found
+
+    def launch(self, n):
+        """The process-group identity of the n-th mutating Helm command."""
+        found = self.launched()
         return found[n - 1] if len(found) >= n else None
 
     def group(self, ident):
+        """LIVENESS of a recorded group: "empty" | "alive" | "unknown". It is not ownership: `alive` is also the
+        answer while other processes occupy a reused group id."""
         import procgroup
-        return procgroup.group_state(ident)
+        try:
+            return procgroup.group_state(ident)
+        except Exception:                                   # a malformed identity proves nothing
+            return "unknown"
+
+    def owned(self, ident):
+        """The recorded group's id when a signal to it is justified, else None. A group id can be reused, so the
+        recorded LEADER must exist with the recorded start time on this host and boot and lead its own group; and
+        the group is never the driver's own, its session's, its parent's, init's or 0."""
+        import procgroup
+        try:
+            pgid, pid = int(ident["pgid"]), int(ident["pid"])
+            now = procgroup.identity_of(pid)
+            mine = {0, 1, os.getpid(), os.getpgid(0), os.getsid(0), os.getppid(), os.getpgid(os.getppid())}
+        except (KeyError, TypeError, ValueError, OSError):
+            return None
+        if pgid != pid or pgid in mine or now is None or \
+                any(now.get(k) != ident.get(k) for k in ("pid", "pgid", "start", "host", "boot_id")):
+            return None
+        return pgid
 
     def signal_group(self, ident, sig):
-        if self.group(ident) != "alive" or ident["pgid"] in (os.getpgid(0), os.getpid(), 0, 1):
-            raise Failed(f"scenario setup failed: Helm's recorded group is {self.group(ident)}, not alive")
-        os.killpg(ident["pgid"], sig)
+        """The ONLY place a scenario signals a Helm group."""
+        pgid = self.owned(ident)
+        if pgid is None:
+            raise Failed(f"scenario setup failed: Helm's recorded group is {self.group(ident)}, not a live group "
+                         f"this run's helper launched")
+        os.killpg(pgid, sig)
 
     def revision(self, n):
         return next((h for h in self.status()["history"] if h["revision"] == n), None)
@@ -519,23 +634,76 @@ class Scenarios(Smoke):
     def progressed(self, launch_no, revision):
         """Helm's n-th command has been released, its revision is in the history, and its group is alive."""
         ident = self.launch(launch_no)
-        if ident is None or self.revision(revision) is None or self.group(ident) != "alive":
+        if ident is None or self.revision(revision) is None or self.owned(ident) is None:
             return None
         return ident
 
+    def strays(self):
+        """Processes whose command line names THIS run's kubeconfig (the work directory's; no other run has it), apart
+        from this driver and its ancestors: for example a Helm the helper launched but did not get to journal. Each
+        is ended by its PID. Returns the problems: finding one is already a problem."""
+        needle, skip, pid = os.fsencode(self.kcfg), set(), os.getpid()
+        while pid > 1 and pid not in skip:
+            skip.add(pid)
+            pid = _ppid(pid)
+
+        def found():
+            out = []
+            for name in os.listdir("/proc"):
+                if name.isdigit() and int(name) not in skip:
+                    try:
+                        with open(f"/proc/{name}/cmdline", "rb") as fh:
+                            if needle in fh.read():
+                                out.append(int(name))
+                    except OSError:
+                        pass
+            return sorted(out)
+        first = found()
+        for pid in first:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        end = time.time() + REAP_S
+        while first and found() and time.time() < end:
+            time.sleep(0.1)
+        left = found() if first else []
+        return ([f"{len(first)} process(es) naming this run's kubeconfig were still running at cleanup"] if first
+                else []) + ([f"processes naming this run's kubeconfig could not be ended: {left}"] if left else [])
+
     def reap(self):
-        """Every error path ends here: no helper process and no Helm group this driver knows of is left running."""
-        for e in self.journal():
-            if e["event"] == "helm-launch" and self.group(e["data"]["identity"]) == "alive":
+        """Every path ends here. Returns the problems; an EMPTY list is the proof that no helper process, no Helm
+        group this run knows of and no process naming this run's kubeconfig is left. The order matters: the helpers
+        are ended FIRST (a living helper can still launch Helm and publish its receipt), then their final launch
+        receipts are read, then each recorded group is ended, if it is provably ours, and must be seen empty within
+        a bound. Nothing here stops the rest of the cleanup, and anything unproven is a problem, never a pass."""
+        problems = []
+        for p in self.procs:
+            try:
+                if p.poll() is None:
+                    p.kill()
+                p.wait(timeout=REAP_S)
+            except Exception as e:
+                problems.append(f"helper process {getattr(p, 'pid', '?')} could not be ended ({type(e).__name__})")
+        try:
+            self.launched()
+        except Exception as e:                              # the identities already known are still cleaned up
+            problems.append(f"the helper's journal could not be read for the cleanup ({type(e).__name__})")
+        for ident in self.known:
+            pgid = self.owned(ident)
+            if pgid is not None:
                 for sig in (signal.SIGCONT, signal.SIGKILL):
                     try:
-                        os.killpg(e["data"]["identity"]["pgid"], sig)
+                        os.killpg(pgid, sig)
                     except ProcessLookupError:
                         pass
-        for p in self.procs:
-            if p.poll() is None:
-                p.kill()
-            p.wait()
+            end = time.time() + REAP_S
+            while self.group(ident) != "empty" and time.time() < end:
+                time.sleep(0.1)
+            if self.group(ident) != "empty":
+                problems.append(f"Helm's recorded group {ident.get('pgid') if isinstance(ident, dict) else '?'} is "
+                                f"{self.group(ident)} after the cleanup: not proven empty")
+        return problems + self.strays()
 
     def expect_outcome(self, classification, step, op):
         st = self.status()
@@ -594,11 +762,10 @@ class Scenarios(Smoke):
             raise Failed(f"the upgrade's intent was not reconciled as rolled back: {rec1}")
         self.ok("the guarded rollback of the failed upgrade applied under the retained lock; reconciled-1 rolled-back")
         self.wait_rolled_out()
-        key = f"deployments/{FORECASTER}"
+        key = DEPLOYMENT
         if self.snapshot("B-cluster-after.json")[key]["spec"] != before[key]["spec"]:
             raise Failed("after the rollback the forecaster Deployment is not the installed one")
         self.at_rest(2, 3, "B")
-        self.no_helm_output()
 
     # --- C: pending upgrade (Helm killed), guarded rollback -------------------------------------------------------------
     def C(self):
@@ -627,7 +794,6 @@ class Scenarios(Smoke):
         self.ok("the guarded rollback from `pending-upgrade` applied with the real Helm", f"revision {out['data']['post']['revision']}")
         self.wait_rolled_out()
         self.at_rest(2, 3, "C")
-        self.no_helm_output()
 
     # --- D and I: the executor dies, Helm finishes ----------------------------------------------------------------------
     def executor_dies(self, tag):
@@ -671,7 +837,6 @@ class Scenarios(Smoke):
         self.ok("after Helm finished: recovery reconciles the upgrade as done from the history and the storage "
                 "metadata, and releases the lock")
         self.at_rest(1, 2, "D")
-        self.no_helm_output()
 
     def I(self):  # noqa: E743
         self.guard()
@@ -871,21 +1036,30 @@ def main(argv=None):
     a = ap.parse_args(argv)
     a.query_api = ""
     s = Scenarios(a)
+    rc = 0
     try:
         for stage in a.stages:
             s.log(f"stage {stage}")
             if stage != "install" and stage != a.scenario:
                 raise Failed(f"stage {stage} does not belong to scenario {a.scenario}")
             getattr(s, stage)()
+            if stage != "install":
+                s.no_helm_output()                         # after EVERY scenario
     except Failed as e:
         s.log(f"FAIL: {e}")
-        return 1
+        rc = 1
     finally:
         try:
-            s.reap()                                       # no helper process and no Helm group is left behind
-        finally:
-            s.write("checks.json", s.checks)
-    return 0
+            problems = s.reap()                            # no helper process and no Helm group is left behind
+        except Exception as e:
+            problems = [f"the cleanup itself failed ({type(e).__name__})"]
+        for problem in problems:
+            s.log(f"FAIL: cleanup: {problem}")
+        if not problems:
+            s.ok("cleanup: the helper processes ended, every recorded Helm group proven empty, no process of this "
+                 "run left", f"{len(s.known)} recorded group(s)")
+        s.write("checks.json", s.checks)
+    return 1 if problems else rc
 
 
 if __name__ == "__main__":

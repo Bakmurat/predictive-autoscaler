@@ -747,7 +747,7 @@ cluster:
 
 | Scenario | What it shows |
 |---|---|
-| A | upgrade, then rollback: `applied` twice; the operation label and the storage UID through the real metadata reader; from the cluster itself every object of the release except the forecaster's Deployment, ReplicaSets, pods and EndpointSlices keeps its uid and resourceVersion, untouched pods keep their containers, and the Deployment differs in the image and the one environment entry only; the TLS Secret's UID and resourceVersion and the certificate served by the NEW forecaster pod are unchanged (a port-forward to that pod, a fresh connection); the three permission proofs |
+| A | upgrade, then rollback: `applied` twice; the operation label and the storage UID through the real metadata reader; from the cluster itself every object the installed chart renders (cluster-scoped objects and objects of other namespaces included; a Secret by its metadata only) except the forecaster's Deployment, ReplicaSets, pods and EndpointSlices keeps its uid and resourceVersion, untouched pods keep their containers, and the Deployment differs in the image and the one environment entry only; the TLS Secret's UID and resourceVersion and the certificate served by the NEW forecaster pod are unchanged (a port-forward to that pod, a fresh connection); the three permission proofs |
 | B | a failed upgrade (a digest that does not exist, a short timeout): `failed`, the lock kept, nothing retried; the guarded rollback |
 | C | Helm's process group is killed (from the journalled identity, once the pending revision is in the history and the group is alive): `unresolved`; the guarded rollback from `pending-upgrade` |
 | D | the executor is killed while Helm, held by SIGSTOP, is alive: recovery refuses ("it is alive"); after SIGCONT Helm finishes and recovery reconciles the upgrade as done |
@@ -758,9 +758,19 @@ cluster:
 | G, K | no revision evidence for an upgrade (G) and for a rollback (K), by a RECORDED SHIM in place of Helm that passes every read to the real Helm and exits 1 on the mutating command without contacting the cluster: `unresolved`; `plan-dispose` refuses three times; the lock stays; nothing is submitted again. A synthetic refusal test, not transport-loss evidence |
 
 A kill is injected only after the driver has seen the real command progress (its launch receipt, its revision in the
-history, its group alive); a boundary that is not reached is reported as an unsuccessful scenario setup, never as a
-pass, and every error path ends the helper processes and Helm groups the driver knows of. Mutating Helm commands are
-counted from the helper's journal and compared with the release's history.
+history, its recorded leader alive); a boundary that is not reached is reported as an unsuccessful scenario setup,
+never as a pass. A signal goes to a Helm group only when it is proven to be the recorded one (the recorded leader with
+its recorded start time on this host and boot: a group id can be reused, so liveness alone authorizes nothing) and
+never to the driver's own group, session or parent. Every path ends in the same cleanup: the helper processes are ended
+first, then their last launch receipts are read, then each recorded group is ended and must be seen empty within a
+bound, and no process naming the run's kubeconfig may be left; a journal that cannot be read, a group that is not
+proven empty or a stray process is a failed run, whatever the scenario showed. Mutating Helm commands are counted from
+the helper's journal and compared with the release's history.
+
+What the driver writes about cluster objects is their identity only (uid, resourceVersion, generation, owners,
+container ids and restart counts, image references and the NAMES of environment entries): the objects themselves are
+compared in memory and never reach a file. After every scenario the work directory is searched for anything Helm
+printed.
 
 Its results are functional smoke evidence, not production evidence: it shows nothing about a lost API response, a
 lab cluster's timing or admission webhooks, or the application after an upgrade. A new statistical image built

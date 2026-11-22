@@ -43,25 +43,38 @@ def smoke(tmp_path, scenario="A", stages=("A",)):
 
 # --- what must and must not have changed --------------------------------------------------------------------------------
 
+def key(kind, name, ns=RS.CONTROL_NS):
+    return f"{kind}/{ns or '-'}/{name}"
+
+
+DEP = RS.DEPLOYMENT
+
+
 def cluster(image, generation=1, pods="one", env=()):
-    """A release as the snapshot holds it: the forecaster with its ReplicaSet, pod and EndpointSlice, the operator with
-    its pod, and a ConfigMap."""
-    def meta(name, uid, rv="10", **extra):
-        return {"name": name, "uid": uid, "resourceVersion": rv, **extra}
-    dep = {"metadata": meta(FC, "dep-fc", str(generation), generation=generation),
-           "spec": {"replicas": 1, "template": {"spec": {"containers": [
-               {"name": "forecaster", "image": image, "env": [{"name": "LOG", "value": "info"}, *env]}]}}}}
-    rs = {"metadata": meta(f"{FC}-{pods}", f"rs-{pods}", ownerReferences=[{"uid": "dep-fc"}])}
-    pod = {"metadata": meta(f"{FC}-{pods}-x", f"pod-{pods}", ownerReferences=[{"uid": f"rs-{pods}"}]),
-           "status": {"containerStatuses": [{"name": "forecaster", "containerID": f"c-{pods}", "restartCount": 0}]}}
-    es = {"metadata": meta(f"{FC}-abc", "es", pods, labels={"kubernetes.io/service-name": FC})}
-    op = {"metadata": meta("operator", "dep-op", generation=1), "spec": {"replicas": 1}}
-    op_pod = {"metadata": meta("operator-1", "pod-op"),
-              "status": {"containerStatuses": [{"name": "operator", "containerID": "c-op", "restartCount": 0}]}}
-    cm = {"metadata": meta("config", "cm")}
-    return {f"deployments/{FC}": dep, f"replicasets/{rs['metadata']['name']}": rs,
-            f"pods/{pod['metadata']['name']}": pod, f"endpointslices/{FC}-abc": es, "deployments/operator": op,
-            "pods/operator-1": op_pod, "configmaps/config": cm}
+    """A release as a snapshot returns it: the forecaster with its ReplicaSet, pod and EndpointSlice, the operator with
+    its pod, a ConfigMap, the TLS Secret (metadata only), a Role of ANOTHER namespace, a ClusterRole, a
+    ClusterRoleBinding and a scrape object."""
+    def obj(kind, name, uid, rv="10", ns=RS.CONTROL_NS, **extra):
+        meta = {"name": name, "uid": uid, "resourceVersion": rv, **extra}
+        if ns:
+            meta["namespace"] = ns
+        return {"kind": kind, "metadata": meta}
+    dep = obj("Deployment", FC, "dep-fc", str(generation), generation=generation)
+    dep["spec"] = {"replicas": 1, "template": {"spec": {"containers": [
+        {"name": "forecaster", "image": image, "env": [{"name": "LOG", "value": "info"}, *env]}]}}}
+    rs = obj("ReplicaSet", f"{FC}-{pods}", f"rs-{pods}", ownerReferences=[{"uid": "dep-fc"}])
+    pod = obj("Pod", f"{FC}-{pods}-x", f"pod-{pods}", ownerReferences=[{"uid": f"rs-{pods}"}])
+    pod["status"] = {"containerStatuses": [{"name": "forecaster", "containerID": f"c-{pods}", "restartCount": 0}]}
+    es = obj("EndpointSlice", f"{FC}-abc", "es", pods, labels={"kubernetes.io/service-name": FC})
+    op = obj("Deployment", "operator", "dep-op", generation=1)
+    op["spec"] = {"replicas": 1}
+    op_pod = obj("Pod", "operator-1", "pod-op")
+    op_pod["status"] = {"containerStatuses": [{"name": "operator", "containerID": "c-op", "restartCount": 0}]}
+    rest = [obj("ConfigMap", "config", "cm"), obj("Secret", f"{FC}-tls", "tls"),
+            obj("Role", "watch", "role-demo", ns="demo"), obj("ClusterRole", "pa-eval-operator", "cr", ns=None),
+            obj("ClusterRoleBinding", "pa-eval-operator", "crb", ns=None),
+            obj("VMServiceScrape", "pa-eval-forecaster", "scrape")]
+    return {RS.okey(o): o for o in (dep, rs, pod, es, op, op_pod, *rest)}
 
 
 def upgraded():
@@ -70,36 +83,52 @@ def upgraded():
 
 def test_an_upgrade_and_its_rollback_are_recognised_as_exactly_that():
     before, after = upgraded()
+    assert key("ClusterRole", "pa-eval-operator", None) == "ClusterRole/-/pa-eval-operator" in before
+    assert key("Role", "watch", "demo") in before and DEP in before
     out = RS.Smoke.compare(before, after, OLD, NEW, ENTRY)
-    assert out == {"unchanged_objects": 3, "forecaster_family": 5, "generation": [1, 2]}
+    assert out == {"unchanged_objects": 8, "forecaster_family": 5, "generation": [1, 2]}
     back = cluster(OLD, 3, "three")
     assert RS.Smoke.compare(after, back, NEW, OLD, ENTRY, env="removed")["generation"] == [2, 3]
 
 
-def _touch(key, **meta):
+def _touch(k, **meta):
     def change(before, after):
-        after[key]["metadata"].update(meta)
+        after[k]["metadata"].update(meta)
     return change
 
 
 def _ctr(doc):
-    return doc[f"deployments/{FC}"]["spec"]["template"]["spec"]["containers"][0]
+    return doc[DEP]["spec"]["template"]["spec"]["containers"][0]
+
+
+OTHERS = [key("ConfigMap", "config"), key("Deployment", "operator"), key("Pod", "operator-1"),
+          key("Secret", f"{FC}-tls"), key("Role", "watch", "demo"), key("ClusterRole", "pa-eval-operator", None),
+          key("ClusterRoleBinding", "pa-eval-operator", None), key("VMServiceScrape", "pa-eval-forecaster")]
+
+
+@pytest.mark.parametrize("k", OTHERS)
+def test_every_other_object_whatever_its_scope_or_namespace_must_be_the_same_object_unchanged(k):
+    for damage, text in ((_touch(k, resourceVersion="11"), "objects other than the forecaster's changed"),
+                         (_touch(k, uid="replaced"), "objects other than the forecaster's changed"),
+                         (lambda b, a: a.pop(k), "objects appeared or vanished")):
+        before, after = upgraded()
+        damage(before, after)
+        with pytest.raises(RS.Failed, match=text):
+            RS.Smoke.compare(before, after, OLD, NEW, ENTRY)
 
 
 @pytest.mark.parametrize("damage,text", [
-    (_touch("configmaps/config", resourceVersion="11"), "objects other than the forecaster's changed"),
-    (_touch("deployments/operator", uid="another"), "objects other than the forecaster's changed"),
-    (_touch("pods/operator-1", resourceVersion="99"), "objects other than the forecaster's changed"),
-    (lambda b, a: a.update({"rolebindings/extra": {"metadata": {"uid": "x", "resourceVersion": "1"}}}),
-     "objects appeared or vanished"),
-    (lambda b, a: a.pop("configmaps/config"), "objects appeared or vanished"),
+    (lambda b, a: a.update({key("RoleBinding", "extra"): {"kind": "RoleBinding", "metadata": {
+        "uid": "x", "resourceVersion": "1"}}}), "objects appeared or vanished"),
+    (lambda b, a: a.update({key("ClusterRole", "extra", None): {"kind": "ClusterRole", "metadata": {
+        "uid": "x", "resourceVersion": "1"}}}), "objects appeared or vanished"),
     (lambda b, a: _ctr(a)["env"].append(dict(ENTRY)), "was not added exactly once"),
     (lambda b, a: _ctr(a)["env"].remove(ENTRY), "was not added exactly once"),
     (lambda b, a: _ctr(a).update(command=["sh"]), "changed in more than its image"),
     (lambda b, a: _ctr(a).update(image=OLD), "changed in more than its image"),
-    (lambda b, a: a[f"deployments/{FC}"]["spec"].update(replicas=2), "changed in more than its image"),
+    (lambda b, a: a[DEP]["spec"].update(replicas=2), "changed in more than its image"),
     (lambda b, a: _ctr(a)["env"].append({"name": "EXTRA", "value": "1"}), "changed in more than its image"),
-    (lambda b, a: a[f"deployments/{FC}"]["metadata"].update(uid="replaced"), "objects appeared or vanished"),
+    (lambda b, a: a[DEP]["metadata"].update(uid="replaced"), "objects appeared or vanished"),
     (lambda b, a: _ctr(b).update(image=NEW), "did not run the expected image before"),
 ])
 def test_anything_else_is_not_an_upgrade(damage, text):
@@ -111,21 +140,143 @@ def test_anything_else_is_not_an_upgrade(damage, text):
 
 @pytest.mark.parametrize("change", [dict(restartCount=1), dict(containerID="c-other")])
 def test_an_untouched_pod_whose_container_restarted_or_changed_is_found(change):
+    k = key("Pod", "operator-1")
     before, after = upgraded()
-    after["pods/operator-1"]["status"]["containerStatuses"][0].update(change)
+    after[k]["status"]["containerStatuses"][0].update(change)
     with pytest.raises(RS.Failed, match="untouched pod restarted or was replaced"):
         RS.Smoke.compare(before, after, OLD, NEW, ENTRY)
     before, after = upgraded()
-    after["pods/operator-1"]["status"]["containerStatuses"] = []          # no status is not "untouched"
-    before["pods/operator-1"]["status"]["containerStatuses"] = []
+    after[k]["status"]["containerStatuses"] = []                         # no status is not "untouched"
+    before[k]["status"]["containerStatuses"] = []
     with pytest.raises(RS.Failed, match="untouched pod restarted or was replaced"):
         RS.Smoke.compare(before, after, OLD, NEW, ENTRY)
 
 
 def test_the_forecasters_family_is_found_by_ownership_and_service_name_not_by_name():
     doc = cluster(OLD)
-    doc["replicasets/looks-like-" + FC] = {"metadata": {"uid": "x", "resourceVersion": "1"}}       # not owned
-    assert RS.Smoke.forecaster_family(doc) == {f"replicasets/{FC}-one", f"pods/{FC}-one-x", f"endpointslices/{FC}-abc"}
+    doc[key("ReplicaSet", "looks-like-" + FC)] = {"kind": "ReplicaSet", "metadata": {"uid": "x", "resourceVersion": "1"}}
+    assert RS.Smoke.forecaster_family(doc) == {key("ReplicaSet", f"{FC}-one"), key("Pod", f"{FC}-one-x"),
+                                               key("EndpointSlice", f"{FC}-abc")}
+
+
+# --- the snapshot: the whole rendered inventory, and nothing of value in a file ----------------------------------------
+
+MARKER = "SYNTHETIC-CREDENTIAL-MARKER"
+IDS = [{"kind": "ClusterRole", "group": "rbac.authorization.k8s.io", "namespace": None, "name": "pa-eval-operator"},
+       {"kind": "ClusterRoleBinding", "group": "rbac.authorization.k8s.io", "namespace": None,
+        "name": "pa-eval-operator"},
+       {"kind": "Deployment", "group": "apps", "namespace": None, "name": "operator"},
+       {"kind": "ConfigMap", "group": "", "namespace": None, "name": "config"},
+       {"kind": "Deployment", "group": "apps", "namespace": None, "name": FC},
+       {"kind": "Role", "group": "rbac.authorization.k8s.io", "namespace": "demo", "name": "watch"},
+       {"kind": "Secret", "group": "", "namespace": None, "name": f"{FC}-tls"},
+       {"kind": "VMServiceScrape", "group": "operator.victoriametrics.com", "namespace": None,
+        "name": "pa-eval-forecaster"}]
+
+
+def snapshotting(tmp_path, missing=None):
+    """A driver whose cluster is `cluster(OLD)` with a credential marker in every place an object can carry one."""
+    s = smoke(tmp_path)
+    os.makedirs(s.work, exist_ok=True)
+    live = cluster(OLD)
+    _ctr(live)["env"].append({"name": "AUTH_TOKEN", "value": MARKER})
+    live[key("ConfigMap", "config")]["data"] = {"password": MARKER}
+    for o in live.values():
+        o["metadata"]["annotations"] = {"note": MARKER}
+        o["metadata"].setdefault("labels", {})["x"] = MARKER
+    live[key("Deployment", "stray", "elsewhere")] = {"kind": "Deployment", "metadata": {
+        "name": "stray", "namespace": "elsewhere", "uid": "s", "resourceVersion": "1"}}       # labelled, not rendered
+    s._ids, calls = IDS, []
+    singular = {"clusterrole.rbac.authorization.k8s.io": "ClusterRole", "configmap": "ConfigMap",
+                "clusterrolebinding.rbac.authorization.k8s.io": "ClusterRoleBinding",
+                "deployment.apps": "Deployment", "role.rbac.authorization.k8s.io": "Role",
+                "vmservicescrape.operator.victoriametrics.com": "VMServiceScrape", "replicaset.apps": "ReplicaSet",
+                "pod": "Pod", "endpointslice.discovery.k8s.io": "EndpointSlice"}
+
+    def k(*args, check=True, stdin=None):
+        calls.append(args)
+        assert "secret" not in " ".join(args).lower().replace("secretmeta", "")
+        if "-A" in args:                                                 # the label sweep
+            kind = singular[args[args.index("get") + 1]]
+            items = [o for o in live.values() if o["kind"] == kind and o["metadata"]["name"] in ("stray", FC)]
+        elif args[-2:] == ("-o", "json") and len(args) == 7:             # one rendered object
+            ns, kind, name = args[1], singular[args[3]], args[4]
+            found = [o for o in live.values() if (o["kind"], o["metadata"]["name"]) == (kind, name) and
+                     o["metadata"].get("namespace") in (ns, None) and name != missing]
+            return argparse.Namespace(returncode=0 if found else 1, stdout=json.dumps(found[0]) if found else "")
+        else:                                                            # the generated kinds of the control namespace
+            items = [o for o in live.values() if o["kind"] == singular[args[3]]]
+        return argparse.Namespace(returncode=0, stdout=json.dumps({"items": items}))
+    s.k = k
+    s.secret_meta = lambda name, *a, namespace=RS.CONTROL_NS: (
+        calls.append(("secretmeta", namespace, name)) or {"found": True, "uid": "tls", "resourceVersion": "10"})
+    return s, live, calls
+
+
+def test_a_snapshot_holds_every_rendered_object_of_any_scope_and_its_file_holds_no_value(tmp_path):
+    s, live, calls = snapshotting(tmp_path)
+    doc = s.snapshot("captured.json")
+    assert set(doc) == set(live)                                         # cluster-scoped, other namespaces, generated
+    assert doc[key("Secret", f"{FC}-tls")] == {"kind": "Secret", "metadata": {
+        "name": f"{FC}-tls", "namespace": RS.CONTROL_NS, "uid": "tls", "resourceVersion": "10"}}
+    assert ("secretmeta", RS.CONTROL_NS, f"{FC}-tls") in calls           # the only way a Secret is observed
+    assert ("-n", "demo", "get", "role.rbac.authorization.k8s.io", "watch", "-o", "json") in calls
+    assert MARKER in json.dumps(doc)                                     # in memory, for the exact comparison
+    text = open(os.path.join(s.work, "captured.json")).read()
+    assert MARKER not in text and "AUTH_TOKEN" in text                   # names, never values
+    filed = json.loads(text)
+    assert set(filed) == set(live) and filed[key("ClusterRole", "pa-eval-operator", None)] == {
+        "uid": "cr", "resourceVersion": "10", "generation": None, "owners": []}
+    assert filed[DEP]["containers"] == [{"name": "forecaster", "image": OLD, "env_names": ["LOG", "AUTH_TOKEN"]}]
+    assert filed[key("Pod", "operator-1")]["containers"] == [["operator", "c-op", 0]]
+    assert all(set(v) <= {"uid", "resourceVersion", "generation", "owners", "containers"} for v in filed.values())
+
+
+@pytest.mark.parametrize("name", ["pa-eval-operator", "watch", "pa-eval-forecaster"])
+def test_a_rendered_object_that_is_not_in_the_cluster_fails_the_snapshot(tmp_path, name):
+    s, _live, _calls = snapshotting(tmp_path, missing=name)
+    with pytest.raises(RS.Failed, match=f"/{name} is not in the cluster"):
+        s.snapshot("captured.json")
+
+
+def test_a_rendered_secret_the_reader_does_not_find_fails_the_snapshot(tmp_path):
+    s, _live, _calls = snapshotting(tmp_path)
+    s.secret_meta = lambda name, *a, namespace=None: {"found": False}
+    with pytest.raises(RS.Failed, match="was not found by the metadata reader"):
+        s.snapshot("captured.json")
+
+
+def test_the_inventory_is_the_installed_charts_rendering_and_its_output_is_never_shown(tmp_path):
+    s = smoke(tmp_path)
+    os.makedirs(os.path.join(s.work, "evidence-demo"))
+    s.write("chart-installed.json", {"dir": "/chart"})
+    s.kube_version = lambda: "1.35.9"
+    rendering = ("apiVersion: v1\nkind: Secret\nmetadata: {name: tls}\nstringData: {k: " + MARKER + "}\n---\n"
+                 "apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\nmetadata: {name: op}\n---\n"
+                 "apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: d, namespace: demo}\n")
+    seen = []
+
+    def run(args, check=True, **kw):
+        seen.append(args)
+        return argparse.Namespace(returncode=0, stdout=rendering, stderr="")
+    s.run = run
+    ids = s.identities()
+    assert seen == [[s.helm, "template", RS.RELEASE, "/chart", "--namespace", RS.CONTROL_NS, "-f",
+                     os.path.join(s.work, "evidence-demo", "release-staging.yaml"), "--kube-version", "1.35.9"]]
+    assert ids == [{"kind": "ClusterRole", "group": "rbac.authorization.k8s.io", "namespace": None, "name": "op"},
+                   {"kind": "Deployment", "group": "apps", "namespace": "demo", "name": "d"},
+                   {"kind": "Secret", "group": "", "namespace": None, "name": "tls"}]
+    assert s.identities() is ids and len(seen) == 1                      # rendered once
+    assert MARKER not in open(os.path.join(s.work, "release-identities.json")).read()
+    for bad, text in ((argparse.Namespace(returncode=1, stdout=MARKER, stderr=MARKER), "exit 1"),
+                      (argparse.Namespace(returncode=0, stdout="kind: X\n", stderr=""), "without an identity"),
+                      (argparse.Namespace(returncode=0, stdout=": :\n  - " + MARKER + ": [", stderr=""), "without an"),
+                      (argparse.Namespace(returncode=0, stdout=rendering + "---\n" + rendering, stderr=""), "twice"),
+                      (argparse.Namespace(returncode=0, stdout="", stderr=""), "is empty")):
+        s._ids, s.run = None, (lambda args, check=True, bad=bad, **kw: bad)
+        with pytest.raises(RS.Failed, match=text) as e:
+            s.identities()
+        assert MARKER not in str(e.value)
 
 
 def test_tls_preservation_needs_a_new_pod_and_three_equal_facts(tmp_path):
@@ -196,11 +347,26 @@ def _journal(s, *identities):
         fh.write('{"event": "unfinished')                               # a line being written: not a receipt yet
 
 
-def test_a_signal_goes_only_to_a_recorded_group_that_is_alive_and_never_to_the_drivers_own(tmp_path, spawn, monkeypatch):
+def test_a_signal_goes_only_to_a_group_proven_to_be_the_recorded_one_and_never_to_the_drivers_own(tmp_path, spawn,
+                                                                                               monkeypatch):
+    import procgroup
     s = smoke(tmp_path)
     p, ident = spawn.group()
+    for _ in range(100):                                                 # until the group has its second member
+        if len(procgroup.members(ident["pgid"])) == 2:
+            break
+        time.sleep(0.05)
+    for wrong in (dict(ident, start=str(int(ident["start"]) + 1)), dict(ident, boot_id="another"),
+                  dict(ident, host="another"), dict(ident, pid=os.getpid()), {"pgid": ident["pgid"]}, None, "x"):
+        assert s.owned(wrong) is None                                    # alive is not ownership
+        with pytest.raises(RS.Failed, match="scenario setup failed: Helm's recorded group is"):
+            s.signal_group(wrong, signal.SIGKILL)
+    assert s.group(dict(ident, start=str(int(ident["start"]) + 1))) == "alive" and p.poll() is None
+    child = next(m for m in procgroup.members(ident["pgid"]) if m != ident["pid"])
+    assert s.owned(procgroup.identity_of(child)) is None                # a member is not the recorded leader
+    assert s.group(None) == "unknown"
     s.signal_group(ident, signal.SIGSTOP)
-    assert s.group(ident) == "alive"                                    # stopped is alive
+    assert s.group(ident) == "alive" and s.owned(ident) == ident["pgid"]     # stopped is alive, and still ours
     s.signal_group(ident, signal.SIGKILL)
     p.wait(timeout=10)
     for _ in range(100):
@@ -211,11 +377,17 @@ def test_a_signal_goes_only_to_a_recorded_group_that_is_alive_and_never_to_the_d
         s.signal_group(ident, signal.SIGKILL)
     sent = []                                                           # from here on no signal is really sent
     monkeypatch.setattr(os, "killpg", lambda pgid, sig: sent.append(pgid))
-    s.group = lambda i: "alive"
-    for pgid in (os.getpgid(0), os.getpid(), 0, 1):
+    monkeypatch.setattr(procgroup, "identity_of", lambda pid: dict(ident, pid=pid, pgid=pid))    # "it is that one"
+    s.signal_group(dict(ident, pid=4242, pgid=4242), signal.SIGTERM)
+    assert sent == [4242]                                               # the stand-in works: only `mine` refuses below
+    for own in (os.getpid(), os.getpgid(0), os.getsid(0), os.getppid(), os.getpgid(os.getppid()), 1, 0):
         with pytest.raises(RS.Failed, match="scenario setup failed"):
-            s.signal_group(dict(ident, pgid=pgid), signal.SIGKILL)
-    assert sent == []
+            s.signal_group(dict(ident, pid=own, pgid=own), signal.SIGKILL)
+        s.known = [dict(ident, pid=own, pgid=own)]
+        s.group = lambda i: "alive"
+        monkeypatch.setattr(RS, "REAP_S", 0.2)
+        assert any("not proven empty" in x for x in s.reap())           # the cleanup refuses it too, and says so
+    assert sent == [4242]
 
 
 def test_every_error_path_ends_the_helper_processes_and_the_helm_groups_it_knows(tmp_path, spawn):
@@ -226,19 +398,100 @@ def test_every_error_path_ends_the_helper_processes_and_the_helm_groups_it_knows
     s.procs.append(helper)
     _journal(s, ident)
     assert s.launch(1) == ident and s.launch(2) is None and s.launches() == 1 and s.events() == ["helm-launch"]
-    s.reap()
-    p.wait(timeout=10)                                                  # a group left stopped fails here, it does not hang
-    assert helper.poll() is not None
-    for _ in range(100):
-        if s.group(ident) == "empty":
-            break
-        time.sleep(0.05)
-    assert s.group(ident) == "empty"
+    assert s.reap() == []                                               # the proof: nothing is left
+    p.wait(timeout=10)
+    assert helper.poll() is not None and s.group(ident) == "empty"
+
+
+def test_the_cleanup_ends_the_helpers_first_and_then_reads_their_last_launches(tmp_path, spawn):
+    """A helper that is still alive can launch Helm and publish the receipt while the cleanup runs."""
+    s = smoke(tmp_path)
+    late = []
+
+    class Helper:
+        pid = 1
+
+        def poll(self):
+            return None
+
+        def kill(self):                                                  # its last act: one more launch, receipted
+            late.append(spawn.group())
+            _journal(s, late[0][1])
+
+        def wait(self, timeout=None):
+            return 0
+    s.procs = [Helper()]
+    assert s.reap() == []
+    late[0][0].wait(timeout=10)
+    assert s.group(late[0][1]) == "empty"
+
+
+def test_a_journal_that_cannot_be_read_does_not_stop_the_cleanup_and_prevents_a_pass(tmp_path, spawn):
+    s = smoke(tmp_path)
+    p, ident = spawn.group()
+    helper = spawn.sleeper()
+    s.procs.append(helper)
+    _journal(s, ident)
+    assert s.launch(1) == ident                                          # known before the journal breaks
+    with open(os.path.join(s.work, "evidence-demo", "receipts", "release.jsonl"), "a") as fh:
+        fh.write("\n{a complete line that is not a receipt\n")
+    problems = s.reap()
+    assert len(problems) == 1 and "journal could not be read" in problems[0]
+    p.wait(timeout=10)
+    assert helper.poll() is not None and s.group(ident) == "empty"
+
+
+def test_a_helper_that_cannot_be_ended_does_not_stop_the_cleanup(tmp_path, spawn):
+    s = smoke(tmp_path)
+    p, ident = spawn.group()
+    _journal(s, ident)
+
+    class Stuck:
+        pid = 77
+
+        def poll(self):
+            raise OSError("no")
+    helper = spawn.sleeper()
+    s.procs = [Stuck(), helper]
+    problems = s.reap()
+    assert problems == ["helper process 77 could not be ended (OSError)"]
+    p.wait(timeout=10)
+    assert helper.poll() is not None and s.group(ident) == "empty"
+
+
+def test_a_group_that_is_not_proven_empty_is_a_problem_within_a_bound(tmp_path, spawn, monkeypatch):
+    s = smoke(tmp_path)
+    p, ident = spawn.group()
+    monkeypatch.setattr(RS, "REAP_S", 0.3)
+    s.known = [dict(ident, start=str(int(ident["start"]) + 1))]         # occupied, but not provably ours
+    t0 = time.time()
+    problems = s.reap()
+    assert problems == [f"Helm's recorded group {ident['pgid']} is alive after the cleanup: not proven empty"]
+    assert time.time() - t0 < 5 and p.poll() is None                     # and it was NOT signalled
+
+
+def test_a_process_naming_this_runs_kubeconfig_is_ended_and_reported(tmp_path, spawn):
+    s = smoke(tmp_path)
+    assert s.strays() == []
+    made = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)", "--kubeconfig", s.kcfg],
+                            start_new_session=True)
+    try:
+        other = spawn.sleeper()                                          # names nothing of this run
+        problems = s.reap()
+        assert problems == ["1 process(es) naming this run's kubeconfig were still running at cleanup"]
+        assert made.wait(timeout=10) == -signal.SIGKILL and other.poll() is None
+    finally:
+        if made.poll() is None:
+            made.kill()
+            made.wait()
 
 
 def test_the_driver_reaps_even_when_a_scenario_fails_and_refuses_a_stage_of_another_scenario(tmp_path, monkeypatch):
     seen = []
-    monkeypatch.setattr(RS.Scenarios, "reap", lambda self: seen.append("reaped"))
+    problems = []
+    monkeypatch.setattr(RS.Scenarios, "reap", lambda self: seen.append("reaped") or list(problems))
+    monkeypatch.setattr(RS.Scenarios, "no_helm_output", lambda self: seen.append("leak check"))
+    monkeypatch.setattr(RS.Scenarios, "D", lambda self: seen.append("D ran"))
     monkeypatch.setattr(RS.Scenarios, "B", lambda self: (_ for _ in ()).throw(RS.Failed("boom")))
     monkeypatch.setattr(RS.Scenarios, "C", lambda self: seen.append("C ran"))
     base = smoke(tmp_path)
@@ -246,7 +499,16 @@ def test_the_driver_reaps_even_when_a_scenario_fails_and_refuses_a_stage_of_anot
             "--new-statistical", NEW, "--helm", base.helm, "--secretmeta", base.meta, "--from-commit", "f" * 40]
     assert RS.main(argv + ["--scenario", "B", "B"]) == 1 and seen == ["reaped"]
     assert RS.main(argv + ["--scenario", "B", "C"]) == 1 and seen == ["reaped", "reaped"]     # C is not B's stage
-    assert json.load(open(os.path.join(base.work, "checks.json"))) == []
+    checks = lambda: [c["check"][:8] for c in json.load(open(os.path.join(base.work, "checks.json")))]  # noqa: E731
+    assert checks() == ["cleanup:"] * 2                                  # one per run; the runs share the directory
+    del seen[:]
+    assert RS.main(argv + ["--scenario", "D", "D"]) == 0                 # the leak check follows EVERY scenario
+    assert seen == ["D ran", "leak check", "reaped"] and checks() == ["cleanup:"] * 3
+    problems.append("Helm's recorded group 5 is alive after the cleanup: not proven empty")
+    assert RS.main(argv + ["--scenario", "D", "D"]) == 1                 # a scenario that passed, a cleanup that did not
+    assert checks() == ["cleanup:"] * 3                                  # and no cleanup check is recorded for it
+    monkeypatch.setattr(RS.Scenarios, "reap", lambda self: (_ for _ in ()).throw(RuntimeError("x")))
+    assert RS.main(argv + ["--scenario", "D", "D"]) == 1 and checks() == ["cleanup:"] * 3
 
 
 # --- the candidate record and its variants ----------------------------------------------------------------------------
