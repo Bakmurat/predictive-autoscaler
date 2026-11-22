@@ -404,6 +404,58 @@ def test_withdrawing_after_a_failed_entry_never_removes_somebody_elses_record(re
     assert guard_of(rec) == foreign and os.path.exists(path)
 
 
+class Interrupted(BaseException):
+    """An interruption that is not an Exception (as KeyboardInterrupt is not), without ending the test session."""
+
+
+def test_an_interruption_anywhere_in_the_cleanup_still_releases_the_coordination_lock(rec, monkeypatch):
+    path, sha = stale_lock(rec)
+    _fail_directory_sync(monkeypatch, OSError(5, "I/O error"))
+
+    class Attempts:                                        # interrupts the cleanup OUTSIDE its bounded attempts
+        def __index__(self):
+            raise Interrupted()
+    monkeypatch.setattr(C, "WITHDRAW_ATTEMPTS", Attempts())
+    g = C.recovery_guard(rec, SCOPE, sha)
+    with pytest.raises(Interrupted):
+        g.__enter__()
+    monkeypatch.undo()
+    assert g._fd is None and os.path.exists(path)          # released all the same
+    assert guard_of(rec)["pid"] == os.getpid()             # its record could not be taken back: visible, not hidden
+
+
+@pytest.mark.parametrize("interruptions,stranded", [(1, False), (C.WITHDRAW_ATTEMPTS - 1, False),
+                                                    (C.WITHDRAW_ATTEMPTS, True)])
+def test_an_interruption_of_the_cleanup_after_a_failed_entry_still_releases_the_lock(rec, monkeypatch, interruptions,
+                                                                                      stranded):
+    """An ordinary I/O failure after the publication, and then the cleanup itself is interrupted: the coordination
+    lock is released in every case, the ORIGINAL failure is the one reported, and the attempt's own record is taken
+    back unless every bounded attempt was interrupted."""
+    path, sha = stale_lock(rec)
+    _fail_directory_sync(monkeypatch, OSError(5, "I/O error"))
+    real, left = C.recovery_guard._withdraw, [interruptions]
+
+    def withdraw(self, body):
+        if left[0] > 0:
+            left[0] -= 1
+            raise Interrupted()
+        return real(self, body)
+    monkeypatch.setattr(C.recovery_guard, "_withdraw", withdraw)
+    g = C.recovery_guard(rec, SCOPE, sha)
+    with pytest.raises(OSError, match="I/O error"):
+        g.__enter__()
+    monkeypatch.undo()
+    assert g._fd is None and g.token is None and os.path.exists(path)
+    if stranded:                                           # its record names this live process: refused, not hidden
+        assert guard_of(rec)["pid"] == os.getpid()
+        with pytest.raises(C.StagingError, match="is still running"):
+            C.recovery_guard(rec, SCOPE, sha).__enter__()
+    else:
+        assert guard_of(rec) is None
+        with C.recovery_guard(rec, SCOPE, sha):
+            pass
+
+
 def test_an_interruption_right_after_the_coordination_lock_was_taken_releases_it(rec, monkeypatch):
     _path, sha = stale_lock(rec)
     real = C.fcntl.flock

@@ -537,6 +537,7 @@ class exclusive_lock:
 
 
 GUARD_SCHEMA = "c28-recovery-guard/v1"
+WITHDRAW_ATTEMPTS = 3                     # how often a failed entry tries to take back the record it published
 
 
 class recovery_guard:
@@ -586,10 +587,17 @@ class recovery_guard:
             self._publish(body, replace=stale is not None)
             self.token = body["token"]
         except BaseException:
-            if body is not None:                          # still under the flock: only what THIS attempt published
-                self._withdraw(body)
-            self._unlock()
-            raise
+            try:
+                if body is not None:                      # still under the flock: only what THIS attempt published
+                    for _again in range(WITHDRAW_ATTEMPTS):      # an interruption of the cleanup is not the end of it
+                        try:
+                            self._withdraw(body)
+                            break
+                        except BaseException:
+                            continue
+            finally:
+                self._unlock()                            # whatever happened above: the coordination lock is released
+            raise                                         # the failure that ended the entry, not the cleanup's
         return self
 
     def _withdraw(self, body: Dict) -> None:
