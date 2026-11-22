@@ -689,9 +689,10 @@ clean executing checkout.
   another field of the forecaster. The one exception is the forecaster's generated TLS Secret: offline each
   rendering makes a new certificate, so only its shape is compared. A plan names objects and paths, never values.
 - **What the offline renderings cannot show.** The plan lists every template of both chart trees that reads the live
-  cluster (`lookup`, `.Capabilities`). The only reviewed `lookup` is the one that keeps the forecaster's TLS Secret
-  across upgrades (the plan binds that Secret's live UID and resourceVersion for the read-back); any other is
-  refused, and capabilities must be bound in the record.
+  cluster (`lookup`, `.Capabilities`). The one reviewed `lookup` keeps the forecaster's TLS Secret across
+  upgrades (the plan binds that Secret's live UID and resourceVersion for the read-back). It is accepted by CONTENT:
+  the template and the helpers it includes must have the reviewed sha256; another template with a lookup, or that
+  file changed, is refused until reviewed. Capabilities must be bound in the record.
 - **Also bound:** the release's history (each description as a class and a sha256, never its text), the storage
   Secret of the installed revision by UID (metadata only), both chart trees (extracted once under the evidence
   directory and verified file by file against git's listing), the live forecaster against the installed rendering
@@ -715,14 +716,16 @@ clean executing checkout.
   `plan-rollback` is a `finalize` plan: it records the reconciliation and releases the lock without running Helm.
 - **Recovery** decides only what is proven: an intent without a launch receipt never executed; a released upgrade
   is done only when its own revision is deployed and its process group is gone; everything else stays unresolved.
-- **Disposition.** What neither recovery nor a rollback may decide (an interrupted rollback, an upgrade without
-  revision evidence) is settled by a reviewed disposition, which runs no Helm and changes nothing in the cluster.
-  `plan-dispose` gathers the evidence and refuses unless all of it holds: only this helper's intents are open and
-  each one's process group is gone; the newest revision is the one deployed revision; and the release is in exactly
+- **Disposition.** An interrupted rollback whose revision exists is settled by a reviewed disposition, which runs no
+  Helm and changes nothing in the cluster. `plan-dispose` gathers the evidence and refuses unless all of it holds:
+  only this helper's intents are open and each one's process group is gone; every released command's revision is in
+  the history; the newest revision is the one deployed revision; and the release is in exactly
   one of two states, shown by the live forecaster equalling the installed or the new rendering in every field
   together with the matching revision. `dispose` recomputes the plan (the state must not have moved during the
   review), enters the recovery guard, journals the disposition and releases the lock. A release in neither state is
-  brought into one by hand first.
+  brought into one by hand first. NOT disposable: a released command WITHOUT revision evidence. A request the API
+  server accepted can still commit after the client is gone, and neither two equal observations nor a waiting time
+  shows that it will not; in version 1 that case stays unresolved, with the lock held.
 
 `applied` means that Helm recorded our revision as deployed. The application read-back (pods, certificate,
 PredictiveAutoscalers, ledger, permissions) is a separate reviewed step. The helper is run directly: starting it

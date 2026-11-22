@@ -115,29 +115,38 @@ class Ctx:
 
 # --- the spec comparison ---------------------------------------------------------------------------------------------
 
-def spec_diff(want, live, path: str = "spec") -> List[str]:
-    """Every difference between the rendered spec and the live one, by path. A live field the render does not set is
-    ignored only when it holds an enumerated server default."""
+def spec_findings(want, live, path: str = "spec") -> List[Tuple[str, str, str, str]]:
+    """Every difference between the rendered spec and the live one as (path, kind, text, parent). A live field the
+    render does not set is ignored only when it holds an enumerated server default. kind is one of absent-live |
+    live-only | entries | values; text is the wording spec_diff prints and MAY QUOTE VALUES. A caller that must not
+    show live content uses the kind and, for live-only, the parent path (the last component of that path is a key
+    only the live object has); every other path consists of keys the rendering has."""
     if isinstance(want, dict) and isinstance(live, dict):
         out = []
         for k in sorted(set(want) | set(live)):
             p = f"{path}.{k}"
             if k not in live:
-                out.append(f"{p}: rendered, absent live")
+                out.append((p, "absent-live", "rendered, absent live", path))
             elif k not in want:
                 # the API server mirrors serviceAccountName into the deprecated serviceAccount field
                 alias = p == "spec.template.spec.serviceAccount" and want.get("serviceAccountName") == live[k]
                 if not alias and not any(rx.match(p) and live[k] == v for rx, v in _DEFAULTS):
-                    out.append(f"{p}: live only ({json.dumps(live[k], sort_keys=True)[:80]})")
+                    out.append((p, "live-only", f"live only ({json.dumps(live[k], sort_keys=True)[:80]})", path))
             else:
-                out += spec_diff(want[k], live[k], p)
+                out += spec_findings(want[k], live[k], p)
         return out
     if isinstance(want, list) and isinstance(live, list):
         if len(want) != len(live):
-            return [f"{path}: {len(want)} rendered entries, {len(live)} live"]
-        return [d for a, b in zip(want, live) for d in spec_diff(a, b, path + "[]")]
+            return [(path, "entries", f"{len(want)} rendered entries, {len(live)} live", path)]
+        return [d for a, b in zip(want, live) for d in spec_findings(a, b, path + "[]")]
     return [] if want == live and type(want) is type(live) else [
-        f"{path}: rendered {json.dumps(want, sort_keys=True)[:80]}, live {json.dumps(live, sort_keys=True)[:80]}"]
+        (path, "values",
+         f"rendered {json.dumps(want, sort_keys=True)[:80]}, live {json.dumps(live, sort_keys=True)[:80]}", path)]
+
+
+def spec_diff(want, live, path: str = "spec") -> List[str]:
+    """spec_findings as text, for the helpers whose objects carry no secret values."""
+    return [f"{p}: {text}" for p, _kind, text, _parent in spec_findings(want, live, path)]
 
 
 def _rendered(params: Dict) -> Dict[Tuple[str, str], Dict]:

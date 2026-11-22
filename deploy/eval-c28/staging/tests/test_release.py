@@ -307,8 +307,8 @@ def test_the_upgrade_plan_binds_what_was_reviewed_and_is_deterministic(w):
     assert d["tls_exception"] == tls and plan["renders"]["from"]["objects"] == 4
     assert plan["renders"]["from"]["secrets"] == plan["renders"]["to"]["secrets"] == [
         {"key": tls, "type": "kubernetes.io/tls", "data_keys": ["tls.key"]}]
-    assert plan["live_dependence"] == {"from": {"lookup": {}, "capabilities": {}},
-                                       "to": {"lookup": {}, "capabilities": {}}}
+    assert plan["live_dependence"] == {"from": {"lookup": {}, "capabilities": {}, "lookup_sha256": {}},
+                                       "to": {"lookup": {}, "capabilities": {}, "lookup_sha256": {}}}
     assert plan["charts"]["from"]["tree"] == "f" * 40 and plan["charts"]["to"]["tree"] == "t" * 40
     assert [p["name"] for p in plan["pods"]] == [f"{w.release}-forecaster-0"]
     assert not w.helm.mutating() and not w.lock()                    # planning ran no mutating command
@@ -961,6 +961,33 @@ def test_a_live_literal_that_differs_from_the_rendering_is_found_and_not_quoted(
     assert MARKER not in json.dumps(plan)
 
 
+@pytest.mark.parametrize("value", [f"3 rendered entries, 4 live {MARKER}", f"x: rendered, absent live {MARKER}",
+                                   f"live only ({MARKER})", f"{MARKER}: rendered, absent live"])
+def test_a_live_value_that_imitates_a_finding_is_still_never_quoted(w, value):
+    _both(w, lambda docs: _ctr(docs)["env"].insert(0, {"name": "AUTH_TOKEN", "value": "rendered"}))
+    w.set_forecaster("from")
+    live = w.api.obj("Deployment", w.from_docs[-1]["metadata"]["name"], w.control_ns)
+    live["spec"]["template"]["spec"]["containers"][0]["env"][0]["value"] = value
+    live["spec"]["template"]["metadata"]["labels"][f"odd key: {MARKER}"] = "x"     # a key only the live object has
+    plan, saved = w.plan()
+    found = [p for p in plan["problems"] if "the live forecaster differs" in p]
+    assert sorted(p.rsplit(": ", 1)[1] for p in found) == ["live only", "the values differ"]
+    assert any("spec.template.metadata.labels.<a key the rendering does not have>: live only" in p for p in found)
+    assert MARKER not in json.dumps(plan) and MARKER not in open(saved["plan"]).read()
+    assert MARKER.encode() not in w.everything_written()
+
+
+def test_a_path_shows_rendered_keys_only_in_the_characters_of_names(w):
+    _both(w, lambda docs: docs[-1]["spec"]["template"]["metadata"]["labels"].update({"a rendered: key": "v"}))
+    w.set_forecaster("from")
+    live = w.api.obj("Deployment", w.from_docs[-1]["metadata"]["name"], w.control_ns)
+    live["spec"]["template"]["metadata"]["labels"]["a rendered: key"] = "other"
+    live["spec"]["template"]["spec"].pop("serviceAccountName")
+    found = [p for p in w.plan()[0]["problems"] if "the live forecaster differs" in p]
+    assert any(p.endswith("spec.template.metadata.labels.a?rendered??key: the values differ") for p in found)
+    assert any(p.endswith("spec.template.spec.serviceAccountName: rendered, absent live") for p in found)
+
+
 @pytest.mark.parametrize("tool", [HELM, META])
 def test_an_executable_that_is_not_the_records_is_never_run(rec, tool):
     w = rec
@@ -1051,24 +1078,62 @@ def test_the_sanitizers_own_yaml_error_names_a_position_only():
     assert MARKER not in str(e.value)
 
 
-def test_templates_that_read_the_live_cluster_are_listed_and_only_the_tls_lookup_is_accepted(w, tmp_path):
-    chart = tmp_path / "chart"
-    (chart / "templates").mkdir(parents=True)
-    (chart / "templates" / "forecaster-tls.yaml").write_text('{{- $e := lookup "v1" "Secret" .Release.Namespace "x" }}\n')
-    (chart / "templates" / "plain.yaml").write_text("kind: ConfigMap\n")
-    (chart / "values.yaml").write_text("lookup: a value, not a template\n")
+TLS_TEMPLATE = '{{- $e := lookup "v1" "Secret" .Release.Namespace (include "x.tls" .) }}\nkind: Secret\n'
+HELPERS = '{{- define "x.tls" -}}x-tls{{- end -}}\n'
+
+
+@pytest.fixture
+def chart(w, tmp_path, monkeypatch):
+    """A chart whose TLS template and helpers are the reviewed content (for this test)."""
+    root = tmp_path / "chart"
+    (root / "templates").mkdir(parents=True)
+    (root / "templates" / "forecaster-tls.yaml").write_text(TLS_TEMPLATE)
+    (root / "templates" / "_helpers.tpl").write_text(HELPERS)
+    (root / "templates" / "plain.yaml").write_text("kind: ConfigMap\n")
+    (root / "values.yaml").write_text("lookup: a value, not a template\n")
+    sha = lambda text: hashlib.sha256(text.encode()).hexdigest()  # noqa: E731
+    monkeypatch.setattr(R, "REVIEWED_LOOKUP", {"templates/forecaster-tls.yaml": {
+        "sha256": (sha(TLS_TEMPLATE),), "with": {"templates/_helpers.tpl": (sha(HELPERS),)}}})
+    return root
+
+
+def test_templates_that_read_the_live_cluster_are_listed_and_the_reviewed_tls_template_is_accepted(w, chart):
     c = w.ctx()
-    assert R.live_dependence(c, str(chart)) == ({"lookup": {"templates/forecaster-tls.yaml": 1}, "capabilities": {}}, [])
+    found, problems = R.live_dependence(c, str(chart))
+    assert problems == [] and found["lookup"] == {"templates/forecaster-tls.yaml": 1} and found["capabilities"] == {}
+    assert found["lookup_sha256"] == {"templates/forecaster-tls.yaml": hashlib.sha256(TLS_TEMPLATE.encode()).hexdigest()}
     (chart / "templates" / "rbac.yaml").write_text(
         '{{ if (lookup "v1" "Namespace" "" "x") }}kind: ClusterRoleBinding{{ end }}\n{{ lookup "v1" "Pod" "" "" }}\n')
     (chart / "templates" / "metrics.yaml").write_text('{{ if .Capabilities.APIVersions.Has "x/v1" }}kind: VMRule{{ end }}\n')
     found, problems = R.live_dependence(c, str(chart))
-    assert found == {"lookup": {"templates/forecaster-tls.yaml": 1, "templates/rbac.yaml": 2},
-                     "capabilities": {"templates/metrics.yaml": 1}}
-    assert any("lookup in templates/rbac.yaml" in p for p in problems)
+    assert found["lookup"] == {"templates/forecaster-tls.yaml": 1, "templates/rbac.yaml": 2}
+    assert found["capabilities"] == {"templates/metrics.yaml": 1}
+    assert [p for p in problems if "lookup in" in p] == [p for p in problems if "lookup in templates/rbac.yaml" in p] != []
     assert any("must bind helm.api_versions" in p for p in problems)
     c.cfg["helm"]["api_versions"] = []                      # bound, even when empty: the capability question is answered
     assert [p for p in R.live_dependence(c, str(chart))[1] if "api_versions" in p] == []
+
+
+@pytest.mark.parametrize("change", [
+    # another lookup under the reviewed FILE NAME: a Namespace lookup guarding a ClusterRoleBinding
+    lambda chart: (chart / "templates" / "forecaster-tls.yaml").write_text(
+        TLS_TEMPLATE + '{{ if (lookup "v1" "Namespace" "" "x") }}kind: ClusterRoleBinding{{ end }}\n'),
+    lambda chart: (chart / "templates" / "forecaster-tls.yaml").write_text(TLS_TEMPLATE.replace(".Release.Namespace",
+                                                                                                 '"kube-system"')),
+    lambda chart: (chart / "templates" / "_helpers.tpl").write_text('{{- define "x.tls" -}}another-secret{{- end -}}\n'),
+    lambda chart: (chart / "templates" / "_helpers.tpl").unlink(),
+])
+def test_the_lookup_exception_is_the_reviewed_content_not_a_file_name(w, chart, change):
+    change(chart)
+    _found, problems = R.live_dependence(w.ctx(), str(chart))
+    assert any("lookup in templates/forecaster-tls.yaml" in p and "not the reviewed content" in p for p in problems)
+
+
+def test_the_charts_own_tls_template_and_helpers_are_the_reviewed_content(w):
+    """Pins REVIEWED_LOOKUP to the chart of this commit: changing the template or its helpers fails here until the
+    change is reviewed and the constant updated."""
+    found, problems = R.live_dependence(w.ctx(), os.path.join(R.repo_root(), R.CHART))
+    assert problems == [] and list(found["lookup"]) == ["templates/forecaster-tls.yaml"] and found["capabilities"] == {}
 
 
 def test_the_mutating_calls_shape_is_an_exact_allowlist(w):
@@ -1189,18 +1254,36 @@ def test_a_killed_guarded_rollback_leaves_two_intents_and_one_disposition_settle
     assert not w.lock() and C.unresolved_intents(w.ctx().record.doc) == {}
 
 
-def test_an_upgrade_without_revision_evidence_is_disposed_as_installed_and_never_submitted_again(rec):
+def test_an_upgrade_without_revision_evidence_is_not_disposable_because_its_request_can_still_commit(rec):
     w = rec
-    w.helm.mode = "lost"
+    w.helm.mode = "lost"                                   # the revision-create was accepted; its answer was lost
     with pytest.raises(X.StagingError):
         w.upgrade()
     PF.crash_owner(w.ctx().record)
-    plan, _ = w.plan(R.plan_dispose, "plan-dispose")
-    assert plan["problems"] == [] and plan["state"] == "installed" and plan["storage"]["revision"] == 1
-    do_dispose(w)
-    assert not w.lock()
-    w.helm.mode = "ok"
-    assert any("already submitted" in p for p in w.plan()[0]["problems"])    # a new record, a new operation
+    plan, saved = w.plan(R.plan_dispose, "plan-dispose")
+    again, _ = w.plan(R.plan_dispose, "plan-dispose")      # two observations that agree prove nothing here
+    assert again["history"] == plan["history"]
+    assert [p for p in plan["problems"] if "step 1" in p] == [
+        "step 1: Helm executed and revision 2 does not exist. A request the API server accepted can still commit, and "
+        "nothing read here can show that it will not: this case is not disposable and stays unresolved"]
+    with pytest.raises(X.StagingError, match="problems"):
+        R.dispose(w.ctx(), X.load_plan(saved["plan"]), saved["plan_digest"])
+    assert w.lock() and "disposition" not in w.events()
+    # ...and now the queued request completes, with no second client submission: the lock was still held
+    w.helm.revisions.append(w.helm.rev(2, "pending-upgrade", "Preparing upgrade"))
+    assert w.lock() and len(w.helm.mutating()) == 1
+    assert C.unresolved_intents(w.ctx().record.doc) == {"release": ["1"]}
+
+
+def test_a_rollback_without_revision_evidence_is_not_disposable_either(rec):
+    w = rec
+    w.upgrade()
+    w.helm.mode = "lost"
+    with pytest.raises(X.StagingError, match="is unresolved"):
+        w.rollback()
+    PF.crash_owner(w.ctx().record)
+    plan, _ = w.plan(R.plan_dispose, "plan-dispose")       # the live state is exactly "upgraded", and still: no
+    assert any("step 2: Helm executed and revision 3 does not exist" in p for p in plan["problems"])
 
 
 def test_an_applied_upgrade_can_also_be_disposed_as_upgraded(rec):

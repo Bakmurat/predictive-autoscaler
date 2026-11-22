@@ -90,8 +90,15 @@ UPGRADE_OPTIONS = ("--namespace", "--kubeconfig", "--kube-context", "-f", "--wai
 ROLLBACK_OPTIONS = ("--namespace", "--kubeconfig", "--kube-context", "--wait", "--timeout")
 ENV_KEEP = ("PATH", "HOME", "LANG")       # the whole environment of every command this helper starts
 TLS_TYPE = "kubernetes.io/tls"
-# Templates that may read the live cluster: the forecaster's TLS Secret is kept across upgrades with `lookup`.
-LOOKUP_TEMPLATES = ("templates/forecaster-tls.yaml",)
+# The ONE reviewed use of `lookup`: the forecaster's TLS Secret is kept across upgrades by looking up the existing
+# Secret of the release's own namespace. The exception is this template CONTENT (and the helpers it includes), by
+# sha256: a changed template, or another lookup under the same file name, is not covered and needs a new review.
+REVIEWED_LOOKUP = {"templates/forecaster-tls.yaml": {
+    "sha256": ("e106607acb395f1965acec2ead357658b66e0ca024b0b357bc128fc950af0418",),
+    "with": {"templates/_helpers.tpl": ("cc5fe690f32d54b39d139f2e3e033af4412c441ba246277fb5d9c7090d724901",)}}}
+# A finding about the live object, in fixed words: never the text of imageroll.spec_findings, which quotes values.
+FINDING = {"absent-live": "rendered, absent live", "live-only": "live only",
+           "entries": "the number of entries differs", "values": "the values differ"}
 ROLES = ("operator", "forecaster", "trainer")
 RUNNER: Callable = procgroup.run          # tests replace these three; the reconcilers have no other way in
 CHARTS: Optional[Callable] = None
@@ -475,12 +482,16 @@ def difference(c: Ctx, frm: Dict, to: Dict) -> Tuple[Dict, List[str]]:
     return diff, problems
 
 
-def _path_only(message: str) -> str:
-    """A spec_diff finding without the values it quotes."""
-    path_, _, rest = message.partition(": ")
-    kind = rest if rest == "rendered, absent live" or "rendered entries" in rest else \
-        "live only" if rest.startswith("live only") else "the values differ"
-    return f"{path_}: {kind}"
+def _safe_path(path_: str) -> str:
+    """A field path as it may be shown: the characters of field, label and annotation names, nothing else."""
+    return re.sub(r"[^A-Za-z0-9_./\[\]-]", "?", path_)[:200]
+
+
+def _shown(path_: str, kind: str, parent: str) -> str:
+    """What a finding about the live object says: a path made of keys the RENDERING has (reviewed chart content),
+    and fixed words. A key that only the live object has is content of the cluster and is not shown."""
+    where = f"{_safe_path(parent)}.<a key the rendering does not have>" if kind == "live-only" else _safe_path(path_)
+    return f"{where}: {FINDING[kind]}"
 
 
 def live_problems(c: Ctx, rendered: Dict) -> Tuple[Dict, List[str]]:
@@ -490,29 +501,40 @@ def live_problems(c: Ctx, rendered: Dict) -> Tuple[Dict, List[str]]:
     live = c.kube.get("Deployment", name, c.control_ns)
     if live is None:
         return {"name": name}, [f"Deployment {name} does not exist"]
-    diffs = imageroll.spec_diff(rendered["spec"], live["spec"])
+    findings = imageroll.spec_findings(rendered["spec"], live["spec"])
     return ({"name": name, "uid": live["metadata"]["uid"], "generation": live["metadata"].get("generation")},
-            [f"the live forecaster differs from the rendering: {_path_only(d)}" for d in diffs])
+            [f"the live forecaster differs from the rendering: {_shown(p, kind, parent)}"
+             for p, kind, _text_that_may_quote_values, parent in findings])
 
 
 def live_dependence(c: Ctx, chart_dir: str) -> Tuple[Dict, List[str]]:
     """Where a chart tree reads the live cluster while rendering, which an offline rendering cannot show: `lookup`
-    and `.Capabilities`, counted per template file. Refused: a lookup outside the reviewed exception (the forecaster's
-    TLS Secret, whose preservation the read-back checks), and capabilities the record does not bind."""
-    found: Dict[str, Dict[str, int]] = {"lookup": {}, "capabilities": {}}
+    and `.Capabilities`, counted per template file (an inventory). A template with a lookup is accepted only when its
+    CONTENT and the helpers it includes are the reviewed ones (REVIEWED_LOOKUP, by sha256); capabilities must be bound
+    by the record."""
+    found: Dict[str, Dict] = {"lookup": {}, "capabilities": {}, "lookup_sha256": {}}
+    sha: Dict[str, str] = {}
     for root, dirs, files in os.walk(chart_dir):
         dirs.sort()
         for f in sorted(files):
             rel = os.path.relpath(os.path.join(root, f), chart_dir)
             if rel.split(os.sep)[0] not in ("templates", "charts"):
                 continue
-            with open(os.path.join(root, f), encoding="utf-8", errors="replace") as fh:
-                text = fh.read()
+            with open(os.path.join(root, f), "rb") as fh:
+                data = fh.read()
+            sha[rel] = hashlib.sha256(data).hexdigest()
+            text = data.decode("utf-8", errors="replace")
             for name, rx in (("lookup", r"\blookup\b"), ("capabilities", r"\.Capabilities\b")):
                 if re.findall(rx, text):
                     found[name][rel] = len(re.findall(rx, text))
-    problems = [f"the chart reads the live cluster with lookup in {rel}: only {list(LOOKUP_TEMPLATES)} is reviewed"
-                for rel in sorted(found["lookup"]) if rel not in LOOKUP_TEMPLATES]
+    problems = []
+    for rel in sorted(found["lookup"]):
+        found["lookup_sha256"][rel] = sha[rel]
+        rule = REVIEWED_LOOKUP.get(rel)
+        if rule is None or sha[rel] not in rule["sha256"] or \
+                any(sha.get(dep) not in ok for dep, ok in rule["with"].items()):
+            problems.append(f"the chart reads the live cluster with lookup in {rel}, and that template (or a helper "
+                            "it includes) is not the reviewed content: its lookups are not covered")
     if found["capabilities"] and "api_versions" not in c.cfg["helm"]:
         problems.append(f"the chart asks for the cluster's capabilities in {sorted(found['capabilities'])}: the "
                         "record must bind helm.api_versions")
@@ -1003,10 +1025,13 @@ def _finalize_plan(c: Ctx) -> Optional[Dict]:
 # --- the reviewed disposition of what the helper cannot decide ----------------------------------------------------------
 
 def plan_dispose(c: Ctx) -> Dict:
-    """For open Helm intents that neither recovery nor a rollback may decide (an interrupted rollback, an upgrade
-    without revision evidence): the evidence that the release is in ONE of the two reviewed states, for a person to
-    review. Required, all of it:
+    """For open Helm intents that neither recovery nor a rollback may decide, when the revision each of them was to
+    write EXISTS (an interrupted rollback whose revision is there): the evidence that the release is in ONE of the two
+    reviewed states, for a person to review. Required, all of it:
       - only this helper's intents are open, and the Helm process group of each is proven gone;
+      - every intent whose command was released has its revision in the history. An intent WITHOUT revision evidence
+        is not disposable: a request the API server accepted can still commit after the client is gone, and neither
+        two equal observations nor a waiting time shows that it will not. That case stays unresolved in version 1;
       - the newest revision is the one `deployed` revision, without a gap;
       - installed: the live forecaster equals the installed rendering in every field, and the newest revision is
         the record's installed revision (its bound storage UID) or a "Rollback to <it>";
@@ -1024,16 +1049,22 @@ def plan_dispose(c: Ctx) -> Dict:
     if left != ({HELPER: [it["step"] for it in open_]} if open_ else {}):
         problems.append(f"intents with unknown outcomes {left}: only this helper's Helm intents may be open")
     groups = {}
+    hist = history(c)
+    revisions = {h["revision"] for h in hist}
     for it in open_:
         ident = _launch(c, it["step"])
         groups[it["step"]] = procgroup.group_state(ident) if ident else "never-released"
         if groups[it["step"]] not in ("empty", "never-released"):
             problems.append(f"step {it['step']}: its Helm process group is not proven gone ({groups[it['step']]})")
+        made = int(it["data"]["pre"].get("revision", -1)) + 1
+        if ident and made not in revisions:                # released, and the revision it was to write is not there
+            problems.append(f"step {it['step']}: Helm executed and revision {made} does not exist. A request the API "
+                            "server accepted can still commit, and nothing read here can show that it will not: this "
+                            "case is not disposable and stays unresolved")
         if it["data"]["context"].get("release_op") != op:
             problems.append(f"step {it['step']} belongs to another operation than this record's")
     if open_ and not lock_sha:
         problems.append("an intent is open but no lock is held")
-    hist = history(c)
     cur = hist[-1]
     problems += history_problems(hist)
     st = storage(c, cur["revision"])
