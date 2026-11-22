@@ -6,6 +6,8 @@
     release.py --record R apply-upgrade  --plan F --plan-digest D
     release.py --record R plan-rollback                             read-only
     release.py --record R apply-rollback --plan F --plan-digest D
+    release.py --record R plan-dispose                              read-only: evidence for a reviewed disposition
+    release.py --record R dispose        --plan F --plan-digest D
     release.py --record R recover-plan | recover --plan F --plan-digest D
 
 Version 1 changes exactly one thing: the forecaster Deployment's image, and one added environment entry
@@ -20,7 +22,7 @@ the difference, the live forecaster against the installed rendering (every field
 the TLS Secret's metadata, the release's pods, the safety conditions, the operation identifier and the exact argument
 array.
 
-Helm runs once, through helmrun.py (its own process group, recorded durably before it can execute; a deadline, TERM,
+Helm runs once, through procgroup.py (its own process group, recorded durably before it can execute; a deadline, TERM,
 KILL; the group proven empty; output only counted and hashed). The call is journalled with the shared intent protocol:
 the lock is marked unsafe, `intent-<n>` is published, then the command is released. Afterwards the outcome is read, not
 inferred from the exit status:
@@ -48,6 +50,7 @@ The application read-back (pods, certificate, PredictiveAutoscalers, ledger, per
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import hashlib
 import importlib.util
@@ -60,11 +63,13 @@ import sys
 import tarfile
 from typing import Callable, Dict, List, Optional, Tuple
 
+import yaml
+
 import common_records as C
 import execlib as X
-import helmrun
 import imageroll
 import prepare
+import procgroup
 
 HELPER = "release"
 UPGRADE_OP, ROLLBACK_OP = "helm-upgrade", "helm-rollback"
@@ -80,13 +85,25 @@ FORBIDDEN = ("--atomic", "--rollback-on-failure", "--cleanup-on-fail", "--force"
              "--set-json", "--post-renderer")
 DESCRIPTIONS = ("Install complete", "Upgrade complete", "Preparing upgrade")
 ROLLBACK_DESCRIPTION = re.compile(r"Rollback to (\d+)$")
-RUNNER: Callable = helmrun.run            # tests replace these three; the reconcilers have no other way in
+# The options a mutating call carries, in order: an exact list, not only "nothing forbidden".
+UPGRADE_OPTIONS = ("--namespace", "--kubeconfig", "--kube-context", "-f", "--wait", "--timeout", "--labels")
+ROLLBACK_OPTIONS = ("--namespace", "--kubeconfig", "--kube-context", "--wait", "--timeout")
+ENV_KEEP = ("PATH", "HOME", "LANG")       # the whole environment of every command this helper starts
+TLS_TYPE = "kubernetes.io/tls"
+# Templates that may read the live cluster: the forecaster's TLS Secret is kept across upgrades with `lookup`.
+LOOKUP_TEMPLATES = ("templates/forecaster-tls.yaml",)
+ROLES = ("operator", "forecaster", "trainer")
+RUNNER: Callable = procgroup.run          # tests replace these three; the reconcilers have no other way in
 CHARTS: Optional[Callable] = None
 PERMISSIONS: Optional[Callable] = None
 
 
 class ReadError(X.StagingError):
     """A read-only command did not give a usable answer. Carries counts and hashes, never output."""
+
+
+class ToolError(ReadError):
+    """The executable is not the one the record names: it was NOT run."""
 
 
 # --- the context ------------------------------------------------------------------------------------------------------
@@ -106,7 +123,7 @@ class Ctx:
                                                   self.params["release"])
         self.runner = runner or RUNNER
         self.charts = charts or CHARTS or (lambda commit: chart_artifact(record, commit))
-        self.permission_check = permission_check or PERMISSIONS or (lambda: imageroll._operator_permissions(self))
+        self.permission_check = permission_check or PERMISSIONS or (lambda: _permissions(self))
         self.checkout = checkout or (lambda: checkout_problems(repo_root(), record.commit))
         self.k = record.doc["kubeconfig"]
 
@@ -116,6 +133,63 @@ class Ctx:
 
     def conn(self) -> List[str]:
         return ["--namespace", self.control_ns, "--kubeconfig", self.k["path"], "--kube-context", self.k["context"]]
+
+    def run(self, argv: List[str], **kw):
+        """EVERY command of this helper starts here: the executable is verified first, the environment is the
+        whitelist, and the runner is procgroup's (its own group, on record before it can act, bounded, proven
+        empty)."""
+        require_tool(self, argv[0])
+        return self.runner(argv, env=environment(), cwd="/", **kw)
+
+
+def environment() -> Dict[str, str]:
+    return {k: os.environ[k] for k in ENV_KEEP if k in os.environ}
+
+
+def require_tool(c: Ctx, path_: str) -> None:
+    """Nothing is executed unless it is the record's helm or metadata reader, byte for byte."""
+    known = {c.cfg["helm"]["binary"]: c.cfg["helm"]["sha256"],
+             c.cfg["metadata_reader"]["binary"]: c.cfg["metadata_reader"]["sha256"]}
+    if path_ not in known or not os.path.isabs(path_) or not os.path.isfile(path_) or \
+            C.sha256_file(path_) != known[path_]:
+        raise ToolError(f"{os.path.basename(str(path_))} is not the executable the record names (path or sha256): "
+                        "it was not run")
+
+
+def clean(r) -> bool:
+    """A procgroup result that can be believed: the command ran once, ended by itself with status 0, all of its
+    output was read and nothing of its group is left."""
+    return bool(r.started and not r.runner_error and r.exit_kind == "exited" and r.exit_status == 0
+                and r.group_empty is True and r.output_complete and not r.survivors and not r.deadline_exceeded)
+
+
+class _Capture:
+    """The bounded stdout of a READ, in memory only."""
+
+    def __init__(self, limit: int):
+        self.limit, self.kept, self.overflow = limit, bytearray(), False
+
+    def add(self, chunk: bytes) -> None:
+        room = self.limit - len(self.kept)
+        self.kept += chunk[:max(room, 0)]
+        self.overflow = self.overflow or len(chunk) > room
+
+
+def _permissions(c: Ctx) -> Dict[str, Dict]:
+    """The permissions helper's proof, in process, for each of the release's three identities."""
+    import permissions
+    targets = c.c28.demo.target_names(c.params)
+
+    def kubectl(args):
+        p = subprocess.run(["kubectl", "--kubeconfig", c.k["path"], "--context", c.k["context"],
+                            "--request-timeout=30s", *args], capture_output=True, text=True, timeout=120)
+        return p.returncode, p.stdout or ""
+    out = {}
+    for role in ROLES:
+        sa = f"{c.release}-predictive-autoscaler-{role}"
+        out[role] = permissions.verdict(permissions.collect(kubectl, c.control_ns, sa, c.ns, targets, role),
+                                        c.control_ns, sa, targets, c.record.cluster_uid)
+    return out
 
 
 def repo_root() -> str:
@@ -204,13 +278,13 @@ def chart_artifact(record: X.Record, commit: str, repo: Optional[str] = None) ->
 # --- reads: Helm and the storage Secret's metadata --------------------------------------------------------------------
 
 def _read(c: Ctx, argv: List[str], capture: int, what: str) -> bytes:
-    r = c.runner(argv, deadline_s=READ_DEADLINE_S, capture_stdout=capture)
-    if not r.clean_exit() or r.stdout is None:
-        s = r.summary()
-        raise ReadError(f"{what} gave no usable answer (end {s['end']}, exit {s['returncode']}, stdout "
-                        f"{s['stdout']['bytes']} bytes, stderr {s['stderr']['bytes']} bytes, group empty "
-                        f"{s['group_empty']})")
-    return r.stdout
+    cap = _Capture(capture)
+    r = c.run(argv, deadline_s=READ_DEADLINE_S, record=lambda _identity: None, stdout_sink=cap.add)
+    if not clean(r) or cap.overflow:
+        raise ReadError(f"{what} gave no usable answer (started {r.started}, exit {r.exit_kind} {r.exit_status}, "
+                        f"stdout {r.stdout_bytes} bytes, stderr {r.stderr_bytes} bytes, group empty {r.group_empty}, "
+                        f"runner error {r.runner_error}, over the bound {cap.overflow})")
+    return bytes(cap.kept)
 
 
 def describe(text) -> Dict:
@@ -240,15 +314,29 @@ def helm_version(c: Ctx) -> str:
     return _read(c, [c.helm, "version", "--template", "{{.Version}}"], 256, "helm version").decode().strip()
 
 
-def render(c: Ctx, chart_dir: str, values: str) -> Tuple[List[Dict], int]:
-    """helm template, offline, straight into the sanitizer: Secret documents are discarded and nothing unsanitized is
-    stored or returned."""
+def render(c: Ctx, chart_dir: str, values: str) -> Dict:
+    """helm template, offline. Returns {"raw": the documents (IN MEMORY ONLY: they are compared, never stored or
+    printed), "sanitized": what may be hashed and shown, "secrets": the Secret documents as key, type and key names}."""
     argv = [c.helm, "template", c.release, chart_dir, "--namespace", c.control_ns, "-f", values, "--kube-version",
             str(c.cfg["helm"]["kube_version"])]
     for api in c.cfg["helm"].get("api_versions") or []:     # the capabilities the chart may ask the cluster for
         argv += ["--api-versions", str(api)]
     raw = _read(c, argv, RENDER_BYTES, "helm template")
-    return _sanitizer().sanitize_stream(raw.decode())
+    try:
+        text = raw.decode("utf-8")
+        docs = [d for d in yaml.safe_load_all(text) if d]
+    except UnicodeDecodeError:
+        raise ReadError("helm template's output is not UTF-8") from None
+    except yaml.YAMLError as e:
+        mark = getattr(e, "problem_mark", None)            # numbers only: the mark's text quotes the source
+        where = f"line {mark.line + 1}, column {mark.column + 1}" if mark is not None else "position unknown"
+        raise ReadError(f"helm template's output is not valid YAML ({where})") from None
+    if any(not isinstance(d, dict) or not d.get("kind") or not isinstance(d.get("metadata"), dict) for d in docs):
+        raise ReadError("helm template's output holds a document without a kind or metadata")
+    sanitized, _discarded = _sanitizer().sanitize_stream(text)
+    secrets = sorted(({"key": _key(d), "type": d.get("type"), "data_keys": _secret_shape(d)["data_keys"]}
+                      for d in docs if d["kind"] == "Secret"), key=lambda s: s["key"])
+    return {"raw": docs, "sanitized": sanitized, "secrets": secrets}
 
 
 def _sanitizer():
@@ -327,13 +415,37 @@ def _container(dep: Dict) -> Dict:
     return hits[0]
 
 
-def difference(c: Ctx, frm: List[Dict], to: List[Dict]) -> Tuple[Dict, List[str]]:
+def _secret_shape(d: Dict) -> Dict:
+    """A Secret without its values: everything but the contents of data and stringData, whose key names stay."""
+    out = {k: v for k, v in d.items() if k not in ("data", "stringData")}
+    out["data_keys"] = sorted(set(d.get("data") or {}) | set(d.get("stringData") or {}))
+    return out
+
+
+def _same(key: str, a: Dict, b: Dict, tls_key: str) -> bool:
+    """Whether two renderings of one object are equal, compared in memory on the UNSANITIZED documents (a redacted
+    value equals every other redacted value, so the sanitized ones cannot show equality). The one exception is the
+    forecaster's generated TLS Secret: offline there is no lookup, each rendering makes a new certificate, and only
+    its shape is compared."""
+    if a.get("kind") != "Secret" or b.get("kind") != "Secret":
+        return a == b
+    if _secret_shape(a) != _secret_shape(b):
+        return False
+    if key == tls_key and a.get("type") == TLS_TYPE:
+        return True
+    return (a.get("data"), a.get("stringData")) == (b.get("data"), b.get("stringData"))
+
+
+def difference(c: Ctx, frm: Dict, to: Dict) -> Tuple[Dict, List[str]]:
     """What the upgrade changes, and why it is refused if it is anything but: the forecaster container's image
-    (installed digest -> the record's statistical image) and exactly one added environment entry."""
-    a, b = _index(frm), _index(to)
-    key = _key(_forecaster(frm))
+    (installed digest -> the record's statistical image) and exactly one added environment entry. Every document of
+    both renderings takes part, Secrets included; the result names objects, never values."""
+    a, b = _index(frm["raw"]), _index(to["raw"])
+    fc = _forecaster(frm["raw"])
+    key, tls_key = _key(fc), f"Secret/{fc['metadata'].get('namespace') or ''}/{fc['metadata']['name']}-tls"
     diff = {"added": sorted(set(b) - set(a)), "removed": sorted(set(a) - set(b)),
-            "changed": sorted(k for k in set(a) & set(b) if a[k] != b[k]), "forecaster": key}
+            "changed": sorted(k for k in set(a) & set(b) if not _same(k, a[k], b[k], tls_key)), "forecaster": key,
+            "tls_exception": tls_key if a.get(tls_key, {}).get("type") == TLS_TYPE and tls_key in b else None}
     problems = [f"the new rendering adds {k}" for k in diff["added"]] + \
                [f"the new rendering removes {k}" for k in diff["removed"]] + \
                [f"{k} differs between the renderings (only the forecaster's image and one environment entry may)"
@@ -359,20 +471,52 @@ def difference(c: Ctx, frm: List[Dict], to: List[Dict]) -> Tuple[Dict, List[str]
     if expected != b[key]:
         problems.append("the forecaster Deployment differs in more than its image and that environment entry")
     diff.update(from_image=old.get("image"), to_image=new.get("image"),
-                added_env=[e for e in new_env if e not in old_env])
+                added_env_names=sorted(str(e.get("name")) for e in new_env if e not in old_env))
     return diff, problems
 
 
+def _path_only(message: str) -> str:
+    """A spec_diff finding without the values it quotes."""
+    path_, _, rest = message.partition(": ")
+    kind = rest if rest == "rendered, absent live" or "rendered entries" in rest else \
+        "live only" if rest.startswith("live only") else "the values differ"
+    return f"{path_}: {kind}"
+
+
 def live_problems(c: Ctx, rendered: Dict) -> Tuple[Dict, List[str]]:
-    """The live forecaster against a rendering: every field, minus the enumerated server defaults. (Both sides pass
-    the sanitizer, which keeps the structure and redacts literal credential values.)"""
+    """The live forecaster against the UNSANITIZED rendering: every field, minus the enumerated server defaults,
+    compared in memory; a finding names the path, never a value."""
     name = rendered["metadata"]["name"]
     live = c.kube.get("Deployment", name, c.control_ns)
     if live is None:
         return {"name": name}, [f"Deployment {name} does not exist"]
-    diffs = imageroll.spec_diff(rendered["spec"], C.sanitize_object(live)["spec"])
+    diffs = imageroll.spec_diff(rendered["spec"], live["spec"])
     return ({"name": name, "uid": live["metadata"]["uid"], "generation": live["metadata"].get("generation")},
-            [f"the live forecaster differs from the rendering: {d}" for d in diffs])
+            [f"the live forecaster differs from the rendering: {_path_only(d)}" for d in diffs])
+
+
+def live_dependence(c: Ctx, chart_dir: str) -> Tuple[Dict, List[str]]:
+    """Where a chart tree reads the live cluster while rendering, which an offline rendering cannot show: `lookup`
+    and `.Capabilities`, counted per template file. Refused: a lookup outside the reviewed exception (the forecaster's
+    TLS Secret, whose preservation the read-back checks), and capabilities the record does not bind."""
+    found: Dict[str, Dict[str, int]] = {"lookup": {}, "capabilities": {}}
+    for root, dirs, files in os.walk(chart_dir):
+        dirs.sort()
+        for f in sorted(files):
+            rel = os.path.relpath(os.path.join(root, f), chart_dir)
+            if rel.split(os.sep)[0] not in ("templates", "charts"):
+                continue
+            with open(os.path.join(root, f), encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+            for name, rx in (("lookup", r"\blookup\b"), ("capabilities", r"\.Capabilities\b")):
+                if re.findall(rx, text):
+                    found[name][rel] = len(re.findall(rx, text))
+    problems = [f"the chart reads the live cluster with lookup in {rel}: only {list(LOOKUP_TEMPLATES)} is reviewed"
+                for rel in sorted(found["lookup"]) if rel not in LOOKUP_TEMPLATES]
+    if found["capabilities"] and "api_versions" not in c.cfg["helm"]:
+        problems.append(f"the chart asks for the cluster's capabilities in {sorted(found['capabilities'])}: the "
+                        "record must bind helm.api_versions")
+    return found, problems
 
 
 # --- conditions -------------------------------------------------------------------------------------------------------
@@ -410,9 +554,11 @@ def safety_problems(c: Ctx, admit: Optional[Dict[str, List[str]]] = None) -> Lis
         out.append(f"intents with unknown outcomes {left}: recover first")
     out += prepare.verify(c.record, c.kube)["problems"]
     out += prepare.demonstration_gate(c.record, c.kube, c.params, c.s, prepare.split(c.params, "demonstration"))[1]
-    perm = c.permission_check()
-    if perm.get("verdict") != "pass" or perm.get("write_grants"):
-        out.append(f"the operator's replica-write permission is not proven absent (verdict {perm.get('verdict')})")
+    perms = c.permission_check()
+    for role in ROLES:                                     # each of the release's identities, none assumed
+        p = perms.get(role) or {}
+        if p.get("verdict") != "pass" or p.get("write_grants"):
+            out.append(f"the {role}'s replica-write permission is not proven absent (verdict {p.get('verdict')})")
     return out
 
 
@@ -455,33 +601,51 @@ def _forbidden(argv: List[str]) -> List[str]:
     return [f"the argument array carries {a}" for a in argv if a.split("=", 1)[0] in FORBIDDEN]
 
 
+def argv_problems(c: Ctx, argv: List[str], verb: str, options: Tuple[str, ...]) -> List[str]:
+    """The mutating call's shape is an exact allowlist: helm, the verb, the release, one positional, and exactly
+    these options in this order (each but --wait with one value)."""
+    out = _forbidden(argv)
+    if argv[:3] != [c.helm, verb, c.release] or len(argv) != 4 + 2 * len(options) - 1:
+        out.append(f"the argument array is not helm {verb} <release> <one argument> and the reviewed options")
+    got = tuple(a for a in argv[4:] if a.startswith("-"))
+    if got != options:
+        out.append(f"the argument array's options are {list(got)}, not exactly {list(options)}")
+    return out
+
+
 # --- plan-upgrade -----------------------------------------------------------------------------------------------------
 
-def _common(c: Ctx) -> Tuple[Dict, List[str], Dict, List[Dict], List[Dict]]:
+def _common(c: Ctx) -> Tuple[Dict, List[str], Dict, Dict, Dict]:
     """What both plans bind: configuration, helm, the charts, the renderings and their difference."""
     problems = config_problems(c)
     cfg = c.cfg
+    for tool in (cfg["helm"]["binary"], cfg["metadata_reader"]["binary"]):
+        require_tool(c, tool)                              # before ANY invocation: a wrong executable is never run
     version = helm_version(c)
     if version != cfg["helm"]["version"]:
         problems.append(f"helm is {version}, the record names {cfg['helm']['version']}")
     frm, to = c.charts(cfg["from"]["commit"]), c.charts(c.record.commit)
-    frm_docs, frm_secrets = render(c, frm["dir"], c.record.resolve(cfg["from"]["values"]))
-    to_docs, to_secrets = render(c, to["dir"], c.record.resolve(cfg["to"]["values"]))
-    diff, dp = difference(c, frm_docs, to_docs)
+    dep_from, p1 = live_dependence(c, frm["dir"])
+    dep_to, p2 = live_dependence(c, to["dir"])
+    frm_r = render(c, frm["dir"], c.record.resolve(cfg["from"]["values"]))
+    to_r = render(c, to["dir"], c.record.resolve(cfg["to"]["values"]))
+    diff, dp = difference(c, frm_r, to_r)
+    problems += p1 + p2
     bound = {"release": c.release, "namespace": c.control_ns, "cluster_uid": c.record.cluster_uid,
              "source_commit": c.record.commit,
              "helm": {"binary": cfg["helm"]["binary"], "sha256": cfg["helm"]["sha256"], "version": version},
              "charts": {"from": frm, "to": to},
              "values": {"from": {"path": cfg["from"]["values"], "sha256": cfg["from"]["values_sha256"]},
                         "to": {"path": cfg["to"]["values"], "sha256": cfg["to"]["values_sha256"]}},
-             "renders": {"from": {"sha256": _sha(frm_docs), "objects": len(frm_docs), "secrets_discarded": frm_secrets},
-                         "to": {"sha256": _sha(to_docs), "objects": len(to_docs), "secrets_discarded": to_secrets}},
+             "renders": {which: {"sha256": _sha(r["sanitized"]), "objects": len(r["sanitized"]),
+                                 "secrets": r["secrets"]} for which, r in (("from", frm_r), ("to", to_r))},
+             "live_dependence": {"from": dep_from, "to": dep_to},
              "difference": diff}
-    return bound, problems + dp, {"from": frm, "to": to}, frm_docs, to_docs
+    return bound, problems + dp, {"from": frm, "to": to}, frm_r, to_r
 
 
 def plan_upgrade(c: Ctx) -> Dict:
-    bound, problems, charts, frm_docs, _to_docs = _common(c)
+    bound, problems, charts, frm_r, _to_r = _common(c)
     cfg, frm_rev = c.cfg, int(c.cfg["from"]["revision"])
     hist = history(c)
     problems += history_problems(hist)
@@ -490,7 +654,7 @@ def plan_upgrade(c: Ctx) -> Dict:
     st = storage(c, frm_rev)
     if not st["helm_object"]:
         problems.append(f"the storage Secret of revision {frm_rev} was not found as Helm's object for this release")
-    fc = _forecaster(frm_docs)
+    fc = _forecaster(frm_r["raw"])
     live, lp = live_problems(c, fc)
     tls = secret_meta(c, f"{fc['metadata']['name']}-tls")
     if not tls["found"]:
@@ -502,7 +666,7 @@ def plan_upgrade(c: Ctx) -> Dict:
     timeout = cfg["helm"]["timeout"]
     argv = [c.helm, "upgrade", c.release, charts["to"]["dir"], *c.conn(), "-f", c.record.resolve(cfg["to"]["values"]),
             "--wait", "--timeout", timeout, "--labels", f"{OP_LABEL}={op}"]
-    problems += lp + safety_problems(c) + _forbidden(argv)
+    problems += lp + safety_problems(c) + argv_problems(c, argv, "upgrade", UPGRADE_OPTIONS)
     action = {"op": UPGRADE_OP, "argv": argv, "deadline_s": _timeout_s(timeout) + MARGIN_S,
               "from_revision": frm_rev, "expected_revision": frm_rev + 1, "rollback_to": frm_rev}
     return X.new_plan(HELPER, c.record, [action], kind="upgrade", operation=op, history=hist,
@@ -510,11 +674,11 @@ def plan_upgrade(c: Ctx) -> Dict:
                       tls={k: tls[k] for k in ("name", "uid", "resourceVersion")}, pods=release_pods(c),
                       notes=["applied means Helm recorded this revision as deployed; the application read-back is a "
                              "separate reviewed step",
-                             "both renderings are made offline with the record's kube_version and api_versions: "
-                             "what the chart renders from the live cluster (lookup, other capabilities) is not in "
-                             "the difference",
-                             "the TLS Secret is rendered anew offline and discarded in both renderings; its live UID "
-                             "and resourceVersion above are what the read-back compares"],
+                             "both renderings are made offline with the record's kube_version and api_versions; "
+                             "live_dependence lists every template that reads the live cluster, and the only "
+                             "reviewed one is the forecaster's TLS Secret (kept with lookup)",
+                             "offline the TLS Secret is generated anew in each rendering: only its shape is "
+                             "compared; its live UID and resourceVersion above are what the read-back compares"],
                       problems=sorted(set(problems)), **bound)
 
 
@@ -541,7 +705,10 @@ def observe_upgrade(c: Ctx, from_revision: int, from_uid: str, op: str) -> Dict:
         if newest["revision"] != want or _gap(hist):
             return {**base, "classification": "foreign", "why": "the history is not the installed revision plus one"}
         old, st = storage(c, from_revision), storage(c, want)
-        if old["found"] and old["uid"] != from_uid:
+        if not old["helm_object"]:                         # missing evidence is not continuity
+            return {**base, "classification": "unknown",
+                    "why": "the installed revision's storage Secret is missing or is not Helm's object"}
+        if old["uid"] != from_uid:
             return {**base, "classification": "foreign", "why": "the installed revision's storage Secret was replaced"}
         if not st["helm_object"] or st["operation"] != op:
             return {**base, "classification": "foreign",
@@ -608,23 +775,24 @@ def _submit(c: Ctx, lock, plan: Dict, plan_digest: str, pre: Dict, judge: Callab
               "pre": pre, "expect": [], "body_sha256": _sha(action["argv"]),
               "mark": f"{c.record.run_id}/{HELPER}/{n}",
               "context": {"operation": action["op"], "release_op": plan["operation"], "plan_sha256": plan_digest}}
+    require_tool(c, action["argv"][0])                    # before anything is journalled
     lock.safe = False
     X.receipt(c.record, HELPER, f"intent-{n}", intent)
-    released: List[Dict] = []
 
     def record_identity(ident: Dict) -> None:
         X.receipt(c.record, HELPER, "helm-launch", {"step": n, "identity": ident})
-        released.append(ident)
     try:
-        result = c.runner(action["argv"], deadline_s=action["deadline_s"], record_identity=record_identity)
-    except BaseException:
-        if not released:                                   # the identity was never durable: nothing was executed
-            X.receipt(c.record, HELPER, f"step-{n}", {**intent, "result": "not-applied",
-                                                       "post": {"why": "the command was never released"}})
-            lock.safe = True
-        raise
-    summary = result.summary()
-    outcome = judge(result) if result.group_empty else {
+        result = c.run(action["argv"], deadline_s=action["deadline_s"], record=record_identity)
+        never = None if result.started else (result.runner_error or "the gate was not opened")
+    except ToolError:
+        result, never = None, "the executable changed after the plan"
+    if never is not None:                                  # procgroup: started is False only when nothing executed
+        X.receipt(c.record, HELPER, f"step-{n}", {**intent, "result": "not-applied",
+                                                   "post": {"why": "the command was never released", "runner": never}})
+        lock.safe = True
+        raise X.StagingError(f"the Helm command was never released ({never}): nothing was executed")
+    summary = result.as_dict()
+    outcome = judge(result) if result.group_empty is True else {
         "classification": "unknown", "why": "the command's process group could not be proven empty"}
     if outcome["classification"] == "applied":
         r = X.receipt(c.record, HELPER, f"step-{n}", {**intent, "result": "applied", "post": outcome["post"],
@@ -665,7 +833,13 @@ def _launch(c: Ctx, step: str) -> Optional[Dict]:
 
 
 def plan_rollback(c: Ctx) -> Dict:
-    bound, problems, charts, frm_docs, to_docs = _common(c)
+    for tool in (c.cfg["helm"]["binary"], c.cfg["metadata_reader"]["binary"]):
+        require_tool(c, tool)
+    fin = _finalize_plan(c)
+    if fin is not None:
+        return fin
+    bound, problems, charts, _frm_r, to_r = _common(c)
+    to_docs = to_r["raw"]
     cfg, dest = c.cfg, int(c.cfg["from"]["revision"])
     hist = history(c)
     cur = hist[-1]
@@ -685,9 +859,9 @@ def plan_rollback(c: Ctx) -> Dict:
         else:
             admit = {HELPER: [mine[0]["step"]]}
             ident = _launch(c, mine[0]["step"])
-            gone, why = helmrun.group_gone(ident) if ident else (True, "never released")
-            if not gone:
-                problems.append(f"the upgrade's Helm process group is not proven gone: {why}")
+            state = procgroup.group_state(ident) if ident else "empty"       # no launch receipt: never released
+            if state != "empty":
+                problems.append(f"the upgrade's Helm process group is not proven gone: it is {state}")
         if cur["status"] not in ("failed", "pending-upgrade"):
             problems.append(f"the unresolved upgrade's revision is {cur['status']}: only failed or pending-upgrade is "
                             "rolled back under the recovery guard")
@@ -703,7 +877,7 @@ def plan_rollback(c: Ctx) -> Dict:
         problems += lp
     timeout = cfg["helm"]["timeout"]
     argv = [c.helm, "rollback", c.release, str(dest), *c.conn(), "--wait", "--timeout", timeout]
-    problems += safety_problems(c, admit) + _forbidden(argv)
+    problems += safety_problems(c, admit) + argv_problems(c, argv, "rollback", ROLLBACK_OPTIONS)
     action = {"op": ROLLBACK_OP, "argv": argv, "deadline_s": _timeout_s(timeout) + MARGIN_S,
               "from_revision": cur["revision"], "expected_revision": cur["revision"] + 1, "destination": dest}
     return X.new_plan(HELPER, c.record, [action], kind="rollback", form=form, operation=op, history=hist,
@@ -725,33 +899,184 @@ def apply_rollback(c: Ctx, reviewed: Dict, reviewed_digest: str) -> Dict:
         a = live["actions"][0]
         return live, _submit(c, lock, live, reviewed_digest,
                              {"revision": a["from_revision"], "destination": a["destination"]},
-                             lambda res: observe_rollback(c, a["from_revision"], a["destination"], res.clean_exit()))
-    if reviewed.get("form") != "unresolved":
+                             lambda res: observe_rollback(c, a["from_revision"], a["destination"], clean(res)))
+    if reviewed.get("form") == "applied":
         with X.mutating(c.record, c.kube, HELPER, {"operation": ROLLBACK_OP}) as lock:
             return go(lock)[1]
     # The upgrade is unresolved: its executor's stale lock stays in place for the whole rollback (no helper can start),
     # the recovery guard proves that executor gone, and the plan admitted only that upgrade's own open intent.
+    with _guard(c, reviewed) as guard:
+        if reviewed.get("form") == "finalize":             # the rollback is already applied and receipted: no Helm
+            live = plan_rollback(c)
+            X.require_live(reviewed, reviewed_digest, HELPER, c.record, live)
+            if live.get("form") != "finalize" or live["problems"]:
+                raise X.StagingError(f"the finalize plan has problems: {live['problems']}")
+            a = live["actions"][0]
+            return _settle(c, guard, [a["upgrade_step"]], "rolled-back", f"step-{a['rollback_step']}",
+                           live["operation"], reviewed_digest, reviewed)
+        upgrade = [it["step"] for it in _open(c)]
+        live, done = go(_Retained())
+        _settle(c, guard, upgrade, "rolled-back", done["event"], live["operation"], reviewed_digest, reviewed)
+        return done
+
+
+@contextlib.contextmanager
+def _guard(c: Ctx, reviewed: Dict):
+    """The recovery guard on the lock the reviewed plan bound (its executor proven gone, one recoverer), with the
+    cluster and the image fence checked inside."""
     with C.recovery_guard(c.record.doc, X.LOCK_SCOPE, reviewed.get("lock_sha256", "")) as guard:
         C.require_cluster(c.kube.api, c.record.cluster_uid)
         fence = X.image_fence(c.record)
         if fence:
-            raise X.StagingError(f"image transition {fence} is open: the rollback is refused; the lock stays")
-        upgrade = [it["step"] for it in _open(c)]
-        live, done = go(_Retained())
-        for n in upgrade:
-            X.receipt(c.record, HELPER, f"reconciled-{n}", {
-                "observed": "rolled-back", "by": done["event"], "why": "the reviewed rollback of this upgrade applied",
-                "context": {"operation": UPGRADE_OP, "release_op": live["operation"]}})
-        import transition_records
-        held = transition_records.release_problem(c.record, guard)
-        if held:
-            raise X.StagingError(f"the rollback applied, but the Active transition still needs handling ({held}): "
-                                 "the lock stays")
-        guard.release_stale()
-        X.receipt(c.record, "recover", "lock-recovered", {"plan_sha256": reviewed_digest,
-                                                          "lock_sha256": reviewed.get("lock_sha256", ""),
-                                                          "by": "release rollback"})
-        return done
+            raise X.StagingError(f"image transition {fence} is open: refused; the lock stays")
+        yield guard
+
+
+def _settle(c: Ctx, guard, steps: List[str], observed: str, by: str, op: str, digest: str, reviewed: Dict,
+            **extra) -> Dict:
+    """Under the entered guard: reconciled-<n> for each named open intent, then the stale lock is released if
+    nothing else holds it. Safe to repeat after an interruption (an intent already reconciled is skipped)."""
+    last = None
+    still = {it["step"] for it in _open(c)}
+    for n in steps:
+        if n in still:
+            last = X.receipt(c.record, HELPER, f"reconciled-{n}", {
+                "observed": observed, "by": by, "plan_sha256": digest, "context": {"release_op": op}, **extra})
+    import transition_records
+    held = transition_records.release_problem(c.record, guard)
+    if held:
+        raise X.StagingError(f"settled, but the Active transition still needs handling ({held}): the lock stays")
+    guard.release_stale()
+    X.receipt(c.record, "recover", "lock-recovered", {"plan_sha256": digest,
+                                                      "lock_sha256": reviewed.get("lock_sha256", ""),
+                                                      "by": f"release {reviewed.get('kind')}"})
+    return last or {"event": "nothing-to-reconcile", "data": {}}
+
+
+def _applied_rollback(c: Ctx, op: str, after: str) -> Optional[Tuple[str, Dict]]:
+    """(step, its data) of a rollback of this operation that Helm applied and that is durably receipted, journalled
+    after the given step."""
+    for n, st in sorted(X._steps(X.receipts(c.record, HELPER)).items(), key=lambda kv: -int(kv[0])):
+        it = st["intent"]
+        if it and it["op"] == ROLLBACK_OP and it["context"].get("release_op") == op and int(n) > int(after) \
+                and (st["outcome"] or {}).get("result") == "applied":
+            return n, st["outcome"]
+    return None
+
+
+def _finalize_plan(c: Ctx) -> Optional[Dict]:
+    """The state an interruption leaves between a rollback's durable `applied` receipt and the reconciliation of the
+    upgrade it rolled back: the upgrade's intent is the one open intent and the lock is still held. Finishing it
+    needs no Helm: the plan binds the evidence that the applied rollback is still the release's state."""
+    open_ = _open(c)
+    if len(open_) != 1 or open_[0]["data"]["op"] != UPGRADE_OP:
+        return None
+    n, op = open_[0]["step"], open_[0]["data"]["context"].get("release_op")
+    done = _applied_rollback(c, op, n)
+    if done is None:
+        return None
+    m, step = done
+    problems = []
+    hist = history(c)
+    cur, post = hist[-1], step["post"]
+    if cur["revision"] != post["revision"] or cur["status"] != "deployed" or _gap(hist) or \
+            cur["description_class"] != f"Rollback to {step['pre']['destination']}":
+        problems.append(f"the newest revision is not the applied rollback's revision {post['revision']}, deployed")
+    st = storage(c, post["revision"])
+    if not st["helm_object"] or st["uid"] != post["uid"]:
+        problems.append("the rollback revision's storage Secret is not the one its receipt recorded")
+    lock_sha = _lock_sha(c)
+    if not lock_sha:
+        problems.append("an intent is open but no lock is held")
+    left = C.unresolved_intents(c.record.doc)
+    if left != {HELPER: [n]}:
+        problems.append(f"intents with unknown outcomes {left}: only the rolled-back upgrade's may be open")
+    action = {"op": "finalize-rollback", "upgrade_step": n, "rollback_step": m, "revision": post["revision"]}
+    return X.new_plan(HELPER, c.record, [action], kind="rollback", form="finalize", operation=op, history=hist,
+                      storage={"revision": post["revision"], "name": st["name"], "uid": st["uid"]},
+                      lock_sha256=lock_sha, release=c.release, namespace=c.control_ns,
+                      notes=["the rollback was applied and receipted; this only records that for the upgrade's "
+                             "intent and releases the dead executor's lock: Helm is not run"],
+                      problems=sorted(set(problems)))
+
+
+# --- the reviewed disposition of what the helper cannot decide ----------------------------------------------------------
+
+def plan_dispose(c: Ctx) -> Dict:
+    """For open Helm intents that neither recovery nor a rollback may decide (an interrupted rollback, an upgrade
+    without revision evidence): the evidence that the release is in ONE of the two reviewed states, for a person to
+    review. Required, all of it:
+      - only this helper's intents are open, and the Helm process group of each is proven gone;
+      - the newest revision is the one `deployed` revision, without a gap;
+      - installed: the live forecaster equals the installed rendering in every field, and the newest revision is
+        the record's installed revision (its bound storage UID) or a "Rollback to <it>";
+        upgraded:  the live forecaster equals the new rendering in every field, and the newest revision is installed+1
+        with this operation's identifier on its storage Secret;
+      - the plan is recomputed at `dispose` and must be identical: the state did not move during the review.
+    Anything else is refused: bring the release into one of the two states by hand, then plan again."""
+    bound, problems, charts, frm_r, to_r = _common(c)
+    frm_rev = int(c.cfg["from"]["revision"])
+    op = operation_id(c, frm_rev, charts["from"], charts["to"])
+    open_, lock_sha = _open(c), _lock_sha(c)
+    if not open_:
+        problems.append("no Helm intent of this helper is open: there is nothing to dispose of")
+    left = C.unresolved_intents(c.record.doc)
+    if left != ({HELPER: [it["step"] for it in open_]} if open_ else {}):
+        problems.append(f"intents with unknown outcomes {left}: only this helper's Helm intents may be open")
+    groups = {}
+    for it in open_:
+        ident = _launch(c, it["step"])
+        groups[it["step"]] = procgroup.group_state(ident) if ident else "never-released"
+        if groups[it["step"]] not in ("empty", "never-released"):
+            problems.append(f"step {it['step']}: its Helm process group is not proven gone ({groups[it['step']]})")
+        if it["data"]["context"].get("release_op") != op:
+            problems.append(f"step {it['step']} belongs to another operation than this record's")
+    if open_ and not lock_sha:
+        problems.append("an intent is open but no lock is held")
+    hist = history(c)
+    cur = hist[-1]
+    problems += history_problems(hist)
+    st = storage(c, cur["revision"])
+    if not st["helm_object"]:
+        problems.append("the newest revision's storage Secret was not found as Helm's object")
+    bound_uid = next((it["data"]["pre"].get("storage_uid") for it in open_ if it["data"]["op"] == UPGRADE_OP), None)
+    live_from, d_from = live_problems(c, _forecaster(frm_r["raw"]))
+    _live_to, d_to = live_problems(c, _forecaster(to_r["raw"]))
+    installed_rev = (cur["revision"] == frm_rev and (bound_uid is None or st["uid"] == bound_uid)) or \
+        cur["description_class"] == f"Rollback to {frm_rev}"
+    upgraded_rev = cur["revision"] == frm_rev + 1 and st["operation"] == op
+    state = "installed" if not d_from and installed_rev else "upgraded" if not d_to and upgraded_rev else None
+    if state is None:
+        problems.append(f"the release is in neither reviewed state (the live forecaster differs from the installed "
+                        f"rendering in {len(d_from)} fields and from the new one in {len(d_to)}; newest revision "
+                        f"{cur['revision']}, {cur['description_class']}): bring it into one by hand, then plan again")
+    perms = c.permission_check()
+    for role in ROLES:
+        p = perms.get(role) or {}
+        if p.get("verdict") != "pass" or p.get("write_grants"):
+            problems.append(f"the {role}'s replica-write permission is not proven absent (verdict {p.get('verdict')})")
+    actions = [{"op": "dispose", "step": it["step"], "intent_op": it["data"]["op"], "state": state} for it in open_]
+    return X.new_plan(HELPER, c.record, actions, kind="dispose", operation=op, state=state, history=hist,
+                      storage={"revision": cur["revision"], "name": st["name"], "uid": st["uid"]},
+                      forecaster=live_from, groups=groups, lock_sha256=lock_sha, pods=release_pods(c),
+                      evidence={"differs_from_installed": len(d_from), "differs_from_new": len(d_to)},
+                      notes=["a disposition is a reviewed statement that the release is in the named state; it runs "
+                             "no Helm and changes nothing in the cluster",
+                             "after it, a further upgrade needs a record whose installed revision is the newest one"],
+                      problems=sorted(set(problems)), **bound)
+
+
+def dispose(c: Ctx, reviewed: Dict, reviewed_digest: str) -> Dict:
+    with _guard(c, reviewed) as guard:
+        live = plan_dispose(c)
+        X.require_live(reviewed, reviewed_digest, HELPER, c.record, live)
+        if live.get("kind") != "dispose" or live["problems"] or not live["actions"]:
+            raise X.StagingError(f"the disposition plan has problems: {live['problems']}")
+        X.receipt(c.record, HELPER, "disposition", {"plan_sha256": reviewed_digest, "state": live["state"],
+                                                    "steps": [a["step"] for a in live["actions"]],
+                                                    "revision": live["storage"]["revision"]})
+        return _settle(c, guard, [a["step"] for a in live["actions"]], "disposed", "disposition", live["operation"],
+                       reviewed_digest, reviewed, state=live["state"])
 
 
 # --- recovery ---------------------------------------------------------------------------------------------------------
@@ -776,9 +1101,9 @@ def _reconcile(kube: X.Kube, d: Dict, record: X.Record) -> Dict:
     ident = X.last(X.receipts(record, HELPER), "helm-launch", step=step)
     if ident is None:
         return {"observed": "not-done", "state": "not-applied", "why": "the command was never released"}
-    gone, why = helmrun.group_gone(ident["data"]["identity"])
-    if not gone:
-        return {"observed": "unresolved", "why": f"the Helm process group is not proven gone: {why}"}
+    state = procgroup.group_state(ident["data"]["identity"])
+    if state != "empty":                                   # "alive", or "unknown" (another host or boot, no /proc)
+        return {"observed": "unresolved", "why": f"the Helm process group is not proven gone: it is {state}"}
     if d["op"] != UPGRADE_OP:
         return {"observed": "unresolved", "why": "an interrupted rollback has ambiguous provenance: reviewed "
                                                  "disposition by hand"}
@@ -812,9 +1137,9 @@ def main(argv: Optional[List[str]] = None, api=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--record", required=True)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("status", "plan-upgrade", "plan-rollback", "recover-plan"):
+    for name in ("status", "plan-upgrade", "plan-rollback", "plan-dispose", "recover-plan"):
         sub.add_parser(name)
-    for name in ("apply-upgrade", "apply-rollback", "recover"):
+    for name in ("apply-upgrade", "apply-rollback", "dispose", "recover"):
         p = sub.add_parser(name)
         p.add_argument("--plan", required=True)
         p.add_argument("--plan-digest", required=True)
@@ -836,6 +1161,10 @@ def main(argv: Optional[List[str]] = None, api=None) -> int:
         X.emit(apply_upgrade(c, X.load_plan(a.plan), a.plan_digest))
     elif a.cmd == "plan-rollback":
         X.emit(X.cli_plan(record, HELPER, plan_rollback(c), "plan-rollback"))
+    elif a.cmd == "plan-dispose":
+        X.emit(X.cli_plan(record, HELPER, plan_dispose(c), "plan-dispose"))
+    elif a.cmd == "dispose":
+        X.emit(dispose(c, X.load_plan(a.plan), a.plan_digest))
     else:
         X.emit(apply_rollback(c, X.load_plan(a.plan), a.plan_digest))
     return 0

@@ -1,5 +1,5 @@
 """release.py against a fake Helm state machine and the in-memory API: no test runs helm (the process runner has its
-own tests, test_helmrun.py). The fake models Helm 3.19's history (pending and failure descriptions), the storage
+own tests, test_procgroup.py). The fake models Helm 3.19's history (pending and failure descriptions), the storage
 Secrets' metadata, lost answers, foreign revisions and an interruption during a rollback; every byte it "prints"
 carries a marker that must appear nowhere."""
 
@@ -14,6 +14,7 @@ import yaml
 import common_records as C
 import execlib as X
 import part2_fixtures as PF
+import procgroup as P
 import release as R
 from part2_fixtures import api  # noqa: F401
 from test_imageroll import PASS, W, served
@@ -24,38 +25,37 @@ HELM, META = "helm-bin", "secretmeta-bin"
 OLD_IMAGE = "harbor.example/autoscaler/statistical@sha256:" + "c" * 64
 
 
-class Result:
-    def __init__(self, end="exited", returncode=0, group_empty=True, stdout=None, ident=None):
-        self.end, self.returncode, self.group_empty, self.output_complete = end, returncode, group_empty, True
-        self.stdout, self.identity = stdout, ident or {}
+IDENT = {"pid": 4242, "pgid": 4242, "start": "777", "host": "test", "boot_id": "b"}
 
-    def clean_exit(self):
-        return self.end == "exited" and self.returncode == 0 and self.group_empty
 
-    def summary(self):
-        h = hashlib.sha256(MARKER.encode()).hexdigest()
-        return {"identity": dict(self.identity), "end": self.end, "returncode": self.returncode,
-                "group_empty": self.group_empty, "output_complete": True,
-                "stdout": {"bytes": len(MARKER), "sha256": h}, "stderr": {"bytes": len(MARKER), "sha256": h},
-                "seconds": 1.0}
+def result(**over):
+    """What procgroup.run returns for a command that ran once and ended cleanly, unless told otherwise."""
+    h = hashlib.sha256(MARKER.encode()).hexdigest()
+    base = dict(started=True, identity=dict(IDENT), exit_kind="exited", exit_status=0, group_empty=True,
+                output_complete=True, stdout_bytes=len(MARKER), stdout_sha256=h, stderr_bytes=len(MARKER),
+                stderr_sha256=h)
+    base.update(over)
+    return P.Result(**base)
 
 
 class FakeHelm:
-    """`runner(argv, deadline_s=, record_identity=, capture_stdout=)` for helm and for c28-secretmeta. upgrade /
-    rollback behave as `self.mode` says:
+    """procgroup.run's interface (argv, env=, cwd=, deadline_s=, record=, stdout_sink=) for helm and for
+    c28-secretmeta. upgrade / rollback behave as `self.mode` says:
       ok            the new revision deployed (and the forecaster changed in the cluster)
       fail          the new revision `failed`, its description an error text
       pending       the new revision `pending-upgrade`, then helm is killed at the deadline
       lost          helm exits 1 and nothing is recorded      hang   helm is terminated, nothing is recorded
       foreign       a revision appears that does not carry the operation's label
-      leftover      deployed, but a process of helm's group survives
-      unrecorded    the identity cannot be made durable (the receipt write fails)
-      storage-swap  deployed, but the installed revision's storage Secret was replaced meanwhile"""
+      leftover      deployed, but the group could not be proven empty
+      unrecorded    the gate is never opened (the identity could not be made durable)
+      storage-swap  deployed, but the installed revision's storage Secret was replaced meanwhile
+      storage-gone  deployed, but the installed revision's storage Secret is gone"""
 
     def __init__(self, w, from_docs, to_docs):
         self.w, self.docs, self.mode, self.calls, self.identity_seen = w, {"from": from_docs, "to": to_docs}, "ok", [], []
         self.version, self.fail_reads, self.uids, self.at_launch = "v3.19.0", set(), 0, None
         self.dirty_reads = {}                                   # command -> what was wrong with an answer it DID give
+        self.raw_template = None                                # bytes to print instead of a rendering
         self.revisions = [self.rev(1, "deployed", "Install complete")]
         self.tls = {"uid": "tls-uid-1", "resourceVersion": "41"}
 
@@ -67,47 +67,51 @@ class FakeHelm:
     def mutating(self):
         return [c for c in self.calls if c[0].endswith(HELM) and c[1] in ("upgrade", "rollback")]
 
-    def __call__(self, argv, deadline_s, record_identity=None, capture_stdout=0):
+    def __call__(self, argv, *, env, cwd, deadline_s, record, stdout_sink=None):
         self.calls.append(list(argv))
+        assert cwd == "/" and set(env) <= set(R.ENV_KEEP) and os.path.isabs(argv[0])
         tool, cmd = os.path.basename(argv[0]), argv[1]
         if tool == META:
-            return self.meta(argv)
-        if cmd in self.fail_reads:
-            return Result(returncode=1)
+            return self.meta(argv, stdout_sink)
         if cmd in ("version", "history", "template"):
+            if cmd in self.fail_reads:
+                return result(exit_status=1)
             if cmd == "version":
                 out = self.version.encode()
             elif cmd == "history":
-                assert argv[-2:] == ["-o", "json"] and capture_stdout
+                assert argv[-2:] == ["-o", "json"]
                 out = json.dumps([{k: r[k] for k in ("revision", "status", "chart", "app_version", "description")}
                                   | {"updated": "now"} for r in self.revisions]).encode()
             else:
                 assert "--kubeconfig" not in argv and "--kube-context" not in argv      # offline
-                out = yaml.safe_dump_all(self.docs["from" if "/from-tree/" in argv[3] else "to"]).encode()
-            return Result(stdout=out, **self.dirty_reads.get(cmd, {}))
-        ident = {"pid": 4242, "pgid": 4242, "pid_start": "777", "host": "test", "boot_id": "b"}
+                out = self.raw_template or \
+                    yaml.safe_dump_all(self.docs["from" if "/from-tree/" in argv[3] else "to"]).encode()
+            stdout_sink(out)
+            return result(**self.dirty_reads.get(cmd, {}))
+        assert stdout_sink is None                               # a mutating call's output goes nowhere
         if self.mode == "unrecorded":
-            raise OSError("the launch receipt could not be written")
-        record_identity(ident)
-        self.identity_seen.append(ident)
+            return P.Result(started=False, runner_error="OSError", exit_kind="never-executed")
+        record(dict(IDENT))
+        self.identity_seen.append(dict(IDENT))
         if self.at_launch:
             self.at_launch()
-        return {"upgrade": self.upgrade, "rollback": self.rollback}[cmd](argv, ident)
+        return {"upgrade": self.upgrade, "rollback": self.rollback}[cmd](argv)
 
-    def meta(self, argv):
+    def meta(self, argv, sink):
         name, keys = argv[argv.index("--name") + 1], [argv[i + 1] for i, a in enumerate(argv) if a == "--label-key"]
         if "meta" in self.fail_reads:
-            return Result(returncode=3)
+            return result(exit_status=3)
         doc = {"schema": "c28-secret-metadata/v1", "namespace": self.w.control_ns, "name": name, "found": False}
         if name.endswith("-tls"):
             doc.update(found=True, **self.tls)
         for r in self.revisions:
-            if name == f"sh.helm.release.v1.{self.w.release}.v{r['revision']}":
+            if name == f"sh.helm.release.v1.{self.w.release}.v{r['revision']}" and not r.get("gone"):
                 labels = {"name": self.w.release, "owner": "helm", "version": str(r["revision"]),
                           "status": r["status"], **r["labels"]}
                 doc.update(found=True, uid=r["uid"], resourceVersion="7",
                            labels={k: v for k, v in labels.items() if k in keys})
-        return Result(stdout=json.dumps(doc).encode())
+        sink(json.dumps(doc).encode())
+        return result()
 
     def label(self, argv):
         if "--labels" not in argv:
@@ -115,34 +119,38 @@ class FakeHelm:
         k, v = argv[argv.index("--labels") + 1].split("=", 1)
         return {k: v}
 
-    def upgrade(self, argv, ident):
+    def upgrade(self, argv):
         n, mode = self.revisions[-1]["revision"] + 1, self.mode
-        if mode in ("lost", "hang"):
-            return Result(end="exited" if mode == "lost" else "terminated", returncode=1 if mode == "lost" else -15,
-                          ident=ident)
+        if mode == "lost":
+            return result(exit_status=1)
+        if mode == "hang":
+            return result(exit_kind="signaled", exit_status=15, deadline_exceeded=True, signals_sent=["TERM"])
         if mode == "foreign":
             self.revisions[-1]["status"] = "superseded"
             self.revisions.append(self.rev(n, "deployed", "Upgrade complete"))
-            return Result(returncode=1, ident=ident)
+            return result(exit_status=1)
         status, text = {"fail": ("failed", f"timed out waiting: {MARKER}"),
                         "pending": ("pending-upgrade", "Preparing upgrade")}.get(mode, ("deployed", "Upgrade complete"))
         if status == "deployed":
             self.revisions[-1]["status"] = "superseded"
             self.w.set_forecaster("to")
         if mode == "storage-swap":
-            self.revisions[-2 if len(self.revisions) > 1 else -1]["uid"] = "storage-uid-swapped"
-        self.revisions.append(self.rev(n, status, text, self.label(argv)))
-        if mode == "storage-swap":
             self.revisions[0]["uid"] = "storage-uid-swapped"
+        if mode == "storage-gone":
+            self.revisions[0]["gone"] = True
+        self.revisions.append(self.rev(n, status, text, self.label(argv)))
         if mode == "pending":
-            return Result(end="killed", returncode=-9, ident=ident)
-        return Result(returncode=0 if status == "deployed" else 1, group_empty=mode != "leftover", ident=ident)
+            return result(exit_kind="signaled", exit_status=9, deadline_exceeded=True, signals_sent=["TERM", "KILL"])
+        if mode == "leftover":
+            return result(group_empty=None, survivors=True)
+        return result(exit_status=0 if status == "deployed" else 1)
 
-    def rollback(self, argv, ident):
+    def rollback(self, argv):
         dest, n, mode = int(argv[3]), self.revisions[-1]["revision"] + 1, self.mode
-        if mode in ("lost", "hang"):
-            return Result(end="exited" if mode == "lost" else "terminated", returncode=1 if mode == "lost" else -15,
-                          ident=ident)
+        if mode == "lost":
+            return result(exit_status=1)
+        if mode == "hang":
+            return result(exit_kind="signaled", exit_status=15, deadline_exceeded=True, signals_sent=["TERM"])
         source = next(r for r in self.revisions if r["revision"] == dest)
         for r in self.revisions:
             if r["status"] == "deployed":
@@ -152,8 +160,8 @@ class FakeHelm:
         if mode != "fail":
             self.w.set_forecaster("from")
         if mode == "pending":                                  # the revision is written, then helm is killed
-            return Result(end="killed", returncode=-9, ident=ident)
-        return Result(returncode=1 if mode == "fail" else 0, ident=ident)
+            return result(exit_kind="signaled", exit_status=9, deadline_exceeded=True, signals_sent=["TERM", "KILL"])
+        return result(exit_status=1 if mode == "fail" else 0)
 
 
 def renderings(release, control_ns, ns, to_image):
@@ -216,7 +224,7 @@ class RW(W):
             "labels": {"app.kubernetes.io/instance": self.release}},
             "spec": {"nodeName": "worker-s", "containers": [{"name": "forecaster"}]},
             "status": {"phase": "Running", "containerStatuses": [{"name": "forecaster", "restartCount": 0}]}})
-        self.checkout = []
+        self.checkout, self.role_perm = [], {}
 
     def set_forecaster(self, which):
         docs = self.from_docs if which == "from" else self.to_docs
@@ -229,7 +237,7 @@ class RW(W):
 
         def permission_check():
             self.perm_calls += 1
-            return self.perm(self.perm_calls)
+            return {role: self.role_perm.get(role, self.perm(self.perm_calls)) for role in R.ROLES}
 
         def charts(commit):
             which = "from" if commit == "f" * 40 else "to"
@@ -283,6 +291,7 @@ def test_the_upgrade_plan_binds_what_was_reviewed_and_is_deterministic(w):
                          "--kube-context", "prodcluster", "-f", str(w.tmp / "values-2.yaml"), "--wait", "--timeout",
                          "5m", "--labels", f"c28.devkuban.com/release-op={op}"]
     assert not [x for x in a["argv"] if x.split("=")[0] in R.FORBIDDEN] and a["deadline_s"] == 390
+    assert R.argv_problems(w.ctx(), a["argv"], "upgrade", R.UPGRADE_OPTIONS) == []
     assert (a["from_revision"], a["expected_revision"], a["rollback_to"]) == (1, 2, 1)
     assert plan["history"] == [{"revision": 1, "status": "deployed", "chart": "predictive-autoscaler-0.9.0",
                                 "app_version": "0.9.0", "description_class": "Install complete",
@@ -293,8 +302,13 @@ def test_the_upgrade_plan_binds_what_was_reviewed_and_is_deterministic(w):
     d = plan["difference"]
     assert (d["added"], d["removed"], d["changed"]) == ([], [], [d["forecaster"]])
     assert (d["from_image"], d["to_image"]) == (OLD_IMAGE, w.to_image)
-    assert d["added_env"] == [{"name": "WATCH_NAMESPACES", "value": w.ns}]
-    assert plan["renders"]["from"]["secrets_discarded"] == 1 and plan["renders"]["from"]["objects"] == 4
+    assert d["added_env_names"] == ["WATCH_NAMESPACES"]
+    tls = f"Secret/{w.control_ns}/{w.release}-predictive-autoscaler-forecaster-tls"
+    assert d["tls_exception"] == tls and plan["renders"]["from"]["objects"] == 4
+    assert plan["renders"]["from"]["secrets"] == plan["renders"]["to"]["secrets"] == [
+        {"key": tls, "type": "kubernetes.io/tls", "data_keys": ["tls.key"]}]
+    assert plan["live_dependence"] == {"from": {"lookup": {}, "capabilities": {}},
+                                       "to": {"lookup": {}, "capabilities": {}}}
     assert plan["charts"]["from"]["tree"] == "f" * 40 and plan["charts"]["to"]["tree"] == "t" * 40
     assert [p["name"] for p in plan["pods"]] == [f"{w.release}-forecaster-0"]
     assert not w.helm.mutating() and not w.lock()                    # planning ran no mutating command
@@ -364,7 +378,6 @@ def test_any_difference_but_the_two_allowed_ones_refuses_the_plan(w, change, tex
     (lambda w: w.helm.revisions[0]["labels"].update(name="another-release"), "was not found as Helm's object"),
     (lambda w: w.helm.tls.clear(), None),
     (lambda w: (w.tmp / "values-2.yaml").write_text("a: 3\n"), "does not have the recorded sha256"),
-    (lambda w: (w.tmp / HELM).write_text("another helm"), "the helm binary"),
     (lambda w: w.checkout.append("the executing checkout is not clean"), "not clean"),
     (lambda w: setattr(w, "perm", lambda n: {"verdict": "fail", "write_grants": ["x"]}),
      "replica-write permission is not proven absent"),
@@ -391,11 +404,19 @@ def test_a_failed_read_refuses_to_plan_without_echoing_anything(w, read):
 
 
 @pytest.mark.parametrize("read", ["history", "template", "version"])
-@pytest.mark.parametrize("wrong", [{"returncode": 1}, {"end": "terminated", "returncode": -15},
-                                   {"group_empty": False}])
+@pytest.mark.parametrize("wrong", [{"exit_status": 1}, {"exit_kind": "signaled", "exit_status": 15},
+                                   {"group_empty": False}, {"group_empty": None}, {"survivors": True},
+                                   {"deadline_exceeded": True}, {"output_complete": False},
+                                   {"runner_error": "KeyboardInterrupt"}, {"started": False}])
 def test_an_answer_from_a_command_that_did_not_end_cleanly_is_not_used(w, read, wrong):
     w.helm.dirty_reads[read] = wrong                        # the answer is complete and well-formed all the same
     with pytest.raises(R.ReadError, match="gave no usable answer"):
+        w.plan()
+
+
+def test_an_answer_larger_than_its_bound_is_refused_not_truncated(w):
+    w.helm.version = "v3.19.0" + " " * 5000                  # helm version's answer is bounded at 256 bytes
+    with pytest.raises(R.ReadError, match="over the bound True"):
         w.plan()
 
 
@@ -420,7 +441,7 @@ def test_an_applied_upgrade_is_bound_by_its_own_revision_and_releases_the_lock(w
 
 @pytest.mark.parametrize("mode,classification", [
     ("fail", "failed"), ("pending", "unresolved"), ("lost", "unresolved"), ("hang", "unresolved"),
-    ("foreign", "foreign"), ("leftover", "unknown"), ("storage-swap", "foreign"),
+    ("foreign", "foreign"), ("leftover", "unknown"), ("storage-swap", "foreign"), ("storage-gone", "unknown"),
 ])
 def test_everything_but_applied_keeps_the_lock_and_is_never_retried(w, mode, classification):
     w.helm.mode = mode
@@ -445,7 +466,7 @@ def test_a_read_that_fails_after_the_launch_is_unknown_not_a_guess(w):
 
 def test_a_command_that_was_never_released_did_not_execute_and_may_be_planned_again(w):
     w.helm.mode = "unrecorded"
-    with pytest.raises(OSError, match="launch receipt"):
+    with pytest.raises(X.StagingError, match="never released .OSError.: nothing was executed"):
         w.upgrade()
     assert w.events() == ["intent-1", "step-1"] and not w.lock()
     step = X.last(X.receipts(w.ctx().record, R.HELPER), "step-1")["data"]
@@ -536,10 +557,10 @@ class Died(BaseException):
 @pytest.fixture
 def rec(w, monkeypatch):
     """Recovery runs in a fresh process: the reconciler builds its own context from the module's defaults."""
-    w.group = (True, "group empty")
+    w.group = "empty"
     monkeypatch.setattr(R, "RUNNER", w.helm)
-    monkeypatch.setattr(R, "PERMISSIONS", lambda: PASS)
-    monkeypatch.setattr(R.helmrun, "group_gone", lambda ident: w.group)
+    monkeypatch.setattr(R, "PERMISSIONS", lambda: {role: PASS for role in R.ROLES})
+    monkeypatch.setattr(R.procgroup, "group_state", lambda ident: w.group)
     return w
 
 
@@ -547,8 +568,8 @@ def die_after(w, mode="ok"):
     """Helm does what `mode` says and the executor dies before reading the outcome."""
     w.helm.mode, real = mode, w.helm.upgrade
 
-    def upgrade(argv, ident):
-        real(argv, ident)
+    def upgrade(argv):
+        real(argv)
         raise Died()
     w.helm.upgrade = upgrade
     with pytest.raises(Died):
@@ -597,12 +618,13 @@ def test_recovery_never_decides_an_upgrade_that_is_not_proven_applied(rec, mode,
 def test_recovery_waits_while_a_process_of_the_helm_group_exists(rec):
     w = rec
     die_after(w)
-    w.group = (False, "a process of group 4242 still exists")
-    with pytest.raises(X.StagingError, match="unresolved outcomes"):
-        recover(w)
-    [a] = recover_plan(w)["actions"]
-    assert "the Helm process group is not proven gone" in a["why"] and w.lock()
-    w.group = (True, "group empty")
+    for state in ("alive", "unknown"):                     # unknown: another host or boot, an unreadable /proc
+        w.group = state
+        with pytest.raises(X.StagingError, match="unresolved outcomes"):
+            recover(w)
+        [a] = recover_plan(w)["actions"]
+        assert f"the Helm process group is not proven gone: it is {state}" in a["why"] and w.lock()
+    w.group = "empty"
     recover(w)
     assert not w.lock()
 
@@ -642,8 +664,8 @@ def test_an_interrupted_rollback_stays_unresolved_whatever_the_history_shows(rec
     w.upgrade()
     real = w.helm.rollback
 
-    def rollback(argv, ident):
-        real(argv, ident)                                  # the rollback revision is written, deployed
+    def rollback(argv):
+        real(argv)                                         # the rollback revision is written, deployed
         raise Died()
     w.helm.rollback = rollback
     with pytest.raises(Died):
@@ -703,9 +725,9 @@ def test_a_guarded_rollback_needs_the_upgrades_helm_group_gone_and_a_revision_to
     w.helm.mode = "fail"
     with pytest.raises(X.StagingError):
         w.upgrade()
-    w.group = (False, "a process of group 4242 still exists")
+    w.group = "unknown"
     plan, _ = w.plan(R.plan_rollback, "plan-rollback")
-    assert any("Helm process group is not proven gone" in p for p in plan["problems"])
+    assert any("Helm process group is not proven gone: it is unknown" in p for p in plan["problems"])
 
 
 def test_an_applied_upgrade_with_an_open_intent_is_for_recovery_not_for_a_guarded_rollback(rec):
@@ -871,3 +893,363 @@ def test_no_forbidden_flag_can_ride_in_a_mutating_call():
     for flag in ("--atomic", "--force", "--install", "--cleanup-on-fail", "--take-ownership", "--reuse-values",
                  "--debug", "--dry-run=server", "-o", "--set", "--no-hooks", "--description"):
         assert R._forbidden(["helm", "upgrade", "r", "c", flag]), flag
+
+
+# --- the first review's findings (PR #109) ----------------------------------------------------------------------------
+
+def _secret(w, name, typ="Opaque", **data):
+    return {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": name, "namespace": w.control_ns}, "type": typ,
+            "data": data}
+
+
+def _tls(docs):
+    return next(d for d in docs if d["kind"] == "Secret" and d["metadata"]["name"].endswith("-tls"))
+
+
+def _ctr(docs):
+    return docs[-1]["spec"]["template"]["spec"]["containers"][0]
+
+
+def _other_deployment(w, token):
+    return {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "operator", "namespace": w.control_ns},
+            "spec": {"template": {"spec": {"containers": [{"name": "operator", "image": "x@sha256:" + "1" * 64,
+                                                           "env": [{"name": "AUTH_TOKEN", "value": token}]}]}}}}
+
+
+def _both(w, fn):
+    fn(w.from_docs)
+    fn(w.to_docs)
+
+
+@pytest.mark.parametrize("change,text", [
+    (lambda w: w.to_docs.append(_secret(w, "extra", token=MARKER)), "the new rendering adds Secret/"),
+    (lambda w: w.to_docs.remove(_tls(w.to_docs)), "the new rendering removes Secret/"),
+    (lambda w: _tls(w.to_docs)["metadata"].update(name="renamed-tls"), "the new rendering adds Secret/"),
+    (lambda w: (w.from_docs.append(_secret(w, "api", token="one-" + MARKER)),
+                w.to_docs.append(_secret(w, "api", token="two-" + MARKER))), "/api differs between the renderings"),
+    (lambda w: _tls(w.to_docs)["data"].update({"ca.crt": MARKER}), "-forecaster-tls differs between the renderings"),
+    (lambda w: _tls(w.to_docs).update(type="Opaque"), "-forecaster-tls differs between the renderings"),
+    (lambda w: (_ctr(w.from_docs)["env"].insert(0, {"name": "AUTH_TOKEN", "value": "one-" + MARKER}),
+                _ctr(w.to_docs)["env"].insert(0, {"name": "AUTH_TOKEN", "value": "two-" + MARKER})),
+     "does not add exactly the one environment entry"),
+    (lambda w: (w.from_docs.insert(0, _other_deployment(w, "one-" + MARKER)),
+                w.to_docs.insert(0, _other_deployment(w, "two-" + MARKER))), "/operator differs between the renderings"),
+])
+def test_secrets_and_literal_credentials_take_part_in_the_difference_and_are_never_quoted(w, change, text):
+    change(w)
+    plan, _saved = w.plan()
+    assert any(text in p for p in plan["problems"]), plan["problems"]
+    assert MARKER not in json.dumps(plan) and MARKER.encode() not in w.everything_written()
+
+
+def test_the_generated_tls_secret_is_the_one_object_compared_by_shape_only(w):
+    _tls(w.to_docs)["data"]["tls.key"] = "another-" + MARKER              # offline, each rendering makes a new key
+    assert w.plan()[0]["problems"] == []
+    _both(w, lambda docs: docs.append(_secret(w, "api", "kubernetes.io/tls", **{"tls.key": "k"})))
+    next(d for d in w.to_docs if d["metadata"]["name"] == "api")["data"]["tls.key"] = "other"
+    assert any("/api differs" in p for p in w.plan()[0]["problems"])      # another TLS Secret is not the exception
+
+
+def test_a_live_literal_that_differs_from_the_rendering_is_found_and_not_quoted(w):
+    _both(w, lambda docs: _ctr(docs)["env"].insert(0, {"name": "AUTH_TOKEN", "value": "rendered-" + MARKER}))
+    w.set_forecaster("from")
+    assert w.plan()[0]["problems"] == []
+    live = w.api.obj("Deployment", w.from_docs[-1]["metadata"]["name"], w.control_ns)
+    live["spec"]["template"]["spec"]["containers"][0]["env"][0]["value"] = "live-" + MARKER
+    plan, _ = w.plan()
+    assert any("the live forecaster differs" in p and "the values differ" in p for p in plan["problems"])
+    assert MARKER not in json.dumps(plan)
+
+
+@pytest.mark.parametrize("tool", [HELM, META])
+def test_an_executable_that_is_not_the_records_is_never_run(rec, tool):
+    w = rec
+    (w.tmp / tool).write_text("something else")
+    for fn, name in ((R.plan_upgrade, "plan-upgrade"), (R.plan_rollback, "plan-rollback")):
+        with pytest.raises(R.ToolError, match="it was not run"):
+            w.plan(fn, name)
+    assert w.helm.calls == []                               # not version, not a rendering, not history, not the reader
+    if tool == HELM:
+        assert "it was not run" in R.status(w.ctx())["history_error"] and w.helm.calls == []
+
+
+def test_an_executable_swapped_between_the_plan_and_the_launch_is_refused_before_anything_is_journalled(w):
+    def perm(n):
+        if n >= 2:                                         # during apply's own re-plan, after its reads
+            (w.tmp / HELM).write_text("swapped")
+        return PASS
+    w.perm = perm
+    _plan, saved = w.plan()
+    with pytest.raises(R.ToolError, match="it was not run"):
+        R.apply_upgrade(w.ctx(), X.load_plan(saved["plan"]), saved["plan_digest"])
+    assert w.events() == [] and not w.lock() and not w.helm.mutating()
+
+
+def test_recovery_does_not_run_a_wrong_executable_either(rec):
+    w = rec
+    die_after(w)
+    PF.crash_owner(w.ctx().record)
+    calls = len(w.helm.calls)
+    (w.tmp / HELM).write_text("something else")
+    [a] = recover_plan(w)["actions"]
+    assert a["observed"] == "unresolved" and "it was not run" in a["why"] and len(w.helm.calls) == calls
+
+
+def test_an_installed_revision_whose_storage_is_gone_is_not_continuity(rec):
+    w = rec
+    die_after(w, "storage-gone")                            # revision 2 deployed and ours; revision 1's storage vanished
+    PF.crash_owner(w.ctx().record)
+    [a] = recover_plan(w)["actions"]
+    assert a["observed"] == "unresolved" and "storage Secret is missing" in a["why"]
+
+
+@pytest.mark.parametrize("role", R.ROLES)
+@pytest.mark.parametrize("answer", [{"verdict": "unproven", "write_grants": []}, {"verdict": "refused"},
+                                    {"verdict": "pass", "write_grants": [{"binding": "b"}]}, {}])
+def test_each_of_the_three_identities_needs_its_own_permission_proof(w, role, answer):
+    w.role_perm[role] = answer
+    plan, saved = w.plan()
+    assert [p for p in plan["problems"] if "permission is not proven absent" in p] == [
+        f"the {role}'s replica-write permission is not proven absent (verdict {answer.get('verdict')})"]
+    with pytest.raises(X.StagingError, match="problems"):
+        R.apply_upgrade(w.ctx(), X.load_plan(saved["plan"]), saved["plan_digest"])
+    assert not w.helm.mutating()
+
+
+def test_the_default_permission_proof_asks_for_the_three_service_accounts(w, monkeypatch):
+    import permissions
+    seen = []
+
+    def collect(kubectl, sa_ns, sa, ns, targets, role):
+        seen.append((sa_ns, sa, ns, role))
+        return {"role": role}
+    monkeypatch.setattr(permissions, "collect", collect)
+    monkeypatch.setattr(permissions, "verdict", lambda collected, sa_ns, sa, targets, uid: {
+        "verdict": "pass", "write_grants": [], "identity": sa})
+    out = R._permissions(w.ctx())
+    assert list(out) == list(R.ROLES) == ["operator", "forecaster", "trainer"]
+    assert seen == [(w.control_ns, f"{w.release}-predictive-autoscaler-{r}", w.ns, r) for r in R.ROLES]
+
+
+@pytest.mark.parametrize("output,text", [
+    (f"kind: Secret\nmetadata: {{name: x}}\ndata:\n  tls.key: {MARKER}\n  broken: [unclosed\n".encode(),
+     r"not valid YAML \(line \d+, column \d+\)"),
+    (b"kind: ConfigMap\nmetadata: {name: x}\ndata: {a: \xff\xfe" + MARKER.encode() + b"}\n", "not UTF-8"),
+    (f"data: {MARKER}\n".encode(), "without a kind or metadata"),
+    (f"kind: Widget\nmetadata: {{name: x}}\nspec: {MARKER}\n".encode(), "needs secret review"),
+])
+def test_a_rendering_that_cannot_be_used_is_reported_without_any_of_its_text(w, output, text):
+    w.helm.raw_template = output
+    with pytest.raises(X.StagingError, match=text) as e:
+        w.plan()
+    assert MARKER not in str(e.value) and MARKER.encode() not in w.everything_written()
+
+
+def test_the_sanitizers_own_yaml_error_names_a_position_only():
+    with pytest.raises(C.StagingError, match=r"line \d+, column \d+") as e:
+        R._sanitizer().sanitize_stream(f"kind: Secret\ndata:\n  a: {MARKER}\n  b: [unclosed\n")
+    assert MARKER not in str(e.value)
+
+
+def test_templates_that_read_the_live_cluster_are_listed_and_only_the_tls_lookup_is_accepted(w, tmp_path):
+    chart = tmp_path / "chart"
+    (chart / "templates").mkdir(parents=True)
+    (chart / "templates" / "forecaster-tls.yaml").write_text('{{- $e := lookup "v1" "Secret" .Release.Namespace "x" }}\n')
+    (chart / "templates" / "plain.yaml").write_text("kind: ConfigMap\n")
+    (chart / "values.yaml").write_text("lookup: a value, not a template\n")
+    c = w.ctx()
+    assert R.live_dependence(c, str(chart)) == ({"lookup": {"templates/forecaster-tls.yaml": 1}, "capabilities": {}}, [])
+    (chart / "templates" / "rbac.yaml").write_text(
+        '{{ if (lookup "v1" "Namespace" "" "x") }}kind: ClusterRoleBinding{{ end }}\n{{ lookup "v1" "Pod" "" "" }}\n')
+    (chart / "templates" / "metrics.yaml").write_text('{{ if .Capabilities.APIVersions.Has "x/v1" }}kind: VMRule{{ end }}\n')
+    found, problems = R.live_dependence(c, str(chart))
+    assert found == {"lookup": {"templates/forecaster-tls.yaml": 1, "templates/rbac.yaml": 2},
+                     "capabilities": {"templates/metrics.yaml": 1}}
+    assert any("lookup in templates/rbac.yaml" in p for p in problems)
+    assert any("must bind helm.api_versions" in p for p in problems)
+    c.cfg["helm"]["api_versions"] = []                      # bound, even when empty: the capability question is answered
+    assert [p for p in R.live_dependence(c, str(chart))[1] if "api_versions" in p] == []
+
+
+def test_the_mutating_calls_shape_is_an_exact_allowlist(w):
+    c = w.ctx()
+    argv = w.plan()[0]["actions"][0]["argv"]
+    assert R.argv_problems(c, argv, "upgrade", R.UPGRADE_OPTIONS) == []
+    for bad in (argv + ["--skip-crds"], argv[:-2], argv[:4] + ["--history-max", "3"] + argv[4:],
+                [argv[0], "install"] + argv[2:], argv[:2] + ["another-release"] + argv[3:],
+                argv[:4] + argv[6:] + argv[4:6], argv + ["extra-positional"]):
+        assert R.argv_problems(c, bad, "upgrade", R.UPGRADE_OPTIONS), bad
+    rb = [argv[0], "rollback", w.release, "1", *c.conn(), "--wait", "--timeout", "5m"]
+    assert R.argv_problems(c, rb, "rollback", R.ROLLBACK_OPTIONS) == []
+    assert R.argv_problems(c, rb + ["--force"], "rollback", R.ROLLBACK_OPTIONS)
+
+
+# --- finishing after an interruption, and the reviewed disposition ----------------------------------------------------
+
+def test_an_interruption_after_the_rollbacks_applied_receipt_is_finished_without_running_helm_again(rec, monkeypatch):
+    w, real = rec, X.receipt
+    w.helm.mode = "fail"
+    with pytest.raises(X.StagingError):
+        w.upgrade()
+    w.helm.mode = "ok"
+    PF.crash_owner(w.ctx().record)
+
+    def receipt(record, helper, event, data, clock=None):
+        if event.startswith("reconciled-"):
+            raise Died()                                   # after step-2 applied is durable, before the reconciliation
+        return real(record, helper, event, data, clock)
+    monkeypatch.setattr(X, "receipt", receipt)
+    with pytest.raises(Died):
+        w.rollback()
+    monkeypatch.setattr(X, "receipt", real)
+    lock = PF.lock_file(w.ctx().record)
+    assert w.lock() and not os.path.exists(lock + ".recovery") and w.events()[-1] == "step-2"
+    assert C.unresolved_intents(w.ctx().record.doc) == {"release": ["1"]}
+    plan, saved = w.plan(R.plan_rollback, "plan-rollback")
+    assert (plan["form"], plan["problems"]) == ("finalize", [])
+    assert plan["actions"] == [{"op": "finalize-rollback", "upgrade_step": "1", "rollback_step": "2", "revision": 3}]
+    r = R.apply_rollback(w.ctx(), X.load_plan(saved["plan"]), saved["plan_digest"])
+    assert r["event"] == "reconciled-1" and (r["data"]["observed"], r["data"]["by"]) == ("rolled-back", "step-2")
+    assert not w.lock() and len(w.helm.mutating()) == 2    # the upgrade and the one rollback: no second rollback
+    assert C.unresolved_intents(w.ctx().record.doc) == {}
+
+
+def test_finishing_is_refused_when_the_release_is_no_longer_the_applied_rollback(rec, monkeypatch):
+    w, real = rec, X.receipt
+    w.helm.mode = "pending"
+    with pytest.raises(X.StagingError):
+        w.upgrade()
+    w.helm.mode = "ok"
+    PF.crash_owner(w.ctx().record)
+    monkeypatch.setattr(X, "receipt", lambda record, helper, event, data, clock=None: (_ for _ in ()).throw(Died())
+                        if event.startswith("reconciled-") else real(record, helper, event, data, clock))
+    with pytest.raises(Died):
+        w.rollback()
+    monkeypatch.setattr(X, "receipt", real)
+    w.helm.revisions[-1]["uid"] = "storage-uid-recreated"
+    plan, saved = w.plan(R.plan_rollback, "plan-rollback")
+    assert plan["form"] == "finalize" and any("is not the one its receipt recorded" in p for p in plan["problems"])
+    w.helm.revisions[-1]["status"] = "superseded"
+    w.helm.revisions.append(w.helm.rev(4, "deployed", "Upgrade complete"))
+    plan, saved = w.plan(R.plan_rollback, "plan-rollback")
+    assert any("the newest revision is not the applied rollback's revision 3" in p for p in plan["problems"])
+    with pytest.raises(X.StagingError, match="problems"):
+        R.apply_rollback(w.ctx(), X.load_plan(saved["plan"]), saved["plan_digest"])
+    assert w.lock()
+
+
+def interrupted_rollback(w):
+    w.upgrade()
+    real = w.helm.rollback
+
+    def rollback(argv):
+        real(argv)
+        raise Died()
+    w.helm.rollback = rollback
+    with pytest.raises(Died):
+        w.rollback()
+    w.helm.rollback = real
+
+
+def do_dispose(w):
+    _plan, saved = w.plan(R.plan_dispose, "plan-dispose")
+    return R.dispose(w.ctx(), X.load_plan(saved["plan"]), saved["plan_digest"])
+
+
+def test_an_interrupted_rollback_is_settled_by_a_reviewed_disposition_with_its_evidence(rec):
+    w = rec
+    interrupted_rollback(w)
+    plan, saved = w.plan(R.plan_dispose, "plan-dispose")
+    assert plan["problems"] == [] and (plan["kind"], plan["state"]) == ("dispose", "installed")
+    assert plan["actions"] == [{"op": "dispose", "step": "2", "intent_op": "helm-rollback", "state": "installed"}]
+    assert plan["groups"] == {"2": "empty"} and plan["storage"]["revision"] == 3
+    assert plan["evidence"]["differs_from_installed"] == 0 and plan["evidence"]["differs_from_new"] > 0
+    with pytest.raises(X.StagingError, match="refusing to recover"):       # the executor is not proven gone
+        R.dispose(w.ctx(), X.load_plan(saved["plan"]), saved["plan_digest"])
+    PF.crash_owner(w.ctx().record)
+    plan, saved = w.plan(R.plan_dispose, "plan-dispose")                   # the lock file changed: a new plan
+    r = R.dispose(w.ctx(), X.load_plan(saved["plan"]), saved["plan_digest"])
+    assert r["event"] == "reconciled-2" and (r["data"]["observed"], r["data"]["state"]) == ("disposed", "installed")
+    assert not w.lock() and w.events()[-2:] == ["disposition", "reconciled-2"] and len(w.helm.mutating()) == 2
+    assert X.last(X.receipts(w.ctx().record, "recover"), "lock-recovered")["data"]["by"] == "release dispose"
+
+
+def test_a_killed_guarded_rollback_leaves_two_intents_and_one_disposition_settles_both(rec):
+    w = rec
+    w.helm.mode = "fail"
+    with pytest.raises(X.StagingError):
+        w.upgrade()
+    PF.crash_owner(w.ctx().record)
+    w.helm.mode = "pending"                                # its helm wrote the rollback revision and was killed
+    with pytest.raises(X.StagingError, match="is unresolved"):
+        w.rollback()
+    plan, _ = w.plan(R.plan_dispose, "plan-dispose")
+    assert plan["problems"] == [] and plan["state"] == "installed" and [a["step"] for a in plan["actions"]] == ["1", "2"]
+    do_dispose(w)
+    assert not w.lock() and C.unresolved_intents(w.ctx().record.doc) == {}
+
+
+def test_an_upgrade_without_revision_evidence_is_disposed_as_installed_and_never_submitted_again(rec):
+    w = rec
+    w.helm.mode = "lost"
+    with pytest.raises(X.StagingError):
+        w.upgrade()
+    PF.crash_owner(w.ctx().record)
+    plan, _ = w.plan(R.plan_dispose, "plan-dispose")
+    assert plan["problems"] == [] and plan["state"] == "installed" and plan["storage"]["revision"] == 1
+    do_dispose(w)
+    assert not w.lock()
+    w.helm.mode = "ok"
+    assert any("already submitted" in p for p in w.plan()[0]["problems"])    # a new record, a new operation
+
+
+def test_an_applied_upgrade_can_also_be_disposed_as_upgraded(rec):
+    w = rec
+    die_after(w)
+    PF.crash_owner(w.ctx().record)
+    plan, _ = w.plan(R.plan_dispose, "plan-dispose")
+    assert plan["problems"] == [] and plan["state"] == "upgraded"
+    assert do_dispose(w)["data"]["state"] == "upgraded" and not w.lock()
+
+
+@pytest.mark.parametrize("damage,text", [
+    (lambda w: setattr(w, "group", "alive"), "its Helm process group is not proven gone (alive)"),
+    (lambda w: w.set_forecaster("to"), "is in neither reviewed state"),            # a rollback revision, new forecaster
+    (lambda w: w.api.obj("Deployment", w.from_docs[-1]["metadata"]["name"], w.control_ns)["spec"]["template"]["spec"][
+        "containers"][0].update(command=["x"]), "is in neither reviewed state"),
+    (lambda w: w.helm.revisions[-1].update(status="failed"), "not the one deployed revision"),
+    (lambda w: w.helm.revisions[-1].update(description="Upgrade complete"), "is in neither reviewed state"),
+    (lambda w: w.helm.revisions[-1].update(gone=True), "was not found as Helm's object"),
+    (lambda w: X.receipt(w.ctx().record, "bounded", "intent-9", {"op": "create", "kind": "Job", "namespace": "demo",
+                                                                  "name": "x", "context": {}}),
+     "only this helper's Helm intents may be open"),
+    (lambda w: w.role_perm.update(trainer={"verdict": "unproven"}), "the trainer's replica-write permission"),
+])
+def test_a_disposition_is_refused_unless_every_piece_of_evidence_holds(rec, damage, text):
+    w = rec
+    interrupted_rollback(w)
+    PF.crash_owner(w.ctx().record)
+    damage(w)
+    plan, saved = w.plan(R.plan_dispose, "plan-dispose")
+    assert any(text in p for p in plan["problems"]), plan["problems"]
+    with pytest.raises(X.StagingError, match="problems"):
+        R.dispose(w.ctx(), X.load_plan(saved["plan"]), saved["plan_digest"])
+    assert w.lock() and "disposition" not in w.events()
+
+
+def test_a_state_that_moved_during_the_review_voids_the_disposition(rec):
+    w = rec
+    interrupted_rollback(w)
+    PF.crash_owner(w.ctx().record)
+    _plan, saved = w.plan(R.plan_dispose, "plan-dispose")
+    w.api.obj("Pod", f"{w.release}-forecaster-0", w.control_ns)["status"]["containerStatuses"][0]["restartCount"] = 2
+    with pytest.raises(X.StagingError, match="no longer produces the reviewed plan"):
+        R.dispose(w.ctx(), X.load_plan(saved["plan"]), saved["plan_digest"])
+    assert w.lock() and "disposition" not in w.events()
+
+
+def test_there_is_nothing_to_dispose_of_without_an_open_intent(rec):
+    w = rec
+    w.upgrade()
+    plan, saved = w.plan(R.plan_dispose, "plan-dispose")
+    assert any("there is nothing to dispose of" in p for p in plan["problems"])

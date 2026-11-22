@@ -667,43 +667,69 @@ with the operator in Recommend and no replica-write permission. It is not a gran
 release.py --record R status
 release.py --record R plan-upgrade   ->  apply-upgrade  --plan F --plan-digest D
 release.py --record R plan-rollback  ->  apply-rollback --plan F --plan-digest D
+release.py --record R plan-dispose   ->  dispose        --plan F --plan-digest D
 release.py --record R recover-plan   ->  recover        --plan F --plan-digest D
 ```
 
 The record gets a section `release_upgrade`: `from` (the installed revision, the commit whose chart tree was
 installed, its values file and sha256), `to` (a NEW immutable values file and its sha256), `helm` (binary, sha256,
-version, timeout, kube_version and, for the offline renderings, optionally api_versions) and `metadata_reader` (the `c28-secretmeta` binary and its sha256). The new chart is
-the tree of the record's `source.commit`, which must be the clean executing checkout.
+version, timeout, kube_version and, for the offline renderings, api_versions) and `metadata_reader` (the
+`c28-secretmeta` binary and its sha256). The new chart is the tree of the record's `source.commit`, which must be the
+clean executing checkout.
 
+- **Nothing is executed unless it is the record's.** Every command of the helper (Helm, the metadata reader; in
+  planning, apply, status and recovery) is checked against the recorded path and sha256 first, and runs through
+  `staging/procgroup.py`: a process group of its own that cannot act before its identity is on record, a whitelist
+  environment, a deadline for the whole group (TERM, then KILL), and a proof from /proc that the group is empty.
+  Output is counted and hashed, never stored; a read's answer is parsed in memory and dropped.
 - **The plan** renders the installed chart tree with the installed values and the new tree with the new values,
-  offline, through the sanitizer (Secret documents are discarded), and refuses any difference but the two allowed
-  ones: an added or removed object, a Role, a NetworkPolicy, a ConfigMap, another field of the forecaster. It also
-  binds the release's history (each description as a class and a sha256, never its text), the storage Secret of the
-  installed revision by UID (metadata only), both chart trees (extracted once under the evidence directory and
-  verified file by file against git's listing), the live forecaster against the installed rendering (every field,
-  minus enumerated server defaults), the TLS Secret's metadata, the release's pods, the safety conditions of the
-  other helpers, and the exact argument array.
-- **The call.** Helm runs once through `staging/helmrun.py`: in a process group of its own that cannot execute
-  before its identity is recorded, with a deadline (Helm's timeout plus a margin), TERM, then KILL, and a proof that
-  the group is empty. Its output is counted and hashed, never stored. The call is journalled with the shared intent
-  protocol, so every other helper's "no open intent" gate sees it.
+  offline, and compares the UNSANITIZED documents in memory, Secrets included (a redacted value equals every other
+  redacted value, so the sanitized renderings are only hashed and shown). It refuses any difference but the two
+  allowed ones: an added, removed or renamed object, a Role, a NetworkPolicy, a ConfigMap, a Secret, a literal value,
+  another field of the forecaster. The one exception is the forecaster's generated TLS Secret: offline each
+  rendering makes a new certificate, so only its shape is compared. A plan names objects and paths, never values.
+- **What the offline renderings cannot show.** The plan lists every template of both chart trees that reads the live
+  cluster (`lookup`, `.Capabilities`). The only reviewed `lookup` is the one that keeps the forecaster's TLS Secret
+  across upgrades (the plan binds that Secret's live UID and resourceVersion for the read-back); any other is
+  refused, and capabilities must be bound in the record.
+- **Also bound:** the release's history (each description as a class and a sha256, never its text), the storage
+  Secret of the installed revision by UID (metadata only), both chart trees (extracted once under the evidence
+  directory and verified file by file against git's listing), the live forecaster against the installed rendering
+  (every field, minus enumerated server defaults), the release's pods, the other helpers' safety conditions, the
+  permission proof for the operator, the forecaster AND the trainer, and the argument array, whose options are an
+  exact ordered list.
+- **The call** is journalled with the shared intent protocol (unsafe, the intent, the launch identity, then the
+  release of the command), so every other helper's "no open intent" gate sees it.
 - **The outcome is read, not inferred from the exit status.** `applied` needs revision from+1 as the newest,
   `deployed`, with a storage Secret that carries this operation's identifier (a Helm release label) and the UID
-  first seen. A `failed` or `pending-upgrade` revision of ours, no revision evidence after Helm executed (whatever
-  its exit), a revision that is not ours, a replaced storage Secret, a surviving process or a failed read all keep
-  the lock. Nothing is retried, and the same operation identifier is never submitted twice. A command that was never
-  released certainly did not execute and may be planned again.
+  first seen, and the installed revision's storage Secret still present at its bound UID. A `failed` or
+  `pending-upgrade` revision of ours, no revision evidence after Helm executed (whatever its exit), a revision that
+  is not ours, a missing or replaced storage Secret, a group not proven empty or a failed read all keep the lock.
+  Nothing is retried, and the same operation identifier is never submitted twice. A command whose gate was never
+  opened certainly did not execute and may be planned again.
 - **Rollback** is `helm rollback` to the installed revision: a NEW revision that restores the unfixed forecaster.
   After an applied upgrade it is an ordinary reviewed operation. For a failed or pending upgrade it runs under the
   recovery guard, with the dead executor's lock retained and only that upgrade's intent open. Helm does not mark a
   rollback as ours, so it counts only when our own Helm process ended cleanly and the expected revision appeared as
-  a rollback to the destination; an interrupted rollback stays unresolved and is not attempted again by the helper.
+  a rollback to the destination. If the helper is interrupted after the rollback's `applied` receipt, the next
+  `plan-rollback` is a `finalize` plan: it records the reconciliation and releases the lock without running Helm.
 - **Recovery** decides only what is proven: an intent without a launch receipt never executed; a released upgrade
-  is done only when its own revision is deployed; everything else stays unresolved.
+  is done only when its own revision is deployed and its process group is gone; everything else stays unresolved.
+- **Disposition.** What neither recovery nor a rollback may decide (an interrupted rollback, an upgrade without
+  revision evidence) is settled by a reviewed disposition, which runs no Helm and changes nothing in the cluster.
+  `plan-dispose` gathers the evidence and refuses unless all of it holds: only this helper's intents are open and
+  each one's process group is gone; the newest revision is the one deployed revision; and the release is in exactly
+  one of two states, shown by the live forecaster equalling the installed or the new rendering in every field
+  together with the matching revision. `dispose` recomputes the plan (the state must not have moved during the
+  review), enters the recovery guard, journals the disposition and releases the lock. A release in neither state is
+  brought into one by hand first.
 
 `applied` means that Helm recorded our revision as deployed. The application read-back (pods, certificate,
-PredictiveAutoscalers, ledger, permissions) is a separate reviewed step. No test runs Helm: the process runner is
-tested with harmless local commands and the helper against a fake Helm state machine.
+PredictiveAutoscalers, ledger, permissions) is a separate reviewed step. The helper is run directly: starting it
+through the systemd unit wrapper is not supported (the wrapper's ownership proof is not part of its recovery).
+No test runs Helm: the helper is tested against a fake Helm state machine that speaks the runner's interface, and the
+runner has its own tests with harmless local commands; a smoke with the real Helm on a throwaway cluster is a
+separate step before first use.
 
 ## Restore to the common starting count
 

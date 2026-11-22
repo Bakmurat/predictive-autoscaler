@@ -366,3 +366,22 @@ P.run(["/bin/sleep", {LONGER!r}], env={{}}, cwd="/", deadline_s=120, record=reco
             os.killpg(json.loads(record.read_text())["pgid"], signal.SIGKILL)
         except (OSError, ValueError):
             pass
+
+
+# --- a read's stdout sink ---------------------------------------------------------------------------------------------
+
+def test_a_reads_stdout_goes_to_its_sink_and_stderr_and_the_result_keep_nothing():
+    got = []
+    res, _ = sh(f"printf '%s' answer-{MARKER}; printf '%s' err-{MARKER} >&2", stdout_sink=got.append)
+    assert b"".join(got) == f"answer-{MARKER}".encode()                  # stdout only, complete, in order
+    assert res.output_complete and res.stdout_bytes == len(f"answer-{MARKER}")
+    assert res.stdout_sha256 == hashlib.sha256(f"answer-{MARKER}".encode()).hexdigest()
+    assert MARKER not in json.dumps(res.as_dict())
+
+
+def test_a_failing_sink_does_not_escape_and_the_output_is_not_called_complete():
+    def sink(chunk):
+        raise RuntimeError(f"a sink error quoting {MARKER}")
+    res, _ = sh("head -c 300000 /dev/zero; sleep 0.2", stdout_sink=sink, deadline_s=5)
+    assert res.output_complete is False and res.group_empty is True      # ended, reaped, nothing claimed about output
+    assert MARKER not in json.dumps(res.as_dict())
