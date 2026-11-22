@@ -529,3 +529,81 @@ def test_a_mutation_lock_with_an_incomplete_owner_record_is_not_recoverable(rec)
         fh.write(json.dumps(body, sort_keys=True))
     with pytest.raises(C.StagingError, match="refusing to recover: its owner record is incomplete"):
         C.recovery_guard(rec, SCOPE, C.sha256_file(path)).__enter__()
+
+
+# --- taking the mutation lock: only by an executor that can be judged later ---------------------------------------------
+
+def test_the_mutation_lock_records_an_owner_that_reads_back_as_this_live_process(rec):
+    with C.exclusive_lock(rec, SCOPE) as lock:
+        body = json.loads(open(lock.path).read())
+        assert C.owner_state(body) == ("alive", f"its executor (pid {os.getpid()}) is still running")
+    assert not os.path.exists(lock.path)
+
+
+@pytest.mark.parametrize("broken,text", [
+    ("process_start", "owner record is incomplete"),       # /proc/<pid>/stat unreadable: no start time
+    ("_boot_id", "owner record is incomplete"),            # no boot id
+])
+def test_an_executor_that_cannot_describe_itself_takes_no_lock_and_changes_nothing(rec, monkeypatch, broken, text):
+    monkeypatch.setattr(C, broken, (lambda pid: None) if broken == "process_start" else (lambda: ""))
+    lock = C.exclusive_lock(rec, SCOPE)
+    ran = []
+    with pytest.raises(C.StagingError, match="cannot describe itself verifiably") as e:
+        with lock:
+            ran.append("a mutation")
+    assert text in str(e.value) and ran == [] and not os.path.exists(lock.path)
+    assert not os.path.isdir(os.path.dirname(lock.path)) or os.listdir(os.path.dirname(lock.path)) == []
+    monkeypatch.undo()
+    with C.exclusive_lock(rec, SCOPE):                     # nothing was left behind: the next executor is not blocked
+        pass
+
+
+def test_a_start_time_that_does_not_read_back_takes_no_lock(rec, monkeypatch):
+    monkeypatch.setattr(C, "process_start", lambda pid: "1")           # a wrong value, not a missing one
+    lock = C.exclusive_lock(rec, SCOPE)
+    with pytest.raises(C.StagingError, match="cannot describe itself verifiably .executor gone."):
+        lock.__enter__()
+    assert not os.path.exists(lock.path)
+
+
+def test_the_executor_on_record_is_the_process_that_enters_not_the_one_that_made_the_object(rec, tmp_path):
+    """A lock object made before a fork: the child that enters is the executor. Recording the parent would let a
+    recovery conclude, once the parent is gone, that a still-running child had terminated."""
+    lock = C.exclusive_lock(rec, SCOPE)                                # made in the parent
+    made = json.loads(lock.body)
+    assert made["pid"] == os.getpid()
+    entered, release = tmp_path / "entered", tmp_path / "release"
+    child = os.fork()
+    if child == 0:                                                     # the child: enter, report, wait, leave
+        code = 1
+        try:
+            with lock:
+                entered.write_text(str(os.getpid()))
+                end = time.time() + 30
+                while not release.exists() and time.time() < end:
+                    time.sleep(0.02)
+            code = 0
+        finally:
+            os._exit(code)
+    try:
+        end = time.time() + 20
+        while not entered.exists():
+            assert time.time() < end, "the child did not enter the lock"
+            time.sleep(0.02)
+        body = json.loads(open(lock.path).read())
+        assert body["pid"] == child != os.getpid()                     # the child, with ITS start time
+        assert body["pid_start"] == C.process_start(child) != made["pid_start"]
+        assert C.owner_state(body) == ("alive", f"its executor (pid {child}) is still running")
+    finally:
+        release.write_text("go")
+        _pid, status = os.waitpid(child, 0)
+    assert os.waitstatus_to_exitcode(status) == 0 and not os.path.exists(lock.path)
+
+
+def test_the_record_is_taken_at_entry_and_stays_what_was_written(rec, monkeypatch):
+    lock = C.exclusive_lock(rec, SCOPE)
+    with lock:
+        written = open(lock.path).read()
+        assert lock.body == written
+        monkeypatch.setattr(C, "process_start", lambda pid: "1")       # later reads do not change what is on record
+        assert lock.body == written

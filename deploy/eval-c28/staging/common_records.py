@@ -507,17 +507,38 @@ class exclusive_lock:
     and reconciled every ambiguous intent against the live objects."""
 
     def __init__(self, rec: Mapping, scope: str, clock=None, holder: str = ""):
-        import socket
         self.safe = True
         self.path = lock_path(rec, scope)
-        self.body = json.dumps({"scope": scope, "holder": holder or scope, "run_id": rec["run_id"],
-                                "cluster_uid": rec["cluster_uid"], "record_sha256": digest(rec),
-                                "receipts_dir": os.path.realpath(os.path.join(rec["evidence_dir"], "receipts")),
-                                "pid": os.getpid(),
-                                "pid_start": process_start(os.getpid()), "host": socket.gethostname(),
-                                "boot_id": _boot_id(), "at": utc_now(clock)}, sort_keys=True)
+        self._rec, self._scope, self._holder, self._clock = rec, scope, holder or scope, clock
+        self._entered: Optional[str] = None
+
+    def _record(self) -> str:
+        """The owner record of the process that calls this, now."""
+        import socket
+        rec = self._rec
+        return json.dumps({"scope": self._scope, "holder": self._holder, "run_id": rec["run_id"],
+                           "cluster_uid": rec["cluster_uid"], "record_sha256": digest(rec),
+                           "receipts_dir": os.path.realpath(os.path.join(rec["evidence_dir"], "receipts")),
+                           "pid": os.getpid(), "pid_start": process_start(os.getpid()),
+                           "host": socket.gethostname(), "boot_id": _boot_id(), "at": utc_now(self._clock)},
+                          sort_keys=True)
+
+    @property
+    def body(self) -> str:
+        """What the lock file holds once entered; before that, what this process would write."""
+        return self._entered if self._entered is not None else self._record()
 
     def __enter__(self):
+        # The executor is whoever ENTERS, described at this moment: an identity captured earlier could be another
+        # process's (the object may have been made before a fork), and recovery would later judge the wrong one.
+        # A lock whose owner record could not later be judged would be unrecoverable by design: an executor that
+        # cannot describe itself verifiably (its own record must read back, now, as a live process) takes no lock
+        # and so mutates nothing.
+        body = self._record()
+        state, why = owner_state(json.loads(body))
+        if state != "alive":
+            raise StagingError(f"this executor cannot describe itself verifiably ({why}): the mutation lock is not "
+                               "taken and nothing is changed")
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         try:
             fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
@@ -525,9 +546,10 @@ class exclusive_lock:
             raise StagingError(f"{self.path} exists: another execution is running or crashed; inspect its receipts "
                                f"and run the helper's recover command") from e
         with os.fdopen(fd, "w") as fh:
-            fh.write(self.body)
+            fh.write(body)
             fh.flush()
             os.fsync(fh.fileno())
+        self._entered = body
         return self
 
     def __exit__(self, exc_type, exc, tb):
