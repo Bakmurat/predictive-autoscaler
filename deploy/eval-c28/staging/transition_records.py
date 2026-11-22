@@ -157,8 +157,8 @@ def _append(record, event, data, clock):
 class recovery:
     """`with R.recovery(record, lock_sha256) as held:` — the recovery of this record's stale evaluation lock, HELD BY
     THIS PROCESS. It enters common_records.recovery_guard (one recoverer; the lock's sha256 as given; the lock's
-    executor proven terminated) and then writes its own identity and a fresh token into the guard file. The shared
-    guard file alone says only that SOME recovery is in progress; `problem()` says whether it is this object's, now.
+    executor proven terminated), whose guard record names this process and a fresh token. `problem()` says whether
+    that record is still this object's, now.
     An object that was never entered, or whose guard another recovery holds, owns nothing: it cannot record a fence,
     cannot release the stale lock, and on leaving does not remove a guard that is not its own."""
 
@@ -172,16 +172,7 @@ class recovery:
 
     def __enter__(self):
         self._guard.__enter__()                           # raises unless this process may recover this lock
-        try:
-            token = secrets.token_hex(16)
-            with open(self._guard.guard, "w") as fh:
-                json.dump({"pid": os.getpid(), "pid_start": C.process_start(os.getpid()), "token": token}, fh)
-                fh.flush()
-                os.fsync(fh.fileno())
-            self._token = token
-        except BaseException:
-            self._guard.__exit__(None, None, None)
-            raise
+        self._token = self._guard.token                   # the shared guard record carries this recovery's identity
         return self
 
     def __exit__(self, exc_type, exc, tb):
@@ -191,9 +182,10 @@ class recovery:
         problem = self._guard_problem()
         self._token = None
         self.fresh_revocation = None
-        if problem is None:
-            return self._guard.__exit__(exc_type, exc, tb)
-        if exc_type is None:
+        # Always leave the shared guard: that releases the coordination lock, and it removes the guard record only if
+        # the record is still this recovery's (the shared guard checks the token itself).
+        self._guard.__exit__(exc_type, exc, tb)
+        if problem is not None and exc_type is None:
             raise X.StagingError(f"the recovery guard was not removed: {problem}")
         return False                                      # an error is already on its way: do not hide it
 

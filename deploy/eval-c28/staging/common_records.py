@@ -32,12 +32,14 @@ from __future__ import annotations
 
 import copy
 import datetime as _dt
+import fcntl
 import hashlib
 import json
 import os
 import re
+import secrets
 import subprocess
-from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 RECORD_SCHEMA = "c28-preparation/v1"
 PLAN_SCHEMA = "c28-staging-plan/v1"
@@ -449,18 +451,51 @@ def process_start(pid: int) -> Optional[str]:
     return stat.rsplit(")", 1)[1].split()[19]
 
 
-def owner_terminated(body: Mapping) -> (bool, str):
-    """Whether the executor that wrote a lock has certainly ended: same host and boot, and its PID is gone or now
-    belongs to a process started at another time. Another host or boot cannot be verified here: not terminated."""
+def _process_state(pid: int) -> Tuple[str, Optional[str]]:
+    """("absent", None) when the process certainly does not exist, ("present", <start time>) when it does, and
+    ("unknown", None) for anything else: /proc unreadable for a reason other than absence, or a stat line that cannot
+    be parsed. Unlike process_start (which is for a process describing ITSELF), this never turns a failed read into
+    "gone"."""
+    try:
+        with open(f"/proc/{pid}/stat") as fh:
+            stat = fh.read()
+    except (FileNotFoundError, ProcessLookupError):
+        return "absent", None
+    except OSError:
+        return "unknown", None
+    fields = stat.rsplit(")", 1)[-1].split() if ")" in stat else []
+    if len(fields) < 20 or not fields[19].isdigit():
+        return "unknown", None
+    return "present", fields[19]
+
+
+def owner_state(body: Mapping) -> Tuple[str, str]:
+    """"terminated" | "alive" | "unknown" for the process an owner record names, with the reason. Terminated ONLY on
+    evidence: a complete record (a positive pid, its start time, host, boot id), this host, this boot, and either no
+    such process or a process with that pid that started at another time. An incomplete record, another host or
+    boot, or a /proc that cannot be read is unknown, never terminated."""
     import socket
-    if body.get("host") != socket.gethostname():
-        return False, f"the lock was taken on host {body.get('host')!r}: verify and recover there"
-    if body.get("boot_id") != _boot_id():
-        return False, "the lock was taken in another boot of this host: its executor cannot be checked"
-    start = process_start(int(body.get("pid", -1)))
-    if start is not None and start == body.get("pid_start"):
-        return False, f"its executor (pid {body.get('pid')}) is still running"
-    return True, "executor gone"
+    pid, start, host, boot = body.get("pid"), body.get("pid_start"), body.get("host"), body.get("boot_id")
+    if not (isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and isinstance(start, str) and start
+            and isinstance(host, str) and host and isinstance(boot, str) and boot):
+        return "unknown", "its owner record is incomplete (pid, start time, host, boot id): nothing can be proven"
+    if host != socket.gethostname():
+        return "unknown", f"the lock was taken on host {host!r}: verify and recover there"
+    mine = _boot_id()
+    if not mine or boot != mine:
+        return "unknown", "the lock was taken in another boot of this host: its executor cannot be checked"
+    state, now = _process_state(pid)
+    if state == "unknown":
+        return "unknown", f"the state of its executor (pid {pid}) could not be read from /proc"
+    if state == "present" and now == start:
+        return "alive", f"its executor (pid {pid}) is still running"
+    return "terminated", "executor gone"
+
+
+def owner_terminated(body: Mapping) -> (bool, str):
+    """Whether the process that wrote an owner record has CERTAINLY ended (owner_state == "terminated")."""
+    state, why = owner_state(body)
+    return state == "terminated", why
 
 
 class exclusive_lock:
@@ -500,48 +535,150 @@ class exclusive_lock:
         return False
 
 
+GUARD_SCHEMA = "c28-recovery-guard/v1"
+
+
 class recovery_guard:
-    """Exclusive recovery of a stale lock: given the lock file's sha256, it takes <lock>.recovery exclusively (one
-    recoverer), proves the lock's executor terminated (owner_terminated), and leaves the stale lock in place while the
-    caller reconciles, so no executor can start meanwhile. release_stale() removes it once every intent is resolved;
-    otherwise the stale lock stays."""
+    """Exclusive recovery of a stale lock. Given the lock file's sha256, it
+
+    1. takes an flock on <lock>.recovery.flock, without waiting, and holds it for the WHOLE recovery: one recoverer
+       at a time, and the kernel releases it when a recoverer dies (that file is never removed: its inode is the
+       coordination point);
+    2. validates the stale lock: the sha256 given, this run and record, its executor proven terminated;
+    3. looks at <lock>.recovery, the guard record of a recovery in progress. None: fine. One left behind by a
+       recoverer that is PROVEN terminated (owner_state on its complete record): it is taken over, and that is
+       journalled durably first (`recover` journal, recovery-guard-takeover, with the old guard's sha256 and owner).
+       Anything else (a live owner, another host or boot, an empty or unreadable record) refuses;
+    4. publishes its own complete guard record atomically (a fsynced temporary file, then an exclusive link or, for
+       a takeover, a rename; the directory synced): who recovers which lock of which record, with a fresh token.
+
+    The stale lock stays in place while the caller reconciles, so no executor can start meanwhile. release_stale()
+    removes it once every intent is resolved. On leaving, the guard record is removed only if it is still this
+    recovery's (its token)."""
 
     def __init__(self, rec: Mapping, scope: str, lock_sha256: str):
-        self.path, self.sha, self.rec = lock_path(rec, scope), lock_sha256, rec
+        self.path, self.sha, self.rec, self.scope = lock_path(rec, scope), lock_sha256, rec, scope
         self.guard = self.path + ".recovery"
+        self.coordination = self.path + ".recovery.flock"
+        self.token: Optional[str] = None
+        self._fd: Optional[int] = None
 
     def __enter__(self):
         if not os.path.exists(self.path):
             raise StagingError("no mutation lock is held: nothing to recover")
+        fd = os.open(self.coordination, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o640)
         try:
-            fd = os.open(self.guard, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
-        except FileExistsError as e:
-            raise StagingError("another recovery is in progress") from e
-        os.close(fd)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            raise StagingError("another recovery is in progress") from None
+        self._fd = fd
         try:
-            if sha256_file(self.path) != self.sha:
-                raise StagingError("the lock file's sha256 differs from the one given; refusing")
-            with open(self.path) as fh:
-                body = json.load(fh)
-            # The recovery must reconcile the OWNER's intents: the same run, record and receipt location.
-            mine = {"run_id": self.rec["run_id"], "cluster_uid": self.rec["cluster_uid"],
-                    "record_sha256": digest(self.rec),
-                    "receipts_dir": os.path.realpath(os.path.join(self.rec["evidence_dir"], "receipts"))}
-            diff = sorted(k for k, v in mine.items() if body.get(k) != v)
-            if diff:
-                raise StagingError(f"the lock belongs to another run or record (differs in {diff}); recover it with "
-                                   f"the owning run's record")
-            gone, why = owner_terminated(body)
-            if not gone:
-                raise StagingError(f"refusing to recover: {why}")
+            self._validate_lock()                         # before anything is written to this run's journal
+            stale = self._stale_guard()
+            body = self._body()
+            if stale is not None:                         # durable BEFORE the guard changes hands
+                append_receipt(self.rec, "recover", "recovery-guard-takeover", {
+                    "scope": self.scope, "lock_sha256": self.sha, "stale_guard": stale,
+                    "new_guard": {k: body[k] for k in ("token", "pid", "pid_start", "host", "boot_id")}})
+            self._publish(body, replace=stale is not None)
+            self.token = body["token"]
         except BaseException:
-            os.unlink(self.guard)
+            self._unlock()
             raise
         return self
 
+    def _validate_lock(self) -> None:
+        if sha256_file(self.path) != self.sha:
+            raise StagingError("the lock file's sha256 differs from the one given; refusing")
+        with open(self.path) as fh:
+            body = json.load(fh)
+        # The recovery must reconcile the OWNER's intents: the same run, record and receipt location.
+        mine = {"run_id": self.rec["run_id"], "cluster_uid": self.rec["cluster_uid"],
+                "record_sha256": digest(self.rec),
+                "receipts_dir": os.path.realpath(os.path.join(self.rec["evidence_dir"], "receipts"))}
+        diff = sorted(k for k, v in mine.items() if body.get(k) != v)
+        if diff:
+            raise StagingError(f"the lock belongs to another run or record (differs in {diff}); recover it with "
+                               f"the owning run's record")
+        gone, why = owner_terminated(body)
+        if not gone:
+            raise StagingError(f"refusing to recover: {why}")
+
+    def _stale_guard(self) -> Optional[Dict]:
+        """None when no guard record exists; what is known of a guard whose recoverer is PROVEN terminated; raises
+        for every other guard."""
+        try:
+            with open(self.guard, "rb") as fh:
+                raw = fh.read()
+        except FileNotFoundError:
+            return None
+        try:
+            body = json.loads(raw)
+            if not isinstance(body, dict):
+                raise ValueError
+        except ValueError:
+            raise StagingError("another recovery is in progress, or left a guard record that cannot be read "
+                               f"({len(raw)} bytes): it is not proven gone") from None
+        state, why = owner_state(body)
+        if state != "terminated":
+            raise StagingError(f"another recovery is in progress or is not proven gone: {why}")
+        return {"sha256": hashlib.sha256(raw).hexdigest(),
+                "owner": {k: body.get(k) for k in ("token", "pid", "pid_start", "host", "boot_id", "at")}}
+
+    def _body(self) -> Dict:
+        import socket
+        return {"schema": GUARD_SCHEMA, "token": secrets.token_hex(16), "pid": os.getpid(),
+                "pid_start": process_start(os.getpid()), "host": socket.gethostname(), "boot_id": _boot_id(),
+                "at": utc_now(), "scope": self.scope, "run_id": self.rec["run_id"],
+                "cluster_uid": self.rec["cluster_uid"], "record_sha256": digest(self.rec), "lock_sha256": self.sha}
+
+    def _publish(self, body: Dict, replace: bool) -> None:
+        tmp = f"{self.guard}.tmp-{body['token']}"
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
+            with os.fdopen(fd, "w") as fh:
+                fh.write(json.dumps(body, sort_keys=True))
+                fh.flush()
+                os.fsync(fh.fileno())
+            if replace:
+                os.replace(tmp, self.guard)               # under the flock: the stale record gives way atomically
+            else:
+                os.link(tmp, self.guard)                  # exclusive: fails if a record appeared meanwhile
+                os.unlink(tmp)
+            d = os.open(os.path.dirname(self.guard), os.O_RDONLY)
+            try:
+                os.fsync(d)
+            finally:
+                os.close(d)
+        except BaseException:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
+
+    def owns(self) -> bool:
+        """Whether the guard record is still this recovery's."""
+        if self.token is None:
+            return False
+        try:
+            with open(self.guard) as fh:
+                body = json.load(fh)
+        except (OSError, ValueError):
+            return False
+        return isinstance(body, dict) and body.get("token") == self.token and body.get("pid") == os.getpid() \
+            and body.get("pid_start") == process_start(os.getpid())
+
+    def _unlock(self) -> None:
+        if self._fd is not None:
+            os.close(self._fd)                            # releases the flock; the coordination file stays
+            self._fd = None
+
     def release_stale(self) -> None:
         """Release only when NO journal of the owning record (whatever tool wrote it under this lock) keeps an
-        unresolved intent; each tool's recover resolves its own, and the last one releases."""
+        unresolved intent; each tool's recover resolves its own, and the last one releases. Only the recovery that
+        still owns the guard may release."""
+        if not self.owns():
+            raise StagingError("the stale lock is released only by the recovery that holds the guard")
         left = unresolved_intents(self.rec)
         if left:
             todo = sorted({RECOVER_COMMANDS.get(j, f"the {j} tool's recover") for j in left})
@@ -550,7 +687,12 @@ class recovery_guard:
         os.unlink(self.path)
 
     def __exit__(self, exc_type, exc, tb):
-        os.unlink(self.guard)
+        try:
+            if self.owns():                               # never another recovery's record
+                os.unlink(self.guard)
+        finally:
+            self.token = None
+            self._unlock()
         return False
 
 
