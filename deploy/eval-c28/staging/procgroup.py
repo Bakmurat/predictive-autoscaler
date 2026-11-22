@@ -19,6 +19,8 @@ What it guarantees, each covered by a test with harmless local commands:
   be completed. A caller must not release a lock on anything but True.
 - **Output is never kept.** stdout and stderr are drained continuously in fixed-size chunks into byte counters and
   SHA-256 digests; no chunk is stored, logged or attached to an exception. Result holds counts and digests only.
+  A caller that must parse the answer of a READ passes `stdout_sink`: each stdout chunk is handed to it and to
+  nothing else (bounding and dropping it is the caller's business); stderr never has a sink.
 - **No surprises from the environment.** `env` is the complete environment: nothing is inherited, and the variable the
   trampoline shell would add (PWD) is removed again; an `env` that itself names PWD or OLDPWD is refused. stdin is
   /dev/null.
@@ -151,9 +153,9 @@ def group_state(identity: Dict) -> str:
 class _Drain(threading.Thread):
     """Reads one stream to its end, keeping only a byte count and a digest."""
 
-    def __init__(self, stream):
+    def __init__(self, stream, sink: Optional[Callable[[bytes], None]] = None):
         super().__init__(daemon=True)
-        self.stream, self.count, self.digest, self.done = stream, 0, hashlib.sha256(), False
+        self.stream, self.count, self.digest, self.done, self.sink = stream, 0, hashlib.sha256(), False, sink
 
     def run(self):
         try:
@@ -164,7 +166,9 @@ class _Drain(threading.Thread):
                     return
                 self.count += len(chunk)
                 self.digest.update(chunk)
-        except (OSError, ValueError):
+                if self.sink is not None:
+                    self.sink(chunk)
+        except Exception:                                      # a failing sink ends the drain: output_complete False
             return
 
 
@@ -190,7 +194,8 @@ def _wait_empty(pgid: int, seconds: float, sleep: Callable[[float], None]) -> Op
 
 def run(argv: List[str], *, env: Dict[str, str], cwd: str, deadline_s: float, record: Callable[[Dict], None],
         grace_s: float = 10.0, linger_s: float = 5.0, reap_s: float = 10.0,
-        sleep: Callable[[float], None] = time.sleep) -> Result:
+        sleep: Callable[[float], None] = time.sleep,
+        stdout_sink: Optional[Callable[[bytes], None]] = None) -> Result:
     """Run argv as described in the module docstring. `record(identity)` must make the identity durable and return;
     if it raises, the command is never executed. argv[0] must be an absolute path (nothing is searched)."""
     res = Result()
@@ -207,7 +212,7 @@ def run(argv: List[str], *, env: Dict[str, str], cwd: str, deadline_s: float, re
                                 start_new_session=True, close_fds=True)
         os.close(gate_r)
         gate_r = -1
-        drains = [_Drain(proc.stdout), _Drain(proc.stderr)]
+        drains = [_Drain(proc.stdout, stdout_sink), _Drain(proc.stderr)]
         for d in drains:
             d.start()
         ident = identity_of(proc.pid)

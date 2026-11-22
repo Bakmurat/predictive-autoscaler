@@ -41,7 +41,9 @@ def sanitize_stream(text: str):
     try:
         docs = [d for d in yaml.safe_load_all(text) if d]
     except yaml.YAMLError as e:
-        raise C.StagingError(f"the rendering is not valid YAML (line {getattr(e, 'problem_mark', None)})") from None
+        mark = getattr(e, "problem_mark", None)            # its text form quotes the source: numbers only
+        where = f"line {mark.line + 1}, column {mark.column + 1}" if mark is not None else "position unknown"
+        raise C.StagingError(f"the rendering is not valid YAML ({where})") from None
     out, secrets = [], 0
     for d in docs:
         if not isinstance(d, dict) or "kind" not in d:
