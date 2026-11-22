@@ -7,6 +7,7 @@ import copy
 import hashlib
 import json
 import os
+import shutil
 
 import pytest
 import yaml
@@ -16,9 +17,8 @@ import execlib as X
 import part2_fixtures as PF
 import procgroup as P
 import release as R
-from part2_fixtures import api  # noqa: F401
 from test_imageroll import PASS, W, served
-from test_prepare_demo import demo_params, world  # noqa: F401
+from test_prepare_demo import build_world, demo_params
 
 MARKER = "tok-SECRET-marker-91c2"
 HELM, META = "helm-bin", "secretmeta-bin"
@@ -272,9 +272,63 @@ class RW(W):
         return b"\n".join(out)
 
 
+def tree_digest(root):
+    """Every file under a directory, by relative path and content."""
+    h = hashlib.sha256()
+    for base, dirs, names in os.walk(root):
+        dirs.sort()
+        for n in sorted(names):
+            p = os.path.join(base, n)
+            with open(p, "rb") as fh:
+                h.update(os.path.relpath(p, root).encode() + b"\0" + fh.read() + b"\0")
+    return h.hexdigest()
+
+
+@pytest.fixture(scope="module")
+def prepared(tmp_path_factory):
+    """ONE prepared installation for the module (preparing it is most of a test's cost), kept IMMUTABLE: a pristine
+    copy of its directory and a pristine copy of every in-memory object (the fake cluster, its controller, the fake
+    Helm, the counters). Records and journals name absolute paths, so each test works in the SAME directory, emptied
+    and refilled from the pristine copy first."""
+    home = tmp_path_factory.mktemp("release-world")
+    work, keep = home / "work", home / "pristine"
+    work.mkdir()
+    base = RW(build_world(work, PF.fake2.FakeApi2()))
+    shutil.copytree(work, keep)
+    return {"work": work, "keep": keep, "world": copy.deepcopy(base), "digest": tree_digest(keep)}
+
+
+def fresh_world(prepared):
+    """A test's own world: the working directory restored file for file, and its own copy of every object."""
+    shutil.rmtree(prepared["work"])
+    shutil.copytree(prepared["keep"], prepared["work"])
+    return copy.deepcopy(prepared["world"])
+
+
 @pytest.fixture
-def w(world):  # noqa: F811
-    return RW(world)
+def w(prepared):
+    return fresh_world(prepared)
+
+
+def test_every_test_gets_the_same_pristine_world_whatever_ran_before(prepared):
+    first = fresh_world(prepared)
+    first.helm.mode = "fail"
+    with pytest.raises(X.StagingError):
+        first.upgrade()
+    first.perm_calls, first.role_perm["trainer"] = 99, {"verdict": "refused"}
+    first.api.obj("Deployment", first.from_docs[-1]["metadata"]["name"], first.control_ns)["spec"]["replicas"] = 7
+    first.from_docs.clear()
+    assert first.lock() and first.events() and len(first.helm.revisions) == 2
+    second = fresh_world(prepared)
+    assert second.events() == [] and not second.lock() and second.helm.calls == [] and second.helm.mode == "ok"
+    assert len(second.helm.revisions) == 1 and second.perm_calls == 0 and second.role_perm == {}
+    assert second.api is not first.api and second.helm is not first.helm and second.helm.w is second
+    assert second.api.obj("Deployment", second.from_docs[-1]["metadata"]["name"], second.control_ns)["spec"][
+        "replicas"] == 1
+    assert second.ctl in second.api.on_poll and first.ctl not in second.api.on_poll
+    assert tree_digest(prepared["work"]) == tree_digest(prepared["keep"]) == prepared["digest"]
+    assert second.plan()[0]["problems"] == []              # and it is a working installation
+    assert tree_digest(prepared["keep"]) == prepared["digest"]      # using a world never touches the pristine copy
 
 
 # --- the plan ---------------------------------------------------------------------------------------------------------

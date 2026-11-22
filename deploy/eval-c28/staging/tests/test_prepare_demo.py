@@ -57,8 +57,13 @@ def demo_section(owner_path, **over):
 
 @pytest.fixture
 def world(tmp_path, api):
+    return build_world(tmp_path, api)
+
+
+def build_world(tmp_path, api):
     """A fake cluster whose W and S are reserved by the OWNER run (reserve.py apply with the owner's record), and a
-    demonstration record that references it. Returns a builder: build(params=None, section=None, owner_extra=None)."""
+    demonstration record that references it. Returns a builder: build(params=None, section=None, owner_extra=None).
+    (A plain function, so a module can prepare one world and hand each test its own copy.)"""
     api.put({"apiVersion": "storage.k8s.io/v1", "kind": "StorageClass", "metadata": {"name": "retained-ssd"},
              "reclaimPolicy": "Retain"})
     api.put(F.node("worker-w", uid=W_UID))
